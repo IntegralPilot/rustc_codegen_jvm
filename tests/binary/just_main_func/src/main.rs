@@ -3,8 +3,7 @@
 #![feature(lang_items)]
 #![no_core]
 
-fn main() {
-}
+fn main() {}
 
 #[lang = "sized"]
 trait Sized {}

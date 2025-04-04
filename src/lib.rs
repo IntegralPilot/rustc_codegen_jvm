@@ -432,8 +432,10 @@ fn generate_class_with_static_methods_bytecode(
             attributes: Vec::new(),
         };
 
-        // Calculate max stack size based on instructions
-        let max_stack = calculate_max_stack_size(method_bytecode_instructions);
+        let max_stack = method_bytecode_instructions
+            .iter()
+            .map(Instruction::stack_utilization)
+            .sum();
         let max_locals = fn_sig.skip_binder().inputs().skip_binder().len() as u16 + 1; // +1 for 'this' (even for static methods in JVM, slot 0 exists) // Skip binder twice!
 
         method.attributes.push(Attribute::Code {
@@ -476,40 +478,6 @@ fn find_instance_by_name<'tcx>(tcx: TyCtxt<'tcx>, function_name: &str) -> Option
         }
     }
     None // Instance not found
-}
-
-fn calculate_max_stack_size(instructions: &Vec<Instruction>) -> u16 {
-    let mut stack_depth: i32 = 0;
-    let mut max_stack_depth: i32 = 0;
-
-    for instruction in instructions {
-        let opcode = instruction.code();
-        let stack_effect: i32 = match opcode {
-            // 0x03 to 0x08 is iconst_m1, iconst_0, ..., iconst_5
-            // 0x1a to 0x23 is iload_0, iload_1, ..., iload_3, iload, aload
-            0x03..=0x08 | 0x1a..=0x23 => 1,
-            0x60 | 0x64 => {
-                stack_depth -= 1;
-                0
-            } // iadd, isub (pop 2, push 1 => net -1, but we're tracking *increase*, so net change from previous is -1+1=0 for tracking max)
-            0xac | 0xb0 => {
-                // ireturn, areturn
-                stack_depth -= 1;
-                0
-            }
-            _ => 0, // Default to 0 for unknown opcodes or those with no stack effect (i.e. _return - void return) for now
-        };
-
-        stack_depth += stack_effect;
-        if stack_depth > max_stack_depth {
-            max_stack_depth = stack_depth;
-        }
-        if stack_depth < 0 {
-            stack_depth = 0; // Avoid negative stack depth if instructions are unbalanced (shouldn't happen in valid code)
-        }
-    }
-
-    max_stack_depth.max(0) as u16 // Ensure max_stack is not negative, and cast to u16
 }
 
 struct RlibArchiveBuilder;
