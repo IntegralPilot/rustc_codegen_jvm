@@ -1,0 +1,2 @@
+[build]
+rustflags = "-Z codegen-backend=../../../target/debug/librustc_codegen_jvm.dylib -C linker=../../../java-linker/target/debug/java-linker -C link-args=\"\""

@@ -28,7 +28,7 @@ fn main() -> Result<(), i32> {
                 eprintln!("Error: -o flag requires an output file path");
                 return Err(1);
             }
-        } else if !arg.starts_with("-Wl") && arg != "-no-pie" && arg != "-nodefaultlibs" {
+        } else if !arg.starts_with("-") && (arg.ends_with(".class") || arg.ends_with(".jar")) {
             input_files.push(arg.clone());
             i += 1;
         } else {
@@ -39,6 +39,14 @@ fn main() -> Result<(), i32> {
     if input_files.is_empty() {
         eprintln!("Error: No input class files provided.");
         return Err(1);
+    }
+
+    // if output_file doesn't end in .jar, add .jar
+    if let Some(ref path) = output_file {
+        if !path.ends_with(".jar") {
+            eprintln!("Warning: Output file should end with .jar. Adding .jar extension.");
+            output_file = Some(format!("{}.jar", path));
+        }
     }
 
     let output_file_path = match output_file {

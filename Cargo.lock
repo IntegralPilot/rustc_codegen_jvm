@@ -56,9 +56,9 @@ dependencies = [
 
 [[package]]
 name = "ristretto_classfile"
-version = "0.14.0"
+version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "83023fe9f9154bbdbaffb4e3f2767509baf9dc4b3e9c725b8ae845abe2bbd23c"
+checksum = "6468fb9aac366032e23daee43329e4da01c6f9cb4c837e5f148d12fd6b642f9b"
 dependencies = [
  "bitflags",
  "byteorder",

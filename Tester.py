@@ -36,7 +36,14 @@ def process_test(test_dir: str):
 
     # Run cargo build.
     print("|--- ⚒️ Building with Cargo...")
-    proc = run_command(["cargo", "build", "--target", "../../../jvm-unknown-unknown.json"], cwd=test_dir)
+    # see if the file no_jvm_target.flag exists in the test directory
+    no_jvm_target = os.path.join(test_dir, "no_jvm_target.flag")
+    if os.path.exists(no_jvm_target):
+        print("|---- ⚠️ Skipping JVM target build due to no_jvm_target.flag")
+        proc = run_command(["cargo", "build"], cwd=test_dir)
+    else:
+        print("|---- 🛠️ Building with JVM target...")
+        proc = run_command(["cargo", "build", "--target", "../../../jvm-unknown-unknown.json"], cwd=test_dir)
     if proc.returncode != 0:
         fail_path = os.path.join(test_dir, "cargo-build-fail.generated")
         output = f"STDOUT:\n{proc.stdout}\n\nSTDERR:\n{proc.stderr}"
@@ -46,6 +53,24 @@ def process_test(test_dir: str):
 
     # Run java with the generated jar.
     print("|--- 🤖 Running with Java...")
+    # if no_jvm_target flag is set, we first need to move target/debug/deps/{test_name}-{hash}.jar to target/jvm-unknown-unknown/debug/{test_name}.jar
+    # we might need to make the directory first
+    if os.path.exists(no_jvm_target):
+        print("|---- ⚠️ Doing some needed moving around due to no_jvm_target.flag")
+        # move the jar file to the target/jvm-unknown-unknown/debug directory
+        jar_path = os.path.join(test_dir, "target", "debug", "deps", f"{test_name}-*.jar")
+        # find the jar file
+        jar_file = None
+        for file in os.listdir(os.path.join(test_dir, "target", "debug", "deps")):
+            if file.startswith(test_name) and file.endswith(".jar"):
+                jar_file = file
+                break
+        if jar_file is None:
+            print("|---- ❌ No jar file found in target/debug/deps")
+            return False
+        # move the file
+        os.makedirs(os.path.join(test_dir, "target", "jvm-unknown-unknown", "debug"), exist_ok=True)
+        os.rename(os.path.join(test_dir, "target", "debug", "deps", jar_file), os.path.join(test_dir, "target", "jvm-unknown-unknown", "debug", f"{test_name}.jar"))
     jar_path = os.path.join(test_dir, "target", "jvm-unknown-unknown", "debug", f"{test_name}.jar")
     proc = run_command(["java", "-jar", jar_path])
     if proc.returncode != 0:
