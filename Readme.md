@@ -20,7 +20,9 @@ The toolchain follows these steps:
 ## Current Capabilities  
 
 - ✅ Compiling a minimal `no_std` & `no_core` Rust program with an empty `main` function.  
-- ✅ Simple mathematical operations on `i32`s: addition, subtraction, and returning `()` or an `i32`.  
+- ✅ Simple mathematical operations on `i32`s: addition, subtraction, mutliplication, division, modulo.
+- ✅ Calling other functions from the same library (including recursion).
+- ✅ if/else statements.
 
 ### Next Milestone:  
 🚧 **Full support for the `core` crate** is in progress!  
