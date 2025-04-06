@@ -1,21 +1,23 @@
 use std::env;
 use std::fs;
-use std::io;
-use std::io::Write;
-use std::path::Path;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use regex::Regex;
 use zip::write::{SimpleFileOptions, ZipWriter};
 use zip::CompressionMethod;
+use tempfile::NamedTempFile;
 
 fn main() -> Result<(), i32> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 3 {
-        eprintln!("Usage: java-linker <input_class_files...> -o <output_jar_file>");
+        eprintln!("Usage: java-linker <input_files...> -o <output_jar_file> [--asm-processor <processor_jar>]");
         return Err(1);
     }
 
     let mut input_files: Vec<String> = Vec::new();
     let mut output_file: Option<String> = None;
+    let mut processor_jar_path: Option<PathBuf> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -26,6 +28,14 @@ fn main() -> Result<(), i32> {
                 i += 2;
             } else {
                 eprintln!("Error: -o flag requires an output file path");
+                return Err(1);
+            }
+        } else if arg == "--asm-processor" {
+            if i + 1 < args.len() {
+                processor_jar_path = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            } else {
+                eprintln!("Error: --asm-processor flag requires a path");
                 return Err(1);
             }
         } else if !arg.starts_with("-") && (arg.ends_with(".class") || arg.ends_with(".jar")) {
@@ -82,7 +92,15 @@ fn main() -> Result<(), i32> {
         cleaned_name.trim_end_matches(".class").replace("/", ".")
     });
 
-    if let Err(err) = create_jar(&input_files, &output_file_path, main_class_name.as_deref()) {
+    let processor_jar_path = processor_jar_path.as_deref();
+    if let Some(path) = processor_jar_path {
+        if !path.exists() || !path.is_file() {
+            eprintln!("Error: ASM processor JAR does not exist or is not a file: {}", path.display());
+            return Err(1);
+        }
+    }
+
+    if let Err(err) = create_jar(&input_files, &output_file_path, main_class_name.as_deref(), processor_jar_path) {
         eprintln!("Error creating JAR: {}", err);
         return Err(1);
     }
@@ -92,20 +110,19 @@ fn main() -> Result<(), i32> {
 }
 
 fn find_main_classes(class_files: &[String]) -> Vec<String> {
-    // currently very simplified, will implement proper parsing later
-
-
     let mut main_classes = Vec::new();
-    // Byte sequences to look for.
     let main_name = b"main";
     let main_descriptor = b"([Ljava/lang/String;)V";
 
     for file in class_files {
-        if let Ok(data) = fs::read(file) {
-            let has_main_name = data.windows(main_name.len()).any(|w| w == main_name);
-            let has_main_descriptor = data.windows(main_descriptor.len()).any(|w| w == main_descriptor);
-            if has_main_name && has_main_descriptor {
-                main_classes.push(file.clone());
+        // Only check .class files for main method bytes
+        if file.ends_with(".class") {
+            if let Ok(data) = fs::read(file) {
+                let has_main_name = data.windows(main_name.len()).any(|w| w == main_name);
+                let has_main_descriptor = data.windows(main_descriptor.len()).any(|w| w == main_descriptor);
+                if has_main_name && has_main_descriptor {
+                    main_classes.push(file.clone());
+                }
             }
         }
     }
@@ -116,6 +133,7 @@ fn create_jar(
     input_files: &[String],
     output_jar_path: &str,
     main_class_name: Option<&str>,
+    processor_jar_path: Option<&Path>,
 ) -> io::Result<()> {
     let output_file = fs::File::create(output_jar_path)?;
     let mut zip_writer = ZipWriter::new(output_file);
@@ -123,27 +141,68 @@ fn create_jar(
         .compression_method(CompressionMethod::DEFLATE)
         .unix_permissions(0o644);
 
-    // Create META-INF/MANIFEST.MF with the appropriate Main-Class.
+    // Create META-INF/MANIFEST.MF
     let manifest_content = create_manifest_content(main_class_name);
     zip_writer.start_file("META-INF/MANIFEST.MF", options)?;
     zip_writer.write_all(manifest_content.as_bytes())?;
 
-    // Regex to match file names with a -randomnumbers suffix.
     let re = Regex::new(r"^(.*?)-[0-9a-f]+(\.class)$").unwrap();
 
-    for input_file in input_files {
-        let path = Path::new(input_file);
-        let original_file_name = path.file_name().unwrap().to_str().unwrap();
-        // Remove the random numbers suffix if it exists.
-        let file_name = if let Some(caps) = re.captures(original_file_name) {
+    for input_file_path_str in input_files {
+        let input_path = Path::new(input_file_path_str);
+        let original_file_name = input_path.file_name()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("Invalid input path: {}", input_file_path_str)))?
+            .to_str()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Input filename is not valid UTF-8"))?;
+
+        let jar_entry_name = if let Some(caps) = re.captures(original_file_name) {
             format!("{}{}", &caps[1], &caps[2])
         } else {
             original_file_name.to_string()
         };
 
-        let data = fs::read(input_file)?;
-        zip_writer.start_file(file_name, options)?;
-        zip_writer.write_all(&data)?;
+        let file_data_to_add: Vec<u8>;
+        let mut _temp_file_handle: Option<NamedTempFile> = None;
+
+        if input_file_path_str.ends_with(".class") {
+            println!("Processing class file: {}", input_file_path_str);
+
+            let file_data = if let Some(processor_path) = processor_jar_path {
+                let temp_out_file = NamedTempFile::new()?;
+                let temp_out_path = temp_out_file.path().to_path_buf();
+
+                let mut cmd = Command::new("java");
+                cmd.arg("-jar")
+                   .arg(processor_path)
+                   .arg(input_file_path_str)
+                   .arg(&temp_out_path);
+
+                println!("Running processor: {:?}", cmd);
+                let output = cmd.output()?;
+
+                if !output.status.success() {
+                    eprintln!("Error processing file: {}", input_file_path_str);
+                    eprintln!("Processor STDOUT:\n{}", String::from_utf8_lossy(&output.stdout));
+                    eprintln!("Processor STDERR:\n{}", String::from_utf8_lossy(&output.stderr));
+                    return Err(io::Error::new(io::ErrorKind::Other, "ASM processor failed"));
+                }
+
+                let processed_data = fs::read(&temp_out_path)?;
+                _temp_file_handle = Some(temp_out_file);
+                processed_data
+            } else {
+                fs::read(input_file_path_str)?
+            };
+
+            file_data_to_add = file_data;
+            println!("Successfully processed: {}", input_file_path_str);
+        } else {
+            println!("Skipping non-class file: {}", input_file_path_str);
+            continue;
+        }
+
+        zip_writer.start_file(&jar_entry_name, options)?;
+        zip_writer.write_all(&file_data_to_add)?;
     }
 
     zip_writer.finish()?;

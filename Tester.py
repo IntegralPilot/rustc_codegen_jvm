@@ -2,6 +2,7 @@
 import os
 import subprocess
 import sys
+import argparse
 
 def read_from_file(path: str) -> str:
     with open(path, "r") as f:
@@ -19,7 +20,7 @@ def write_to_file(path: str, content: str):
     with open(path, "w") as f:
         f.write(content)
 
-def process_test(test_dir: str):
+def process_test(test_dir: str, release_mode: bool):
     test_name = os.path.basename(test_dir)
     normalized = normalize_name(test_name)
     print(f"|-- Test '{test_name}' ({normalized})")
@@ -36,14 +37,14 @@ def process_test(test_dir: str):
 
     # Run cargo build.
     print("|--- ⚒️ Building with Cargo...")
-    # see if the file no_jvm_target.flag exists in the test directory
+    build_cmd = ["cargo", "build", "--release"] if release_mode else ["cargo", "build"]
     no_jvm_target = os.path.join(test_dir, "no_jvm_target.flag")
     if os.path.exists(no_jvm_target):
         print("|---- ⚠️ Skipping JVM target build due to no_jvm_target.flag")
-        proc = run_command(["cargo", "build"], cwd=test_dir)
     else:
         print("|---- 🛠️ Building with JVM target...")
-        proc = run_command(["cargo", "build", "--target", "../../../jvm-unknown-unknown.json"], cwd=test_dir)
+        build_cmd.extend(["--target", "../../../jvm-unknown-unknown.json"])
+    proc = run_command(build_cmd, cwd=test_dir)
     if proc.returncode != 0:
         fail_path = os.path.join(test_dir, "cargo-build-fail.generated")
         output = f"STDOUT:\n{proc.stdout}\n\nSTDERR:\n{proc.stderr}"
@@ -53,26 +54,22 @@ def process_test(test_dir: str):
 
     # Run java with the generated jar.
     print("|--- 🤖 Running with Java...")
-    # if no_jvm_target flag is set, we first need to move target/debug/deps/{test_name}-{hash}.jar to target/jvm-unknown-unknown/debug/{test_name}.jar
-    # we might need to make the directory first
+    target_dir = "release" if release_mode else "debug"
     if os.path.exists(no_jvm_target):
         print("|---- ⚠️ Doing some needed moving around due to no_jvm_target.flag")
-        # move the jar file to the target/jvm-unknown-unknown/debug directory
-        jar_path = os.path.join(test_dir, "target", "debug", "deps", f"{test_name}-*.jar")
-        # find the jar file
+        jar_path = os.path.join(test_dir, "target", target_dir, "deps", f"{test_name}-*.jar")
         jar_file = None
-        for file in os.listdir(os.path.join(test_dir, "target", "debug", "deps")):
+        for file in os.listdir(os.path.join(test_dir, "target", target_dir, "deps")):
             if file.startswith(test_name) and file.endswith(".jar"):
                 jar_file = file
                 break
         if jar_file is None:
-            print("|---- ❌ No jar file found in target/debug/deps")
+            print("|---- ❌ No jar file found in target/{target_dir}/deps")
             return False
-        # move the file
-        os.makedirs(os.path.join(test_dir, "target", "jvm-unknown-unknown", "debug"), exist_ok=True)
-        os.rename(os.path.join(test_dir, "target", "debug", "deps", jar_file), os.path.join(test_dir, "target", "jvm-unknown-unknown", "debug", f"{test_name}.jar"))
-    jar_path = os.path.join(test_dir, "target", "jvm-unknown-unknown", "debug", f"{test_name}.jar")
-    proc = run_command(["java", "-jar", jar_path])
+        os.makedirs(os.path.join(test_dir, "target", "jvm-unknown-unknown", target_dir), exist_ok=True)
+        os.rename(os.path.join(test_dir, "target", target_dir, "deps", jar_file), os.path.join(test_dir, "target", "jvm-unknown-unknown", target_dir, f"{test_name}.jar"))
+    jar_path = os.path.join(test_dir, "target", "jvm-unknown-unknown", target_dir, f"{test_name}.jar")
+    proc = run_command(["java", "-jar", jar_path]) 
     if proc.returncode != 0:
         fail_path = os.path.join(test_dir, "java-fail.generated")
         output = f"STDOUT:\n{proc.stdout}\n\nSTDERR:\n{proc.stderr}"
@@ -100,8 +97,15 @@ def process_test(test_dir: str):
     return True
 
 def main():
+    parser = argparse.ArgumentParser(description="Tester for Rustc's JVM Codegen Backend")
+    parser.add_argument("--release", action="store_true", help="Run cargo in release mode")
+    args = parser.parse_args()
+
     print("🧪 Tester for Rustc's JVM Codegen Backend started!")
     overall_success = True
+
+    if args.release:
+        print("|- ⚒️ Running in release mode")
 
     print(" ")
 
@@ -113,7 +117,7 @@ def main():
         binary_tests = []
     print(f"|- 📦 Running {len(binary_tests)} binary build tests...")
     for idx, test_dir in enumerate(binary_tests):
-        if not process_test(test_dir):
+        if not process_test(test_dir, args.release):
             overall_success = False
 
     print("")

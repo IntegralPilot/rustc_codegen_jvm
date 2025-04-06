@@ -532,44 +532,208 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             OI::Rem { dest, op1, op2 } => self.translate_binary_op(dest, op1, op2, &default_type, JI::Irem)?,
 
             OI::AddWithOverflow { dest, op1, op2 } => {
-                // Load operands onto the stack
+                let base_label = format!("_add_ovf_{}", self.jvm_instructions.len());
+                let label_check_neg = format!("{}_check_neg", base_label);
+                let label_overflow_true = format!("{}_overflow_true", base_label);
+                let label_no_overflow = format!("{}_no_overflow", base_label);
+                let label_end = format!("{}_end", base_label);
+
+                let result_var = format!("{}_result", dest);
+                let overflow_var = format!("{}_overflow", dest);
+
+                // Load operands (a, b) and store temporarily
                 self.load_operand(op1, &default_type)?;
                 self.load_operand(op2, &default_type)?;
+                let b_tmp_idx = self.get_or_assign_local(&format!("{}_b_tmp", dest), &default_type);
+                self.jvm_instructions.push(Self::get_store_instruction(&default_type, b_tmp_idx)?);
+                let a_tmp_idx = self.get_or_assign_local(&format!("{}_a_tmp", dest), &default_type);
+                self.jvm_instructions.push(Self::get_store_instruction(&default_type, a_tmp_idx)?); // stack: []
 
-                // Perform the addition
+                // --- Check Positive Overflow ---
+                self.jvm_instructions.push(Self::get_load_instruction(&default_type, a_tmp_idx)?); // stack: [a]
+                self.jvm_instructions.push(JI::Ifle(0)); // Consumes a. stack: []
+                self.branch_fixups.push((self.jvm_instructions.len() - 1, label_check_neg.clone()));
+
+                self.jvm_instructions.push(Self::get_load_instruction(&default_type, b_tmp_idx)?); // stack: [b]
+                self.jvm_instructions.push(JI::Ifle(0)); // Consumes b. stack: []
+                self.branch_fixups.push((self.jvm_instructions.len() - 1, label_check_neg.clone()));
+
+                // Now a > 0, b > 0. Check if b > MAX - a
+                // ** Reload b and a **
+                self.jvm_instructions.push(Self::get_load_instruction(&default_type, b_tmp_idx)?); // stack: [b]
+                let int_const_instr = Self::get_int_const_instr(self, i32::MAX);
+                self.jvm_instructions.push(int_const_instr); // stack: [b, MAX]
+                self.jvm_instructions.push(Self::get_load_instruction(&default_type, a_tmp_idx)?); // stack: [b, MAX, a]
+                self.jvm_instructions.push(JI::Isub); // stack: [b, MAX - a]
+                self.jvm_instructions.push(JI::If_icmpgt(0)); // Consumes both. stack: []
+                self.branch_fixups.push((self.jvm_instructions.len() - 1, label_overflow_true.clone()));
+
+                self.jvm_instructions.push(JI::Goto(0));
+                self.branch_fixups.push((self.jvm_instructions.len() - 1, label_check_neg.clone()));
+
+                // --- Check Negative Overflow ---
+                let check_neg_idx = self.jvm_instructions.len();
+                self.label_to_instr_index.insert(label_check_neg.clone(), check_neg_idx as u16); // stack: []
+                self.jvm_instructions.push(Self::get_load_instruction(&default_type, a_tmp_idx)?); // stack: [a]
+                self.jvm_instructions.push(JI::Ifge(0)); // Consumes a. stack: []
+                self.branch_fixups.push((self.jvm_instructions.len() - 1, label_no_overflow.clone()));
+
+                self.jvm_instructions.push(Self::get_load_instruction(&default_type, b_tmp_idx)?); // stack: [b]
+                self.jvm_instructions.push(JI::Ifge(0)); // Consumes b. stack: []
+                self.branch_fixups.push((self.jvm_instructions.len() - 1, label_no_overflow.clone()));
+
+                // Now a < 0, b < 0. Check if b < MIN - a
+                // ** Reload b and a **
+                self.jvm_instructions.push(Self::get_load_instruction(&default_type, b_tmp_idx)?); // stack: [b]
+                let int_const_instr = Self::get_int_const_instr(self, i32::MIN);
+                self.jvm_instructions.push(int_const_instr); // stack: [b, MIN]
+                self.jvm_instructions.push(Self::get_load_instruction(&default_type, a_tmp_idx)?); // stack: [b, MIN, a]
+                self.jvm_instructions.push(JI::Isub); // stack: [b, MIN - a]
+                self.jvm_instructions.push(JI::If_icmplt(0)); // Consumes both. stack: []
+                self.branch_fixups.push((self.jvm_instructions.len() - 1, label_overflow_true.clone()));
+
+                self.jvm_instructions.push(JI::Goto(0));
+                self.branch_fixups.push((self.jvm_instructions.len() - 1, label_no_overflow.clone()));
+
+                // --- Overflow True Path ---
+                let overflow_true_idx = self.jvm_instructions.len();
+                self.label_to_instr_index.insert(label_overflow_true.clone(), overflow_true_idx as u16); // stack: []
+                self.jvm_instructions.push(JI::Iconst_1); // stack: [1]
+                self.store_result(&overflow_var, &oomir::Type::Boolean)?; // stack: []
+                self.jvm_instructions.push(JI::Goto(0));
+                self.branch_fixups.push((self.jvm_instructions.len() - 1, label_end.clone()));
+
+                // --- No Overflow Path ---
+                let no_overflow_idx = self.jvm_instructions.len();
+                self.label_to_instr_index.insert(label_no_overflow.clone(), no_overflow_idx as u16); // stack: []
+                self.jvm_instructions.push(JI::Iconst_0); // stack: [0]
+                self.store_result(&overflow_var, &oomir::Type::Boolean)?; // stack: []
+                // Fallthrough
+
+                // --- Perform Addition and Store Result (Common Path) ---
+                let end_idx = self.jvm_instructions.len();
+                self.label_to_instr_index.insert(label_end.clone(), end_idx as u16); // stack: []
+                self.jvm_instructions.push(Self::get_load_instruction(&default_type, a_tmp_idx)?);
+                self.jvm_instructions.push(Self::get_load_instruction(&default_type, b_tmp_idx)?);
                 self.jvm_instructions.push(JI::Iadd);
+                self.store_result(&result_var, &default_type)?; // stack: []
+            }
 
-                // Store the result in a tuple (result, overflow flag)
+            // --- Corrected SubWithOverflow ---
+            OI::SubWithOverflow { dest, op1, op2 } => {
+                let base_label = format!("_sub_ovf_{}", self.jvm_instructions.len());
+                let label_b_is_min = format!("{}_b_is_min", base_label);
+                let label_b_not_min = format!("{}_b_not_min", base_label); // Added for clarity, might optimize later
+                let label_check_neg_pos = format!("{}_check_neg_pos", base_label);
+                let label_overflow_true = format!("{}_overflow_true", base_label);
+                let label_no_overflow = format!("{}_no_overflow", base_label);
+                let label_end = format!("{}_end", base_label);
+
                 let result_var = format!("{}_result", dest);
                 let overflow_var = format!("{}_overflow", dest);
 
-                // Store the result in the result variable
-                self.store_result(&result_var, &default_type)?;
-
-                // Simulate overflow flag (always false for now, as JVM does not natively support overflow detection)
-                self.jvm_instructions.push(JI::Iconst_0); // Push false (0) for overflow flag
-                self.store_result(&overflow_var, &oomir::Type::Boolean)?;
-            },
-            OI::SubWithOverflow { dest, op1, op2 } => {
-                // Load operands onto the stack
+                // Load operands (a, b) and store temporarily
                 self.load_operand(op1, &default_type)?;
                 self.load_operand(op2, &default_type)?;
+                let b_tmp_idx = self.get_or_assign_local(&format!("{}_b_tmp", dest), &default_type);
+                self.jvm_instructions.push(Self::get_store_instruction(&default_type, b_tmp_idx)?);
+                let a_tmp_idx = self.get_or_assign_local(&format!("{}_a_tmp", dest), &default_type);
+                self.jvm_instructions.push(Self::get_store_instruction(&default_type, a_tmp_idx)?); // stack: []
 
-                // Perform the subtraction
+                // --- Check Case 1: b == MIN? ---
+                self.jvm_instructions.push(Self::get_load_instruction(&default_type, b_tmp_idx)?); // stack: [b]
+                let int_const_instr = Self::get_int_const_instr(self, i32::MIN);
+                self.jvm_instructions.push(int_const_instr); // stack: [b, MIN]
+                self.jvm_instructions.push(JI::If_icmpeq(0)); // Consumes both. stack: []
+                self.branch_fixups.push((self.jvm_instructions.len() - 1, label_b_is_min.clone()));
+                // Fallthrough if b != MIN, stack: []
+
+                // Label for b != MIN path (might not strictly be needed if fallthrough is obvious)
+                let b_not_min_idx = self.jvm_instructions.len();
+                self.label_to_instr_index.insert(label_b_not_min.clone(), b_not_min_idx as u16);
+
+                // --- Case 2: b != MIN ---
+                // Check Pos - Neg: a > 0 && b < 0?
+                self.jvm_instructions.push(Self::get_load_instruction(&default_type, a_tmp_idx)?); // stack: [a]
+                self.jvm_instructions.push(JI::Ifle(0)); // Consumes a. stack: []
+                self.branch_fixups.push((self.jvm_instructions.len() - 1, label_check_neg_pos.clone()));
+
+                self.jvm_instructions.push(Self::get_load_instruction(&default_type, b_tmp_idx)?); // stack: [b]
+                self.jvm_instructions.push(JI::Ifge(0)); // Consumes b. stack: []
+                self.branch_fixups.push((self.jvm_instructions.len() - 1, label_check_neg_pos.clone()));
+
+                // Now a > 0, b < 0. Check if a > MAX + b
+                // ** Reload a and b **
+                self.jvm_instructions.push(Self::get_load_instruction(&default_type, a_tmp_idx)?); // stack: [a]
+                let int_const_instr = Self::get_int_const_instr(self, i32::MAX);
+                self.jvm_instructions.push(int_const_instr); // stack: [a, MAX]
+                self.jvm_instructions.push(Self::get_load_instruction(&default_type, b_tmp_idx)?); // stack: [a, MAX, b]
+                self.jvm_instructions.push(JI::Iadd); // stack: [a, MAX + b]
+                self.jvm_instructions.push(JI::If_icmpgt(0)); // Consumes both. stack: []
+                self.branch_fixups.push((self.jvm_instructions.len() - 1, label_overflow_true.clone()));
+
+                self.jvm_instructions.push(JI::Goto(0)); // No overflow here, check next case
+                self.branch_fixups.push((self.jvm_instructions.len() - 1, label_check_neg_pos.clone()));
+
+                // --- Check Case 1 Handler: b == MIN ---
+                let b_is_min_idx = self.jvm_instructions.len();
+                self.label_to_instr_index.insert(label_b_is_min.clone(), b_is_min_idx as u16); // stack: []
+                self.jvm_instructions.push(Self::get_load_instruction(&default_type, a_tmp_idx)?); // stack: [a]
+                self.jvm_instructions.push(JI::Ifge(0)); // Consumes a. stack: []
+                self.branch_fixups.push((self.jvm_instructions.len() - 1, label_overflow_true.clone()));
+                 // Fallthrough if a < 0 means no overflow for b == MIN
+                self.jvm_instructions.push(JI::Goto(0));
+                self.branch_fixups.push((self.jvm_instructions.len() - 1, label_no_overflow.clone()));
+
+                // --- Check Case 2 (Cont.): Neg - Pos ---
+                let check_neg_pos_idx = self.jvm_instructions.len();
+                self.label_to_instr_index.insert(label_check_neg_pos.clone(), check_neg_pos_idx as u16); // stack: []
+                self.jvm_instructions.push(Self::get_load_instruction(&default_type, a_tmp_idx)?); // stack: [a]
+                self.jvm_instructions.push(JI::Ifge(0)); // Consumes a. stack: []
+                self.branch_fixups.push((self.jvm_instructions.len() - 1, label_no_overflow.clone()));
+
+                self.jvm_instructions.push(Self::get_load_instruction(&default_type, b_tmp_idx)?); // stack: [b]
+                self.jvm_instructions.push(JI::Ifle(0)); // Consumes b. stack: []
+                self.branch_fixups.push((self.jvm_instructions.len() - 1, label_no_overflow.clone()));
+
+                // Now a < 0, b > 0. Check if a < MIN + b
+                // ** Reload a and b **
+                self.jvm_instructions.push(Self::get_load_instruction(&default_type, a_tmp_idx)?); // stack: [a]
+                let int_const_instr = Self::get_int_const_instr(self, i32::MIN);
+                self.jvm_instructions.push(int_const_instr); // stack: [a, MIN]
+                self.jvm_instructions.push(Self::get_load_instruction(&default_type, b_tmp_idx)?); // stack: [a, MIN, b]
+                self.jvm_instructions.push(JI::Iadd); // stack: [a, MIN + b]
+                self.jvm_instructions.push(JI::If_icmplt(0)); // Consumes both. stack: []
+                self.branch_fixups.push((self.jvm_instructions.len() - 1, label_overflow_true.clone()));
+
+                // Fallthrough means no overflow for neg-pos case.
+                self.jvm_instructions.push(JI::Goto(0));
+                self.branch_fixups.push((self.jvm_instructions.len() - 1, label_no_overflow.clone()));
+
+                // --- Overflow True Path ---
+                let overflow_true_idx = self.jvm_instructions.len();
+                self.label_to_instr_index.insert(label_overflow_true.clone(), overflow_true_idx as u16); // stack: []
+                self.jvm_instructions.push(JI::Iconst_1); // stack: [1]
+                self.store_result(&overflow_var, &oomir::Type::Boolean)?; // stack: []
+                self.jvm_instructions.push(JI::Goto(0));
+                self.branch_fixups.push((self.jvm_instructions.len() - 1, label_end.clone()));
+
+                // --- No Overflow Path ---
+                let no_overflow_idx = self.jvm_instructions.len();
+                self.label_to_instr_index.insert(label_no_overflow.clone(), no_overflow_idx as u16); // stack: []
+                self.jvm_instructions.push(JI::Iconst_0); // stack: [0]
+                self.store_result(&overflow_var, &oomir::Type::Boolean)?; // stack: []
+                // Fallthrough
+
+                // --- Perform Subtraction and Store Result (Common Path) ---
+                let end_idx = self.jvm_instructions.len();
+                self.label_to_instr_index.insert(label_end.clone(), end_idx as u16); // stack: []
+                self.jvm_instructions.push(Self::get_load_instruction(&default_type, a_tmp_idx)?);
+                self.jvm_instructions.push(Self::get_load_instruction(&default_type, b_tmp_idx)?);
                 self.jvm_instructions.push(JI::Isub);
-
-                // Store the result in a tuple (result, overflow flag)
-                let result_var = format!("{}_result", dest);
-                let overflow_var = format!("{}_overflow", dest);
-
-                // Store the result in the result variable
-                self.store_result(&result_var, &default_type)?;
-
-                // Simulate overflow flag (always false for now, as JVM does not natively support overflow detection)
-                self.jvm_instructions.push(JI::Iconst_0); // Push false (0) for overflow flag
-                self.store_result(&overflow_var, &oomir::Type::Boolean)?;
-            },
-
+                self.store_result(&result_var, &default_type)?; // stack: []
+            }
+                        
             // --- Comparisons ---
             // Need to handle operand types (int, long, float, double, ref)
             OI::Eq { dest, op1, op2 } => self.translate_comparison_op(dest, op1, op2, &default_type, JI::If_icmpeq)?,
@@ -809,8 +973,7 @@ pub fn oomir_to_jvm_bytecode(
     }
 
     let mut class_file = ClassFile {
-        // Java 6 so we don't need stack map tables! :)
-        version: Version::Java6 { minor: 0 },
+        version: Version::Java8 { minor: 0 },
         constant_pool, // Will be moved
         access_flags: ClassAccessFlags::PUBLIC | ClassAccessFlags::SUPER,
         this_class: this_class_index,
