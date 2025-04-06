@@ -67,7 +67,17 @@ pub enum Instruction {
         op1: Operand,
         op2: Operand,
     },
+    AddWithOverflow {
+        dest: String,
+        op1: Operand,
+        op2: Operand,
+    },
     Sub {
+        dest: String,
+        op1: Operand,
+        op2: Operand,
+    },
+    SubWithOverflow {
         dest: String,
         op1: Operand,
         op2: Operand,
@@ -172,6 +182,13 @@ pub enum Instruction {
         dest: String,
         src: Operand, // Source operand (could be Variable or Constant, though in this context, it's likely Variable)
     },
+    Throw {
+        exception: Operand, // Exception to throw
+    },
+    ThrowNewWithMessage {
+        exception_class: String, // e.g., "java/lang/RuntimeException"
+        message: String,         // The message from the panic/assert
+    },
 }
 
 
@@ -196,7 +213,7 @@ pub enum Constant {
     Boolean(bool),
     Char(char),
     String(String),
-    // Add more constant types as needed (e.g., String, Bool, etc.)
+    Class(String), 
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

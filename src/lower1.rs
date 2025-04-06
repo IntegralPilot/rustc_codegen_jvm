@@ -148,6 +148,7 @@ fn convert_basic_block<'tcx>(
     bb_data: &BasicBlockData<'tcx>,
     tcx: TyCtxt<'tcx>,
     return_oomir_type: &oomir::Type, // Pass function return type
+    basic_blocks: &mut HashMap<String, oomir::BasicBlock>,
 ) -> oomir::BasicBlock {
     // Use the basic block index as its label.
     let label = format!("bb{}", bb.index());
@@ -162,7 +163,6 @@ fn convert_basic_block<'tcx>(
                     let oomir_op1 = convert_operand(op1, tcx);
                     let oomir_op2 = convert_operand(op2, tcx);
 
-                    // --- MODIFICATION FOR CHECKED OPS ---
                     match bin_op {
                         // Non-checked ops remain the same
                         BinOp::Add => instructions.push(oomir::Instruction::Add { dest, op1: oomir_op1, op2: oomir_op2 }),
@@ -173,19 +173,46 @@ fn convert_basic_block<'tcx>(
                         BinOp::Rem => {
                             instructions.push(oomir::Instruction::Rem { dest, op1: oomir_op1, op2: oomir_op2 });
                         }
-                        // Checked ops: Generate the standard op, implicitly discarding overflow flag.
-                        // The `dest` variable will now only hold the integer result, not the tuple.
+                        // Checked ops: Generate a tuple with result and overflow flag
                         BinOp::AddWithOverflow => {
-                            println!("Info: Mapping AddWithOverflow to simple Add, discarding overflow flag. Dest '{}' holds i32 result.", dest);
-                            instructions.push(oomir::Instruction::Add { dest, op1: oomir_op1, op2: oomir_op2 });
-                        }
-                         BinOp::SubWithOverflow => {
-                            println!("Info: Mapping SubWithOverflow to simple Sub, discarding overflow flag. Dest '{}' holds i32 result.", dest);
-                            instructions.push(oomir::Instruction::Sub { dest, op1: oomir_op1, op2: oomir_op2 });
-                         }
-                         BinOp::MulWithOverflow => {
-                            println!("Info: Mapping MulWithOverflow to simple Mul, discarding overflow flag. Dest '{}' holds i32 result.", dest);
-                            instructions.push(oomir::Instruction::Mul { dest, op1: oomir_op1, op2: oomir_op2 });
+                            let tuple_dest = format!("{}_tuple", dest);
+                            instructions.push(oomir::Instruction::AddWithOverflow {
+                                dest: tuple_dest.clone(),
+                                op1: oomir_op1,
+                                op2: oomir_op2,
+                            });
+
+                            // Split the tuple into result and overflow flag
+                            let result_dest = format!("{}_result", tuple_dest);
+                            let overflow_dest = format!("{}_overflow", tuple_dest);
+                            instructions.push(oomir::Instruction::Move {
+                                src: oomir::Operand::Variable(result_dest.clone()),
+                                dest: format!("{}.0", dest),
+                            });
+                            instructions.push(oomir::Instruction::Move {
+                                src: oomir::Operand::Variable(overflow_dest.clone()),
+                                dest: format!("{}.1", dest),
+                            });
+                        },
+                        BinOp::SubWithOverflow => {
+                            let tuple_dest = format!("{}_tuple", dest);
+                            instructions.push(oomir::Instruction::SubWithOverflow {
+                                dest: tuple_dest.clone(),
+                                op1: oomir_op1,
+                                op2: oomir_op2,
+                            });
+
+                            // Split the tuple into result and overflow flag
+                            let result_dest = format!("{}_result", tuple_dest);
+                            let overflow_dest = format!("{}_overflow", tuple_dest);
+                            instructions.push(oomir::Instruction::Move {
+                                src: oomir::Operand::Variable(result_dest.clone()),
+                                dest: format!("{}.0", dest),
+                            });
+                            instructions.push(oomir::Instruction::Move {
+                                src: oomir::Operand::Variable(overflow_dest.clone()),
+                                dest: format!("{}.1", dest),
+                            });
                         }
                         // Default case for other binary ops
                          _ => {
@@ -198,31 +225,56 @@ fn convert_basic_block<'tcx>(
                     // Convert the MIR operand (_1, constant, _7.0, etc.)
                     let mut src_oomir_operand = convert_operand(mir_operand, tcx);
 
-                    println!("Info: Converting Rvalue::Use to OOMIR operand: {:?}", src_oomir_operand);
-
                     // Check if the *source* operand is a variable that looks like a tuple field access
                     if let oomir::Operand::Variable(ref src_name) = src_oomir_operand {
-                        println!("Info: Source operand is a variable: {}", src_name);
-                        // Check common tuple field projections explicitly
-                        if src_name.ends_with(".0") || src_name.ends_with(".1") {
-                            // Extract the base variable name (e.g., "_7" from "_7.0")
-                            if let Some((base_var, _)) = src_name.rsplit_once('.') {
-                                 println!("Info: Adjusting Rvalue::Use source operand {} to base {} for Move instruction to dest '{}'.", src_name, base_var, dest);
-                                 // Replace the operand with one using just the base name
-                                 src_oomir_operand = oomir::Operand::Variable(base_var.to_string());
-                             } else {
-                                 println!("Warning: Failed to extract base variable from tuple field access: {}", src_name);
-                             }
-                         } else {
-                            println!("Info: Source operand is a variable, but not a tuple field access: {}", src_name);
-                         }
-                     } else {
-                            println!("Warning: Unhandled source operand type {:?}", src_oomir_operand);
-                     }
+                        if src_name.contains('.') {
+                            // Handle tuple projections (e.g., _7.0, _7.1)
+                            if let Some((base_var, field)) = src_name.split_once('.') {
+                                let projection_var = format!("{}_proj_{}", base_var, field);
+                                instructions.push(oomir::Instruction::Move {
+                                    dest: projection_var.clone(),
+                                    src: oomir::Operand::Variable(src_name.clone()),
+                                });
+                                src_oomir_operand = oomir::Operand::Variable(projection_var);
+                            }
+                        }
+                    }
 
                     // Generate the OOMIR Move instruction with the (potentially adjusted) source
                     instructions.push(oomir::Instruction::Move { dest: dest.clone(), src: src_oomir_operand });
-                }               
+                }
+                Rvalue::Aggregate(box kind, operands) => {
+                    match kind {
+                        rustc_middle::mir::AggregateKind::Tuple => {
+                            // 'dest' here is the name of the tuple itself (e.g., "_2")
+                            // We need to define its fields.
+                            if operands.len() > 2 {
+                                println!("Warning: Tuple aggregate with >2 fields not fully handled: {}", dest);
+                            }
+                            for (i, mir_op) in operands.iter().enumerate() {
+                                // Define the field variable name (e.g., "_2.0")
+                                let field_dest = format!("{}.{}", dest, i);
+                                let field_src = convert_operand(mir_op, tcx);
+                                // Generate a Move to define the field variable
+                                instructions.push(oomir::Instruction::Move {
+                                    dest: field_dest,
+                                    src: field_src,
+                                });
+                            }
+                            // We might not need an explicit instruction for the tuple 'dest' itself
+                            // if we only ever access its fields directly via the ".N" names.
+                        }
+                        _ => {
+                            println!("Warning: Unhandled aggregate kind {:?} for dest {}", kind, dest);
+                            // Assign a default/dummy value? Might cause issues later.
+                            // For now, maybe push a placeholder move:
+                             instructions.push(oomir::Instruction::Move {
+                                 dest: dest.clone(),
+                                 src: oomir::Operand::Constant(oomir::Constant::I32(0)), // Placeholder!
+                             });
+                        }
+                    }
+                }
                 _ => {
                     println!("Warning: Unhandled rvalue {:?}", rvalue);
                 }
@@ -326,14 +378,44 @@ fn convert_basic_block<'tcx>(
                     println!("Info: Call in bb{} has no return target (diverges).", bb.index());
                 }
             }
-            TerminatorKind::Assert { target, cond: _, expected: _, msg: _, unwind: _ } => {
-                // Instead of ignoring, treat it as an unconditional jump to the success path `target`.
-                // This ignores the assertion check itself but preserves the essential control flow.
-                let target_label = format!("bb{}", target.index());
-                println!("Info: Treating Assert Terminator in bb{} as unconditional jump to {}", bb.index(), target_label);
-                instructions.push(oomir::Instruction::Jump { target: target_label });
-                // NOTE: The assertion condition (`cond`) might have been computed in a previous statement
-                // (e.g., _3 = Eq(...)). That statement still exists, but the Branch/Assert based on it is replaced by Jump.
+            TerminatorKind::Assert { target, cond, expected, msg, unwind: _ } => {
+                // Convert the condition operand
+                let condition = convert_operand(cond, tcx);
+
+                // Generate a comparison instruction to check if the condition matches the expected value
+                let comparison_dest = format!("assert_cmp_{}", bb.index());
+                instructions.push(oomir::Instruction::Eq {
+                    dest: comparison_dest.clone(),
+                    op1: condition,
+                    op2: oomir::Operand::Constant(oomir::Constant::Boolean(*expected)),
+                });
+
+                // Generate a branch based on the comparison result
+                let true_block = format!("bb{}", target.index()); // Success path
+                let false_block = format!("assert_fail_{}", bb.index()); // Failure path label
+                instructions.push(oomir::Instruction::Branch {
+                    condition: oomir::Operand::Variable(comparison_dest),
+                    true_block, // Jump here if assertion holds (cond == expected)
+                    false_block: false_block.clone(), // Jump here if assertion fails
+                });
+
+                // Add a new basic block for the assertion failure (panic)
+                let fail_instructions = vec![
+                    oomir::Instruction::ThrowNewWithMessage {
+                        // For now, hardcode RuntimeException. Could be configurable later.
+                        exception_class: "java/lang/RuntimeException".to_string(),
+                        // Extract the format string as the message.
+                        // TODO: Handle msg.args() for formatted messages later.
+                        message: format!("{:?}", msg),
+                    },
+                ];
+                basic_blocks.insert( // Ensure 'basic_blocks' map is mutable and passed in
+                    false_block.clone(),
+                    oomir::BasicBlock {
+                        label: false_block,
+                        instructions: fail_instructions,
+                    },
+                );
             }
             // Other terminator kinds (like Resume, etc.) can be added as needed.
             _ => {
@@ -392,7 +474,7 @@ pub fn mir_to_oomir<'tcx>(
     let entry_label = "bb0".to_string();
 
     for (bb, bb_data) in mir.basic_blocks_mut().iter_enumerated() {
-        let bb_ir = convert_basic_block(bb, bb_data, tcx, &return_oomir_ty); // Pass return type here
+        let bb_ir = convert_basic_block(bb, bb_data, tcx, &return_oomir_ty, &mut basic_blocks); // Pass return type here
         basic_blocks.insert(bb_ir.label.clone(), bb_ir);
     }
 

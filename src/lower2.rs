@@ -251,18 +251,18 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         use jvm::attributes::Instruction as JI;
 
         let instr = match constant {
-            OC::I8(v) => Self::get_int_const_instr(*v as i32),
-            OC::I16(v) => Self::get_int_const_instr(*v as i32),
-            OC::I32(v) => Self::get_int_const_instr(*v),
+            OC::I8(v) => Self::get_int_const_instr(self,*v as i32),
+            OC::I16(v) => Self::get_int_const_instr(self,*v as i32),
+            OC::I32(v) => Self::get_int_const_instr(self,*v),
             OC::I64(v) => Self::get_long_const_instr(*v),
-            OC::U8(v) => Self::get_int_const_instr(*v as i32), // Treat as signed int
-            OC::U16(v) => Self::get_int_const_instr(*v as i32), // Treat as signed int
-            OC::U32(v) => Self::get_int_const_instr(*v as i32), // Treat as signed int
+            OC::U8(v) => Self::get_int_const_instr(self, *v as i32), // Treat as signed int
+            OC::U16(v) => Self::get_int_const_instr(self,*v as i32), // Treat as signed int
+            OC::U32(v) => Self::get_int_const_instr(self,*v as i32), // Treat as signed int
             OC::U64(v) => Self::get_long_const_instr(*v as i64), // Treat as signed long
             OC::F32(v) => Self::get_float_const_instr(*v),
             OC::F64(v) => Self::get_double_const_instr(*v),
             OC::Boolean(v) => if *v { JI::Iconst_1 } else { JI::Iconst_0 },
-            OC::Char(v) => Self::get_int_const_instr(*v as i32), // Char treated as int
+            OC::Char(v) => Self::get_int_const_instr(self,*v as i32), // Char treated as int
             OC::String(s) => {
                 let index = self.constant_pool.add_string(s)?;
                 if let Ok(idx8) = u8::try_from(index) {
@@ -270,7 +270,15 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 } else {
                     JI::Ldc_w(index)
                 }
-            }
+            },
+            OC::Class(c) => {
+                let index = self.constant_pool.add_class(c)?;
+                if let Ok(idx8) = u8::try_from(index) {
+                    JI::Ldc(idx8)
+                } else {
+                    JI::Ldc_w(index)
+                }
+            },
          };
          self.jvm_instructions.push(instr.clone());
          // Handle Ldc2_w for long/double constants loaded via LDC
@@ -290,7 +298,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
     }
 
     // Helper to get the appropriate integer constant loading instruction
-    fn get_int_const_instr(val: i32) -> Instruction {
+    fn get_int_const_instr(&mut self, val: i32) -> Instruction {
         match val {
             // Direct iconst mapping
             -1 => Instruction::Iconst_m1,
@@ -307,26 +315,14 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             // Sipush range (-32768 to 32767), excluding the bipush range
             v @ -32768..=-129 | v @ 128..=32767 => Instruction::Sipush(v as i16),
 
-            // --- Fallback with Clamping ---
-            // Values outside the -32768 to 32767 range
-            mut v => { // Make v mutable for potential clamping
-                let original_val = v; // Store original value for warning message
-
-                if v > i16::MAX as i32 {
-                    println!(
-                        "Warning: Integer constant {} is outside sipush range (> {}). Clamping to {}. LDC support not implemented.",
-                        original_val, i16::MAX, i16::MAX
-                    );
-                    v = i16::MAX as i32; // Clamp down to max i16
-                } else { // v must be < i16::MIN
-                    println!(
-                        "Warning: Integer constant {} is outside sipush range (< {}). Clamping to {}. LDC support not implemented.",
-                        original_val, i16::MIN, i16::MIN
-                    );
-                    v = i16::MIN as i32; // Clamp up to min i16
+            // Use LDC for values outside the -32768 to 32767 range
+            v => {
+                let index = self.constant_pool.add_integer(v).expect("Failed to add integer to constant pool");
+                if let Ok(idx8) = u8::try_from(index) {
+                    Instruction::Ldc(idx8)
+                } else {
+                    Instruction::Ldc_w(index)
                 }
-                // Use sipush with the clamped value
-                Instruction::Sipush(v as i16)
             }
         }
     }
@@ -524,6 +520,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                      oomir::Constant::Boolean(_) => oomir::Type::Boolean,
                      oomir::Constant::Char(_) => oomir::Type::Char,
                      oomir::Constant::String(_) => oomir::Type::String,
+                     oomir::Constant::Class(name) => oomir::Type::Class(name.clone()),
                 };
                 self.load_constant(value)?;
                 self.store_result(dest, &ty)?;
@@ -533,6 +530,45 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             OI::Mul { dest, op1, op2 } => self.translate_binary_op(dest, op1, op2, &default_type, JI::Imul)?,
             OI::Div { dest, op1, op2 } => self.translate_binary_op(dest, op1, op2, &default_type, JI::Idiv)?, // Handle division by zero?
             OI::Rem { dest, op1, op2 } => self.translate_binary_op(dest, op1, op2, &default_type, JI::Irem)?,
+
+            OI::AddWithOverflow { dest, op1, op2 } => {
+                // Load operands onto the stack
+                self.load_operand(op1, &default_type)?;
+                self.load_operand(op2, &default_type)?;
+
+                // Perform the addition
+                self.jvm_instructions.push(JI::Iadd);
+
+                // Store the result in a tuple (result, overflow flag)
+                let result_var = format!("{}_result", dest);
+                let overflow_var = format!("{}_overflow", dest);
+
+                // Store the result in the result variable
+                self.store_result(&result_var, &default_type)?;
+
+                // Simulate overflow flag (always false for now, as JVM does not natively support overflow detection)
+                self.jvm_instructions.push(JI::Iconst_0); // Push false (0) for overflow flag
+                self.store_result(&overflow_var, &oomir::Type::Boolean)?;
+            },
+            OI::SubWithOverflow { dest, op1, op2 } => {
+                // Load operands onto the stack
+                self.load_operand(op1, &default_type)?;
+                self.load_operand(op2, &default_type)?;
+
+                // Perform the subtraction
+                self.jvm_instructions.push(JI::Isub);
+
+                // Store the result in a tuple (result, overflow flag)
+                let result_var = format!("{}_result", dest);
+                let overflow_var = format!("{}_overflow", dest);
+
+                // Store the result in the result variable
+                self.store_result(&result_var, &default_type)?;
+
+                // Simulate overflow flag (always false for now, as JVM does not natively support overflow detection)
+                self.jvm_instructions.push(JI::Iconst_0); // Push false (0) for overflow flag
+                self.store_result(&overflow_var, &oomir::Type::Boolean)?;
+            },
 
             // --- Comparisons ---
             // Need to handle operand types (int, long, float, double, ref)
@@ -675,35 +711,38 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                  // Assuming types are compatible or known. Need type info.
                 self.load_operand(src, &default_type)?;
                 self.store_result(dest, &default_type)?;
-             }
-            /*  OI::Throw { message } => {
-                 // 1. Create a new RuntimeException object
-                 let runtime_exception_class_index = self.constant_pool.add_class("java/lang/RuntimeException")?;
-                 let new_instr = JI::New(runtime_exception_class_index);
-                 self.jvm_instructions.push(new_instr);
-                 self.jvm_instructions.push(JI::Dup); // Duplicate the reference for the constructor call
+            }
+            OI::Throw { exception } => {
+                // Assuming the operand is already an exception *instance* reference
+                // TODO: Determine the correct type hint here! Assuming Object for now.
+                self.load_operand(exception, &oomir::Type::Class("java/lang/Throwable".to_string()))?;
+                self.jvm_instructions.push(JI::Athrow);
+            }
+            OI::ThrowNewWithMessage { exception_class, message } => {
+                // 1. Add necessary constants to the pool
+                let class_index = self.constant_pool.add_class(exception_class)?;
+                let string_index = self.constant_pool.add_string(message)?;
+                // Assumes a constructor like new RuntimeException(String msg)
+                let constructor_ref_index = self.constant_pool.add_method_ref(
+                    class_index,
+                    "<init>",
+                    "(Ljava/lang/String;)V", // Descriptor for constructor taking a String
+                )?;
 
-                 // 2. Load the message string onto the stack
-                 let string_const_index = self.constant_pool.add_string(message)?;
-                  if let Ok(idx8) = u8::try_from(string_const_index) {
-                    self.jvm_instructions.push(JI::Ldc(idx8));
-                  } else {
-                    self.jvm_instructions.push(JI::Ldc_w(string_const_index));
-                  }
+                // 2. Emit the bytecode sequence: new, dup, ldc(message), invokespecial, athrow
+                self.jvm_instructions.push(JI::New(class_index));
+                self.jvm_instructions.push(JI::Dup);
 
+                // Load the message string constant
+                if let Ok(idx8) = u8::try_from(string_index) {
+                     self.jvm_instructions.push(JI::Ldc(idx8));
+                } else {
+                     self.jvm_instructions.push(JI::Ldc_w(string_index));
+                 }
 
-                 // 3. Call the RuntimeException constructor <init>(String)
-                 let constructor_ref_index = self.constant_pool.add_method_ref(
-                     runtime_exception_class_index,
-                     "<init>",
-                     "(Ljava/lang/String;)V",
-                 )?;
-                 self.jvm_instructions.push(JI::Invokespecial(constructor_ref_index));
-
-                 // 4. Throw the exception
-                 self.jvm_instructions.push(JI::Athrow);
-             } */
-
+                self.jvm_instructions.push(JI::Invokespecial(constructor_ref_index));
+                self.jvm_instructions.push(JI::Athrow);
+            }
         }
         Ok(())
     }
@@ -737,7 +776,7 @@ pub fn oomir_to_jvm_bytecode(
         let descriptor_index = constant_pool.add_utf8(&function.signature.to_string())?;
 
         // Translate the function body to JVM instructions
-        let translator = FunctionTranslator::new(function, &mut constant_pool, &module.name, module);
+        let translator: FunctionTranslator<'_, '_> = FunctionTranslator::new(function, &mut constant_pool, &module.name, module);
         let (jvm_code, max_locals_val) = translator.translate()?;
 
 
