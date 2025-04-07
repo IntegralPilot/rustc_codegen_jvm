@@ -10,6 +10,7 @@
 //! Compiler backend for rustc that generates JVM bytecode, using a two-stage lowering process:
 //! MIR -> OOMIR -> JVM Bytecode.
 
+extern crate rustc_abi;
 extern crate rustc_codegen_ssa;
 extern crate rustc_data_structures;
 extern crate rustc_driver;
@@ -24,16 +25,16 @@ use rustc_codegen_ssa::{
     CodegenResults, CompiledModule, CrateInfo, ModuleKind, traits::CodegenBackend,
 };
 
-use rustc_metadata::EncodedMetadata;
 use rustc_data_structures::fx::FxIndexMap;
+use rustc_metadata::EncodedMetadata;
 use rustc_middle::dep_graph::{WorkProduct, WorkProductId};
 use rustc_middle::ty::TyCtxt;
 use rustc_session::{Session, config::OutputFilenames};
 use std::{any::Any, io::Write, path::Path, vec};
 
-mod oomir;
 mod lower1;
 mod lower2;
+mod oomir;
 
 /// An instance of our Java bytecode codegen backend.
 struct MyBackend;
@@ -84,19 +85,24 @@ impl CodegenBackend for MyBackend {
                 let oomir_function = lower1::mir_to_oomir(tcx, instance, &mut mir);
                 println!("--- Finished MIR to OOMIR Lowering for function: {i} ---");
 
-                println!("OOMIR is: {:?}", oomir_function);
-
-                oomir_module.functions.insert(oomir_function.name.clone(), oomir_function);
+                oomir_module
+                    .functions
+                    .insert(oomir_function.name.clone(), oomir_function);
             }
         }
 
         println!("OOMIR module: {:?}", oomir_module);
 
-        println!("--- Starting OOMIR to JVM Bytecode Lowering for module: {} ---", crate_name);
+        println!(
+            "--- Starting OOMIR to JVM Bytecode Lowering for module: {} ---",
+            crate_name
+        );
         let bytecode = lower2::oomir_to_jvm_bytecode(&oomir_module, tcx).unwrap();
         //let bytecode = vec![0; 1024];
-        println!("--- Finished OOMIR to JVM Bytecode Lowering for module: {} ---", crate_name);
-
+        println!(
+            "--- Finished OOMIR to JVM Bytecode Lowering for module: {} ---",
+            crate_name
+        );
 
         Box::new((
             bytecode,
@@ -116,8 +122,6 @@ impl CodegenBackend for MyBackend {
             let (bytecode, crate_name, metadata, crate_info) = *ongoing_codegen
                 .downcast::<(Vec<u8>, String, EncodedMetadata, CrateInfo)>()
                 .expect("in join_codegen: ongoing_codegen is not bytecode vector");
-
-            println!("going to write: {:?}", bytecode);
 
             let class_path = outputs.temp_path_ext("class", None);
 
@@ -171,7 +175,6 @@ use std::alloc::Layout;
 pub fn custom_alloc_error_hook(layout: Layout) {
     panic!("Memory allocation failed: {} bytes", layout.size());
 }
-
 
 struct RlibArchiveBuilder;
 impl ArchiveBuilderBuilder for RlibArchiveBuilder {

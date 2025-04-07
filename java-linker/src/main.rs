@@ -1,11 +1,11 @@
 use std::env;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Write, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use regex::Regex;
 use zip::write::{SimpleFileOptions, ZipWriter};
-use zip::CompressionMethod;
+use zip::{CompressionMethod, ZipArchive};
 use tempfile::NamedTempFile;
 
 fn main() -> Result<(), i32> {
@@ -129,6 +129,23 @@ fn find_main_classes(class_files: &[String]) -> Vec<String> {
     main_classes
 }
 
+fn process_jar_file(jar_path: &str) -> io::Result<Vec<(String, Vec<u8>)>> {
+    let jar_file = fs::File::open(jar_path)?;
+    let mut archive = ZipArchive::new(jar_file)?;
+    let mut class_files = Vec::new();
+
+    for i in 0..archive.len() {
+        let mut file = archive.by_index(i)?;
+        if file.name().ends_with(".class") {
+            let mut contents = Vec::new();
+            file.read_to_end(&mut contents)?;
+            class_files.push((file.name().to_string(), contents));
+        }
+    }
+
+    Ok(class_files)
+}
+
 fn create_jar(
     input_files: &[String],
     output_jar_path: &str,
@@ -148,61 +165,100 @@ fn create_jar(
 
     let re = Regex::new(r"^(.*?)-[0-9a-f]+(\.class)$").unwrap();
 
+    // Track all class files we've added to avoid duplicates
+    let mut added_class_files = std::collections::HashSet::new();
+
     for input_file_path_str in input_files {
-        let input_path = Path::new(input_file_path_str);
-        let original_file_name = input_path.file_name()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("Invalid input path: {}", input_file_path_str)))?
-            .to_str()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Input filename is not valid UTF-8"))?;
+        if input_file_path_str.ends_with(".jar") {
+            println!("Processing JAR file: {}", input_file_path_str);
+            let class_files = process_jar_file(input_file_path_str)?;
+            
+            for (class_path, class_data) in class_files {
+                if !added_class_files.contains(&class_path) {
+                    let processed_data = if let Some(processor_path) = processor_jar_path {
+                        let temp_out_file = NamedTempFile::new()?;
+                        let temp_in_file = NamedTempFile::new()?;
+                        fs::write(&temp_in_file, &class_data)?;
 
-        let jar_entry_name = if let Some(caps) = re.captures(original_file_name) {
-            format!("{}{}", &caps[1], &caps[2])
-        } else {
-            original_file_name.to_string()
-        };
+                        let temp_out_path = temp_out_file.path().to_path_buf();
+                        let temp_in_path = temp_in_file.path().to_path_buf();
 
-        let file_data_to_add: Vec<u8>;
-        let mut _temp_file_handle: Option<NamedTempFile> = None;
+                        let mut cmd = Command::new("java");
+                        cmd.arg("-jar")
+                           .arg(processor_path)
+                           .arg(&temp_in_path)
+                           .arg(&temp_out_path);
 
-        if input_file_path_str.ends_with(".class") {
-            println!("Processing class file: {}", input_file_path_str);
+                        println!("Running processor on {}: {:?}", class_path, cmd);
+                        let output = cmd.output()?;
 
-            let file_data = if let Some(processor_path) = processor_jar_path {
-                let temp_out_file = NamedTempFile::new()?;
-                let temp_out_path = temp_out_file.path().to_path_buf();
+                        if !output.status.success() {
+                            eprintln!("Error processing file from JAR: {}", class_path);
+                            eprintln!("Processor STDOUT:\n{}", String::from_utf8_lossy(&output.stdout));
+                            eprintln!("Processor STDERR:\n{}", String::from_utf8_lossy(&output.stderr));
+                            return Err(io::Error::new(io::ErrorKind::Other, "ASM processor failed"));
+                        }
 
-                let mut cmd = Command::new("java");
-                cmd.arg("-jar")
-                   .arg(processor_path)
-                   .arg(input_file_path_str)
-                   .arg(&temp_out_path);
+                        fs::read(&temp_out_path)?
+                    } else {
+                        class_data
+                    };
 
-                println!("Running processor: {:?}", cmd);
-                let output = cmd.output()?;
-
-                if !output.status.success() {
-                    eprintln!("Error processing file: {}", input_file_path_str);
-                    eprintln!("Processor STDOUT:\n{}", String::from_utf8_lossy(&output.stdout));
-                    eprintln!("Processor STDERR:\n{}", String::from_utf8_lossy(&output.stderr));
-                    return Err(io::Error::new(io::ErrorKind::Other, "ASM processor failed"));
+                    zip_writer.start_file(&class_path, options)?;
+                    zip_writer.write_all(&processed_data)?;
+                    added_class_files.insert(class_path.clone());
+                    println!("Added class from JAR: {}", class_path);
                 }
+            }
+        } else if input_file_path_str.ends_with(".class") {
+            let input_path = Path::new(input_file_path_str);
+            let original_file_name = input_path.file_name()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("Invalid input path: {}", input_file_path_str)))?
+                .to_str()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Input filename is not valid UTF-8"))?;
 
-                let processed_data = fs::read(&temp_out_path)?;
-                _temp_file_handle = Some(temp_out_file);
-                processed_data
+            let jar_entry_name = if let Some(caps) = re.captures(original_file_name) {
+                format!("{}{}", &caps[1], &caps[2])
             } else {
-                fs::read(input_file_path_str)?
+                original_file_name.to_string()
             };
 
-            file_data_to_add = file_data;
-            println!("Successfully processed: {}", input_file_path_str);
-        } else {
-            println!("Skipping non-class file: {}", input_file_path_str);
-            continue;
-        }
+            if !added_class_files.contains(&jar_entry_name) {
+                println!("Processing class file: {}", input_file_path_str);
 
-        zip_writer.start_file(&jar_entry_name, options)?;
-        zip_writer.write_all(&file_data_to_add)?;
+                let file_data = if let Some(processor_path) = processor_jar_path {
+                    let temp_out_file = NamedTempFile::new()?;
+                    let temp_out_path = temp_out_file.path().to_path_buf();
+
+                    let mut cmd = Command::new("java");
+                    cmd.arg("-jar")
+                       .arg(processor_path)
+                       .arg(input_file_path_str)
+                       .arg(&temp_out_path);
+
+                    println!("Running processor: {:?}", cmd);
+                    let output = cmd.output()?;
+
+                    if !output.status.success() {
+                        eprintln!("Error processing file: {}", input_file_path_str);
+                        eprintln!("Processor STDOUT:\n{}", String::from_utf8_lossy(&output.stdout));
+                        eprintln!("Processor STDERR:\n{}", String::from_utf8_lossy(&output.stderr));
+                        return Err(io::Error::new(io::ErrorKind::Other, "ASM processor failed"));
+                    }
+
+                    fs::read(&temp_out_path)?
+                } else {
+                    fs::read(input_file_path_str)?
+                };
+
+                zip_writer.start_file(&jar_entry_name, options)?;
+                zip_writer.write_all(&file_data)?;
+                added_class_files.insert(jar_entry_name);
+                println!("Successfully processed: {}", input_file_path_str);
+            }
+        } else {
+            println!("Skipping non-class/jar file: {}", input_file_path_str);
+        }
     }
 
     zip_writer.finish()?;

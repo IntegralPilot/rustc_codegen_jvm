@@ -134,6 +134,7 @@ This project includes integration tests managed by a Python script.
 *   `asm-processor/`: Kotlin/Gradle project for the ASM-based bytecode post-processor that adds stack map frames to the generated `.class` files.
 *   `tests/`: Integration tests.
     *   `binary/`: Tests for compiling executable Rust crates.
+*   `library/`: Source code for a minimal Kotlin-based implementation of the Rust core library. This serves as a temporary substitute to bootstrap the project until the backend can fully compile the Rust core library itself.
 *   `jvm-unknown-unknown.json`: The Rust target specification file.
 *   `Tester.py`: Python script for running integration tests.
 *   `Makefile`, `build.sh`: Scripts for building the entire toolchain.

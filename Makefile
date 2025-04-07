@@ -1,8 +1,8 @@
 # Makefile
 
-.PHONY: all rust java-linker asm-processor clean clean-rust clean-java-linker clean-asm-processor
+.PHONY: all rust java-linker asm-processor clean clean-rust clean-java-linker clean-asm-processor library clean-library
 
-all: rust java-linker asm-processor
+all: rust java-linker asm-processor library
 
 # --- Rust root project ---
 rust:
@@ -25,5 +25,11 @@ asm-processor:
 clean-asm-processor:
 	cd asm-processor && gradle clean
 
+# --- Standard Library Shim (Gradle) ---
+library:
+	cd library && gradle build
+clean-library:
+	cd library && gradle clean
+
 # --- Clean everything ---
-clean: clean-rust clean-java-linker clean-asm-processor
+clean: clean-rust clean-java-linker clean-asm-processor clean-library

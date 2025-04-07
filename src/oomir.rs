@@ -1,7 +1,6 @@
 // src/oomir.rs
 //! This is the output of the stage 1 lowering pass of the compiler.
-//! It is responsible for converting the MIR into a lower-level IR, called OOMIR (see `src/oomir.rs`).
-//! It is a simple pass that converts the MIR into a more object-oriented representation.
+//! It is responsible for converting the MIR into a lower-level IR, called OOMIR (defined in this file).
 use std::collections::HashMap;
 
 // OOMIR definitions
@@ -152,12 +151,14 @@ pub enum Instruction {
         op1: Operand,
         op2: Operand,
     },
-     And { // Logical AND
+    And {
+        // Logical AND
         dest: String,
         op1: Operand,
         op2: Operand,
     },
-    Or {  // Logical OR
+    Or {
+        // Logical OR
         dest: String,
         op1: Operand,
         op2: Operand,
@@ -174,9 +175,9 @@ pub enum Instruction {
         operand: Option<Operand>, // Optional return value
     },
     Call {
-        dest: Option<String>,     // Optional destination variable for the return value
-        function: String,       // Name of the function to call
-        args: Vec<Operand>,      // Arguments to the function
+        dest: Option<String>, // Optional destination variable for the return value
+        function: String,     // Name of the function to call
+        args: Vec<Operand>,   // Arguments to the function
     },
     Move {
         dest: String,
@@ -189,8 +190,13 @@ pub enum Instruction {
         exception_class: String, // e.g., "java/lang/RuntimeException"
         message: String,         // The message from the panic/assert
     },
+    Switch {
+        discr: Operand, // The value being switched on
+        // Vec of (Constant Value, Target Label) pairs
+        targets: Vec<(Constant, String)>,
+        otherwise: String, // Label for the default case
+    },
 }
-
 
 #[derive(Debug, Clone)]
 pub enum Operand {
@@ -213,7 +219,20 @@ pub enum Constant {
     Boolean(bool),
     Char(char),
     String(String),
-    Class(String), 
+    Class(String),
+}
+
+// Helper to check if a Constant is integer-like (needed for Switch)
+impl Constant {
+    pub fn is_integer_like(&self) -> bool {
+        matches!(
+            self,
+            Constant::I8(_) | Constant::I16(_) | Constant::I32(_) | Constant::I64(_) |
+            Constant::U8(_) | Constant::U16(_) | Constant::U32(_) | Constant::U64(_) |
+            Constant::Char(_) | // Chars can be switched on in JVM
+            Constant::Boolean(_) // Booleans (0 or 1) can be switched on
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -233,8 +252,8 @@ pub enum Type {
     F64,
     Reference(Box<Type>), // Representing references
     Array(Box<Type>),     // Representing arrays, need to handle dimensions
-    String,              // String type
-    Class(String),       // For structs, enums, and potentially Objects
+    String,               // String type
+    Class(String),        // For structs, enums, and potentially Objects
 }
 
 impl Type {

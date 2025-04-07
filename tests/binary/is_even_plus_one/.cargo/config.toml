@@ -2,5 +2,8 @@
 rustflags = [
   "-Z", "codegen-backend=../../../target/debug/librustc_codegen_jvm.dylib",
   "-C", "linker=../../../java-linker/target/debug/java-linker",
-  "-C", "link-args=--asm-processor ../../../asm-processor/build/libs/asm-processor-1.0-SNAPSHOT-all.jar"
+  "-C", "link-args=../../../library/build/libs/library-0.1.0.jar --asm-processor ../../../asm-processor/build/libs/asm-processor-1.0-SNAPSHOT-all.jar"
 ]
+
+[profile.debug]
+panic = "abort"
