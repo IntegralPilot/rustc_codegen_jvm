@@ -8,7 +8,7 @@
 //! (arithmetic, branching, returns) and can be extended to support more of Rust.
 
 use crate::oomir;
-use rustc_abi::Size;
+use regex::Regex;
 use rustc_middle::mir::interpret::{AllocRange, ErrorHandled};
 use rustc_middle::mir::{
     BasicBlock, BasicBlockData, BinOp, Body, Operand as MirOperand, Place, Rvalue, StatementKind,
@@ -20,6 +20,7 @@ use rustc_middle::ty::{
     FloatTy, Instance, IntTy, PseudoCanonicalInput, Ty, TyCtxt, TyKind, UintTy,
 };
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 /// Converts a Rust MIR type (`Ty`) to an OOMIR type (`oomir::Type`).
 fn ty_to_oomir_type<'tcx>(ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) -> oomir::Type {
@@ -32,15 +33,15 @@ fn ty_to_oomir_type<'tcx>(ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) -> oomir::Type {
             IntTy::I32 => oomir::Type::I32,
             IntTy::I64 => oomir::Type::I64,
             IntTy::Isize => oomir::Type::I64,
-            IntTy::I128 => oomir::Type::I64,
+            IntTy::I128 => oomir::Type::Class("java/lang/BigInteger".to_string()), // doesn't fit in a primitive
         },
         rustc_middle::ty::TyKind::Uint(uint_ty) => match uint_ty {
-            UintTy::U8 => oomir::Type::U8,
-            UintTy::U16 => oomir::Type::U16,
-            UintTy::U32 => oomir::Type::U32,
-            UintTy::U64 => oomir::Type::U64,
-            UintTy::Usize => oomir::Type::U64,
-            UintTy::U128 => oomir::Type::U64,
+            UintTy::U8 => oomir::Type::I16, // make it the next size up to capture full range
+            UintTy::U16 => oomir::Type::I32,
+            UintTy::U32 => oomir::Type::I64,
+            UintTy::U64 => oomir::Type::Class("java/lang/BigInteger".to_string()),
+            UintTy::Usize => oomir::Type::Class("java/lang/BigInteger".to_string()),
+            UintTy::U128 => oomir::Type::Class("java/lang/BigInteger".to_string()),
         },
         rustc_middle::ty::TyKind::Float(float_ty) => match float_ty {
             FloatTy::F32 => oomir::Type::F32,
@@ -97,7 +98,11 @@ fn place_to_string<'tcx>(place: &Place<'tcx>, _tcx: TyCtxt<'tcx>) -> String {
 }
 
 /// Convert a MIR operand to an OOMIR operand.
-fn convert_operand<'tcx>(mir_op: &MirOperand<'tcx>, tcx: TyCtxt<'tcx>) -> oomir::Operand {
+fn convert_operand<'tcx>(
+    mir_op: &MirOperand<'tcx>,
+    tcx: TyCtxt<'tcx>,
+    mir: &Body<'tcx>,
+) -> oomir::Operand {
     match mir_op {
         MirOperand::Constant(box constant) => {
             match constant.const_ {
@@ -152,7 +157,13 @@ fn convert_operand<'tcx>(mir_op: &MirOperand<'tcx>, tcx: TyCtxt<'tcx>) -> oomir:
         }
         MirOperand::Copy(place) | MirOperand::Move(place) => {
             let var_name = place_to_string(place, tcx);
-            oomir::Operand::Variable(var_name)
+            // --- Get the type of the place ---
+            let oomir_type = get_place_type(place, mir, tcx);
+            // --- Create typed Variable operand ---
+            oomir::Operand::Variable {
+                name: var_name,
+                ty: oomir_type,
+            }
         }
     }
 }
@@ -170,21 +181,27 @@ fn handle_const_value<'tcx>(
                     match ty.kind() {
                         rustc_middle::ty::TyKind::Int(int_ty) => {
                             let val = match int_ty {
-                                IntTy::I8 => scalar_int.to_i8() as i32,
-                                IntTy::I16 => scalar_int.to_i16() as i32,
-                                IntTy::I32 => scalar_int.to_i32(),
-                                _ => scalar_int.to_i32(), // Default
+                                IntTy::I8 => oomir::Constant::I8(scalar_int.to_i8()),
+                                IntTy::I16 => oomir::Constant::I16(scalar_int.to_i16()),
+                                IntTy::I32 => oomir::Constant::I32(scalar_int.to_i32()),
+                                IntTy::I64 => oomir::Constant::I64(scalar_int.to_i64()),
+                                _ => oomir::Constant::I32(scalar_int.to_i32()), // Default fallback
                             };
-                            oomir::Operand::Constant(oomir::Constant::I32(val))
+                            oomir::Operand::Constant(val)
                         }
                         rustc_middle::ty::TyKind::Uint(uint_ty) => {
+                            // The JVM only has signed integers, so we need to convert
+                            // Ensure that the FULL RANGE is covered, i.e., u8 must become i16
                             let val = match uint_ty {
-                                UintTy::U8 => scalar_int.to_u8() as u32,
-                                UintTy::U16 => scalar_int.to_u16() as u32,
-                                UintTy::U32 => scalar_int.to_u32(),
-                                _ => scalar_int.to_u32(), // Default
+                                UintTy::U8 => oomir::Constant::I16(scalar_int.to_u8() as i16),
+                                UintTy::U16 => oomir::Constant::I32(scalar_int.to_u16() as i32),
+                                UintTy::U32 => oomir::Constant::I64(scalar_int.to_u32() as i64),
+                                UintTy::U64 => {
+                                    oomir::Constant::Class("java/lang/BigInteger".to_string())
+                                } // Doesn't fit in a primitive
+                                _ => oomir::Constant::I32(scalar_int.to_u32() as i32), // Default fallback
                             };
-                            oomir::Operand::Constant(oomir::Constant::U32(val))
+                            oomir::Operand::Constant(val)
                         }
                         rustc_middle::ty::TyKind::Bool => {
                             let val = scalar_int.try_to_bool().unwrap_or(false);
@@ -243,63 +260,86 @@ fn handle_const_value<'tcx>(
                                 TyKind::Ref(_, inner_ty, _) => {
                                     if let TyKind::Array(elem_ty, array_len_const) = inner_ty.kind()
                                     {
-                                        // We are expecting [&str; 1] from panic!/assert! format strings
-                                        let array_len = array_len_const.try_to_target_usize(tcx);
-                                        if array_len == Some(1) {
-                                            // Check it's a single-element array
+                                        // Try to get the length of the array constant
+                                        if let Some(array_len) =
+                                            array_len_const.try_to_target_usize(tcx)
+                                        {
                                             // Check if the element type is &str
                                             if let TyKind::Ref(_, str_ty, _) = elem_ty.kind() {
                                                 if str_ty.is_str() {
                                                     println!(
-                                                        "Info: Handling Ref-to-[&str; 1]. Reading inner fat pointer from allocation {:?}.",
-                                                        alloc_id
+                                                        "Info: Handling Ref-to-[&str; {}]. Reading inner fat pointers from allocation {:?}.",
+                                                        array_len, alloc_id
                                                     );
 
+                                                    // Get layout of the element type (&str, which is a fat pointer)
                                                     let typing_env =
-                                                        TypingEnv::fully_monomorphized();
-                                                    // Get layout of the element type (&str)
+                                                        TypingEnv::fully_monomorphized(); // Use appropriate Env
                                                     match tcx.layout_of(PseudoCanonicalInput {
                                                         typing_env: typing_env,
                                                         value: *elem_ty,
                                                     }) {
                                                         Ok(elem_layout) => {
-                                                            // Check layout size is correct for fat pointer (*const u8, usize)
-                                                            let expected_size = tcx
-                                                                .data_layout
-                                                                .pointer_size
+                                                            // Sanity check: element layout should be a fat pointer
+                                                            let pointer_size =
+                                                                tcx.data_layout.pointer_size;
+                                                            let expected_elem_size = pointer_size
                                                                 .checked_mul(2, &tcx.data_layout)
                                                                 .expect(
                                                                     "Pointer size * 2 overflowed",
                                                                 );
-                                                            if !elem_layout.is_unsized()
-                                                                && elem_layout.size == expected_size
-                                                            {
-                                                                let pointer_size =
-                                                                    tcx.data_layout.pointer_size;
 
-                                                                // Read the data pointer part (offset 0 in *this* allocation)
+                                                            if elem_layout.is_unsized()
+                                                                || elem_layout.size
+                                                                    != expected_elem_size
+                                                            {
+                                                                println!(
+                                                                    "Warning: Layout of element type {:?} doesn't look like a fat pointer (&str). Size: {:?}, Expected: {:?}",
+                                                                    elem_ty,
+                                                                    elem_layout.size,
+                                                                    expected_elem_size
+                                                                );
+                                                                return oomir::Operand::Constant(
+                                                                    oomir::Constant::I64(-1),
+                                                                ); // Indicate layout error
+                                                            }
+
+                                                            // Vector to hold the resulting string constants
+                                                            let mut string_constants =
+                                                                Vec::with_capacity(
+                                                                    array_len as usize,
+                                                                );
+                                                            let mut encountered_error = false; // Flag errors during loop
+
+                                                            for i in 0..array_len {
+                                                                // Calculate the offset of the current element within the array allocation
+                                                                let current_elem_offset = expected_elem_size.checked_mul(i as u64, &tcx.data_layout)
+                                                                    .expect("Array element offset calculation overflowed");
+
+                                                                // Read the data pointer part from the current element's offset
                                                                 let data_ptr_range = AllocRange {
-                                                                    start: Size::from_bytes(0),
+                                                                    start: current_elem_offset,
                                                                     size: pointer_size,
                                                                 };
                                                                 let data_ptr_scalar_res =
                                                                     allocation.read_scalar(
                                                                         &tcx.data_layout,
                                                                         data_ptr_range,
-                                                                        true,
-                                                                    ); // Read provenance
+                                                                        true, // Read provenance
+                                                                    );
 
-                                                                // Read the length part (offset pointer_size in *this* allocation)
+                                                                // Read the length part from the current element's offset
                                                                 let len_range = AllocRange {
-                                                                    start: pointer_size,
+                                                                    start: current_elem_offset
+                                                                        + pointer_size,
                                                                     size: pointer_size,
                                                                 };
                                                                 let len_scalar_res = allocation
                                                                     .read_scalar(
                                                                         &tcx.data_layout,
                                                                         len_range,
-                                                                        false,
-                                                                    ); // No provenance for len
+                                                                        false, // No provenance for len
+                                                                    );
 
                                                                 match (
                                                                     data_ptr_scalar_res,
@@ -328,74 +368,94 @@ fn handle_const_value<'tcx>(
                                                                             rustc_middle::mir::interpret::GlobalAlloc::Memory(final_const_alloc) => {
                                                                                 let final_alloc = final_const_alloc.inner();
                                                                                 let start_byte = final_offset.bytes_usize();
-                                                                                let end_byte = start_byte.checked_add(len as usize).expect("String slice range overflowed");
-                                                                                let final_range = start_byte..end_byte;
-                                                                                // Bounds check
-                                                                                if end_byte > final_alloc.size().bytes_usize() {
-                                                                                    println!("Warning: Calculated string slice range {:?} out of bounds for allocation {:?} size {}", final_range, final_alloc_id, final_alloc.size().bytes());
-                                                                                    return oomir::Operand::Constant(oomir::Constant::I64(0));
-                                                                                }
-                                                                                // Read the final bytes
-                                                                                let final_bytes = final_alloc.inspect_with_uninit_and_ptr_outside_interpreter(final_range);
-            
-                                                                                // Convert to string
-                                                                                match String::from_utf8(final_bytes.to_vec()) {
-                                                                                    Ok(s) => {
-                                                                                        println!("Info: Successfully extracted inner &str constant via fat pointer: \"{}\"", s);
-                                                                                        oomir::Operand::Constant(oomir::Constant::String(s))
+                                                                                // Use checked_add for length calculation
+                                                                                if let Some(end_byte) = start_byte.checked_add(len as usize) {
+                                                                                    // Bounds check
+                                                                                    if end_byte <= final_alloc.size().bytes_usize() {
+                                                                                        let final_range = start_byte..end_byte;
+                                                                                        // Read the final bytes
+                                                                                        let final_bytes = final_alloc.inspect_with_uninit_and_ptr_outside_interpreter(final_range);
+
+                                                                                        // Convert to string
+                                                                                        match String::from_utf8(final_bytes.to_vec()) {
+                                                                                            Ok(s) => {
+                                                                                                println!("Info: Successfully extracted string const at index {}: \"{}\"", i, s);
+                                                                                                string_constants.push(oomir::Constant::String(s));
+                                                                                            }
+                                                                                            Err(e) => {
+                                                                                                println!("Warning: Final string bytes (idx {}) from allocation {:?} were not valid UTF-8: {}", i, final_alloc_id, e);
+                                                                                                string_constants.push(oomir::Constant::String("Invalid UTF8 (Inner)".to_string()));
+                                                                                            }
+                                                                                        }
+                                                                                    } else {
+                                                                                         println!("Warning: Calculated string slice range {}..{} (idx {}) out of bounds for allocation {:?} size {}", start_byte, end_byte, i, final_alloc_id, final_alloc.size().bytes());
+                                                                                         encountered_error = true;
+                                                                                         break; // Stop processing this array
                                                                                     }
-                                                                                    Err(e) => {
-                                                                                        println!("Warning: Final string bytes from allocation {:?} were not valid UTF-8: {}", final_alloc_id, e);
-                                                                                        oomir::Operand::Constant(oomir::Constant::String("Invalid UTF8 (Inner)".to_string()))
-                                                                                    }
+                                                                                } else {
+                                                                                    println!("Warning: String slice length calculation overflowed (idx {})", i);
+                                                                                    encountered_error = true;
+                                                                                    break; // Stop processing this array
                                                                                 }
                                                                             }
-                                                                            // Handle case where inner pointer points to function/static/vtable (unlikely for string)
                                                                             _ => {
-                                                                                println!("Warning: Inner string pointer {:?} points to unexpected GlobalAlloc kind {:?}", data_ptr, tcx.global_alloc(final_alloc_id));
-                                                                                oomir::Operand::Constant(oomir::Constant::I64(0))
+                                                                                println!("Warning: Inner string pointer (idx {}) {:?} points to unexpected GlobalAlloc kind {:?}", i, data_ptr, tcx.global_alloc(final_alloc_id));
+                                                                                encountered_error = true;
+                                                                                break; // Stop processing this array
                                                                             }
                                                                         }
                                                                     }
-                                                                    // Error handling for reading scalars
+                                                                    // Error handling for reading scalars for *this element*
                                                                     (Err(e), _) => {
                                                                         println!(
-                                                                            "Error reading inner string data pointer scalar from allocation {:?}: {:?}",
-                                                                            alloc_id, e
+                                                                            "Error reading inner string data pointer scalar (idx {}) from allocation {:?}: {:?}",
+                                                                            i, alloc_id, e
                                                                         );
-                                                                        oomir::Operand::Constant(
-                                                                            oomir::Constant::I64(0),
-                                                                        )
+                                                                        encountered_error = true;
+                                                                        break; // Stop processing this array
                                                                     }
                                                                     (_, Err(e)) => {
                                                                         println!(
-                                                                            "Error reading inner string length scalar from allocation {:?}: {:?}",
-                                                                            alloc_id, e
+                                                                            "Error reading inner string length scalar (idx {}) from allocation {:?}: {:?}",
+                                                                            i, alloc_id, e
                                                                         );
-                                                                        oomir::Operand::Constant(
-                                                                            oomir::Constant::I64(0),
-                                                                        )
+                                                                        encountered_error = true;
+                                                                        break; // Stop processing this array
                                                                     }
                                                                     (Ok(data), Ok(len)) => {
                                                                         println!(
-                                                                            "Warning: Read unexpected scalar types for fat pointer. Data: {:?}, Len: {:?}",
-                                                                            data, len
+                                                                            "Warning: Read unexpected scalar types for fat pointer (idx {}). Data: {:?}, Len: {:?}",
+                                                                            i, data, len
                                                                         );
-                                                                        oomir::Operand::Constant(
-                                                                            oomir::Constant::I64(0),
-                                                                        )
+                                                                        encountered_error = true;
+                                                                        break; // Stop processing this array
                                                                     }
                                                                 }
-                                                            } else {
+                                                            } // End loop over array elements
+
+                                                            // Check if errors occurred during the loop
+                                                            if encountered_error {
                                                                 println!(
-                                                                    "Warning: Layout of element type {:?} doesn't look like a fat pointer (&str). Size: {:?}, Expected: {:?}",
-                                                                    elem_ty,
-                                                                    elem_layout.size,
-                                                                    expected_size
+                                                                    "Warning: Encountered errors while processing elements of array constant in allocation {:?}. Returning error placeholder.",
+                                                                    alloc_id
                                                                 );
-                                                                oomir::Operand::Constant(
-                                                                    oomir::Constant::I64(0),
-                                                                )
+                                                                return oomir::Operand::Constant(
+                                                                    oomir::Constant::I64(-2),
+                                                                ); // Indicate partial/failed array read
+                                                            } else {
+                                                                // Success: return the array of string constants
+                                                                println!(
+                                                                    "Info: Successfully extracted array of {} string constants from allocation {:?}.",
+                                                                    array_len, alloc_id
+                                                                );
+                                                                return oomir::Operand::Constant(
+                                                                    oomir::Constant::Array(
+                                                                        Box::new(
+                                                                            oomir::Type::String,
+                                                                        ),
+                                                                        string_constants,
+                                                                    ),
+                                                                );
                                                             }
                                                         }
                                                         Err(e) => {
@@ -404,50 +464,50 @@ fn handle_const_value<'tcx>(
                                                                 elem_ty, e
                                                             );
                                                             oomir::Operand::Constant(
-                                                                oomir::Constant::I64(0),
-                                                            )
+                                                                oomir::Constant::I64(-3),
+                                                            ) // Indicate layout error
                                                         }
                                                     }
                                                 } else {
-                                                    /* Array element not &str */
+                                                    /* Array element type is Ref, but not to str */
                                                     println!(
-                                                        "Warning: Scalar::Ptr points to Ref-to-Array where element type {:?} is not &str.",
+                                                        "Warning: Scalar::Ptr points to Ref-to-Array where element type {:?} is Ref but not &str.",
                                                         elem_ty
                                                     );
                                                     return oomir::Operand::Constant(
-                                                        oomir::Constant::I64(0),
-                                                    );
+                                                        oomir::Constant::I64(-4),
+                                                    ); // Indicate wrong element type
                                                 }
                                             } else {
-                                                /* Array element not Ref */
+                                                /* Array element type is not Ref */
                                                 println!(
                                                     "Warning: Scalar::Ptr points to Ref-to-Array where element type {:?} is not a reference.",
                                                     elem_ty
                                                 );
                                                 return oomir::Operand::Constant(
-                                                    oomir::Constant::I64(0),
-                                                );
+                                                    oomir::Constant::I64(-5),
+                                                ); // Indicate wrong element type
                                             }
                                         } else {
-                                            // Array length != 1
+                                            // Could not determine array length (e.g., generic)
                                             println!(
-                                                "Warning: Scalar::Ptr points to Ref-to-Array with unexpected length: {:?}. Expected 1.",
-                                                array_len
+                                                "Warning: Scalar::Ptr points to Ref-to-Array but could not determine constant length: {:?}",
+                                                array_len_const
                                             );
                                             return oomir::Operand::Constant(oomir::Constant::I64(
-                                                0,
-                                            ));
+                                                -6,
+                                            )); // Indicate unknown length
                                         }
                                     } else {
-                                        // Inner type not array
+                                        // Inner type of the Ref is not an Array
                                         println!(
-                                            "Warning: Scalar::Ptr points to Ref to non-Array type {:?}. Not a recognized string pattern.",
+                                            "Warning: Scalar::Ptr points to Ref to non-Array type {:?}. Not a recognized string array pattern.",
                                             inner_ty
                                         );
-                                        return oomir::Operand::Constant(oomir::Constant::I64(0));
+                                        // Fall through to default handling or return specific error
+                                        oomir::Operand::Constant(oomir::Constant::I64(-7)) // Indicate not ref-to-array
                                     }
-                                } // End Case 2
-                                // Handle other pointer types if necessary
+                                }
                                 _ => {
                                     println!(
                                         "Warning: Scalar::Ptr points to an allocation, but the type {:?} is not a recognized string or slice ref.",
@@ -535,8 +595,8 @@ fn convert_basic_block<'tcx>(
             let dest = format!("{:?}", place); // Destination variable
             match rvalue {
                 Rvalue::BinaryOp(bin_op, box (op1, op2)) => {
-                    let oomir_op1 = convert_operand(op1, tcx);
-                    let oomir_op2 = convert_operand(op2, tcx);
+                    let oomir_op1 = convert_operand(op1, tcx, mir);
+                    let oomir_op2 = convert_operand(op2, tcx, mir);
 
                     match bin_op {
                         // Non-checked ops remain the same
@@ -573,44 +633,55 @@ fn convert_basic_block<'tcx>(
                             });
                         }
                         // Checked ops: Generate a tuple with result and overflow flag
-                        BinOp::AddWithOverflow => {
-                            let tuple_dest = format!("{}_tuple", dest);
-                            instructions.push(oomir::Instruction::AddWithOverflow {
-                                dest: tuple_dest.clone(),
-                                op1: oomir_op1,
-                                op2: oomir_op2,
-                            });
+                        BinOp::AddWithOverflow | BinOp::SubWithOverflow => {
+                            use oomir::Operand as OO;
+                            use oomir::Type as OomType;
 
-                            // Split the tuple into result and overflow flag
-                            let result_dest = format!("{}_result", tuple_dest);
-                            let overflow_dest = format!("{}_overflow", tuple_dest);
-                            instructions.push(oomir::Instruction::Move {
-                                src: oomir::Operand::Variable(result_dest.clone()),
-                                dest: format!("{}.0", dest),
-                            });
-                            instructions.push(oomir::Instruction::Move {
-                                src: oomir::Operand::Variable(overflow_dest.clone()),
-                                dest: format!("{}.1", dest),
-                            });
-                        }
-                        BinOp::SubWithOverflow => {
-                            let tuple_dest = format!("{}_tuple", dest);
-                            instructions.push(oomir::Instruction::SubWithOverflow {
-                                dest: tuple_dest.clone(),
-                                op1: oomir_op1,
-                                op2: oomir_op2,
-                            });
+                            let dest_name = dest;
 
-                            // Split the tuple into result and overflow flag
-                            let result_dest = format!("{}_result", tuple_dest);
-                            let overflow_dest = format!("{}_overflow", tuple_dest);
+                            // Need special handling for tuple assignment
+                            let tuple_dest_name = format!("{}_tuple", dest_name); // Intermediate name
+
+                            match bin_op {
+                                BinOp::AddWithOverflow => {
+                                    instructions.push(oomir::Instruction::AddWithOverflow {
+                                        dest: tuple_dest_name.clone(), // Store in intermediate
+                                        op1: oomir_op1.clone(),
+                                        op2: oomir_op2,
+                                    })
+                                }
+                                BinOp::SubWithOverflow => {
+                                    instructions.push(oomir::Instruction::SubWithOverflow {
+                                        dest: tuple_dest_name.clone(), // Store in intermediate
+                                        op1: oomir_op1.clone(),
+                                        op2: oomir_op2,
+                                    })
+                                }
+                                _ => unreachable!(), // Already covered
+                            }
+
+                            // Get types for the tuple fields
+                            let op1_type = match &oomir_op1 {
+                                OO::Constant(c) => OomType::from_constant(c),
+                                OO::Variable { ty, .. } => ty.clone(),
+                            };
+
+                            let bool_type = OomType::Boolean;
+
+                            // Generate moves to split the conceptual tuple
                             instructions.push(oomir::Instruction::Move {
-                                src: oomir::Operand::Variable(result_dest.clone()),
-                                dest: format!("{}.0", dest),
+                                dest: format!("{}.0", dest_name), // Field name
+                                src: oomir::Operand::Variable {
+                                    name: format!("{}_result", tuple_dest_name),
+                                    ty: op1_type,
+                                }, // Use typed intermediate var
                             });
                             instructions.push(oomir::Instruction::Move {
-                                src: oomir::Operand::Variable(overflow_dest.clone()),
-                                dest: format!("{}.1", dest),
+                                dest: format!("{}.1", dest_name), // Field name
+                                src: oomir::Operand::Variable {
+                                    name: format!("{}_overflow", tuple_dest_name),
+                                    ty: bool_type,
+                                }, // Use typed intermediate var
                             });
                         }
                         // Default case for other binary ops
@@ -625,27 +696,11 @@ fn convert_basic_block<'tcx>(
                     }
                 }
                 Rvalue::Use(mir_operand) => {
-                    // Convert the MIR operand (_1, constant, _7.0, etc.)
-                    let mut src_oomir_operand = convert_operand(mir_operand, tcx);
-
-                    // Check if the *source* operand is a variable that looks like a tuple field access
-                    if let oomir::Operand::Variable(ref src_name) = src_oomir_operand {
-                        if src_name.contains('.') {
-                            // Handle tuple projections (e.g., _7.0, _7.1)
-                            if let Some((base_var, field)) = src_name.split_once('.') {
-                                let projection_var = format!("{}_proj_{}", base_var, field);
-                                instructions.push(oomir::Instruction::Move {
-                                    dest: projection_var.clone(),
-                                    src: oomir::Operand::Variable(src_name.clone()),
-                                });
-                                src_oomir_operand = oomir::Operand::Variable(projection_var);
-                            }
-                        }
-                    }
-
-                    // Generate the OOMIR Move instruction with the (potentially adjusted) source
+                    let dest_name = dest;
+                    let src_oomir_operand = convert_operand(mir_operand, tcx, mir);
+                    // The destination's type will be the same as the source's type
                     instructions.push(oomir::Instruction::Move {
-                        dest: dest.clone(),
+                        dest: dest_name, // Just the name
                         src: src_oomir_operand,
                     });
                 }
@@ -663,7 +718,7 @@ fn convert_basic_block<'tcx>(
                             for (i, mir_op) in operands.iter().enumerate() {
                                 // Define the field variable name (e.g., "_2.0")
                                 let field_dest = format!("{}.{}", dest, i);
-                                let field_src = convert_operand(mir_op, tcx);
+                                let field_src = convert_operand(mir_op, tcx, mir);
                                 // Generate a Move to define the field variable
                                 instructions.push(oomir::Instruction::Move {
                                     dest: field_dest,
@@ -703,7 +758,7 @@ fn convert_basic_block<'tcx>(
                     instructions.push(oomir::Instruction::Return { operand: None });
                 } else {
                     let return_operand =
-                        convert_operand(&MirOperand::Move(Place::return_place()), tcx);
+                        convert_operand(&MirOperand::Move(Place::return_place()), tcx, mir);
                     instructions.push(oomir::Instruction::Return {
                         operand: Some(return_operand),
                     });
@@ -717,7 +772,7 @@ fn convert_basic_block<'tcx>(
             }
             TerminatorKind::SwitchInt { discr, targets, .. } => {
                 // --- GENERAL SwitchInt Handling ---
-                let discr_operand = convert_operand(discr, tcx);
+                let discr_operand = convert_operand(discr, tcx, mir);
                 // Get the actual type of the discriminant from MIR local declarations
                 let discr_ty = discr.ty(&mir.local_decls, tcx);
 
@@ -756,10 +811,10 @@ fn convert_basic_block<'tcx>(
                 target,
                 ..
             } => {
-                let function_name = format!("{:?}", func); // Get function name - needs refinement to extract actual name
+                let function_name = make_jvm_safe(format!("{:?}", func).as_str()); // Get function name - needs refinement to extract actual name
                 let oomir_args = args
                     .iter()
-                    .map(|arg| convert_operand(&arg.node, tcx))
+                    .map(|arg| convert_operand(&arg.node, tcx, mir))
                     .collect();
                 let dest = Some(format!("{:?}", destination.local));
 
@@ -795,7 +850,7 @@ fn convert_basic_block<'tcx>(
                 unwind: _,
             } => {
                 // Convert the condition operand
-                let condition = convert_operand(cond, tcx);
+                let condition = convert_operand(cond, tcx, mir);
 
                 // Generate a comparison instruction to check if the condition matches the expected value
                 let comparison_dest = format!("assert_cmp_{}", bb.index());
@@ -809,7 +864,10 @@ fn convert_basic_block<'tcx>(
                 let true_block = format!("bb{}", target.index()); // Success path
                 let false_block = format!("assert_fail_{}", bb.index()); // Failure path label
                 instructions.push(oomir::Instruction::Branch {
-                    condition: oomir::Operand::Variable(comparison_dest),
+                    condition: oomir::Operand::Variable {
+                        name: comparison_dest,
+                        ty: oomir::Type::Boolean,
+                    },
                     true_block, // Jump here if assertion holds (cond == expected)
                     false_block: false_block.clone(), // Jump here if assertion fails
                 });
@@ -957,4 +1015,34 @@ fn mir_int_to_oomir_const<'tcx>(value: u128, ty: Ty<'tcx>, _tcx: TyCtxt<'tcx>) -
             oomir::Constant::I32(0) // Default fallback
         }
     }
+}
+
+// Make a rust idenfier (i.e. function name) JVM safe
+// i.e. Arguments::<'_>::new_const::<1> -> arguments_new_const
+pub fn make_jvm_safe(input: &str) -> String {
+    static RE_ANGLES: OnceLock<Regex> = OnceLock::new();
+    static RE_COLONS: OnceLock<Regex> = OnceLock::new();
+    static RE_TRAILING_UNDERSCORE: OnceLock<Regex> = OnceLock::new();
+
+    // 1. Remove anything inside < > (including the angle brackets themselves)
+    let re_angles = RE_ANGLES.get_or_init(|| Regex::new(r"<[^>]*>").expect("Invalid regex"));
+    let without_angles = re_angles.replace_all(input, "");
+
+    // 2. Replace occurrences of :: (or more consecutive ':') with a single underscore
+    let re_colons = RE_COLONS.get_or_init(|| Regex::new(r":{2,}").expect("Invalid regex"));
+    let replaced = re_colons.replace_all(&without_angles, "_");
+
+    // 3. Ensure there is not a trailing underscore
+    let re_trailing_underscore =
+        RE_TRAILING_UNDERSCORE.get_or_init(|| Regex::new(r"_$").expect("Invalid regex"));
+    let replaced = re_trailing_underscore.replace_all(&replaced, "");
+
+    // 4. Convert all to lowercase
+    replaced.to_lowercase()
+}
+
+// --- Helper to get OOMIR Type for a Place ---
+fn get_place_type<'tcx>(place: &Place<'tcx>, mir: &Body<'tcx>, tcx: TyCtxt<'tcx>) -> oomir::Type {
+    let place_ty = place.ty(&mir.local_decls, tcx);
+    ty_to_oomir_type(place_ty.ty, tcx)
 }

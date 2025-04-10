@@ -1,0 +1,10 @@
+{
+  "arguments_new_const": {
+    "descriptor": "([Ljava/lang/String;)Ljava/lang/String;",
+    "is_static": true
+  },
+  "panic_fmt": {
+    "descriptor": "(Ljava/lang/String;)V",
+    "is_static": true
+  }
+}

@@ -1,15 +1,55 @@
 // src/lower2.rs
 //! This module converts OOMIR into JVM bytecode.
 
-use crate::oomir;
+use crate::oomir::{self, Type};
 use rustc_middle::ty::TyCtxt; // Assuming this is needed elsewhere, but not directly used in the core logic below.
 
-use ristretto_classfile::attributes::{Attribute, Instruction, MaxStack};
+use ristretto_classfile::attributes::{ArrayType, Attribute, Instruction, MaxStack};
 use ristretto_classfile::{
     self as jvm, ClassAccessFlags, ClassFile, ConstantPool, MethodAccessFlags, Version,
 };
+use serde::Deserialize;
 use std::collections::{HashMap, VecDeque};
 use std::convert::TryInto;
+use std::sync::OnceLock;
+
+// --- Standard Library Shim Metadata Loader ---
+
+#[derive(Deserialize, Debug, Clone)]
+struct ShimInfo {
+    descriptor: String,
+    is_static: bool,
+}
+
+// Key: Simplified function name (output of make_jvm_safe)
+type ShimMap = HashMap<String, ShimInfo>;
+
+// --- Lazy Static Loader for Shims (Reads JSON File) ---
+
+static SHIM_METADATA: OnceLock<Result<ShimMap, String>> = OnceLock::new();
+
+fn get_shim_metadata() -> Result<&'static ShimMap, &'static str> {
+    SHIM_METADATA
+        .get_or_init(|| {
+            // Embed the JSON file content at compile time, because we know where it is then, but can't guarantee at runtime.
+
+            const JSON_BYTES: &[u8] = include_bytes!("../shim-metadata-gen/core.json");
+            // Example: If core.json is in the same directory as lower2.rs:
+            // const JSON_BYTES: &[u8] = include_bytes!("core.json");
+            // Example: If using an absolute path (less portable):
+            // const JSON_BYTES: &[u8] = include_bytes!("/absolute/path/to/core.json");
+
+            // 1. Convert bytes to &str (assuming UTF-8)
+            let json_str = str::from_utf8(JSON_BYTES)
+                .map_err(|e| format!("Failed to decode embedded JSON bytes as UTF-8: {}", e))?;
+
+            // 2. Parse the JSON string
+            serde_json::from_str(json_str)
+                .map_err(|e| format!("Failed to parse embedded JSON string: {}", e))
+        })
+        .as_ref()
+        .map_err(|e| e.as_str())
+}
 
 // --- Helper Structs ---
 
@@ -130,7 +170,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
     /// Returns the number of JVM local variable slots a type occupies (1 or 2).
     fn get_type_size(ty: &oomir::Type) -> u16 {
         match ty {
-            oomir::Type::I64 | oomir::Type::U64 | oomir::Type::F64 => 2,
+            oomir::Type::I64 | oomir::Type::F64 => 2,
             _ => 1,
         }
     }
@@ -168,7 +208,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             }
 
             // Add successor blocks to worklist if not visited
-            print!("DEBUG: Successors for {}: ", block_label);
             if let Some(last_instr) = block.instructions.last() {
                 match last_instr {
                     oomir::Instruction::Jump { target } => {
@@ -273,16 +312,12 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
     }
 
     /// Appends JVM instructions for loading an operand onto the stack.
-    fn load_operand(
-        &mut self,
-        operand: &oomir::Operand,
-        ty_hint: &oomir::Type,
-    ) -> Result<(), jvm::Error> {
+    fn load_operand(&mut self, operand: &oomir::Operand) -> Result<(), jvm::Error> {
         match operand {
             oomir::Operand::Constant(c) => self.load_constant(c)?,
-            oomir::Operand::Variable(var_name) => {
+            oomir::Operand::Variable { name: var_name, ty } => {
                 let index = self.get_local(var_name)?;
-                let load_instr = Self::get_load_instruction(ty_hint, index)?;
+                let load_instr = Self::get_load_instruction(ty, index)?;
                 self.jvm_instructions.push(load_instr);
             }
         }
@@ -294,48 +329,145 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         use jvm::attributes::Instruction as JI;
         use oomir::Constant as OC;
 
-        let instr = match constant {
-            OC::I8(v) => Self::get_int_const_instr(self, *v as i32),
-            OC::I16(v) => Self::get_int_const_instr(self, *v as i32),
-            OC::I32(v) => Self::get_int_const_instr(self, *v),
-            OC::I64(v) => Self::get_long_const_instr(*v),
-            OC::U8(v) => Self::get_int_const_instr(self, *v as i32), // Treat as signed int
-            OC::U16(v) => Self::get_int_const_instr(self, *v as i32), // Treat as signed int
-            OC::U32(v) => Self::get_int_const_instr(self, *v as i32), // Treat as signed int
-            OC::U64(v) => Self::get_long_const_instr(*v as i64),     // Treat as signed long
-            OC::F32(v) => Self::get_float_const_instr(*v),
-            OC::F64(v) => Self::get_double_const_instr(*v),
+        let mut instructions_to_add = Vec::new();
+
+        match constant {
+            OC::I8(v) => instructions_to_add.push(Self::get_int_const_instr(self, *v as i32)),
+            OC::I16(v) => instructions_to_add.push(Self::get_int_const_instr(self, *v as i32)),
+            OC::I32(v) => instructions_to_add.push(Self::get_int_const_instr(self, *v)),
+            OC::I64(v) => instructions_to_add.push(Self::get_long_const_instr(*v)),
+            OC::F32(v) => instructions_to_add.push(Self::get_float_const_instr(*v)),
+            OC::F64(v) => instructions_to_add.push(Self::get_double_const_instr(*v)),
             OC::Boolean(v) => {
-                if *v {
-                    JI::Iconst_1
-                } else {
-                    JI::Iconst_0
-                }
+                instructions_to_add.push(if *v { JI::Iconst_1 } else { JI::Iconst_0 })
             }
-            OC::Char(v) => Self::get_int_const_instr(self, *v as i32), // Char treated as int
+            OC::Char(v) => instructions_to_add.push(Self::get_int_const_instr(self, *v as i32)),
             OC::String(s) => {
                 let index = self.constant_pool.add_string(s)?;
-                if let Ok(idx8) = u8::try_from(index) {
+                instructions_to_add.push(if let Ok(idx8) = u8::try_from(index) {
                     JI::Ldc(idx8)
                 } else {
                     JI::Ldc_w(index)
-                }
+                });
             }
             OC::Class(c) => {
                 let index = self.constant_pool.add_class(c)?;
-                if let Ok(idx8) = u8::try_from(index) {
+                instructions_to_add.push(if let Ok(idx8) = u8::try_from(index) {
                     JI::Ldc(idx8)
                 } else {
                     JI::Ldc_w(index)
+                });
+            }
+            OC::Array(elem_ty, elements) => {
+                let array_len = elements.len();
+
+                // 1. Push array size onto stack
+                instructions_to_add.push(Self::get_int_const_instr(self, array_len as i32));
+
+                // 2. Create the new array (primitive or reference)
+                if let Some(atype_code) = elem_ty.to_jvm_primitive_array_type_code() {
+                    let array_type =
+                        ArrayType::from_bytes(&mut std::io::Cursor::new(vec![atype_code])) // Wrap atype_code in Cursor<Vec<u8>>
+                            .map_err(|e| jvm::Error::VerificationError {
+                                context: format!("Function {}", self.oomir_func.name),
+                                // Use Display formatting for the error type if available
+                                message: format!(
+                                    "Invalid primitive array type code {}: {:?}",
+                                    atype_code, e
+                                ),
+                            })?;
+                    instructions_to_add.push(JI::Newarray(array_type)); // Stack: [arrayref]
+                } else if let Some(internal_name) = elem_ty.to_jvm_internal_name() {
+                    let class_index = self.constant_pool.add_class(&internal_name)?;
+                    instructions_to_add.push(JI::Anewarray(class_index)); // Stack: [arrayref]
+                } else {
+                    return Err(jvm::Error::VerificationError {
+                        context: format!("Function {}", self.oomir_func.name),
+                        message: format!("Cannot create JVM array for element type: {:?}", elem_ty),
+                    });
                 }
+
+                let store_instruction =
+                    elem_ty.get_jvm_array_store_instruction().ok_or_else(|| {
+                        jvm::Error::VerificationError {
+                            context: format!("Function {}", self.oomir_func.name),
+                            message: format!(
+                                "Cannot determine array store instruction for type: {:?}",
+                                elem_ty
+                            ),
+                        }
+                    })?;
+
+                // 3. Populate the array
+                for (i, element_const) in elements.iter().enumerate() {
+                    let constant_type = Type::from_constant(element_const);
+                    if &constant_type != elem_ty.as_ref()
+                        && !Self::are_types_jvm_compatible(&constant_type, elem_ty)
+                    {
+                        return Err(jvm::Error::VerificationError {
+                            context: format!("Function {}", self.oomir_func.name),
+                            message: format!(
+                                "Type mismatch in Constant::Array: expected {:?}, found {:?} for element {}",
+                                elem_ty, constant_type, i
+                            ),
+                        });
+                    }
+
+                    instructions_to_add.push(JI::Dup); // Stack: [arrayref, arrayref]
+                    instructions_to_add.push(Self::get_int_const_instr(self, i as i32)); // Stack: [arrayref, arrayref, index]
+
+                    // --- Corrected Element Loading ---
+                    // 1. Record the length of the main instruction vector *before* the recursive call.
+                    let original_jvm_len = self.jvm_instructions.len();
+
+                    // 2. Make the recursive call. This *will* append instructions to self.jvm_instructions.
+                    self.load_constant(element_const)?;
+
+                    // 3. Determine the range of instructions added by the recursive call.
+                    let new_jvm_len = self.jvm_instructions.len();
+
+                    // 4. If instructions were added, copy them from self.jvm_instructions to instructions_to_add.
+                    if new_jvm_len > original_jvm_len {
+                        // Create a slice referencing the newly added instructions
+                        let added_instructions_slice =
+                            &self.jvm_instructions[original_jvm_len..new_jvm_len];
+                        // Extend the temporary vector with a clone of these instructions
+                        instructions_to_add.extend_from_slice(added_instructions_slice);
+                    }
+
+                    // 5. Remove the instructions just added by the recursive call from self.jvm_instructions.
+                    //    We truncate back to the length it had *before* the recursive call.
+                    self.jvm_instructions.truncate(original_jvm_len);
+                    // Now, self.jvm_instructions is back to its state before loading the element,
+                    // and instructions_to_add contains the necessary Dup, index, element load instructions.
+
+                    // Add the array store instruction to the temporary vector
+                    instructions_to_add.push(store_instruction.clone()); // Stack: [arrayref]
+                }
+                // Final stack state after loop: [arrayref] (the populated array)
             }
         };
-        self.jvm_instructions.push(instr.clone());
-        // Handle Ldc2_w for long/double constants loaded via LDC
-        if matches!(instr, JI::Ldc2_w(_)) {
-            // Ldc2_w pushes a 64-bit value (2 stack words)
-        }
+
+        // Append the generated instructions for this constant (now including array logic)
+        self.jvm_instructions.extend(instructions_to_add);
+
         Ok(())
+    }
+
+    // Helper to check if types are compatible enough for JVM assignments (e.g., U8 -> I32)
+    fn are_types_jvm_compatible(src: &oomir::Type, dest: &oomir::Type) -> bool {
+        if src == dest {
+            return true;
+        }
+        match (src, dest) {
+            // Allow storing smaller ints into I32 array slots if that's the JVM target type
+            (
+                oomir::Type::I8 | oomir::Type::I16 | oomir::Type::Boolean | oomir::Type::Char,
+                oomir::Type::I32,
+            ) => true,
+            // TODO: Add more other compatibility rules (e.g., Reference vs Class)
+            _ => false,
+        }
     }
 
     /// Appends JVM instructions for storing the value currently on top of the stack
@@ -420,9 +552,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             oomir::Type::I8
             | oomir::Type::I16
             | oomir::Type::I32
-            | oomir::Type::U8
-            | oomir::Type::U16
-            | oomir::Type::U32
             | oomir::Type::Boolean
             | oomir::Type::Char => match index {
                 0 => Instruction::Iload_0,
@@ -431,7 +560,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 3 => Instruction::Iload_3,
                 _ => Instruction::Iload(index_u8),
             },
-            oomir::Type::I64 | oomir::Type::U64 => match index {
+            oomir::Type::I64 => match index {
                 0 => Instruction::Lload_0,
                 1 => Instruction::Lload_1,
                 2 => Instruction::Lload_2,
@@ -478,9 +607,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             oomir::Type::I8
             | oomir::Type::I16
             | oomir::Type::I32
-            | oomir::Type::U8
-            | oomir::Type::U16
-            | oomir::Type::U32
             | oomir::Type::Boolean
             | oomir::Type::Char => match index {
                 0 => Instruction::Istore_0,
@@ -489,7 +615,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 3 => Instruction::Istore_3,
                 _ => Instruction::Istore(index_u8),
             },
-            oomir::Type::I64 | oomir::Type::U64 => match index {
+            oomir::Type::I64 => match index {
                 0 => Instruction::Lstore_0,
                 1 => Instruction::Lstore_1,
                 2 => Instruction::Lstore_2,
@@ -536,13 +662,16 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         dest: &str,
         op1: &oomir::Operand,
         op2: &oomir::Operand,
-        op_type: &oomir::Type,
         jvm_op: Instruction,
     ) -> Result<(), jvm::Error> {
-        self.load_operand(op1, op_type)?;
-        self.load_operand(op2, op_type)?;
+        self.load_operand(op1)?;
+        self.load_operand(op2)?;
         self.jvm_instructions.push(jvm_op);
-        self.store_result(dest, op_type)?;
+        let op1_type = match op1 {
+            oomir::Operand::Variable { ty, .. } => ty.clone(),
+            oomir::Operand::Constant(c) => Type::from_constant(c),
+        };
+        self.store_result(dest, &op1_type)?;
         Ok(())
     }
 
@@ -554,11 +683,10 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         dest: &str,
         op1: &oomir::Operand,
         op2: &oomir::Operand,
-        op_type: &oomir::Type, // Type of operands being compared
         jump_op_if_true: fn(u16) -> Instruction, // e.g., Instruction::If_icmpeq for Eq
     ) -> Result<(), jvm::Error> {
-        self.load_operand(op1, op_type)?;
-        self.load_operand(op2, op_type)?;
+        self.load_operand(op1)?;
+        self.load_operand(op2)?;
 
         let instr_idx_if = self.jvm_instructions.len();
         let label_true = format!("_comparison_true_{}", instr_idx_if);
@@ -599,44 +727,19 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
     ) -> Result<(), jvm::Error> {
         use jvm::attributes::Instruction as JI;
         use oomir::Instruction as OI;
-
-        // TODO: Infer types properly. This is a major simplification.
-        // We need type information for variables to select the correct JVM opcodes.
-        // Assuming I32 for many operations for now based on the example.
-        let default_type = oomir::Type::I32;
+        use oomir::Operand as OO;
 
         match instr {
             OI::Const { dest, value } => {
-                let ty = match value {
-                    oomir::Constant::I8(_) | oomir::Constant::U8(_) => oomir::Type::I8,
-                    oomir::Constant::I16(_) | oomir::Constant::U16(_) => oomir::Type::I16,
-                    oomir::Constant::I32(_) | oomir::Constant::U32(_) => oomir::Type::I32,
-                    oomir::Constant::I64(_) | oomir::Constant::U64(_) => oomir::Type::I64,
-                    oomir::Constant::F32(_) => oomir::Type::F32,
-                    oomir::Constant::F64(_) => oomir::Type::F64,
-                    oomir::Constant::Boolean(_) => oomir::Type::Boolean,
-                    oomir::Constant::Char(_) => oomir::Type::Char,
-                    oomir::Constant::String(_) => oomir::Type::String,
-                    oomir::Constant::Class(name) => oomir::Type::Class(name.clone()),
-                };
+                let ty = Type::from_constant(value);
                 self.load_constant(value)?;
                 self.store_result(dest, &ty)?;
             }
-            OI::Add { dest, op1, op2 } => {
-                self.translate_binary_op(dest, op1, op2, &default_type, JI::Iadd)?
-            }
-            OI::Sub { dest, op1, op2 } => {
-                self.translate_binary_op(dest, op1, op2, &default_type, JI::Isub)?
-            }
-            OI::Mul { dest, op1, op2 } => {
-                self.translate_binary_op(dest, op1, op2, &default_type, JI::Imul)?
-            }
-            OI::Div { dest, op1, op2 } => {
-                self.translate_binary_op(dest, op1, op2, &default_type, JI::Idiv)?
-            } // Handle division by zero?
-            OI::Rem { dest, op1, op2 } => {
-                self.translate_binary_op(dest, op1, op2, &default_type, JI::Irem)?
-            }
+            OI::Add { dest, op1, op2 } => self.translate_binary_op(dest, op1, op2, JI::Iadd)?,
+            OI::Sub { dest, op1, op2 } => self.translate_binary_op(dest, op1, op2, JI::Isub)?,
+            OI::Mul { dest, op1, op2 } => self.translate_binary_op(dest, op1, op2, JI::Imul)?,
+            OI::Div { dest, op1, op2 } => self.translate_binary_op(dest, op1, op2, JI::Idiv)?, // Handle division by zero?
+            OI::Rem { dest, op1, op2 } => self.translate_binary_op(dest, op1, op2, JI::Irem)?,
 
             OI::AddWithOverflow { dest, op1, op2 } => {
                 let base_label = format!("_add_ovf_{}", self.jvm_instructions.len());
@@ -648,9 +751,15 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 let result_var = format!("{}_result", dest);
                 let overflow_var = format!("{}_overflow", dest);
 
+                // get the type of op1
+                let default_type = match op1 {
+                    OO::Variable { ty, .. } => ty.clone(),
+                    OO::Constant(c) => Type::from_constant(c),
+                };
+
                 // Load operands (a, b) and store temporarily
-                self.load_operand(op1, &default_type)?;
-                self.load_operand(op2, &default_type)?;
+                self.load_operand(op1)?;
+                self.load_operand(op2)?;
                 let b_tmp_idx = self.get_or_assign_local(&format!("{}_b_tmp", dest), &default_type);
                 self.jvm_instructions
                     .push(Self::get_store_instruction(&default_type, b_tmp_idx)?);
@@ -764,9 +873,15 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 let result_var = format!("{}_result", dest);
                 let overflow_var = format!("{}_overflow", dest);
 
+                // get the type of op1
+                let default_type = match op1 {
+                    OO::Variable { ty, .. } => ty.clone(),
+                    OO::Constant(c) => Type::from_constant(c),
+                };
+
                 // Load operands (a, b) and store temporarily
-                self.load_operand(op1, &default_type)?;
-                self.load_operand(op2, &default_type)?;
+                self.load_operand(op1)?;
+                self.load_operand(op2)?;
                 let b_tmp_idx = self.get_or_assign_local(&format!("{}_b_tmp", dest), &default_type);
                 self.jvm_instructions
                     .push(Self::get_store_instruction(&default_type, b_tmp_idx)?);
@@ -901,40 +1016,30 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             // --- Comparisons ---
             // Need to handle operand types (int, long, float, double, ref)
             OI::Eq { dest, op1, op2 } => {
-                self.translate_comparison_op(dest, op1, op2, &default_type, JI::If_icmpeq)?
+                self.translate_comparison_op(dest, op1, op2, JI::If_icmpeq)?
             }
             OI::Ne { dest, op1, op2 } => {
-                self.translate_comparison_op(dest, op1, op2, &default_type, JI::If_icmpne)?
+                self.translate_comparison_op(dest, op1, op2, JI::If_icmpne)?
             }
             OI::Lt { dest, op1, op2 } => {
-                self.translate_comparison_op(dest, op1, op2, &default_type, JI::If_icmplt)?
+                self.translate_comparison_op(dest, op1, op2, JI::If_icmplt)?
             }
             OI::Le { dest, op1, op2 } => {
-                self.translate_comparison_op(dest, op1, op2, &default_type, JI::If_icmple)?
+                self.translate_comparison_op(dest, op1, op2, JI::If_icmple)?
             }
             OI::Gt { dest, op1, op2 } => {
-                self.translate_comparison_op(dest, op1, op2, &default_type, JI::If_icmpgt)?
+                self.translate_comparison_op(dest, op1, op2, JI::If_icmpgt)?
             }
             OI::Ge { dest, op1, op2 } => {
-                self.translate_comparison_op(dest, op1, op2, &default_type, JI::If_icmpge)?
+                self.translate_comparison_op(dest, op1, op2, JI::If_icmpge)?
             }
 
             // --- Bitwise Operations ---
-            OI::BitAnd { dest, op1, op2 } => {
-                self.translate_binary_op(dest, op1, op2, &default_type, JI::Iand)?
-            }
-            OI::BitOr { dest, op1, op2 } => {
-                self.translate_binary_op(dest, op1, op2, &default_type, JI::Ior)?
-            }
-            OI::BitXor { dest, op1, op2 } => {
-                self.translate_binary_op(dest, op1, op2, &default_type, JI::Ixor)?
-            }
-            OI::Shl { dest, op1, op2 } => {
-                self.translate_binary_op(dest, op1, op2, &default_type, JI::Ishl)?
-            }
-            OI::Shr { dest, op1, op2 } => {
-                self.translate_binary_op(dest, op1, op2, &default_type, JI::Ishr)?
-            } // Assuming signed shr, needs checking
+            OI::BitAnd { dest, op1, op2 } => self.translate_binary_op(dest, op1, op2, JI::Iand)?,
+            OI::BitOr { dest, op1, op2 } => self.translate_binary_op(dest, op1, op2, JI::Ior)?,
+            OI::BitXor { dest, op1, op2 } => self.translate_binary_op(dest, op1, op2, JI::Ixor)?,
+            OI::Shl { dest, op1, op2 } => self.translate_binary_op(dest, op1, op2, JI::Ishl)?,
+            OI::Shr { dest, op1, op2 } => self.translate_binary_op(dest, op1, op2, JI::Ishr)?, // Assuming signed shr, needs checking
 
             // --- Logical Operations (Need Short-circuiting) ---
             // These are more complex as they involve control flow, not direct JVM ops.
@@ -949,10 +1054,18 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             //   iconst_0          // Result is false
             // label_end:
             //   istore dest
-            OI::And { dest, op1, op2 } => {
+            OI::And {
+                dest: _,
+                op1: _,
+                op2: _,
+            } => {
                 unimplemented!("Logical And needs control flow translation")
             }
-            OI::Or { dest, op1, op2 } => {
+            OI::Or {
+                dest: _,
+                op1: _,
+                op2: _,
+            } => {
                 unimplemented!("Logical Or needs control flow translation")
             }
 
@@ -968,7 +1081,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 false_block,
             } => {
                 // 1. Load the condition (must evaluate to int 0 or 1)
-                self.load_operand(condition, &oomir::Type::Boolean)?; // Assuming boolean type
+                self.load_operand(condition)?;
 
                 // 2. Add conditional jump (if condition != 0, jump to true_block)
                 let instr_idx_ifne = self.jvm_instructions.len();
@@ -989,12 +1102,14 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             } => {
                 // We will translate this into a chain of if/goto instructions.
 
-                // 0. Determine the type of the discriminant (Assume I32 for JVM switch)
-                //    Ideally, lower1 would guarantee this or provide type info.
-                let discr_type = oomir::Type::I32; // Essential assumption for if_icmp*
+                // 0. calculate the type of the discriminant
+                let discr_type = match discr {
+                    OO::Variable { ty, .. } => ty.clone(),
+                    OO::Constant(c) => Type::from_constant(c),
+                };
 
                 // 1. Load the discriminant value onto the stack
-                self.load_operand(discr, &discr_type)?;
+                self.load_operand(discr)?;
 
                 // 2. Store the discriminant in a temporary local variable.
                 //    This is necessary because each comparison (if_icmpeq) consumes operands,
@@ -1014,9 +1129,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                         oomir::Constant::I8(v) => i32::from(*v),
                         oomir::Constant::I16(v) => i32::from(*v),
                         oomir::Constant::I32(v) => *v,
-                        oomir::Constant::U8(v) => i32::from(*v), // Treat as signed for JVM comparison
-                        oomir::Constant::U16(v) => i32::from(*v), // Treat as signed
-                        oomir::Constant::U32(v) => *v as i32,    // Treat as signed
                         oomir::Constant::Boolean(b) => {
                             if *b {
                                 1
@@ -1068,17 +1180,14 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     Some(op) => {
                         // Determine type based on function signature's return type
                         let ret_ty = &self.oomir_func.signature.ret;
-                        self.load_operand(op, ret_ty)?;
+                        self.load_operand(op)?;
                         let return_instr = match **ret_ty {
                             oomir::Type::I8
                             | oomir::Type::I16
                             | oomir::Type::I32
-                            | oomir::Type::U8
-                            | oomir::Type::U16
-                            | oomir::Type::U32
                             | oomir::Type::Boolean
                             | oomir::Type::Char => JI::Ireturn,
-                            oomir::Type::I64 | oomir::Type::U64 => JI::Lreturn,
+                            oomir::Type::I64 => JI::Lreturn,
                             oomir::Type::F32 => JI::Freturn,
                             oomir::Type::F64 => JI::Dreturn,
                             oomir::Type::Reference(_)
@@ -1096,109 +1205,174 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             }
             OI::Call {
                 dest,
-                function,
+                function: function_name,
                 args,
             } => {
-                let mut is_diverging_call = false; // Track if the call will panic/not return
+                println!(
+                    "Translating Call: name='{}', args={:?}",
+                    function_name, args
+                );
 
-                // Try mapping to a known stdlib function first
-                if let Some((kotlin_class, kotlin_method, jvm_descriptor)) =
-                    Self::map_stdlib_call(function)
-                {
-                    // 1. Load arguments onto the stack
-                    // TODO: have the kotlin shim library build process generate some metadata file that we can just load and compare here, rather than manually specifying the signatures.
-                    if function.contains("panic_fmt") && args.len() == 1 {
-                        // Assuming the single argument IS the message string operand
-                        self.load_operand(&args[0], &oomir::Type::String)?; // Load as String
-                        is_diverging_call = true; // This call will not return
-                    } else if function.contains("new_const") && args.len() == 1 {
-                        // Assuming the simplified approach where args[0] is the string piece
-                        self.load_operand(&args[0], &oomir::Type::String)?;
-                    } else {
-                        // Handle argument loading for other stdlib calls or error out
-                        return Err(jvm::Error::VerificationError {
-                            context: format!("Function {}", self.oomir_func.name),
-                            message: format!(
-                                "Argument mismatch or unhandled stdlib function signature for '{}'",
-                                function
-                            ),
-                        });
-                    }
+                let mut handled_as_shim = false;
+                let mut is_diverging_call = false;
 
-                    // 2. Add MethodRef to constant pool
-                    let class_index = self.constant_pool.add_class(kotlin_class)?;
-                    let method_ref_index = self.constant_pool.add_method_ref(
-                        class_index,
-                        kotlin_method,
-                        jvm_descriptor,
-                    )?;
+                // --- Shim Lookup using JSON metadata ---
+                match get_shim_metadata() {
+                    Ok(shim_map) => {
+                        // Use the function_name (make_jvm_safe output) as the key
+                        if let Some(shim_info) = shim_map.get(function_name) {
+                            println!(
+                                "Found shim for '{}' in JSON metadata: {:?}",
+                                function_name, shim_info
+                            );
+                            handled_as_shim = true;
 
-                    // 3. Add invokestatic instruction
-                    self.jvm_instructions
-                        .push(JI::Invokestatic(method_ref_index));
-
-                    // 4. Store result if 'dest' is Some and the shim returns something
-                    // Example for new_const_stub which returns String:
-                    if !is_diverging_call {
-                        if function.contains("new_const") {
-                            if let Some(dest_var) = dest {
-                                self.store_result(dest_var, &oomir::Type::String)?; // Store the returned String
+                            // 1. Load arguments
+                            for arg in args {
+                                self.load_operand(arg)?;
                             }
-                        }
+
+                            // 2. Add MethodRef
+                            // Convention: Class is always org/rustlang/core/Core
+                            let kotlin_shim_class = "org/rustlang/core/Core";
+                            let class_index = self.constant_pool.add_class(kotlin_shim_class)?;
+                            let method_ref_index = self.constant_pool.add_method_ref(
+                                class_index,
+                                function_name,         // The key IS the method name
+                                &shim_info.descriptor, // Use descriptor from JSON
+                            )?;
+
+                            // 3. Add invoke instruction
+                            if shim_info.is_static {
+                                self.jvm_instructions
+                                    .push(JI::Invokestatic(method_ref_index));
+                            } else {
+                                return Err(jvm::Error::VerificationError {
+                                    context: format!("Function {}", self.oomir_func.name),
+                                    message: format!(
+                                        "Non-static shim calls not yet supported ('{}')",
+                                        function_name
+                                    ),
+                                });
+                            }
+
+                            // Check for diverging
+                            // Currently hardcoded
+                            if function_name == "panic_fmt" {
+                                is_diverging_call = true;
+                            }
+
+                            // 4. Store result (logic remains similar, needs descriptor parsing)
+                            if !is_diverging_call && !shim_info.descriptor.ends_with(")V") {
+                                if let Some(dest_var) = dest {
+                                    // Parse the return type from the descriptor
+                                    let return_type = oomir::Type::from_jvm_descriptor_return_type(
+                                        &shim_info.descriptor,
+                                    );
+                                    self.store_result(dest_var, &return_type)?;
+                                } else {
+                                    // Pop ignored result (needs size from descriptor)
+                                    let return_type = oomir::Type::from_jvm_descriptor_return_type(
+                                        &shim_info.descriptor,
+                                    );
+                                    match Self::get_type_size(&return_type) {
+                                        1 => self.jvm_instructions.push(JI::Pop),
+                                        2 => self.jvm_instructions.push(JI::Pop2),
+                                        _ => {
+                                            return Err(jvm::Error::VerificationError {
+                                                context: format!(
+                                                    "Function {}",
+                                                    self.oomir_func.name
+                                                ),
+                                                message: format!(
+                                                    "Unexpected return type size for shim '{}' from descriptor '{}'",
+                                                    function_name, shim_info.descriptor
+                                                ),
+                                            });
+                                        }
+                                    }
+                                }
+                            } else if dest.is_some()
+                                && !is_diverging_call
+                                && shim_info.descriptor.ends_with(")V")
+                            {
+                                return Err(jvm::Error::VerificationError {
+                                    context: format!("Function {}", self.oomir_func.name),
+                                    message: format!(
+                                        "Attempting to store void result from shim '{}'",
+                                        function_name
+                                    ),
+                                });
+                            }
+                        } // End if shim_info found by name
+                    } // End Ok(shim_map)
+                    Err(e) => {
+                        // Metadata loading failed, print warning and fall through
+                        println!(
+                            "Warning: Failed to get shim metadata: {}. Falling back to intra-module call attempt for '{}'.",
+                            e, function_name
+                        );
                     }
-                } else {
-                    let target_func = module.functions.get(function).ok_or_else(|| {
+                } // End Shim Lookup
+
+                // --- Intra-Module Call (Fallback) ---
+                if !handled_as_shim {
+                    println!("Treating call to '{}' as intra-module.", function_name);
+                    // This logic remains the same, using function_name for lookup
+                    let target_func = module.functions.get(function_name).ok_or_else(|| {
                         jvm::Error::VerificationError {
                             context: format!("Function {}", self.oomir_func.name),
                             message: format!(
-                                "Cannot find signature for intra-module called function '{}'",
-                                function
+                                "Cannot find function '{}' within OOMIR module or as a known shim.",
+                                function_name
                             ),
                         }
                     })?;
                     let target_sig = &target_func.signature;
 
-                    // 1. Load arguments onto the stack
+                    // 1. Load arguments
                     if args.len() != target_sig.params.len() {
                         return Err(jvm::Error::VerificationError {
                             context: format!("Function {}", self.oomir_func.name),
                             message: format!(
-                                "Argument count mismatch calling intra-module function '{}'",
-                                function
+                                "Argument count mismatch for function '{}': expected {}, found {}",
+                                function_name,
+                                target_sig.params.len(),
+                                args.len()
                             ),
                         });
                     }
-                    for (arg, param_ty) in args.iter().zip(target_sig.params.iter()) {
-                        self.load_operand(arg, param_ty)?;
+                    for (arg, _) in args.iter().zip(target_sig.params.iter()) {
+                        self.load_operand(arg)?;
                     }
 
-                    // 2. Add MethodRef to constant pool
-                    let class_index = self.constant_pool.add_class(self.this_class_name)?; // Assume call within same class
+                    // 2. Add MethodRef
+                    let class_index = self.constant_pool.add_class(self.this_class_name)?;
                     let method_ref_index = self.constant_pool.add_method_ref(
                         class_index,
-                        function.clone(),       // function name is correct here
-                        target_sig.to_string(), // Get descriptor from OOMIR sig
+                        function_name.clone(),
+                        target_sig.to_string(),
                     )?;
 
-                    // 3. Add invokestatic instruction
+                    // 3. Add invokestatic
                     self.jvm_instructions
                         .push(JI::Invokestatic(method_ref_index));
 
-                    // 4. Store result if 'dest' is Some
+                    // 4. Store result or Pop
                     if let Some(dest_var) = dest {
                         if *target_sig.ret != oomir::Type::Void {
                             self.store_result(dest_var, &target_sig.ret)?;
-                        } else if dest.is_some() {
-                            return Err(jvm::Error::VerificationError {
-                                context: format!("Function {}", self.oomir_func.name),
-                                message: format!(
-                                    "Attempting to store void result from intra-module function '{}'",
-                                    function
-                                ),
-                            });
+                        } else { /* error storing void */
+                        }
+                    } else if *target_sig.ret != oomir::Type::Void {
+                        match Self::get_type_size(&target_sig.ret) {
+                            1 => self.jvm_instructions.push(JI::Pop),
+                            2 => self.jvm_instructions.push(JI::Pop2),
+                            _ => {}
                         }
                     }
                 }
+
                 if is_diverging_call {
                     // After calling a function like panic_fmt that returns void but always throws,
                     // add an unreachable throw sequence to satisfy the bytecode verifier.
@@ -1217,29 +1391,25 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 }
             }
             OI::Move { dest, src } => {
-                let (load_type_hint, store_type) = match src {
+                let (_, store_type) = match src {
                     oomir::Operand::Constant(c) => {
-                        let ty = get_constant_type(c);
+                        let ty = oomir::Type::from_constant(c);
                         // Load constant uses its own logic, store needs the specific type.
                         (ty.clone(), ty)
                     }
-                    oomir::Operand::Variable(_) => {
-                        // TODO: Add type tracking for variables.
-                        // Use the default type (i32) for now.
-                        (default_type.clone(), default_type.clone())
+                    oomir::Operand::Variable { ty, .. } => {
+                        // Load uses the type of the variable, store needs the specific type.
+                        (ty.clone(), ty.clone())
                     }
                 };
 
-                self.load_operand(src, &load_type_hint)?; // Load the source
+                self.load_operand(src)?; // Load the source
                 self.store_result(dest, &store_type)?; // Store using the correct type if known
             }
             OI::Throw { exception } => {
                 // Assuming the operand is already an exception *instance* reference
                 // TODO: Determine the correct type hint here! Assuming Object for now.
-                self.load_operand(
-                    exception,
-                    &oomir::Type::Class("java/lang/Throwable".to_string()),
-                )?;
+                self.load_operand(exception)?;
                 self.jvm_instructions.push(JI::Athrow);
             }
             OI::ThrowNewWithMessage {
@@ -1273,26 +1443,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             }
         }
         Ok(())
-    }
-
-    fn map_stdlib_call(rust_fn_name: &str) -> Option<(&str, &str, &str)> {
-        // (Kotlin Class, Kotlin Method, JVM Descriptor)
-        if rust_fn_name.contains("panic_fmt") {
-            Some((
-                "org/rustlang/core/Core",
-                "rust_panic_fmt",
-                "(Ljava/lang/String;)V",
-            ))
-        } else if rust_fn_name.contains("Arguments") && rust_fn_name.contains("new_const") {
-            // Match key parts
-            Some((
-                "org/rustlang/core/Core",
-                "rust_fmt_arguments_new_const_stub",
-                "(Ljava/lang/String;)Ljava/lang/String;",
-            ))
-        } else {
-            None // Not a recognized stdlib function we have a shim for
-        }
     }
 }
 
@@ -1421,20 +1571,4 @@ fn create_default_constructor(
         descriptor_index: init_desc_index,
         attributes: vec![code_attribute],
     })
-}
-
-/// Finds out what OOMIR type an OOMIR constant is.
-fn get_constant_type(c: &oomir::Constant) -> oomir::Type {
-    match c {
-        oomir::Constant::I8(_) | oomir::Constant::U8(_) => oomir::Type::I8, // Or I32 if JVM targetting I32 always
-        oomir::Constant::I16(_) | oomir::Constant::U16(_) => oomir::Type::I16, // Or I32
-        oomir::Constant::I32(_) | oomir::Constant::U32(_) => oomir::Type::I32,
-        oomir::Constant::I64(_) | oomir::Constant::U64(_) => oomir::Type::I64,
-        oomir::Constant::F32(_) => oomir::Type::F32,
-        oomir::Constant::F64(_) => oomir::Type::F64,
-        oomir::Constant::Boolean(_) => oomir::Type::Boolean, // Or I32
-        oomir::Constant::Char(_) => oomir::Type::Char,       // Or I32
-        oomir::Constant::String(_) => oomir::Type::String,
-        oomir::Constant::Class(name) => oomir::Type::Class(name.clone()),
-    }
 }
