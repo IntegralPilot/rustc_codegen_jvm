@@ -20,11 +20,7 @@ jobs:
       uses: dtolnay/rust-toolchain@stable
       with:
         toolchain: nightly
-        components: rustc-dev llvm-tools, cargo
-
-    # 3. Cargo Caching (Crucial for speed)
-    - name: Cache cargo dependencies
-      uses: Swatinem/rust-cache@v2
+        components: rustc-dev llvm-tools cargo
 
     # 4. Set up Java
     - name: Set up Java
@@ -39,14 +35,22 @@ jobs:
       with:
         python-version: '3.x'
 
-    # 6. Set up Gradle)
+    # 6. Set up Gradle
     - name: Set up Gradle
       uses: gradle/actions/setup-gradle@v4
 
-    # 7. Build using the CI-specific make target
+    # 7. Make just the files needed to cargo cache
+    - name: Make Gen Files
+      run: make gen-files
+      
+    # 8. Cargo Caching (Crucial for speed)
+    - name: Cache cargo dependencies
+      uses: Swatinem/rust-cache@v2
+    
+    # 9. Build using the CI-specific make target
     - name: Build CI Target
       run: make ci # Use your optimized CI build command
 
-    # 8. Run tests
+    # 10. Run tests
     - name: Run integration tests
       run: python3 Tester.py

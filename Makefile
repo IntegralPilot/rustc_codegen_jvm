@@ -16,11 +16,15 @@ LIBRARY_DIR := library
 LIBRARY_JAR := $(LIBRARY_DIR)/build/libs/library-0.1.0.jar
 
 # === Default Target ===
+ifeq ($(IS_CI),1)
+all: rust java-linker asm-processor
+	@echo "$(GREEN)✨ Build complete in CI mode! ✨$(RESET)"
+else
 all: rust gen-files java-linker asm-processor
 	@echo "$(GREEN)✨ Build complete! ✨$(RESET)"
+endif
 
 # === CI Target ===
-# Running "make ci" sets IS_CI=1 and then behaves exactly like "make all"
 ci:
 	$(MAKE) all IS_CI=1
 
@@ -89,22 +93,38 @@ clean-shim-metadata-gen:
 # === ASM Processor (Gradle) ===
 asm-processor:
 	@echo "$(CYAN)⚙️  Building ASM processor...$(RESET)"
+ifeq ($(IS_CI),1)
+	cd $(ASM_PROCESSOR_DIR) && gradle --no-daemon shadowJar
+else
 	cd $(ASM_PROCESSOR_DIR) && gradle shadowJar
+endif
 
 clean-asm-processor:
 	@echo "$(CYAN)🧹 Cleaning ASM processor...$(RESET)"
+ifeq ($(IS_CI),1)
+	cd $(ASM_PROCESSOR_DIR) && gradle --no-daemon clean
+else
 	cd $(ASM_PROCESSOR_DIR) && gradle clean
+endif
 
 # === Standard Library Shim (Gradle) ===
 library: $(LIBRARY_JAR)
 
 $(LIBRARY_JAR):
 	@echo "$(CYAN)📚 Building standard library shim...$(RESET)"
+ifeq ($(IS_CI),1)
+	cd $(LIBRARY_DIR) && gradle --no-daemon build && cd build/distributions && unzip -o library-0.1.0.zip
+else
 	cd $(LIBRARY_DIR) && gradle build && cd build/distributions && unzip -o library-0.1.0.zip
+endif
 
 clean-library:
 	@echo "$(CYAN)🧹 Cleaning library shim...$(RESET)"
+ifeq ($(IS_CI),1)
+	cd $(LIBRARY_DIR) && gradle --no-daemon clean
+else
 	cd $(LIBRARY_DIR) && gradle clean
+endif
 
 # === Generate files from templates ===
 gen-files: clean-gen-files
