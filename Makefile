@@ -14,6 +14,7 @@ SHIM_METADATA_GEN_DIR := shim-metadata-gen
 ASM_PROCESSOR_DIR := asm-processor
 LIBRARY_DIR := library
 LIBRARY_JAR := $(LIBRARY_DIR)/build/libs/library-0.1.0.jar
+RUST_SOURCES := $(shell find $(SHIM_METADATA_GEN_DIR)/src -type f -name '*.rs')
 
 # === Default Target ===
 ifeq ($(IS_CI),1)
@@ -39,7 +40,6 @@ help:
 	@echo "  make rust-components      - Install needed Rust components"
 	@echo "  make rust                 - Build the Rust root project"
 	@echo "  make java-linker          - Build the Java Linker subproject"
-	@echo "  make shim-metadata-gen    - Generate library shim metadata"
 	@echo "  make asm-processor        - Build the ASM processor"
 	@echo "  make library              - Build the standard library shim"
 	@echo "  make gen-files            - Generate necessary files from templates"
@@ -75,11 +75,9 @@ clean-java-linker:
 	cd $(JAVA_LINKER_DIR) && cargo clean
 
 # === Library Shim Metadata Generator ===
-$(SHIM_METADATA_GEN_DIR)/core.json: library
+$(SHIM_METADATA_GEN_DIR)/core.json: $(RUST_SOURCES) library clean-shim-metadata-gen-json-files
 	@if [ "$(IS_CI)" = "1" ]; then \
 	    echo "$(CYAN)CI mode: skipping shim-metadata-gen$(RESET)"; \
-	elif [ -f $@ ]; then \
-	    echo "$(CYAN)core.json already exists, skipping shim-metadata-gen$(RESET)"; \
 	else \
 	    echo "$(CYAN)🛠️  Generating library shim metadata...$(RESET)"; \
 	    cd $(SHIM_METADATA_GEN_DIR) && cargo run -- ../$(LIBRARY_JAR) ./core.json; \
@@ -88,7 +86,14 @@ $(SHIM_METADATA_GEN_DIR)/core.json: library
 clean-shim-metadata-gen:
 	@echo "$(CYAN)🧹 Cleaning shim-metadata-gen...$(RESET)"
 	cd $(SHIM_METADATA_GEN_DIR) && cargo clean
-	rm -f $(SHIM_METADATA_GEN_DIR)/core.json
+
+clean-shim-metadata-gen-json-files:
+	@if [ "$(IS_CI)" = "1" ]; then \
+	    echo "$(CYAN)CI mode: skipping cleaning shim-metadata-gen JSON files$(RESET)"; \
+	else \
+	    echo "$(CYAN)🧹 Cleaning shim-metadata-gen JSON files...$(RESET)"; \
+	    rm -f $(SHIM_METADATA_GEN_DIR)/*.json; \
+	fi
 
 # === ASM Processor (Gradle) ===
 asm-processor:
