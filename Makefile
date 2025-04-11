@@ -1,7 +1,7 @@
 # === Phony Targets ===
 .PHONY: all help clean rust-components rust clean-rust java-linker clean-java-linker \
         shim-metadata-gen clean-shim-metadata-gen asm-processor clean-asm-processor \
-        library clean-library gen-files clean-gen-files
+        library clean-library gen-files clean-gen-files ci
 
 # === Terminal Colors ===
 GREEN  := \033[1;32m
@@ -19,12 +19,18 @@ LIBRARY_JAR := $(LIBRARY_DIR)/build/libs/library-0.1.0.jar
 all: rust gen-files java-linker asm-processor
 	@echo "$(GREEN)✨ Build complete! ✨$(RESET)"
 
+# === CI Target ===
+# Running "make ci" sets IS_CI=1 and then behaves exactly like "make all"
+ci:
+	$(MAKE) all IS_CI=1
+
 # === Help ===
 help:
 	@echo "$(CYAN)🛠️  Makefile for building the project$(RESET)"
 	@echo ""
 	@echo "Available targets:"
 	@echo "  make all                  - Build all components"
+	@echo "  make ci                   - Build all components in CI mode (skips rust-components and shim-metadata-gen)"
 	@echo "  make clean                - Clean all components"
 	@echo "  make rust-components      - Install needed Rust components"
 	@echo "  make rust                 - Build the Rust root project"
@@ -38,12 +44,18 @@ help:
 # === Needed rust components ===
 rust-components:
 	@echo "$(CYAN)🔧 Installing Rust components...$(RESET)"
-	rustup component add rust-src rustc-dev llvm-tools-preview
+	rustup component add rustc-dev llvm-tools
 
 # === Rust root project (Cargo) ===
+ifeq ($(IS_CI),1)
+rust: $(SHIM_METADATA_GEN_DIR)/core.json
+	@echo "$(CYAN)📦 Building Rust root project...$(RESET)"
+	cargo build
+else
 rust: $(SHIM_METADATA_GEN_DIR)/core.json rust-components
 	@echo "$(CYAN)📦 Building Rust root project...$(RESET)"
 	cargo build
+endif
 
 clean-rust:
 	@echo "$(CYAN)🧹 Cleaning Rust root project...$(RESET)"
@@ -60,8 +72,14 @@ clean-java-linker:
 
 # === Library Shim Metadata Generator ===
 $(SHIM_METADATA_GEN_DIR)/core.json: library
-	@echo "$(CYAN)🛠️  Generating library shim metadata...$(RESET)"
-	cd $(SHIM_METADATA_GEN_DIR) && cargo run -- ../$(LIBRARY_JAR) ./core.json
+	@if [ "$(IS_CI)" = "1" ]; then \
+	    echo "$(CYAN)CI mode: skipping shim-metadata-gen$(RESET)"; \
+	elif [ -f $@ ]; then \
+	    echo "$(CYAN)core.json already exists, skipping shim-metadata-gen$(RESET)"; \
+	else \
+	    echo "$(CYAN)🛠️  Generating library shim metadata...$(RESET)"; \
+	    cd $(SHIM_METADATA_GEN_DIR) && cargo run -- ../$(LIBRARY_JAR) ./core.json; \
+	fi
 
 clean-shim-metadata-gen:
 	@echo "$(CYAN)🧹 Cleaning shim-metadata-gen...$(RESET)"
@@ -88,7 +106,7 @@ clean-library:
 	@echo "$(CYAN)🧹 Cleaning library shim...$(RESET)"
 	cd $(LIBRARY_DIR) && gradle clean
 
-# === Generate files from templates ==
+# === Generate files from templates ===
 gen-files: clean-gen-files
 	@echo "$(CYAN)🛠️  Generating files from templates...$(RESET)"
 	python3 GenerateFiles.py
