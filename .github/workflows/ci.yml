@@ -45,3 +45,7 @@ jobs:
 
     - name: Run integration tests
       run: python3 Tester.py
+
+    - name: Cleanup
+      if: always() # Ensure cleanup runs even if previous steps failed
+      run: make clean
