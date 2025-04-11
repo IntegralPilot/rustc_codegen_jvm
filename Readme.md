@@ -84,8 +84,15 @@ To compile *your own* Rust project using this backend:
         rustflags = [
           "-Z", "codegen-backend=/path/to/rustc_codegen_jvm/target/debug/librustc_codegen_jvm.dylib",
           "-C", "linker=/path/to/rustc_codegen_jvm/java-linker/target/debug/java-linker",
-          "-C", "link-args=--asm-processor /path/to/rustc_codegen_jvm/asm-processor/build/libs/asm-processor-1.0-SNAPSHOT-all.jar"
+          "-C", "link-args=/path/to/rustc_codegen_jvm/library/build/distributions/library-0.1.0/lib/library-0.1.0.jar /path/to/rustc_codegen_jvm/library/build/distributions/library-0.1.0/lib/kotlin-stdlib-2.1.20.jar --asm-processor /path/to/rustc_codegen_jvm/asm-processor/build/libs/asm-processor-1.0-SNAPSHOT-all.jar --known-good kotlin-stdlib"
         ]
+
+        # Throwing a JVM exception will unwind and give a stack trace, no need for rust to handle unwinding.
+        [profile.debug]
+        panic = "abort"
+
+        [profile.release]
+        panic = "abort"
         ```
     *   **Important:** Replace `/path/to/rustc_codegen_jvm/...` with the path to where you cloned the repository. If you're not on macOS, changed `.dylib` to `.so` for Linux or `.dll` for Windows.
 
@@ -111,7 +118,7 @@ To compile *your own* Rust project using this backend:
 This project includes integration tests managed by a Python script.
 
 1.  **Ensure Toolchain is Built:** Build the project using `make all`.
-2.  **Check Target JSON:** Make sure the `jvm-unknown-unknown.json` file in the *root* of this repository has the **relative paths** starting with `../../../` for the linker and backend, as the tester expects this structure when running tests from subdirectories. If you changed them to absolute paths for external use, change them back temporarily.
+2.  **Check Target JSON:** Make sure the `jvm-unknown-unknown.json` file in the *root* of this repository has the **relative paths** starting with `/path/to/rustc_codegen_jvm/` for the linker and backend, as the tester expects this structure when running tests from subdirectories. If you changed them to absolute paths for external use, change them back temporarily.
 3.  **Run the Tester:**
     ```bash
     python3 Tester.py

@@ -61,6 +61,7 @@ struct FunctionTranslator<'a, 'cp> {
     this_class_name: &'a str, // Class name for self-references if needed
 
     local_var_map: HashMap<String, u16>, // OOMIR var name -> JVM local index
+    local_var_types: HashMap<String, oomir::Type>, // OOMIR var name -> OOMIR Type
     next_local_index: u16,
     jvm_instructions: Vec<jvm::attributes::Instruction>,
     label_to_instr_index: HashMap<String, u16>, // OOMIR label -> JVM instruction index
@@ -85,6 +86,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             constant_pool,
             this_class_name,
             local_var_map: HashMap::new(),
+            local_var_types: HashMap::new(),
             next_local_index: 0, // Start at 0 for static methods
             jvm_instructions: Vec::new(),
             label_to_instr_index: HashMap::new(),
@@ -98,72 +100,137 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         // Assumes OOMIR uses MIR's _1, _2 naming convention for args passed from lower1.rs.
         let num_params = oomir_func.signature.params.len();
         for i in 0..num_params {
-            // Construct the MIR-style parameter name "_1", "_2", etc.
-            let param_mir_name = format!("_{}", i + 1);
+            // Internal name for translator logic (optional, but helps clarity if complex logic added later)
+            let param_translator_name = format!("param_{}", i);
+            // The name used in the OOMIR body, corresponding to MIR convention (_1, _2, ...)
+            let param_oomir_name = format!("_{}", i + 1);
             let param_ty = &oomir_func.signature.params[i];
 
-            // Use assign_local to allocate the correct slot(s) and update state
-            // This correctly handles types taking 1 or 2 slots (like long/double)
-            // and advances next_local_index.
-            let assigned_index = translator.assign_local(param_mir_name.as_str(), param_ty);
+            // Use assign_local to allocate the slot using the *translator* name first.
+            // This ensures the slot is reserved and next_local_index advances correctly.
+            let assigned_index = translator.assign_local(param_translator_name.as_str(), param_ty);
 
-            // Optional: Debug print to confirm mapping
+            // --- ADD THIS ---
+            // Now, explicitly map the OOMIR name (_1, _2, ...) to the *same* slot index
+            // and store its type information using the OOMIR name as the key.
+            // This allows instructions in the body using "_1" to find the correct slot.
+            if translator
+                .local_var_map
+                .insert(param_oomir_name.clone(), assigned_index)
+                .is_some()
+            {
+                // This shouldn't happen if MIR locals truly start after parameters
+                println!(
+                    "Warning: OOMIR parameter name '{}' potentially clashed with an existing mapping during parameter assignment.",
+                    param_oomir_name
+                );
+            }
+            if translator
+                .local_var_types
+                .insert(param_oomir_name.clone(), param_ty.clone())
+                .is_some()
+            {
+                println!(
+                    "Warning: OOMIR parameter name '{}' potentially clashed with an existing type mapping during parameter assignment.",
+                    param_oomir_name
+                );
+            }
+            // --- END ADD ---
+
+            // Debug print confirmation
             println!(
-                "Debug: Mapped parameter {} ({:?}) to JVM local starting at index {}",
-                param_mir_name, param_ty, assigned_index
+                "Debug: Mapped parameter (MIR '{}', Translator '{}') ({:?}) to JVM local index {}",
+                param_oomir_name,      // The OOMIR name
+                param_translator_name, // The internal name (optional for lookup now)
+                param_ty,
+                assigned_index
             );
         }
-        // `next_local_index` and `max_locals_used` are now correctly updated
-        // by the assign_local calls within the loop.
-
-        // Recalculate next_local_index based on parameters
-        translator.next_local_index = translator.max_locals_used;
 
         translator
     }
 
-    /// Assigns a JVM local variable slot to an OOMIR variable name.
-    /// Handles types that take two slots (long, double).
+    /// Assigns a local variable to a JVM slot, returning the index.
     fn assign_local(&mut self, var_name: &str, ty: &oomir::Type) -> u16 {
         if let std::collections::hash_map::Entry::Vacant(e) =
             self.local_var_map.entry(var_name.to_string())
         {
             let index = self.next_local_index;
             e.insert(index);
+            self.local_var_types
+                .insert(var_name.to_string(), ty.clone());
             let size = Self::get_type_size(ty);
             self.next_local_index += size;
             self.max_locals_used = self.max_locals_used.max(index + size);
+            println!(
+                "Debug: Assigned local '{}' (type {:?}) to index {}, size {}, next_local_index is now {}",
+                var_name, ty, index, size, self.next_local_index
+            );
             index
         } else {
-            // Should ideally not happen if OOMIR uses SSA-like properties or unique names per scope
+            // This warning might fire legitimately now if get_or_assign_local tries to assign
+            // _1 after the parameter mapping, which is fine.
+            println!(
+                "Debug: Attempted to re-assign existing local '{}' (index {}). Using existing index.",
+                var_name, self.local_var_map[var_name]
+            );
             self.local_var_map[var_name]
         }
     }
 
     /// Gets the slot index for a variable, assigning if new.
-    /// *Important*: This assumes the type is known when assigning. It might be better
-    /// to pre-scan or have type info available alongside variable names in OOMIR.
-    /// For now, we'll try to infer type from context or default to size 1.
     fn get_or_assign_local(&mut self, var_name: &str, ty_hint: &oomir::Type) -> u16 {
-        *self
-            .local_var_map
-            .entry(var_name.to_string())
-            .or_insert_with(|| {
-                let index = self.next_local_index;
-                let size = Self::get_type_size(ty_hint);
-                self.next_local_index += size;
-                self.max_locals_used = self.max_locals_used.max(index + size);
-                index
-            })
+        // Check if the variable (e.g., "_1") already exists.
+        // If it was assigned during parameter mapping, we'll find it here.
+        // If it's a body local not seen before, it will be assigned.
+        if let Some(index) = self.local_var_map.get(var_name) {
+            // Variable exists, return index. Check type consistency if desired.
+            if let Some(existing_ty) = self.local_var_types.get(var_name) {
+                if existing_ty != ty_hint && !Self::are_types_jvm_compatible(ty_hint, existing_ty) {
+                    println!(
+                        "Warning: Type hint mismatch for existing local '{}' (index {}). Existing: {:?}, Hint: {:?}. Using existing index.",
+                        var_name, index, existing_ty, ty_hint
+                    );
+                }
+            } else {
+                // This case indicates an internal inconsistency - map has index but no type.
+                println!(
+                    "Error: Local '{}' (index {}) exists in index map but not in type map!",
+                    var_name, index
+                );
+                // Attempt to recover by storing the type hint? Or panic?
+                // For now, let's store it, but this warrants investigation.
+                self.local_var_types
+                    .insert(var_name.to_string(), ty_hint.clone());
+            }
+            *index
+        } else {
+            // Variable is genuinely new (a MIR body local not previously encountered
+            // and not a parameter name). Use assign_local.
+            println!(
+                "Debug: Encountered new body local '{}'. Assigning.",
+                var_name
+            );
+            self.assign_local(var_name, ty_hint)
+        }
     }
 
-    fn get_local(&self, var_name: &str) -> Result<u16, jvm::Error> {
+    fn get_local_index(&self, var_name: &str) -> Result<u16, jvm::Error> {
         self.local_var_map
             .get(var_name)
             .copied()
             .ok_or_else(|| jvm::Error::VerificationError {
                 context: format!("Function {}", self.oomir_func.name),
                 message: format!("Undefined local variable used: {}", var_name),
+            })
+    }
+
+    fn get_local_type(&self, var_name: &str) -> Result<&oomir::Type, jvm::Error> {
+        self.local_var_types
+            .get(var_name)
+            .ok_or_else(|| jvm::Error::VerificationError {
+                context: format!("Function {}", self.oomir_func.name),
+                message: format!("Undefined local variable type requested for: {}", var_name),
             })
     }
 
@@ -316,7 +383,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         match operand {
             oomir::Operand::Constant(c) => self.load_constant(c)?,
             oomir::Operand::Variable { name: var_name, ty } => {
-                let index = self.get_local(var_name)?;
+                let index = self.get_local_index(var_name)?;
                 let load_instr = Self::get_load_instruction(ty, index)?;
                 self.jvm_instructions.push(load_instr);
             }
@@ -335,9 +402,9 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             OC::I8(v) => instructions_to_add.push(Self::get_int_const_instr(self, *v as i32)),
             OC::I16(v) => instructions_to_add.push(Self::get_int_const_instr(self, *v as i32)),
             OC::I32(v) => instructions_to_add.push(Self::get_int_const_instr(self, *v)),
-            OC::I64(v) => instructions_to_add.push(Self::get_long_const_instr(*v)),
+            OC::I64(v) => instructions_to_add.push(Self::get_long_const_instr(self, *v)),
             OC::F32(v) => instructions_to_add.push(Self::get_float_const_instr(*v)),
-            OC::F64(v) => instructions_to_add.push(Self::get_double_const_instr(*v)),
+            OC::F64(v) => instructions_to_add.push(Self::get_double_const_instr(self, *v)),
             OC::Boolean(v) => {
                 instructions_to_add.push(if *v { JI::Iconst_1 } else { JI::Iconst_0 })
             }
@@ -446,6 +513,10 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 }
                 // Final stack state after loop: [arrayref] (the populated array)
             }
+            OC::Null => {
+                // Push null reference onto the stack
+                instructions_to_add.push(JI::Aconst_null);
+            }
         };
 
         // Append the generated instructions for this constant (now including array logic)
@@ -473,7 +544,11 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
     /// Appends JVM instructions for storing the value currently on top of the stack
     /// into a local variable.
     fn store_result(&mut self, dest_var: &str, ty: &oomir::Type) -> Result<(), jvm::Error> {
-        let index = self.get_or_assign_local(dest_var, ty);
+        println!(
+            "Debug: Storing result into local variable '{}', type {:?}",
+            dest_var, ty
+        );
+        let index: u16 = self.get_or_assign_local(dest_var, ty);
         let store_instr = Self::get_store_instruction(ty, index)?;
         self.jvm_instructions.push(store_instr);
         Ok(())
@@ -513,11 +588,20 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
     }
 
     // Helper to get the appropriate long constant loading instruction
-    fn get_long_const_instr(val: i64) -> Instruction {
+    fn get_long_const_instr(&mut self, val: i64) -> Instruction {
+        // <-- Add `&mut self`
         match val {
             0 => Instruction::Lconst_0,
             1 => Instruction::Lconst_1,
-            _ => unimplemented!("Ldc2_w for i64 not implemented via ConstantPool yet"), // Need constant_pool.add_long
+            _ => {
+                // Add the long value to the constant pool.
+                let index = self
+                    .constant_pool
+                    .add_long(val)
+                    .expect("Failed to add long to constant pool");
+                // Ldc2_w is used for long/double constants and always takes a u16 index.
+                Instruction::Ldc2_w(index)
+            }
         }
     }
 
@@ -535,16 +619,24 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
     }
 
     // Helper to get the appropriate double constant loading instruction
-    fn get_double_const_instr(val: f64) -> Instruction {
-        if val == 0.0 {
+    fn get_double_const_instr(&mut self, val: f64) -> Instruction {
+        // <-- Add `&mut self`
+        // Using bit representation for exact zero comparison is more robust
+        if val.to_bits() == 0.0f64.to_bits() {
+            // Handles +0.0 and -0.0
             Instruction::Dconst_0
         } else if val == 1.0 {
             Instruction::Dconst_1
         } else {
-            unimplemented!("Ldc2_w for f64 not implemented via ConstantPool yet")
-        } // Need constant_pool.add_double
+            // Add the double value to the constant pool.
+            let index = self
+                .constant_pool
+                .add_double(val)
+                .expect("Failed to add double to constant pool");
+            // Ldc2_w is used for long/double constants and always takes a u16 index.
+            Instruction::Ldc2_w(index)
+        }
     }
-
     /// Gets the appropriate type-specific load instruction.
     fn get_load_instruction(ty: &oomir::Type, index: u16) -> Result<Instruction, jvm::Error> {
         let index_u8: u8 = index.try_into().unwrap();
@@ -731,9 +823,10 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
 
         match instr {
             OI::Const { dest, value } => {
-                let ty = Type::from_constant(value);
+                // The type is determined by the constant value
+                let value_type = Type::from_constant(value);
                 self.load_constant(value)?;
-                self.store_result(dest, &ty)?;
+                self.store_result(dest, &value_type)?;
             }
             OI::Add { dest, op1, op2 } => self.translate_binary_op(dest, op1, op2, JI::Iadd)?,
             OI::Sub { dest, op1, op2 } => self.translate_binary_op(dest, op1, op2, JI::Isub)?,
@@ -1229,7 +1322,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
 
                             // 1. Load arguments
                             for arg in args {
-                                self.load_operand(arg)?;
+                                self.load_call_argument(arg)?; // Use helper to handle references properly
                             }
 
                             // 2. Add MethodRef
@@ -1343,7 +1436,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                         });
                     }
                     for (arg, _) in args.iter().zip(target_sig.params.iter()) {
-                        self.load_operand(arg)?;
+                        self.load_call_argument(arg)?; // Use helper to handle references properly
                     }
 
                     // 2. Add MethodRef
@@ -1391,20 +1484,129 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 }
             }
             OI::Move { dest, src } => {
-                let (_, store_type) = match src {
-                    oomir::Operand::Constant(c) => {
-                        let ty = oomir::Type::from_constant(c);
-                        // Load constant uses its own logic, store needs the specific type.
-                        (ty.clone(), ty)
-                    }
-                    oomir::Operand::Variable { ty, .. } => {
-                        // Load uses the type of the variable, store needs the specific type.
-                        (ty.clone(), ty.clone())
-                    }
+                // Determine the type of the VALUE being moved (from the source operand)
+                let value_type = match src {
+                    OO::Constant(c) => Type::from_constant(c),
+                    OO::Variable { ty, .. } => ty.clone(),
                 };
 
-                self.load_operand(src)?; // Load the source
-                self.store_result(dest, &store_type)?; // Store using the correct type if known
+                // 1. Load the source operand's value onto the stack.
+                self.load_operand(src)?; // e.g., pushes I32(11)
+
+                // 2. Store the value from the stack into the destination variable.
+                //    Crucially, use the 'value_type' determined above.
+                //    'store_result' will call 'get_or_assign_local' internally.
+                //    'get_or_assign_local' will handle finding the index (and warning
+                //    if reusing a slot like '_1' with an incompatible type hint).
+                //    'store_result' will then use the correct 'value_type' (e.g., I32)
+                //    to select the appropriate JVM store instruction (e.g., istore_0).
+                self.store_result(dest, &value_type)?;
+            }
+            OI::NewArray {
+                dest,
+                element_type,
+                size,
+            } => {
+                println!(
+                    "Info: Translating NewArray dest={}, type={:?}, size={:?}",
+                    dest, element_type, size
+                );
+                // 1. Load size onto the stack
+                self.load_operand(size)?; // Stack: [size_int]
+
+                // 2. Determine and add the array creation instruction
+                let array_type_for_dest = oomir::Type::Array(Box::new(element_type.clone()));
+                if let Some(atype_code) = element_type.to_jvm_primitive_array_type_code() {
+                    // Primitive array
+                    let array_type_enum =
+                        ArrayType::from_bytes(&mut std::io::Cursor::new(vec![atype_code]))
+                            .map_err(|e| jvm::Error::VerificationError {
+                                context: format!("Function {}", self.oomir_func.name),
+                                message: format!(
+                                    "Invalid primitive array type code {} for NewArray: {:?}",
+                                    atype_code, e
+                                ),
+                            })?;
+                    self.jvm_instructions.push(JI::Newarray(array_type_enum)); // Stack: [arrayref]
+                    println!("   -> Emitted newarray {}", atype_code);
+                } else if let Some(internal_name) = element_type.to_jvm_internal_name() {
+                    // Reference type array
+                    let class_index = self.constant_pool.add_class(&internal_name)?;
+                    self.jvm_instructions.push(JI::Anewarray(class_index)); // Stack: [arrayref]
+                    println!("   -> Emitted anewarray {}", internal_name);
+                } else {
+                    // Unsupported element type
+                    return Err(jvm::Error::VerificationError {
+                        context: format!("Function {}", self.oomir_func.name),
+                        message: format!(
+                            "Cannot create JVM array for element type: {:?} in NewArray",
+                            element_type
+                        ),
+                    });
+                }
+
+                // 3. Store the resulting array reference into the destination variable
+                // This also ensures the type Type::Array(...) is stored for 'dest'
+                self.store_result(dest, &array_type_for_dest)?; // Stack: []
+                println!("   -> Stored array reference in var '{}'", dest);
+            }
+
+            OI::ArrayStore {
+                array_var,
+                index,
+                value,
+            } => {
+                println!(
+                    "Info: Translating ArrayStore array_var={}, index={:?}, value={:?}",
+                    array_var, index, value
+                );
+                // 1. Get the type of the array variable to find the element type
+                let array_type = self.get_local_type(array_var)?.clone(); // Clone to avoid borrow issues
+                let element_type = match array_type.clone() {
+                    oomir::Type::Array(et) => et,
+                    _ => {
+                        return Err(jvm::Error::VerificationError {
+                            context: format!("Function {}", self.oomir_func.name),
+                            message: format!(
+                                "Variable '{}' used in ArrayStore is not an array type, found {:?}",
+                                array_var,
+                                array_type.clone()
+                            ),
+                        });
+                    }
+                };
+                println!("   -> Array element type: {:?}", element_type);
+
+                // 2. Load array reference
+                // Use the full array type when loading the variable
+                let array_operand = oomir::Operand::Variable {
+                    name: array_var.clone(),
+                    ty: array_type,
+                };
+                self.load_operand(&array_operand)?; // Stack: [arrayref]
+                println!("   -> Loaded array ref from var '{}'", array_var);
+
+                // 3. Load index
+                self.load_operand(index)?; // Stack: [arrayref, index_int]
+                println!("   -> Loaded index {:?}", index);
+
+                // 4. Load value
+                self.load_operand(value)?; // Stack: [arrayref, index_int, value]
+                println!("   -> Loaded value {:?}", value);
+
+                // 5. Get and add the appropriate array store instruction
+                let store_instr =
+                    element_type
+                        .get_jvm_array_store_instruction()
+                        .ok_or_else(|| jvm::Error::VerificationError {
+                            context: format!("Function {}", self.oomir_func.name),
+                            message: format!(
+                                "Cannot determine array store instruction for element type: {:?}",
+                                element_type
+                            ),
+                        })?;
+                println!("   -> Emitting store instruction: {:?}", store_instr);
+                self.jvm_instructions.push(store_instr); // Stack: []
             }
             OI::Throw { exception } => {
                 // Assuming the operand is already an exception *instance* reference
@@ -1440,6 +1642,43 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 self.jvm_instructions
                     .push(JI::Invokespecial(constructor_ref_index));
                 self.jvm_instructions.push(JI::Athrow);
+            }
+        }
+        Ok(())
+    }
+
+    /// Helper to load an operand specifically for a function call argument.
+    /// Handles the case where OOMIR indicates a Ref<Primitive> but we need to load the primitive.
+    fn load_call_argument(&mut self, operand: &oomir::Operand) -> Result<(), jvm::Error> {
+        match operand {
+            oomir::Operand::Variable { name: var_name, ty } => {
+                let index = self.get_local_index(var_name)?;
+                // Decide which type to use for loading based on whether it's a Ref to Primitive
+                let load_type = match ty {
+                    // If the argument is declared as Ref<Primitive>, load the primitive directly
+                    oomir::Type::Reference(inner_ty) if inner_ty.is_jvm_primitive() => {
+                        println!(
+                            "Info: Loading Call argument '{}' (Ref<{:?}> @{}) as primitive {:?}",
+                            var_name, inner_ty, index, inner_ty
+                        );
+                        inner_ty.as_ref() // Use the inner type for loading
+                    }
+                    // Otherwise, use the declared type
+                    _ => {
+                        println!(
+                            "Info: Loading Call argument '{}' (@{}) as declared type {:?}",
+                            var_name, index, ty
+                        );
+                        ty
+                    }
+                };
+                let load_instr = Self::get_load_instruction(load_type, index)?;
+                self.jvm_instructions.push(load_instr);
+            }
+            oomir::Operand::Constant(c) => {
+                // Constants are loaded directly, no special handling needed here for refs
+                println!("Info: Loading Call argument Constant {:?}", c);
+                self.load_constant(c)?;
             }
         }
         Ok(())

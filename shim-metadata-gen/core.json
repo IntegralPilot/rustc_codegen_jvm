@@ -3,6 +3,26 @@
     "descriptor": "([Ljava/lang/String;)Ljava/lang/String;",
     "is_static": true
   },
+  "core_fmt_rt_argument_new_display_i32": {
+    "descriptor": "(I)Ljava/lang/String;",
+    "is_static": true
+  },
+  "core_fmt_rt_argument_new_display": {
+    "descriptor": "(Ljava/lang/Object;)Ljava/lang/String;",
+    "is_static": true
+  },
+  "core_fmt_rt_argument_new_display_f64": {
+    "descriptor": "(D)Ljava/lang/String;",
+    "is_static": true
+  },
+  "core_fmt_rt_argument_new_display_bool": {
+    "descriptor": "(Z)Ljava/lang/String;",
+    "is_static": true
+  },
+  "arguments_new_v1": {
+    "descriptor": "([Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;",
+    "is_static": true
+  },
   "panic_fmt": {
     "descriptor": "(Ljava/lang/String;)V",
     "is_static": true

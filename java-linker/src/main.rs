@@ -11,13 +11,14 @@ use tempfile::NamedTempFile;
 fn main() -> Result<(), i32> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 3 {
-        eprintln!("Usage: java-linker <input_files...> -o <output_jar_file> [--asm-processor <processor_jar>]");
+        eprintln!("Usage: java-linker <input_files...> -o <output_jar_file> [--asm-processor <processor_jar>] [--known-good <identifier>]");
         return Err(1);
     }
 
     let mut input_files: Vec<String> = Vec::new();
     let mut output_file: Option<String> = None;
     let mut processor_jar_path: Option<PathBuf> = None;
+    let mut known_good_identifier: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -38,11 +39,19 @@ fn main() -> Result<(), i32> {
                 eprintln!("Error: --asm-processor flag requires a path");
                 return Err(1);
             }
+        } else if arg == "--known-good" {
+            if i + 1 < args.len() {
+                known_good_identifier = Some(args[i + 1].clone());
+                i += 2;
+            } else {
+                eprintln!("Error: --known-good flag requires an identifier string");
+                return Err(1);
+            }
         } else if !arg.starts_with("-") && (arg.ends_with(".class") || arg.ends_with(".jar")) {
             input_files.push(arg.clone());
             i += 1;
         } else {
-            i += 1; // Ignore flags
+            i += 1;
         }
     }
 
@@ -51,7 +60,6 @@ fn main() -> Result<(), i32> {
         return Err(1);
     }
 
-    // if output_file doesn't end in .jar, add .jar
     if let Some(ref path) = output_file {
         if !path.ends_with(".jar") {
             eprintln!("Warning: Output file should end with .jar. Adding .jar extension.");
@@ -74,7 +82,6 @@ fn main() -> Result<(), i32> {
         return Err(1);
     }
 
-    // Prepare the regex for sanitizing the main class file name.
     let re = Regex::new(r"^(.*?)-[0-9a-f]+(\.class)$").unwrap();
     let main_class_name = main_classes.first().map(|class_path| {
         let file_name = Path::new(class_path)
@@ -82,13 +89,11 @@ fn main() -> Result<(), i32> {
             .unwrap()
             .to_str()
             .unwrap();
-        // Sanitize the file name if it matches the pattern.
         let cleaned_name = if let Some(caps) = re.captures(file_name) {
             format!("{}{}", &caps[1], &caps[2])
         } else {
             file_name.to_string()
         };
-        // Remove the ".class" extension and replace "/" with "." to get the fully qualified name.
         cleaned_name.trim_end_matches(".class").replace("/", ".")
     });
 
@@ -100,7 +105,13 @@ fn main() -> Result<(), i32> {
         }
     }
 
-    if let Err(err) = create_jar(&input_files, &output_file_path, main_class_name.as_deref(), processor_jar_path) {
+    if let Err(err) = create_jar(
+        &input_files,
+        &output_file_path,
+        main_class_name.as_deref(),
+        processor_jar_path,
+        known_good_identifier.as_deref(),
+    ) {
         eprintln!("Error creating JAR: {}", err);
         return Err(1);
     }
@@ -115,7 +126,6 @@ fn find_main_classes(class_files: &[String]) -> Vec<String> {
     let main_descriptor = b"([Ljava/lang/String;)V";
 
     for file in class_files {
-        // Only check .class files for main method bytes
         if file.ends_with(".class") {
             if let Ok(data) = fs::read(file) {
                 let has_main_name = data.windows(main_name.len()).any(|w| w == main_name);
@@ -151,6 +161,7 @@ fn create_jar(
     output_jar_path: &str,
     main_class_name: Option<&str>,
     processor_jar_path: Option<&Path>,
+    known_good_identifier: Option<&str>,
 ) -> io::Result<()> {
     let output_file = fs::File::create(output_jar_path)?;
     let mut zip_writer = ZipWriter::new(output_file);
@@ -158,23 +169,30 @@ fn create_jar(
         .compression_method(CompressionMethod::DEFLATE)
         .unix_permissions(0o644);
 
-    // Create META-INF/MANIFEST.MF
     let manifest_content = create_manifest_content(main_class_name);
     zip_writer.start_file("META-INF/MANIFEST.MF", options)?;
     zip_writer.write_all(manifest_content.as_bytes())?;
 
     let re = Regex::new(r"^(.*?)-[0-9a-f]+(\.class)$").unwrap();
-
-    // Track all class files we've added to avoid duplicates
     let mut added_class_files = std::collections::HashSet::new();
 
     for input_file_path_str in input_files {
         if input_file_path_str.ends_with(".jar") {
             println!("Processing JAR file: {}", input_file_path_str);
             let class_files = process_jar_file(input_file_path_str)?;
-            
+
             for (class_path, class_data) in class_files {
                 if !added_class_files.contains(&class_path) {
+                    if let Some(known_str) = known_good_identifier {
+                        if input_file_path_str.contains(known_str) {
+                            println!("Skipping ASM processing for known-good JAR file: {}", class_path);
+                            zip_writer.start_file(&class_path, options)?;
+                            zip_writer.write_all(&class_data)?;
+                            added_class_files.insert(class_path.clone());
+                            continue;
+                        }
+                    }
+
                     let processed_data = if let Some(processor_path) = processor_jar_path {
                         let temp_out_file = NamedTempFile::new()?;
                         let temp_in_file = NamedTempFile::new()?;
@@ -224,8 +242,18 @@ fn create_jar(
             };
 
             if !added_class_files.contains(&jar_entry_name) {
-                println!("Processing class file: {}", input_file_path_str);
+                if let Some(known_str) = known_good_identifier {
+                    if input_file_path_str.contains(known_str) {
+                        println!("Skipping ASM processing for known-good class: {}", input_file_path_str);
+                        let file_data = fs::read(input_file_path_str)?;
+                        zip_writer.start_file(&jar_entry_name, options)?;
+                        zip_writer.write_all(&file_data)?;
+                        added_class_files.insert(jar_entry_name);
+                        continue;
+                    }
+                }
 
+                println!("Processing class file: {}", input_file_path_str);
                 let file_data = if let Some(processor_path) = processor_jar_path {
                     let temp_out_file = NamedTempFile::new()?;
                     let temp_out_path = temp_out_file.path().to_path_buf();

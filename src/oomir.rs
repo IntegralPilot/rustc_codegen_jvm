@@ -196,6 +196,16 @@ pub enum Instruction {
         targets: Vec<(Constant, String)>,
         otherwise: String, // Label for the default case
     },
+    NewArray {
+        dest: String,
+        element_type: Type,
+        size: Operand,
+    },
+    ArrayStore {
+        array_var: String,
+        index: Operand,
+        value: Operand,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -218,6 +228,7 @@ pub enum Constant {
     Class(String),
     // 0 = the type of elements, 1 = the elements as a vec of constants
     Array(Box<Type>, Vec<Constant>),
+    Null,
 }
 
 // Helper to check if a Constant is integer-like (needed for Switch)
@@ -370,6 +381,9 @@ impl Type {
             Constant::Char(_) => Type::Char,
             Constant::String(_) => Type::String,
             Constant::Class(name) => Type::Class(name.to_string()),
+            // For Null, assume a base Object type if a specific type is needed from the constant itself.
+            // Often, the type will come from the destination variable context instead.
+            Constant::Null => Type::Class("java/lang/Object".to_string()),
         }
     }
 
@@ -379,6 +393,29 @@ impl Type {
         let ret_type_start = descriptor.find(')').unwrap() + 1;
         let ret_type = &descriptor[ret_type_start..];
         Self::from_jvm_descriptor(ret_type)
+    }
+
+    pub fn is_jvm_primitive(&self) -> bool {
+        matches!(
+            self,
+            Type::Boolean
+                | Type::Char
+                | Type::I8
+                | Type::I16
+                | Type::I32
+                | Type::I64
+                | Type::F32
+                | Type::F64
+        )
+    }
+
+    /// Checks if the type corresponds to a JVM reference type (Object, Array, String, etc.)
+    /// as opposed to a primitive (int, float, boolean, etc.) or Void.
+    pub fn is_jvm_reference_type(&self) -> bool {
+        matches!(
+            self,
+            Type::Reference(_) | Type::Array(_) | Type::String | Type::Class(_)
+        )
     }
 }
 

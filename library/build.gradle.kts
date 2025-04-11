@@ -10,6 +10,10 @@ repositories {
     mavenCentral()
 }
 
+dependencies {
+    implementation(kotlin("stdlib"))
+}
+
 kotlin {
     jvmToolchain(21) // latest LTS. note to self: update when they release a new LTS.
 }

@@ -49,8 +49,41 @@ fn ty_to_oomir_type<'tcx>(ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) -> oomir::Type {
             FloatTy::F16 => oomir::Type::F32,
             FloatTy::F128 => oomir::Type::F64,
         },
-        rustc_middle::ty::TyKind::Adt(adt_def, _) => {
-            oomir::Type::Class(format!("{:?}", adt_def.did()))
+        rustc_middle::ty::TyKind::Adt(adt_def, _substs) => {
+            // Get the full path string for the ADT
+            let full_path_str = tcx.def_path_str(adt_def.did());
+
+            // --- Check for specific types we need to map ---
+            if full_path_str == "core::fmt::rt::Argument" {
+                println!("Info: Mapping core::fmt::rt::Argument to java.lang.Object");
+                oomir::Type::Class("java/lang/Object".to_string())
+            }
+            // --- Check for Arguments struct itself ---
+            else if full_path_str == "core::fmt::Arguments" {
+                // Arguments are often handled opaquely or via specific shims, mapping to Object might be safe
+                println!("Info: Mapping core::fmt::Arguments to java.lang.Object");
+                oomir::Type::Class("java/lang/Object".to_string())
+            }
+            // TODO: Add more mappings here for other core types if needed later
+            // else if full_path_str == "some::other::Struct" {
+            //     oomir::Type::Class("your/jvm/package/SomeOtherStruct".to_string())
+            // }
+            else {
+                // --- Fallback: Generate a *valid* but perhaps non-functional JVM name ---
+                // Replace :: with / and remove generics <...> for a basic valid name
+                println!(
+                    "Warning: Generating placeholder JVM name for ADT: {}",
+                    full_path_str
+                );
+                // Use make_jvm_safe logic first, then replace . with / (make_jvm_safe might handle some ::)
+                let safe_name = make_jvm_safe(&full_path_str);
+                let jvm_name = safe_name.replace("::", "/").replace('.', "/"); // Ensure all separators are /
+                oomir::Type::Class(jvm_name)
+            }
+        }
+        rustc_middle::ty::TyKind::Str => {
+            println!("Info: Mapping Rust str to java.lang.String");
+            oomir::Type::Class("java/lang/String".to_string())
         }
         rustc_middle::ty::TyKind::Ref(_, inner_ty, _)
         | rustc_middle::ty::TyKind::RawPtr(inner_ty, _) => {
@@ -210,6 +243,20 @@ fn handle_const_value<'tcx>(
                         rustc_middle::ty::TyKind::Char => {
                             let val = char::from_u32(scalar_int.to_u32()).unwrap_or('\0');
                             oomir::Operand::Constant(oomir::Constant::Char(val))
+                        }
+                        rustc_middle::ty::TyKind::Float(float_ty) => {
+                            let val = match float_ty {
+                                FloatTy::F32 => {
+                                    let bits = scalar_int.to_u32(); // Get the raw bits as u32
+                                    oomir::Constant::F32(f32::from_bits(bits))
+                                }
+                                FloatTy::F64 => {
+                                    let bits = scalar_int.to_u64(); // Get the raw bits as u64
+                                    oomir::Constant::F64(f64::from_bits(bits))
+                                }
+                                _ => oomir::Constant::I32(scalar_int.to_i32()), // Default fallback
+                            };
+                            oomir::Operand::Constant(val)
                         }
                         _ => {
                             println!("Warning: Unhandled scalar type {:?} for Scalar::Int", ty);
@@ -526,7 +573,12 @@ fn handle_const_value<'tcx>(
             }
         }
         ConstValue::Slice { data: _, meta: _ } => {
-            if ty.is_str() || ty.is_slice() {
+            let is_str_slice_or_ref = match ty.kind() {
+                TyKind::Str | TyKind::Slice(_) => true, // Direct str or slice type
+                TyKind::Ref(_, inner_ty, _) => inner_ty.is_str() || inner_ty.is_slice(), // Reference to str or slice
+                _ => false, // Not a str/slice or reference to one
+            };
+            if is_str_slice_or_ref {
                 match const_val.try_get_slice_bytes_for_diagnostics(tcx) {
                     Some(bytes) => match String::from_utf8(bytes.to_vec()) {
                         Ok(s) => {
@@ -592,7 +644,27 @@ fn convert_basic_block<'tcx>(
     // Convert each MIR statement in the block.
     for stmt in &bb_data.statements {
         if let StatementKind::Assign(box (place, rvalue)) = &stmt.kind {
-            let dest = format!("{:?}", place); // Destination variable
+            let dest = place_to_string(place, tcx);
+            let get_placeholder_operand = |dest_place: &Place<'tcx>| -> oomir::Operand {
+                let dest_oomir_type = get_place_type(dest_place, mir, tcx);
+                if dest_oomir_type.is_jvm_reference_type() {
+                    // Destination needs a reference, use Null placeholder
+                    println!(
+                        "Info: Generating Null placeholder for unhandled assignment to reference type var '{}' ({:?})",
+                        place_to_string(dest_place, tcx), // Recalculate name if needed, or use dest_name
+                        dest_oomir_type
+                    );
+                    oomir::Operand::Constant(oomir::Constant::Null)
+                } else {
+                    // Destination is likely a primitive, use I32(0) as placeholder
+                    println!(
+                        "Info: Generating I32(0) placeholder for unhandled assignment to primitive type var '{}' ({:?})",
+                        place_to_string(dest_place, tcx),
+                        dest_oomir_type
+                    );
+                    oomir::Operand::Constant(oomir::Constant::I32(0))
+                }
+            };
             match rvalue {
                 Rvalue::BinaryOp(bin_op, box (op1, op2)) => {
                     let oomir_op1 = convert_operand(op1, tcx, mir);
@@ -705,45 +777,118 @@ fn convert_basic_block<'tcx>(
                     });
                 }
                 Rvalue::Aggregate(box kind, operands) => {
+                    let dest_name = place_to_string(place, tcx);
+
                     match kind {
                         rustc_middle::mir::AggregateKind::Tuple => {
-                            // 'dest' here is the name of the tuple itself (e.g., "_2")
-                            // We need to define its fields.
                             if operands.len() > 2 {
                                 println!(
                                     "Warning: Tuple aggregate with >2 fields not fully handled: {}",
-                                    dest
+                                    dest_name
                                 );
                             }
                             for (i, mir_op) in operands.iter().enumerate() {
-                                // Define the field variable name (e.g., "_2.0")
-                                let field_dest = format!("{}.{}", dest, i);
+                                let field_dest = format!("{}.{}", dest_name, i);
                                 let field_src = convert_operand(mir_op, tcx, mir);
-                                // Generate a Move to define the field variable
                                 instructions.push(oomir::Instruction::Move {
                                     dest: field_dest,
                                     src: field_src,
                                 });
                             }
-                            // We might not need an explicit instruction for the tuple 'dest' itself
-                            // if we only ever access its fields directly via the ".N" names.
+                        }
+
+                        rustc_middle::mir::AggregateKind::Array(mir_element_ty) => {
+                            println!(
+                                "Info: Handling Rvalue::Aggregate Array for dest '{}'",
+                                dest_name
+                            );
+
+                            // 1. Get the OOMIR element type
+                            let oomir_element_type = ty_to_oomir_type(*mir_element_ty, tcx);
+
+                            // 2. Get the array size
+                            let array_size = operands.len();
+                            let size_operand =
+                                oomir::Operand::Constant(oomir::Constant::I32(array_size as i32));
+
+                            // 3. Generate the NewArray instruction
+                            //    The dest_name ('_6') will hold the reference to the new array.
+                            instructions.push(oomir::Instruction::NewArray {
+                                dest: dest_name.clone(), // Assign the new array ref to _6
+                                element_type: oomir_element_type.clone(),
+                                size: size_operand,
+                            });
+                            println!(
+                                "   -> Emitted NewArray: dest={}, type={:?}, size={}",
+                                dest_name, oomir_element_type, array_size
+                            );
+
+                            // 4. Generate ArrayStore instructions for each element
+                            for (i, mir_operand) in operands.iter().enumerate() {
+                                let value_operand = convert_operand(mir_operand, tcx, mir);
+                                let index_operand =
+                                    oomir::Operand::Constant(oomir::Constant::I32(i as i32));
+
+                                instructions.push(oomir::Instruction::ArrayStore {
+                                    array_var: dest_name.clone(), // Store into the array ref in _6
+                                    index: index_operand,
+                                    value: value_operand.clone(), // Clone operand if needed elsewhere
+                                });
+                                println!(
+                                    "   -> Emitted ArrayStore: array={}, index={}, value={:?}",
+                                    dest_name, i, value_operand
+                                );
+                            }
                         }
                         _ => {
                             println!(
                                 "Warning: Unhandled aggregate kind {:?} for dest {}",
-                                kind, dest
+                                kind, dest_name
                             );
-                            // Assign a default/dummy value? Might cause issues later.
-                            // For now, maybe push a placeholder move:
+                            // Assign a type-aware placeholder
                             instructions.push(oomir::Instruction::Move {
-                                dest: dest.clone(),
-                                src: oomir::Operand::Constant(oomir::Constant::I32(0)), // Placeholder!
+                                dest: dest_name,                     // Use the extracted dest_name
+                                src: get_placeholder_operand(place), // Use helper
                             });
                         }
                     }
                 }
+                Rvalue::Ref(_region, _borrow_kind, source_place) => {
+                    let dest_name = dest;
+                    let source_name = place_to_string(source_place, tcx); // e.g., "_1"
+
+                    // Get the type of the place BEING REFERENCED (the inner type)
+                    let source_type = get_place_type(source_place, mir, tcx);
+                    // Get the type of the DESTINATION (the reference itself)
+
+                    // Create the source operand (Variable)
+                    let source_operand = oomir::Operand::Variable {
+                        name: source_name,
+                        ty: source_type.clone(), // The variable being referenced
+                    };
+
+                    // Generate a Move instruction.
+                    // In OOMIR/JVM, passing a reference often means passing the object/value itself.
+                    // The type information associated with the destination variable `dest_name`
+                    // in lower2 will be `Reference(source_type)`, ensuring Aload/Astore are used if needed.
+                    instructions.push(oomir::Instruction::Move {
+                        dest: dest_name,
+                        src: source_operand,
+                    });
+                    println!(
+                        "Info: Handled Rvalue::Ref: {} = &{} (via Move with types src={:?})",
+                        place_to_string(place, tcx),
+                        place_to_string(source_place, tcx),
+                        source_type
+                    );
+                }
                 _ => {
                     println!("Warning: Unhandled rvalue {:?}", rvalue);
+                    // Assign a type-aware placeholder
+                    instructions.push(oomir::Instruction::Move {
+                        dest,                                // Use the calculated name
+                        src: get_placeholder_operand(place), // Use helper
+                    });
                 }
             }
         }
@@ -1023,10 +1168,17 @@ pub fn make_jvm_safe(input: &str) -> String {
     static RE_ANGLES: OnceLock<Regex> = OnceLock::new();
     static RE_COLONS: OnceLock<Regex> = OnceLock::new();
     static RE_TRAILING_UNDERSCORE: OnceLock<Regex> = OnceLock::new();
-
-    // 1. Remove anything inside < > (including the angle brackets themselves)
-    let re_angles = RE_ANGLES.get_or_init(|| Regex::new(r"<[^>]*>").expect("Invalid regex"));
-    let without_angles = re_angles.replace_all(input, "");
+    // 1. Remove anything inside < > (including the angle brackets themselves),
+    // but keep the inner thing if it is a Rust primitive type.
+    let re_angles = RE_ANGLES.get_or_init(|| Regex::new(r"<([^>]+)>").expect("Invalid regex"));
+    let without_angles = re_angles.replace_all(input, |caps: &regex::Captures| {
+        let inner = &caps[1];
+        match inner {
+            "i8" | "i16" | "i32" | "i64" | "i128" | "u8" | "u16" | "u32" | "u64" | "u128"
+            | "f32" | "f64" | "bool" | "char" | "str" => inner.to_string(),
+            _ => "".to_string(),
+        }
+    });
 
     // 2. Replace occurrences of :: (or more consecutive ':') with a single underscore
     let re_colons = RE_COLONS.get_or_init(|| Regex::new(r":{2,}").expect("Invalid regex"));

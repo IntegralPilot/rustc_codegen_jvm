@@ -39,9 +39,7 @@ def process_test(test_dir: str, release_mode: bool):
     print("|--- ⚒️ Building with Cargo...")
     build_cmd = ["cargo", "build", "--release"] if release_mode else ["cargo", "build"]
     no_jvm_target = os.path.join(test_dir, "no_jvm_target.flag")
-    if os.path.exists(no_jvm_target):
-        print("|---- ⚠️ Skipping JVM target build due to no_jvm_target.flag")
-    else:
+    if not os.path.exists(no_jvm_target):
         print("|---- 🛠️ Building with JVM target...")
         build_cmd.extend(["--target", "../../../jvm-unknown-unknown.json"])
     proc = run_command(build_cmd, cwd=test_dir)
@@ -56,7 +54,6 @@ def process_test(test_dir: str, release_mode: bool):
     print("|--- 🤖 Running with Java...")
     target_dir = "release" if release_mode else "debug"
     if os.path.exists(no_jvm_target):
-        print("|---- ⚠️ Doing some needed moving around due to no_jvm_target.flag")
         jar_path = os.path.join(test_dir, "target", target_dir, "deps", f"{test_name}-*.jar")
         jar_file = None
         for file in os.listdir(os.path.join(test_dir, "target", target_dir, "deps")):
@@ -70,22 +67,40 @@ def process_test(test_dir: str, release_mode: bool):
         os.rename(os.path.join(test_dir, "target", target_dir, "deps", jar_file), os.path.join(test_dir, "target", "jvm-unknown-unknown", target_dir, f"{test_name}.jar"))
     jar_path = os.path.join(test_dir, "target", "jvm-unknown-unknown", target_dir, f"{test_name}.jar")
     proc = run_command(["java", "-jar", jar_path]) 
-    if proc.returncode != 0:
-        fail_path = os.path.join(test_dir, "java-fail.generated")
-        output = f"STDOUT:\n{proc.stdout}\n\nSTDERR:\n{proc.stderr}"
-        write_to_file(fail_path, output)
-        print(f"|---- ❌ java exited with code {proc.returncode}")
-        return False
+    
+    # Check for java-returncode.expected
+    expected_returncode_file = os.path.join(test_dir, "java-returncode.expected")
+    if os.path.exists(expected_returncode_file):
+        expected_returncode = int(read_from_file(expected_returncode_file).strip())
+        if proc.returncode != expected_returncode:
+            fail_path = os.path.join(test_dir, "java-returncode-fail.generated")
+            output = f"Expected return code: {expected_returncode}\nActual return code: {proc.returncode}\n\nSTDOUT:\n{proc.stdout}\n\nSTDERR:\n{proc.stderr}"
+            write_to_file(fail_path, output)
+            print(f"|---- ❌ java exited with code {proc.returncode}, expected {expected_returncode}")
+            return False
+    else:
+        if proc.returncode != 0:
+            fail_path = os.path.join(test_dir, "java-fail.generated")
+            output = f"STDOUT:\n{proc.stdout}\n\nSTDERR:\n{proc.stderr}"
+            write_to_file(fail_path, output)
+            print(f"|---- ❌ java exited with code {proc.returncode}")
+            return False
 
-    # Compare the STDOUT to {test_dir}/java_output.expected
-    expected_file = os.path.join(test_dir, "java_output.expected")
+    # Compare the STDOUT and STDERR to {test_dir}/java-output.expected
+    expected_file = os.path.join(test_dir, "java-output.expected")
     if os.path.exists(expected_file):
         expected_output = read_from_file(expected_file)
-        actual_output = proc.stdout.strip()
+        # special case: blank file = no STDOUT or STDERR expected
+        if expected_output.strip() == "":
+            expected_output = "STDOUT:STDERR:"
+        else:
+            expected_output = expected_output.replace("\n", "")
+        actual_output = f"STDOUT:{proc.stdout.strip()}STDERR:{proc.stderr.strip()}"
+        # remove all remaining newlines
+        actual_output = actual_output.replace("\n", "")
         if actual_output != expected_output.strip():
             diff_path = os.path.join(test_dir, "output-diff.generated")
-            diff_output = f"Expected:\n{expected_output}\n\nGot:\n{actual_output}"
-            write_to_file(diff_path, diff_output)
+            write_to_file(diff_path, actual_output)
             print("|---- ❌ java output did not match expected output")
             return False
         else:

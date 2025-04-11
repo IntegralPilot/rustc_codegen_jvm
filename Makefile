@@ -46,7 +46,8 @@ clean-java-linker:
 	cd java-linker && cargo clean
 
 # === Library shim metadata generator ===
-shim-metadata-gen: library
+# needs to clean first so unzip doesn't prompt for overwrite
+shim-metadata-gen: clean-library library
 	@echo "$(CYAN)🔧 Generating shim metadata...$(RESET)"
 	cd shim-metadata-gen && rm -f core.json && cargo run -- ../library/build/libs/library-0.1.0.jar ./core.json
 
@@ -66,7 +67,7 @@ clean-asm-processor:
 # === Standard Library Shim (Gradle) ===
 library:
 	@echo "$(CYAN)📚 Building standard library shim...$(RESET)"
-	cd library && gradle build
+	cd library && gradle build && cd build/distributions && unzip library-0.1.0.zip
 
 clean-library:
 	@echo "$(CYAN)🧹 Cleaning library shim...$(RESET)"
