@@ -138,10 +138,13 @@ impl CodegenBackend for MyBackend {
     
             // Iterate over each (file_name, bytecode) pair in the map.
             for (name, bytecode) in bytecode_map.into_iter() {
-                // The key is expected to be the file name without the ".class" extension.
-                // Append ".class" here.
-                let file_name = format!("{}.class", name);
-                let file_path = outputs.temp_path_ext(&file_name, None);
+                let file_path = outputs.temp_path_ext_for_cgu(&name, ".class", None);
+
+                // extract the directory from the file path
+                let dir = file_path.parent().unwrap();
+
+                // make the actual file path by adding {name}.class to the directory
+                let file_path = dir.join(format!("{}.class", name));
     
                 // Write the bytecode to the file
                 let mut file = std::fs::File::create(&file_path)
