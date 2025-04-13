@@ -234,7 +234,9 @@ pub enum Instruction {
         field_ty: Type,      // Type of the field (needed for JVM descriptor)
         owner_class: String, // JVM class name where the field is defined
     },
-    Label { name: String },
+    Label {
+        name: String,
+    },
 }
 
 #[derive(Debug, Clone)]

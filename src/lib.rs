@@ -133,9 +133,9 @@ impl CodegenBackend for MyBackend {
                     CrateInfo,
                 )>()
                 .expect("in join_codegen: ongoing_codegen is not a bytecode map");
-    
+
             let mut compiled_modules = Vec::new();
-    
+
             // Iterate over each (file_name, bytecode) pair in the map.
             for (name, bytecode) in bytecode_map.into_iter() {
                 let file_path = outputs.temp_path_ext_for_cgu(&name, ".class", None);
@@ -145,13 +145,19 @@ impl CodegenBackend for MyBackend {
 
                 // make the actual file path by adding {name}.class to the directory
                 let file_path = dir.join(format!("{}.class", name));
-    
+
                 // Write the bytecode to the file
-                let mut file = std::fs::File::create(&file_path)
-                    .unwrap_or_else(|e| panic!("Could not create file {}: {}", file_path.display(), e));
-                file.write_all(&bytecode)
-                    .unwrap_or_else(|e| panic!("Could not write bytecode to file {}: {}", file_path.display(), e));
-    
+                let mut file = std::fs::File::create(&file_path).unwrap_or_else(|e| {
+                    panic!("Could not create file {}: {}", file_path.display(), e)
+                });
+                file.write_all(&bytecode).unwrap_or_else(|e| {
+                    panic!(
+                        "Could not write bytecode to file {}: {}",
+                        file_path.display(),
+                        e
+                    )
+                });
+
                 // Create a CompiledModule for this file
                 compiled_modules.push(CompiledModule {
                     name: name.clone(),
@@ -164,7 +170,7 @@ impl CodegenBackend for MyBackend {
                     assembly: None,
                 });
             }
-    
+
             let codegen_results = CodegenResults {
                 modules: compiled_modules,
                 allocator_module: None,
@@ -176,7 +182,7 @@ impl CodegenBackend for MyBackend {
         }))
         .expect("Could not join_codegen")
     }
-    
+
     fn link(&self, sess: &Session, codegen_results: CodegenResults, outputs: &OutputFilenames) {
         println!("linking!");
         use rustc_codegen_ssa::back::link::link_binary;
