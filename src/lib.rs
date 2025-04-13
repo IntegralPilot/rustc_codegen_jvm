@@ -30,7 +30,7 @@ use rustc_metadata::EncodedMetadata;
 use rustc_middle::dep_graph::{WorkProduct, WorkProductId};
 use rustc_middle::ty::TyCtxt;
 use rustc_session::{Session, config::OutputFilenames};
-use std::{any::Any, io::Write, path::Path, vec};
+use std::{any::Any, io::Write, path::Path};
 
 mod lower1;
 mod lower2;
@@ -57,6 +57,7 @@ impl CodegenBackend for MyBackend {
         let mut oomir_module = oomir::Module {
             name: crate_name.clone(),
             functions: std::collections::HashMap::new(),
+            data_types: std::collections::HashMap::new(),
         };
 
         // Iterate through all items in the crate and find functions
@@ -82,12 +83,16 @@ impl CodegenBackend for MyBackend {
                 println!("MIR for function {i}: {:?}", mir);
 
                 println!("--- Starting MIR to OOMIR Lowering for function: {i} ---");
-                let oomir_function = lower1::mir_to_oomir(tcx, instance, &mut mir);
+                let oomir_result = lower1::mir_to_oomir(tcx, instance, &mut mir);
                 println!("--- Finished MIR to OOMIR Lowering for function: {i} ---");
+
+                let oomir_function = oomir_result.0;
 
                 oomir_module
                     .functions
                     .insert(oomir_function.name.clone(), oomir_function);
+
+                oomir_module.merge_data_types(&oomir_result.1);
             }
         }
 
@@ -119,30 +124,46 @@ impl CodegenBackend for MyBackend {
         outputs: &OutputFilenames,
     ) -> (CodegenResults, FxIndexMap<WorkProductId, WorkProduct>) {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let (bytecode, crate_name, metadata, crate_info) = *ongoing_codegen
-                .downcast::<(Vec<u8>, String, EncodedMetadata, CrateInfo)>()
-                .expect("in join_codegen: ongoing_codegen is not bytecode vector");
-
-            let class_path = outputs.temp_path_ext("class", None);
-
-            let mut class_file =
-                std::fs::File::create(&class_path).expect("Could not create the Java .class file!");
-            class_file
-                .write_all(&bytecode)
-                .expect("Could not write Java bytecode to file!");
-
-            let modules = vec![CompiledModule {
-                name: crate_name,
-                kind: ModuleKind::Regular,
-                object: Some(class_path),
-                bytecode: None,
-                dwarf_object: None,
-                llvm_ir: None,
-                links_from_incr_cache: Vec::new(),
-                assembly: None,
-            }];
+            // Update the downcast to expect a HashMap now.
+            let (bytecode_map, _, metadata, crate_info) = *ongoing_codegen
+                .downcast::<(
+                    std::collections::HashMap<String, Vec<u8>>,
+                    String,
+                    EncodedMetadata,
+                    CrateInfo,
+                )>()
+                .expect("in join_codegen: ongoing_codegen is not a bytecode map");
+    
+            let mut compiled_modules = Vec::new();
+    
+            // Iterate over each (file_name, bytecode) pair in the map.
+            for (name, bytecode) in bytecode_map.into_iter() {
+                // The key is expected to be the file name without the ".class" extension.
+                // Append ".class" here.
+                let file_name = format!("{}.class", name);
+                let file_path = outputs.temp_path_ext(&file_name, None);
+    
+                // Write the bytecode to the file
+                let mut file = std::fs::File::create(&file_path)
+                    .unwrap_or_else(|e| panic!("Could not create file {}: {}", file_path.display(), e));
+                file.write_all(&bytecode)
+                    .unwrap_or_else(|e| panic!("Could not write bytecode to file {}: {}", file_path.display(), e));
+    
+                // Create a CompiledModule for this file
+                compiled_modules.push(CompiledModule {
+                    name: name.clone(),
+                    kind: ModuleKind::Regular,
+                    object: Some(file_path),
+                    bytecode: None,
+                    dwarf_object: None,
+                    llvm_ir: None,
+                    links_from_incr_cache: Vec::new(),
+                    assembly: None,
+                });
+            }
+    
             let codegen_results = CodegenResults {
-                modules,
+                modules: compiled_modules,
                 allocator_module: None,
                 metadata_module: None,
                 metadata,
@@ -152,7 +173,7 @@ impl CodegenBackend for MyBackend {
         }))
         .expect("Could not join_codegen")
     }
-
+    
     fn link(&self, sess: &Session, codegen_results: CodegenResults, outputs: &OutputFilenames) {
         println!("linking!");
         use rustc_codegen_ssa::back::link::link_binary;

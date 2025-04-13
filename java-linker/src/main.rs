@@ -357,7 +357,7 @@ fn create_jar(
     zip_writer.start_file("META-INF/MANIFEST.MF", options)?;
     zip_writer.write_all(manifest_content.as_bytes())?;
 
-    let re = Regex::new(r"^(.*?)-[0-9a-fA-F]+(\.class)$").unwrap();
+    let re = Regex::new(r"^[^-]+-[0-9a-fA-F]+\.(?P<name>[^/\\]+\.class)$").unwrap();
     let mut added_class_files = std::collections::HashSet::new();
 
     for input_file_path_str in input_files {
@@ -439,16 +439,11 @@ fn create_jar(
                 })?;
 
             let jar_entry_name = if let Some(caps) = re.captures(original_file_name) {
-                format!("{}{}", &caps[1], &caps[2])
+                caps["name"].to_string()
             } else {
-                // If not hashed, assume the filename corresponds to the path within the JAR.
-                // This might need adjustment depending on how class files are laid out relative
-                // to their package structure on the filesystem before being passed to the linker.
-                // For now, we just use the filename. A better approach might involve stripping
-                // a known source root path.
                 original_file_name.to_string()
             };
-
+                
             if !added_class_files.contains(&jar_entry_name) {
                 let is_known_good = known_good_identifier
                     .map(|id| input_file_path_str.contains(id))

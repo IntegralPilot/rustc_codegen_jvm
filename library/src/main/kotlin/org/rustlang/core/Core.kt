@@ -56,4 +56,16 @@ public object Core {
         }
         return sb.toString()
     }
+
+    @JvmStatic 
+    public fun to_string(value: Any?): String {
+        // Convert the value to a string.
+        return value?.toString() ?: "null"
+    }
+
+    @JvmStatic
+    public fun eq(value1: Any?, value2: Any?): Boolean {
+        // Check for equality.
+        return value1 == value2
+    }
 }

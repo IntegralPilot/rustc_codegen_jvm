@@ -23,8 +23,16 @@
     "descriptor": "(I)Ljava/lang/String;",
     "is_static": true
   },
+  "eq": {
+    "descriptor": "(Ljava/lang/Object;Ljava/lang/Object;)Z",
+    "is_static": true
+  },
   "panic_fmt": {
     "descriptor": "(Ljava/lang/String;)V",
+    "is_static": true
+  },
+  "to_string": {
+    "descriptor": "(Ljava/lang/Object;)Ljava/lang/String;",
     "is_static": true
   }
 }

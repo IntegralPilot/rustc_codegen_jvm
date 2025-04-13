@@ -9,6 +9,25 @@ use std::{collections::HashMap, fmt};
 pub struct Module {
     pub name: String,
     pub functions: HashMap<String, Function>,
+    pub data_types: HashMap<String, DataType>,
+}
+
+impl Module {
+    // Helper function to merge data types into the module
+    // Ensure no dups (if there are, give the older one precedence)
+    pub fn merge_data_types(&mut self, other: &HashMap<String, DataType>) {
+        for (name, data_type) in other {
+            if !self.data_types.contains_key(name) {
+                self.data_types.insert(name.clone(), data_type.clone());
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DataType {
+    pub name: String,
+    pub fields: Vec<(String, Type)>, // 0 = field name and 1 = type
 }
 
 #[derive(Debug, Clone)]
@@ -67,17 +86,7 @@ pub enum Instruction {
         op1: Operand,
         op2: Operand,
     },
-    AddWithOverflow {
-        dest: String,
-        op1: Operand,
-        op2: Operand,
-    },
     Sub {
-        dest: String,
-        op1: Operand,
-        op2: Operand,
-    },
-    SubWithOverflow {
         dest: String,
         op1: Operand,
         op2: Operand,
@@ -206,6 +215,26 @@ pub enum Instruction {
         index: Operand,
         value: Operand,
     },
+    ConstructObject {
+        dest: String, // Variable to hold the new object reference
+        class_name: String, // JVM class name (e.g., my_crate/MyStruct)
+                      // Implicitly calls the default constructor <init>()V
+    },
+    SetField {
+        object_var: String,  // Variable holding the object reference
+        field_name: String,  // Name of the field in the class
+        value: Operand,      // Value to store in the field
+        field_ty: Type,      // Type of the field (needed for JVM descriptor)
+        owner_class: String, // JVM class name where the field is defined
+    },
+    GetField {
+        dest: String,        // Variable to store the loaded field value
+        object_var: String,  // Variable holding the object reference
+        field_name: String,  // Name of the field in the class
+        field_ty: Type,      // Type of the field (needed for JVM descriptor)
+        owner_class: String, // JVM class name where the field is defined
+    },
+    Label { name: String },
 }
 
 #[derive(Debug, Clone)]

@@ -6,7 +6,7 @@ use rustc_middle::ty::TyCtxt; // Assuming this is needed elsewhere, but not dire
 
 use ristretto_classfile::attributes::{ArrayType, Attribute, Instruction, MaxStack};
 use ristretto_classfile::{
-    self as jvm, ClassAccessFlags, ClassFile, ConstantPool, MethodAccessFlags, Version,
+    self as jvm, BaseType, ClassAccessFlags, ClassFile, ConstantPool, FieldAccessFlags, MethodAccessFlags, Version
 };
 use serde::Deserialize;
 use std::collections::{HashMap, VecDeque};
@@ -151,14 +151,20 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
     }
 
     /// Assigns a local variable to a JVM slot, returning the index.
+    // Ensure assign_local ONLY inserts if vacant, it shouldn't be called directly
+    // when we intend to overwrite like in the type mismatch case above.
+    // The logic above directly modifies the map and next_local_index when overwriting.
     fn assign_local(&mut self, var_name: &str, ty: &oomir::Type) -> u16 {
         if let std::collections::hash_map::Entry::Vacant(e) =
             self.local_var_map.entry(var_name.to_string())
         {
             let index = self.next_local_index;
             e.insert(index);
-            self.local_var_types
-                .insert(var_name.to_string(), ty.clone());
+            // Only insert type if it's also vacant (should always be if index is vacant)
+            if self.local_var_types.insert(var_name.to_string(), ty.clone()).is_some() {
+                 println!("Internal Warning: Type map already had entry for supposedly new local '{}'", var_name);
+            }
+
             let size = Self::get_type_size(ty);
             self.next_local_index += size;
             self.max_locals_used = self.max_locals_used.max(index + size);
@@ -168,50 +174,76 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             );
             index
         } else {
-            // This warning might fire legitimately now if get_or_assign_local tries to assign
-            // _1 after the parameter mapping, which is fine.
-            println!(
-                "Debug: Attempted to re-assign existing local '{}' (index {}). Using existing index.",
-                var_name, self.local_var_map[var_name]
-            );
-            self.local_var_map[var_name]
+            // This case should ideally not be hit if get_or_assign_local handles re-assignments.
+            // If it IS hit, it means assign_local was called when the variable already exists.
+            // This might happen with parameters if called carelessly after initial setup.
+             let existing_index = self.local_var_map[var_name];
+             println!(
+                 "Warning: assign_local called for existing variable '{}' (index {}). Reusing index.",
+                 var_name, existing_index
+             );
+              // Should we verify type consistency here too? Probably.
+              if let Some(existing_ty) = self.local_var_types.get(var_name){
+                   if existing_ty != ty {
+                       println!("   -> CRITICAL WARNING: assign_local type mismatch for '{}'! Existing: {:?}, New: {:?}. Keeping existing index but this indicates a flaw!", var_name, existing_ty, ty);
+                   }
+              }
+             existing_index // Return existing index, but flag this as problematic
         }
     }
 
     /// Gets the slot index for a variable, assigning if new.
     fn get_or_assign_local(&mut self, var_name: &str, ty_hint: &oomir::Type) -> u16 {
-        // Check if the variable (e.g., "_1") already exists.
-        // If it was assigned during parameter mapping, we'll find it here.
-        // If it's a body local not seen before, it will be assigned.
-        if let Some(index) = self.local_var_map.get(var_name) {
-            // Variable exists, return index. Check type consistency if desired.
+        if let Some(existing_index) = self.local_var_map.get(var_name) {
             if let Some(existing_ty) = self.local_var_types.get(var_name) {
-                if existing_ty != ty_hint && !Self::are_types_jvm_compatible(ty_hint, existing_ty) {
+                // Check for exact type match OR JVM compatibility (e.g., storing I8 into an I32 slot might be okay sometimes, but struct vs array is not)
+                // Let's be strict for now: require exact match to reuse.
+                if existing_ty == ty_hint {
+                    // Types match, reuse the slot
+                    println!("Debug: Reusing local '{}' (index {}) with matching type {:?}.", var_name, existing_index, ty_hint);
+                    *existing_index
+                } else {
+                    // Types differ. Assign a NEW slot and UPDATE the mapping for var_name.
                     println!(
-                        "Warning: Type hint mismatch for existing local '{}' (index {}). Existing: {:?}, Hint: {:?}. Using existing index.",
-                        var_name, index, existing_ty, ty_hint
+                        "Warning: Type change detected for MIR local '{}'. Existing: {:?} (index {}), New: {:?}. Assigning NEW slot.",
+                        var_name, existing_ty, existing_index, ty_hint
                     );
+
+                    // Use assign_local's core logic but ensure we update the map for this specific var_name
+                    let index = self.next_local_index;
+                    // --- Overwrite the mapping for var_name ---
+                    self.local_var_map.insert(var_name.to_string(), index);
+                    self.local_var_types.insert(var_name.to_string(), ty_hint.clone());
+                    // --- Advance next_local_index ---
+                    let size = Self::get_type_size(ty_hint);
+                    self.next_local_index += size;
+                    self.max_locals_used = self.max_locals_used.max(index + size);
+                    println!(
+                        "   -> Assigned NEW index {} for '{}', size {}, next_local_index is now {}",
+                        index, var_name, size, self.next_local_index
+                    );
+                    index // Return the newly assigned index
                 }
             } else {
-                // This case indicates an internal inconsistency - map has index but no type.
-                println!(
-                    "Error: Local '{}' (index {}) exists in index map but not in type map!",
-                    var_name, index
-                );
-                // Attempt to recover by storing the type hint? Or panic?
-                // For now, let's store it, but this warrants investigation.
-                self.local_var_types
-                    .insert(var_name.to_string(), ty_hint.clone());
+                // Inconsistency: index exists, but type doesn't. Treat as new assignment.
+                 println!("Error: Local '{}' index {} found but type missing! Assigning NEW slot.", var_name, existing_index);
+                 // This duplicates the logic from the block above - could be refactored
+                 let index = self.next_local_index;
+                 self.local_var_map.insert(var_name.to_string(), index);
+                 self.local_var_types.insert(var_name.to_string(), ty_hint.clone());
+                 let size = Self::get_type_size(ty_hint);
+                self.next_local_index += size;
+                self.max_locals_used = self.max_locals_used.max(index + size);
+                println!("   -> Assigned NEW index {} for '{}', size {}, next_local_index is now {}", index, var_name, size, self.next_local_index);
+                index
             }
-            *index
         } else {
-            // Variable is genuinely new (a MIR body local not previously encountered
-            // and not a parameter name). Use assign_local.
+            // Variable is genuinely new (or first time seen in this type context). Use assign_local.
             println!(
-                "Debug: Encountered new body local '{}'. Assigning.",
-                var_name
+                "Debug: Encountered new body local '{}' type {:?}. Assigning.",
+                var_name, ty_hint
             );
-            self.assign_local(var_name, ty_hint)
+            self.assign_local(var_name, ty_hint) // assign_local handles map insertion etc.
         }
     }
 
@@ -833,279 +865,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             OI::Mul { dest, op1, op2 } => self.translate_binary_op(dest, op1, op2, JI::Imul)?,
             OI::Div { dest, op1, op2 } => self.translate_binary_op(dest, op1, op2, JI::Idiv)?, // Handle division by zero?
             OI::Rem { dest, op1, op2 } => self.translate_binary_op(dest, op1, op2, JI::Irem)?,
-
-            OI::AddWithOverflow { dest, op1, op2 } => {
-                let base_label = format!("_add_ovf_{}", self.jvm_instructions.len());
-                let label_check_neg = format!("{}_check_neg", base_label);
-                let label_overflow_true = format!("{}_overflow_true", base_label);
-                let label_no_overflow = format!("{}_no_overflow", base_label);
-                let label_end = format!("{}_end", base_label);
-
-                let result_var = format!("{}_result", dest);
-                let overflow_var = format!("{}_overflow", dest);
-
-                // get the type of op1
-                let default_type = match op1 {
-                    OO::Variable { ty, .. } => ty.clone(),
-                    OO::Constant(c) => Type::from_constant(c),
-                };
-
-                // Load operands (a, b) and store temporarily
-                self.load_operand(op1)?;
-                self.load_operand(op2)?;
-                let b_tmp_idx = self.get_or_assign_local(&format!("{}_b_tmp", dest), &default_type);
-                self.jvm_instructions
-                    .push(Self::get_store_instruction(&default_type, b_tmp_idx)?);
-                let a_tmp_idx = self.get_or_assign_local(&format!("{}_a_tmp", dest), &default_type);
-                self.jvm_instructions
-                    .push(Self::get_store_instruction(&default_type, a_tmp_idx)?); // stack: []
-
-                // --- Check Positive Overflow ---
-                self.jvm_instructions
-                    .push(Self::get_load_instruction(&default_type, a_tmp_idx)?); // stack: [a]
-                self.jvm_instructions.push(JI::Ifle(0)); // Consumes a. stack: []
-                self.branch_fixups
-                    .push((self.jvm_instructions.len() - 1, label_check_neg.clone()));
-
-                self.jvm_instructions
-                    .push(Self::get_load_instruction(&default_type, b_tmp_idx)?); // stack: [b]
-                self.jvm_instructions.push(JI::Ifle(0)); // Consumes b. stack: []
-                self.branch_fixups
-                    .push((self.jvm_instructions.len() - 1, label_check_neg.clone()));
-
-                // Now a > 0, b > 0. Check if b > MAX - a
-                // ** Reload b and a **
-                self.jvm_instructions
-                    .push(Self::get_load_instruction(&default_type, b_tmp_idx)?); // stack: [b]
-                let int_const_instr = Self::get_int_const_instr(self, i32::MAX);
-                self.jvm_instructions.push(int_const_instr); // stack: [b, MAX]
-                self.jvm_instructions
-                    .push(Self::get_load_instruction(&default_type, a_tmp_idx)?); // stack: [b, MAX, a]
-                self.jvm_instructions.push(JI::Isub); // stack: [b, MAX - a]
-                self.jvm_instructions.push(JI::If_icmpgt(0)); // Consumes both. stack: []
-                self.branch_fixups
-                    .push((self.jvm_instructions.len() - 1, label_overflow_true.clone()));
-
-                self.jvm_instructions.push(JI::Goto(0));
-                self.branch_fixups
-                    .push((self.jvm_instructions.len() - 1, label_check_neg.clone()));
-
-                // --- Check Negative Overflow ---
-                let check_neg_idx = self.jvm_instructions.len();
-                self.label_to_instr_index
-                    .insert(label_check_neg.clone(), check_neg_idx as u16); // stack: []
-                self.jvm_instructions
-                    .push(Self::get_load_instruction(&default_type, a_tmp_idx)?); // stack: [a]
-                self.jvm_instructions.push(JI::Ifge(0)); // Consumes a. stack: []
-                self.branch_fixups
-                    .push((self.jvm_instructions.len() - 1, label_no_overflow.clone()));
-
-                self.jvm_instructions
-                    .push(Self::get_load_instruction(&default_type, b_tmp_idx)?); // stack: [b]
-                self.jvm_instructions.push(JI::Ifge(0)); // Consumes b. stack: []
-                self.branch_fixups
-                    .push((self.jvm_instructions.len() - 1, label_no_overflow.clone()));
-
-                // Now a < 0, b < 0. Check if b < MIN - a
-                // ** Reload b and a **
-                self.jvm_instructions
-                    .push(Self::get_load_instruction(&default_type, b_tmp_idx)?); // stack: [b]
-                let int_const_instr = Self::get_int_const_instr(self, i32::MIN);
-                self.jvm_instructions.push(int_const_instr); // stack: [b, MIN]
-                self.jvm_instructions
-                    .push(Self::get_load_instruction(&default_type, a_tmp_idx)?); // stack: [b, MIN, a]
-                self.jvm_instructions.push(JI::Isub); // stack: [b, MIN - a]
-                self.jvm_instructions.push(JI::If_icmplt(0)); // Consumes both. stack: []
-                self.branch_fixups
-                    .push((self.jvm_instructions.len() - 1, label_overflow_true.clone()));
-
-                self.jvm_instructions.push(JI::Goto(0));
-                self.branch_fixups
-                    .push((self.jvm_instructions.len() - 1, label_no_overflow.clone()));
-
-                // --- Overflow True Path ---
-                let overflow_true_idx = self.jvm_instructions.len();
-                self.label_to_instr_index
-                    .insert(label_overflow_true.clone(), overflow_true_idx as u16); // stack: []
-                self.jvm_instructions.push(JI::Iconst_1); // stack: [1]
-                self.store_result(&overflow_var, &oomir::Type::Boolean)?; // stack: []
-                self.jvm_instructions.push(JI::Goto(0));
-                self.branch_fixups
-                    .push((self.jvm_instructions.len() - 1, label_end.clone()));
-
-                // --- No Overflow Path ---
-                let no_overflow_idx = self.jvm_instructions.len();
-                self.label_to_instr_index
-                    .insert(label_no_overflow.clone(), no_overflow_idx as u16); // stack: []
-                self.jvm_instructions.push(JI::Iconst_0); // stack: [0]
-                self.store_result(&overflow_var, &oomir::Type::Boolean)?; // stack: []
-                // Fallthrough
-
-                // --- Perform Addition and Store Result (Common Path) ---
-                let end_idx = self.jvm_instructions.len();
-                self.label_to_instr_index
-                    .insert(label_end.clone(), end_idx as u16); // stack: []
-                self.jvm_instructions
-                    .push(Self::get_load_instruction(&default_type, a_tmp_idx)?);
-                self.jvm_instructions
-                    .push(Self::get_load_instruction(&default_type, b_tmp_idx)?);
-                self.jvm_instructions.push(JI::Iadd);
-                self.store_result(&result_var, &default_type)?; // stack: []
-            }
-
-            // --- Corrected SubWithOverflow ---
-            OI::SubWithOverflow { dest, op1, op2 } => {
-                let base_label = format!("_sub_ovf_{}", self.jvm_instructions.len());
-                let label_b_is_min = format!("{}_b_is_min", base_label);
-                let label_b_not_min = format!("{}_b_not_min", base_label); // Added for clarity, might optimize later
-                let label_check_neg_pos = format!("{}_check_neg_pos", base_label);
-                let label_overflow_true = format!("{}_overflow_true", base_label);
-                let label_no_overflow = format!("{}_no_overflow", base_label);
-                let label_end = format!("{}_end", base_label);
-
-                let result_var = format!("{}_result", dest);
-                let overflow_var = format!("{}_overflow", dest);
-
-                // get the type of op1
-                let default_type = match op1 {
-                    OO::Variable { ty, .. } => ty.clone(),
-                    OO::Constant(c) => Type::from_constant(c),
-                };
-
-                // Load operands (a, b) and store temporarily
-                self.load_operand(op1)?;
-                self.load_operand(op2)?;
-                let b_tmp_idx = self.get_or_assign_local(&format!("{}_b_tmp", dest), &default_type);
-                self.jvm_instructions
-                    .push(Self::get_store_instruction(&default_type, b_tmp_idx)?);
-                let a_tmp_idx = self.get_or_assign_local(&format!("{}_a_tmp", dest), &default_type);
-                self.jvm_instructions
-                    .push(Self::get_store_instruction(&default_type, a_tmp_idx)?); // stack: []
-
-                // --- Check Case 1: b == MIN? ---
-                self.jvm_instructions
-                    .push(Self::get_load_instruction(&default_type, b_tmp_idx)?); // stack: [b]
-                let int_const_instr = Self::get_int_const_instr(self, i32::MIN);
-                self.jvm_instructions.push(int_const_instr); // stack: [b, MIN]
-                self.jvm_instructions.push(JI::If_icmpeq(0)); // Consumes both. stack: []
-                self.branch_fixups
-                    .push((self.jvm_instructions.len() - 1, label_b_is_min.clone()));
-                // Fallthrough if b != MIN, stack: []
-
-                // Label for b != MIN path (might not strictly be needed if fallthrough is obvious)
-                let b_not_min_idx = self.jvm_instructions.len();
-                self.label_to_instr_index
-                    .insert(label_b_not_min.clone(), b_not_min_idx as u16);
-
-                // --- Case 2: b != MIN ---
-                // Check Pos - Neg: a > 0 && b < 0?
-                self.jvm_instructions
-                    .push(Self::get_load_instruction(&default_type, a_tmp_idx)?); // stack: [a]
-                self.jvm_instructions.push(JI::Ifle(0)); // Consumes a. stack: []
-                self.branch_fixups
-                    .push((self.jvm_instructions.len() - 1, label_check_neg_pos.clone()));
-
-                self.jvm_instructions
-                    .push(Self::get_load_instruction(&default_type, b_tmp_idx)?); // stack: [b]
-                self.jvm_instructions.push(JI::Ifge(0)); // Consumes b. stack: []
-                self.branch_fixups
-                    .push((self.jvm_instructions.len() - 1, label_check_neg_pos.clone()));
-
-                // Now a > 0, b < 0. Check if a > MAX + b
-                // ** Reload a and b **
-                self.jvm_instructions
-                    .push(Self::get_load_instruction(&default_type, a_tmp_idx)?); // stack: [a]
-                let int_const_instr = Self::get_int_const_instr(self, i32::MAX);
-                self.jvm_instructions.push(int_const_instr); // stack: [a, MAX]
-                self.jvm_instructions
-                    .push(Self::get_load_instruction(&default_type, b_tmp_idx)?); // stack: [a, MAX, b]
-                self.jvm_instructions.push(JI::Iadd); // stack: [a, MAX + b]
-                self.jvm_instructions.push(JI::If_icmpgt(0)); // Consumes both. stack: []
-                self.branch_fixups
-                    .push((self.jvm_instructions.len() - 1, label_overflow_true.clone()));
-
-                self.jvm_instructions.push(JI::Goto(0)); // No overflow here, check next case
-                self.branch_fixups
-                    .push((self.jvm_instructions.len() - 1, label_check_neg_pos.clone()));
-
-                // --- Check Case 1 Handler: b == MIN ---
-                let b_is_min_idx = self.jvm_instructions.len();
-                self.label_to_instr_index
-                    .insert(label_b_is_min.clone(), b_is_min_idx as u16); // stack: []
-                self.jvm_instructions
-                    .push(Self::get_load_instruction(&default_type, a_tmp_idx)?); // stack: [a]
-                self.jvm_instructions.push(JI::Ifge(0)); // Consumes a. stack: []
-                self.branch_fixups
-                    .push((self.jvm_instructions.len() - 1, label_overflow_true.clone()));
-                // Fallthrough if a < 0 means no overflow for b == MIN
-                self.jvm_instructions.push(JI::Goto(0));
-                self.branch_fixups
-                    .push((self.jvm_instructions.len() - 1, label_no_overflow.clone()));
-
-                // --- Check Case 2 (Cont.): Neg - Pos ---
-                let check_neg_pos_idx = self.jvm_instructions.len();
-                self.label_to_instr_index
-                    .insert(label_check_neg_pos.clone(), check_neg_pos_idx as u16); // stack: []
-                self.jvm_instructions
-                    .push(Self::get_load_instruction(&default_type, a_tmp_idx)?); // stack: [a]
-                self.jvm_instructions.push(JI::Ifge(0)); // Consumes a. stack: []
-                self.branch_fixups
-                    .push((self.jvm_instructions.len() - 1, label_no_overflow.clone()));
-
-                self.jvm_instructions
-                    .push(Self::get_load_instruction(&default_type, b_tmp_idx)?); // stack: [b]
-                self.jvm_instructions.push(JI::Ifle(0)); // Consumes b. stack: []
-                self.branch_fixups
-                    .push((self.jvm_instructions.len() - 1, label_no_overflow.clone()));
-
-                // Now a < 0, b > 0. Check if a < MIN + b
-                // ** Reload a and b **
-                self.jvm_instructions
-                    .push(Self::get_load_instruction(&default_type, a_tmp_idx)?); // stack: [a]
-                let int_const_instr = Self::get_int_const_instr(self, i32::MIN);
-                self.jvm_instructions.push(int_const_instr); // stack: [a, MIN]
-                self.jvm_instructions
-                    .push(Self::get_load_instruction(&default_type, b_tmp_idx)?); // stack: [a, MIN, b]
-                self.jvm_instructions.push(JI::Iadd); // stack: [a, MIN + b]
-                self.jvm_instructions.push(JI::If_icmplt(0)); // Consumes both. stack: []
-                self.branch_fixups
-                    .push((self.jvm_instructions.len() - 1, label_overflow_true.clone()));
-
-                // Fallthrough means no overflow for neg-pos case.
-                self.jvm_instructions.push(JI::Goto(0));
-                self.branch_fixups
-                    .push((self.jvm_instructions.len() - 1, label_no_overflow.clone()));
-
-                // --- Overflow True Path ---
-                let overflow_true_idx = self.jvm_instructions.len();
-                self.label_to_instr_index
-                    .insert(label_overflow_true.clone(), overflow_true_idx as u16); // stack: []
-                self.jvm_instructions.push(JI::Iconst_1); // stack: [1]
-                self.store_result(&overflow_var, &oomir::Type::Boolean)?; // stack: []
-                self.jvm_instructions.push(JI::Goto(0));
-                self.branch_fixups
-                    .push((self.jvm_instructions.len() - 1, label_end.clone()));
-
-                // --- No Overflow Path ---
-                let no_overflow_idx = self.jvm_instructions.len();
-                self.label_to_instr_index
-                    .insert(label_no_overflow.clone(), no_overflow_idx as u16); // stack: []
-                self.jvm_instructions.push(JI::Iconst_0); // stack: [0]
-                self.store_result(&overflow_var, &oomir::Type::Boolean)?; // stack: []
-                // Fallthrough
-
-                // --- Perform Subtraction and Store Result (Common Path) ---
-                let end_idx = self.jvm_instructions.len();
-                self.label_to_instr_index
-                    .insert(label_end.clone(), end_idx as u16); // stack: []
-                self.jvm_instructions
-                    .push(Self::get_load_instruction(&default_type, a_tmp_idx)?);
-                self.jvm_instructions
-                    .push(Self::get_load_instruction(&default_type, b_tmp_idx)?);
-                self.jvm_instructions.push(JI::Isub);
-                self.store_result(&result_var, &default_type)?; // stack: []
-            }
-
             // --- Comparisons ---
             // Need to handle operand types (int, long, float, double, ref)
             OI::Eq { dest, op1, op2 } => {
@@ -1296,6 +1055,33 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     }
                 }
             }
+            OI::Label { name } => {
+                // This instruction marks a potential jump target within the bytecode stream.
+                // Record the current JVM instruction index (offset) for this label name.
+                // This index points to the *next* instruction that will be generated.
+                let current_jvm_instr_index = self.jvm_instructions.len()
+                    .try_into()
+                    .map_err(|_| jvm::Error::VerificationError {
+                        context: "Function too large".to_string(),
+                        message: "Instruction index exceeds u16::MAX".to_string(),
+                    })?;
+    
+                // Insert the mapping from the OOMIR label name to the JVM instruction index.
+                if let Some(old_idx) = self.label_to_instr_index.insert(name.clone(), current_jvm_instr_index) {
+                    // This *could* happen if a label name conflicts with a basic block name,
+                    // or if the label generation logic somehow creates duplicates.
+                    // Should be investigated if it occurs. Might indicate an issue in lower1's label generation.
+                    println!(
+                        "Warning: Overwriting existing entry in label_to_instr_index for label '{}'. Old index: {}, New index: {}",
+                        name, old_idx, current_jvm_instr_index
+                     );
+                    // Depending on requirements, you might want to error here instead of warning.
+                }
+                // No JVM instructions are generated for an OOMIR Label itself.
+                // It only affects the mapping used by branch fixups.
+                println!("Debug: Registered label '{}' at JVM instruction index {}", name, current_jvm_instr_index); // Added Debug log
+    
+            }   
             OI::Call {
                 dest,
                 function: function_name,
@@ -1643,6 +1429,142 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     .push(JI::Invokespecial(constructor_ref_index));
                 self.jvm_instructions.push(JI::Athrow);
             }
+            OI::ConstructObject { dest, class_name } => {
+                println!("Info: Translating ConstructObject dest={}, class={}", dest, class_name);
+                // 1. Add Class reference to constant pool
+                let class_index = self.constant_pool.add_class(class_name)?;
+                println!("   -> Added class '{}' to CP, index {}", class_name, class_index);
+
+                // 2. Add Method reference for the default constructor "<init>()V"
+                let constructor_ref_index = self.constant_pool.add_method_ref(
+                    class_index,
+                    "<init>", // Standard name for constructors
+                    "()V",    // Standard descriptor for default constructor
+                )?;
+                 println!("   -> Added constructor ref for '{}' to CP, index {}", class_name, constructor_ref_index);
+
+                // 3. Emit 'new' instruction
+                self.jvm_instructions.push(JI::New(class_index)); // Stack: [uninitialized_ref]
+                println!("   -> Emitted New {}", class_index);
+
+                // 4. Emit 'dup' instruction
+                self.jvm_instructions.push(JI::Dup); // Stack: [uninitialized_ref, uninitialized_ref]
+                println!("   -> Emitted Dup");
+
+                // 5. Emit 'invokespecial' to call the constructor
+                self.jvm_instructions.push(JI::Invokespecial(constructor_ref_index)); // Stack: [initialized_ref]
+                println!("   -> Emitted Invokespecial {}", constructor_ref_index);
+
+                // 6. Store the initialized object reference into the destination variable
+                //    The type of the destination variable is Type::Class(class_name)
+                let dest_type = oomir::Type::Class(class_name.clone());
+                self.store_result(dest, &dest_type)?; // Stack: []
+                println!("   -> Stored object reference in var '{}' with type {:?}", dest, dest_type);
+            }
+
+            OI::SetField {
+                object_var,
+                field_name,
+                value,
+                field_ty,
+                owner_class, // Class where the field is *defined*
+            } => {
+                 println!("Info: Translating SetField obj={}, field={}, value={:?}, type={:?}, owner={}",
+                          object_var, field_name, value, field_ty, owner_class);
+
+                // 1. Get the type of the object variable itself (should be a Class type)
+                let object_actual_type = self.get_local_type(object_var)?.clone();
+                 println!("   -> Object var '{}' has actual type {:?}", object_var, object_actual_type);
+                 // We don't strictly *need* object_actual_type for the load instruction itself
+                 // if get_load_instruction correctly handles all reference types with Aload,
+                 // but it's good practice to verify it's a reference type.
+                 if !object_actual_type.is_jvm_reference_type() {
+                     return Err(jvm::Error::VerificationError {
+                         context: format!("Function {}", self.oomir_func.name),
+                         message: format!(
+                             "Variable '{}' used in SetField is not a reference type, found {:?}",
+                             object_var, object_actual_type
+                         ),
+                     });
+                 }
+
+                 // 2. Add Field reference to constant pool
+                 let owner_class_index = self.constant_pool.add_class(owner_class)?;
+                 let field_descriptor = field_ty.to_jvm_descriptor();
+                 let field_ref_index = self.constant_pool.add_field_ref(
+                    owner_class_index,
+                    field_name,
+                    &field_descriptor,
+                 )?;
+                 println!("   -> Added field ref '{}.{}' desc='{}' to CP, index {}", owner_class, field_name, field_descriptor, field_ref_index);
+
+                 // 3. Load the object reference onto the stack
+                 // Use object_actual_type (which must be a reference type) to get aload
+                 let object_var_index = self.get_local_index(object_var)?;
+                 let load_object_instr = Self::get_load_instruction(&object_actual_type, object_var_index)?;
+                 self.jvm_instructions.push(load_object_instr.clone()); // Stack: [object_ref]
+                 println!("   -> Emitted Load Object ({:?}) from index {}", load_object_instr, object_var_index);
+
+
+                 // 4. Load the value to be stored onto the stack
+                 self.load_operand(value)?; // Stack: [object_ref, value] (value size 1 or 2)
+                 println!("   -> Loaded value operand {:?}", value);
+
+
+                 // 5. Emit 'putfield' instruction
+                 self.jvm_instructions.push(JI::Putfield(field_ref_index)); // Stack: []
+                 println!("   -> Emitted Putfield {}", field_ref_index);
+            }
+
+            OI::GetField {
+                dest,
+                object_var,
+                field_name,
+                field_ty, // Type of the field *value* being retrieved
+                owner_class, // Class where the field is *defined*
+            } => {
+                println!("Info: Translating GetField dest={}, obj={}, field={}, type={:?}, owner={}",
+                         dest, object_var, field_name, field_ty, owner_class);
+
+                // 1. Get the type of the object variable itself
+                let object_actual_type = self.get_local_type(object_var)?.clone();
+                 println!("   -> Object var '{}' has actual type {:?}", object_var, object_actual_type);
+                 if !object_actual_type.is_jvm_reference_type() {
+                     return Err(jvm::Error::VerificationError {
+                         context: format!("Function {}", self.oomir_func.name),
+                         message: format!(
+                             "Variable '{}' used in GetField is not a reference type, found {:?}",
+                             object_var, object_actual_type
+                         ),
+                     });
+                 }
+
+                 // 2. Add Field reference to constant pool (same as SetField)
+                 let owner_class_index = self.constant_pool.add_class(owner_class)?;
+                 let field_descriptor = field_ty.to_jvm_descriptor();
+                 let field_ref_index = self.constant_pool.add_field_ref(
+                    owner_class_index,
+                    field_name,
+                    &field_descriptor,
+                 )?;
+                println!("   -> Added field ref '{}.{}' desc='{}' to CP, index {}", owner_class, field_name, field_descriptor, field_ref_index);
+
+                 // 3. Load the object reference onto the stack
+                 let object_var_index = self.get_local_index(object_var)?;
+                 let load_object_instr = Self::get_load_instruction(&object_actual_type, object_var_index)?;
+                 self.jvm_instructions.push(load_object_instr.clone()); // Stack: [object_ref]
+                 println!("   -> Emitted Load Object ({:?}) from index {}", load_object_instr, object_var_index);
+
+                 // 4. Emit 'getfield' instruction
+                 self.jvm_instructions.push(JI::Getfield(field_ref_index)); // Stack: [field_value] (size 1 or 2)
+                 println!("   -> Emitted Getfield {}", field_ref_index);
+
+                 // 5. Store the retrieved field value into the destination variable
+                 //    The type for storage is the field's type (field_ty)
+                 self.store_result(dest, field_ty)?; // Stack: []
+                 println!("   -> Stored field value in var '{}' with type {:?}", dest, field_ty);
+
+            }
         }
         Ok(())
     }
@@ -1687,80 +1609,214 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
 
 // --- Main Conversion Function ---
 
-/// Converts an OOMIR module into a JVM class file (as a byte vector).
+/// Converts an OOMIR module into JVM class files
+/// Returns a HashMap where the key is the JVM class name (with '/') and the value is the bytecode
 pub fn oomir_to_jvm_bytecode(
     module: &oomir::Module,
     _tcx: TyCtxt, // Keep tcx in signature if needed later, but unused now
-) -> jvm::Result<Vec<u8>> {
-    let mut constant_pool = ConstantPool::default();
-    let super_class_index = constant_pool.add_class("java/lang/Object")?;
-    let this_class_index = constant_pool.add_class(&module.name)?;
-    let code_attribute_name_index = constant_pool.add_utf8("Code")?;
+) -> jvm::Result<HashMap<String, Vec<u8>>> {
 
-    let mut methods: Vec<jvm::Method> = Vec::new();
-    let mut has_constructor = false;
+    // Map to store the generated class files (Class Name -> Bytes)
+    let mut generated_classes: HashMap<String, Vec<u8>> = HashMap::new();
 
-    for function in module.functions.values() {
-        if function.name == "<init>" {
-            has_constructor = true;
-            // TODO: Translate the provided constructor if necessary.
-            // For now, we'll rely on the default one if none is explicit.
-            // If an explicit one exists, it MUST call a super constructor.
+    // --- 1. Generate the Main Module Class (containing functions) ---
+    { // Scope block for the main class generation
+        let mut main_cp = ConstantPool::default();
+        // Convert module name to JVM internal format (replace '.' with '/')
+        let main_class_name_jvm = module.name.replace('.', "/");
+        let super_class_name_jvm = "java/lang/Object"; // Standard superclass
+
+        let super_class_index = main_cp.add_class(super_class_name_jvm)?;
+        let this_class_index = main_cp.add_class(&main_class_name_jvm)?;
+        let code_attribute_name_index = main_cp.add_utf8("Code")?;
+
+        let mut methods: Vec<jvm::Method> = Vec::new();
+        let mut has_constructor = false;
+
+        for function in module.functions.values() {
+            // Don't create a default constructor if the OOMIR provided one
+            if function.name == "<init>" {
+                has_constructor = true;
+            }
+
+            let name_index = main_cp.add_utf8(&function.name)?;
+            let descriptor_index = main_cp.add_utf8(&function.signature.to_string())?;
+
+            // Translate the function body using its own constant pool reference
+            let translator = FunctionTranslator::new(
+                function,
+                &mut main_cp, // Use the main class's constant pool
+                &main_class_name_jvm,
+                module,
+            );
+            let (jvm_code, max_locals_val) = translator.translate()?;
+
+            let max_stack_val = jvm_code.max_stack(&main_cp)?;
+
+            let code_attribute = Attribute::Code {
+                name_index: code_attribute_name_index,
+                max_stack: max_stack_val,
+                max_locals: max_locals_val,
+                code: jvm_code,
+                exception_table: Vec::new(),
+                attributes: Vec::new(),
+            };
+
+            let mut method = jvm::Method::default();
+            // Assume static for now, adjust if instance methods are needed
+            method.access_flags = MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC;
+            if function.name == "<init>" {
+                 // Constructors cannot be static
+                 method.access_flags = MethodAccessFlags::PUBLIC;
+            }
+            method.name_index = name_index;
+            method.descriptor_index = descriptor_index;
+            method.attributes.push(code_attribute);
+
+            methods.push(method);
         }
 
-        let name_index = constant_pool.add_utf8(&function.name)?;
-        let descriptor_index = constant_pool.add_utf8(&function.signature.to_string())?;
+        // Add a default constructor if none was provided in OOMIR
+        if !has_constructor && !module.functions.contains_key("<init>") {
+             methods.push(create_default_constructor(
+                 &mut main_cp,
+                 super_class_index,
+             )?);
+        }
 
-        // Translate the function body to JVM instructions
-        let translator: FunctionTranslator<'_, '_> =
-            FunctionTranslator::new(function, &mut constant_pool, &module.name, module);
-        let (jvm_code, max_locals_val) = translator.translate()?;
-
-        // Calculate max_stack
-        let max_stack_val = jvm_code.max_stack(&constant_pool)?;
-        // max_locals is calculated during translation
-
-        // Create the Code attribute
-        let code_attribute = Attribute::Code {
-            name_index: code_attribute_name_index,
-            max_stack: max_stack_val,
-            max_locals: max_locals_val,
-            code: jvm_code,
-            exception_table: Vec::new(), // TODO: Populate if OOMIR supports exceptions
-            attributes: Vec::new(),      // TODO: Add LineNumberTable, etc. if needed
+        let mut class_file = ClassFile {
+            version: Version::Java8 { minor: 0 },
+            constant_pool: main_cp, // Move the main constant pool here
+            access_flags: ClassAccessFlags::PUBLIC | ClassAccessFlags::SUPER,
+            this_class: this_class_index,
+            super_class: super_class_index,
+            interfaces: Vec::new(),
+            fields: Vec::new(), // Main class might not have fields unless they are static globals
+            methods,
+            attributes: Vec::new(),
         };
 
-        let mut method = jvm::Method::default();
-        method.access_flags = MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC; // Assuming all are public static for now
-        method.name_index = name_index;
-        method.descriptor_index = descriptor_index;
-        method.attributes.push(code_attribute);
+        // Add SourceFile attribute
+        let source_file_name = format!("{}.rs", module.name.split('.').last().unwrap_or(&module.name)); // Simple name
+        let source_file_utf8_index = class_file.constant_pool.add_utf8(&source_file_name)?;
+        let source_file_attr_name_index = class_file.constant_pool.add_utf8("SourceFile")?;
+        class_file.attributes.push(Attribute::SourceFile {
+            name_index: source_file_attr_name_index,
+            source_file_index: source_file_utf8_index,
+        });
 
-        methods.push(method);
+        // Serialize the main class file
+        let mut byte_vector = Vec::new();
+        class_file.to_bytes(&mut byte_vector)?;
+        generated_classes.insert(main_class_name_jvm.clone(), byte_vector);
+
+        println!("Generated main class: {}", main_class_name_jvm);
+
     }
 
-    // Add a default constructor if none was found
-    if !has_constructor {
-        methods.push(create_default_constructor(
-            &mut constant_pool,
-            super_class_index,
-        )?);
+
+    // --- 2. Generate Class Files for Data Types ---
+    for (dt_name_oomir, data_type) in &module.data_types {
+        println!("Generating data type class: {}", dt_name_oomir);
+
+        // Create and serialize the class file for this data type
+        let dt_bytecode = create_data_type_classfile(
+            &dt_name_oomir,
+            data_type,
+            "java/lang/Object", // Superclass
+        )?;
+        generated_classes.insert(dt_name_oomir.clone(), dt_bytecode);
     }
 
+    Ok(generated_classes) // Return the map containing all generated classes
+}
+
+fn oomir_type_to_ristretto_field_type(
+    type2: &oomir::Type,
+) -> jvm::FieldType {
+    match type2 {
+        oomir::Type::I8 => jvm::FieldType::Base(BaseType::Byte),
+        oomir::Type::I16 => jvm::FieldType::Base(BaseType::Short),
+        oomir::Type::I32 => jvm::FieldType::Base(BaseType::Int),
+        oomir::Type::I64 => jvm::FieldType::Base(BaseType::Long),
+        oomir::Type::F32 => jvm::FieldType::Base(BaseType::Float),
+        oomir::Type::F64 => jvm::FieldType::Base(BaseType::Double),
+        oomir::Type::Boolean => jvm::FieldType::Base(BaseType::Boolean),
+        oomir::Type::Char => jvm::FieldType::Base(BaseType::Char),
+        oomir::Type::String => jvm::FieldType::Object(
+            "java/lang/String".to_string(), // String class reference
+        ),
+        oomir::Type::Reference(ref2) => {
+            let inner_ty = ref2.as_ref();
+            oomir_type_to_ristretto_field_type(inner_ty) // recursion
+        }
+        oomir::Type::Array(inner_ty) => {
+            let inner_field_type = oomir_type_to_ristretto_field_type(inner_ty);
+            jvm::FieldType::Array(Box::new(inner_field_type))
+        }
+        oomir::Type::Class(name) => {
+            jvm::FieldType::Object(name.clone())
+        }
+        oomir::Type::Void => {
+            panic!("Void type cannot be used as a field type");
+        }
+    }
+}
+
+/// Creates a ClassFile (as bytes) for a given OOMIR DataType.
+fn create_data_type_classfile(
+    class_name_jvm: &str,
+    data_type: &oomir::DataType,
+    super_class_name_jvm: &str,
+) -> jvm::Result<Vec<u8>> {
+
+    // Each data type class gets its *own* constant pool
+    let mut cp = ConstantPool::default();
+
+    let this_class_index = cp.add_class(class_name_jvm)?;
+    let super_class_index = cp.add_class(super_class_name_jvm)?;
+
+    // --- Create Fields ---
+    let mut fields: Vec<jvm::Field> = Vec::new();
+    for (field_name, field_ty) in &data_type.fields {
+        let name_index = cp.add_utf8(field_name)?;
+        let descriptor = field_ty.to_jvm_descriptor();
+        let descriptor_index = cp.add_utf8(&descriptor)?;
+
+        let field = jvm::Field {
+            // Making fields public for now for simplicity. Could be private with getters/setters in future (maybe?)
+            access_flags: FieldAccessFlags::PUBLIC,
+            name_index,
+            descriptor_index,
+            field_type: oomir_type_to_ristretto_field_type(field_ty),
+            attributes: Vec::new(),
+        };
+        fields.push(field);
+        println!("  - Added field: {} {}", field_name, descriptor);
+    }
+
+    // --- Create Default Constructor ---
+    // Data type classes need a standard constructor to be instantiated
+    let constructor = create_default_constructor(&mut cp, super_class_index)?;
+    let methods = vec![constructor]; // Start with just the constructor
+
+    // --- Assemble ClassFile ---
     let mut class_file = ClassFile {
         version: Version::Java8 { minor: 0 },
-        constant_pool, // Will be moved
+        constant_pool: cp, // Move the data type's constant pool
         access_flags: ClassAccessFlags::PUBLIC | ClassAccessFlags::SUPER,
         this_class: this_class_index,
         super_class: super_class_index,
         interfaces: Vec::new(),
-        fields: Vec::new(), // Assuming no fields for now
-        methods,
-        attributes: Vec::new(), // Add SourceFile attribute?
+        fields, // Add the generated fields
+        methods, // Add the constructor
+        attributes: Vec::new(),
     };
 
-    // Add SourceFile attribute (optional but good practice)
-    let source_file_name = format!("{}.rs", module.name); // Or derive from actual source
+    // --- Add SourceFile Attribute (Optional but Recommended) ---
+    // Use the simple name part of the class name
+    let simple_name = class_name_jvm.split('/').last().unwrap_or(class_name_jvm);
+    let source_file_name = format!("{}.rs", simple_name); // Assume it came from a .rs file
     let source_file_utf8_index = class_file.constant_pool.add_utf8(&source_file_name)?;
     let source_file_attr_name_index = class_file.constant_pool.add_utf8("SourceFile")?;
     class_file.attributes.push(Attribute::SourceFile {
@@ -1768,17 +1824,21 @@ pub fn oomir_to_jvm_bytecode(
         source_file_index: source_file_utf8_index,
     });
 
-    // Serialize the class file to bytes
+
+    // --- Serialize ---
     let mut byte_vector = Vec::new();
     class_file.to_bytes(&mut byte_vector)?;
+
     Ok(byte_vector)
 }
 
+
 /// Creates a default constructor `<init>()V` that just calls `super()`.
+/// (This helper function remains largely the same, just ensure it's accessible)
 fn create_default_constructor(
     cp: &mut ConstantPool,
     super_class_index: u16,
-) -> jvm::Result<jvm::Method> {
+) -> jvm::Result<jvm::Method> { // Changed return type to Method
     let code_attr_name_index = cp.add_utf8("Code")?;
     let init_name_index = cp.add_utf8("<init>")?;
     let init_desc_index = cp.add_utf8("()V")?;
@@ -1787,12 +1847,14 @@ fn create_default_constructor(
     let super_init_ref_index = cp.add_method_ref(super_class_index, "<init>", "()V")?;
 
     let instructions = vec![
-        Instruction::Aload_0,                             // Load 'this'
+        Instruction::Aload_0,                             // Load 'this' (implicit arg 0 for instance methods)
         Instruction::Invokespecial(super_init_ref_index), // Call super()
         Instruction::Return,
     ];
 
-    let max_stack = instructions.max_stack(cp)?; // Should be 1
+    // Need to calculate max_stack based *only* on these instructions.
+    // A simple calculation works here: Aload_0 pushes 1, Invokespecial pops 1 (the 'this'), so max_stack = 1
+    let max_stack = 1; // Calculated manually for this simple sequence
     let max_locals = 1; // Just 'this'
 
     let code_attribute = Attribute::Code {
@@ -1801,7 +1863,7 @@ fn create_default_constructor(
         max_locals,
         code: instructions,
         exception_table: Vec::new(),
-        attributes: Vec::new(), // No inner attributes like LineNumberTable needed for default
+        attributes: Vec::new(), // No inner attributes needed for default constructor
     };
 
     Ok(jvm::Method {

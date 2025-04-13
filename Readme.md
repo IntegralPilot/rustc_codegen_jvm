@@ -39,6 +39,7 @@ This backend currently supports a subset of Rust features:
 *   ✅ Basic variable assignment (`let x = y;`).
 *   ✅ Arrays and slices.
 *   ✅ Floats (`f32`, `f64`).
+*   ✅ Structs and Tuples (enums and unions coming soon!)
 *   ✅ Generating executable `.jar` files for binary crates.
 
 ### Next Milestone:
