@@ -45,6 +45,11 @@ pub fn handle_rvalue<'a>(
                     op1: oomir_op1,
                     op2: oomir_op2,
                 }),
+                BinOp::Div => instructions.push(oomir::Instruction::Div {
+                    dest,
+                    op1: oomir_op1,
+                    op2: oomir_op2,
+                }),
                 BinOp::Eq => instructions.push(oomir::Instruction::Eq {
                     dest,
                     op1: oomir_op1,
