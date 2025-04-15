@@ -23,6 +23,10 @@
     "descriptor": "(I)Ljava/lang/String;",
     "is_static": true
   },
+  "core_panicking_panic": {
+    "descriptor": "(Ljava/lang/String;)V",
+    "is_static": true
+  },
   "eq": {
     "descriptor": "(Ljava/lang/Object;Ljava/lang/Object;)Z",
     "is_static": true

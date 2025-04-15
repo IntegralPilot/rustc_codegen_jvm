@@ -9,7 +9,6 @@ def read_from_file(path: str) -> str:
         return f.read()
 
 def normalize_name(test_name: str) -> str:
-    # Replace underscores with spaces and capitalize the first letter.
     return test_name.replace("_", " ").capitalize()
 
 def run_command(cmd: list, cwd=None):
@@ -25,7 +24,6 @@ def process_test(test_dir: str, release_mode: bool):
     normalized = normalize_name(test_name)
     print(f"|-- Test '{test_name}' ({normalized})")
     
-    # Clean the folder: with cargo clean
     print("|--- 🧼 Cleaning test folder...")
     proc = run_command(["cargo", "clean"], cwd=test_dir)
     if proc.returncode != 0:
@@ -35,7 +33,6 @@ def process_test(test_dir: str, release_mode: bool):
         print(f"|---- ❌ cargo clean exited with code {proc.returncode}")
         return False
 
-    # Run cargo build.
     print("|--- ⚒️ Building with Cargo...")
     build_cmd = ["cargo", "build", "--release"] if release_mode else ["cargo", "build"]
     no_jvm_target = os.path.join(test_dir, "no_jvm_target.flag")
@@ -50,7 +47,6 @@ def process_test(test_dir: str, release_mode: bool):
         print(f"|---- ❌ cargo build exited with code {proc.returncode}")
         return False
 
-    # Run java with the generated jar.
     print("|--- 🤖 Running with Java...")
     target_dir = "release" if release_mode else "debug"
     if os.path.exists(no_jvm_target):
@@ -64,11 +60,12 @@ def process_test(test_dir: str, release_mode: bool):
             print("|---- ❌ No jar file found in target/{target_dir}/deps")
             return False
         os.makedirs(os.path.join(test_dir, "target", "jvm-unknown-unknown", target_dir), exist_ok=True)
-        os.rename(os.path.join(test_dir, "target", target_dir, "deps", jar_file), os.path.join(test_dir, "target", "jvm-unknown-unknown", target_dir, f"{test_name}.jar"))
+        os.rename(os.path.join(test_dir, "target", target_dir, "deps", jar_file),
+                  os.path.join(test_dir, "target", "jvm-unknown-unknown", target_dir, f"{test_name}.jar"))
+
     jar_path = os.path.join(test_dir, "target", "jvm-unknown-unknown", target_dir, f"{test_name}.jar")
     proc = run_command(["java", "-jar", jar_path]) 
     
-    # Check for java-returncode.expected
     expected_returncode_file = os.path.join(test_dir, "java-returncode.expected")
     if os.path.exists(expected_returncode_file):
         expected_returncode = int(read_from_file(expected_returncode_file).strip())
@@ -86,17 +83,14 @@ def process_test(test_dir: str, release_mode: bool):
             print(f"|---- ❌ java exited with code {proc.returncode}")
             return False
 
-    # Compare the STDOUT and STDERR to {test_dir}/java-output.expected
     expected_file = os.path.join(test_dir, "java-output.expected")
     if os.path.exists(expected_file):
         expected_output = read_from_file(expected_file)
-        # special case: blank file = no STDOUT or STDERR expected
         if expected_output.strip() == "":
             expected_output = "STDOUT:STDERR:"
         else:
             expected_output = expected_output.replace("\n", "")
         actual_output = f"STDOUT:{proc.stdout.strip()}STDERR:{proc.stderr.strip()}"
-        # remove all remaining newlines
         actual_output = actual_output.replace("\n", "")
         if actual_output != expected_output.strip():
             diff_path = os.path.join(test_dir, "output-diff.generated")
@@ -114,6 +108,7 @@ def process_test(test_dir: str, release_mode: bool):
 def main():
     parser = argparse.ArgumentParser(description="Tester for Rustc's JVM Codegen Backend")
     parser.add_argument("--release", action="store_true", help="Run cargo in release mode")
+    parser.add_argument("--only-run", type=str, help="Comma-separated list of specific test names to run")
     args = parser.parse_args()
 
     print("🧪 Tester for Rustc's JVM Codegen Backend started!")
@@ -124,19 +119,24 @@ def main():
 
     print(" ")
 
-    # Process binary tests.
+    # Gather test directories
     binary_dir = os.path.join("tests", "binary")
     if os.path.isdir(binary_dir):
         binary_tests = [os.path.join(binary_dir, d) for d in os.listdir(binary_dir) if os.path.isdir(os.path.join(binary_dir, d))]
     else:
         binary_tests = []
-    print(f"|- 📦 Running {len(binary_tests)} binary build tests...")
-    for idx, test_dir in enumerate(binary_tests):
+
+    # Filter based on --only-run
+    if args.only_run:
+        requested_tests = set([name.strip() for name in args.only_run.split(",")])
+        binary_tests = [t for t in binary_tests if os.path.basename(t) in requested_tests]
+
+    print(f"|- 📦 Running {len(binary_tests)} binary build test(s)...")
+    for test_dir in binary_tests:
         if not process_test(test_dir, args.release):
             overall_success = False
 
     print("")
-
     if overall_success:
         print("|-✅ All tests passed!")
         sys.exit(0)

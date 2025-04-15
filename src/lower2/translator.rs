@@ -1,6 +1,7 @@
 use super::{
     helpers::{
-        are_types_jvm_compatible, get_load_instruction, get_store_instruction, get_type_size,
+        are_types_jvm_compatible, get_cast_instructions, get_load_instruction, get_operand_type,
+        get_store_instruction, get_type_size,
     },
     shim::get_shim_metadata,
 };
@@ -406,7 +407,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             OC::I16(v) => instructions_to_add.push(self.get_int_const_instr(*v as i32)),
             OC::I32(v) => instructions_to_add.push(self.get_int_const_instr(*v)),
             OC::I64(v) => instructions_to_add.push(self.get_long_const_instr(*v)),
-            OC::F32(v) => instructions_to_add.push(Self::get_float_const_instr(*v)),
+            OC::F32(v) => instructions_to_add.push(self.get_float_const_instr(*v)),
             OC::F64(v) => instructions_to_add.push(self.get_double_const_instr(*v)),
             OC::Boolean(v) => {
                 instructions_to_add.push(if *v { JI::Iconst_1 } else { JI::Iconst_0 })
@@ -593,7 +594,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
     }
 
     // Helper to get the appropriate float constant loading instruction
-    fn get_float_const_instr(val: f32) -> Instruction {
+    fn get_float_const_instr(&mut self, val: f32) -> Instruction {
         if val == 0.0 {
             Instruction::Fconst_0
         } else if val == 1.0 {
@@ -601,8 +602,14 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         } else if val == 2.0 {
             Instruction::Fconst_2
         } else {
-            unimplemented!("Ldc for f32 not implemented via ConstantPool yet")
-        } // Need constant_pool.add_float
+            // Add the float value to the constant pool.
+            let index = self
+                .constant_pool
+                .add_float(val)
+                .expect("Failed to add float to constant pool");
+            // Ldc2_w is used for long/double constants and always takes a u16 index.
+            Instruction::Ldc_w(index)
+        }
     }
 
     // Helper to get the appropriate double constant loading instruction
@@ -644,45 +651,143 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         Ok(())
     }
 
-    // Translate comparison operations (Eq, Ne, Lt, etc.)
-    // Pushes 1 if true, 0 if false onto the stack, then stores it in `dest`.
-    // Uses conditional branches.
+    /// Translates a comparison operation.
+    ///
+    /// The function emits code to compare `op1` and `op2` using the specified operation
+    /// (e.g. "eq", "ne", "lt", "le", "gt", "ge") and leaves a boolean (0 or 1) result.
+    /// For integer (or char) types it uses the if_icmp? instructions directly, while for I64,
+    /// F32, and F64 it first emits an explicit comparison instruction (Lcmp/Fcmpl/Dcmpl)
+    /// and then an integer branch instruction (Ifeq, Ifne, Iflt, Ifle, Ifgt, or Ifge).
     fn translate_comparison_op(
         &mut self,
         dest: &str,
         op1: &oomir::Operand,
         op2: &oomir::Operand,
-        jump_op_if_true: fn(u16) -> Instruction, // e.g., Instruction::If_icmpeq for Eq
+        comp_op: &str, // expected values: "eq", "ne", "lt", "le", "gt", "ge"
     ) -> Result<(), jvm::Error> {
+        // Determine operand types.
+        let op1_type = get_operand_type(op1);
+        let op2_type = get_operand_type(op2);
+        if op1_type != op2_type {
+            return Err(jvm::Error::VerificationError {
+                context: format!("Function {}", self.oomir_func.name),
+                message: format!(
+                    "Type mismatch in comparison: {:?} vs {:?}",
+                    op1_type, op2_type
+                ),
+            });
+        }
+
+        // Load both operands onto the stack.
         self.load_operand(op1)?;
         self.load_operand(op2)?;
 
+        // These will be set to the branch constructor function and an optional comparison
+        // instruction to be emitted first.
+        let branch_constructor: Box<dyn Fn(u16) -> Instruction>;
+        // For types where a separate compare instruction is required (I64, F32, F64),
+        // we emit that now.
+        match op1_type {
+            // For I32 and Char, we can do a direct if_icmp? branch.
+            oomir::Type::I32 | oomir::Type::Char | oomir::Type::Boolean => {
+                branch_constructor = Box::new(|offset| match comp_op {
+                    "eq" => Instruction::If_icmpeq(offset),
+                    "ne" => Instruction::If_icmpne(offset),
+                    "lt" => Instruction::If_icmplt(offset),
+                    "le" => Instruction::If_icmple(offset),
+                    "gt" => Instruction::If_icmpgt(offset),
+                    "ge" => Instruction::If_icmpge(offset),
+                    _ => {
+                        // This branch should never be reached if comp_op is validated.
+                        Instruction::Nop
+                    }
+                });
+            }
+            // For I64, we need to perform a comparison (Lcmp) then use an integer branch.
+            oomir::Type::I64 => {
+                self.jvm_instructions.push(Instruction::Lcmp); // Compares two longs; result is int.
+                branch_constructor = Box::new(|offset| match comp_op {
+                    "eq" => Instruction::Ifeq(offset),
+                    "ne" => Instruction::Ifne(offset),
+                    "lt" => Instruction::Iflt(offset),
+                    "le" => Instruction::Ifle(offset),
+                    "gt" => Instruction::Ifgt(offset),
+                    "ge" => Instruction::Ifge(offset),
+                    _ => Instruction::Nop,
+                });
+            }
+            // For F32, perform a float comparison.
+            oomir::Type::F32 => {
+                self.jvm_instructions.push(Instruction::Fcmpl); // Compares floats; result is int.
+                branch_constructor = Box::new(|offset| match comp_op {
+                    "eq" => Instruction::Ifeq(offset),
+                    "ne" => Instruction::Ifne(offset),
+                    "lt" => Instruction::Iflt(offset),
+                    "le" => Instruction::Ifle(offset),
+                    "gt" => Instruction::Ifgt(offset),
+                    "ge" => Instruction::Ifge(offset),
+                    _ => Instruction::Nop,
+                });
+            }
+            // For F64, perform a double comparison.
+            oomir::Type::F64 => {
+                self.jvm_instructions.push(Instruction::Dcmpl); // Compares doubles; result is int.
+                branch_constructor = Box::new(|offset| match comp_op {
+                    "eq" => Instruction::Ifeq(offset),
+                    "ne" => Instruction::Ifne(offset),
+                    "lt" => Instruction::Iflt(offset),
+                    "le" => Instruction::Ifle(offset),
+                    "gt" => Instruction::Ifgt(offset),
+                    "ge" => Instruction::Ifge(offset),
+                    _ => Instruction::Nop,
+                });
+            }
+            _ => {
+                return Err(jvm::Error::VerificationError {
+                    context: format!("Function {}", self.oomir_func.name),
+                    message: format!("Unsupported type for comparison: {:?}", op1_type),
+                });
+            }
+        }
+
+        // Validate that the comp_op string was one of the allowed values.
+        if !["eq", "ne", "lt", "le", "gt", "ge"].contains(&comp_op) {
+            return Err(jvm::Error::VerificationError {
+                context: format!("Function {}", self.oomir_func.name),
+                message: format!("Invalid comparison operator: {}", comp_op),
+            });
+        }
+
+        // Record instruction indices and labels for branch fixups.
         let instr_idx_if = self.jvm_instructions.len();
         let label_true = format!("_comparison_true_{}", instr_idx_if);
         let label_after = format!("_comparison_after_{}", instr_idx_if);
 
-        // Add placeholder for the conditional jump to the 'true' case
-        self.jvm_instructions.push(jump_op_if_true(0)); // Placeholder offset
+        // Emit branch instruction using the branch_constructor.
+        // The actual branch offset is a placeholder (0) to be fixed later.
+        self.jvm_instructions.push(branch_constructor(0));
         self.branch_fixups.push((instr_idx_if, label_true.clone()));
 
-        // False case: push 0
+        // False case: push 0 (false)
         self.jvm_instructions.push(Instruction::Iconst_0);
         let instr_idx_goto_after = self.jvm_instructions.len();
-        self.jvm_instructions.push(Instruction::Goto(0)); // Placeholder offset
+        self.jvm_instructions.push(Instruction::Goto(0)); // Placeholder offset.
         self.branch_fixups
             .push((instr_idx_goto_after, label_after.clone()));
 
-        // True case: push 1 (record label first)
-        let true_instr_index = self.jvm_instructions.len().try_into().unwrap();
+        // True case: record label, then push 1 (true)
+        let true_instr_index: u16 = self.jvm_instructions.len().try_into().unwrap();
         self.label_to_instr_index
             .insert(label_true, true_instr_index);
         self.jvm_instructions.push(Instruction::Iconst_1);
 
-        // After case: store the result (0 or 1)
-        let after_instr_index = self.jvm_instructions.len().try_into().unwrap();
+        // After branch: record label.
+        let after_instr_index: u16 = self.jvm_instructions.len().try_into().unwrap();
         self.label_to_instr_index
             .insert(label_after, after_instr_index);
-        self.store_result(dest, &oomir::Type::Boolean)?; // Comparison result is always boolean
+
+        // Store the result (comparison yields a boolean value).
+        self.store_result(dest, &oomir::Type::Boolean)?;
 
         Ok(())
     }
@@ -699,44 +804,201 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         use oomir::Operand as OO;
 
         match instr {
-            OI::Const { dest, value } => {
-                // The type is determined by the constant value
-                let value_type = Type::from_constant(value);
-                self.load_constant(value)?;
-                self.store_result(dest, &value_type)?;
+            OI::Add { dest, op1, op2 } => {
+                let op_type = match op1 {
+                    oomir::Operand::Variable { ty, .. } => ty.clone(),
+                    oomir::Operand::Constant(c) => Type::from_constant(c),
+                };
+                let jvm_op = match op_type {
+                    Type::I32 | Type::I8 | Type::I16 | Type::Boolean | Type::Char => JI::Iadd,
+                    Type::I64 => JI::Ladd,
+                    Type::F32 => JI::Fadd,
+                    Type::F64 => JI::Dadd,
+                    _ => {
+                        return Err(jvm::Error::VerificationError {
+                            context: format!("Function {}", self.oomir_func.name),
+                            message: format!("Unsupported type for Add operation: {:?}", op_type),
+                        });
+                    }
+                };
+                self.translate_binary_op(dest, op1, op2, jvm_op)?
             }
-            OI::Add { dest, op1, op2 } => self.translate_binary_op(dest, op1, op2, JI::Iadd)?,
-            OI::Sub { dest, op1, op2 } => self.translate_binary_op(dest, op1, op2, JI::Isub)?,
-            OI::Mul { dest, op1, op2 } => self.translate_binary_op(dest, op1, op2, JI::Imul)?,
-            OI::Div { dest, op1, op2 } => self.translate_binary_op(dest, op1, op2, JI::Idiv)?, // Handle division by zero?
-            OI::Rem { dest, op1, op2 } => self.translate_binary_op(dest, op1, op2, JI::Irem)?,
+            OI::Sub { dest, op1, op2 } => {
+                let op_type = match op1 {
+                    oomir::Operand::Variable { ty, .. } => ty.clone(),
+                    oomir::Operand::Constant(c) => Type::from_constant(c),
+                };
+                let jvm_op = match op_type {
+                    Type::I32 | Type::I8 | Type::I16 | Type::Boolean | Type::Char => JI::Isub,
+                    Type::I64 => JI::Lsub,
+                    Type::F32 => JI::Fsub,
+                    Type::F64 => JI::Dsub,
+                    _ => {
+                        return Err(jvm::Error::VerificationError {
+                            context: format!("Function {}", self.oomir_func.name),
+                            message: format!("Unsupported type for Sub operation: {:?}", op_type),
+                        });
+                    }
+                };
+                self.translate_binary_op(dest, op1, op2, jvm_op)?
+            }
+            OI::Mul { dest, op1, op2 } => {
+                let op_type = match op1 {
+                    oomir::Operand::Variable { ty, .. } => ty.clone(),
+                    oomir::Operand::Constant(c) => Type::from_constant(c),
+                };
+                let jvm_op = match op_type {
+                    Type::I32 | Type::I8 | Type::I16 | Type::Boolean | Type::Char => JI::Imul,
+                    Type::I64 => JI::Lmul,
+                    Type::F32 => JI::Fmul,
+                    Type::F64 => JI::Dmul,
+                    _ => {
+                        return Err(jvm::Error::VerificationError {
+                            context: format!("Function {}", self.oomir_func.name),
+                            message: format!("Unsupported type for Mul operation: {:?}", op_type),
+                        });
+                    }
+                };
+                self.translate_binary_op(dest, op1, op2, jvm_op)?
+            }
+            OI::Div { dest, op1, op2 } => {
+                let op_type = match op1 {
+                    oomir::Operand::Variable { ty, .. } => ty.clone(),
+                    oomir::Operand::Constant(c) => Type::from_constant(c),
+                };
+                let jvm_op = match op_type {
+                    Type::I32 | Type::I8 | Type::I16 | Type::Boolean | Type::Char => JI::Idiv,
+                    Type::I64 => JI::Ldiv,
+                    Type::F32 => JI::Fdiv,
+                    Type::F64 => JI::Ddiv,
+                    _ => {
+                        return Err(jvm::Error::VerificationError {
+                            context: format!("Function {}", self.oomir_func.name),
+                            message: format!("Unsupported type for Div operation: {:?}", op_type),
+                        });
+                    }
+                };
+                self.translate_binary_op(dest, op1, op2, jvm_op)?
+            }
+            OI::Rem { dest, op1, op2 } => {
+                let op_type = match op1 {
+                    oomir::Operand::Variable { ty, .. } => ty.clone(),
+                    oomir::Operand::Constant(c) => Type::from_constant(c),
+                };
+                let jvm_op = match op_type {
+                    Type::I32 | Type::I8 | Type::I16 | Type::Boolean | Type::Char => JI::Irem,
+                    Type::I64 => JI::Lrem,
+                    Type::F32 => JI::Frem,
+                    Type::F64 => JI::Drem,
+                    _ => {
+                        return Err(jvm::Error::VerificationError {
+                            context: format!("Function {}", self.oomir_func.name),
+                            message: format!("Unsupported type for Rem operation: {:?}", op_type),
+                        });
+                    }
+                };
+                self.translate_binary_op(dest, op1, op2, jvm_op)?
+            }
             // --- Comparisons ---
-            // Need to handle operand types (int, long, float, double, ref)
-            OI::Eq { dest, op1, op2 } => {
-                self.translate_comparison_op(dest, op1, op2, JI::If_icmpeq)?
-            }
-            OI::Ne { dest, op1, op2 } => {
-                self.translate_comparison_op(dest, op1, op2, JI::If_icmpne)?
-            }
-            OI::Lt { dest, op1, op2 } => {
-                self.translate_comparison_op(dest, op1, op2, JI::If_icmplt)?
-            }
-            OI::Le { dest, op1, op2 } => {
-                self.translate_comparison_op(dest, op1, op2, JI::If_icmple)?
-            }
-            OI::Gt { dest, op1, op2 } => {
-                self.translate_comparison_op(dest, op1, op2, JI::If_icmpgt)?
-            }
-            OI::Ge { dest, op1, op2 } => {
-                self.translate_comparison_op(dest, op1, op2, JI::If_icmpge)?
-            }
+            OI::Eq { dest, op1, op2 } => self.translate_comparison_op(dest, op1, op2, "eq")?,
+            OI::Ne { dest, op1, op2 } => self.translate_comparison_op(dest, op1, op2, "ne")?,
+            OI::Lt { dest, op1, op2 } => self.translate_comparison_op(dest, op1, op2, "lt")?,
+            OI::Le { dest, op1, op2 } => self.translate_comparison_op(dest, op1, op2, "le")?,
+            OI::Gt { dest, op1, op2 } => self.translate_comparison_op(dest, op1, op2, "gt")?,
+            OI::Ge { dest, op1, op2 } => self.translate_comparison_op(dest, op1, op2, "ge")?,
 
             // --- Bitwise Operations ---
-            OI::BitAnd { dest, op1, op2 } => self.translate_binary_op(dest, op1, op2, JI::Iand)?,
-            OI::BitOr { dest, op1, op2 } => self.translate_binary_op(dest, op1, op2, JI::Ior)?,
-            OI::BitXor { dest, op1, op2 } => self.translate_binary_op(dest, op1, op2, JI::Ixor)?,
-            OI::Shl { dest, op1, op2 } => self.translate_binary_op(dest, op1, op2, JI::Ishl)?,
-            OI::Shr { dest, op1, op2 } => self.translate_binary_op(dest, op1, op2, JI::Ishr)?, // Assuming signed shr, needs checking
+            OI::BitAnd { dest, op1, op2 } => {
+                let op_type = match op1 {
+                    oomir::Operand::Variable { ty, .. } => ty.clone(),
+                    oomir::Operand::Constant(c) => Type::from_constant(c),
+                };
+                let jvm_op = match op_type {
+                    Type::I32 | Type::I8 | Type::I16 | Type::Boolean | Type::Char => JI::Iand,
+                    Type::I64 => JI::Land,
+                    _ => {
+                        return Err(jvm::Error::VerificationError {
+                            context: format!("Function {}", self.oomir_func.name),
+                            message: format!(
+                                "Unsupported type for BitAnd operation: {:?}",
+                                op_type
+                            ),
+                        });
+                    }
+                };
+                self.translate_binary_op(dest, op1, op2, jvm_op)?
+            }
+            OI::BitOr { dest, op1, op2 } => {
+                let op_type = match op1 {
+                    oomir::Operand::Variable { ty, .. } => ty.clone(),
+                    oomir::Operand::Constant(c) => Type::from_constant(c),
+                };
+                let jvm_op = match op_type {
+                    Type::I32 | Type::I8 | Type::I16 | Type::Boolean | Type::Char => JI::Ior,
+                    Type::I64 => JI::Lor,
+                    _ => {
+                        return Err(jvm::Error::VerificationError {
+                            context: format!("Function {}", self.oomir_func.name),
+                            message: format!("Unsupported type for BitOr operation: {:?}", op_type),
+                        });
+                    }
+                };
+                self.translate_binary_op(dest, op1, op2, jvm_op)?
+            }
+            OI::BitXor { dest, op1, op2 } => {
+                let op_type = match op1 {
+                    oomir::Operand::Variable { ty, .. } => ty.clone(),
+                    oomir::Operand::Constant(c) => Type::from_constant(c),
+                };
+                let jvm_op = match op_type {
+                    Type::I32 | Type::I8 | Type::I16 | Type::Boolean | Type::Char => JI::Ixor,
+                    Type::I64 => JI::Lxor,
+                    _ => {
+                        return Err(jvm::Error::VerificationError {
+                            context: format!("Function {}", self.oomir_func.name),
+                            message: format!(
+                                "Unsupported type for BitXor operation: {:?}",
+                                op_type
+                            ),
+                        });
+                    }
+                };
+                self.translate_binary_op(dest, op1, op2, jvm_op)?
+            }
+            OI::Shl { dest, op1, op2 } => {
+                let op_type = match op1 {
+                    oomir::Operand::Variable { ty, .. } => ty.clone(),
+                    oomir::Operand::Constant(c) => Type::from_constant(c),
+                };
+                let jvm_op = match op_type {
+                    Type::I32 | Type::I8 | Type::I16 | Type::Boolean | Type::Char => JI::Ishl,
+                    Type::I64 => JI::Lshl,
+                    _ => {
+                        return Err(jvm::Error::VerificationError {
+                            context: format!("Function {}", self.oomir_func.name),
+                            message: format!("Unsupported type for Shl operation: {:?}", op_type),
+                        });
+                    }
+                };
+                self.translate_binary_op(dest, op1, op2, jvm_op)?
+            }
+            OI::Shr { dest, op1, op2 } => {
+                let op_type = match op1 {
+                    oomir::Operand::Variable { ty, .. } => ty.clone(),
+                    oomir::Operand::Constant(c) => Type::from_constant(c),
+                };
+                let jvm_op = match op_type {
+                    Type::I32 | Type::I8 | Type::I16 | Type::Boolean | Type::Char => JI::Ishr,
+                    Type::I64 => JI::Lshr,
+                    _ => {
+                        return Err(jvm::Error::VerificationError {
+                            context: format!("Function {}", self.oomir_func.name),
+                            message: format!("Unsupported type for Shr operation: {:?}", op_type),
+                        });
+                    }
+                };
+                self.translate_binary_op(dest, op1, op2, jvm_op)?
+            }
 
             // --- Logical Operations (Need Short-circuiting) ---
             // These are more complex as they involve control flow, not direct JVM ops.
@@ -805,68 +1067,156 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     OO::Constant(c) => Type::from_constant(c),
                 };
 
+                // --- Input Validation ---
+                // Check if the discriminant type is suitable for comparison
+                match discr_type {
+                    Type::I8
+                    | Type::I16
+                    | Type::I32
+                    | Type::Boolean
+                    | Type::Char
+                    | Type::I64
+                    | Type::F32
+                    | Type::F64 => {
+                        // These types are okay for switch comparison
+                    }
+                    _ => {
+                        return Err(jvm::Error::VerificationError {
+                            context: format!("Function {}", self.oomir_func.name),
+                            message: format!(
+                                "Unsupported discriminant type {:?} for OOMIR Switch instruction",
+                                discr_type
+                            ),
+                        });
+                    }
+                }
+
                 // 1. Load the discriminant value onto the stack
-                self.load_operand(discr)?;
+                self.load_operand(discr)?; // Stack: [discr_value] (size 1 or 2 depending on type)
 
                 // 2. Store the discriminant in a temporary local variable.
-                //    This is necessary because each comparison (if_icmpeq) consumes operands,
-                //    and we need the original discriminant value for every check.
                 let temp_discr_var_name =
                     format!("_switch_discr_temp_{}", self.current_oomir_block_label);
                 let temp_discr_index = self.get_or_assign_local(&temp_discr_var_name, &discr_type);
                 let store_instr = get_store_instruction(&discr_type, temp_discr_index)?;
                 self.jvm_instructions.push(store_instr); // Stack is now empty
 
-                // 3. Iterate through the specific targets and generate if_icmpeq checks
+                // 3. Iterate through the specific targets and generate comparison checks
                 for (constant_key, target_label) in targets {
-                    // Check if the key is compatible (should be integer-like)
-                    let key_value = match constant_key {
-                        // Extract the i32 value. Handle boolean/char as 0/1 or char code.
-                        // Other types are likely errors here if not handled in lower1.
-                        oomir::Constant::I8(v) => i32::from(*v),
-                        oomir::Constant::I16(v) => i32::from(*v),
-                        oomir::Constant::I32(v) => *v,
-                        oomir::Constant::Boolean(b) => {
-                            if *b {
-                                1
-                            } else {
-                                0
-                            }
-                        }
-                        oomir::Constant::Char(c) => *c as i32,
-                        // Long/Float/Double/String/Class are invalid for JVM switch keys
-                        _ => {
-                            return Err(jvm::Error::VerificationError {
-                                context: format!("Function {}", self.oomir_func.name),
-                                message: format!(
-                                    "Invalid constant type {:?} used as key in OOMIR Switch instruction",
-                                    constant_key
-                                ),
-                            });
-                        }
-                    };
-
                     // a. Reload the discriminant value from the temporary local
                     let load_instr = get_load_instruction(&discr_type, temp_discr_index)?;
-                    self.jvm_instructions.push(load_instr); // Stack: [discr_value]
+                    self.jvm_instructions.push(load_instr); // Stack: [discr_value] (size 1 or 2)
 
-                    // b. Load the constant key value
-                    let const_instr = self.get_int_const_instr(key_value);
-                    self.jvm_instructions.push(const_instr); // Stack: [discr_value, key_value]
+                    // --- b. Load constant key and perform comparison based on discriminant type ---
+                    let comparison_succeeded; // Flag to track if this key was handled
 
-                    // c. Add the comparison instruction (if_icmpeq jumps if equal)
-                    let if_instr_index = self.jvm_instructions.len();
-                    self.jvm_instructions.push(JI::If_icmpeq(0)); // Placeholder offset
+                    match &discr_type {
+                        // --- Integer-like types (use if_icmpeq) ---
+                        Type::I8 | Type::I16 | Type::I32 | Type::Boolean | Type::Char => {
+                            let key_value_i32 = match constant_key {
+                                oomir::Constant::I8(v) => i32::from(*v),
+                                oomir::Constant::I16(v) => i32::from(*v),
+                                oomir::Constant::I32(v) => *v,
+                                oomir::Constant::Boolean(b) => {
+                                    if *b {
+                                        1
+                                    } else {
+                                        0
+                                    }
+                                }
+                                oomir::Constant::Char(c) => *c as i32,
+                                _ => {
+                                    return Err(jvm::Error::VerificationError {
+                                        context: format!("Function {}", self.oomir_func.name),
+                                        message: format!(
+                                            "Type mismatch in OOMIR Switch: Discriminant type is {:?}, but case key is {:?}",
+                                            discr_type, constant_key
+                                        ),
+                                    });
+                                }
+                            };
 
-                    // d. Add fixup for the target label if the comparison is true
-                    self.branch_fixups
-                        .push((if_instr_index, target_label.clone()));
+                            // Load the i32 constant key
+                            let const_instr = self.get_int_const_instr(key_value_i32);
+                            self.jvm_instructions.push(const_instr); // Stack: [discr_value(i32), key_value(i32)]
+
+                            // Add the comparison instruction (if_icmpeq jumps if equal)
+                            let if_instr_index = self.jvm_instructions.len();
+                            self.jvm_instructions.push(JI::If_icmpeq(0)); // Placeholder offset
+                            self.branch_fixups
+                                .push((if_instr_index, target_label.clone()));
+                            comparison_succeeded = true;
+                        }
+
+                        // --- I64 (long) type (use lcmp, ifeq) ---
+                        Type::I64 => {
+                            self.load_constant(constant_key)?;
+
+                            // Compare longs: pushes -1, 0, or 1 (int) onto the stack
+                            self.jvm_instructions.push(JI::Lcmp); // Stack: [comparison_result(i32)]
+
+                            // Jump if the comparison result is 0 (equal)
+                            let if_instr_index = self.jvm_instructions.len();
+                            self.jvm_instructions.push(JI::Ifeq(0)); // Placeholder offset
+                            self.branch_fixups
+                                .push((if_instr_index, target_label.clone()));
+                            comparison_succeeded = true;
+                        }
+
+                        // --- F32 (float) type (use fcmpl/fcmpg, ifeq) ---
+                        Type::F32 => {
+                            self.load_constant(constant_key)?; // Stack: [discr_value(f32), key_value(f32)]
+
+                            // Compare floats: pushes -1, 0, or 1 (int) onto the stack.
+                            // fcmpl treats NaN comparison as -1. fcmpg treats it as +1.
+                            // For equality checks (== 0), they behave the same unless one operand is NaN.
+                            // Standard equality `discr == key` is false if either is NaN, so `ifeq` works after fcmpl/fcmpg.
+                            self.jvm_instructions.push(JI::Fcmpl); // Stack: [comparison_result(i32)]
+
+                            // Jump if the comparison result is 0 (equal)
+                            let if_instr_index = self.jvm_instructions.len();
+                            self.jvm_instructions.push(JI::Ifeq(0)); // Placeholder offset
+                            self.branch_fixups
+                                .push((if_instr_index, target_label.clone()));
+                            comparison_succeeded = true;
+                        }
+
+                        // --- F64 (double) type (use dcmpl/dcmpg, ifeq) ---
+                        Type::F64 => {
+                            self.load_constant(constant_key)?; // Stack: [discr_value(f64), key_value(f64)]
+
+                            // Compare doubles (similar logic to floats regarding NaN and dcmpl/dcmpg)
+                            self.jvm_instructions.push(JI::Dcmpl); // Stack: [comparison_result(i32)]
+
+                            // Jump if the comparison result is 0 (equal)
+                            let if_instr_index = self.jvm_instructions.len();
+                            self.jvm_instructions.push(JI::Ifeq(0)); // Placeholder offset
+                            self.branch_fixups
+                                .push((if_instr_index, target_label.clone()));
+                            comparison_succeeded = true;
+                        }
+
+                        // Should have been caught by the validation check before the loop
+                        _ => unreachable!("Invalid discriminant type survived initial check"),
+                    }
+
+                    // If the constant_key type didn't match the discr_type in the inner match
+                    if !comparison_succeeded {
+                        return Err(jvm::Error::VerificationError {
+                            context: format!("Function {}", self.oomir_func.name),
+                            message: format!(
+                                "Type mismatch in OOMIR Switch: Discriminant type is {:?}, but case key is {:?}",
+                                discr_type, constant_key
+                            ),
+                        });
+                    }
 
                     // If the comparison is false, execution falls through to the next check (or the final goto)
+                    // The stack should be empty after the conditional jump instruction consumes its operand(s).
                 }
 
                 // 4. After all specific checks, add an unconditional jump to the 'otherwise' block.
-                //    This is executed if none of the if_icmpeq comparisons were true.
+                //    This is executed if none of the comparisons were true.
                 let goto_instr_index = self.jvm_instructions.len();
                 self.jvm_instructions.push(JI::Goto(0)); // Placeholder offset
                 self.branch_fixups
@@ -988,7 +1338,9 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
 
                             // Check for diverging
                             // Currently hardcoded
-                            if function_name == "panic_fmt" {
+                            if function_name == "panic_fmt"
+                                || function_name == "core_panicking_panic"
+                            {
                                 is_diverging_call = true;
                             }
 
@@ -1451,6 +1803,28 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 println!(
                     "   -> Stored field value in var '{}' with type {:?}",
                     dest, field_ty
+                );
+            }
+            OI::Cast { op, ty, dest } => {
+                // 1. Load the operand on the stack
+                self.load_operand(op)?; // Stack: [value]
+
+                let old_ty = get_operand_type(op);
+
+                // 2. Get cast instructions
+                let instructions = get_cast_instructions(&old_ty, ty)?;
+
+                // 3. Emit the cast instructions
+                for instr in instructions {
+                    self.jvm_instructions.push(instr);
+                }
+
+                // 4. Store the casted value into the destination variable
+                //    The type for storage is the new type (ty)
+                self.store_result(dest, ty)?; // Stack: []
+                println!(
+                    "   -> Casted value from {:?} to {:?} and stored in var '{}'",
+                    old_ty, ty, dest
                 );
             }
         }

@@ -69,18 +69,8 @@ pub struct BasicBlock {
     pub instructions: Vec<Instruction>,
 }
 
-impl BasicBlock {
-    pub fn with_extra(self, extra: BasicBlock) -> (BasicBlock, Option<BasicBlock>) {
-        (self, Some(extra))
-    }
-}
-
 #[derive(Debug, Clone)]
 pub enum Instruction {
-    Const {
-        dest: String,
-        value: Constant,
-    },
     Add {
         dest: String,
         op1: Operand,
@@ -236,6 +226,11 @@ pub enum Instruction {
     },
     Label {
         name: String,
+    },
+    Cast {
+        op: Operand,
+        ty: Type,
+        dest: String, // Destination variable for the casted value
     },
 }
 

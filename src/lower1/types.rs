@@ -201,10 +201,11 @@ pub fn mir_int_to_oomir_const<'tcx>(
         },
         TyKind::Uint(uint_ty) => match uint_ty {
             // JVM uses signed types, treat appropriately
-            UintTy::U8 => oomir::Constant::I8(value as i8), // Treat as signed byte for JVM switch
-            UintTy::U16 => oomir::Constant::I16(value as i16), // Treat as signed short
-            UintTy::U32 => oomir::Constant::I32(value as i32), // Treat as signed int
-            UintTy::U64 => oomir::Constant::I64(value as i64), // Treat as signed long
+            // maps to the next size up to capture full range
+            UintTy::U8 => oomir::Constant::I16(value as i16),
+            UintTy::U16 => oomir::Constant::I32(value as i32),
+            UintTy::U32 => oomir::Constant::I64(value as i64),
+            UintTy::U64 => oomir::Constant::I64(value as i64), // Truncate? Error?
             UintTy::Usize => oomir::Constant::I64(value as i64), // Assuming 64-bit
             UintTy::U128 => oomir::Constant::I64(value as i64), // Truncate? Error?
         },

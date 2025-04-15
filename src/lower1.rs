@@ -16,7 +16,6 @@ use rustc_middle::{
 use std::collections::HashMap;
 use types::ty_to_oomir_type;
 
-mod checked_ops;
 mod control_flow;
 mod operand;
 mod place;

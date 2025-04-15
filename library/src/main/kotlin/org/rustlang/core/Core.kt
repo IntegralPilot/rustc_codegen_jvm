@@ -68,4 +68,11 @@ public object Core {
         // Check for equality.
         return value1 == value2
     }
+
+    @JvmStatic
+    public fun core_panicking_panic(message: String?) {
+        // This is a placeholder for the panic function.
+        // In a real implementation, this would handle the panic appropriately.
+        throw RuntimeException("Rust panic: " + (message ?: "<no message>"))
+    }
 }
