@@ -157,6 +157,16 @@ pub enum Instruction {
         op1: Operand,
         op2: Operand,
     },
+    Not {
+        // Logical/Bitwise NOT
+        dest: String,
+        src: Operand,
+    },
+    Neg {
+        // Arithmetic Negation
+        dest: String,
+        src: Operand,
+    },
     Or {
         dest: String,
         op1: Operand,
@@ -204,6 +214,15 @@ pub enum Instruction {
         array_var: String,
         index: Operand,
         value: Operand,
+    },
+    ArrayGet {
+        dest: String,
+        array_var: String,
+        index: Operand,
+    },
+    Length {
+        dest: String,
+        array_var: String,
     },
     ConstructObject {
         dest: String, // Variable to hold the new object reference
@@ -383,6 +402,28 @@ impl Type {
             // Reference types:
             Type::String | Type::Class(_) | Type::Array(_) | Type::Reference(_) => {
                 Some(JVMInstruction::Aastore)
+            }
+            Type::Void => None,
+        }
+    }
+
+    /// Returns the appropriate JVM array element load instruction.
+    pub fn get_jvm_array_load_instruction(&self) -> Option<JVMInstruction> {
+        match self {
+            Type::I8 => Some(JVMInstruction::Baload),
+            // I16 (including promoted U8) is loaded with Saload:
+            Type::I16 => Some(JVMInstruction::Saload),
+            Type::Boolean => Some(JVMInstruction::Baload),
+            Type::Char => Some(JVMInstruction::Caload),
+            // I32 (including promoted U16) is loaded with Iaload:
+            Type::I32 => Some(JVMInstruction::Iaload),
+            // I64 (including promoted U32) is loaded with Laload:
+            Type::I64 => Some(JVMInstruction::Laload),
+            Type::F32 => Some(JVMInstruction::Faload),
+            Type::F64 => Some(JVMInstruction::Daload),
+            // Reference types:
+            Type::String | Type::Class(_) | Type::Array(_) | Type::Reference(_) => {
+                Some(JVMInstruction::Aaload)
             }
             Type::Void => None,
         }

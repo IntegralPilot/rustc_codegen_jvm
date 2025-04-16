@@ -19,15 +19,15 @@ pub fn ty_to_oomir_type<'tcx>(
             IntTy::I16 => oomir::Type::I16,
             IntTy::I32 => oomir::Type::I32,
             IntTy::I64 => oomir::Type::I64,
-            IntTy::Isize => oomir::Type::I64,
+            IntTy::Isize => oomir::Type::I32,
             IntTy::I128 => oomir::Type::Class("java/lang/BigInteger".to_string()), // doesn't fit in a primitive
         },
         rustc_middle::ty::TyKind::Uint(uint_ty) => match uint_ty {
             UintTy::U8 => oomir::Type::I16, // make it the next size up to capture full range
             UintTy::U16 => oomir::Type::I32,
             UintTy::U32 => oomir::Type::I64,
+            UintTy::Usize => oomir::Type::I32, // java uses an i32 for most "usize" i.e. array indexes etc.
             UintTy::U64 => oomir::Type::Class("java/lang/BigInteger".to_string()),
-            UintTy::Usize => oomir::Type::Class("java/lang/BigInteger".to_string()),
             UintTy::U128 => oomir::Type::Class("java/lang/BigInteger".to_string()),
         },
         rustc_middle::ty::TyKind::Float(float_ty) => match float_ty {
@@ -206,8 +206,8 @@ pub fn mir_int_to_oomir_const<'tcx>(
             UintTy::U16 => oomir::Constant::I32(value as i32),
             UintTy::U32 => oomir::Constant::I64(value as i64),
             UintTy::U64 => oomir::Constant::I64(value as i64), // Truncate? Error?
-            UintTy::Usize => oomir::Constant::I64(value as i64), // Assuming 64-bit
-            UintTy::U128 => oomir::Constant::I64(value as i64), // Truncate? Error?
+            UintTy::Usize => oomir::Constant::I32(value as i32), // java uses an i32 for most "usize" tasks i.e. array indexes etc.
+            UintTy::U128 => oomir::Constant::I64(value as i64),  // Truncate? Error?
         },
         TyKind::Bool => oomir::Constant::Boolean(value != 0), // 0 is false, non-zero is true
         TyKind::Char => {

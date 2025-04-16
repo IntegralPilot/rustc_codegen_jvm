@@ -1,7 +1,10 @@
 use super::{
     operand::convert_operand,
-    place::{extract_base_and_field, get_place_type, make_jvm_safe, place_to_string},
-    types::{get_field_name_from_index, mir_int_to_oomir_const, ty_to_oomir_type},
+    place::{
+        emit_instructions_to_get_on_own, emit_instructions_to_set_value, make_jvm_safe,
+        place_to_string,
+    },
+    types::mir_int_to_oomir_const,
 };
 use crate::oomir;
 
@@ -33,9 +36,56 @@ pub fn convert_basic_block<'tcx>(
 
     // Convert each MIR statement in the block.
     for stmt in &bb_data.statements {
-        if let StatementKind::Assign(box (place, rvalue)) = &stmt.kind {
-            let dest = place_to_string(place, tcx);
-            rvalue::handle_rvalue(rvalue, mir, tcx, data_types, place, dest, &mut instructions);
+        match &stmt.kind {
+            StatementKind::Assign(box (place, rvalue)) => {
+                // 1. Evaluate the Rvalue to get the source operand and temp instructions
+                let (rvalue_instructions, source_operand) = rvalue::convert_rvalue_to_operand(
+                    // Call the refactored function
+                    rvalue, place, // Pass original destination for temp naming hints
+                    mir, tcx, data_types,
+                );
+
+                // Add instructions needed to calculate the Rvalue
+                instructions.extend(rvalue_instructions);
+
+                // 2. Generate instructions to store the computed value into the destination place
+                let assignment_instructions = emit_instructions_to_set_value(
+                    place,          // The actual destination Place
+                    source_operand, // The OOMIR operand holding the value from the Rvalue
+                    tcx,
+                    mir,
+                    data_types,
+                );
+
+                // Add the final assignment instructions (Move, SetField, ArrayStore)
+                instructions.extend(assignment_instructions);
+            }
+            StatementKind::StorageLive(_)
+            | StatementKind::StorageDead(_)
+            | StatementKind::Retag(_, _) => {
+                // no-op, currently
+            }
+            StatementKind::Nop => {
+                // Literally a no-op
+            }
+            StatementKind::SetDiscriminant {
+                place,
+                variant_index,
+            } => {
+                println!(
+                    "Warning: StatementKind::SetDiscriminant NYI. Place: {:?}, Index: {:?}",
+                    place, variant_index
+                );
+                // TODO: Need logic similar to emit_instructions_to_set_value but for discriminants
+            }
+            StatementKind::Deinit(place) => {
+                println!("Warning: StatementKind::Deinit NYI. Place: {:?}", place);
+                // Often a no-op in GC'd languages unless specific resource cleanup needed
+            }
+            // Handle other StatementKind variants if necessary
+            _ => {
+                println!("Warning: Unhandled StatementKind: {:?}", stmt.kind);
+            }
         }
     }
 
@@ -145,7 +195,6 @@ pub fn convert_basic_block<'tcx>(
                 unwind: _,
             } => {
                 let condition_operand: oomir::Operand;
-                let temp_condition_value_var; // To store the name if GetField is used
 
                 // Check if the condition operand is a direct use of a place (Copy or Move)
                 let condition_place_opt = match cond {
@@ -155,76 +204,14 @@ pub fn convert_basic_block<'tcx>(
 
                 if let Some(place) = condition_place_opt {
                     // Now, check if this place has a field projection
-                    if let Some((base_place, field_index, field_mir_ty)) =
-                        extract_base_and_field(tcx, place)
-                    {
-                        // It's a field access (e.g., _7.1)! Generate GetField
-                        let object_var_name = place_to_string(&base_place, tcx); // e.g., "_7"
-                        let owner_oomir_type = get_place_type(&base_place, mir, tcx, data_types);
-                        let owner_class_name = match &owner_oomir_type {
-                            oomir::Type::Class(name) => name.clone(),
-                            oomir::Type::Reference(inner) => {
-                                // Handle if base is &Tuple
-                                if let oomir::Type::Class(name) = inner.as_ref() {
-                                    name.clone()
-                                } else {
-                                    panic!(
-                                        "Assert cond field source's inner type is not a Class: {:?}",
-                                        inner
-                                    );
-                                }
-                            }
-                            _ => panic!(
-                                "Assert cond field source base '{}' is not a class type: {:?}",
-                                object_var_name, owner_oomir_type
-                            ),
-                        };
-
-                        let field_name = match get_field_name_from_index(
-                            &owner_class_name,
-                            field_index.index(),
-                            data_types,
-                        ) {
-                            Ok(name) => name,
-                            Err(e) => {
-                                panic!("Error getting field name for assert condition: {}", e)
-                            }
-                        };
-
-                        let field_oomir_type = ty_to_oomir_type(field_mir_ty, tcx, data_types);
-
-                        // Generate a temporary variable to hold the result of GetField
-                        let temp_dest = format!("assert_cond_val_{}", bb.index());
-                        instructions.push(oomir::Instruction::GetField {
-                            dest: temp_dest.clone(),
-                            object_var: object_var_name,
-                            field_name,
-                            field_ty: field_oomir_type.clone(),
-                            owner_class: owner_class_name,
-                        });
-
-                        // Use the temporary variable as the condition operand
-                        condition_operand = oomir::Operand::Variable {
-                            name: temp_dest.clone(),
-                            ty: field_oomir_type,
-                        };
-                        temp_condition_value_var = Some(temp_dest); // Store for potential negation
-
-                        println!(
-                            // Log the GetField generation
-                            "Info: Assert condition uses field access {:?}. Emitted GetField to temp '{}'",
-                            place_to_string(place, tcx),
-                            temp_condition_value_var.as_ref().unwrap()
-                        );
-                    } else {
-                        // It's a simple place (e.g., _3), convert normally
-                        println!(
-                            // Log simple case
-                            "Info: Assert condition uses simple place {:?}",
-                            place_to_string(place, tcx)
-                        );
-                        condition_operand = convert_operand(cond, tcx, mir, data_types);
-                    }
+                    let (temp_dest, instrs, field_oomir_type) =
+                        emit_instructions_to_get_on_own(place, tcx, mir, data_types);
+                    instructions.extend(instrs);
+                    // Use the temporary variable as the condition operand
+                    condition_operand = oomir::Operand::Variable {
+                        name: temp_dest.clone(),
+                        ty: field_oomir_type,
+                    };
                 } else {
                     println!(
                         // Log constant case

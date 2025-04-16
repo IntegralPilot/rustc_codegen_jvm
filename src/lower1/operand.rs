@@ -6,7 +6,7 @@ use rustc_middle::{
         Body, Const, ConstOperand, ConstValue, Operand as MirOperand, Place,
         interpret::{AllocRange, ErrorHandled, Scalar},
     },
-    ty::{FloatTy, IntTy, PseudoCanonicalInput, Ty, TyCtxt, TyKind, TypingEnv, UintTy},
+    ty::{ConstKind, FloatTy, IntTy, PseudoCanonicalInput, Ty, TyCtxt, TyKind, TypingEnv, UintTy},
 };
 use std::collections::HashMap;
 
@@ -20,10 +20,25 @@ pub fn convert_operand<'tcx>(
     match mir_op {
         MirOperand::Constant(box constant) => {
             match constant.const_ {
-                Const::Val(const_val, ty) => handle_const_value(constant, const_val, &ty, tcx),
-                Const::Ty(const_ty, _) => {
-                    println!("Warning: Const::Ty constants not handled: {:?}", const_ty);
-                    oomir::Operand::Constant(oomir::Constant::I32(0))
+                Const::Val(const_val, ty) => {
+                    handle_const_value(Some(constant), const_val, &ty, tcx)
+                }
+                Const::Ty(const_ty, ty_const) => {
+                    // ty_const is NOT a type, naming is b/c it's a ty::Const (as opposed to mir::Const)
+                    let kind = ty_const.kind();
+                    match kind {
+                        ConstKind::Value(val) => {
+                            let constval = tcx.valtree_to_const_val(val);
+                            handle_const_value(None, constval, &const_ty, tcx)
+                        }
+                        _ => {
+                            println!(
+                                "Warning: unhandled constant kind for a Ty const: {:?}",
+                                kind
+                            );
+                            oomir::Operand::Constant(oomir::Constant::I32(-1))
+                        }
+                    }
                 }
                 Const::Unevaluated(uv, ty) => {
                     // Create the parameter environment. reveal_all is usually okay for codegen.
@@ -41,7 +56,7 @@ pub fn convert_operand<'tcx>(
                                 uv, span, const_val
                             );
                             // Now handle the resulting ConstValue using the existing function
-                            handle_const_value(&constant, const_val, &ty, tcx)
+                            handle_const_value(Some(constant), const_val, &ty, tcx)
                         }
                         Err(ErrorHandled::Reported(error_reported, ..)) => {
                             // An error occurred during evaluation and rustc has already reported it.
@@ -83,7 +98,7 @@ pub fn convert_operand<'tcx>(
 }
 
 pub fn handle_const_value<'tcx>(
-    constant: &ConstOperand,
+    constant: Option<&ConstOperand>,
     const_val: ConstValue<'tcx>,
     ty: &Ty<'tcx>,
     tcx: TyCtxt<'tcx>,
@@ -98,8 +113,19 @@ pub fn handle_const_value<'tcx>(
                                 IntTy::I8 => oomir::Constant::I8(scalar_int.to_i8()),
                                 IntTy::I16 => oomir::Constant::I16(scalar_int.to_i16()),
                                 IntTy::I32 => oomir::Constant::I32(scalar_int.to_i32()),
+                                IntTy::Isize => {
+                                    // the "pointer size" of the target platform can't be known at compiletime
+                                    // as the same bytecode supports both 32-bit and 64-bit JVMs
+                                    // go with 32-bit (i32 = i64 to ensure full range)
+                                    // better for memory usage and performance
+                                    // need to call to_i64() because if compiling on a 64-bit host it will contain 8 bytes
+                                    oomir::Constant::I32(scalar_int.to_i64() as i32)
+                                }
                                 IntTy::I64 => oomir::Constant::I64(scalar_int.to_i64()),
-                                _ => oomir::Constant::I32(scalar_int.to_i32()), // Default fallback
+                                // doesn't fit in primitive
+                                IntTy::I128 => {
+                                    oomir::Constant::Class("java/lang/BigInteger".into())
+                                }
                             };
                             oomir::Operand::Constant(val)
                         }
@@ -110,10 +136,15 @@ pub fn handle_const_value<'tcx>(
                                 UintTy::U8 => oomir::Constant::I16(scalar_int.to_u8() as i16),
                                 UintTy::U16 => oomir::Constant::I32(scalar_int.to_u16() as i32),
                                 UintTy::U32 => oomir::Constant::I64(scalar_int.to_u32() as i64),
-                                UintTy::U64 => {
-                                    oomir::Constant::Class("java/lang/BigInteger".to_string())
-                                } // Doesn't fit in a primitive
-                                _ => oomir::Constant::I32(scalar_int.to_u32() as i32), // Default fallback
+                                UintTy::Usize => {
+                                    // java uses an i32 for most "usize" i.e. array indexes etc.
+                                    // need to call to_u64() because if compiling on a 64-bit host it will contain 8 bytes
+                                    oomir::Constant::I32(scalar_int.to_u64() as i32)
+                                }
+                                // Doesn't fit in a primitive
+                                UintTy::U64 | UintTy::U128 => {
+                                    oomir::Constant::Class("java/lang/BigInteger".into())
+                                }
                             };
                             oomir::Operand::Constant(val)
                         }
@@ -737,5 +768,27 @@ pub fn get_placeholder_operand<'tcx>(
             dest_oomir_type
         );
         oomir::Operand::Constant(oomir::Constant::I32(0))
+    }
+}
+
+// For when you have an OOMIR Operand but just want the inner number it holds (only works for Consts)
+// I8, I16, I32, I64, Char: Returns inner value
+// F32, F64: Returns rounded inner value
+// Boolean: Returns 1 for true, 0 for false
+// Others: Returns None
+pub fn extract_number_from_operand(operand: oomir::Operand) -> Option<i64> {
+    match operand {
+        oomir::Operand::Constant(constant) => match constant {
+            oomir::Constant::I8(val) => Some(val as i64),
+            oomir::Constant::I16(val) => Some(val as i64),
+            oomir::Constant::I32(val) => Some(val as i64),
+            oomir::Constant::I64(val) => Some(val),
+            oomir::Constant::Boolean(val) => Some(if val { 1 } else { 0 }),
+            oomir::Constant::Char(val) => Some(val as i64),
+            oomir::Constant::F32(val) => Some(val.round() as i64),
+            oomir::Constant::F64(val) => Some(val.round() as i64),
+            _ => None,
+        },
+        oomir::Operand::Variable { .. } => None, // can't be known at compiletime
     }
 }
