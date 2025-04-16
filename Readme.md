@@ -31,13 +31,16 @@ This backend currently supports a subset of Rust features:
 *   ✅ Compiling simple programs using basic `core` features (like the `is_even_plus_one` test) using the host target.
 *   ✅ Basic integer arithmetic operations on all types of numbers:
     *   Addition (`+`), Subtraction (`-`), Multiplication (`*`), Division (`/`), Remainder (`%`).
-    *   Checked addition and subtraction (`checked_add`, `checked_sub`) returning `(result, overflowed_bool)` tuples.
+    *   Checked addition, subtraction and multiplication returning `(result, overflowed_bool)` tuples (occurs in debug mode)
 *   ✅ Comparisons (`==`, `!=`, `<`, `<=`, `>`, `>=`).
 *   ✅ Bitwise operations (`&`, `|`, `^`, `<<`, `>>`).
-*   ✅ Basic control flow: `if`/`else` statements, `panic!` / `assert!` (including multiple arguments and formatting (`{}`) of most rust primitives)
-*   ✅ Calling other `static` functions within the same crate (including recursion).
-*   ✅ Basic variable assignment (`let x = y;`).
-*   ✅ Arrays and slices.
+*   ✅ Logical operations (`&&`, `||`, `!`), support for `if` (and `else if`/`else`) and `match` statements.
+*   ✅ Unary operations (`-`, `!`).
+*   ✅ Type casting (e.g., `as` operator).
+*   ✅ Support for all primitive types.
+*   ✅ Calling other functions (including recursion).
+*   ✅ Variable assignment including subfield and array index assignment, including nesting.
+*   ✅ Arrays and slices, including inserting, accessing and mutating at a given index.
 *   ✅ Floats (`f32`, `f64`).
 *   ✅ Structs and Tuples (enums and unions coming soon!)
 *   ✅ Generating executable `.jar` files for binary crates.
