@@ -75,4 +75,11 @@ public object Core {
         // In a real implementation, this would handle the panic appropriately.
         throw RuntimeException("Rust panic: " + (message ?: "<no message>"))
     }
+
+    @JvmStatic
+    public fun core_panicking_assert_failed(message: String?) {
+        // This is a placeholder for the assert failed function.
+        // In a real implementation, this would handle the assertion failure appropriately.
+        throw AssertionError("Rust assertion failed: " + (message ?: "<no message>"))
+    }
 }

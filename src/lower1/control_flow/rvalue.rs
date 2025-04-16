@@ -551,7 +551,11 @@ pub fn convert_rvalue_to_operand<'a>(
                     } else {
                         // Enum, Union
                         println!("Warning: Unhandled ADT Aggregate Kind -> Temp Placeholder");
-                        // No instructions needed for placeholder, result set below
+                        // make a placeholder (Class("java/lang/Object"))
+                        instructions.push(oomir::Instruction::ConstructObject {
+                            dest: temp_aggregate_var.clone(),
+                            class_name: "java/lang/Object".to_string(),
+                        });
                     }
                 }
                 _ => {

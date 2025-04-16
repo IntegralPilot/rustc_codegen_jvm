@@ -39,10 +39,11 @@ This backend currently supports a subset of Rust features:
 *   ✅ Type casting (e.g., `as` operator).
 *   ✅ Support for all primitive types.
 *   ✅ Calling other functions (including recursion).
+*   ✅ Loops such as `for`, `while`, and `loop`.
 *   ✅ Variable assignment including subfield and array index assignment, including nesting.
-*   ✅ Arrays and slices, including inserting, accessing and mutating at a given index.
+*   ✅ Arrays and slices, including inserting, accessing and mutating at a given index (supporting nesting).
 *   ✅ Floats (`f32`, `f64`).
-*   ✅ Structs and Tuples (enums and unions coming soon!)
+*   ✅ Structs and Tuples (enums and unions coming soon!) including nesting access/setting/mutation of fields.
 *   ✅ Generating executable `.jar` files for binary crates.
 
 ### Next Milestone:

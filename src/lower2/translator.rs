@@ -1364,6 +1364,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                             // Currently hardcoded
                             if function_name == "panic_fmt"
                                 || function_name == "core_panicking_panic"
+                                || function_name == "core_panicking_assert_failed"
                             {
                                 is_diverging_call = true;
                             }
