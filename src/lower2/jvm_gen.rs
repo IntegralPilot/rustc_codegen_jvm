@@ -89,13 +89,7 @@ pub(super) fn create_data_type_classfile(
 
     let this_class_index = cp.add_class(class_name_jvm)?;
 
-    let super_class_from_data_type = &data_type.super_class;
-    let super_class_index;
-    if let Some(super_class) = super_class_from_data_type {
-        super_class_index = cp.add_class(super_class)?;
-    } else {
-        super_class_index = cp.add_class(super_class_name_jvm)?;
-    }
+    let super_class_index = cp.add_class(super_class_name_jvm)?;
 
     // --- Create Fields ---
     let mut fields: Vec<jvm::Field> = Vec::new();
@@ -165,7 +159,6 @@ pub(super) fn create_data_type_classfile(
 
         let jvm_method = jvm::Method {
             access_flags: MethodAccessFlags::PUBLIC
-                | MethodAccessFlags::STATIC
                 | if is_abstract {
                     MethodAccessFlags::ABSTRACT
                 } else {

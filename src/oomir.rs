@@ -240,6 +240,14 @@ pub enum Instruction {
         ty: Type,
         dest: String, // Destination variable for the casted value
     },
+    InvokeVirtual {
+        dest: Option<String>, // Optional destination variable for the return value
+        class_name: String,   // JVM class name (e.g., MyStruct)
+        method_name: String,  // Name of the method to call
+        method_ty: Signature, // Signature of the method (input/output types)
+        args: Vec<Operand>,   // Arguments to the function
+        operand: Operand,     // The object reference (this) for the method call
+    },
 }
 
 #[derive(Debug, Clone)]

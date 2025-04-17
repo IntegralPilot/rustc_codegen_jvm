@@ -1613,6 +1613,50 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 //    The type for storage is the new type (ty)
                 self.store_result(dest, ty)?; // Stack: []
             }
+
+            OI::InvokeVirtual {
+                dest,
+                class_name,
+                method_name,
+                method_ty,
+                args,
+                operand,
+            } => {
+                // 1. Add Method reference to constant pool
+                let class_index = self.constant_pool.add_class(class_name)?;
+                let method_ref_index = self.constant_pool.add_method_ref(
+                    class_index,
+                    method_name,
+                    &method_ty.to_string(),
+                )?;
+
+                // 2. Load arguments onto the stack
+                for arg in args {
+                    self.load_call_argument(arg)?; // Use helper to handle references properly
+                }
+
+                // 3. Load the object reference (self) onto the stack
+                // The object reference is the first argument for instance methods
+                self.load_operand(operand)?; // Stack: [object_ref, args...]
+
+                // 4. Emit 'invokevirtual' instruction
+                self.jvm_instructions
+                    .push(JI::Invokevirtual(method_ref_index)); // Stack: [result]
+                // Note: The result type is determined by the method signature
+
+                // 5. Handle the return value
+                if let Some(dest_var) = dest {
+                    // Store the result in the destination variable
+                    self.store_result(dest_var, &method_ty.ret)?;
+                } else if *method_ty.ret.as_ref() != oomir::Type::Void {
+                    // Pop the result if it's not void and no destination is provided
+                    match get_type_size(&method_ty.ret) {
+                        1 => self.jvm_instructions.push(JI::Pop),
+                        2 => self.jvm_instructions.push(JI::Pop2),
+                        _ => {}
+                    }
+                }
+            }
         }
         Ok(())
     }

@@ -131,7 +131,7 @@ pub fn oomir_to_jvm_bytecode(
         let dt_bytecode = create_data_type_classfile(
             &dt_name_oomir,
             data_type,
-            "java/lang/Object", // Superclass
+            data_type.super_class.as_deref().unwrap_or("java/lang/Object"),
         )?;
         generated_classes.insert(dt_name_oomir.clone(), dt_bytecode);
     }

@@ -353,7 +353,13 @@ pub fn convert_basic_block<'tcx>(
                     target: target_label,
                 });
             }
-            // Other terminator kinds (like Resume, etc.) can be added as needed.
+            TerminatorKind::Unreachable => {
+                instructions.push(oomir::Instruction::ThrowNewWithMessage {
+                    exception_class: "java/lang/RuntimeException".to_string(),
+                    message: "Unreachable code reached".to_string(),
+                });
+            }
+            // Other terminator kinds (like Resume, etc.) will be added as needed.
             _ => {
                 println!("Warning: Unhandled terminator {:?}", terminator.kind);
             }

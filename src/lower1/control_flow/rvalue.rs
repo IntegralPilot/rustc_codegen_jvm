@@ -1,3 +1,4 @@
+use rustc_abi::FieldIdx;
 use rustc_middle::{
     mir::{BinOp, Body, Operand as MirOperand, Place, Rvalue, UnOp},
     ty::{ConstKind, TyCtxt, TyKind, inherent::ValueConst},
@@ -655,6 +656,30 @@ pub fn convert_rvalue_to_operand<'a>(
                         }
 
                         // Construct the enum variant object
+                        instructions.push(oomir::Instruction::ConstructObject {
+                            dest: temp_aggregate_var.clone(),
+                            class_name: variant_class_name.clone(),
+                        });
+
+                        // Set fields
+                        for (i, field) in variant_def.fields.iter().enumerate() {
+                            let field_name = format!("field{}", i);
+                            let field_mir_ty = field.ty(tcx, substs);
+                            let field_oomir_type = ty_to_oomir_type(field_mir_ty, tcx, data_types);
+                            let value_operand = convert_operand(
+                                &operands[FieldIdx::from_usize(i)],
+                                tcx,
+                                mir,
+                                data_types,
+                            );
+                            instructions.push(oomir::Instruction::SetField {
+                                object_var: temp_aggregate_var.clone(),
+                                field_name,
+                                value: value_operand,
+                                field_ty: field_oomir_type,
+                                owner_class: variant_class_name.clone(),
+                            });
+                        }
                     } else {
                         // Union
                         println!("Warning: Unhandled ADT Aggregate Kind -> Temp Placeholder");
@@ -726,7 +751,46 @@ pub fn convert_rvalue_to_operand<'a>(
                 }
             }
         }
+        Rvalue::Discriminant(place) => {
+            // get the discriminate of the place (usually an enum)
+            // so basically just call `getVariantIdx` on the class in the place
 
+            let place_name = place_to_string(place, tcx);
+            let place_type = get_place_type(place, mir, tcx, data_types);
+
+            let temp_discriminant_var = generate_temp_var_name(&base_temp_name);
+            let place_class_name = match place_type.clone() {
+                oomir::Type::Class(name) => name.clone(),
+                _ => panic!("Discriminant on non-class type {:?}", place),
+            };
+            let place_class = data_types.get(&place_class_name).unwrap();
+            let method_name = "getVariantIdx".to_string();
+            let method_return_tuple = place_class.methods.get(&method_name).unwrap();
+            let method_return_type = method_return_tuple.0.clone();
+
+            let method_ty = oomir::Signature {
+                params: vec![],
+                ret: Box::new(method_return_type.clone()),
+            };
+
+            // we can InvokeStatic as lower2 makes the field index method static (it doesn't depend on fields at all)
+            instructions.push(oomir::Instruction::InvokeVirtual {
+                class_name: place_class_name.clone(),
+                method_name,
+                args: vec![],
+                dest: Some(temp_discriminant_var.clone()),
+                method_ty,
+                operand: oomir::Operand::Variable {
+                    name: place_name,
+                    ty: place_type,
+                },
+            });
+
+            result_operand = oomir::Operand::Variable {
+                name: temp_discriminant_var,
+                ty: method_return_type,
+            };
+        }
         // Handle other Rvalue variants by generating a placeholder
         _ => {
             println!(

@@ -43,7 +43,7 @@ This backend currently supports a subset of Rust features:
 *   ✅ Variable assignment including subfield and array index assignment, including nesting.
 *   ✅ Arrays and slices, including inserting, accessing and mutating at a given index (supporting nesting).
 *   ✅ Floats (`f32`, `f64`).
-*   ✅ Structs and Tuples (enums and unions coming soon!) including nesting access/setting/mutation of fields.
+*   ✅ Structs, Tuples and Enums (currently only C-like enums, no anonymous structs or tuples yet) including nesting access/setting/mutation of fields.
 *   ✅ Generating executable `.jar` files for binary crates.
 
 ### Next Milestone:

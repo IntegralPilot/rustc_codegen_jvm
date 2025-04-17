@@ -215,7 +215,7 @@ pub fn mir_int_to_oomir_const<'tcx>(
             IntTy::I16 => oomir::Constant::I16(value as i16), // Be careful
             IntTy::I32 => oomir::Constant::I32(value as i32), // Be careful
             IntTy::I64 => oomir::Constant::I64(value as i64),
-            IntTy::Isize => oomir::Constant::I64(value as i64), // Assuming 64-bit target
+            IntTy::Isize => oomir::Constant::I32(value as i32), // JVM uses i32 for most "usize" tasks
             IntTy::I128 => oomir::Constant::I64(value as i64), // Truncate for JVM compatibility? Or error?
         },
         TyKind::Uint(uint_ty) => match uint_ty {
