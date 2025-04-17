@@ -1,7 +1,8 @@
 use super::{
+    consts::{get_int_const_instr, load_constant},
     helpers::{
-        are_types_jvm_compatible, get_cast_instructions, get_load_instruction, get_operand_type,
-        get_store_instruction, get_type_size,
+        get_cast_instructions, get_load_instruction, get_operand_type, get_store_instruction,
+        get_type_size,
     },
     shim::get_shim_metadata,
 };
@@ -366,147 +367,15 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
     /// Appends JVM instructions for loading an operand onto the stack.
     fn load_operand(&mut self, operand: &oomir::Operand) -> Result<(), jvm::Error> {
         match operand {
-            oomir::Operand::Constant(c) => self.load_constant(c)?,
+            oomir::Operand::Constant(c) => {
+                load_constant(&mut self.jvm_instructions, &mut self.constant_pool, c)?
+            }
             oomir::Operand::Variable { name: var_name, ty } => {
                 let index = self.get_local_index(var_name)?;
                 let load_instr = get_load_instruction(ty, index)?;
                 self.jvm_instructions.push(load_instr);
             }
         }
-        Ok(())
-    }
-
-    /// Appends JVM instructions for loading a constant onto the stack.
-    fn load_constant(&mut self, constant: &oomir::Constant) -> Result<(), jvm::Error> {
-        use jvm::attributes::Instruction as JI;
-        use oomir::Constant as OC;
-
-        let mut instructions_to_add = Vec::new();
-
-        match constant {
-            OC::I8(v) => instructions_to_add.push(self.get_int_const_instr(*v as i32)),
-            OC::I16(v) => instructions_to_add.push(self.get_int_const_instr(*v as i32)),
-            OC::I32(v) => instructions_to_add.push(self.get_int_const_instr(*v)),
-            OC::I64(v) => instructions_to_add.push(self.get_long_const_instr(*v)),
-            OC::F32(v) => instructions_to_add.push(self.get_float_const_instr(*v)),
-            OC::F64(v) => instructions_to_add.push(self.get_double_const_instr(*v)),
-            OC::Boolean(v) => {
-                instructions_to_add.push(if *v { JI::Iconst_1 } else { JI::Iconst_0 })
-            }
-            OC::Char(v) => instructions_to_add.push(self.get_int_const_instr(*v as i32)),
-            OC::String(s) => {
-                let index = self.constant_pool.add_string(s)?;
-                instructions_to_add.push(if let Ok(idx8) = u8::try_from(index) {
-                    JI::Ldc(idx8)
-                } else {
-                    JI::Ldc_w(index)
-                });
-            }
-            OC::Class(c) => {
-                let index = self.constant_pool.add_class(c)?;
-                instructions_to_add.push(if let Ok(idx8) = u8::try_from(index) {
-                    JI::Ldc(idx8)
-                } else {
-                    JI::Ldc_w(index)
-                });
-            }
-            OC::Array(elem_ty, elements) => {
-                let array_len = elements.len();
-
-                // 1. Push array size onto stack
-                instructions_to_add.push(self.get_int_const_instr(array_len as i32));
-
-                // 2. Create the new array (primitive or reference)
-                if let Some(atype_code) = elem_ty.to_jvm_primitive_array_type_code() {
-                    let array_type =
-                        ArrayType::from_bytes(&mut std::io::Cursor::new(vec![atype_code])) // Wrap atype_code in Cursor<Vec<u8>>
-                            .map_err(|e| jvm::Error::VerificationError {
-                                context: format!("Function {}", self.oomir_func.name),
-                                // Use Display formatting for the error type if available
-                                message: format!(
-                                    "Invalid primitive array type code {}: {:?}",
-                                    atype_code, e
-                                ),
-                            })?;
-                    instructions_to_add.push(JI::Newarray(array_type)); // Stack: [arrayref]
-                } else if let Some(internal_name) = elem_ty.to_jvm_internal_name() {
-                    let class_index = self.constant_pool.add_class(&internal_name)?;
-                    instructions_to_add.push(JI::Anewarray(class_index)); // Stack: [arrayref]
-                } else {
-                    return Err(jvm::Error::VerificationError {
-                        context: format!("Function {}", self.oomir_func.name),
-                        message: format!("Cannot create JVM array for element type: {:?}", elem_ty),
-                    });
-                }
-
-                let store_instruction =
-                    elem_ty.get_jvm_array_store_instruction().ok_or_else(|| {
-                        jvm::Error::VerificationError {
-                            context: format!("Function {}", self.oomir_func.name),
-                            message: format!(
-                                "Cannot determine array store instruction for type: {:?}",
-                                elem_ty
-                            ),
-                        }
-                    })?;
-
-                // 3. Populate the array
-                for (i, element_const) in elements.iter().enumerate() {
-                    let constant_type = Type::from_constant(element_const);
-                    if &constant_type != elem_ty.as_ref()
-                        && !are_types_jvm_compatible(&constant_type, elem_ty)
-                    {
-                        return Err(jvm::Error::VerificationError {
-                            context: format!("Function {}", self.oomir_func.name),
-                            message: format!(
-                                "Type mismatch in Constant::Array: expected {:?}, found {:?} for element {}",
-                                elem_ty, constant_type, i
-                            ),
-                        });
-                    }
-
-                    instructions_to_add.push(JI::Dup); // Stack: [arrayref, arrayref]
-                    instructions_to_add.push(self.get_int_const_instr(i as i32)); // Stack: [arrayref, arrayref, index]
-
-                    // --- Corrected Element Loading ---
-                    // 1. Record the length of the main instruction vector *before* the recursive call.
-                    let original_jvm_len = self.jvm_instructions.len();
-
-                    // 2. Make the recursive call. This *will* append instructions to self.jvm_instructions.
-                    self.load_constant(element_const)?;
-
-                    // 3. Determine the range of instructions added by the recursive call.
-                    let new_jvm_len = self.jvm_instructions.len();
-
-                    // 4. If instructions were added, copy them from self.jvm_instructions to instructions_to_add.
-                    if new_jvm_len > original_jvm_len {
-                        // Create a slice referencing the newly added instructions
-                        let added_instructions_slice =
-                            &self.jvm_instructions[original_jvm_len..new_jvm_len];
-                        // Extend the temporary vector with a clone of these instructions
-                        instructions_to_add.extend_from_slice(added_instructions_slice);
-                    }
-
-                    // 5. Remove the instructions just added by the recursive call from self.jvm_instructions.
-                    //    We truncate back to the length it had *before* the recursive call.
-                    self.jvm_instructions.truncate(original_jvm_len);
-                    // Now, self.jvm_instructions is back to its state before loading the element,
-                    // and instructions_to_add contains the necessary Dup, index, element load instructions.
-
-                    // Add the array store instruction to the temporary vector
-                    instructions_to_add.push(store_instruction.clone()); // Stack: [arrayref]
-                }
-                // Final stack state after loop: [arrayref] (the populated array)
-            }
-            OC::Null => {
-                // Push null reference onto the stack
-                instructions_to_add.push(JI::Aconst_null);
-            }
-        };
-
-        // Append the generated instructions for this constant (now including array logic)
-        self.jvm_instructions.extend(instructions_to_add);
-
         Ok(())
     }
 
@@ -517,95 +386,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         let store_instr = get_store_instruction(ty, index)?;
         self.jvm_instructions.push(store_instr);
         Ok(())
-    }
-
-    // Helper to get the appropriate integer constant loading instruction
-    fn get_int_const_instr(&mut self, val: i32) -> Instruction {
-        match val {
-            // Direct iconst mapping
-            -1 => Instruction::Iconst_m1,
-            0 => Instruction::Iconst_0,
-            1 => Instruction::Iconst_1,
-            2 => Instruction::Iconst_2,
-            3 => Instruction::Iconst_3,
-            4 => Instruction::Iconst_4,
-            5 => Instruction::Iconst_5,
-
-            // Bipush range (-128 to 127), excluding the iconst values already handled
-            v @ -128..=-2 | v @ 6..=127 => Instruction::Bipush(v as i8),
-
-            // Sipush range (-32768 to 32767), excluding the bipush range
-            v @ -32768..=-129 | v @ 128..=32767 => Instruction::Sipush(v as i16),
-
-            // Use LDC for values outside the -32768 to 32767 range
-            v => {
-                let index = self
-                    .constant_pool
-                    .add_integer(v)
-                    .expect("Failed to add integer to constant pool");
-                if let Ok(idx8) = u8::try_from(index) {
-                    Instruction::Ldc(idx8)
-                } else {
-                    Instruction::Ldc_w(index)
-                }
-            }
-        }
-    }
-
-    // Helper to get the appropriate long constant loading instruction
-    fn get_long_const_instr(&mut self, val: i64) -> Instruction {
-        // <-- Add `&mut self`
-        match val {
-            0 => Instruction::Lconst_0,
-            1 => Instruction::Lconst_1,
-            _ => {
-                // Add the long value to the constant pool.
-                let index = self
-                    .constant_pool
-                    .add_long(val)
-                    .expect("Failed to add long to constant pool");
-                // Ldc2_w is used for long/double constants and always takes a u16 index.
-                Instruction::Ldc2_w(index)
-            }
-        }
-    }
-
-    // Helper to get the appropriate float constant loading instruction
-    fn get_float_const_instr(&mut self, val: f32) -> Instruction {
-        if val == 0.0 {
-            Instruction::Fconst_0
-        } else if val == 1.0 {
-            Instruction::Fconst_1
-        } else if val == 2.0 {
-            Instruction::Fconst_2
-        } else {
-            // Add the float value to the constant pool.
-            let index = self
-                .constant_pool
-                .add_float(val)
-                .expect("Failed to add float to constant pool");
-            // Ldc2_w is used for long/double constants and always takes a u16 index.
-            Instruction::Ldc_w(index)
-        }
-    }
-
-    // Helper to get the appropriate double constant loading instruction
-    fn get_double_const_instr(&mut self, val: f64) -> Instruction {
-        // Using bit representation for exact zero comparison is more robust
-        if val.to_bits() == 0.0f64.to_bits() {
-            // Handles +0.0 and -0.0
-            Instruction::Dconst_0
-        } else if val == 1.0 {
-            Instruction::Dconst_1
-        } else {
-            // Add the double value to the constant pool.
-            let index = self
-                .constant_pool
-                .add_double(val)
-                .expect("Failed to add double to constant pool");
-            // Ldc2_w is used for long/double constants and always takes a u16 index.
-            Instruction::Ldc2_w(index)
-        }
     }
 
     // --- Instruction Translation Helpers ---
@@ -977,33 +757,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 self.translate_binary_op(dest, op1, op2, jvm_op)?
             }
 
-            // --- Logical Operations (Need Short-circuiting) ---
-            // These are more complex as they involve control flow, not direct JVM ops.
-            // Example for And:
-            //   load op1
-            //   ifeq label_false  // If op1 is false, result is false
-            //   load op2
-            //   ifeq label_false  // If op2 is false, result is false
-            //   iconst_1          // Both true, result is true
-            //   goto label_end
-            // label_false:
-            //   iconst_0          // Result is false
-            // label_end:
-            //   istore dest
-            OI::And {
-                dest: _,
-                op1: _,
-                op2: _,
-            } => {
-                unimplemented!("Logical And needs control flow translation")
-            }
-            OI::Or {
-                dest: _,
-                op1: _,
-                op2: _,
-            } => {
-                unimplemented!("Logical Or needs control flow translation")
-            }
             OI::Not { dest, src } => {
                 // 1. Load source operand
                 self.load_operand(src)?; // Stack: [value]
@@ -1174,7 +927,8 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                             };
 
                             // Load the i32 constant key
-                            let const_instr = self.get_int_const_instr(key_value_i32);
+                            let const_instr =
+                                get_int_const_instr(&mut self.constant_pool, key_value_i32);
                             self.jvm_instructions.push(const_instr); // Stack: [discr_value(i32), key_value(i32)]
 
                             // Add the comparison instruction (if_icmpeq jumps if equal)
@@ -1187,7 +941,11 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
 
                         // --- I64 (long) type (use lcmp, ifeq) ---
                         Type::I64 => {
-                            self.load_constant(constant_key)?;
+                            load_constant(
+                                &mut self.jvm_instructions,
+                                &mut self.constant_pool,
+                                constant_key,
+                            )?;
 
                             // Compare longs: pushes -1, 0, or 1 (int) onto the stack
                             self.jvm_instructions.push(JI::Lcmp); // Stack: [comparison_result(i32)]
@@ -1202,7 +960,11 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
 
                         // --- F32 (float) type (use fcmpl/fcmpg, ifeq) ---
                         Type::F32 => {
-                            self.load_constant(constant_key)?; // Stack: [discr_value(f32), key_value(f32)]
+                            load_constant(
+                                &mut self.jvm_instructions,
+                                &mut self.constant_pool,
+                                constant_key,
+                            )?; // Stack: [discr_value(f32), key_value(f32)]
 
                             // Compare floats: pushes -1, 0, or 1 (int) onto the stack.
                             // fcmpl treats NaN comparison as -1. fcmpg treats it as +1.
@@ -1220,7 +982,11 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
 
                         // --- F64 (double) type (use dcmpl/dcmpg, ifeq) ---
                         Type::F64 => {
-                            self.load_constant(constant_key)?; // Stack: [discr_value(f64), key_value(f64)]
+                            load_constant(
+                                &mut self.jvm_instructions,
+                                &mut self.constant_pool,
+                                constant_key,
+                            )?; // Stack: [discr_value(f64), key_value(f64)]
 
                             // Compare doubles (similar logic to floats regarding NaN and dcmpl/dcmpg)
                             self.jvm_instructions.push(JI::Dcmpl); // Stack: [comparison_result(i32)]
@@ -1685,12 +1451,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
 
                 self.store_result(dest, &dest_type)?; // Stack: []
             }
-            OI::Throw { exception } => {
-                // Assuming the operand is already an exception *instance* reference
-                // TODO: Determine the correct type hint here! Assuming Object for now.
-                self.load_operand(exception)?;
-                self.jvm_instructions.push(JI::Athrow);
-            }
             OI::ThrowNewWithMessage {
                 exception_class,
                 message,
@@ -1877,7 +1637,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             }
             oomir::Operand::Constant(c) => {
                 // Constants are loaded directly, no special handling needed here for refs
-                self.load_constant(c)?;
+                load_constant(&mut self.jvm_instructions, &mut self.constant_pool, c)?;
             }
         }
         Ok(())

@@ -61,10 +61,27 @@ pub fn ty_to_oomir_type<'tcx>(
                     data_types.insert(
                         jvm_name.clone(),
                         oomir::DataType {
-                            name: jvm_name.clone(),
                             fields: oomir_fields,
+                            is_abstract: false,
+                            methods: HashMap::new(),
+                            super_class: None,
                         },
                     );
+                } else if adt_def.is_enum() {
+                    // the enum in general
+                    if !data_types.contains_key(&jvm_name) {
+                        let mut methods = HashMap::new();
+                        methods.insert("getVariantIdx".to_string(), (oomir::Type::I32, None));
+                        data_types.insert(
+                            jvm_name.clone(),
+                            oomir::DataType {
+                                fields: vec![], // No fields in the abstract class
+                                is_abstract: true,
+                                methods,
+                                super_class: None,
+                            },
+                        );
+                    }
                 }
                 oomir::Type::Class(jvm_name)
             }
@@ -119,8 +136,10 @@ pub fn ty_to_oomir_type<'tcx>(
 
                 // Create and insert the DataType definition
                 let tuple_data_type = oomir::DataType {
-                    name: tuple_class_name.clone(),
                     fields: oomir_fields,
+                    is_abstract: false,
+                    methods: HashMap::new(),
+                    super_class: None,
                 };
                 data_types.insert(tuple_class_name.clone(), tuple_data_type);
                 println!("   -> Added DataType: {:?}", data_types[&tuple_class_name]);

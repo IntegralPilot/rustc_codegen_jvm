@@ -26,8 +26,11 @@ impl Module {
 
 #[derive(Debug, Clone)]
 pub struct DataType {
-    pub name: String,
+    pub is_abstract: bool,           // "abstract" is a keyword in Rust
     pub fields: Vec<(String, Type)>, // 0 = field name and 1 = type
+    // key = method name, value0 = return type, vaule1 = thing it returns (None if it's an abstract method). Currently methods on datatypes only need to be able to return a thing - there's no accepting arguments or doing anything else.
+    pub methods: HashMap<String, (Type, Option<Constant>)>,
+    pub super_class: Option<String>, // Name of the super class, if any
 }
 
 #[derive(Debug, Clone)]
@@ -151,12 +154,6 @@ pub enum Instruction {
         op1: Operand,
         op2: Operand,
     },
-    And {
-        // Logical AND
-        dest: String,
-        op1: Operand,
-        op2: Operand,
-    },
     Not {
         // Logical/Bitwise NOT
         dest: String,
@@ -166,11 +163,6 @@ pub enum Instruction {
         // Arithmetic Negation
         dest: String,
         src: Operand,
-    },
-    Or {
-        dest: String,
-        op1: Operand,
-        op2: Operand,
     },
     Jump {
         target: String, // Label of the target BB
@@ -191,9 +183,6 @@ pub enum Instruction {
     Move {
         dest: String,
         src: Operand, // Source operand (could be Variable or Constant, though in this context, it's likely Variable)
-    },
-    Throw {
-        exception: Operand, // Exception to throw
     },
     ThrowNewWithMessage {
         exception_class: String, // e.g., "java/lang/RuntimeException"
@@ -273,7 +262,6 @@ pub enum Constant {
     Class(String),
     // 0 = the type of elements, 1 = the elements as a vec of constants
     Array(Box<Type>, Vec<Constant>),
-    Null,
 }
 
 // Helper to check if a Constant is integer-like (needed for Switch)
@@ -301,7 +289,7 @@ pub enum Type {
     I64,
     F32,
     F64,
-    Reference(Box<Type>), // Representing references
+    Reference(Box<Type>), // Representing references, not currently constructed but might be useful in future for more complex things.
     Array(Box<Type>),     // Representing arrays, need to handle dimensions
     String,               // String type
     Class(String),        // For structs, enums, and potentially Objects
@@ -448,9 +436,6 @@ impl Type {
             Constant::Char(_) => Type::Char,
             Constant::String(_) => Type::String,
             Constant::Class(name) => Type::Class(name.to_string()),
-            // For Null, assume a base Object type if a specific type is needed from the constant itself.
-            // Often, the type will come from the destination variable context instead.
-            Constant::Null => Type::Class("java/lang/Object".to_string()),
         }
     }
 

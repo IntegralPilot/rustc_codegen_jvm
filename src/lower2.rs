@@ -13,6 +13,7 @@ use ristretto_classfile::{
 use rustc_middle::ty::TyCtxt;
 use std::collections::HashMap;
 
+mod consts;
 mod helpers;
 mod jvm_gen;
 mod shim;

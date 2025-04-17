@@ -1,6 +1,8 @@
 // src/lower2/jvm_gen.rs
 
-use crate::oomir;
+use super::consts::load_constant;
+use crate::oomir::{self, Type};
+
 use ristretto_classfile::{
     self as jvm, BaseType, ClassAccessFlags, ClassFile, ConstantPool, FieldAccessFlags,
     MethodAccessFlags, Version,
@@ -86,7 +88,14 @@ pub(super) fn create_data_type_classfile(
     let mut cp = ConstantPool::default();
 
     let this_class_index = cp.add_class(class_name_jvm)?;
-    let super_class_index = cp.add_class(super_class_name_jvm)?;
+
+    let super_class_from_data_type = &data_type.super_class;
+    let super_class_index;
+    if let Some(super_class) = super_class_from_data_type {
+        super_class_index = cp.add_class(super_class)?;
+    } else {
+        super_class_index = cp.add_class(super_class_name_jvm)?;
+    }
 
     // --- Create Fields ---
     let mut fields: Vec<jvm::Field> = Vec::new();
@@ -107,14 +116,22 @@ pub(super) fn create_data_type_classfile(
     }
 
     // --- Create Default Constructor ---
-    let constructor = create_default_constructor(&mut cp, super_class_index)?; // Use helper
+    let constructor = create_default_constructor(&mut cp, super_class_index)?;
     let methods = vec![constructor];
+
+    let is_abstract = data_type.is_abstract;
 
     // --- Assemble ClassFile ---
     let mut class_file = ClassFile {
         version: Version::Java8 { minor: 0 },
         constant_pool: cp,
-        access_flags: ClassAccessFlags::PUBLIC | ClassAccessFlags::SUPER,
+        access_flags: ClassAccessFlags::PUBLIC
+            | ClassAccessFlags::SUPER
+            | if is_abstract {
+                ClassAccessFlags::ABSTRACT
+            } else {
+                ClassAccessFlags::FINAL
+            },
         this_class: this_class_index,
         super_class: super_class_index,
         interfaces: Vec::new(),
@@ -122,6 +139,45 @@ pub(super) fn create_data_type_classfile(
         methods,
         attributes: Vec::new(),
     };
+
+    // Check for methods
+    for (method_name, tuple) in data_type.methods.iter() {
+        let return_type = &tuple.0;
+        let return_const = &tuple.1;
+        let method_desc = format!("(){}", return_type.to_jvm_descriptor());
+
+        // Add the method to the class file
+        let name_index = class_file.constant_pool.add_utf8(&method_name)?;
+        let descriptor_index = class_file.constant_pool.add_utf8(method_desc)?;
+
+        let mut attributes = vec![];
+        let mut is_abstract = false;
+
+        match return_const {
+            Some(rc) => attributes.push(create_code_from_method_name_and_constant_return(
+                &rc,
+                &mut class_file.constant_pool,
+            )?),
+            None => {
+                is_abstract = true;
+            }
+        }
+
+        let jvm_method = jvm::Method {
+            access_flags: MethodAccessFlags::PUBLIC
+                | MethodAccessFlags::STATIC
+                | if is_abstract {
+                    MethodAccessFlags::ABSTRACT
+                } else {
+                    MethodAccessFlags::FINAL
+                },
+            name_index,
+            descriptor_index,
+            attributes,
+        };
+
+        class_file.methods.push(jvm_method);
+    }
 
     // --- Add SourceFile Attribute ---
     let simple_name = class_name_jvm.split('/').last().unwrap_or(class_name_jvm);
@@ -138,4 +194,51 @@ pub(super) fn create_data_type_classfile(
     class_file.to_bytes(&mut byte_vector)?;
 
     Ok(byte_vector)
+}
+
+/// Creates a code attribute for a method that returns a constant value.
+fn create_code_from_method_name_and_constant_return(
+    return_const: &oomir::Constant,
+    cp: &mut ConstantPool,
+) -> jvm::Result<Attribute> {
+    let code_attr_name_index = cp.add_utf8("Code")?;
+    let return_ty = Type::from_constant(return_const);
+
+    // Create the instructions based on the constant type
+    let mut instructions = Vec::new();
+
+    load_constant(&mut instructions, cp, return_const)?;
+
+    // add an instruction to return the value that we just loaded onto the stack
+    let return_instr = match return_ty {
+        oomir::Type::I8
+        | oomir::Type::I16
+        | oomir::Type::I32
+        | oomir::Type::Boolean
+        | oomir::Type::Char => Instruction::Ireturn,
+        oomir::Type::I64 => Instruction::Lreturn,
+        oomir::Type::F32 => Instruction::Freturn,
+        oomir::Type::F64 => Instruction::Dreturn,
+        oomir::Type::Reference(_)
+        | oomir::Type::Array(_)
+        | oomir::Type::String
+        | oomir::Type::Class(_) => Instruction::Areturn,
+        oomir::Type::Void => Instruction::Return, // Should not happen with Some(op)
+    };
+
+    instructions.push(return_instr);
+
+    let max_stack = 1;
+    let max_locals = 1;
+
+    let code_attribute = Attribute::Code {
+        name_index: code_attr_name_index,
+        max_stack,
+        max_locals,
+        code: instructions,
+        exception_table: Vec::new(),
+        attributes: Vec::new(),
+    };
+
+    Ok(code_attribute)
 }

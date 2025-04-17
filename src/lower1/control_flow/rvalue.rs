@@ -543,13 +543,120 @@ pub fn convert_rvalue_to_operand<'a>(
                             data_types.insert(
                                 jvm_class_name.clone(),
                                 oomir::DataType {
-                                    name: jvm_class_name,
                                     fields: oomir_fields,
+                                    is_abstract: false,
+                                    methods: HashMap::new(),
+                                    super_class: None,
                                 },
                             );
                         }
+                    } else if adt_def.is_enum() {
+                        let variant_def = adt_def.variant(*variant_idx);
+                        let base_enum_name = make_jvm_safe(&tcx.def_path_str(adt_def.did()));
+                        let variant_class_name = format!(
+                            "{}${}",
+                            base_enum_name,
+                            make_jvm_safe(&variant_def.name.to_string())
+                        );
+
+                        println!(
+                            "Info: Handling Enum Aggregate (Variant: {}) -> Temp Var '{}' (Class: {})",
+                            variant_def.name, temp_aggregate_var, variant_class_name
+                        );
+
+                        /*
+                        i.e. consider rust code:
+                        ```rust
+                        enum MyEnum {
+                            A(i32),
+                            B{x: String},
+                            C,
+                        }
+                        ```
+
+                        psuedo-java for the plan on how to handle this
+                        ```java
+                        abstract class MyEnum {
+                            public abstract int getVariantIdx();
+                        }
+
+                        class MyEnum$A extends MyEnum {
+                            public int field0;
+
+                            public MyEnum$A(int field0) {
+                                this.field0 = field0;
+                            }
+
+                            @Override
+                            public final int getVariantIdx() { return 0; }
+                        }
+
+                        class MyEnum$B extends MyEnum {
+                            public String field0;
+
+                            public MyEnum$B(String field0) {
+                                this.field0 = field0;
+                            }
+
+                            @Override
+                            public final int getVariantIdx() { return 1; }
+                        }
+
+                        class MyEnum$C extends MyEnum {
+                            @Override
+                            public final int getVariantIdx() { return 2; }
+                        }
+                        ```
+                        */
+
+                        // the enum in general
+                        if !data_types.contains_key(&base_enum_name) {
+                            let mut methods = HashMap::new();
+                            methods.insert("getVariantIdx".to_string(), (oomir::Type::I32, None));
+                            data_types.insert(
+                                base_enum_name.clone(),
+                                oomir::DataType {
+                                    fields: vec![], // No fields in the abstract class
+                                    is_abstract: true,
+                                    methods,
+                                    super_class: None,
+                                },
+                            );
+                        }
+
+                        // this variant
+                        if !data_types.contains_key(&variant_class_name) {
+                            let mut fields = vec![];
+                            for (i, field) in variant_def.fields.iter().enumerate() {
+                                let field_name = format!("field{}", i);
+                                let field_type =
+                                    ty_to_oomir_type(field.ty(tcx, substs), tcx, data_types);
+                                fields.push((field_name, field_type));
+                            }
+
+                            let mut methods = HashMap::new();
+                            methods.insert(
+                                "getVariantIdx".to_string(),
+                                (
+                                    oomir::Type::I32,
+                                    Some(oomir::Constant::I32(variant_idx.as_u32() as i32)),
+                                ),
+                            );
+
+                            data_types.insert(
+                                variant_class_name.clone(),
+                                oomir::DataType {
+                                    fields,
+                                    is_abstract: false,
+                                    methods,
+                                    super_class: Some(base_enum_name.clone()),
+                                },
+                            );
+                        }
+
+                        // Construct the enum variant object
                     } else {
-                        // Enum, Union
+                        // Union
                         println!("Warning: Unhandled ADT Aggregate Kind -> Temp Placeholder");
                         // make a placeholder (Class("java/lang/Object"))
                         instructions.push(oomir::Instruction::ConstructObject {
