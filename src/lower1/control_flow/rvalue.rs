@@ -59,7 +59,8 @@ pub fn convert_rvalue_to_operand<'a>(
                 }
                 MirOperand::Constant(_) => {
                     // Constant is already an operand, no extra instructions
-                    result_operand = convert_operand(mir_operand, tcx, mir, data_types);
+                    result_operand =
+                        convert_operand(mir_operand, tcx, mir, data_types, &mut instructions);
                 }
             }
         }
@@ -71,7 +72,8 @@ pub fn convert_rvalue_to_operand<'a>(
 
             if let rustc_middle::ty::TyKind::Array(elem_ty, _) = place_ty.kind() {
                 let oomir_elem_type = ty_to_oomir_type(elem_ty.clone(), tcx, data_types);
-                let oomir_elem_op = convert_operand(element_op, tcx, mir, data_types);
+                let oomir_elem_op =
+                    convert_operand(element_op, tcx, mir, data_types, &mut instructions);
                 let array_size = match len_const.kind() {
                     ConstKind::Value(val) => {
                         /* ... extract size ... */
@@ -80,6 +82,7 @@ pub fn convert_rvalue_to_operand<'a>(
                             tcx.valtree_to_const_val(val),
                             &val.ty(),
                             tcx,
+                            data_types,
                         ))
                         .unwrap_or(0)
                     } // Simplified extraction
@@ -145,7 +148,7 @@ pub fn convert_rvalue_to_operand<'a>(
             let oomir_target_type = ty_to_oomir_type(*target_mir_ty, tcx, data_types);
             let source_mir_ty = operand.ty(&mir.local_decls, tcx);
             let oomir_source_type = ty_to_oomir_type(source_mir_ty, tcx, data_types);
-            let oomir_operand = convert_operand(operand, tcx, mir, data_types);
+            let oomir_operand = convert_operand(operand, tcx, mir, data_types, &mut instructions);
 
             if oomir_target_type == oomir_source_type {
                 println!("Info: Handling Rvalue::Cast (Same OOMIR Types) -> Temp Move.");
@@ -169,8 +172,8 @@ pub fn convert_rvalue_to_operand<'a>(
 
         Rvalue::BinaryOp(bin_op, box (op1, op2)) => {
             let temp_binop_var = generate_temp_var_name(&base_temp_name);
-            let oomir_op1 = convert_operand(op1, tcx, mir, data_types);
-            let oomir_op2 = convert_operand(op2, tcx, mir, data_types);
+            let oomir_op1 = convert_operand(op1, tcx, mir, data_types, &mut instructions);
+            let oomir_op2 = convert_operand(op2, tcx, mir, data_types, &mut instructions);
             // Determine result type based on operands or destination hint
             let oomir_result_type = get_place_type(original_dest_place, mir, tcx, data_types);
 
@@ -349,7 +352,8 @@ pub fn convert_rvalue_to_operand<'a>(
 
         Rvalue::UnaryOp(operation, operand) => {
             let temp_unop_var = generate_temp_var_name(&base_temp_name);
-            let oomir_src_operand = convert_operand(operand, tcx, mir, data_types);
+            let oomir_src_operand =
+                convert_operand(operand, tcx, mir, data_types, &mut instructions);
             // Determine result type (often same as operand, except for PtrMetadata)
             let oomir_result_type = match operation {
                 UnOp::PtrMetadata => oomir::Type::I32,
@@ -474,7 +478,8 @@ pub fn convert_rvalue_to_operand<'a>(
                         };
                         let element_oomir_type =
                             ty_to_oomir_type(element_mir_ty.clone(), tcx, data_types);
-                        let value_operand = convert_operand(mir_op, tcx, mir, data_types);
+                        let value_operand =
+                            convert_operand(mir_op, tcx, mir, data_types, &mut instructions);
                         instructions.push(oomir::Instruction::SetField {
                             object_var: temp_aggregate_var.clone(),
                             field_name,
@@ -500,7 +505,8 @@ pub fn convert_rvalue_to_operand<'a>(
                     });
                     // Store elements into the temporary array
                     for (i, mir_operand) in operands.iter().enumerate() {
-                        let value_operand = convert_operand(mir_operand, tcx, mir, data_types);
+                        let value_operand =
+                            convert_operand(mir_operand, tcx, mir, data_types, &mut instructions);
                         let index_operand =
                             oomir::Operand::Constant(oomir::Constant::I32(i as i32));
                         instructions.push(oomir::Instruction::ArrayStore {
@@ -530,7 +536,13 @@ pub fn convert_rvalue_to_operand<'a>(
                             let field_name = field_def.ident(tcx).to_string();
                             let field_mir_ty = field_def.ty(tcx, substs);
                             let field_oomir_type = ty_to_oomir_type(field_mir_ty, tcx, data_types);
-                            let value_operand = convert_operand(mir_operand, tcx, mir, data_types);
+                            let value_operand = convert_operand(
+                                mir_operand,
+                                tcx,
+                                mir,
+                                data_types,
+                                &mut instructions,
+                            );
                             instructions.push(oomir::Instruction::SetField {
                                 object_var: temp_aggregate_var.clone(),
                                 field_name,
@@ -671,6 +683,7 @@ pub fn convert_rvalue_to_operand<'a>(
                                 tcx,
                                 mir,
                                 data_types,
+                                &mut instructions,
                             );
                             instructions.push(oomir::Instruction::SetField {
                                 object_var: temp_aggregate_var.clone(),

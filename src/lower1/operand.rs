@@ -1,14 +1,23 @@
 use super::place::{get_place_type, place_to_string};
 use crate::oomir;
 
+use super::place::emit_instructions_to_get_on_own;
+use rustc_abi::Size;
 use rustc_middle::{
     mir::{
         Body, Const, ConstOperand, ConstValue, Operand as MirOperand, Place,
-        interpret::{AllocRange, ErrorHandled, Scalar},
+        interpret::{AllocRange, ErrorHandled, GlobalAlloc, Provenance, Scalar},
     },
-    ty::{ConstKind, FloatTy, IntTy, PseudoCanonicalInput, Ty, TyCtxt, TyKind, TypingEnv, UintTy},
+    ty::{
+        ConstKind, FloatTy, IntTy, PseudoCanonicalInput, ScalarInt, Ty, TyCtxt, TyKind, TypingEnv,
+        UintTy,
+    },
 };
 use std::collections::HashMap;
+
+mod adt;
+
+use adt::read_constant_value_from_memory;
 
 /// Convert a MIR operand to an OOMIR operand.
 pub fn convert_operand<'tcx>(
@@ -16,12 +25,13 @@ pub fn convert_operand<'tcx>(
     tcx: TyCtxt<'tcx>,
     mir: &Body<'tcx>,
     data_types: &mut HashMap<String, oomir::DataType>,
+    instructions: &mut Vec<oomir::Instruction>,
 ) -> oomir::Operand {
     match mir_op {
         MirOperand::Constant(box constant) => {
             match constant.const_ {
                 Const::Val(const_val, ty) => {
-                    handle_const_value(Some(constant), const_val, &ty, tcx)
+                    handle_const_value(Some(constant), const_val, &ty, tcx, data_types)
                 }
                 Const::Ty(const_ty, ty_const) => {
                     // ty_const is NOT a type, naming is b/c it's a ty::Const (as opposed to mir::Const)
@@ -29,7 +39,7 @@ pub fn convert_operand<'tcx>(
                     match kind {
                         ConstKind::Value(val) => {
                             let constval = tcx.valtree_to_const_val(val);
-                            handle_const_value(None, constval, &const_ty, tcx)
+                            handle_const_value(None, constval, &const_ty, tcx, data_types)
                         }
                         _ => {
                             println!(
@@ -56,7 +66,7 @@ pub fn convert_operand<'tcx>(
                                 uv, span, const_val
                             );
                             // Now handle the resulting ConstValue using the existing function
-                            handle_const_value(Some(constant), const_val, &ty, tcx)
+                            handle_const_value(Some(constant), const_val, &ty, tcx, data_types)
                         }
                         Err(ErrorHandled::Reported(error_reported, ..)) => {
                             // An error occurred during evaluation and rustc has already reported it.
@@ -80,18 +90,27 @@ pub fn convert_operand<'tcx>(
                             oomir::Operand::Constant(oomir::Constant::I32(-2)) // Placeholder for generic error
                         }
                     }
-                    // --- END OF const_eval_resolve LOGIC ---
                 }
             }
         }
         MirOperand::Copy(place) | MirOperand::Move(place) => {
-            let var_name = place_to_string(place, tcx);
-            // --- Get the type of the place ---
-            let oomir_type = get_place_type(place, mir, tcx, data_types);
-            // --- Create typed Variable operand ---
-            oomir::Operand::Variable {
-                name: var_name,
-                ty: oomir_type,
+            if place.projection.is_empty() {
+                let var_name = place_to_string(place, tcx);
+                let oomir_type = get_place_type(place, mir, tcx, data_types);
+                oomir::Operand::Variable {
+                    name: var_name,
+                    ty: oomir_type,
+                }
+            } else {
+                let (final_var_name, get_instructions, final_type) =
+                    emit_instructions_to_get_on_own(place, tcx, mir, data_types);
+
+                instructions.extend(get_instructions);
+
+                oomir::Operand::Variable {
+                    name: final_var_name,
+                    ty: final_type,
+                }
             }
         }
     }
@@ -102,79 +121,14 @@ pub fn handle_const_value<'tcx>(
     const_val: ConstValue<'tcx>,
     ty: &Ty<'tcx>,
     tcx: TyCtxt<'tcx>,
+    data_types: &mut HashMap<String, oomir::DataType>,
 ) -> oomir::Operand {
     match const_val {
         ConstValue::Scalar(scalar) => {
             match scalar {
                 Scalar::Int(scalar_int) => {
-                    match ty.kind() {
-                        rustc_middle::ty::TyKind::Int(int_ty) => {
-                            let val = match int_ty {
-                                IntTy::I8 => oomir::Constant::I8(scalar_int.to_i8()),
-                                IntTy::I16 => oomir::Constant::I16(scalar_int.to_i16()),
-                                IntTy::I32 => oomir::Constant::I32(scalar_int.to_i32()),
-                                IntTy::Isize => {
-                                    // the "pointer size" of the target platform can't be known at compiletime
-                                    // as the same bytecode supports both 32-bit and 64-bit JVMs
-                                    // go with 32-bit (i32 = i64 to ensure full range)
-                                    // better for memory usage and performance
-                                    // need to call to_i64() because if compiling on a 64-bit host it will contain 8 bytes
-                                    oomir::Constant::I32(scalar_int.to_i64() as i32)
-                                }
-                                IntTy::I64 => oomir::Constant::I64(scalar_int.to_i64()),
-                                // doesn't fit in primitive
-                                IntTy::I128 => {
-                                    oomir::Constant::Class("java/lang/BigInteger".into())
-                                }
-                            };
-                            oomir::Operand::Constant(val)
-                        }
-                        rustc_middle::ty::TyKind::Uint(uint_ty) => {
-                            // The JVM only has signed integers, so we need to convert
-                            // Ensure that the FULL RANGE is covered, i.e., u8 must become i16
-                            let val = match uint_ty {
-                                UintTy::U8 => oomir::Constant::I16(scalar_int.to_u8() as i16),
-                                UintTy::U16 => oomir::Constant::I32(scalar_int.to_u16() as i32),
-                                UintTy::U32 => oomir::Constant::I64(scalar_int.to_u32() as i64),
-                                UintTy::Usize => {
-                                    // java uses an i32 for most "usize" i.e. array indexes etc.
-                                    // need to call to_u64() because if compiling on a 64-bit host it will contain 8 bytes
-                                    oomir::Constant::I32(scalar_int.to_u64() as i32)
-                                }
-                                // Doesn't fit in a primitive
-                                UintTy::U64 | UintTy::U128 => {
-                                    oomir::Constant::Class("java/lang/BigInteger".into())
-                                }
-                            };
-                            oomir::Operand::Constant(val)
-                        }
-                        rustc_middle::ty::TyKind::Bool => {
-                            let val = scalar_int.try_to_bool().unwrap_or(false);
-                            oomir::Operand::Constant(oomir::Constant::Boolean(val))
-                        }
-                        rustc_middle::ty::TyKind::Char => {
-                            let val = char::from_u32(scalar_int.to_u32()).unwrap_or('\0');
-                            oomir::Operand::Constant(oomir::Constant::Char(val))
-                        }
-                        rustc_middle::ty::TyKind::Float(float_ty) => {
-                            let val = match float_ty {
-                                FloatTy::F32 => {
-                                    let bits = scalar_int.to_u32(); // Get the raw bits as u32
-                                    oomir::Constant::F32(f32::from_bits(bits))
-                                }
-                                FloatTy::F64 => {
-                                    let bits = scalar_int.to_u64(); // Get the raw bits as u64
-                                    oomir::Constant::F64(f64::from_bits(bits))
-                                }
-                                _ => oomir::Constant::I32(scalar_int.to_i32()), // Default fallback
-                            };
-                            oomir::Operand::Constant(val)
-                        }
-                        _ => {
-                            println!("Warning: Unhandled scalar type {:?} for Scalar::Int", ty);
-                            oomir::Operand::Constant(oomir::Constant::I32(0))
-                        }
-                    }
+                    let oomir_const = scalar_int_to_oomir_constant(scalar_int, ty);
+                    oomir::Operand::Constant(oomir_const)
                 }
                 Scalar::Ptr(pointer, _) => {
                     let alloc_id = pointer.provenance.alloc_id();
@@ -182,6 +136,36 @@ pub fn handle_const_value<'tcx>(
                     match alloc {
                         rustc_middle::mir::interpret::GlobalAlloc::Memory(const_allocation) => {
                             let allocation = const_allocation.inner();
+
+                            // eventually the read_constant_value_from_memory function (which is much better than the hardcoded/messy code here) will be used
+                            // for every pointer type (it supports all of them). but currently it's just used for ADTs as some specific bugs need to be ironed out.
+                            //
+                            /*let offset = pointer.into_parts().1;
+
+                            let constant_oomir = read_constant_value_from_memory(
+                                tcx,
+                                allocation,
+                                offset,
+                                *ty,
+                                data_types
+                            );
+
+                            match constant_oomir {
+                                Ok(oomir_constant) => {
+                                    println!(
+                                        "Info: Successfully read constant value from memory: {:?}",
+                                        oomir_constant
+                                    );
+                                    return oomir::Operand::Constant(oomir_constant)
+                                }
+                                Err(e) => {
+                                    println!(
+                                        "Warning: Failed to read constant value from memory for allocation {:?}. Error: {:?}",
+                                        alloc_id, e
+                                    );
+                                    return oomir::Operand::Constant(oomir::Constant::I32(-1))
+                                }
+                            }*/
 
                             // Determine the range to read
                             let size = allocation.size();
@@ -314,7 +298,7 @@ pub fn handle_const_value<'tcx>(
                                                                         let len = len_scalar
                                                                             .to_target_isize(tcx);
 
-                                                                        // Get AllocId and offset from the *inner* data pointer
+                                                                        // Get AllocId and offset from the inner data pointer
                                                                         let final_alloc_id =
                                                                             data_ptr
                                                                                 .provenance
@@ -322,8 +306,8 @@ pub fn handle_const_value<'tcx>(
                                                                         let (_, final_offset) =
                                                                             data_ptr.into_parts();
 
-                                                                        // Get the *final* allocation containing the string bytes
-                                                                        match tcx.global_alloc(final_alloc_id) {
+                                                                        // Get the final allocation containing the string bytes
+                                                                        match tcx.global_alloc(final_alloc_id.get_alloc_id().unwrap()) {
                                                                             rustc_middle::mir::interpret::GlobalAlloc::Memory(final_const_alloc) => {
                                                                                 let final_alloc = final_const_alloc.inner();
                                                                                 let start_byte = final_offset.bytes_usize();
@@ -364,7 +348,7 @@ pub fn handle_const_value<'tcx>(
                                                                             }
                                                                         }
                                                                     }
-                                                                    // Error handling for reading scalars for *this element*
+                                                                    // Error handling for reading scalars for this element
                                                                     (Err(e), _) => {
                                                                         println!(
                                                                             "Error reading inner string data pointer scalar (idx {}) from allocation {:?}: {:?}",
@@ -483,192 +467,465 @@ pub fn handle_const_value<'tcx>(
                                         }
                                     } else if inner_ty.is_ref() {
                                         println!(
-                                            "Info: Scalar::Ptr points to Ref-to-Ref type {:?}. Attempting to read inner fat pointer.",
-                                            ty // The original type, like &&str
+                                            "Info: Scalar::Ptr points to Ref-to-Ref type {:?}. Reading inner pointer.",
+                                            ty // The original type, like &&u8 or &&str
                                         );
 
-                                        // Get the type of the *inner* reference (e.g., &str)
-                                        let inner_ref_ty = *inner_ty; // inner_ty is the &str from &&str
+                                        // Get the type of the inner reference (e.g., &u8 or &str)
+                                        let inner_ref_ty = *inner_ty;
 
-                                        // *** Check if the *next* inner type is str ***
-                                        // We expect inner_ref_ty to be a Ref itself.
-                                        if let TyKind::Ref(_, next_inner_ty, _) =
-                                            inner_ref_ty.kind()
-                                        {
-                                            if !next_inner_ty.is_str() {
+                                        // Get the type of the innermost value (e.g., u8 or str)
+                                        let next_inner_ty = match inner_ref_ty.kind() {
+                                            TyKind::Ref(_, ty, _) => *ty,
+                                            _ => {
+                                                // This case should technically not be reachable if inner_ty.is_ref() was true
                                                 println!(
-                                                    "Warning: Scalar::Ptr points to Ref-to-Ref, but the innermost type {:?} is not str. Type was {:?}.",
-                                                    next_inner_ty, ty
+                                                    "Warning: Inner type {:?} of Ref-to-Ref was not itself a Ref? Original type: {:?}",
+                                                    inner_ref_ty, ty
                                                 );
                                                 return oomir::Operand::Constant(
-                                                    oomir::Constant::I64(-11),
-                                                ); // Indicate wrong inner type
+                                                    oomir::Constant::I64(-20),
+                                                ); // Indicate unexpected type structure
                                             }
-                                            // Proceed, we expect &&str layout
-                                        } else {
-                                            // This shouldn't happen if inner_ty.is_ref() was true, but safety check.
-                                            println!(
-                                                "Warning: Scalar::Ptr points to Ref-to-Ref, but inner type {:?} is not a Ref itself? Type was {:?}.",
-                                                inner_ref_ty, ty
-                                            );
-                                            return oomir::Operand::Constant(oomir::Constant::I64(
-                                                -12,
-                                            ));
-                                        }
+                                        };
 
-                                        // *** Start copied/adapted logic from the array case ***
+                                        // Read the inner pointer scalar from the current allocation (`allocation`)
+                                        let pointer_size = tcx.data_layout.pointer_size;
+                                        let inner_ptr_range = AllocRange {
+                                            start: rustc_abi::Size::ZERO,
+                                            size: pointer_size,
+                                        };
+                                        let inner_ptr_scalar_res = allocation.read_scalar(
+                                            &tcx.data_layout,
+                                            inner_ptr_range,
+                                            true, // Read provenance, we need the AllocId
+                                        );
 
-                                        // Get layout of the inner reference type (&str)
-                                        let typing_env = TypingEnv::fully_monomorphized();
-                                        match tcx.layout_of(PseudoCanonicalInput {
-                                            typing_env: typing_env,
-                                            value: inner_ref_ty, // Get layout of &str
-                                        }) {
-                                            Ok(inner_ref_layout) => {
-                                                // Sanity check: layout should be a fat pointer
-                                                let pointer_size = tcx.data_layout.pointer_size;
-                                                let expected_size = pointer_size
-                                                    .checked_mul(2, &tcx.data_layout)
-                                                    .expect("Pointer size * 2 overflowed");
+                                        match inner_ptr_scalar_res {
+                                            Ok(Scalar::Ptr(inner_ptr, _)) => {
+                                                // Successfully read the inner pointer. Now find where it points.
+                                                let (final_alloc_id, final_offset) =
+                                                    inner_ptr.into_parts(); // Get AllocId and offset
 
-                                                if inner_ref_layout.is_unsized()
-                                                    || inner_ref_layout.size != expected_size
-                                                {
-                                                    println!(
-                                                        "Warning: Layout of inner ref type {:?} doesn't look like a fat pointer (&str). Size: {:?}, Expected: {:?}. Original type was {:?}.",
-                                                        inner_ref_ty,
-                                                        inner_ref_layout.size,
-                                                        expected_size,
-                                                        ty
-                                                    );
-                                                    return oomir::Operand::Constant(
-                                                        oomir::Constant::I64(-8),
-                                                    ); // Indicate layout error
-                                                }
+                                                // Get the final allocation containing the actual value (e.g., the u8)
+                                                match tcx.global_alloc(
+                                                    final_alloc_id.get_alloc_id().unwrap(),
+                                                ) {
+                                                    GlobalAlloc::Memory(final_const_alloc) => {
+                                                        let final_alloc = final_const_alloc.inner();
 
-                                                // Read the fat pointer parts from the *current* allocation
-                                                // Read the data pointer part
-                                                let data_ptr_range = AllocRange {
-                                                    start: rustc_abi::Size::ZERO, // Start at the beginning
-                                                    size: pointer_size,
-                                                };
-                                                let data_ptr_scalar_res = allocation.read_scalar(
-                                                    &tcx.data_layout,
-                                                    data_ptr_range,
-                                                    true, // Read provenance
-                                                );
+                                                        // Determine the layout (size) of the innermost type (e.g., u8)
+                                                        match tcx.layout_of(PseudoCanonicalInput {
+                                                            typing_env:
+                                                                TypingEnv::fully_monomorphized(),
+                                                            value: inner_ref_ty, // Get layout of &str
+                                                        }) {
+                                                            Ok(final_layout) => {
+                                                                if next_inner_ty.is_str() {
+                                                                    // It's actually &&str
+                                                                    // We need the length too, which requires reading the fat pointer from the first allocation
+                                                                    println!(
+                                                                        "Info: Detected &&str, reading fat pointer from initial allocation."
+                                                                    );
 
-                                                // Read the length part
-                                                let len_range = AllocRange {
-                                                    start: pointer_size, // Offset by pointer size
-                                                    size: pointer_size,
-                                                };
-                                                let len_scalar_res = allocation.read_scalar(
-                                                    &tcx.data_layout,
-                                                    len_range,
-                                                    false, // No provenance for len
-                                                );
+                                                                    // Read the length part from the first allocation
+                                                                    let len_range = AllocRange {
+                                                                        start: pointer_size,
+                                                                        size: pointer_size,
+                                                                    };
+                                                                    let len_scalar_res = allocation
+                                                                        .read_scalar(
+                                                                            &tcx.data_layout,
+                                                                            len_range,
+                                                                            false,
+                                                                        );
 
-                                                match (data_ptr_scalar_res, len_scalar_res) {
-                                                    (
-                                                        Ok(Scalar::Ptr(data_ptr, _)),
-                                                        Ok(Scalar::Int(len_scalar)),
-                                                    ) => {
-                                                        let len = len_scalar.to_target_usize(tcx); // Use usize directly
+                                                                    match len_scalar_res {
+                                                                        Ok(Scalar::Int(
+                                                                            len_scalar,
+                                                                        )) => {
+                                                                            let len = len_scalar
+                                                                                .to_target_usize(
+                                                                                    tcx,
+                                                                                );
+                                                                            let start_byte =
+                                                                                final_offset
+                                                                                    .bytes_usize();
 
-                                                        // Get AllocId and offset from the *inner* data pointer
-                                                        let final_alloc_id =
-                                                            data_ptr.provenance.alloc_id();
-                                                        let (_, final_offset) =
-                                                            data_ptr.into_parts(); // offset within final_alloc
-
-                                                        // Get the *final* allocation containing the string bytes
-                                                        match tcx.global_alloc(final_alloc_id) {
-                                                        rustc_middle::mir::interpret::GlobalAlloc::Memory(final_const_alloc) => {
-                                                            let final_alloc = final_const_alloc.inner();
-                                                            let start_byte = final_offset.bytes_usize();
-
-                                                            // Use checked_add for length calculation
-                                                            if let Some(end_byte) = start_byte.checked_add(len as usize) {
-                                                                // Bounds check
-                                                                if end_byte <= final_alloc.size().bytes_usize() {
-                                                                    let final_range = start_byte..end_byte;
-                                                                    // Read the final bytes
-                                                                    let final_bytes = final_alloc.inspect_with_uninit_and_ptr_outside_interpreter(final_range);
-
-                                                                    // Convert to string
-                                                                    match String::from_utf8(final_bytes.to_vec()) {
-                                                                        Ok(s) => {
-                                                                            println!("Info: Successfully extracted string const from &&str indirection: \"{}\"", s);
-                                                                            oomir::Operand::Constant(oomir::Constant::String(s))
+                                                                            if let Some(end_byte) =
+                                                                                start_byte
+                                                                                    .checked_add(
+                                                                                    len as usize,
+                                                                                )
+                                                                            {
+                                                                                if end_byte <= final_alloc.size().bytes_usize() {
+                                                                                        let final_range = start_byte..end_byte;
+                                                                                        let final_bytes = final_alloc.inspect_with_uninit_and_ptr_outside_interpreter(final_range);
+                                                                                        match String::from_utf8(final_bytes.to_vec()) {
+                                                                                            Ok(s) => {
+                                                                                                 println!("Info: Successfully extracted string const from &&str indirection: \"{}\"", s);
+                                                                                                 return oomir::Operand::Constant(oomir::Constant::String(s));
+                                                                                            }
+                                                                                            Err(e) => {
+                                                                                                println!("Warning: Final string bytes from allocation {:?} (via &&str) were not valid UTF-8: {}", final_alloc_id, e);
+                                                                                                return oomir::Operand::Constant(oomir::Constant::String("Invalid UTF8 (Inner)".to_string()));
+                                                                                            }
+                                                                                        }
+                                                                                     } else { /* bounds error */ return oomir::Operand::Constant(oomir::Constant::I64(-9)); }
+                                                                            } else {
+                                                                                /* overflow error */
+                                                                                return oomir::Operand::Constant(oomir::Constant::I64(-10));
+                                                                            }
                                                                         }
                                                                         Err(e) => {
-                                                                            println!("Warning: Final string bytes from allocation {:?} (via &&str) were not valid UTF-8: {}", final_alloc_id, e);
-                                                                            oomir::Operand::Constant(oomir::Constant::String("Invalid UTF8 (Inner)".to_string()))
+                                                                            println!(
+                                                                                "Error reading length scalar for &&str: {:?}",
+                                                                                e
+                                                                            );
+                                                                            return oomir::Operand::Constant(oomir::Constant::I64(-13));
+                                                                        }
+                                                                        Ok(_) => {
+                                                                            println!(
+                                                                                "Warning: Expected Int scalar for &&str length, got something else."
+                                                                            );
+                                                                            return oomir::Operand::Constant(oomir::Constant::I64(-14));
                                                                         }
                                                                     }
                                                                 } else {
-                                                                    println!("Warning: Calculated string slice range {}..{} (via &&str) out of bounds for allocation {:?} size {}", start_byte, end_byte, final_alloc_id, final_alloc.size().bytes());
-                                                                    oomir::Operand::Constant(oomir::Constant::I64(-9)) // Indicate bounds error
+                                                                    // It's a sized type (like u8, i32, bool, etc.)
+
+                                                                    // Get the allocation size
+                                                                    let alloc_size =
+                                                                        final_alloc.size();
+                                                                    // Get the starting offset in bytes
+                                                                    let start_offset_bytes =
+                                                                        final_offset.bytes_usize();
+
+                                                                    // Calculate the number of bytes *actually available* in the allocation
+                                                                    // starting from the offset.
+                                                                    let available_bytes_count =
+                                                                        alloc_size
+                                                                            .bytes_usize()
+                                                                            .saturating_sub(
+                                                                                start_offset_bytes,
+                                                                            );
+
+                                                                    // Determine the number of bytes to read. This should correspond
+                                                                    // to the intrinsic size of the type, which is reflected in the
+                                                                    // available bytes in the allocation for this constant.
+                                                                    // We previously got final_layout.size which was potentially too large (8).
+                                                                    // Let's trust the available_bytes_count if it's smaller than the layout size,
+                                                                    // but also sanity check against the layout size if available_bytes_count seems too large.
+                                                                    // For primitives like u8, the available_bytes_count (1) should be correct.
+
+                                                                    // Ensure we don't try to read zero bytes if offset is at the end
+                                                                    if available_bytes_count == 0 {
+                                                                        println!(
+                                                                            "Warning: Calculated available bytes is zero. Offset: {:?}, Alloc size: {:?}, Type: {:?}",
+                                                                            final_offset,
+                                                                            alloc_size,
+                                                                            next_inner_ty
+                                                                        );
+                                                                        return oomir::Operand::Constant(oomir::Constant::I64(-31)); // Indicate zero available bytes error
+                                                                    }
+
+                                                                    // Calculate the end offset for the read operation
+                                                                    let end_offset_bytes =
+                                                                        start_offset_bytes
+                                                                            + available_bytes_count;
+
+                                                                    // Define the range based *only* on available bytes in this specific allocation
+                                                                    let final_range_to_read =
+                                                                        start_offset_bytes
+                                                                            ..end_offset_bytes;
+
+                                                                    let final_size =
+                                                                        end_offset_bytes
+                                                                            - start_offset_bytes;
+
+                                                                    println!(
+                                                                        "Debug: Reading final value for type {:?}. \
+                         Final Alloc ID: {:?}, Offset: {} bytes, Alloc Size: {} bytes, \
+                         Available Bytes: {}, Reading Range: {:?}",
+                                                                        next_inner_ty,
+                                                                        final_alloc_id,
+                                                                        start_offset_bytes,
+                                                                        alloc_size.bytes(),
+                                                                        available_bytes_count,
+                                                                        final_range_to_read
+                                                                    );
+
+                                                                    // Read the raw bytes using the calculated range based on available data
+                                                                    let final_bytes = final_alloc.inspect_with_uninit_and_ptr_outside_interpreter(
+                       final_range_to_read // Use the safe range
+                    );
+
+                                                                    // We expect only `final_size` bytes (e.g., 1 byte for u8)
+                                                                    if final_bytes.len()
+                                                                        != final_size
+                                                                    {
+                                                                        println!(
+                                                                            "Warning: Read {} bytes via get_bytes, but expected size was {}. Type: {:?}",
+                                                                            final_bytes.len(),
+                                                                            final_size,
+                                                                            next_inner_ty
+                                                                        );
+                                                                        // Decide how to handle this size mismatch - maybe proceed if enough bytes?
+                                                                        // For now, let's return an error placeholder.
+                                                                        return oomir::Operand::Constant(oomir::Constant::I64(-30)); // Indicate size mismatch error
+                                                                    }
+
+                                                                    println!(
+                                                                        "Info: Read raw bytes {:?} for type {:?} via Ref-to-Ref.",
+                                                                        final_bytes, next_inner_ty
+                                                                    );
+
+                                                                    // Determine the expected size based on the type's layout
+                                                                    let expected_size =
+                                                                        final_layout.size; // Use the size from layout_of
+
+                                                                    // Convert raw bytes back to a standard Rust integer type first,
+                                                                    // handling endianness and size.
+                                                                    // Convert raw bytes back to a standard Rust integer type first,
+                                                                    // handling endianness and size.
+                                                                    let scalar_int_res: Result<ScalarInt, String> = match next_inner_ty.kind() {
+                        // Unsigned Integers
+                        TyKind::Uint(uty) => {
+                            // Determine the intrinsic size based on the type
+                            let intrinsic_size = Size::from_bytes(match uty {
+                                UintTy::U8 => 1,
+                                UintTy::U16 => 2,
+                                UintTy::U32 => 4,
+                                UintTy::Usize => expected_size.bytes(), // Use layout size for usize
+                                UintTy::U64 => 8,
+                                UintTy::U128 => 16,
+                            });
+                            // Size check performed by try_into inside match arms
+                            let value_res: Result<u128, String> = match uty {
+                                UintTy::U8 => final_bytes.try_into().map(u8::from_le_bytes).map(|v| v as u128)
+                                    .map_err(|_| "Slice to [u8; 1] failed for U8".to_string()),
+                                UintTy::U16 => final_bytes.try_into().map(u16::from_le_bytes).map(|v| v as u128)
+                                    .map_err(|_| "Slice to [u8; 2] failed for U16".to_string()),
+                                UintTy::U32 => final_bytes.try_into().map(u32::from_le_bytes).map(|v| v as u128)
+                                    .map_err(|_| "Slice to [u8; 4] failed for U32".to_string()),
+                                UintTy::Usize => {
+                                    // Determine expected size for usize conversion
+                                    if expected_size.bytes() == 8 {
+                                        final_bytes.try_into().map(u64::from_le_bytes).map(|v| v as u128)
+                                           .map_err(|_| "Slice to [u8; 8] failed for Usize(64)".to_string())
+                                    } else if expected_size.bytes() == 4 {
+                                        final_bytes.try_into().map(u32::from_le_bytes).map(|v| v as u128)
+                                            .map_err(|_| "Slice to [u8; 4] failed for Usize(32)".to_string())
+                                    } else {
+                                         Err(format!("Unexpected size {} for Usize", expected_size.bytes()))
+                                    }
+                                }
+                                UintTy::U64 => final_bytes.try_into().map(u64::from_le_bytes).map(|v| v as u128)
+                                    .map_err(|_| "Slice to [u8; 8] failed for U64".to_string()),
+                                UintTy::U128 => final_bytes.try_into().map(u128::from_le_bytes)
+                                    .map_err(|_| "Slice to [u8; 16] failed for U128".to_string()),
+
+                            };
+                            value_res.and_then(|value| {
+                                ScalarInt::try_from_uint(value, intrinsic_size)
+                                    .ok_or_else(|| format!("ScalarInt::try_from_uint failed for {:?} value {} size {}", uty, value, intrinsic_size.bytes()))
+                            })
+                        }
+                        // Signed Integers
+                        TyKind::Int(ity) => {
+                            // Determine the intrinsic size based on the type
+                            let intrinsic_size = Size::from_bytes(match ity {
+                                IntTy::I8 => 1,
+                                IntTy::I16 => 2,
+                                IntTy::I32 => 4,
+                                IntTy::Isize => expected_size.bytes(), // Use layout size for isize
+                                IntTy::I64 => 8,
+                                IntTy::I128 => 16,
+                            });
+                            let value_res: Result<i128, String> = match ity {
+                                 IntTy::I8 => final_bytes.try_into().map(i8::from_le_bytes).map(|v| v as i128)
+                                    .map_err(|_| "Slice to [u8; 1] failed for I8".to_string()),
+                                IntTy::I16 => final_bytes.try_into().map(i16::from_le_bytes).map(|v| v as i128)
+                                    .map_err(|_| "Slice to [u8; 2] failed for I16".to_string()),
+                                IntTy::I32 => final_bytes.try_into().map(i32::from_le_bytes).map(|v| v as i128)
+                                    .map_err(|_| "Slice to [u8; 4] failed for I32".to_string()),
+                                IntTy::Isize => {
+                                     if expected_size.bytes() == 8 {
+                                        final_bytes.try_into().map(i64::from_le_bytes).map(|v| v as i128)
+                                            .map_err(|_| "Slice to [u8; 8] failed for Isize(64)".to_string())
+                                    } else if expected_size.bytes() == 4 {
+                                        final_bytes.try_into().map(i32::from_le_bytes).map(|v| v as i128)
+                                            .map_err(|_| "Slice to [u8; 4] failed for Isize(32)".to_string())
+                                    } else {
+                                         Err(format!("Unexpected size {} for Isize", expected_size.bytes()))
+                                    }
+                                }
+                                IntTy::I64 => final_bytes.try_into().map(i64::from_le_bytes).map(|v| v as i128)
+                                    .map_err(|_| "Slice to [u8; 8] failed for I64".to_string()),
+                                IntTy::I128 => final_bytes.try_into().map(i128::from_le_bytes)
+                                    .map_err(|_| "Slice to [u8; 16] failed for I128".to_string()),
+                            };
+                            value_res.and_then(|value| {
+                                ScalarInt::try_from_int(value, intrinsic_size)
+                                    .ok_or_else(|| format!("ScalarInt::try_from_int failed for {:?} value {} size {}", ity, value, intrinsic_size.bytes()))
+                            })
+                        }
+                        // Bool (usually stored as u8)
+                        TyKind::Bool => {
+                            final_bytes.try_into().map(u8::from_le_bytes).map_err(|_| "Slice to [u8; 1] failed for Bool".to_string())
+                                .and_then(|value| {
+                                    ScalarInt::try_from_uint(value as u128, expected_size)
+                                         .ok_or_else(|| format!("ScalarInt::try_from_uint failed for Bool value {}", value))
+                                })
+                        }
+                        // Char (usually stored as u32)
+                        TyKind::Char => {
+                            final_bytes.try_into().map(u32::from_le_bytes).map_err(|_| "Slice to [u8; 4] failed for Char".to_string())
+                                .and_then(|value| {
+                                    ScalarInt::try_from_uint(value as u128, expected_size)
+                                         .ok_or_else(|| format!("ScalarInt::try_from_uint failed for Char value {}", value))
+                                })
+                        }
+                        // Floats (store their bits as integers)
+                        TyKind::Float(fty) => {
+                             let bits_res: Result<u128, String> = match fty {
+                                FloatTy::F16 => final_bytes.try_into().map(u16::from_le_bytes).map(|v| v as u128)
+                                    .map_err(|_| "Slice to [u8; 2] failed for F16".to_string()),
+                                FloatTy::F32 => final_bytes.try_into().map(u32::from_le_bytes).map(|v| v as u128)
+                                    .map_err(|_| "Slice to [u8; 4] failed for F32".to_string()),
+                                FloatTy::F64 => final_bytes.try_into().map(u64::from_le_bytes).map(|v| v as u128)
+                                    .map_err(|_| "Slice to [u8; 8] failed for F64".to_string()),
+                                FloatTy::F128 => final_bytes.try_into().map(u128::from_le_bytes).map(|v| v as u128)
+                                .map_err(|_| "Slice to [u8; 16] failed for F128".to_string()),
+                            };
+                            bits_res.and_then(|bits_value| {
+                                ScalarInt::try_from_uint(bits_value, expected_size)
+                                    .ok_or_else(|| format!("ScalarInt::try_from_uint failed for {:?} bits {}", fty, bits_value))
+                            })
+                        }
+                        TyKind::Str => {
+                            // Handle str as a special case, usually stored as u8
+                            final_bytes.try_into().map(u8::from_le_bytes).map_err(|_| "Slice to [u8; 1] failed for Str".to_string())
+                                .and_then(|value| {
+                                    ScalarInt::try_from_uint(value as u128, expected_size)
+                                         .ok_or_else(|| format!("ScalarInt::try_from_uint failed for Str value {}", value))
+                                })
+                        }
+                        // Other types?
+                        _ => Err(format!("Cannot create ScalarInt from raw bytes for unexpected type: {:?}", next_inner_ty)),
+                    };
+
+                                                                    // Handle the result of creating ScalarInt
+                                                                    match scalar_int_res {
+                                                                        Ok(scalar_int) => {
+                                                                            // Use the helper function to convert ScalarInt to OOMIR constant
+                                                                            let oomir_const = scalar_int_to_oomir_constant(scalar_int, &next_inner_ty);
+                                                                            return oomir::Operand::Constant(oomir_const);
+                                                                        }
+                                                                        Err(e) => {
+                                                                            println!(
+                                                                                "Error creating ScalarInt from bytes for type {:?}: {}",
+                                                                                next_inner_ty, e
+                                                                            );
+                                                                            return oomir::Operand::Constant(oomir::Constant::I64(-33)); // Indicate ScalarInt creation error
+                                                                        }
+                                                                    }
                                                                 }
-                                                            } else {
-                                                                println!("Warning: String slice length calculation overflowed (via &&str)");
-                                                                 oomir::Operand::Constant(oomir::Constant::I64(-10)) // Indicate overflow
+                                                            }
+                                                            Err(e) => {
+                                                                println!(
+                                                                    "Error getting layout for innermost type {:?}: {:?}",
+                                                                    next_inner_ty, e
+                                                                );
+                                                                return oomir::Operand::Constant(
+                                                                    oomir::Constant::I64(-15),
+                                                                ); // Indicate layout error
                                                             }
                                                         }
-                                                        _ => {
-                                                            println!("Warning: Inner string pointer {:?} (via &&str) points to unexpected GlobalAlloc kind {:?}", data_ptr, tcx.global_alloc(final_alloc_id));
-                                                            oomir::Operand::Constant(oomir::Constant::I64(-11)) // Indicate wrong alloc kind
-                                                        }
                                                     }
-                                                    }
-                                                    // Error handling for reading scalars
-                                                    (Err(e), _) => {
+                                                    _ => {
                                                         println!(
-                                                            "Error reading inner string data pointer scalar (via &&str) from allocation {:?}: {:?}",
-                                                            alloc_id, e
+                                                            "Warning: Inner pointer {:?} (via Ref-to-Ref) points to unexpected GlobalAlloc kind {:?}",
+                                                            inner_ptr,
+                                                            tcx.global_alloc(
+                                                                final_alloc_id
+                                                                    .get_alloc_id()
+                                                                    .unwrap()
+                                                            )
                                                         );
-                                                        oomir::Operand::Constant(
-                                                            oomir::Constant::I64(-12),
-                                                        )
-                                                    }
-                                                    (_, Err(e)) => {
-                                                        println!(
-                                                            "Error reading inner string length scalar (via &&str) from allocation {:?}: {:?}",
-                                                            alloc_id, e
-                                                        );
-                                                        oomir::Operand::Constant(
-                                                            oomir::Constant::I64(-13),
-                                                        )
-                                                    }
-                                                    (Ok(data), Ok(len)) => {
-                                                        println!(
-                                                            "Warning: Read unexpected scalar types for fat pointer (via &&str). Data: {:?}, Len: {:?}",
-                                                            data, len
-                                                        );
-                                                        oomir::Operand::Constant(
-                                                            oomir::Constant::I64(-14),
-                                                        )
+                                                        return oomir::Operand::Constant(
+                                                            oomir::Constant::I64(-11),
+                                                        ); // Indicate wrong alloc kind
                                                     }
                                                 }
                                             }
+                                            // Error handling for reading the inner pointer itself
                                             Err(e) => {
                                                 println!(
-                                                    "Error getting layout for inner ref type {:?} (from original {:?}): {:?}",
-                                                    inner_ref_ty, ty, e
+                                                    "Error reading inner pointer scalar (for Ref-to-Ref) from allocation {:?}: {:?}",
+                                                    alloc_id, e
                                                 );
-                                                oomir::Operand::Constant(oomir::Constant::I64(-15)) // Indicate layout error
+                                                return oomir::Operand::Constant(
+                                                    oomir::Constant::I64(-12),
+                                                );
+                                            }
+                                            Ok(other_scalar) => {
+                                                println!(
+                                                    "Warning: Expected inner pointer (Scalar::Ptr) when handling Ref-to-Ref, but got {:?}.",
+                                                    other_scalar
+                                                );
+                                                return oomir::Operand::Constant(
+                                                    oomir::Constant::I64(-25),
+                                                ); // Indicate unexpected scalar type for inner ptr
                                             }
                                         }
-                                        // *** End copied/adapted logic ***
-                                    } else {
-                                        // Inner type of the Ref is not an Array or str
+                                    } else if inner_ty.is_adt() {
+                                        /*let _ = inner_ty.ty_adt_def().expect("ADT type should have ADT def");
+                                        let _ = match inner_ty.kind() {
+                                            TyKind::Adt(_, substs) => substs,
+                                            _ => panic!("Expected ADT type"),
+                                        };*/
+
                                         println!(
-                                            "Warning: Scalar::Ptr points to Ref to non-Array and non-str type {:?}. Not a recognized pattern.",
+                                            "Info: Handling Ref-to-ADT {:?}. Reading constant data from allocation {:?}.",
+                                            inner_ty, alloc_id
+                                        );
+
+                                        // We need a way to read the constant value from the allocation based on its type.
+                                        // This often involves recursion, so let's define a helper function.
+                                        // The initial call uses the `pointer.offset` as the starting point within the `allocation`.
+                                        match read_constant_value_from_memory(
+                                            tcx,
+                                            allocation,
+                                            pointer.into_parts().1,
+                                            *inner_ty,
+                                            data_types,
+                                        ) {
+                                            Ok(oomir_const) => {
+                                                // Successfully read the constant ADT value
+                                                println!(
+                                                    "Info: Successfully extracted constant ADT: {:?}",
+                                                    oomir_const
+                                                );
+                                                oomir::Operand::Constant(oomir_const)
+                                            }
+                                            Err(e) => {
+                                                println!(
+                                                    "Error: Failed to read constant ADT of type {:?} from allocation {:?}: {}",
+                                                    inner_ty, alloc_id, e
+                                                );
+                                                // Return an error placeholder or panic, depending on desired robustness
+                                                oomir::Operand::Constant(oomir::Constant::I64(-50)) // Placeholder for ADT read error
+                                            }
+                                        }
+                                    } else {
+                                        // Inner type of the Ref is not an Array, str, ADT or another Ref
+                                        println!(
+                                            "Warning: Scalar::Ptr points to Ref to non-Array, non-str, non-Ref, non-ADT type {:?}. Not a recognized pattern.",
                                             inner_ty
                                         );
                                         // Fall through to default handling or return specific error
-                                        oomir::Operand::Constant(oomir::Constant::I64(-7)) // Indicate not ref-to-array or str
+                                        oomir::Operand::Constant(oomir::Constant::I64(-7)) // Indicate not ref-to-array or str or ref
                                     }
                                 }
                                 _ => {
@@ -790,5 +1047,51 @@ pub fn extract_number_from_operand(operand: oomir::Operand) -> Option<i64> {
             _ => None,
         },
         oomir::Operand::Variable { .. } => None, // can't be known at compiletime
+    }
+}
+
+/// Converts a Rust MIR Scalar::Int into the appropriate OOMIR Constant based on the type.
+fn scalar_int_to_oomir_constant(scalar_int: ScalarInt, ty: &Ty<'_>) -> oomir::Constant {
+    match ty.kind() {
+        TyKind::Int(int_ty) => match int_ty {
+            IntTy::I8 => oomir::Constant::I8(scalar_int.to_i8() as i8),
+            IntTy::I16 => oomir::Constant::I16(scalar_int.to_i16() as i16),
+            IntTy::I32 => oomir::Constant::I32(scalar_int.to_i32() as i32),
+            IntTy::Isize => oomir::Constant::I32(scalar_int.to_i64() as i32), // JVM usize -> i32
+            IntTy::I64 => oomir::Constant::I64(scalar_int.to_i64()),
+            IntTy::I128 => oomir::Constant::Class("java/lang/BigInteger".into()),
+        },
+        TyKind::Uint(uint_ty) => match uint_ty {
+            UintTy::U8 => oomir::Constant::I16(scalar_int.to_u8() as i16), // Widen to cover range
+            UintTy::U16 => oomir::Constant::I32(scalar_int.to_u16() as i32), // Widen
+            UintTy::U32 => oomir::Constant::I64(scalar_int.to_u32() as i64), // Widen
+            UintTy::Usize => oomir::Constant::I32(scalar_int.to_u64() as i32), // JVM usize -> i32
+            UintTy::U64 | UintTy::U128 => oomir::Constant::Class("java/lang/BigInteger".into()),
+        },
+        TyKind::Bool => {
+            let val = scalar_int.try_to_bool().unwrap_or(false);
+            oomir::Constant::Boolean(val)
+        }
+        TyKind::Char => {
+            let val = char::from_u32(scalar_int.to_u32()).unwrap_or('\0');
+            oomir::Constant::Char(val)
+        }
+        TyKind::Float(float_ty) => match float_ty {
+            FloatTy::F16 => {
+                // F16 is not directly supported in OOMIR, so we convert to F32
+                let val = f32::from_bits(scalar_int.to_u16() as u32);
+                oomir::Constant::F32(val)
+            }
+            FloatTy::F32 => oomir::Constant::F32(f32::from_bits(scalar_int.to_u32())),
+            FloatTy::F64 => oomir::Constant::F64(f64::from_bits(scalar_int.to_u64())),
+            FloatTy::F128 => oomir::Constant::Class("java/lang/BigDecimal".into()), // F128 is not directly supported
+        },
+        TyKind::Str => {
+            let val = scalar_int.to_u32();
+            oomir::Constant::String(val.to_string())
+        }
+        _ => {
+            panic!("Unsupported type for ScalarInt conversion: {:?}", ty);
+        }
     }
 }

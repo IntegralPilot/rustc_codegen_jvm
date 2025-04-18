@@ -2,7 +2,7 @@ use super::{
     consts::{get_int_const_instr, load_constant},
     helpers::{
         get_cast_instructions, get_load_instruction, get_operand_type, get_store_instruction,
-        get_type_size,
+        get_type_size, parse_jvm_descriptor_params,
     },
     shim::get_shim_metadata,
 };
@@ -445,8 +445,12 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         // For types where a separate compare instruction is required (I64, F32, F64),
         // we emit that now.
         match op1_type {
-            // For I32 and Char, we can do a direct if_icmp? branch.
-            oomir::Type::I32 | oomir::Type::Char | oomir::Type::Boolean => {
+            // For I8->I32 and Char, we can do a direct if_icmp? branch.
+            oomir::Type::I8
+            | oomir::Type::I16
+            | oomir::Type::I32
+            | oomir::Type::Char
+            | oomir::Type::Boolean => {
                 branch_constructor = Box::new(|offset| match comp_op {
                     "eq" => Instruction::If_icmpeq(offset),
                     "ne" => Instruction::If_icmpne(offset),
@@ -1097,72 +1101,138 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                         if let Some(shim_info) = shim_map.get(function_name) {
                             handled_as_shim = true;
 
-                            // 1. Load arguments
-                            for arg in args {
-                                self.load_call_argument(arg)?; // Use helper to handle references properly
+                            let shim_descriptor = Some(shim_info.descriptor.clone()); // Store descriptor
+
+                            // --- Argument Loading with Boxing ---
+                            let expected_jvm_param_types = parse_jvm_descriptor_params(
+                                &shim_info.descriptor,
+                            )
+                            .map_err(|e| jvm::Error::VerificationError {
+                                context: format!("Function {}", self.oomir_func.name),
+                                message: format!("Error parsing shim descriptor: {}", e),
+                            })?;
+
+                            if args.len() != expected_jvm_param_types.len() {
+                                return Err(jvm::Error::VerificationError {
+                                    context: format!("Function {}", self.oomir_func.name),
+                                    message: format!(
+                                        "Shim argument count mismatch for '{}': descriptor '{}' expects {}, found {}",
+                                        function_name,
+                                        shim_info.descriptor,
+                                        expected_jvm_param_types.len(),
+                                        args.len()
+                                    ),
+                                });
                             }
 
-                            // 2. Add MethodRef
-                            // Convention: Class is always org/rustlang/core/Core
-                            let kotlin_shim_class = "org/rustlang/core/Core";
+                            for (arg_operand, expected_jvm_type) in
+                                args.iter().zip(expected_jvm_param_types.iter())
+                            {
+                                // 1. Get the OOMIR type of the argument being passed
+                                let provided_oomir_type = get_operand_type(arg_operand);
+
+                                // 2. Load the raw value onto the stack first
+                                self.load_call_argument(arg_operand)?; // Assumes this loads the primitive value correctly
+
+                                // 3. Check if boxing is needed: Expects Object, Got Primitive
+                                //    (Only boxing to java.lang.Object for now)
+                                if expected_jvm_type == "Ljava/lang/Object;"
+                                    && provided_oomir_type.is_jvm_primitive()
+                                {
+                                    // 4. Get boxing information
+                                    if let Some((wrapper_class, box_method, box_desc)) =
+                                        provided_oomir_type.get_boxing_info()
+                                    {
+                                        // 5. Add MethodRef for the boxing method (e.g., Integer.valueOf)
+                                        let class_index =
+                                            self.constant_pool.add_class(wrapper_class)?;
+                                        let method_ref_index = self.constant_pool.add_method_ref(
+                                            class_index,
+                                            box_method,
+                                            box_desc,
+                                        )?;
+                                        // 6. Add the invokestatic instruction for boxing
+                                        self.jvm_instructions
+                                            .push(JI::Invokestatic(method_ref_index));
+                                    } else {
+                                        // This indicates an internal error - we identified a primitive
+                                        // but don't know how to box it.
+                                        return Err(jvm::Error::VerificationError {
+                                            context: format!("Function {}", self.oomir_func.name),
+                                            message: format!(
+                                                "No boxing information found for type {:?}",
+                                                provided_oomir_type
+                                            ),
+                                        });
+                                    }
+                                } else if expected_jvm_type.starts_with('L')
+                                    && !expected_jvm_type.ends_with(';')
+                                {
+                                    // Basic sanity check for descriptor parsing
+                                    return Err(jvm::Error::VerificationError {
+                                        context: format!("Function {}", self.oomir_func.name),
+                                        message: format!(
+                                            "Invalid JVM descriptor for expected type: {}",
+                                            expected_jvm_type
+                                        ),
+                                    });
+                                }
+                                // Else: No boxing needed. The type is either already an object,
+                                // or the expected type is not Object (e.g., primitive expected, primitive provided).
+                            } // End loop over args
+
+                            // --- Continue with Shim Call Invocation ---
+
+                            // Add MethodRef for the actual shim function
+                            let kotlin_shim_class = "org/rustlang/core/Core"; // Or get from shim_info if varies
                             let class_index = self.constant_pool.add_class(kotlin_shim_class)?;
                             let method_ref_index = self.constant_pool.add_method_ref(
                                 class_index,
-                                function_name,         // The key IS the method name
-                                &shim_info.descriptor, // Use descriptor from JSON
+                                function_name, // Use the original function name key
+                                &shim_info.descriptor, // Use the stored descriptor
                             )?;
 
-                            // 3. Add invoke instruction
+                            // Add invoke instruction
                             if shim_info.is_static {
                                 self.jvm_instructions
                                     .push(JI::Invokestatic(method_ref_index));
                             } else {
+                                // Handle non-static if needed, or keep error
                                 return Err(jvm::Error::VerificationError {
                                     context: format!("Function {}", self.oomir_func.name),
                                     message: format!(
-                                        "Non-static shim calls not yet supported ('{}')",
+                                        "Non-static shim function '{}' not supported",
                                         function_name
                                     ),
                                 });
                             }
 
-                            // Check for diverging
-                            // Currently hardcoded
+                            // Check for diverging (can use shim_info if available)
                             if function_name == "panic_fmt"
-                                || function_name == "core_panicking_panic"
-                                || function_name == "core_panicking_assert_failed"
+                                || function_name == "core_panic"
+                                || function_name == "core_assert_failed"
+                            // Or check shim_info.diverges
                             {
                                 is_diverging_call = true;
                             }
 
-                            // 4. Store result (logic remains similar, needs descriptor parsing)
-                            if !is_diverging_call && !shim_info.descriptor.ends_with(")V") {
+                            // Store result or pop (using the stored descriptor)
+                            let current_shim_descriptor = shim_descriptor.as_ref().unwrap(); // We know it's Some here
+                            if !is_diverging_call && !current_shim_descriptor.ends_with(")V") {
                                 if let Some(dest_var) = dest {
-                                    // Parse the return type from the descriptor
                                     let return_type = oomir::Type::from_jvm_descriptor_return_type(
-                                        &shim_info.descriptor,
+                                        current_shim_descriptor,
                                     );
                                     self.store_result(dest_var, &return_type)?;
                                 } else {
-                                    // Pop ignored result (needs size from descriptor)
                                     let return_type = oomir::Type::from_jvm_descriptor_return_type(
-                                        &shim_info.descriptor,
+                                        current_shim_descriptor,
                                     );
                                     match get_type_size(&return_type) {
+                                        // Assumes get_type_size works for OOMIR types
                                         1 => self.jvm_instructions.push(JI::Pop),
                                         2 => self.jvm_instructions.push(JI::Pop2),
-                                        _ => {
-                                            return Err(jvm::Error::VerificationError {
-                                                context: format!(
-                                                    "Function {}",
-                                                    self.oomir_func.name
-                                                ),
-                                                message: format!(
-                                                    "Unexpected return type size for shim '{}' from descriptor '{}'",
-                                                    function_name, shim_info.descriptor
-                                                ),
-                                            });
-                                        }
+                                        _ => { /* Error or ignore void/unhandled */ }
                                     }
                                 }
                             } else if dest.is_some()

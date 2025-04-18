@@ -335,3 +335,86 @@ pub fn are_types_jvm_compatible(src: &oomir::Type, dest: &oomir::Type) -> bool {
         _ => false,
     }
 }
+
+/// Parses a JVM method descriptor and returns the parameter types as a vector of strings.
+pub fn parse_jvm_descriptor_params(descriptor: &str) -> Result<Vec<String>, String> {
+    // 1. Find the '(' and the closing ')'
+    let start = descriptor
+        .find('(')
+        .ok_or_else(|| "Descriptor must start with '('".to_string())?;
+    let end = descriptor[start + 1..]
+        .find(')')
+        .ok_or_else(|| "Descriptor missing ')'".to_string())?
+        + start
+        + 1;
+    let params = &descriptor[start + 1..end];
+
+    let bytes = params.as_bytes();
+    let mut i = 0;
+    let mut out = Vec::new();
+
+    while i < bytes.len() {
+        let tok_start = i;
+        match bytes[i] as char {
+            // 2a. Primitive
+            'B' | 'C' | 'D' | 'F' | 'I' | 'J' | 'S' | 'Z' => {
+                i += 1;
+            }
+
+            // 2b. Object type
+            'L' => {
+                i += 1;
+                // scan until ';'
+                while i < bytes.len() && bytes[i] as char != ';' {
+                    i += 1;
+                }
+                if i == bytes.len() {
+                    return Err("Unterminated object type (missing `;`)".into());
+                }
+                i += 1; // include ';'
+            }
+
+            // 2c. Array: one or more '[' then a component descriptor
+            '[' => {
+                i += 1;
+                // multi-dimensional arrays
+                while i < bytes.len() && bytes[i] as char == '[' {
+                    i += 1;
+                }
+                if i == bytes.len() {
+                    return Err("Array type without component descriptor".into());
+                }
+                match bytes[i] as char {
+                    // primitive component
+                    'B' | 'C' | 'D' | 'F' | 'I' | 'J' | 'S' | 'Z' => {
+                        i += 1;
+                    }
+                    // object component
+                    'L' => {
+                        i += 1;
+                        while i < bytes.len() && bytes[i] as char != ';' {
+                            i += 1;
+                        }
+                        if i == bytes.len() {
+                            return Err("Unterminated object type in array".into());
+                        }
+                        i += 1;
+                    }
+                    other => {
+                        return Err(format!("Invalid array component descriptor '{}'", other));
+                    }
+                }
+            }
+
+            // anything else is invalid
+            other => {
+                return Err(format!("Invalid descriptor character '{}'", other));
+            }
+        }
+
+        // slice out the full token and push
+        out.push(params[tok_start..i].to_string());
+    }
+
+    Ok(out)
+}

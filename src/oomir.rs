@@ -270,6 +270,16 @@ pub enum Constant {
     Class(String),
     // 0 = the type of elements, 1 = the elements as a vec of constants
     Array(Box<Type>, Vec<Constant>),
+    /// Represents a constant instance of a struct or an enum variant.
+    /// For enums, `class_name` should be the specific variant's class name
+    /// (e.g., "MyEnum$VariantA").
+    Instance {
+        /// The fully qualified JVM class name (e.g., "MyStruct", "MyEnum$VariantA").
+        class_name: String,
+        /// The constant values of the fields, keyed by field name.
+        /// For enum variants using numbered fields, use "field0", "field1", etc.
+        fields: std::collections::HashMap<String, Constant>,
+    },
 }
 
 // Helper to check if a Constant is integer-like (needed for Switch)
@@ -284,8 +294,6 @@ impl Constant {
     }
 }
 
-// The unsigned types have been removed from this enum. The mapping is now handled in the conversion,
-// e.g. Constant::U8 is treated as a signed I16.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Type {
     Void,
@@ -444,6 +452,7 @@ impl Type {
             Constant::Char(_) => Type::Char,
             Constant::String(_) => Type::String,
             Constant::Class(name) => Type::Class(name.to_string()),
+            Constant::Instance { class_name, .. } => Type::Class(class_name.to_string()),
         }
     }
 
@@ -476,6 +485,22 @@ impl Type {
             self,
             Type::Reference(_) | Type::Array(_) | Type::String | Type::Class(_)
         )
+    }
+
+    /// If this is one of the primitive types that Java boxes,
+    /// returns (wrapper_class_internal_name, "valueOf", valueOf_descriptor).
+    /// Otherwise returns None.
+    pub fn get_boxing_info(&self) -> Option<(&'static str, &'static str, &'static str)> {
+        match self {
+            Type::I32 => Some(("java/lang/Integer", "valueOf", "(I)Ljava/lang/Integer;")),
+            Type::I16 => Some(("java/lang/Short", "valueOf", "(S)Ljava/lang/Short;")),
+            Type::I8 => Some(("java/lang/Byte", "valueOf", "(B)Ljava/lang/Byte;")),
+            Type::Boolean => Some(("java/lang/Boolean", "valueOf", "(Z)Ljava/lang/Boolean;")),
+            Type::I64 => Some(("java/lang/Long", "valueOf", "(J)Ljava/lang/Long;")),
+            Type::F32 => Some(("java/lang/Float", "valueOf", "(F)Ljava/lang/Float;")),
+            Type::F64 => Some(("java/lang/Double", "valueOf", "(D)Ljava/lang/Double;")),
+            _ => None,
+        }
     }
 }
 

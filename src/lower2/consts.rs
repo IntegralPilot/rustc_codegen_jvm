@@ -210,6 +210,49 @@ pub fn load_constant(
             }
             // Final stack state after loop: [arrayref] (the populated array)
         }
+        OC::Instance { class_name, fields } => {
+            // 1. Add Class reference to constant pool
+            let class_index = cp.add_class(class_name)?;
+
+            // 2. Add Method reference for the default constructor "<init>()V"
+            let constructor_ref_index = cp.add_method_ref(
+                class_index,
+                "<init>", // Standard name for constructors
+                "()V",    // Standard descriptor for default constructor
+            )?;
+
+            // 3. Emit 'new' instruction
+            instructions_to_add.push(JI::New(class_index)); // Stack: [uninitialized_ref]
+
+            // 4. Emit 'dup' instruction (One ref for init, one for field setting/result)
+            instructions_to_add.push(JI::Dup); // Stack: [uninitialized_ref, uninitialized_ref]
+
+            // 5. Emit 'invokespecial' to call the constructor
+            instructions_to_add.push(JI::Invokespecial(constructor_ref_index)); // Stack: [initialized_ref]
+
+            // 6. Iterate through fields to set them
+            for (field_name, field_value) in fields {
+                // a. Duplicate the object reference (needed for putfield)
+                instructions_to_add.push(JI::Dup); // Stack: [initialized_ref, initialized_ref]
+
+                // b. Load the field's value onto the stack (using recursion into a temp vec)
+                let mut field_value_instructions = Vec::new();
+                load_constant(&mut field_value_instructions, cp, field_value)?;
+                instructions_to_add.extend(field_value_instructions);
+                // Stack: [initialized_ref, initialized_ref, field_value] (size 1 or 2)
+
+                // c. Add Field reference
+                let field_type = Type::from_constant(field_value);
+                let field_descriptor = field_type.to_jvm_descriptor();
+                let field_ref_index =
+                    cp.add_field_ref(class_index, field_name, &field_descriptor)?;
+
+                // d. Emit 'putfield'
+                instructions_to_add.push(JI::Putfield(field_ref_index));
+                // Stack: [initialized_ref] (putfield consumes the top ref and the value)
+            }
+            // After the loop, the final initialized_ref is left on the stack.
+        }
     };
 
     // Append the generated instructions for this constant (now including array logic)

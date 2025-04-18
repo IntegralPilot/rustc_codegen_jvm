@@ -6,7 +6,7 @@ use crate::oomir::{self, Instruction, Operand};
 use regex::Regex;
 use rustc_middle::{
     mir::{Body, Operand as MirOperand, Place, ProjectionElem},
-    ty::TyCtxt,
+    ty::{TyCtxt, TyKind},
 };
 use std::{collections::HashMap, sync::OnceLock};
 
@@ -15,27 +15,50 @@ pub fn place_to_string<'tcx>(place: &Place<'tcx>, _tcx: TyCtxt<'tcx>) -> String 
     format!("_{}", place.local.index()) // Start with base local "_N"
 }
 
-pub fn make_jvm_safe(input: &str) -> String {
-    static RE_ANGLES: OnceLock<Regex> = OnceLock::new();
-    static RE_COLONS: OnceLock<Regex> = OnceLock::new();
-    static RE_TRAILING_UNDERSCORE: OnceLock<Regex> = OnceLock::new();
-    let re_angles = RE_ANGLES.get_or_init(|| Regex::new(r"<([^>]+)>").expect("Invalid regex"));
-    let without_angles = re_angles.replace_all(input, |caps: &regex::Captures| {
-        let inner = &caps[1];
-        match inner {
-            "i8" | "i16" | "i32" | "i64" | "i128" | "u8" | "u16" | "u32" | "u64" | "u128"
-            | "f32" | "f64" | "bool" | "char" | "str" => inner.to_string(),
-            _ => "".to_string(),
+/// 1) Remove nested generics completely.
+fn strip_generics(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut depth = 0;
+    for c in s.chars() {
+        match c {
+            '<' => depth += 1,
+            '>' if depth > 0 => depth -= 1,
+            c if depth == 0 => out.push(c),
+            _ => {} // inside <…>, skip
         }
-    });
-    let re_colons = RE_COLONS.get_or_init(|| Regex::new(r":{2,}").expect("Invalid regex"));
-    let replaced: std::borrow::Cow<'_, str> = re_colons.replace_all(&without_angles, "_");
-    let re_trailing_underscore = RE_TRAILING_UNDERSCORE
-        .get_or_init(|| Regex::new(r"^[<>_]+|[<>_]+$").expect("Invalid regex"));
-    let replaced = re_trailing_underscore.replace_all(&replaced, "");
-    let lower = replaced.to_lowercase();
-    let trimmed = lower.trim_start_matches('_').trim_end_matches('_');
-    trimmed.to_string()
+    }
+    out
+}
+
+pub fn make_jvm_safe(input: &str) -> String {
+    // 1) Strip out all <…> (including nested)
+    let mut s = strip_generics(input);
+
+    // 2) Remove any trailing "::"
+    while s.ends_with("::") {
+        s.truncate(s.len() - 2);
+    }
+
+    // 3) Split on "::", drop empty segments, then:
+    //    - if we have at least two parts, join first+last with "_"
+    //    - else if one part, just use that
+    //    - else (shouldn't happen), fall back to the full string
+    let parts: Vec<_> = s.split("::").filter(|p| !p.is_empty()).collect();
+    let combined = if parts.len() >= 2 {
+        format!("{}_{}", parts[0], parts[parts.len() - 1])
+    } else if parts.len() == 1 {
+        parts[0].to_string()
+    } else {
+        s.clone()
+    };
+
+    // 4) Collapse any run of non‑alphanumeric/underscore into a single "_"
+    static RE_NONWORD: OnceLock<Regex> = OnceLock::new();
+    let re_nw = RE_NONWORD.get_or_init(|| Regex::new(r"[^\w]+").unwrap());
+    let cleaned = re_nw.replace_all(&combined, "_");
+
+    // 5) Trim leading/trailing "_" and lowercase
+    cleaned.trim_matches('_').to_lowercase()
 }
 
 /// Generates the necessary OOMIR instructions to retrieve the value corresponding
@@ -61,7 +84,8 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
     let mut instructions = vec![];
 
     // Iterate over each projection element in the order they appear.
-    for proj in place.projection.iter() {
+    for (proj_index, proj) in place.projection.iter().enumerate() {
+        let type_before_proj = current_type.clone();
         match proj {
             ProjectionElem::Field(field_index, field_ty) => {
                 // Get the owner class name and field name.
@@ -112,6 +136,7 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
                     tcx,
                     mir,
                     data_types,
+                    &mut instructions,
                 );
                 // Create a temporary name for the array element.
                 let next_var = format!("{}_elem", current_var);
@@ -200,7 +225,117 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
             ProjectionElem::Deref => {
                 // do nothing
             }
-            // Add more projection kinds (e.g., Downcast) as needed.
+            ProjectionElem::Downcast(_, variant_idx) => {
+                // A downcast changes the *effective type* for subsequent projections.
+
+                // 1. Get the base enum OOMIR class name from the type *before* the downcast.
+                let base_enum_oomir_name = match &type_before_proj {
+                    oomir::Type::Class(name) => name.clone(),
+                    oomir::Type::Reference(inner)
+                        if matches!(inner.as_ref(), oomir::Type::Class(_)) =>
+                    {
+                        // If it's a reference to the enum, operate on the enum type itself
+                        if let oomir::Type::Class(name) = inner.as_ref() {
+                            // We should ideally verify this name corresponds to an enum base class in data_types
+                            name.clone()
+                        } else {
+                            unreachable!() // Caught by matches!
+                        }
+                    }
+                    _ => panic!(
+                        "Downcast applied to non-enum/non-ref-enum type: var '{}' has type {:?} before downcast. Place: {:?}",
+                        current_var, type_before_proj, place
+                    ),
+                };
+
+                // 2. Get the AdtDef of the enum to find the variant's actual name.
+                //    We need the Rust Ty of the base enum *before* the downcast.
+                let base_place_proj_slice = &place.projection[..proj_index]; // Projections *before* this downcast
+                let base_place_for_downcast = Place {
+                    local: place.local,
+                    projection: tcx.mk_place_elems(base_place_proj_slice),
+                };
+                let base_rust_ty = base_place_for_downcast.ty(&mir.local_decls, tcx).ty;
+
+                let (adt_def, substs) = match base_rust_ty.kind() {
+                    TyKind::Adt(adt, s) => (*adt, s),
+                    TyKind::Ref(_, ty, _) => match ty.kind() {
+                        // Handle reference to enum
+                        TyKind::Adt(adt, s) => (*adt, s),
+                        _ => panic!(
+                            "Downcast base is Ref to non-ADT: {:?} ({:?})",
+                            base_rust_ty, place
+                        ),
+                    },
+                    _ => panic!(
+                        "Downcast base is not an ADT: {:?} ({:?})",
+                        base_rust_ty, place
+                    ),
+                };
+
+                if !adt_def.is_enum() {
+                    panic!(
+                        "Downcast applied to non-enum ADT: {:?} ({:?})",
+                        adt_def, place
+                    );
+                }
+
+                // 3. Get the specific variant definition using the index.
+                let variant_def = adt_def.variant(variant_idx);
+
+                // 4. Construct the OOMIR variant class name
+                let variant_class_name = format!(
+                    "{}${}",
+                    base_enum_oomir_name, // Use OOMIR name already derived
+                    make_jvm_safe(&variant_def.name.to_string())  // Use actual variant name
+                );
+
+                // 5. Update current_type directly to the OOMIR Class representing the variant.
+                current_type = oomir::Type::Class(variant_class_name.clone());
+
+                // Verify this class exists in data_types
+                if !data_types.contains_key(&variant_class_name) {
+                    println!(
+                        "Info: Downcast resulted in variant class name '{}' which is not yet in data_types! Will insert it.",
+                        variant_class_name
+                    );
+                    let mut fields = vec![];
+                    for (i, field) in variant_def.fields.iter().enumerate() {
+                        let field_name = format!("field{}", i);
+                        let field_type = ty_to_oomir_type(field.ty(tcx, substs), tcx, data_types);
+                        fields.push((field_name, field_type));
+                    }
+
+                    let mut methods = HashMap::new();
+                    methods.insert(
+                        "getVariantIdx".to_string(),
+                        (
+                            oomir::Type::I32,
+                            Some(oomir::Constant::I32(variant_idx.as_u32() as i32)),
+                        ),
+                    );
+
+                    data_types.insert(
+                        variant_class_name.clone(),
+                        oomir::DataType {
+                            fields,
+                            is_abstract: false,
+                            methods,
+                            super_class: Some(base_enum_oomir_name.clone()),
+                        },
+                    );
+                }
+
+                println!(
+                    "Info: Handled Downcast: Variant {}({}), BaseEnum='{}', New Type (Variant Class): {:?}, Var: {}",
+                    variant_def.name, // Use actual name from variant_def
+                    variant_idx.index(),
+                    base_enum_oomir_name,
+                    current_type, // Should now be Class("complexenum$userdata")
+                    current_var
+                );
+            }
+            // Will add more projection kinds when needed.
             _ => {
                 println!(
                     "Warning: Unhandled projection element in nested access: {:?}. Skipping.",
@@ -331,7 +466,8 @@ pub fn emit_instructions_to_set_value<'tcx>(
 
                 // Convert the MIR index operand (_local) to an OOMIR operand
                 let mir_index_operand = MirOperand::Copy(Place::from(*index_local)); // Or Move? Copy usually safer.
-                let oomir_index_operand = convert_operand(&mir_index_operand, tcx, mir, data_types);
+                let oomir_index_operand =
+                    convert_operand(&mir_index_operand, tcx, mir, data_types, &mut instructions);
 
                 instructions.push(Instruction::ArrayStore {
                     array_var: base_var_name,   // The array retrieved in step 2
@@ -401,6 +537,14 @@ pub fn emit_instructions_to_set_value<'tcx>(
 
             ProjectionElem::Deref => {
                 // do nothing
+            }
+            ProjectionElem::Downcast(..) => {
+                // Downcast should not be the last element for an assignment.
+                // You assign to a field/index within the downcast variant.
+                panic!(
+                    "Downcast cannot be the final projection element for an assignment. Place: {:?}",
+                    dest_place
+                );
             }
             _ => {
                 panic!(

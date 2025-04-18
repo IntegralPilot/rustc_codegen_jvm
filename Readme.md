@@ -28,7 +28,7 @@ The toolchain transforms Rust code into executable `.jar` files through several 
 This backend currently supports a subset of Rust features:
 
 *   ✅ Compiling minimal `no_std` & `no_core` Rust programs (like an empty `main`) using the `jvm-unknown-unknown` target.
-*   ✅ Compiling simple programs using basic `core` features (like the `is_even_plus_one` test) using the host target.
+*   ✅ Compiling simple programs using basic `core` features (like other tests) using the host target but this codegen backend to produce JVM bytecode.
 *   ✅ Basic integer arithmetic operations on all types of numbers:
     *   Addition (`+`), Subtraction (`-`), Multiplication (`*`), Division (`/`), Remainder (`%`).
     *   Checked addition, subtraction and multiplication returning `(result, overflowed_bool)` tuples (occurs in debug mode)
@@ -43,7 +43,7 @@ This backend currently supports a subset of Rust features:
 *   ✅ Variable assignment including subfield and array index assignment, including nesting.
 *   ✅ Arrays and slices, including inserting, accessing and mutating at a given index (supporting nesting).
 *   ✅ Floats (`f32`, `f64`).
-*   ✅ Structs, Tuples and Enums (currently only C-like enums, no anonymous structs or tuples yet) including nesting access/setting/mutation of fields.
+*   ✅ Structs, Tuples and Enums (including traditional C-like enums but also Rust-like enums with anonymous structs and tuples in them) including nested access/setting/mutation of fields and array indices within these.
 *   ✅ Generating executable `.jar` files for binary crates.
 
 ### Next Milestone:

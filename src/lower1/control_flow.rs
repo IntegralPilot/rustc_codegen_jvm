@@ -102,6 +102,7 @@ pub fn convert_basic_block<'tcx>(
                         tcx,
                         mir,
                         data_types,
+                        &mut instructions,
                     );
                     instructions.push(oomir::Instruction::Return {
                         operand: Some(return_operand),
@@ -116,7 +117,7 @@ pub fn convert_basic_block<'tcx>(
             }
             TerminatorKind::SwitchInt { discr, targets, .. } => {
                 // --- GENERAL SwitchInt Handling ---
-                let discr_operand = convert_operand(discr, tcx, mir, data_types);
+                let discr_operand = convert_operand(discr, tcx, mir, data_types, &mut instructions);
                 // Get the actual type of the discriminant from MIR local declarations
                 let discr_ty = discr.ty(&mir.local_decls, tcx);
 
@@ -159,7 +160,7 @@ pub fn convert_basic_block<'tcx>(
                 let function_name = make_jvm_safe(format!("{:?}", func).as_str()); // Get function name - needs refinement to extract actual name
                 let oomir_args = args
                     .iter()
-                    .map(|arg| convert_operand(&arg.node, tcx, mir, data_types))
+                    .map(|arg| convert_operand(&arg.node, tcx, mir, data_types, &mut instructions))
                     .collect();
                 let dest = Some(format!("{:?}", destination.local));
 
@@ -219,7 +220,8 @@ pub fn convert_basic_block<'tcx>(
                         cond
                     );
                     // Condition is likely a constant itself
-                    condition_operand = convert_operand(cond, tcx, mir, data_types);
+                    condition_operand =
+                        convert_operand(cond, tcx, mir, data_types, &mut instructions);
                 }
                 // --- End of condition operand handling ---
 
