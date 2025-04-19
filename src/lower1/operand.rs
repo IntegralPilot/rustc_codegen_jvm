@@ -15,9 +15,11 @@ use rustc_middle::{
 };
 use std::collections::HashMap;
 
-mod adt;
+mod experimental;
+mod float;
 
-use adt::read_constant_value_from_memory;
+use experimental::read_constant_value_from_memory;
+use float::f128_to_string;
 
 /// Convert a MIR operand to an OOMIR operand.
 pub fn convert_operand<'tcx>(
@@ -138,7 +140,8 @@ pub fn handle_const_value<'tcx>(
                             let allocation = const_allocation.inner();
 
                             // eventually the read_constant_value_from_memory function (which is much better than the hardcoded/messy code here) will be used
-                            // for every pointer type (it supports all of them). but currently it's just used for ADTs as some specific bugs need to be ironed out.
+                            // for every pointer type (it supports all of them). but currently it's just used for ADTs and scalar pointers for now, slowly it will
+                            // be phased in for more types as it's support is expanded (currently it doesn't have full support, yet).
                             //
                             /*let offset = pointer.into_parts().1;
 
@@ -918,6 +921,66 @@ pub fn handle_const_value<'tcx>(
                                                 oomir::Operand::Constant(oomir::Constant::I64(-50)) // Placeholder for ADT read error
                                             }
                                         }
+                                    } else if inner_ty.is_scalar() {
+                                        // Handle scalar types (e.g., i32, f64, etc.) using the experimental resolution engine
+                                        println!(
+                                            "Info: Handling Ref-to-scalar {:?}. Reading constant value from allocation {:?}.",
+                                            inner_ty, alloc_id
+                                        );
+
+                                        // Read the constant value from the allocation
+                                        match read_constant_value_from_memory(
+                                            tcx,
+                                            allocation,
+                                            pointer.into_parts().1,
+                                            *inner_ty,
+                                            data_types,
+                                        ) {
+                                            Ok(oomir_const) => {
+                                                println!(
+                                                    "Info: Successfully extracted constant scalar: {:?}",
+                                                    oomir_const
+                                                );
+                                                oomir::Operand::Constant(oomir_const)
+                                            }
+                                            Err(e) => {
+                                                println!(
+                                                    "Error: Failed to read constant scalar of type {:?} from allocation {:?}: {}",
+                                                    inner_ty, alloc_id, e
+                                                );
+                                                oomir::Operand::Constant(oomir::Constant::I64(-51)) // Placeholder for scalar read error
+                                            }
+                                        }
+                                    } else if inner_ty.is_array() {
+                                        // Handle array types
+                                        println!(
+                                            "Info: Handling Ref-to-array {:?}. Reading constant value from allocation {:?}.",
+                                            inner_ty, alloc_id
+                                        );
+
+                                        // Read the constant value from the allocation
+                                        match read_constant_value_from_memory(
+                                            tcx,
+                                            allocation,
+                                            pointer.into_parts().1,
+                                            *inner_ty,
+                                            data_types,
+                                        ) {
+                                            Ok(oomir_const) => {
+                                                println!(
+                                                    "Info: Successfully extracted constant array: {:?}",
+                                                    oomir_const
+                                                );
+                                                oomir::Operand::Constant(oomir_const)
+                                            }
+                                            Err(e) => {
+                                                println!(
+                                                    "Error: Failed to read constant array of type {:?} from allocation {:?}: {}",
+                                                    inner_ty, alloc_id, e
+                                                );
+                                                oomir::Operand::Constant(oomir::Constant::I64(-52)) // Placeholder for array read error
+                                            }
+                                        }
                                     } else {
                                         // Inner type of the Ref is not an Array, str, ADT or another Ref
                                         println!(
@@ -1059,14 +1122,39 @@ fn scalar_int_to_oomir_constant(scalar_int: ScalarInt, ty: &Ty<'_>) -> oomir::Co
             IntTy::I32 => oomir::Constant::I32(scalar_int.to_i32() as i32),
             IntTy::Isize => oomir::Constant::I32(scalar_int.to_i64() as i32), // JVM usize -> i32
             IntTy::I64 => oomir::Constant::I64(scalar_int.to_i64()),
-            IntTy::I128 => oomir::Constant::Class("java/lang/BigInteger".into()),
+            IntTy::I128 => {
+                let value = scalar_int.to_i128();
+                let param = oomir::Constant::String(value.to_string());
+                oomir::Constant::Instance {
+                    class_name: "java/math/BigInteger".into(),
+                    fields: HashMap::new(),
+                    params: vec![param],
+                }
+            }
         },
         TyKind::Uint(uint_ty) => match uint_ty {
             UintTy::U8 => oomir::Constant::I16(scalar_int.to_u8() as i16), // Widen to cover range
             UintTy::U16 => oomir::Constant::I32(scalar_int.to_u16() as i32), // Widen
             UintTy::U32 => oomir::Constant::I64(scalar_int.to_u32() as i64), // Widen
             UintTy::Usize => oomir::Constant::I32(scalar_int.to_u64() as i32), // JVM usize -> i32
-            UintTy::U64 | UintTy::U128 => oomir::Constant::Class("java/lang/BigInteger".into()),
+            UintTy::U64 => {
+                let value = scalar_int.to_u64();
+                let param = oomir::Constant::String(value.to_string());
+                oomir::Constant::Instance {
+                    class_name: "java/math/BigInteger".into(),
+                    fields: HashMap::new(),
+                    params: vec![param],
+                }
+            }
+            UintTy::U128 => {
+                let value = scalar_int.to_u128();
+                let param = oomir::Constant::String(value.to_string());
+                oomir::Constant::Instance {
+                    class_name: "java/math/BigInteger".into(),
+                    fields: HashMap::new(),
+                    params: vec![param],
+                }
+            }
         },
         TyKind::Bool => {
             let val = scalar_int.try_to_bool().unwrap_or(false);
@@ -1078,19 +1166,53 @@ fn scalar_int_to_oomir_constant(scalar_int: ScalarInt, ty: &Ty<'_>) -> oomir::Co
         }
         TyKind::Float(float_ty) => match float_ty {
             FloatTy::F16 => {
-                // F16 is not directly supported in OOMIR, so we convert to F32
-                let val = f32::from_bits(scalar_int.to_u16() as u32);
-                oomir::Constant::F32(val)
+                // 1. Get the raw bits
+                let f16_bits = scalar_int.to_u16();
+                // 2. Create an f16 from the bits.
+                // need to use half::f16 so we can call to_f32()
+                let f16_val = half::f16::from_bits(f16_bits);
+                // 3. Convert the f16 value to an f32 value
+                let f32_val = f16_val.to_f32();
+                oomir::Constant::F32(f32_val)
             }
             FloatTy::F32 => oomir::Constant::F32(f32::from_bits(scalar_int.to_u32())),
             FloatTy::F64 => oomir::Constant::F64(f64::from_bits(scalar_int.to_u64())),
-            FloatTy::F128 => oomir::Constant::Class("java/lang/BigDecimal".into()), // F128 is not directly supported
+            FloatTy::F128 => {
+                // 1. Pull out the raw bits
+                let bits: u128 = scalar_int.to_u128();
+                // 2. Reinterpret as f128
+                let val: f128 = f128::from_bits(bits);
+
+                // 3. Special‑case NaN & ±∞ before we try to format them:
+                if val.is_nan() {
+                    panic!("Attempt to store NaN as a constant BigDecimal/F128 (impossible).");
+                } else if val.is_infinite() {
+                    panic!("Attempt to store ±∞ as a constant BigDecimal/F128 (impossible).");
+                } else {
+                    // 4. Normal finite values → decimal string → BigDecimal
+                    let s = f128_to_string(val);
+                    let param = oomir::Constant::String(s);
+                    oomir::Constant::Instance {
+                        class_name: "java/math/BigDecimal".into(),
+                        fields: HashMap::new(),
+                        params: vec![param],
+                    }
+                }
+            }
         },
         TyKind::Str => {
-            let val = scalar_int.to_u32();
+            let val = scalar_int.to_u64();
             oomir::Constant::String(val.to_string())
         }
+        TyKind::Ref(_, ty, _) => {
+            // Handle references by converting to the underlying type
+            let inner_ty = ty;
+            let inner_scalar_int = scalar_int.to_u64();
+            let inner_constant = scalar_int_to_oomir_constant(inner_scalar_int.into(), inner_ty);
+            return inner_constant;
+        }
         _ => {
+            // non-int type
             panic!("Unsupported type for ScalarInt conversion: {:?}", ty);
         }
     }

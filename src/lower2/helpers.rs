@@ -1,8 +1,9 @@
 use super::oomir;
 
 use oomir::Type;
-use ristretto_classfile::{self as jvm, attributes::Instruction};
-use std::collections::{HashMap, HashSet, VecDeque};
+use ristretto_classfile::{self as jvm, ConstantPool, attributes::Instruction};
+
+use super::{BIG_DECIMAL_CLASS, BIG_INTEGER_CLASS};
 
 /// Returns the number of JVM local variable slots a type occupies (1 or 2).
 pub fn get_type_size(ty: &Type) -> u16 {
@@ -163,154 +164,331 @@ pub fn get_store_instruction(ty: &Type, index: u16) -> Result<Instruction, jvm::
     Ok(instr)
 }
 
-/// Returns a sequence of instructions to cast a primitive type from `src` to `dest`.
-pub fn get_cast_instructions(src: &Type, dest: &Type) -> Result<Vec<Instruction>, jvm::Error> {
-    // If the two types are equal, no conversion is needed.
+/// Returns a sequence of instructions to cast a value of type `src` on the stack
+/// to type `dest`. Requires the constant pool for class/method references.
+pub fn get_cast_instructions(
+    src: &Type,
+    dest: &Type,
+    cp: &mut ConstantPool,
+) -> Result<Vec<Instruction>, jvm::Error> {
+    use Instruction as JI;
+
+    // 0. Identity cast
     if src == dest {
         return Ok(vec![]);
     }
 
-    // Only support numeric primitive conversions.
-    // Supported types: I8, I16, I32, I64, F32, F64, and Char.
-    fn is_supported(ty: &Type) -> bool {
-        matches!(
-            ty,
-            Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::F32 | Type::F64 | Type::Char
-        )
-    }
-    if !(is_supported(src) && is_supported(dest)) {
-        return Err(jvm::Error::VerificationError {
-            context: "get_cast_instructions".to_string(),
-            message: format!("Unsupported type conversion from {:?} to {:?}", src, dest),
-        });
+    // 1. Primitive <-> Primitive
+    if src.is_jvm_primitive_like() && dest.is_jvm_primitive_like() {
+        return primitive_to_primitive(src, dest);
     }
 
-    // Normalize types: in the JVM, I8, I16, and Char are treated as I32 on the operand stack.
+    // 2. Primitive -> BigInteger / BigDecimal
+    if src.is_jvm_primitive_like() {
+        if let Type::Class(cn) = dest {
+            if cn == BIG_INTEGER_CLASS {
+                return prim_to_bigint(src, cp);
+            }
+            if cn == BIG_DECIMAL_CLASS {
+                return prim_to_bigdec(src, cp);
+            }
+        }
+    }
+
+    // 3. BigInteger / BigDecimal -> Primitive
+    if let Type::Class(cn) = src {
+        if dest.is_jvm_primitive_like() {
+            if cn == BIG_INTEGER_CLASS {
+                return bigint_to_prim(dest, cp);
+            }
+            if cn == BIG_DECIMAL_CLASS {
+                return bigdec_to_prim(dest, cp);
+            }
+        }
+    }
+
+    // 4. Reference -> Reference (including String, BigInteger, BigDecimal interop)
+    if src.is_jvm_reference_type() && dest.is_jvm_reference_type() {
+        // String -> BigInteger
+        if src == &Type::String && dest == &Type::Class(BIG_INTEGER_CLASS.into()) {
+            let bi_idx = cp.add_class(BIG_INTEGER_CLASS)?;
+            let ctor = cp.add_method_ref(bi_idx, "<init>", "(Ljava/lang/String;)V")?;
+            return Ok(vec![JI::New(bi_idx), JI::Swap, JI::Invokespecial(ctor)]);
+        }
+
+        // BigInteger -> String
+        if src == &Type::Class(BIG_INTEGER_CLASS.into()) && dest == &Type::String {
+            let bi_idx = cp.add_class(BIG_INTEGER_CLASS)?;
+            let mref = cp.add_method_ref(bi_idx, "toString", "()Ljava/lang/String;")?;
+            return Ok(vec![JI::Invokevirtual(mref)]);
+        }
+
+        // String -> BigDecimal
+        if src == &Type::String && dest == &Type::Class(BIG_DECIMAL_CLASS.into()) {
+            let bd_idx = cp.add_class(BIG_DECIMAL_CLASS)?;
+            let ctor = cp.add_method_ref(bd_idx, "<init>", "(Ljava/lang/String;)V")?;
+            return Ok(vec![JI::New(bd_idx), JI::Swap, JI::Invokespecial(ctor)]);
+        }
+
+        // BigDecimal -> String
+        if src == &Type::Class(BIG_DECIMAL_CLASS.into()) && dest == &Type::String {
+            let bd_idx = cp.add_class(BIG_DECIMAL_CLASS)?;
+            let mref = cp.add_method_ref(bd_idx, "toString", "()Ljava/lang/String;")?;
+            return Ok(vec![JI::Invokevirtual(mref)]);
+        }
+
+        // BigInteger -> BigDecimal
+        if src == &Type::Class(BIG_INTEGER_CLASS.into())
+            && dest == &Type::Class(BIG_DECIMAL_CLASS.into())
+        {
+            let bd_idx = cp.add_class(BIG_DECIMAL_CLASS)?;
+            let ctor = cp.add_method_ref(bd_idx, "<init>", "(Ljava/math/BigInteger;)V")?;
+            return Ok(vec![JI::New(bd_idx), JI::Swap, JI::Invokespecial(ctor)]);
+        }
+
+        // BigDecimal -> BigInteger
+        if src == &Type::Class(BIG_DECIMAL_CLASS.into())
+            && dest == &Type::Class(BIG_INTEGER_CLASS.into())
+        {
+            let bd_idx = cp.add_class(BIG_DECIMAL_CLASS)?;
+            let mref =
+                cp.add_method_ref(bd_idx, "toBigIntegerExact", "()Ljava/math/BigInteger;")?;
+            return Ok(vec![JI::Invokevirtual(mref)]);
+        }
+
+        // Generic checkcast for all other reference-to-reference
+        if let (Some(internal), Some(_)) = (
+            src.to_jvm_descriptor_or_internal_name(),
+            dest.to_jvm_descriptor_or_internal_name(),
+        ) {
+            let dest_idx = cp.add_class(&internal)?;
+            return Ok(vec![JI::Checkcast(dest_idx)]);
+        }
+    }
+
+    // 5. Fallback: unsupported
+    Err(jvm::Error::VerificationError {
+        context: "get_casting_instructions".into(),
+        message: format!("Unsupported cast: {:?} → {:?}", src, dest),
+    })
+}
+
+/// Helper for primitive→primitive casts via a small JVM‐opcode graph + narrowing.
+fn primitive_to_primitive(src: &Type, dest: &Type) -> Result<Vec<Instruction>, jvm::Error> {
+    use Instruction as JI;
+    use std::collections::{HashMap, HashSet, VecDeque};
+
+    // Normalize smaller ints → I32
     fn normalize(ty: &Type) -> Type {
         match ty {
-            Type::I8 | Type::I16 | Type::Char => Type::I32,
+            Type::I8 | Type::I16 | Type::Char | Type::Boolean => Type::I32,
             _ => ty.clone(),
         }
     }
-
-    let norm_src = normalize(src);
-    let norm_dest = normalize(dest);
-
-    // Final conversion: when the destination is one of the narrow types, use a final opcode.
-    fn final_conversion(orig_dest: &Type) -> Option<Instruction> {
-        match orig_dest {
-            Type::I8 => Some(Instruction::I2b),
-            Type::Char => Some(Instruction::I2c),
-            Type::I16 => Some(Instruction::I2s),
-            _ => None,
-        }
+    // Final narrowing instr for byte/char/short
+    fn narrow(dest: &Type) -> Option<Instruction> {
+        Some(match dest {
+            Type::I8 => JI::I2b,
+            Type::Char => JI::I2c,
+            Type::I16 => JI::I2s,
+            _ => return None,
+        })
     }
 
-    let mut instructions = vec![];
+    let ns = normalize(src);
+    let nd = normalize(dest);
 
-    // If the normalized types are already equal, only perform a final conversion
-    // if the original destination is a narrow type.
-    if norm_src == norm_dest {
-        if let Some(final_inst) = final_conversion(dest) {
-            instructions.push(final_inst);
-        }
-        return Ok(instructions);
+    // If same, just maybe narrow
+    if ns == nd {
+        return Ok(narrow(dest).into_iter().collect());
     }
 
-    // Build the conversion graph between normalized types.
-    // The nodes we care about are: I32, I64, F32, and F64.
-    // Each edge is a pair (target_type, conversion_instruction).
-    let mut graph: HashMap<Type, Vec<(Type, Instruction)>> = HashMap::new();
+    // Build graph
+    let graph: HashMap<_, _> = [
+        (
+            Type::I32,
+            vec![
+                (Type::I64, JI::I2l),
+                (Type::F64, JI::I2d),
+                (Type::F32, JI::I2f),
+            ],
+        ),
+        (
+            Type::I64,
+            vec![
+                (Type::I32, JI::L2i),
+                (Type::F64, JI::L2d),
+                (Type::F32, JI::L2f),
+            ],
+        ),
+        (
+            Type::F64,
+            vec![
+                (Type::I32, JI::D2i),
+                (Type::I64, JI::D2l),
+                (Type::F32, JI::D2f),
+            ],
+        ),
+        (
+            Type::F32,
+            vec![
+                (Type::I32, JI::F2i),
+                (Type::I64, JI::F2l),
+                (Type::F64, JI::F2d),
+            ],
+        ),
+    ]
+    .into_iter()
+    .collect();
 
-    // From I32:
-    graph.insert(
-        Type::I32,
-        vec![
-            (Type::I64, Instruction::I2l),
-            (Type::F64, Instruction::I2d),
-            (Type::F32, Instruction::I2f),
-        ],
-    );
-    // From I64:
-    graph.insert(
-        Type::I64,
-        vec![
-            (Type::I32, Instruction::L2i),
-            (Type::F64, Instruction::L2d),
-            (Type::F32, Instruction::L2f),
-        ],
-    );
-    // From F64:
-    graph.insert(
-        Type::F64,
-        vec![
-            (Type::I32, Instruction::D2i),
-            (Type::I64, Instruction::D2l),
-            (Type::F32, Instruction::D2f),
-        ],
-    );
-    // From F32:
-    graph.insert(
-        Type::F32,
-        vec![
-            (Type::I32, Instruction::F2i),
-            (Type::I64, Instruction::F2l),
-            (Type::F64, Instruction::F2d),
-        ],
-    );
-
-    // Use breadth-first search (BFS) to find a conversion path from norm_src to norm_dest.
+    // BFS
     #[derive(Clone)]
     struct Node {
         ty: Type,
         path: Vec<Instruction>,
     }
-
-    let mut queue = VecDeque::new();
-    let mut visited = HashSet::new();
-
-    queue.push_back(Node {
-        ty: norm_src.clone(),
+    let mut q = VecDeque::new();
+    let mut seen = HashSet::new();
+    q.push_back(Node {
+        ty: ns.clone(),
         path: vec![],
     });
-    visited.insert(norm_src.clone());
+    seen.insert(ns.clone());
 
-    let mut found_path: Option<Vec<Instruction>> = None;
-
-    while let Some(current) = queue.pop_front() {
-        if current.ty == norm_dest {
-            found_path = Some(current.path);
-            break;
+    while let Some(Node { ty, path }) = q.pop_front() {
+        if ty == nd {
+            let mut p = path;
+            if let Some(n) = narrow(dest) {
+                p.push(n);
+            }
+            return Ok(p);
         }
-        if let Some(neighbors) = graph.get(&current.ty) {
-            for (next_ty, opcode) in neighbors {
-                if !visited.contains(next_ty) {
-                    let mut new_path = current.path.clone();
-                    new_path.push(opcode.clone());
-                    queue.push_back(Node {
-                        ty: next_ty.clone(),
-                        path: new_path,
+        if let Some(neigh) = graph.get(&ty) {
+            for (nty, op) in neigh {
+                if seen.insert(nty.clone()) {
+                    let mut p2 = path.clone();
+                    p2.push(op.clone());
+                    q.push_back(Node {
+                        ty: nty.clone(),
+                        path: p2,
                     });
-                    visited.insert(next_ty.clone());
                 }
             }
         }
     }
 
-    let conversion_chain = found_path.ok_or_else(|| jvm::Error::VerificationError {
-        context: "get_cast_instructions".to_string(),
-        message: format!("No conversion path found from {:?} to {:?}", src, dest),
-    })?;
+    Err(jvm::Error::VerificationError {
+        context: "primitive_to_primitive".into(),
+        message: format!("No path {:?}→{:?}", src, dest),
+    })
+}
 
-    // Append the conversion chain instructions.
-    instructions.extend(conversion_chain);
-
-    // If a final conversion from I32 to a narrow type is required, append it.
-    if let Some(final_inst) = final_conversion(dest) {
-        instructions.push(final_inst);
+/// primitive → BigInteger via BigInteger.valueOf(long)
+fn prim_to_bigint(src: &Type, cp: &mut ConstantPool) -> Result<Vec<Instruction>, jvm::Error> {
+    use Instruction as JI;
+    let bi_idx = cp.add_class(BIG_INTEGER_CLASS)?;
+    let mref = cp.add_method_ref(bi_idx, "valueOf", "(J)Ljava/math/BigInteger;")?;
+    let mut ins = Vec::new();
+    match src {
+        Type::I64            => ins.push(JI::Invokestatic(mref)),
+        _ /* smaller ints */ => {
+            ins.push(JI::I2l);
+            ins.push(JI::Invokestatic(mref));
+        }
     }
+    Ok(ins)
+}
 
-    Ok(instructions)
+/// primitive → BigDecimal via BigDecimal.valueOf(long|double)
+fn prim_to_bigdec(src: &Type, cp: &mut ConstantPool) -> Result<Vec<Instruction>, jvm::Error> {
+    use Instruction as JI;
+    let bd_idx = cp.add_class(BIG_DECIMAL_CLASS)?;
+    let (cast, sig) = match src {
+        Type::F32           => (Some(JI::F2d), "(D)Ljava/math/BigDecimal;"),
+        Type::F64           => (None,          "(D)Ljava/math/BigDecimal;"),
+        _ /* ints */        => (Some(JI::I2l), "(J)Ljava/math/BigDecimal;"),
+    };
+    let mref = cp.add_method_ref(bd_idx, "valueOf", sig)?;
+    let mut ins = Vec::new();
+    if let Some(c) = cast {
+        ins.push(c)
+    }
+    ins.push(JI::Invokestatic(mref));
+    Ok(ins)
+}
+
+/// BigInteger → primitive via intValue/longValue/doubleValue(...)
+fn bigint_to_prim(dest: &Type, cp: &mut ConstantPool) -> Result<Vec<Instruction>, jvm::Error> {
+    use Instruction as JI;
+    let bi_idx = cp.add_class(BIG_INTEGER_CLASS)?;
+    let mut ins = Vec::new();
+    match dest {
+        Type::I32 | Type::I8 | Type::I16 | Type::Char | Type::Boolean => {
+            let m = cp.add_method_ref(bi_idx, "intValue", "()I")?;
+            ins.push(JI::Invokevirtual(m));
+            if let Some(n) = final_conversion(dest) {
+                ins.push(n)
+            }
+        }
+        Type::I64 => {
+            let m = cp.add_method_ref(bi_idx, "longValue", "()J")?;
+            ins.push(JI::Invokevirtual(m));
+        }
+        Type::F32 => {
+            let m = cp.add_method_ref(bi_idx, "doubleValue", "()D")?;
+            ins.push(JI::Invokevirtual(m));
+            ins.push(JI::D2f);
+        }
+        Type::F64 => {
+            let m = cp.add_method_ref(bi_idx, "doubleValue", "()D")?;
+            ins.push(JI::Invokevirtual(m));
+        }
+        _ => {
+            return Err(jvm::Error::VerificationError {
+                context: "bigint_to_prim".into(),
+                message: format!("Cannot unbox BigInteger → {:?}", dest),
+            });
+        }
+    }
+    Ok(ins)
+}
+
+/// BigDecimal → primitive via intValue/longValue/floatValue/doubleValue(...)
+fn bigdec_to_prim(dest: &Type, cp: &mut ConstantPool) -> Result<Vec<Instruction>, jvm::Error> {
+    use Instruction as JI;
+    let bd_idx = cp.add_class(BIG_DECIMAL_CLASS)?;
+    let mut ins = Vec::new();
+    let (name, sig) = match dest {
+        Type::I32 | Type::I8 | Type::I16 | Type::Char | Type::Boolean => ("intValue", "()I"),
+        Type::I64 => ("longValue", "()J"),
+        Type::F32 => ("floatValue", "()F"),
+        Type::F64 => ("doubleValue", "()D"),
+        _ => {
+            return Err(jvm::Error::VerificationError {
+                context: "bigdec_to_prim".into(),
+                message: format!("Cannot unbox BigDecimal → {:?}", dest),
+            });
+        }
+    };
+    let m = cp.add_method_ref(bd_idx, name, sig)?;
+    ins.push(JI::Invokevirtual(m));
+    if matches!(dest, Type::I8 | Type::I16 | Type::Char) {
+        if let Some(n) = final_conversion(dest) {
+            ins.push(n)
+        }
+    }
+    Ok(ins)
+}
+
+/// Final narrowing for byte/short/char
+fn final_conversion(dest: &Type) -> Option<Instruction> {
+    use Instruction::*;
+    match dest {
+        Type::I8 => Some(I2b),
+        Type::Char => Some(I2c),
+        Type::I16 => Some(I2s),
+        _ => None,
+    }
 }
 
 pub fn get_operand_type(operand: &oomir::Operand) -> Type {

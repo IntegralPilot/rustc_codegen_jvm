@@ -19,6 +19,9 @@ mod jvm_gen;
 mod shim;
 mod translator;
 
+pub const BIG_INTEGER_CLASS: &str = "java/math/BigInteger";
+pub const BIG_DECIMAL_CLASS: &str = "java/math/BigDecimal";
+
 /// Converts an OOMIR module into JVM class files
 /// Returns a HashMap where the key is the JVM class name (with '/') and the value is the bytecode
 pub fn oomir_to_jvm_bytecode(

@@ -1,5 +1,5 @@
 use super::helpers::are_types_jvm_compatible;
-use crate::oomir::{self, Type};
+use crate::oomir::{self, Signature, Type};
 use ristretto_classfile::{
     self as jvm, ConstantPool,
     attributes::{ArrayType, Instruction},
@@ -210,44 +210,70 @@ pub fn load_constant(
             }
             // Final stack state after loop: [arrayref] (the populated array)
         }
-        OC::Instance { class_name, fields } => {
+        OC::Instance {
+            class_name,
+            fields,
+            params,
+        } => {
             // 1. Add Class reference to constant pool
             let class_index = cp.add_class(class_name)?;
 
-            // 2. Add Method reference for the default constructor "<init>()V"
+            // 2. Determine constructor parameter types and signature descriptor
+            let param_types = params
+                .iter()
+                .map(Type::from_constant) // Get oomir::Type from each oomir::Constant
+                .collect::<Vec<_>>();
+
+            let constructor_signature = Signature {
+                ret: Box::new(Type::Void), // Constructors are void methods in bytecode
+                params: param_types,
+            };
+            // Assuming Signature::to_string() produces the correct JVM descriptor format, e.g., "(Ljava/lang/String;I)V"
+            let constructor_descriptor = constructor_signature.to_string();
+
+            // 3. Add Method reference for the constructor "<init>" with the determined signature
             let constructor_ref_index = cp.add_method_ref(
                 class_index,
-                "<init>", // Standard name for constructors
-                "()V",    // Standard descriptor for default constructor
+                "<init>",                // Standard name for constructors
+                &constructor_descriptor, // Use the calculated descriptor
             )?;
+            // 4. Generate instructions to create the object and set its fields
 
-            // 3. Emit 'new' instruction
+            // a. Emit 'new' instruction: Create uninitialized object
             instructions_to_add.push(JI::New(class_index)); // Stack: [uninitialized_ref]
 
-            // 4. Emit 'dup' instruction (One ref for init, one for field setting/result)
+            // b. Emit 'dup' instruction: Duplicate ref (one for invokespecial, one for result/fields)
             instructions_to_add.push(JI::Dup); // Stack: [uninitialized_ref, uninitialized_ref]
 
-            // 5. Emit 'invokespecial' to call the constructor
+            // c. Load constructor parameters onto the stack IN ORDER
+            for param_const in params {
+                // Recursively load the constant value for the parameter.
+                // Append the instructions directly to our temporary list.
+                load_constant(&mut instructions_to_add, cp, param_const)?;
+                // Stack: [uninitialized_ref, uninitialized_ref, param1, ..., param_i]
+            }
+
+            // d. Emit 'invokespecial' to call the constructor
+            // Consumes the top ref and all params, initializes the object pointed to by the second ref.
             instructions_to_add.push(JI::Invokespecial(constructor_ref_index)); // Stack: [initialized_ref]
 
-            // 6. Iterate through fields to set them
+            // e. Iterate through fields to set them *after* construction
             for (field_name, field_value) in fields {
-                // a. Duplicate the object reference (needed for putfield)
+                // i. Duplicate the now *initialized* object reference (needed for putfield)
                 instructions_to_add.push(JI::Dup); // Stack: [initialized_ref, initialized_ref]
 
-                // b. Load the field's value onto the stack (using recursion into a temp vec)
-                let mut field_value_instructions = Vec::new();
-                load_constant(&mut field_value_instructions, cp, field_value)?;
-                instructions_to_add.extend(field_value_instructions);
+                // ii. Load the field's value onto the stack
+                load_constant(&mut instructions_to_add, cp, field_value)?;
                 // Stack: [initialized_ref, initialized_ref, field_value] (size 1 or 2)
 
-                // c. Add Field reference
+                // iii. Add Field reference
                 let field_type = Type::from_constant(field_value);
+                // Assuming Type::to_jvm_descriptor() produces the correct JVM type descriptor, e.g., "Ljava/lang/String;", "I"
                 let field_descriptor = field_type.to_jvm_descriptor();
                 let field_ref_index =
                     cp.add_field_ref(class_index, field_name, &field_descriptor)?;
 
-                // d. Emit 'putfield'
+                // iv. Emit 'putfield'
                 instructions_to_add.push(JI::Putfield(field_ref_index));
                 // Stack: [initialized_ref] (putfield consumes the top ref and the value)
             }

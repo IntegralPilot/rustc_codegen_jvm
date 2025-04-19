@@ -1,6 +1,7 @@
 // src/oomir.rs
 //! This is the output of the stage 1 lowering pass of the compiler.
 //! It is responsible for converting the MIR into a lower-level IR, called OOMIR (defined in this file).
+use super::lower2::BIG_INTEGER_CLASS;
 use ristretto_classfile::attributes::Instruction as JVMInstruction;
 use std::{collections::HashMap, fmt};
 
@@ -270,27 +271,30 @@ pub enum Constant {
     Class(String),
     // 0 = the type of elements, 1 = the elements as a vec of constants
     Array(Box<Type>, Vec<Constant>),
-    /// Represents a constant instance of a struct or an enum variant.
-    /// For enums, `class_name` should be the specific variant's class name
-    /// (e.g., "MyEnum$VariantA").
     Instance {
         /// The fully qualified JVM class name (e.g., "MyStruct", "MyEnum$VariantA").
         class_name: String,
         /// The constant values of the fields, keyed by field name.
         /// For enum variants using numbered fields, use "field0", "field1", etc.
         fields: std::collections::HashMap<String, Constant>,
+        /// Any parameters to the constructor.
+        params: Vec<Constant>,
     },
 }
 
 // Helper to check if a Constant is integer-like (needed for Switch)
 impl Constant {
     pub fn is_integer_like(&self) -> bool {
-        matches!(
-            self,
-            Constant::I8(_) | Constant::I16(_) | Constant::I32(_) | Constant::I64(_) |
-            Constant::Char(_) | // Chars can be switched on in JVM
-            Constant::Boolean(_) // Booleans (0 or 1) can be switched on
-        )
+        match self {
+            Constant::I8(_)
+            | Constant::I16(_)
+            | Constant::I32(_)
+            | Constant::I64(_)
+            | Constant::Char(_) // Chars can be switched on in JVM
+            | Constant::Boolean(_) => true,
+            Constant::Instance { class_name, .. } => class_name == BIG_INTEGER_CLASS,
+            _ => false,
+        }
     }
 }
 
@@ -434,11 +438,6 @@ impl Type {
     }
 
     /// Create a Type from a Constant.
-    /// Unsigned constants are promoted:
-    /// - U8 -> I16,
-    /// - U16 -> I32,
-    /// - U32 -> I64,
-    /// - U64 -> Mapped as a Class ("java/lang/BigInteger").
     pub fn from_constant(constant: &Constant) -> Self {
         match constant {
             Constant::I8(_) => Type::I8,
@@ -499,6 +498,32 @@ impl Type {
             Type::I64 => Some(("java/lang/Long", "valueOf", "(J)Ljava/lang/Long;")),
             Type::F32 => Some(("java/lang/Float", "valueOf", "(F)Ljava/lang/Float;")),
             Type::F64 => Some(("java/lang/Double", "valueOf", "(D)Ljava/lang/Double;")),
+            _ => None,
+        }
+    }
+    /// Checks if the type is treated as a primitive on the JVM stack
+    /// (byte, short, int, long, float, double, char, boolean).
+    pub fn is_jvm_primitive_like(&self) -> bool {
+        matches!(
+            self,
+            Type::I8
+                | Type::I16
+                | Type::I32
+                | Type::I64
+                | Type::F32
+                | Type::F64
+                | Type::Char
+                | Type::Boolean
+        )
+    }
+
+    /// Provides the JVM internal name or descriptor needed for Checkcast/Anewarray.
+    pub fn to_jvm_descriptor_or_internal_name(&self) -> Option<String> {
+        match self {
+            Type::Class(name) => Some(name.clone()),
+            Type::Array(_) => Some(self.to_jvm_descriptor()), // Array descriptor works for checkcast/anewarray
+            Type::String => Some("java/lang/String".to_string()),
+            Type::Reference(inner) => inner.to_jvm_descriptor_or_internal_name(), // Or handle based on ref semantics
             _ => None,
         }
     }

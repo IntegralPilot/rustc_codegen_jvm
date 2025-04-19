@@ -12,6 +12,10 @@ use super::{
 };
 use crate::oomir;
 
+// Named "experimental" as it provides a new experimental (and not fully complete for every type) constant resolution engine to replace the overly hardcoded one in operand.rs
+// Slowly, operations are being switched over to this new engine.
+// Currently the engine is used for handling of ADTs and pointers to scalars.
+
 /// Reads a constant value of type `ty` from the `allocation` starting at `offset`.
 /// Eventually, this recursive function will replace the hardcoded/nested logic which is spagetti-like in operand.rs
 /// Currently, it is used only for ADTs as a trial period.
@@ -57,6 +61,31 @@ pub fn read_constant_value_from_memory<'tcx>(
             Ok(scalar_int_to_oomir_constant(scalar_int, &ty))
         }
 
+        TyKind::Ref(_, inner_ty, _) if inner_ty.is_str() => {
+            let size = allocation.size();
+            let range = 0..size.bytes_usize();
+
+            // Read the raw bytes, ignoring provenance and initialization checks
+            // Should be okay as we are "outisde the interpreter" as the name suggests
+            let bytes: &[u8] = allocation.inspect_with_uninit_and_ptr_outside_interpreter(range);
+            match String::from_utf8(bytes.to_vec()) {
+                Ok(s) => {
+                    println!(
+                        "Info: Successfully extracted string constant from allocation: \"{}\"",
+                        s
+                    );
+                    Ok(oomir::Constant::String(s))
+                }
+                Err(e) => {
+                    println!(
+                        "Warning: Bytes from allocation for &str were not valid UTF-8: {}",
+                        e
+                    );
+                    // TODO: make OOMIR support raw bytes?
+                    Ok(oomir::Constant::String("Invalid UTF8".to_string()))
+                }
+            }
+        }
         // --- Pointer/Reference Types (requires recursive dereference) ---
         TyKind::Ref(_, inner_ty, _) | TyKind::RawPtr(inner_ty, _) => {
             // Read the pointer scalar itself from the current allocation
@@ -65,7 +94,7 @@ pub fn read_constant_value_from_memory<'tcx>(
                 size: tcx.data_layout.pointer_size,
             };
             let scalar = allocation
-                .read_scalar(&tcx.data_layout, ptr_range, true)
+                .read_scalar(&tcx.data_layout, ptr_range, false)
                 .map_err(|e| {
                     println!("Error reading pointer scalar: {:?}", e);
                     "Failed to read pointer scalar".to_string()
@@ -109,10 +138,7 @@ pub fn read_constant_value_from_memory<'tcx>(
                         GlobalAlloc::VTable(..) => Err("Unsupported type: VTable".to_string()),
                     }
                 }
-                Scalar::Int(_) => Err(
-                    "Expected pointer scalar, found integer. A null pointer represented as an Int?"
-                        .to_string(),
-                ),
+                Scalar::Int(scalar) => Ok(scalar_int_to_oomir_constant(scalar, &ty)),
             }
         }
 
@@ -240,6 +266,7 @@ pub fn read_constant_value_from_memory<'tcx>(
             Ok(oomir::Constant::Instance {
                 class_name: tuple_class_name,
                 fields: fields_map,
+                params: vec![],
             })
         }
 
@@ -292,6 +319,7 @@ fn handle_constant_struct<'tcx>(
     Ok(oomir::Constant::Instance {
         class_name,
         fields: fields_map,
+        params: vec![],
     })
 }
 
@@ -691,5 +719,6 @@ fn handle_constant_enum<'tcx>(
     Ok(oomir::Constant::Instance {
         class_name: variant_class_name,
         fields: fields_map,
+        params: vec![],
     })
 }

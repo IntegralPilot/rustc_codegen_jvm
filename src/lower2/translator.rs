@@ -13,6 +13,8 @@ use ristretto_classfile::{self as jvm, ConstantPool};
 use std::collections::{HashMap, VecDeque};
 use std::convert::TryInto;
 
+use super::{BIG_DECIMAL_CLASS, BIG_INTEGER_CLASS};
+
 /// Represents the state during the translation of a single function's body.
 pub struct FunctionTranslator<'a, 'cp> {
     module: &'a oomir::Module,
@@ -408,146 +410,349 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         Ok(())
     }
 
-    /// Translates a comparison operation.
-    ///
-    /// The function emits code to compare `op1` and `op2` using the specified operation
-    /// (e.g. "eq", "ne", "lt", "le", "gt", "ge") and leaves a boolean (0 or 1) result.
-    /// For integer (or char) types it uses the if_icmp? instructions directly, while for I64,
-    /// F32, and F64 it first emits an explicit comparison instruction (Lcmp/Fcmpl/Dcmpl)
-    /// and then an integer branch instruction (Ifeq, Ifne, Iflt, Ifle, Ifgt, or Ifge).
+    /// Determines the common comparison type based on numeric promotion rules,
+    /// including BigInteger and BigDecimal. Also returns necessary cast targets.
+    fn determine_comparison_type(
+        &self, // Keep self if error reporting needs function context
+        op1_type: &oomir::Type,
+        op2_type: &oomir::Type,
+    ) -> Result<(oomir::Type, Option<oomir::Type>, Option<oomir::Type>), jvm::Error> {
+        // Helper to check if a type is BigInteger or BigDecimal
+        let is_big_type = |ty: &Type| {
+            matches!(ty,
+            Type::Class(c) if c == BIG_INTEGER_CLASS || c == BIG_DECIMAL_CLASS)
+        };
+
+        // Helper to check if a type is numeric primitive or boolean/char
+        let is_promotable_primitive = |ty: &Type| {
+            matches!(
+                ty,
+                Type::I8
+                    | Type::I16
+                    | Type::I32
+                    | Type::I64
+                    | Type::F32
+                    | Type::F64
+                    | Type::Boolean
+                    | Type::Char
+            )
+        };
+
+        match (op1_type, op2_type) {
+            // --- Both are the same type ---
+            (t1, t2) if t1 == t2 => {
+                // Check if the type itself is comparable
+                match t1 {
+                    Type::I8
+                    | Type::I16
+                    | Type::I32
+                    | Type::I64
+                    | Type::F32
+                    | Type::F64
+                    | Type::Boolean
+                    | Type::Char
+                    | Type::Class(_)
+                    | Type::String
+                    | Type::Reference(_)
+                    | Type::Array(_) => Ok((t1.clone(), None, None)), // Assume comparable for now, specific logic in main function handles details
+                    Type::Void => Err(jvm::Error::VerificationError {
+                        context: format!("Function {}", self.oomir_func.name),
+                        message: format!("Cannot compare void types"),
+                    }),
+                }
+            }
+
+            // --- BigInteger / BigDecimal Handling ---
+            (Type::Class(c1), t2) if c1 == BIG_INTEGER_CLASS && is_promotable_primitive(t2) => {
+                Ok((op1_type.clone(), None, Some(op1_type.clone())))
+            } // Promote primitive to BigInt
+            (t1, Type::Class(c2)) if c2 == BIG_INTEGER_CLASS && is_promotable_primitive(t1) => {
+                Ok((op2_type.clone(), Some(op2_type.clone()), None))
+            } // Promote primitive to BigInt
+
+            (Type::Class(c1), t2) if c1 == BIG_DECIMAL_CLASS && is_promotable_primitive(t2) => {
+                Ok((op1_type.clone(), None, Some(op1_type.clone())))
+            } // Promote primitive to BigDec
+            (t1, Type::Class(c2)) if c2 == BIG_DECIMAL_CLASS && is_promotable_primitive(t1) => {
+                Ok((op2_type.clone(), Some(op2_type.clone()), None))
+            } // Promote primitive to BigDec
+
+            // Prevent comparing BigInt with BigDec directly (require explicit cast in source)
+            (Type::Class(c1), Type::Class(c2))
+                if (c1 == BIG_INTEGER_CLASS && c2 == BIG_DECIMAL_CLASS)
+                    || (c1 == BIG_DECIMAL_CLASS && c2 == BIG_INTEGER_CLASS) =>
+            {
+                Err(jvm::Error::VerificationError {
+                    context: format!("Function {}", self.oomir_func.name),
+                    message: format!(
+                        "Cannot directly compare BigInteger and BigDecimal. Cast one operand explicitly."
+                    ),
+                })
+            }
+
+            // Prevent comparing Big types with other non-primitive reference types for now
+            (t1, t2)
+                if (is_big_type(t1) && !is_promotable_primitive(t2) && !is_big_type(t2))
+                    || (is_big_type(t2) && !is_promotable_primitive(t1) && !is_big_type(t1)) =>
+            {
+                Err(jvm::Error::VerificationError {
+                    context: format!("Function {}", self.oomir_func.name),
+                    message: format!(
+                        "Cannot compare BigInteger/BigDecimal with non-primitive type: {:?} vs {:?}",
+                        op1_type, op2_type
+                    ),
+                })
+            }
+
+            // --- Numeric Primitive Promotion Rules ---
+            (t1, t2) if is_promotable_primitive(t1) && is_promotable_primitive(t2) => {
+                // Determine target type based on promotion rules
+                let target_type = if t1 == &Type::F64 || t2 == &Type::F64 {
+                    Type::F64
+                } else if t1 == &Type::F32 || t2 == &Type::F32 {
+                    Type::F32
+                } else if t1 == &Type::I64 || t2 == &Type::I64 {
+                    Type::I64
+                } else {
+                    Type::I32
+                }; // Promote smaller ints/bool/char to I32
+
+                let cast1 = if t1 != &target_type {
+                    Some(target_type.clone())
+                } else {
+                    None
+                };
+                let cast2 = if t2 != &target_type {
+                    Some(target_type.clone())
+                } else {
+                    None
+                };
+                Ok((target_type, cast1, cast2))
+            }
+
+            // --- Reference Type Equality (only eq/ne) ---
+            // Handled by the t1 == t2 case for simplicity, but could be explicit:
+            (t1, t2) if t1.is_jvm_reference_type() && t2.is_jvm_reference_type() => {
+                // Allow comparison if types are compatible (e.g. String vs String, MyClass vs MyClass)
+                // For now, require exact match for simplicity. Could potentially allow subclass checks later.
+                if t1 == t2 {
+                    Ok((t1.clone(), None, None)) // Compare as references
+                } else {
+                    Err(jvm::Error::VerificationError {
+                        context: format!("Function {}", self.oomir_func.name),
+                        message: format!(
+                            "Cannot compare incompatible reference types: {:?} vs {:?}",
+                            op1_type, op2_type
+                        ),
+                    })
+                }
+            }
+
+            // --- Fallback for other unsupported combinations ---
+            _ => Err(jvm::Error::VerificationError {
+                context: format!("Function {}", self.oomir_func.name),
+                message: format!(
+                    "Unsupported comparison between types: {:?} and {:?}",
+                    op1_type, op2_type
+                ),
+            }),
+        }
+    }
+
     fn translate_comparison_op(
         &mut self,
         dest: &str,
         op1: &oomir::Operand,
         op2: &oomir::Operand,
-        comp_op: &str, // expected values: "eq", "ne", "lt", "le", "gt", "ge"
+        comp_op: &str, // "eq", "ne", "lt", "le", "gt", "ge"
     ) -> Result<(), jvm::Error> {
-        // Determine operand types.
         let op1_type = get_operand_type(op1);
         let op2_type = get_operand_type(op2);
-        if op1_type != op2_type {
-            return Err(jvm::Error::VerificationError {
-                context: format!("Function {}", self.oomir_func.name),
-                message: format!(
-                    "Type mismatch in comparison: {:?} vs {:?}",
-                    op1_type, op2_type
-                ),
-            });
+
+        // Determine the type to compare operands as, and if casting is needed
+        let (comparison_type, cast1_target, cast2_target) =
+            self.determine_comparison_type(&op1_type, &op2_type)?;
+
+        // --- Load and Cast Operands ---
+        self.load_operand(op1)?;
+        if let Some(target_type) = cast1_target {
+            // Use the enhanced casting helper which needs the constant pool
+            let cast_instrs =
+                get_cast_instructions(&op1_type, &target_type, &mut self.constant_pool)?;
+            self.jvm_instructions.extend(cast_instrs);
         }
 
-        // Load both operands onto the stack.
-        self.load_operand(op1)?;
         self.load_operand(op2)?;
+        if let Some(target_type) = cast2_target {
+            let cast_instrs =
+                get_cast_instructions(&op2_type, &target_type, &mut self.constant_pool)?;
+            self.jvm_instructions.extend(cast_instrs);
+        }
+        // Stack now holds: [value1_promoted, value2_promoted] (both of comparison_type)
 
-        // These will be set to the branch constructor function and an optional comparison
-        // instruction to be emitted first.
+        // --- Perform Comparison based on comparison_type ---
         let branch_constructor: Box<dyn Fn(u16) -> Instruction>;
-        // For types where a separate compare instruction is required (I64, F32, F64),
-        // we emit that now.
-        match op1_type {
-            // For I8->I32 and Char, we can do a direct if_icmp? branch.
-            oomir::Type::I8
-            | oomir::Type::I16
-            | oomir::Type::I32
-            | oomir::Type::Char
-            | oomir::Type::Boolean => {
-                branch_constructor = Box::new(|offset| match comp_op {
+        //let is_reference_comparison = comparison_type.is_jvm_reference_type();
+
+        match comparison_type {
+            // Integer types (I32 includes promoted I8, I16, Char, Boolean)
+            Type::I8 | Type::I16 | Type::I32 | Type::Char | Type::Boolean => {
+                if !["eq", "ne", "lt", "le", "gt", "ge"].contains(&comp_op) { /* error */ }
+                branch_constructor = Box::new(move |offset| match comp_op {
+                    // move comp_op
                     "eq" => Instruction::If_icmpeq(offset),
                     "ne" => Instruction::If_icmpne(offset),
                     "lt" => Instruction::If_icmplt(offset),
                     "le" => Instruction::If_icmple(offset),
                     "gt" => Instruction::If_icmpgt(offset),
                     "ge" => Instruction::If_icmpge(offset),
+                    _ => unreachable!(), // Already checked
+                });
+            }
+            Type::I64 => {
+                if !["eq", "ne", "lt", "le", "gt", "ge"].contains(&comp_op) { /* error */ }
+                self.jvm_instructions.push(Instruction::Lcmp); // Stack: [int_result]
+                branch_constructor = Box::new(move |offset| match comp_op {
+                    // move comp_op
+                    "eq" => Instruction::Ifeq(offset), // compares int_result with 0
+                    "ne" => Instruction::Ifne(offset),
+                    "lt" => Instruction::Iflt(offset),
+                    "le" => Instruction::Ifle(offset),
+                    "gt" => Instruction::Ifgt(offset),
+                    "ge" => Instruction::Ifge(offset),
+                    _ => unreachable!(),
+                });
+            }
+            Type::F32 => {
+                if !["eq", "ne", "lt", "le", "gt", "ge"].contains(&comp_op) { /* error */ }
+                // Use Fcmpl (NaN -> -1) or Fcmpg (NaN -> +1). Doesn't matter for == 0.
+                self.jvm_instructions.push(Instruction::Fcmpl); // Stack: [int_result]
+                branch_constructor = Box::new(move |offset| match comp_op {
+                    // move comp_op
+                    "eq" => Instruction::Ifeq(offset),
+                    "ne" => Instruction::Ifne(offset),
+                    "lt" => Instruction::Iflt(offset),
+                    "le" => Instruction::Ifle(offset),
+                    "gt" => Instruction::Ifgt(offset),
+                    "ge" => Instruction::Ifge(offset),
+                    _ => unreachable!(),
+                });
+            }
+            Type::F64 => {
+                if !["eq", "ne", "lt", "le", "gt", "ge"].contains(&comp_op) { /* error */ }
+                self.jvm_instructions.push(Instruction::Dcmpl); // Stack: [int_result]
+                branch_constructor = Box::new(move |offset| match comp_op {
+                    // move comp_op
+                    "eq" => Instruction::Ifeq(offset),
+                    "ne" => Instruction::Ifne(offset),
+                    "lt" => Instruction::Iflt(offset),
+                    "le" => Instruction::Ifle(offset),
+                    "gt" => Instruction::Ifgt(offset),
+                    "ge" => Instruction::Ifge(offset),
+                    _ => unreachable!(),
+                });
+            }
+            Type::Class(ref class_name) if class_name == BIG_INTEGER_CLASS => {
+                if !["eq", "ne", "lt", "le", "gt", "ge"].contains(&comp_op) { /* error */ }
+                // Call BigInteger.compareTo(BigInteger) -> int
+                let class_idx = self.constant_pool.add_class(BIG_INTEGER_CLASS)?;
+                let method_ref = self.constant_pool.add_method_ref(
+                    class_idx,
+                    "compareTo",
+                    "(Ljava/math/BigInteger;)I",
+                )?;
+                self.jvm_instructions
+                    .push(Instruction::Invokevirtual(method_ref)); // Stack: [int_result]
+                // Branch based on the int result compared to 0
+                branch_constructor = Box::new(move |offset| match comp_op {
+                    // move comp_op
+                    "eq" => Instruction::Ifeq(offset),
+                    "ne" => Instruction::Ifne(offset),
+                    "lt" => Instruction::Iflt(offset),
+                    "le" => Instruction::Ifle(offset),
+                    "gt" => Instruction::Ifgt(offset),
+                    "ge" => Instruction::Ifge(offset),
+                    _ => unreachable!(),
+                });
+            }
+            Type::Class(ref class_name) if class_name == BIG_DECIMAL_CLASS => {
+                if !["eq", "ne", "lt", "le", "gt", "ge"].contains(&comp_op) { /* error */ }
+                // Call BigDecimal.compareTo(BigDecimal) -> int
+                let class_idx = self.constant_pool.add_class(BIG_DECIMAL_CLASS)?;
+                let method_ref = self.constant_pool.add_method_ref(
+                    class_idx,
+                    "compareTo",
+                    "(Ljava/math/BigDecimal;)I",
+                )?;
+                self.jvm_instructions
+                    .push(Instruction::Invokevirtual(method_ref)); // Stack: [int_result]
+                // Branch based on the int result compared to 0
+                branch_constructor = Box::new(move |offset| match comp_op {
+                    // move comp_op
+                    "eq" => Instruction::Ifeq(offset),
+                    "ne" => Instruction::Ifne(offset),
+                    "lt" => Instruction::Iflt(offset),
+                    "le" => Instruction::Ifle(offset),
+                    "gt" => Instruction::Ifgt(offset),
+                    "ge" => Instruction::Ifge(offset),
+                    _ => unreachable!(),
+                });
+            }
+            // General Reference types (including String, Array, other Classes)
+            ref ty if ty.is_jvm_reference_type() => {
+                // Only support equality/inequality for general references
+                match comp_op {
+                    "eq" => branch_constructor = Box::new(|offset| Instruction::If_acmpeq(offset)),
+                    "ne" => branch_constructor = Box::new(|offset| Instruction::If_acmpne(offset)),
                     _ => {
-                        // This branch should never be reached if comp_op is validated.
-                        Instruction::Nop
+                        return Err(jvm::Error::VerificationError {
+                            context: format!("Function {}", self.oomir_func.name),
+                            message: format!(
+                                "Unsupported comparison operator '{}' for reference type {:?}",
+                                comp_op, comparison_type
+                            ),
+                        });
                     }
-                });
+                }
             }
-            // For I64, we need to perform a comparison (Lcmp) then use an integer branch.
-            oomir::Type::I64 => {
-                self.jvm_instructions.push(Instruction::Lcmp); // Compares two longs; result is int.
-                branch_constructor = Box::new(|offset| match comp_op {
-                    "eq" => Instruction::Ifeq(offset),
-                    "ne" => Instruction::Ifne(offset),
-                    "lt" => Instruction::Iflt(offset),
-                    "le" => Instruction::Ifle(offset),
-                    "gt" => Instruction::Ifgt(offset),
-                    "ge" => Instruction::Ifge(offset),
-                    _ => Instruction::Nop,
-                });
-            }
-            // For F32, perform a float comparison.
-            oomir::Type::F32 => {
-                self.jvm_instructions.push(Instruction::Fcmpl); // Compares floats; result is int.
-                branch_constructor = Box::new(|offset| match comp_op {
-                    "eq" => Instruction::Ifeq(offset),
-                    "ne" => Instruction::Ifne(offset),
-                    "lt" => Instruction::Iflt(offset),
-                    "le" => Instruction::Ifle(offset),
-                    "gt" => Instruction::Ifgt(offset),
-                    "ge" => Instruction::Ifge(offset),
-                    _ => Instruction::Nop,
-                });
-            }
-            // For F64, perform a double comparison.
-            oomir::Type::F64 => {
-                self.jvm_instructions.push(Instruction::Dcmpl); // Compares doubles; result is int.
-                branch_constructor = Box::new(|offset| match comp_op {
-                    "eq" => Instruction::Ifeq(offset),
-                    "ne" => Instruction::Ifne(offset),
-                    "lt" => Instruction::Iflt(offset),
-                    "le" => Instruction::Ifle(offset),
-                    "gt" => Instruction::Ifgt(offset),
-                    "ge" => Instruction::Ifge(offset),
-                    _ => Instruction::Nop,
-                });
-            }
+
+            // Should be caught by determine_comparison_type, but as a safeguard:
             _ => {
                 return Err(jvm::Error::VerificationError {
                     context: format!("Function {}", self.oomir_func.name),
-                    message: format!("Unsupported type for comparison: {:?}", op1_type),
+                    message: format!("Unsupported type for comparison: {:?}", comparison_type),
                 });
             }
         }
 
-        // Validate that the comp_op string was one of the allowed values.
-        if !["eq", "ne", "lt", "le", "gt", "ge"].contains(&comp_op) {
-            return Err(jvm::Error::VerificationError {
-                context: format!("Function {}", self.oomir_func.name),
-                message: format!("Invalid comparison operator: {}", comp_op),
-            });
-        }
-
-        // Record instruction indices and labels for branch fixups.
+        // --- Generate Branching Logic (unchanged from original) ---
         let instr_idx_if = self.jvm_instructions.len();
         let label_true = format!("_comparison_true_{}", instr_idx_if);
         let label_after = format!("_comparison_after_{}", instr_idx_if);
 
-        // Emit branch instruction using the branch_constructor.
-        // The actual branch offset is a placeholder (0) to be fixed later.
-        self.jvm_instructions.push(branch_constructor(0));
+        // Emit branch instruction (using the constructor decided above)
+        self.jvm_instructions.push(branch_constructor(0)); // Placeholder offset
         self.branch_fixups.push((instr_idx_if, label_true.clone()));
 
-        // False case: push 0 (false)
+        // False case: push 0
         self.jvm_instructions.push(Instruction::Iconst_0);
         let instr_idx_goto_after = self.jvm_instructions.len();
-        self.jvm_instructions.push(Instruction::Goto(0)); // Placeholder offset.
+        self.jvm_instructions.push(Instruction::Goto(0)); // Placeholder offset
         self.branch_fixups
             .push((instr_idx_goto_after, label_after.clone()));
 
-        // True case: record label, then push 1 (true)
+        // True case: record label, push 1
         let true_instr_index: u16 = self.jvm_instructions.len().try_into().unwrap();
         self.label_to_instr_index
             .insert(label_true, true_instr_index);
         self.jvm_instructions.push(Instruction::Iconst_1);
 
-        // After branch: record label.
+        // After branch: record label
         let after_instr_index: u16 = self.jvm_instructions.len().try_into().unwrap();
         self.label_to_instr_index
             .insert(label_after, after_instr_index);
 
-        // Store the result (comparison yields a boolean value).
+        // Store the boolean result (unchanged)
         self.store_result(dest, &oomir::Type::Boolean)?;
 
         Ok(())
@@ -566,99 +771,453 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
 
         match instr {
             OI::Add { dest, op1, op2 } => {
-                let op_type = match op1 {
-                    oomir::Operand::Variable { ty, .. } => ty.clone(),
-                    oomir::Operand::Constant(c) => Type::from_constant(c),
+                let op1_type = get_operand_type(op1);
+                let op2_type = get_operand_type(op2); // Get type of op2 as well
+
+                // Promote based on types (Simplified: assumes BigInt/BigDec promote others)
+                // A more robust system would use determine_comparison_type logic
+                let op_type = if op1_type == Type::Class(BIG_DECIMAL_CLASS.to_string())
+                    || op2_type == Type::Class(BIG_DECIMAL_CLASS.to_string())
+                {
+                    Type::Class(BIG_DECIMAL_CLASS.to_string())
+                } else if op1_type == Type::Class(BIG_INTEGER_CLASS.to_string())
+                    || op2_type == Type::Class(BIG_INTEGER_CLASS.to_string())
+                {
+                    Type::Class(BIG_INTEGER_CLASS.to_string())
+                } else {
+                    // Fallback to op1's type for primitive promotion (translate_binary_op handles this)
+                    op1_type.clone()
                 };
-                let jvm_op = match op_type {
-                    Type::I32 | Type::I8 | Type::I16 | Type::Boolean | Type::Char => JI::Iadd,
-                    Type::I64 => JI::Ladd,
-                    Type::F32 => JI::Fadd,
-                    Type::F64 => JI::Dadd,
+
+                match op_type {
+                    Type::I32 | Type::I8 | Type::I16 | Type::Boolean | Type::Char => {
+                        // TODO: Implement numeric promotion (e.g., i8+i32 -> i32) if not handled by translate_binary_op
+                        self.translate_binary_op(dest, op1, op2, JI::Iadd)?
+                    }
+                    Type::I64 => self.translate_binary_op(dest, op1, op2, JI::Ladd)?,
+                    Type::F32 => self.translate_binary_op(dest, op1, op2, JI::Fadd)?,
+                    Type::F64 => self.translate_binary_op(dest, op1, op2, JI::Dadd)?,
+                    Type::Class(ref c) if c == BIG_INTEGER_CLASS => {
+                        // BigInteger ADD operation: add(BigInteger)
+                        let class_idx = self.constant_pool.add_class(BIG_INTEGER_CLASS)?;
+                        let method_ref = self.constant_pool.add_method_ref(
+                            class_idx,
+                            "add",
+                            "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+                        )?;
+
+                        // 1. Load op1, casting to BigInt if needed
+                        self.load_operand(op1)?;
+                        if op1_type != op_type {
+                            let cast_instrs =
+                                get_cast_instructions(&op1_type, &op_type, self.constant_pool)?;
+                            self.jvm_instructions.extend(cast_instrs);
+                        }
+                        // 2. Load op2, casting to BigInt if needed
+                        self.load_operand(op2)?;
+                        if op2_type != op_type {
+                            let cast_instrs =
+                                get_cast_instructions(&op2_type, &op_type, self.constant_pool)?;
+                            self.jvm_instructions.extend(cast_instrs);
+                        }
+                        // 3. Call the method
+                        self.jvm_instructions.push(JI::Invokevirtual(method_ref)); // Stack: [result]
+                        // 4. Store the result
+                        self.store_result(dest, &op_type)?; // Stack: []
+                    }
+                    Type::Class(ref c) if c == BIG_DECIMAL_CLASS => {
+                        // BigDecimal ADD operation: add(BigDecimal)
+                        let class_idx = self.constant_pool.add_class(BIG_DECIMAL_CLASS)?;
+                        let method_ref = self.constant_pool.add_method_ref(
+                            class_idx,
+                            "add",
+                            "(Ljava/math/BigDecimal;)Ljava/math/BigDecimal;",
+                        )?;
+                        // 1. Load op1, casting to BigDec if needed
+                        self.load_operand(op1)?;
+                        if op1_type != op_type {
+                            let cast_instrs =
+                                get_cast_instructions(&op1_type, &op_type, self.constant_pool)?;
+                            self.jvm_instructions.extend(cast_instrs);
+                        }
+                        // 2. Load op2, casting to BigDec if needed
+                        self.load_operand(op2)?;
+                        if op2_type != op_type {
+                            let cast_instrs =
+                                get_cast_instructions(&op2_type, &op_type, self.constant_pool)?;
+                            self.jvm_instructions.extend(cast_instrs);
+                        }
+                        // 3. Call the method
+                        self.jvm_instructions.push(JI::Invokevirtual(method_ref)); // Stack: [result]
+                        // 4. Store the result
+                        self.store_result(dest, &op_type)?; // Stack: []
+                    }
                     _ => {
                         return Err(jvm::Error::VerificationError {
                             context: format!("Function {}", self.oomir_func.name),
                             message: format!("Unsupported type for Add operation: {:?}", op_type),
                         });
                     }
-                };
-                self.translate_binary_op(dest, op1, op2, jvm_op)?
+                }
             }
             OI::Sub { dest, op1, op2 } => {
-                let op_type = match op1 {
-                    oomir::Operand::Variable { ty, .. } => ty.clone(),
-                    oomir::Operand::Constant(c) => Type::from_constant(c),
+                let op1_type = get_operand_type(op1);
+                let op2_type = get_operand_type(op2);
+
+                // Determine result type (similar promotion logic as Add)
+                let op_type = if op1_type == Type::Class(BIG_DECIMAL_CLASS.to_string())
+                    || op2_type == Type::Class(BIG_DECIMAL_CLASS.to_string())
+                {
+                    Type::Class(BIG_DECIMAL_CLASS.to_string())
+                } else if op1_type == Type::Class(BIG_INTEGER_CLASS.to_string())
+                    || op2_type == Type::Class(BIG_INTEGER_CLASS.to_string())
+                {
+                    Type::Class(BIG_INTEGER_CLASS.to_string())
+                } else {
+                    op1_type.clone()
                 };
-                let jvm_op = match op_type {
-                    Type::I32 | Type::I8 | Type::I16 | Type::Boolean | Type::Char => JI::Isub,
-                    Type::I64 => JI::Lsub,
-                    Type::F32 => JI::Fsub,
-                    Type::F64 => JI::Dsub,
+
+                match op_type {
+                    Type::I32 | Type::I8 | Type::I16 | Type::Boolean | Type::Char => {
+                        self.translate_binary_op(dest, op1, op2, JI::Isub)?
+                    }
+                    Type::I64 => self.translate_binary_op(dest, op1, op2, JI::Lsub)?,
+                    Type::F32 => self.translate_binary_op(dest, op1, op2, JI::Fsub)?,
+                    Type::F64 => self.translate_binary_op(dest, op1, op2, JI::Dsub)?,
+                    Type::Class(ref c) if c == BIG_INTEGER_CLASS => {
+                        // BigInteger SUBTRACT operation: subtract(BigInteger)
+                        let class_idx = self.constant_pool.add_class(BIG_INTEGER_CLASS)?;
+                        let method_ref = self.constant_pool.add_method_ref(
+                            class_idx,
+                            "subtract", // Correct method name
+                            "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+                        )?;
+
+                        // 1. Load op1, casting if needed
+                        self.load_operand(op1)?;
+                        if op1_type != op_type {
+                            let cast_instrs =
+                                get_cast_instructions(&op1_type, &op_type, self.constant_pool)?;
+                            self.jvm_instructions.extend(cast_instrs);
+                        }
+                        // 2. Load op2, casting if needed
+                        self.load_operand(op2)?;
+                        if op2_type != op_type {
+                            let cast_instrs =
+                                get_cast_instructions(&op2_type, &op_type, self.constant_pool)?;
+                            self.jvm_instructions.extend(cast_instrs);
+                        }
+                        // 3. Call the method
+                        self.jvm_instructions.push(JI::Invokevirtual(method_ref));
+                        // 4. Store the result
+                        self.store_result(dest, &op_type)?;
+                    }
+                    Type::Class(ref c) if c == BIG_DECIMAL_CLASS => {
+                        // BigDecimal SUBTRACT operation: subtract(BigDecimal)
+                        let class_idx = self.constant_pool.add_class(BIG_DECIMAL_CLASS)?;
+                        let method_ref = self.constant_pool.add_method_ref(
+                            class_idx,
+                            "subtract", // Correct method name
+                            "(Ljava/math/BigDecimal;)Ljava/math/BigDecimal;",
+                        )?;
+                        // 1. Load op1, casting if needed
+                        self.load_operand(op1)?;
+                        if op1_type != op_type {
+                            let cast_instrs =
+                                get_cast_instructions(&op1_type, &op_type, self.constant_pool)?;
+                            self.jvm_instructions.extend(cast_instrs);
+                        }
+                        // 2. Load op2, casting if needed
+                        self.load_operand(op2)?;
+                        if op2_type != op_type {
+                            let cast_instrs =
+                                get_cast_instructions(&op2_type, &op_type, self.constant_pool)?;
+                            self.jvm_instructions.extend(cast_instrs);
+                        }
+                        // 3. Call the method
+                        self.jvm_instructions.push(JI::Invokevirtual(method_ref));
+                        // 4. Store the result
+                        self.store_result(dest, &op_type)?;
+                    }
                     _ => {
                         return Err(jvm::Error::VerificationError {
                             context: format!("Function {}", self.oomir_func.name),
                             message: format!("Unsupported type for Sub operation: {:?}", op_type),
                         });
                     }
-                };
-                self.translate_binary_op(dest, op1, op2, jvm_op)?
+                }
             }
             OI::Mul { dest, op1, op2 } => {
-                let op_type = match op1 {
-                    oomir::Operand::Variable { ty, .. } => ty.clone(),
-                    oomir::Operand::Constant(c) => Type::from_constant(c),
+                let op1_type = get_operand_type(op1);
+                let op2_type = get_operand_type(op2);
+                let op_type = if op1_type == Type::Class(BIG_DECIMAL_CLASS.to_string())
+                    || op2_type == Type::Class(BIG_DECIMAL_CLASS.to_string())
+                {
+                    Type::Class(BIG_DECIMAL_CLASS.to_string())
+                } else if op1_type == Type::Class(BIG_INTEGER_CLASS.to_string())
+                    || op2_type == Type::Class(BIG_INTEGER_CLASS.to_string())
+                {
+                    Type::Class(BIG_INTEGER_CLASS.to_string())
+                } else {
+                    op1_type.clone()
                 };
-                let jvm_op = match op_type {
-                    Type::I32 | Type::I8 | Type::I16 | Type::Boolean | Type::Char => JI::Imul,
-                    Type::I64 => JI::Lmul,
-                    Type::F32 => JI::Fmul,
-                    Type::F64 => JI::Dmul,
+
+                match op_type {
+                    Type::I32 | Type::I8 | Type::I16 | Type::Boolean | Type::Char => {
+                        self.translate_binary_op(dest, op1, op2, JI::Imul)?
+                    }
+                    Type::I64 => self.translate_binary_op(dest, op1, op2, JI::Lmul)?,
+                    Type::F32 => self.translate_binary_op(dest, op1, op2, JI::Fmul)?,
+                    Type::F64 => self.translate_binary_op(dest, op1, op2, JI::Dmul)?,
+                    Type::Class(ref c) if c == BIG_INTEGER_CLASS => {
+                        // BigInteger MULTIPLY operation: multiply(BigInteger)
+                        let class_idx = self.constant_pool.add_class(BIG_INTEGER_CLASS)?;
+                        let method_ref = self.constant_pool.add_method_ref(
+                            class_idx,
+                            "multiply", // Correct method name
+                            "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+                        )?;
+
+                        self.load_operand(op1)?; // Load op1
+                        if op1_type != op_type {
+                            // Cast if needed
+                            let cast_instrs =
+                                get_cast_instructions(&op1_type, &op_type, self.constant_pool)?;
+                            self.jvm_instructions.extend(cast_instrs);
+                        }
+                        self.load_operand(op2)?; // Load op2
+                        if op2_type != op_type {
+                            // Cast if needed
+                            let cast_instrs =
+                                get_cast_instructions(&op2_type, &op_type, self.constant_pool)?;
+                            self.jvm_instructions.extend(cast_instrs);
+                        }
+                        self.jvm_instructions.push(JI::Invokevirtual(method_ref)); // Call
+                        self.store_result(dest, &op_type)?; // Store
+                    }
+                    Type::Class(ref c) if c == BIG_DECIMAL_CLASS => {
+                        // BigDecimal MULTIPLY operation: multiply(BigDecimal)
+                        let class_idx = self.constant_pool.add_class(BIG_DECIMAL_CLASS)?;
+                        let method_ref = self.constant_pool.add_method_ref(
+                            class_idx,
+                            "multiply", // Correct method name
+                            "(Ljava/math/BigDecimal;)Ljava/math/BigDecimal;",
+                        )?;
+
+                        self.load_operand(op1)?; // Load op1
+                        if op1_type != op_type {
+                            // Cast if needed
+                            let cast_instrs =
+                                get_cast_instructions(&op1_type, &op_type, self.constant_pool)?;
+                            self.jvm_instructions.extend(cast_instrs);
+                        }
+                        self.load_operand(op2)?; // Load op2
+                        if op2_type != op_type {
+                            // Cast if needed
+                            let cast_instrs =
+                                get_cast_instructions(&op2_type, &op_type, self.constant_pool)?;
+                            self.jvm_instructions.extend(cast_instrs);
+                        }
+                        self.jvm_instructions.push(JI::Invokevirtual(method_ref)); // Call
+                        self.store_result(dest, &op_type)?; // Store
+                    }
                     _ => {
                         return Err(jvm::Error::VerificationError {
                             context: format!("Function {}", self.oomir_func.name),
                             message: format!("Unsupported type for Mul operation: {:?}", op_type),
                         });
                     }
-                };
-                self.translate_binary_op(dest, op1, op2, jvm_op)?
+                }
             }
             OI::Div { dest, op1, op2 } => {
-                let op_type = match op1 {
-                    oomir::Operand::Variable { ty, .. } => ty.clone(),
-                    oomir::Operand::Constant(c) => Type::from_constant(c),
+                let op1_type = get_operand_type(op1);
+                let op2_type = get_operand_type(op2);
+                let op_type = if op1_type == Type::Class(BIG_DECIMAL_CLASS.to_string())
+                    || op2_type == Type::Class(BIG_DECIMAL_CLASS.to_string())
+                {
+                    Type::Class(BIG_DECIMAL_CLASS.to_string())
+                } else if op1_type == Type::Class(BIG_INTEGER_CLASS.to_string())
+                    || op2_type == Type::Class(BIG_INTEGER_CLASS.to_string())
+                {
+                    Type::Class(BIG_INTEGER_CLASS.to_string())
+                } else {
+                    op1_type.clone()
                 };
-                let jvm_op = match op_type {
-                    Type::I32 | Type::I8 | Type::I16 | Type::Boolean | Type::Char => JI::Idiv,
-                    Type::I64 => JI::Ldiv,
-                    Type::F32 => JI::Fdiv,
-                    Type::F64 => JI::Ddiv,
+
+                match op_type {
+                    Type::I32 | Type::I8 | Type::I16 | Type::Boolean | Type::Char => {
+                        // Potential DivisionByZeroError for primitives handled by JVM
+                        self.translate_binary_op(dest, op1, op2, JI::Idiv)?
+                    }
+                    Type::I64 => self.translate_binary_op(dest, op1, op2, JI::Ldiv)?,
+                    Type::F32 => self.translate_binary_op(dest, op1, op2, JI::Fdiv)?, // Handles +/- Infinity, NaN
+                    Type::F64 => self.translate_binary_op(dest, op1, op2, JI::Ddiv)?, // Handles +/- Infinity, NaN
+                    Type::Class(ref c) if c == BIG_INTEGER_CLASS => {
+                        // BigInteger DIVIDE operation: divide(BigInteger)
+                        // Throws ArithmeticException if divisor is zero.
+                        let class_idx = self.constant_pool.add_class(BIG_INTEGER_CLASS)?;
+                        let method_ref = self.constant_pool.add_method_ref(
+                            class_idx,
+                            "divide", // Correct method name
+                            "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+                        )?;
+
+                        self.load_operand(op1)?; // Load op1
+                        if op1_type != op_type {
+                            // Cast if needed
+                            let cast_instrs =
+                                get_cast_instructions(&op1_type, &op_type, self.constant_pool)?;
+                            self.jvm_instructions.extend(cast_instrs);
+                        }
+                        self.load_operand(op2)?; // Load op2
+                        if op2_type != op_type {
+                            // Cast if needed
+                            let cast_instrs =
+                                get_cast_instructions(&op2_type, &op_type, self.constant_pool)?;
+                            self.jvm_instructions.extend(cast_instrs);
+                        }
+                        self.jvm_instructions.push(JI::Invokevirtual(method_ref)); // Call
+                        self.store_result(dest, &op_type)?; // Store
+                    }
+                    Type::Class(ref c) if c == BIG_DECIMAL_CLASS => {
+                        // BigDecimal DIVIDE operation: divide(BigDecimal, RoundingMode)
+                        // Using RoundingMode.HALF_UP.
+                        // Throws ArithmeticException if divisor is zero or exact result requires infinite digits.
+                        let rounding_mode_enum = "java/math/RoundingMode";
+                        let rounding_mode_field = "HALF_UP"; // Example default
+
+                        let big_dec_class_idx = self.constant_pool.add_class(BIG_DECIMAL_CLASS)?;
+                        let rounding_mode_class_idx =
+                            self.constant_pool.add_class(rounding_mode_enum)?;
+
+                        // Method ref for divide(BigDecimal, RoundingMode)
+                        let method_ref = self.constant_pool.add_method_ref(
+                            big_dec_class_idx,
+                            "divide",
+                            &format!(
+                                "(Ljava/math/BigDecimal;L{};)Ljava/math/BigDecimal;",
+                                rounding_mode_enum
+                            ),
+                        )?;
+                        // Field ref for the RoundingMode constant
+                        let field_ref = self.constant_pool.add_field_ref(
+                            rounding_mode_class_idx,
+                            rounding_mode_field,
+                            &format!("L{};", rounding_mode_enum), // Descriptor for the enum field
+                        )?;
+
+                        self.load_operand(op1)?; // Load op1 (dividend)
+                        if op1_type != op_type {
+                            // Cast if needed
+                            let cast_instrs =
+                                get_cast_instructions(&op1_type, &op_type, self.constant_pool)?;
+                            self.jvm_instructions.extend(cast_instrs);
+                        }
+                        self.load_operand(op2)?; // Load op2 (divisor)
+                        if op2_type != op_type {
+                            // Cast if needed
+                            let cast_instrs =
+                                get_cast_instructions(&op2_type, &op_type, self.constant_pool)?;
+                            self.jvm_instructions.extend(cast_instrs);
+                        }
+                        // Load the RoundingMode constant
+                        self.jvm_instructions.push(JI::Getstatic(field_ref)); // Stack: [op1, op2, rounding_mode]
+
+                        self.jvm_instructions.push(JI::Invokevirtual(method_ref)); // Call
+                        self.store_result(dest, &op_type)?; // Store
+                    }
                     _ => {
                         return Err(jvm::Error::VerificationError {
                             context: format!("Function {}", self.oomir_func.name),
                             message: format!("Unsupported type for Div operation: {:?}", op_type),
                         });
                     }
-                };
-                self.translate_binary_op(dest, op1, op2, jvm_op)?
+                }
             }
             OI::Rem { dest, op1, op2 } => {
-                let op_type = match op1 {
-                    oomir::Operand::Variable { ty, .. } => ty.clone(),
-                    oomir::Operand::Constant(c) => Type::from_constant(c),
+                let op1_type = get_operand_type(op1);
+                let op2_type = get_operand_type(op2);
+                let op_type = if op1_type == Type::Class(BIG_DECIMAL_CLASS.to_string())
+                    || op2_type == Type::Class(BIG_DECIMAL_CLASS.to_string())
+                {
+                    Type::Class(BIG_DECIMAL_CLASS.to_string())
+                } else if op1_type == Type::Class(BIG_INTEGER_CLASS.to_string())
+                    || op2_type == Type::Class(BIG_INTEGER_CLASS.to_string())
+                {
+                    Type::Class(BIG_INTEGER_CLASS.to_string())
+                } else {
+                    op1_type.clone()
                 };
-                let jvm_op = match op_type {
-                    Type::I32 | Type::I8 | Type::I16 | Type::Boolean | Type::Char => JI::Irem,
-                    Type::I64 => JI::Lrem,
-                    Type::F32 => JI::Frem,
-                    Type::F64 => JI::Drem,
+
+                match op_type {
+                    Type::I32 | Type::I8 | Type::I16 | Type::Boolean | Type::Char => {
+                        // Potential DivisionByZeroError handled by JVM
+                        self.translate_binary_op(dest, op1, op2, JI::Irem)?
+                    }
+                    Type::I64 => self.translate_binary_op(dest, op1, op2, JI::Lrem)?,
+                    Type::F32 => self.translate_binary_op(dest, op1, op2, JI::Frem)?, // Handles NaN
+                    Type::F64 => self.translate_binary_op(dest, op1, op2, JI::Drem)?, // Handles NaN
+                    Type::Class(ref c) if c == BIG_INTEGER_CLASS => {
+                        // BigInteger REMAINDER operation: remainder(BigInteger)
+                        // Throws ArithmeticException if divisor is zero.
+                        let class_idx = self.constant_pool.add_class(BIG_INTEGER_CLASS)?;
+                        let method_ref = self.constant_pool.add_method_ref(
+                            class_idx,
+                            "remainder", // Correct method name
+                            "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+                        )?;
+
+                        self.load_operand(op1)?; // Load op1
+                        if op1_type != op_type {
+                            // Cast if needed
+                            let cast_instrs =
+                                get_cast_instructions(&op1_type, &op_type, self.constant_pool)?;
+                            self.jvm_instructions.extend(cast_instrs);
+                        }
+                        self.load_operand(op2)?; // Load op2
+                        if op2_type != op_type {
+                            // Cast if needed
+                            let cast_instrs =
+                                get_cast_instructions(&op2_type, &op_type, self.constant_pool)?;
+                            self.jvm_instructions.extend(cast_instrs);
+                        }
+                        self.jvm_instructions.push(JI::Invokevirtual(method_ref)); // Call
+                        self.store_result(dest, &op_type)?; // Store
+                    }
+                    Type::Class(ref c) if c == BIG_DECIMAL_CLASS => {
+                        // BigDecimal REMAINDER operation: remainder(BigDecimal)
+                        // Throws ArithmeticException if divisor is zero.
+                        let class_idx = self.constant_pool.add_class(BIG_DECIMAL_CLASS)?;
+                        let method_ref = self.constant_pool.add_method_ref(
+                            class_idx,
+                            "remainder", // Correct method name
+                            "(Ljava/math/BigDecimal;)Ljava/math/BigDecimal;",
+                        )?;
+
+                        self.load_operand(op1)?; // Load op1
+                        if op1_type != op_type {
+                            // Cast if needed
+                            let cast_instrs =
+                                get_cast_instructions(&op1_type, &op_type, self.constant_pool)?;
+                            self.jvm_instructions.extend(cast_instrs);
+                        }
+                        self.load_operand(op2)?; // Load op2
+                        if op2_type != op_type {
+                            // Cast if needed
+                            let cast_instrs =
+                                get_cast_instructions(&op2_type, &op_type, self.constant_pool)?;
+                            self.jvm_instructions.extend(cast_instrs);
+                        }
+                        self.jvm_instructions.push(JI::Invokevirtual(method_ref)); // Call
+                        self.store_result(dest, &op_type)?; // Store
+                    }
                     _ => {
                         return Err(jvm::Error::VerificationError {
                             context: format!("Function {}", self.oomir_func.name),
                             message: format!("Unsupported type for Rem operation: {:?}", op_type),
                         });
                     }
-                };
-                self.translate_binary_op(dest, op1, op2, jvm_op)?
+                }
             }
             // --- Comparisons ---
             OI::Eq { dest, op1, op2 } => self.translate_comparison_op(dest, op1, op2, "eq")?,
@@ -670,13 +1229,33 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
 
             // --- Bitwise Operations ---
             OI::BitAnd { dest, op1, op2 } => {
-                let op_type = match op1 {
-                    oomir::Operand::Variable { ty, .. } => ty.clone(),
-                    oomir::Operand::Constant(c) => Type::from_constant(c),
-                };
-                let jvm_op = match op_type {
-                    Type::I32 | Type::I8 | Type::I16 | Type::Boolean | Type::Char => JI::Iand,
-                    Type::I64 => JI::Land,
+                let op_type = get_operand_type(op1); // Use helper to get type robustly
+
+                match op_type {
+                    Type::I32 | Type::I8 | Type::I16 | Type::Boolean | Type::Char => {
+                        self.translate_binary_op(dest, op1, op2, JI::Iand)?
+                    }
+                    Type::I64 => self.translate_binary_op(dest, op1, op2, JI::Land)?,
+                    Type::Class(ref c) if c == BIG_INTEGER_CLASS => {
+                        // BigInteger AND operation
+                        let class_idx = self.constant_pool.add_class(BIG_INTEGER_CLASS)?;
+                        let method_ref = self.constant_pool.add_method_ref(
+                            class_idx,
+                            "and",
+                            "(Ljava/math/BigInteger;)Ljava/math/BigInteger;", // Correct descriptor
+                        )?;
+
+                        // 1. Load the instance (`op1`)
+                        self.load_operand(op1)?; // Stack: [instance]
+                        // 2. Load the argument (`op2`)
+                        self.load_operand(op2)?; // Stack: [instance, argument]
+                        // 3. Call the method
+                        self.jvm_instructions.push(JI::Invokevirtual(method_ref)); // Stack: [result]
+                        // 4. Store the result into 'dest'
+                        //    The result type is known from the method signature's return type
+                        let result_type = Type::Class(BIG_INTEGER_CLASS.to_string());
+                        self.store_result(dest, &result_type)?; // Stack: []
+                    }
                     _ => {
                         return Err(jvm::Error::VerificationError {
                             context: format!("Function {}", self.oomir_func.name),
@@ -686,34 +1265,85 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                             ),
                         });
                     }
-                };
-                self.translate_binary_op(dest, op1, op2, jvm_op)?
+                }
             }
             OI::BitOr { dest, op1, op2 } => {
-                let op_type = match op1 {
-                    oomir::Operand::Variable { ty, .. } => ty.clone(),
-                    oomir::Operand::Constant(c) => Type::from_constant(c),
-                };
-                let jvm_op = match op_type {
-                    Type::I32 | Type::I8 | Type::I16 | Type::Boolean | Type::Char => JI::Ior,
-                    Type::I64 => JI::Lor,
+                // Use helper to get type robustly
+                let op_type = get_operand_type(op1);
+
+                match op_type {
+                    Type::I32 | Type::I8 | Type::I16 | Type::Boolean | Type::Char => {
+                        // Primitive case handled by translate_binary_op below
+                        self.translate_binary_op(dest, op1, op2, JI::Ior)?
+                    }
+                    Type::I64 => {
+                        // Primitive case handled by translate_binary_op below
+                        self.translate_binary_op(dest, op1, op2, JI::Lor)?
+                    }
+                    Type::Class(ref c) if c == BIG_INTEGER_CLASS => {
+                        // BigInteger OR operation
+                        let class_idx = self.constant_pool.add_class(BIG_INTEGER_CLASS)?;
+                        let method_ref = self.constant_pool.add_method_ref(
+                            class_idx,
+                            "or",
+                            "(Ljava/math/BigInteger;)Ljava/math/BigInteger;", // Correct descriptor
+                        )?;
+
+                        // 1. Load the instance (`op1`)
+                        self.load_operand(op1)?; // Stack: [instance]
+                        // 2. Load the argument (`op2`)
+                        self.load_operand(op2)?; // Stack: [instance, argument]
+                        // 3. Call the method
+                        self.jvm_instructions.push(JI::Invokevirtual(method_ref)); // Stack: [result]
+                        // 4. Store the result into 'dest'
+                        let result_type = Type::Class(BIG_INTEGER_CLASS.to_string());
+                        self.store_result(dest, &result_type)?; // Stack: []
+
+                        // No premature return! Ok(()) implicitly returned at end of block
+                    }
                     _ => {
                         return Err(jvm::Error::VerificationError {
                             context: format!("Function {}", self.oomir_func.name),
                             message: format!("Unsupported type for BitOr operation: {:?}", op_type),
                         });
                     }
-                };
-                self.translate_binary_op(dest, op1, op2, jvm_op)?
+                }
+                // Primitive cases fall through here if translate_binary_op was called
             }
             OI::BitXor { dest, op1, op2 } => {
-                let op_type = match op1 {
-                    oomir::Operand::Variable { ty, .. } => ty.clone(),
-                    oomir::Operand::Constant(c) => Type::from_constant(c),
-                };
-                let jvm_op = match op_type {
-                    Type::I32 | Type::I8 | Type::I16 | Type::Boolean | Type::Char => JI::Ixor,
-                    Type::I64 => JI::Lxor,
+                // Use helper to get type robustly
+                let op_type = get_operand_type(op1);
+
+                match op_type {
+                    Type::I32 | Type::I8 | Type::I16 | Type::Boolean | Type::Char => {
+                        // Primitive case handled by translate_binary_op below
+                        self.translate_binary_op(dest, op1, op2, JI::Ixor)?
+                    }
+                    Type::I64 => {
+                        // Primitive case handled by translate_binary_op below
+                        self.translate_binary_op(dest, op1, op2, JI::Lxor)?
+                    }
+                    Type::Class(ref c) if c == BIG_INTEGER_CLASS => {
+                        // BigInteger XOR operation
+                        let class_idx = self.constant_pool.add_class(BIG_INTEGER_CLASS)?;
+                        let method_ref = self.constant_pool.add_method_ref(
+                            class_idx,
+                            "xor",
+                            "(Ljava/math/BigInteger;)Ljava/math/BigInteger;", // Correct descriptor
+                        )?;
+
+                        // 1. Load the instance (`op1`)
+                        self.load_operand(op1)?; // Stack: [instance]
+                        // 2. Load the argument (`op2`)
+                        self.load_operand(op2)?; // Stack: [instance, argument]
+                        // 3. Call the method
+                        self.jvm_instructions.push(JI::Invokevirtual(method_ref)); // Stack: [result]
+                        // 4. Store the result into 'dest'
+                        let result_type = Type::Class(BIG_INTEGER_CLASS.to_string());
+                        self.store_result(dest, &result_type)?; // Stack: []
+
+                        // No premature return! Ok(()) implicitly returned at end of block
+                    }
                     _ => {
                         return Err(jvm::Error::VerificationError {
                             context: format!("Function {}", self.oomir_func.name),
@@ -723,66 +1353,194 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                             ),
                         });
                     }
-                };
-                self.translate_binary_op(dest, op1, op2, jvm_op)?
+                }
+                // Primitive cases fall through here if translate_binary_op was called
             }
             OI::Shl { dest, op1, op2 } => {
-                let op_type = match op1 {
-                    oomir::Operand::Variable { ty, .. } => ty.clone(),
-                    oomir::Operand::Constant(c) => Type::from_constant(c),
-                };
-                let jvm_op = match op_type {
-                    Type::I32 | Type::I8 | Type::I16 | Type::Boolean | Type::Char => JI::Ishl,
-                    Type::I64 => JI::Lshl,
+                // Type of the object being shifted
+                let op1_type = get_operand_type(op1);
+                // Type of the shift amount (must be int for BigInteger.shiftLeft/Right)
+                let op2_type = get_operand_type(op2);
+
+                match op1_type {
+                    Type::I32 | Type::I8 | Type::I16 | Type::Boolean | Type::Char => {
+                        // JVM Ishl/Lshl takes int shift amount. op2 might need casting if not I32.
+                        // translate_binary_op implicitly handles this by taking only I32 shift value.
+                        self.load_operand(op1)?; // Load value to shift
+                        self.load_operand(op2)?; // Load shift amount (should be I32)
+                        // Perform potential cast of op1 to I32 if needed (e.g., I8 -> I32)
+                        match get_operand_type(op1) {
+                            // Re-check op1's specific type for casting
+                            Type::I8 | Type::I16 | Type::Boolean | Type::Char => {
+                                let cast_instrs = get_cast_instructions(
+                                    &get_operand_type(op1),
+                                    &Type::I32,
+                                    self.constant_pool,
+                                )?;
+                                self.jvm_instructions.extend(cast_instrs);
+                            }
+                            _ => {} // Already I32
+                        }
+                        self.jvm_instructions.push(JI::Ishl);
+                        self.store_result(dest, &Type::I32)?; // Result is I32
+                    }
+                    Type::I64 => {
+                        self.load_operand(op1)?; // Load long value
+                        self.load_operand(op2)?; // Load int shift amount
+                        self.jvm_instructions.push(JI::Lshl);
+                        self.store_result(dest, &Type::I64)?; // Result is I64
+                    }
+                    Type::Class(ref c) if c == BIG_INTEGER_CLASS => {
+                        // BigInteger SHL operation: shiftLeft(int)
+                        let class_idx = self.constant_pool.add_class(BIG_INTEGER_CLASS)?;
+                        let method_ref = self.constant_pool.add_method_ref(
+                            class_idx,
+                            "shiftLeft",
+                            "(I)Ljava/math/BigInteger;", // Takes int!
+                        )?;
+
+                        // 1. Load the instance (`op1`)
+                        self.load_operand(op1)?; // Stack: [instance]
+                        // 2. Load the shift amount (`op2`) and ensure it's int
+                        self.load_operand(op2)?; // Stack: [instance, shift_amount_raw]
+                        if op2_type != Type::I32 {
+                            // Cast op2 to int if necessary (e.g., from I64, I16, I8)
+                            let cast_instrs =
+                                get_cast_instructions(&op2_type, &Type::I32, self.constant_pool)?;
+                            self.jvm_instructions.extend(cast_instrs); // Stack: [instance, shift_amount_int]
+                        }
+                        // 3. Call the method
+                        self.jvm_instructions.push(JI::Invokevirtual(method_ref)); // Stack: [result]
+                        // 4. Store the result into 'dest'
+                        let result_type = Type::Class(BIG_INTEGER_CLASS.to_string());
+                        self.store_result(dest, &result_type)?; // Stack: []
+                    }
                     _ => {
                         return Err(jvm::Error::VerificationError {
                             context: format!("Function {}", self.oomir_func.name),
-                            message: format!("Unsupported type for Shl operation: {:?}", op_type),
+                            message: format!("Unsupported type for Shl operation: {:?}", op1_type),
                         });
                     }
-                };
-                self.translate_binary_op(dest, op1, op2, jvm_op)?
+                }
             }
             OI::Shr { dest, op1, op2 } => {
-                let op_type = match op1 {
-                    oomir::Operand::Variable { ty, .. } => ty.clone(),
-                    oomir::Operand::Constant(c) => Type::from_constant(c),
-                };
-                let jvm_op = match op_type {
-                    Type::I32 | Type::I8 | Type::I16 | Type::Boolean | Type::Char => JI::Ishr,
-                    Type::I64 => JI::Lshr,
+                // Type of the object being shifted
+                let op1_type = get_operand_type(op1);
+                // Type of the shift amount (must be int for BigInteger.shiftLeft/Right)
+                let op2_type = get_operand_type(op2);
+
+                match op1_type {
+                    Type::I32 | Type::I8 | Type::I16 | Type::Boolean | Type::Char => {
+                        // JVM Ishr/Lshr takes int shift amount. op2 might need casting if not I32.
+                        self.load_operand(op1)?; // Load value to shift
+                        self.load_operand(op2)?; // Load shift amount (should be I32)
+                        // Perform potential cast of op1 to I32 if needed (e.g., I8 -> I32)
+                        match get_operand_type(op1) {
+                            // Re-check op1's specific type for casting
+                            Type::I8 | Type::I16 | Type::Boolean | Type::Char => {
+                                let cast_instrs = get_cast_instructions(
+                                    &get_operand_type(op1),
+                                    &Type::I32,
+                                    self.constant_pool,
+                                )?;
+                                self.jvm_instructions.extend(cast_instrs);
+                            }
+                            _ => {} // Already I32
+                        }
+                        self.jvm_instructions.push(JI::Ishr); // Use Ishr for signed right shift
+                        self.store_result(dest, &Type::I32)?; // Result is I32
+                    }
+                    Type::I64 => {
+                        self.load_operand(op1)?; // Load long value
+                        self.load_operand(op2)?; // Load int shift amount
+                        self.jvm_instructions.push(JI::Lshr); // Use Lshr for signed right shift
+                        self.store_result(dest, &Type::I64)?; // Result is I64
+                    }
+                    Type::Class(ref c) if c == BIG_INTEGER_CLASS => {
+                        // BigInteger SHR operation: shiftRight(int)
+                        let class_idx = self.constant_pool.add_class(BIG_INTEGER_CLASS)?;
+                        let method_ref = self.constant_pool.add_method_ref(
+                            class_idx,
+                            "shiftRight",
+                            "(I)Ljava/math/BigInteger;", // Takes int!
+                        )?;
+
+                        // 1. Load the instance (`op1`)
+                        self.load_operand(op1)?; // Stack: [instance]
+                        // 2. Load the shift amount (`op2`) and ensure it's int
+                        self.load_operand(op2)?; // Stack: [instance, shift_amount_raw]
+                        if op2_type != Type::I32 {
+                            // Cast op2 to int if necessary (e.g., from I64, I16, I8)
+                            let cast_instrs =
+                                get_cast_instructions(&op2_type, &Type::I32, self.constant_pool)?;
+                            self.jvm_instructions.extend(cast_instrs); // Stack: [instance, shift_amount_int]
+                        }
+                        // 3. Call the method
+                        self.jvm_instructions.push(JI::Invokevirtual(method_ref)); // Stack: [result]
+                        // 4. Store the result into 'dest'
+                        let result_type = Type::Class(BIG_INTEGER_CLASS.to_string());
+                        self.store_result(dest, &result_type)?; // Stack: []
+                    }
                     _ => {
                         return Err(jvm::Error::VerificationError {
                             context: format!("Function {}", self.oomir_func.name),
-                            message: format!("Unsupported type for Shr operation: {:?}", op_type),
+                            message: format!("Unsupported type for Shr operation: {:?}", op1_type),
                         });
                     }
-                };
-                self.translate_binary_op(dest, op1, op2, jvm_op)?
+                }
             }
 
             OI::Not { dest, src } => {
-                // 1. Load source operand
-                self.load_operand(src)?; // Stack: [value]
-                // 2. Determine type and apply appropriate NOT logic
-                let src_type = get_operand_type(src); // You need this helper
+                let src_type = get_operand_type(src);
                 match src_type {
                     oomir::Type::Boolean => {
-                        // Boolean NOT (!bool_val equivalent to bool_val ^ 1)
-                        self.jvm_instructions.push(JI::Iconst_1); // Stack: [value(0/1), 1]
-                        self.jvm_instructions.push(JI::Ixor); // Stack: [!value]
+                        self.load_operand(src)?;
+                        self.jvm_instructions.push(JI::Iconst_1);
+                        self.jvm_instructions.push(JI::Ixor);
+                        self.store_result(dest, &src_type)?; // Store boolean result
                     }
-                    // Integer types use bitwise NOT (~int_val equivalent to int_val ^ -1)
                     oomir::Type::I8 | oomir::Type::I16 | oomir::Type::I32 | oomir::Type::Char => {
-                        self.jvm_instructions.push(JI::Iconst_m1); // Stack: [value, -1]
-                        self.jvm_instructions.push(JI::Ixor); // Stack: [~value]
+                        self.load_operand(src)?;
+                        // Cast to I32 if necessary before XOR
+                        if src_type != Type::I32 {
+                            let cast_instrs =
+                                get_cast_instructions(&src_type, &Type::I32, self.constant_pool)?;
+                            self.jvm_instructions.extend(cast_instrs);
+                        }
+                        self.jvm_instructions.push(JI::Iconst_m1);
+                        self.jvm_instructions.push(JI::Ixor);
+                        // Store result as original type (e.g., if src was I8, dest should be I8)
+                        // Result of IXOR is I32, so cast back if needed
+                        if src_type != Type::I32 {
+                            let cast_instrs =
+                                get_cast_instructions(&Type::I32, &src_type, self.constant_pool)?;
+                            self.jvm_instructions.extend(cast_instrs);
+                        }
+                        self.store_result(dest, &src_type)?;
                     }
                     oomir::Type::I64 => {
-                        // Long Bitwise NOT: value ^ -1L
-                        // Ldc2_w is used for loading long/double constants. -1L needs to be in the pool.
-                        let neg_one_long_index = self.constant_pool.add_long(-1_i64)?; // Add -1L if not present
-                        self.jvm_instructions.push(JI::Ldc2_w(neg_one_long_index)); // Stack: [value(long), -1L(long)]
-                        self.jvm_instructions.push(JI::Lxor); // Stack: [~value(long)]
+                        self.load_operand(src)?;
+                        let neg_one_long_index = self.constant_pool.add_long(-1_i64)?;
+                        self.jvm_instructions.push(JI::Ldc2_w(neg_one_long_index));
+                        self.jvm_instructions.push(JI::Lxor);
+                        self.store_result(dest, &src_type)?; // Store long result
+                    }
+                    oomir::Type::Class(ref c) if c == BIG_INTEGER_CLASS => {
+                        // BigInteger NOT operation: not()
+                        let class_idx = self.constant_pool.add_class(BIG_INTEGER_CLASS)?;
+                        let method_ref = self.constant_pool.add_method_ref(
+                            class_idx,
+                            "not",
+                            "()Ljava/math/BigInteger;", // Takes no args!
+                        )?;
+
+                        // 1. Load the instance (`src`)
+                        self.load_operand(src)?; // Stack: [instance]
+                        // 2. Call the method
+                        self.jvm_instructions.push(JI::Invokevirtual(method_ref)); // Stack: [result]
+                        // 3. Store the result into 'dest'
+                        let result_type = Type::Class(BIG_INTEGER_CLASS.to_string());
+                        self.store_result(dest, &result_type)?; // Stack: []
                     }
                     _ => {
                         return Err(jvm::Error::VerificationError {
@@ -791,35 +1549,73 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                         });
                     }
                 }
-                // 3. Store the result (type remains the same as source)
-                self.store_result(dest, &src_type)?; // Stack: []
+                // No single store_result needed here, handled within each match arm
             }
 
             OI::Neg { dest, src } => {
-                // 1. Load source operand
-                self.load_operand(src)?; // Stack: [value]
-                // 2. Determine type and apply appropriate Negation instruction
-                let src_type = get_operand_type(src); // You need this helper
-                let neg_instr = match src_type {
-                    // Integer types (including bool/char treated as int) use Ineg
+                let src_type = get_operand_type(src);
+                match src_type {
                     oomir::Type::I8
                     | oomir::Type::I16
                     | oomir::Type::I32
                     | oomir::Type::Boolean
-                    | oomir::Type::Char => JI::Ineg,
-                    oomir::Type::I64 => JI::Lneg,
-                    oomir::Type::F32 => JI::Fneg,
-                    oomir::Type::F64 => JI::Dneg,
+                    | oomir::Type::Char => {
+                        self.load_operand(src)?;
+                        // Cast to I32 if needed before INEG
+                        if src_type != Type::I32 {
+                            let cast_instrs =
+                                get_cast_instructions(&src_type, &Type::I32, self.constant_pool)?;
+                            self.jvm_instructions.extend(cast_instrs);
+                        }
+                        self.jvm_instructions.push(JI::Ineg);
+                        // Cast back if needed
+                        if src_type != Type::I32 {
+                            let cast_instrs =
+                                get_cast_instructions(&Type::I32, &src_type, self.constant_pool)?;
+                            self.jvm_instructions.extend(cast_instrs);
+                        }
+                        self.store_result(dest, &src_type)?;
+                    }
+                    oomir::Type::I64 => {
+                        self.load_operand(src)?;
+                        self.jvm_instructions.push(JI::Lneg);
+                        self.store_result(dest, &src_type)?;
+                    }
+                    oomir::Type::F32 => {
+                        self.load_operand(src)?;
+                        self.jvm_instructions.push(JI::Fneg);
+                        self.store_result(dest, &src_type)?;
+                    }
+                    oomir::Type::F64 => {
+                        self.load_operand(src)?;
+                        self.jvm_instructions.push(JI::Dneg);
+                        self.store_result(dest, &src_type)?;
+                    }
+                    oomir::Type::Class(ref c) if c == BIG_INTEGER_CLASS => {
+                        // BigInteger Negation operation: negate()
+                        let class_idx = self.constant_pool.add_class(BIG_INTEGER_CLASS)?;
+                        let method_ref = self.constant_pool.add_method_ref(
+                            class_idx,
+                            "negate",
+                            "()Ljava/math/BigInteger;", // Takes no args!
+                        )?;
+
+                        // 1. Load the instance (`src`)
+                        self.load_operand(src)?; // Stack: [instance]
+                        // 2. Call the method
+                        self.jvm_instructions.push(JI::Invokevirtual(method_ref)); // Stack: [result]
+                        // 3. Store the result into 'dest'
+                        let result_type = Type::Class(BIG_INTEGER_CLASS.to_string());
+                        self.store_result(dest, &result_type)?; // Stack: []
+                    }
                     _ => {
                         return Err(jvm::Error::VerificationError {
                             context: format!("Function {}", self.oomir_func.name),
                             message: format!("Unsupported type for Neg operation: {:?}", src_type),
                         });
                     }
-                };
-                self.jvm_instructions.push(neg_instr.clone()); // Stack: [-value]
-                // 3. Store the result (type remains the same as source)
-                self.store_result(dest, &src_type)?; // Stack: []
+                }
+                // No single store_result needed here, handled within each match arm
             }
 
             // --- Control Flow ---
@@ -853,44 +1649,40 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 targets,
                 otherwise,
             } => {
-                // We will translate this into a chain of if/goto instructions.
-
-                // 0. calculate the type of the discriminant
-                let discr_type = match discr {
-                    OO::Variable { ty, .. } => ty.clone(),
-                    OO::Constant(c) => Type::from_constant(c),
-                };
+                // 0. Calculate the type of the discriminant
+                let discr_type = get_operand_type(discr); // Use helper consistently
 
                 // --- Input Validation ---
-                // Check if the discriminant type is suitable for comparison
-                match discr_type {
-                    Type::I8
-                    | Type::I16
-                    | Type::I32
-                    | Type::Boolean
-                    | Type::Char
-                    | Type::I64
-                    | Type::F32
-                    | Type::F64 => {
-                        // These types are okay for switch comparison
-                    }
-                    _ => {
-                        return Err(jvm::Error::VerificationError {
-                            context: format!("Function {}", self.oomir_func.name),
-                            message: format!(
-                                "Unsupported discriminant type {:?} for OOMIR Switch instruction",
-                                discr_type
-                            ),
-                        });
-                    }
+                // Check if the discriminant type is suitable for switch comparison
+                let is_valid_switch_type = match &discr_type {
+                    Type::I8 | Type::I16 | Type::I32 | Type::Boolean | Type::Char => true, // Promoted to int
+                    Type::I64 => true,
+                    Type::F32 => true,
+                    Type::F64 => true,
+                    Type::String => true, // Use .equals()
+                    Type::Class(c) if c == BIG_INTEGER_CLASS || c == BIG_DECIMAL_CLASS => true, // Use .compareTo()
+                    _ => false,
+                };
+
+                if !is_valid_switch_type {
+                    return Err(jvm::Error::VerificationError {
+                        context: format!("Function {}", self.oomir_func.name),
+                        message: format!(
+                            "Unsupported discriminant type {:?} for OOMIR Switch instruction",
+                            discr_type
+                        ),
+                    });
                 }
 
                 // 1. Load the discriminant value onto the stack
                 self.load_operand(discr)?; // Stack: [discr_value] (size 1 or 2 depending on type)
 
                 // 2. Store the discriminant in a temporary local variable.
-                let temp_discr_var_name =
-                    format!("_switch_discr_temp_{}", self.current_oomir_block_label);
+                //    This is necessary because we need to reload it for each comparison.
+                let temp_discr_var_name = format!(
+                    "_switch_discr_temp_{}_{}",
+                    self.oomir_func.name, self.current_oomir_block_label
+                );
                 let temp_discr_index = self.get_or_assign_local(&temp_discr_var_name, &discr_type);
                 let store_instr = get_store_instruction(&discr_type, temp_discr_index)?;
                 self.jvm_instructions.push(store_instr); // Stack is now empty
@@ -902,7 +1694,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     self.jvm_instructions.push(load_instr); // Stack: [discr_value] (size 1 or 2)
 
                     // --- b. Load constant key and perform comparison based on discriminant type ---
-                    let comparison_succeeded; // Flag to track if this key was handled
 
                     match &discr_type {
                         // --- Integer-like types (use if_icmpeq) ---
@@ -929,101 +1720,186 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                                     });
                                 }
                             };
-
-                            // Load the i32 constant key
                             let const_instr =
                                 get_int_const_instr(&mut self.constant_pool, key_value_i32);
-                            self.jvm_instructions.push(const_instr); // Stack: [discr_value(i32), key_value(i32)]
-
-                            // Add the comparison instruction (if_icmpeq jumps if equal)
+                            self.jvm_instructions.push(const_instr); // Stack: [discr(i32), key(i32)]
                             let if_instr_index = self.jvm_instructions.len();
-                            self.jvm_instructions.push(JI::If_icmpeq(0)); // Placeholder offset
+                            self.jvm_instructions.push(JI::If_icmpeq(0)); // Jump if equal
                             self.branch_fixups
                                 .push((if_instr_index, target_label.clone()));
-                            comparison_succeeded = true;
                         }
 
                         // --- I64 (long) type (use lcmp, ifeq) ---
                         Type::I64 => {
+                            match constant_key {
+                                oomir::Constant::I64(_) => {} // Expected type
+                                _ => {
+                                    return Err(jvm::Error::VerificationError {
+                                        context: format!("Function {}", self.oomir_func.name),
+                                        message: format!(
+                                            "Type mismatch in OOMIR Switch: Discriminant type is {:?}, but case key is {:?}",
+                                            discr_type, constant_key
+                                        ),
+                                    });
+                                }
+                            };
                             load_constant(
                                 &mut self.jvm_instructions,
                                 &mut self.constant_pool,
                                 constant_key,
-                            )?;
-
-                            // Compare longs: pushes -1, 0, or 1 (int) onto the stack
-                            self.jvm_instructions.push(JI::Lcmp); // Stack: [comparison_result(i32)]
-
-                            // Jump if the comparison result is 0 (equal)
+                            )?; // Stack: [discr(long), key(long)]
+                            self.jvm_instructions.push(JI::Lcmp); // Stack: [cmp_result(int)]
                             let if_instr_index = self.jvm_instructions.len();
-                            self.jvm_instructions.push(JI::Ifeq(0)); // Placeholder offset
+                            self.jvm_instructions.push(JI::Ifeq(0)); // Jump if equal (cmp_result == 0)
                             self.branch_fixups
                                 .push((if_instr_index, target_label.clone()));
-                            comparison_succeeded = true;
                         }
 
-                        // --- F32 (float) type (use fcmpl/fcmpg, ifeq) ---
+                        // --- F32 (float) type (use fcmpl, ifeq) ---
                         Type::F32 => {
+                            match constant_key {
+                                oomir::Constant::F32(_) => {} // Expected type
+                                _ => {
+                                    return Err(jvm::Error::VerificationError {
+                                        context: format!("Function {}", self.oomir_func.name),
+                                        message: format!(
+                                            "Type mismatch in OOMIR Switch: Discriminant type is {:?}, but case key is {:?}",
+                                            discr_type, constant_key
+                                        ),
+                                    });
+                                }
+                            };
                             load_constant(
                                 &mut self.jvm_instructions,
                                 &mut self.constant_pool,
                                 constant_key,
-                            )?; // Stack: [discr_value(f32), key_value(f32)]
-
-                            // Compare floats: pushes -1, 0, or 1 (int) onto the stack.
-                            // fcmpl treats NaN comparison as -1. fcmpg treats it as +1.
-                            // For equality checks (== 0), they behave the same unless one operand is NaN.
-                            // Standard equality `discr == key` is false if either is NaN, so `ifeq` works after fcmpl/fcmpg.
-                            self.jvm_instructions.push(JI::Fcmpl); // Stack: [comparison_result(i32)]
-
-                            // Jump if the comparison result is 0 (equal)
+                            )?; // Stack: [discr(f32), key(f32)]
+                            self.jvm_instructions.push(JI::Fcmpl); // Stack: [cmp_result(int)]
                             let if_instr_index = self.jvm_instructions.len();
-                            self.jvm_instructions.push(JI::Ifeq(0)); // Placeholder offset
+                            self.jvm_instructions.push(JI::Ifeq(0)); // Jump if equal
                             self.branch_fixups
                                 .push((if_instr_index, target_label.clone()));
-                            comparison_succeeded = true;
                         }
 
-                        // --- F64 (double) type (use dcmpl/dcmpg, ifeq) ---
+                        // --- F64 (double) type (use dcmpl, ifeq) ---
                         Type::F64 => {
+                            match constant_key {
+                                oomir::Constant::F64(_) => {} // Expected type
+                                _ => {
+                                    return Err(jvm::Error::VerificationError {
+                                        context: format!("Function {}", self.oomir_func.name),
+                                        message: format!(
+                                            "Type mismatch in OOMIR Switch: Discriminant type is {:?}, but case key is {:?}",
+                                            discr_type, constant_key
+                                        ),
+                                    });
+                                }
+                            };
                             load_constant(
                                 &mut self.jvm_instructions,
                                 &mut self.constant_pool,
                                 constant_key,
-                            )?; // Stack: [discr_value(f64), key_value(f64)]
-
-                            // Compare doubles (similar logic to floats regarding NaN and dcmpl/dcmpg)
-                            self.jvm_instructions.push(JI::Dcmpl); // Stack: [comparison_result(i32)]
-
-                            // Jump if the comparison result is 0 (equal)
+                            )?; // Stack: [discr(f64), key(f64)]
+                            self.jvm_instructions.push(JI::Dcmpl); // Stack: [cmp_result(int)]
                             let if_instr_index = self.jvm_instructions.len();
-                            self.jvm_instructions.push(JI::Ifeq(0)); // Placeholder offset
+                            self.jvm_instructions.push(JI::Ifeq(0)); // Jump if equal
                             self.branch_fixups
                                 .push((if_instr_index, target_label.clone()));
-                            comparison_succeeded = true;
                         }
 
-                        // Should have been caught by the validation check before the loop
-                        _ => unreachable!("Invalid discriminant type survived initial check"),
+                        // --- String type (use .equals(), ifne) ---
+                        Type::String => {
+                            match constant_key {
+                                oomir::Constant::String(_) => {} // Expected type
+                                _ => {
+                                    return Err(jvm::Error::VerificationError {
+                                        context: format!("Function {}", self.oomir_func.name),
+                                        message: format!(
+                                            "Type mismatch in OOMIR Switch: Discriminant type is {:?}, but case key is {:?}",
+                                            discr_type, constant_key
+                                        ),
+                                    });
+                                }
+                            };
+                            load_constant(
+                                &mut self.jvm_instructions,
+                                &mut self.constant_pool,
+                                constant_key,
+                            )?; // Stack: [discr(str_ref), key(str_ref)]
+
+                            let string_class_idx =
+                                self.constant_pool.add_class("java/lang/String")?;
+                            let equals_method_ref = self.constant_pool.add_method_ref(
+                                string_class_idx,
+                                "equals",
+                                "(Ljava/lang/Object;)Z", // String.equals takes Object, returns boolean (Z -> int)
+                            )?;
+                            self.jvm_instructions
+                                .push(JI::Invokevirtual(equals_method_ref)); // Stack: [equals_result(int 0 or 1)]
+
+                            let if_instr_index = self.jvm_instructions.len();
+                            // Jump if the result is non-zero (i.e., true)
+                            self.jvm_instructions.push(JI::Ifne(0));
+                            self.branch_fixups
+                                .push((if_instr_index, target_label.clone()));
+                        }
+
+                        // --- BigInteger type (use .compareTo(), ifeq) ---
+                        Type::Class(c) if c == BIG_INTEGER_CLASS => {
+                            load_constant(
+                                &mut self.jvm_instructions,
+                                &mut self.constant_pool,
+                                constant_key,
+                            )?; // Stack: [discr(BI_ref), key(BI_ref)]
+
+                            let class_idx = self.constant_pool.add_class(BIG_INTEGER_CLASS)?;
+                            let compare_to_ref = self.constant_pool.add_method_ref(
+                                class_idx,
+                                "compareTo",
+                                "(Ljava/math/BigInteger;)I",
+                            )?;
+                            self.jvm_instructions
+                                .push(JI::Invokevirtual(compare_to_ref)); // Stack: [cmp_result(int)]
+                            let if_instr_index = self.jvm_instructions.len();
+                            self.jvm_instructions.push(JI::Ifeq(0)); // Jump if equal (cmp_result == 0)
+                            self.branch_fixups
+                                .push((if_instr_index, target_label.clone()));
+                        }
+
+                        // --- BigDecimal type (use .compareTo(), ifeq) ---
+                        Type::Class(c) if c == BIG_DECIMAL_CLASS => {
+                            load_constant(
+                                &mut self.jvm_instructions,
+                                &mut self.constant_pool,
+                                constant_key,
+                            )?; // Stack: [discr(BD_ref), key(BD_ref)]
+
+                            let class_idx = self.constant_pool.add_class(BIG_DECIMAL_CLASS)?;
+                            let compare_to_ref = self.constant_pool.add_method_ref(
+                                class_idx,
+                                "compareTo",
+                                "(Ljava/math/BigDecimal;)I",
+                            )?;
+                            self.jvm_instructions
+                                .push(JI::Invokevirtual(compare_to_ref)); // Stack: [cmp_result(int)]
+                            let if_instr_index = self.jvm_instructions.len();
+                            self.jvm_instructions.push(JI::Ifeq(0)); // Jump if equal (cmp_result == 0)
+                            self.branch_fixups
+                                .push((if_instr_index, target_label.clone()));
+                        }
+
+                        // Should be caught by the validation check before the loop
+                        _ => unreachable!(
+                            "Invalid discriminant type {:?} survived initial check",
+                            discr_type
+                        ),
                     }
 
-                    // If the constant_key type didn't match the discr_type in the inner match
-                    if !comparison_succeeded {
-                        return Err(jvm::Error::VerificationError {
-                            context: format!("Function {}", self.oomir_func.name),
-                            message: format!(
-                                "Type mismatch in OOMIR Switch: Discriminant type is {:?}, but case key is {:?}",
-                                discr_type, constant_key
-                            ),
-                        });
-                    }
-
-                    // If the comparison is false, execution falls through to the next check (or the final goto)
-                    // The stack should be empty after the conditional jump instruction consumes its operand(s).
+                    // If the comparison is false, execution falls through to the next check.
+                    // The stack should be empty after the conditional jump or method call + conditional jump consumes its operands.
                 }
 
                 // 4. After all specific checks, add an unconditional jump to the 'otherwise' block.
-                //    This is executed if none of the comparisons were true.
                 let goto_instr_index = self.jvm_instructions.len();
                 self.jvm_instructions.push(JI::Goto(0)); // Placeholder offset
                 self.branch_fixups
@@ -1672,7 +2548,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 let old_ty = get_operand_type(op);
 
                 // 2. Get cast instructions
-                let instructions = get_cast_instructions(&old_ty, ty)?;
+                let instructions = get_cast_instructions(&old_ty, ty, self.constant_pool)?;
 
                 // 3. Emit the cast instructions
                 for instr in instructions {

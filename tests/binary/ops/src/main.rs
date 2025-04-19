@@ -1,185 +1,285 @@
+#![feature(f16)]
+#![feature(f128)]
+
+macro_rules! test_comparisons {
+    ($type:ty, $a:expr, $b:expr, $c:expr, $d:expr, $zero:expr, $nzero:expr) => {
+        assert!($a == $b, concat!(stringify!($type), ": a == b"));
+        assert!($a != $c, concat!(stringify!($type), ": a != c"));
+        assert!($a < $c, concat!(stringify!($type), ": a < c"));
+        assert!($a <= $b, concat!(stringify!($type), ": a <= b"));
+        assert!($c > $a, concat!(stringify!($type), ": c > a"));
+        assert!($a >= $b, concat!(stringify!($type), ": a >= b"));
+        assert!($d < $a, concat!(stringify!($type), ": d < a"));
+    };
+}
+
+macro_rules! test_comparisons_float {
+    ($type:ty, $a:expr, $b:expr, $c:expr, $d:expr, $zero:expr, $nzero:expr, $nan:expr) => {
+        assert!($a == $b, concat!(stringify!($type), ": a == b"));
+        assert!($a != $c, concat!(stringify!($type), ": a != c"));
+        assert!($a < $c, concat!(stringify!($type), ": a < c"));
+        assert!($a <= $b, concat!(stringify!($type), ": a <= b"));
+        assert!($c > $a, concat!(stringify!($type), ": c > a"));
+        assert!($a >= $b, concat!(stringify!($type), ": a >= b"));
+        assert!($d < $a, concat!(stringify!($type), ": d < a"));
+        assert!($zero == $nzero, concat!(stringify!($type), ": 0.0 == -0.0"));
+        assert!(!$nan.eq(&$nan), concat!(stringify!($type), ": !(nan == nan)"));
+        assert!($nan != $nan, concat!(stringify!($type), ": nan != nan"));
+    };
+}
+
+macro_rules! test_comparisons_float_no_nan {
+    ($type:ty, $a:expr, $b:expr, $c:expr, $d:expr, $zero:expr, $nzero:expr) => {
+        assert!($a == $b, concat!(stringify!($type), ": a == b"));
+        assert!($a != $c, concat!(stringify!($type), ": a != c"));
+        assert!($a < $c, concat!(stringify!($type), ": a < c"));
+        assert!($a <= $b, concat!(stringify!($type), ": a <= b"));
+        assert!($c > $a, concat!(stringify!($type), ": c > a"));
+        assert!($a >= $b, concat!(stringify!($type), ": a >= b"));
+        assert!($d < $a, concat!(stringify!($type), ": d < a"));
+        assert!($zero == $nzero, concat!(stringify!($type), ": 0.0 == -0.0"));
+    };
+}
+
+macro_rules! test_binary_ops {
+    ($type:ty, $a:expr, $b:expr, $zero:expr, $and:expr, $or:expr, $xor:expr) => {
+        assert!(($a & $b) == $and, concat!(stringify!($type), ": a & b"));
+        assert!(($a | $b) == $or, concat!(stringify!($type), ": a | b"));
+        assert!(($a ^ $b) == $xor, concat!(stringify!($type), ": a ^ b"));
+        assert!(($a & $zero) == $zero, concat!(stringify!($type), ": a & 0"));
+        assert!(($a | $zero) == $a, concat!(stringify!($type), ": a | 0"));
+        assert!(($a ^ $zero) == $a, concat!(stringify!($type), ": a ^ 0"));
+    };
+}
+
+macro_rules! test_ops {
+    ($type:ty, $a:expr, $b:expr, $zero:expr, $add:expr, $sub:expr, $mul:expr, $div:expr) => {
+        assert!($a + $b == $add, concat!(stringify!($type), ": a + b"));
+        assert!($a - $b == $sub, concat!(stringify!($type), ": a - b"));
+        assert!($a * $b == $mul, concat!(stringify!($type), ": a * b"));
+        assert!($a / $b == $div, concat!(stringify!($type), ": a / b"));
+        assert!($a + $zero == $a, concat!(stringify!($type), ": a + 0"));
+        assert!($a - $zero == $a, concat!(stringify!($type), ": a - 0"));
+        assert!($a * $zero == $zero, concat!(stringify!($type), ": a * 0"));
+    };
+}
+
 fn main() {
-    {
-        // i32 comparisons
-        let a = 5i32;
-        let b = 5i32;
-        let c = 10i32;
-        let d = -2i32;
-        assert!(a == b, "i32: a == b");
-        assert!(a != c, "i32: a != c");
-        assert!(a != d, "i32: a != d");
-        assert!(a < c, "i32: a < c");
-        assert!(a <= c, "i32: a <= c");
-        assert!(a <= b, "i32: a <= b");
-        assert!(c > a, "i32: c > a");
-        assert!(c >= a, "i32: c >= a");
-        assert!(a >= b, "i32: a >= b");
-        assert!(d < a, "i32: d < a");
+    // u8 comparisons
+    test_comparisons!(u8, 5u8, 5u8, 10u8, 2u8, 0u8, 0u8);
 
-        // i64 comparisons
-        let a64 = 500i64;
-        let b64 = 500i64;
-        let c64 = 1000i64;
-        assert!(a64 == b64, "i64: a64 == b64");
-        assert!(a64 != c64, "i64: a64 != c64");
-        assert!(a64 < c64, "i64: a64 < c64");
-        assert!(a64 <= b64, "i64: a64 <= b64");
-        assert!(c64 > a64, "i64: c64 > a64");
-        assert!(a64 >= b64, "i64: a64 >= b64");
+    // i8 comparisons
+    test_comparisons!(i8, 5i8, 5i8, 10i8, -2i8, 0i8, 0i8);
 
-        // f32 comparisons
-        let fa = 5.0f32;
-        let fb = 5.0f32;
-        let fc = 10.5f32;
-        let fd = -2.1f32;
-        let fzero = 0.0f32;
-        let fnzero = -0.0f32;
-        let fnan = f32::NAN;
-        assert!(fa == fb, "f32: fa == fb");
-        assert!(fa != fc, "f32: fa != fc");
-        assert!(fa < fc, "f32: fa < fc");
-        assert!(fa <= fb, "f32: fa <= fb");
-        assert!(fc > fa, "f32: fc > fa");
-        assert!(fa >= fb, "f32: fa >= fb");
-        assert!(fd < fa, "f32: fd < fa");
-        assert!(fzero == fnzero, "f32: 0.0 == -0.0"); // Special zero comparison
-        assert!(!(fnan == fnan), "f32: !(nan == nan)"); // NaN special comparison
-        assert!(fnan != fnan, "f32: nan != nan"); // NaN special comparison
+    // u16 comparisons
+    test_comparisons!(u16, 5u16, 5u16, 10u16, 2u16, 0u16, 0u16);
 
-        // f64 comparisons
-        let fa64 = 5.0f64;
-        let fb64 = 5.0f64;
-        let fc64 = 10.5f64;
-        let fd64 = -2.1f64;
-        let fzero64 = 0.0f64;
-        let fnzero64 = -0.0f64;
-        let fnan64 = f64::NAN;
-        assert!(fa64 == fb64, "f64: fa64 == fb64");
-        assert!(fa64 != fc64, "f64: fa64 != fc64");
-        assert!(fa64 < fc64, "f64: fa64 < fc64");
-        assert!(fa64 <= fb64, "f64: fa64 <= fb64");
-        assert!(fc64 > fa64, "f64: fc64 > fa64");
-        assert!(fa64 >= fb64, "f64: fa64 >= fb64");
-        assert!(fd64 < fa64, "f64: fd64 < fa64");
-        assert!(fzero64 == fnzero64, "f64: 0.0 == -0.0"); // Special zero comparison
-        assert!(!(fnan64 == fnan64), "f64: !(nan == nan)"); // NaN special comparison
-        assert!(fnan64 != fnan64, "f64: nan != nan"); // NaN special comparison
-    }
+    // i16 comparisons
+    test_comparisons!(i16, 5i16, 5i16, 10i16, -2i16, 0i16, 0i16);
 
-    {
-        // i32 binary AND tests
-        let a = 0b1100_1010i32;
-        let b = 0b1010_0110i32;
-        let zero = 0i32;
-        assert!((a & b) == 0b1000_0010i32, "i32: a & b");
-        assert!((a & zero) == 0, "i32: a & 0");
-        assert!((b & zero) == 0, "i32: b & 0");
-        assert!((a & a) == a, "i32: a & a");
+    // f16 comparisons
+    test_comparisons_float!(f16, 5.0f16, 5.0f16, 10.5f16, -2.1f16, 0.0f16, -0.0f16, f16::NAN);
 
-        // i64 binary AND tests with valid hex literals
-        let ua: i64 = 0x1234_5678_9ABC_DEF0;
-        let ub: i64 = 0x0FED_CBA9_8765_4321;
-        // Precomputed bitwise AND:
-        //   0x1234_5678_9ABC_DEF0
-        // & 0x0FED_CBA9_8765_4321
-        // = 0x0224_4228_8224_4220
-        let expected_and: i64 = 0x0224_4228_8224_4220;
-        assert!((ua & ub) == expected_and, "i64: ua & ub");
-        assert!((ua & 0) == 0, "i64: ua & 0");
-        assert!((ua & ua) == ua, "i64: ua & ua");
-    }
+    // u32 comparisons
+    test_comparisons!(u32, 5u32, 5u32, 10u32, 2u32, 0u32, 0u32);
 
-    {
-        // i32 binary OR tests
-        let a = 0b1100_1010i32;
-        let b = 0b1010_0110i32;
-        let zero = 0i32;
-        assert!((a | b) == 0b1110_1110i32, "i32: a | b");
-        assert!((a | zero) == a, "i32: a | 0");
-        assert!((b | zero) == b, "i32: b | 0");
-        assert!((a | a) == a, "i32: a | a");
+    // i32 comparisons
+    test_comparisons!(i32, 5i32, 5i32, 10i32, -2i32, 0i32, 0i32);
 
-        // i64 binary OR tests with valid hex literals
-        let ua: i64 = 0x1234_5678_9ABC_DEF0;
-        let ub: i64 = 0x0FED_CBA9_8765_4321;
-        // Precomputed bitwise OR:
-        //   0x1234_5678_9ABC_DEF0
-        // | 0x0FED_CBA9_8765_4321
-        // = 0x1FFD_DFF9_9FFD_DFF1
-        let expected_or: i64 = 0x1FFD_DFF9_9FFD_DFF1;
-        assert!((ua | ub) == expected_or, "i64: ua | ub");
-        assert!((ua | 0) == ua, "i64: ua | 0");
-        assert!((ua | ua) == ua, "i64: ua | ua");
-    }
+    // f32 comparisons
+    test_comparisons_float!(f32, 5.0f32, 5.0f32, 10.5f32, -2.1f32, 0.0f32, -0.0f32, f32::NAN);    
 
-    // --- Binary XOR (^) Tests ---
-    {
-        // i32 binary XOR tests
-        let a = 0b1100_1010i32;
-        let b = 0b1010_0110i32;
-        let zero = 0i32;
-        assert!((a ^ b) == 0b0110_1100i32, "i32: a ^ b");
-        assert!((a ^ zero) == a, "i32: a ^ 0");
-        assert!((b ^ zero) == b, "i32: b ^ 0");
-        assert!((a ^ a) == 0, "i32: a ^ a");
+    // i64 comparisons
+    test_comparisons!(i64, 500i64, 500i64, 1000i64, -200i64, 0i64, 0i64);
 
-        // i64 binary XOR tests with valid hex literals
-        let ua: i64 = 0x1234_5678_9ABC_DEF0;
-        let ub: i64 = 0x0FED_CBA9_8765_4321;
-        // Precomputed XOR:
-        //   0x1234_5678_9ABC_DEF0
-        // ^ 0x0FED_CBA9_8765_4321
-        // = 0x1DD9_9DD1_1DD9_9DD1
-        let expected_xor: i64 = 0x1DD9_9DD1_1DD9_9DD1;
-        assert!((ua ^ ub) == expected_xor, "i64: ua ^ ub");
-        assert!((ua ^ 0) == ua, "i64: ua ^ 0");
-        assert!((ua ^ ua) == 0, "i64: ua ^ ua");
-    }
+    // f64 comparisons
+    test_comparisons_float!(f64, 5.0f64, 5.0f64, 10.5f64, -2.1f64, 0.0f64, -0.0f64, f64::NAN);
 
-    // --- Shift Left (<<) Tests ---
-    {
-        // i32 shift left tests
-        let a = 5i32; // 0b101
-        let neg = -5i32;
-        assert!((a << 0) == 5, "i32: a << 0");
-        assert!((a << 1) == 10, "i32: a << 1"); // 0b1010
-        assert!((a << 2) == 20, "i32: a << 2"); // 0b10100
-        assert!((neg << 1) == -10, "i32: neg << 1");
+    // u128 comparisons
+    test_comparisons!(u128, 5_000_000_000_000_000_000_000u128, 5_000_000_000_000_000_000_000u128, 10_000_000_000_000_000_000_000u128, 2u128, 0u128, 0u128);
 
-        // i64 shift left tests (using a small value)
-        let ua = 7i64;
-        assert!((ua << 0) == 7, "i64: ua << 0");
-        assert!((ua << 1) == 14, "i64: ua << 1");
-        assert!((ua << 10) == 7168, "i64: ua << 10"); // (7 * 1024)
-    }
+    // i128 comparisons
+    test_comparisons!(i128, 5_000_000_000_000_000_000_000i128, 5_000_000_000_000_000_000_000i128, 10_000_000_000_000_000_000_000i128, -2i128, 0i128, 0i128);
 
-    // --- Shift Right (>>) Tests ---
-    {
-        // i32 shift right tests (Arithmetic Shift Right)
-        let a = 20i32;  // 0b10100
-        let neg = -20i32; // ...11101100
-        let min = i32::MIN; // 0x80000000
-        assert!((a >> 0) == 20, "i32: a >> 0");
-        assert!((a >> 1) == 10, "i32: a >> 1");
-        assert!((a >> 2) == 5, "i32: a >> 2");
-        assert!((a >> 3) == 2, "i32: a >> 3");
-        assert!((a >> 4) == 1, "i32: a >> 4");
-        assert!((a >> 5) == 0, "i32: a >> 5");
-        assert!((neg >> 0) == -20, "i32: neg >> 0");
-        assert!((neg >> 1) == -10, "i32: neg >> 1");
-        assert!((neg >> 2) == -5, "i32: neg >> 2");
+    // f128 comparisons
+    test_comparisons_float_no_nan!(f128, 5.0f128, 5.0f128, 10.5f128, -2.1f128, 0.0f128, -0.0f128);
+    
+    // u8 binary operations
+    test_binary_ops!(
+        u8,
+        0b1100_1010u8,
+        0b1010_0110u8,
+        0u8,
+        0b1000_0010u8,
+        0b1110_1110u8,
+        0b0110_1100u8
+    );
 
-        // i64 shift right tests using a positive value
-        let pos64: i64 = 1024;
-        assert!((pos64 >> 0) == 1024, "i64: pos64 >> 0");
-        assert!((pos64 >> 1) == 512, "i64: pos64 >> 1");
-        assert!((pos64 >> 10) == 1, "i64: pos64 >> 10");
-        assert!((pos64 >> 11) == 0, "i64: pos64 >> 11");
+    // i8 binary operations
+    test_binary_ops!(
+        i8,
+        -54i8, // 0b11001010
+        -90i8, // 0b10100110
+        0i8,
+        -126i8, // a & b = 0b10000010
+        -18i8,  // a | b = 0b11101110
+        108i8   // a ^ b = 0b01101100
+    );
 
-        // i64 shift right tests using a negative value (arithmetic shift right)
-        let neg64: i64 = -1024;
-        assert!((neg64 >> 0) == -1024, "i64: neg64 >> 0");
-        assert!((neg64 >> 1) == -512, "i64: neg64 >> 1");
-        assert!((neg64 >> 10) == -1, "i64: neg64 >> 10");
-    }
+    // u16 binary operations
+    test_binary_ops!(
+        u16,
+        0xACF0u16, // 1010110011110000
+        0x5A0Fu16, // 0101101000001111
+        0u16,
+        0x0800u16, // a & b
+        0xFEFFu16, // a | b
+        0xF6FFu16  // a ^ b
+    );
+
+    // i16 binary operations
+    test_binary_ops!(
+        i16,
+        -21264i16, // 0xACF0
+        23055i16,  // 0x5A0F
+        0i16,
+        2048i16,   // a & b = 0x0800
+        -257i16,  // a | b = 0xFEFF
+        -2305i16   // a ^ b = 0xF6FF
+    );
+
+    // u32 binary operations
+    test_binary_ops!(
+        u32,
+        0xDEADBEEFu32,
+        0xFEEDC0DEu32,
+        0u32,
+        0xDEAD80CEu32, // a & b
+        0xFEEDFEFFu32, // a | b
+        0x20407E31u32  // a ^ b
+    );
+
+    // i32 binary operations
+    test_binary_ops!(
+        i32,
+        0b1100_1010i32,
+        0b1010_0110i32,
+        0i32,
+        0b1000_0010i32,
+        0b1110_1110i32,
+        0b0110_1100i32
+    );
+
+    // u64 binary operations
+    test_binary_ops!(
+        u64,
+        0x1234_5678_9ABC_DEF0u64,
+        0x0FED_CBA9_8765_4321u64,
+        0u64,
+        0x0224_4228_8224_4220u64,
+        0x1FFD_DFF9_9FFD_DFF1u64,
+        0x1DD9_9DD1_1DD9_9DD1u64
+    );
+
+    // i64 binary operations
+    test_binary_ops!(
+        i64,
+        0x1234_5678_9ABC_DEF0i64,
+        0x0FED_CBA9_8765_4321i64,
+        0i64,
+        0x0224_4228_8224_4220i64,
+        0x1FFD_DFF9_9FFD_DFF1i64,
+        0x1DD9_9DD1_1DD9_9DD1i64
+    );
+
+    // u128 binary operations
+    test_binary_ops!(
+        u128,
+        0x1234_5678_9ABC_DEF0_1234_5678_9ABC_DEF0u128,
+        0x0FED_CBA9_8765_4321_0FED_CBA9_8765_4321u128,
+        0u128,
+        0x0224_4228_8224_4220_0224_4228_8224_4220u128,
+        0x1FFD_DFF9_9FFD_DFF1_1FFD_DFF9_9FFD_DFF1u128,
+        0x1DD9_9DD1_1DD9_9DD1_1DD9_9DD1_1DD9_9DD1u128
+    );
+
+   // i128 binary operations
+    test_binary_ops!(
+        i128,
+        0x1234_5678_9ABC_DEF0_1234_5678_9ABC_DEF0i128,
+        0x0FED_CBA9_8765_4321_0FED_CBA9_8765_4321i128,
+        0i128,
+        0x0224_4228_8224_4220_0224_4228_8224_4220i128,
+        0x1FFD_DFF9_9FFD_DFF1_1FFD_DFF9_9FFD_DFF1i128,
+        0x1DD9_9DD1_1DD9_9DD1_1DD9_9DD1_1DD9_9DD1i128
+    );
+
+    // u8 operations
+    test_ops!(u8, 10u8, 5u8, 0u8, 15u8, 5u8, 50u8, 2u8);
+
+    // i8 operations
+    test_ops!(i8, 10i8, 5i8, 0i8, 15i8, 5i8, 50i8, 2i8);
+    
+    // u16 operations
+    test_ops!(u16, 10u16, 5u16, 0u16, 15u16, 5u16, 50u16, 2u16);
+
+    // i16 operations
+    test_ops!(i16, 10i16, 5i16, 0i16, 15i16, 5i16, 50i16, 2i16);
+    
+    // f16 operations
+    test_ops!(f16, 10.0f16, 2.0f16, 0.0f16, 12.0f16, 8.0f16, 20.0f16, 5.0f16);
+    
+    // u32 operations
+    test_ops!(u32, 10000u32, 5000u32, 0u32, 15000u32, 5000u32, 50000000u32, 2u32);
+    
+    // i32 operations
+    test_ops!(i32, 10000i32, 5000i32, 0i32, 15000i32, 5000i32, 50000000i32, 2i32);
+    
+    // f32 operations
+    test_ops!(f32, 10.5f32, 2.5f32, 0.0f32, 13.0f32, 8.0f32, 26.25f32, 4.2f32);
+    
+    // u64 operations
+    test_ops!(u64, 1000000u64, 200000u64, 0u64, 1200000u64, 800000u64, 200000000000u64, 5u64);
+    
+    // i64 operations
+    test_ops!(i64, 1000000i64, 200000i64, 0i64, 1200000i64, 800000i64, 200000000000i64, 5i64);
+    
+    // f64 operations
+    test_ops!(f64, 10.5f64, 2.5f64, 0.0f64, 13.0f64, 8.0f64, 26.25f64, 4.2f64);
+    
+    // u128 operations
+    test_ops!(
+        u128, 
+        1000000000000000000u128, 
+        200000000000000000u128, 
+        0u128, 
+        1200000000000000000u128, 
+        800000000000000000u128, 
+        200000000000000000000000000000000000u128, 
+        5u128
+    );
+
+    // i128 operations
+    test_ops!(
+        i128, 
+        1000000000000000000i128, 
+        200000000000000000i128, 
+        0i128, 
+        1200000000000000000i128, 
+        800000000000000000i128, 
+        200000000000000000000000000000000000i128, 
+        5i128
+    );
+
+    // f128 operations
+    test_ops!(
+        f128, 
+        10.0f128, 
+        2.0f128, 
+        0.0f128, 
+        12.0f128, 
+        8.0f128, 
+        20.0f128, 
+        5.0f128
+    );
 }

@@ -76,6 +76,16 @@ public object Core {
             return false
         }
 
+        // Special handling for floating point types
+        // Java's .equals() method does not handle NaN correctly (NaN == NaN which is the opposite of what Rust expects)
+        if ((value1 is Double || value1 is Float) && (value2 is Double || value2 is Float)) {
+            val d1 = if (value1 is Float) value1.toDouble() else value1 as Double
+            val d2 = if (value2 is Float) value2.toDouble() else value2 as Double
+            // Direct comparison using IEEE 754 rules (NaN != NaN)
+            @Suppress("FloatingPointLiteralComparison") // We WANT this specific comparison
+            return d1 == d2
+        }
+
         // 2. Handle common Kotlin/Java types where '==' gives value equality
         //    or specific content checks are needed.
         val class1 = value1::class.java

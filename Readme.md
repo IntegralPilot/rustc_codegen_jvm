@@ -29,20 +29,20 @@ This backend currently supports a subset of Rust features:
 
 *   ✅ Compiling minimal `no_std` & `no_core` Rust programs (like an empty `main`) using the `jvm-unknown-unknown` target.
 *   ✅ Compiling simple programs using basic `core` features (like other tests) using the host target but this codegen backend to produce JVM bytecode.
-*   ✅ Basic integer arithmetic operations on all types of numbers:
+*   ✅ Basic integer arithmetic operations on all types of numbers including floats:
     *   Addition (`+`), Subtraction (`-`), Multiplication (`*`), Division (`/`), Remainder (`%`).
-    *   Checked addition, subtraction and multiplication returning `(result, overflowed_bool)` tuples (occurs in debug mode)
-*   ✅ Comparisons (`==`, `!=`, `<`, `<=`, `>`, `>=`).
-*   ✅ Bitwise operations (`&`, `|`, `^`, `<<`, `>>`).
-*   ✅ Logical operations (`&&`, `||`, `!`), support for `if` (and `else if`/`else`) and `match` statements.
+    *   Checked addition, subtraction and multiplication returning `(result, overflowed_bool)` tuples (`rustc` requests this in debug mode even for normal operations to panic on overflow).
+*   ✅ Comparisons between all number types (`==`, `!=`, `<`, `<=`, `>`, `>=`).
+*   ✅ Bitwise operations on all numbers (`&`, `|`, `^`, `<<`, `>>`).
+*   ✅ Logical operations(`&&`, `||`, `!`), support for `if` (and `else if`/`else`) and `match` statements.
 *   ✅ Unary operations (`-`, `!`).
 *   ✅ Type casting (e.g., `as` operator).
-*   ✅ Support for all primitive types.
+*   ✅ Support for all Rust primitive types.
 *   ✅ Calling other functions (including recursion).
 *   ✅ Loops such as `for`, `while`, and `loop`.
 *   ✅ Variable assignment including subfield and array index assignment, including nesting.
 *   ✅ Arrays and slices, including inserting, accessing and mutating at a given index (supporting nesting).
-*   ✅ Floats (`f32`, `f64`).
+*   ✅ Floats (`f16`, `f32`, `f64`, `f128`) and their operations.
 *   ✅ Structs, Tuples and Enums (including traditional C-like enums but also Rust-like enums with anonymous structs and tuples in them) including nested access/setting/mutation of fields and array indices within these.
 *   ✅ Generating executable `.jar` files for binary crates.
 
