@@ -765,28 +765,38 @@ pub fn convert_rvalue_to_operand<'a>(
             }
         }
         Rvalue::Discriminant(place) => {
-            // get the discriminate of the place (usually an enum)
-            // so basically just call `getVariantIdx` on the class in the place
-
-            let place_name = place_to_string(place, tcx);
-            let place_type = get_place_type(place, mir, tcx, data_types);
-
+            // 1. Generate instructions to get the actual value from the place
+            let (actual_value_var_name, get_instructions, actual_value_oomir_type) =
+                emit_instructions_to_get_on_own(place, tcx, mir, data_types);
+        
+            // Add the instructions needed to get the value (e.g., ArrayGet)
+            instructions.extend(get_instructions);
+        
+            // 2. Now operate on the variable holding the actual value
             let temp_discriminant_var = generate_temp_var_name(&base_temp_name);
-            let place_class_name = match place_type.clone() {
+        
+            let place_class_name = match actual_value_oomir_type.clone() {
                 oomir::Type::Class(name) => name.clone(),
-                _ => panic!("Discriminant on non-class type {:?}", place),
+                // Handle potential references if get_on_own returns Ref(Class)
+                oomir::Type::Reference(inner) => {
+                     if let oomir::Type::Class(name) = inner.as_ref() {
+                        name.clone()
+                     } else {
+                         panic!("Discriminant on Ref to non-class type: {:?}", inner)
+                     }
+                }
+                _ => panic!("Discriminant on non-class type: {:?}", actual_value_oomir_type),
             };
-            let place_class = data_types.get(&place_class_name).unwrap();
+        
             let method_name = "getVariantIdx".to_string();
-            let method_return_tuple = place_class.methods.get(&method_name).unwrap();
-            let method_return_type = method_return_tuple.0.clone();
-
+            let method_return_type = oomir::Type::I32;
+        
             let method_ty = oomir::Signature {
                 params: vec![],
                 ret: Box::new(method_return_type.clone()),
             };
-
-            // we can InvokeStatic as lower2 makes the field index method static (it doesn't depend on fields at all)
+        
+            // 3. Call InvokeVirtual on the CORRECT variable
             instructions.push(oomir::Instruction::InvokeVirtual {
                 class_name: place_class_name.clone(),
                 method_name,
@@ -794,16 +804,17 @@ pub fn convert_rvalue_to_operand<'a>(
                 dest: Some(temp_discriminant_var.clone()),
                 method_ty,
                 operand: oomir::Operand::Variable {
-                    name: place_name,
-                    ty: place_type,
+                    name: actual_value_var_name,
+                    ty: actual_value_oomir_type,
                 },
             });
-
+        
+            // 4. The result is the temporary variable holding the discriminant value
             result_operand = oomir::Operand::Variable {
                 name: temp_discriminant_var,
-                ty: method_return_type,
+                ty: method_return_type, // Should be I32
             };
-        }
+        }        
         // Handle other Rvalue variants by generating a placeholder
         _ => {
             println!(

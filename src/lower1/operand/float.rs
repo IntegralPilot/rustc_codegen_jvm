@@ -63,7 +63,7 @@ pub fn f128_to_string(x: f128) -> String {
 
     // --- Integer part + remainder ---
     let int_part = &num / &den;
-    let mut rem = num % &den;
+    let rem = num % &den;
 
     // Convert the integer part to decimal
     let mut int_str = int_part.to_str_radix(10);
@@ -86,7 +86,6 @@ pub fn f128_to_string(x: f128) -> String {
         let next = frac_digits[PREC];
         // any non‑zero bits beyond PREC+1 make it “> 5”
         let tie_or_above = next > 5 || (next == 5 && rem2 != BigUint::zero());
-        let tie = next == 5 && rem2.is_zero();
 
         let mut round_up = false;
         if tie_or_above {

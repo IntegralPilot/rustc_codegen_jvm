@@ -527,6 +527,16 @@ impl Type {
             _ => None,
         }
     }
+
+    /// Returns the JVM class name for the class or interface.
+    pub fn to_jvm_class_name(&self) -> Option<String> {
+        match self {
+            Type::Class(name) => Some(name.replace('.', "/")),
+            Type::Array(inner) => inner.to_jvm_internal_name(), // Delegate to inner type
+            Type::String => Some("java/lang/String".to_string()),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for Signature {

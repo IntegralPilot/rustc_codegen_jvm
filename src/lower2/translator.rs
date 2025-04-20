@@ -2,7 +2,7 @@ use super::{
     consts::{get_int_const_instr, load_constant},
     helpers::{
         get_cast_instructions, get_load_instruction, get_operand_type, get_store_instruction,
-        get_type_size, parse_jvm_descriptor_params,
+        get_type_size, parse_jvm_descriptor_params, parse_jvm_descriptor_return
     },
     shim::get_shim_metadata,
 };
@@ -2093,22 +2093,39 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                             }
 
                             // Store result or pop (using the stored descriptor)
-                            let current_shim_descriptor = shim_descriptor.as_ref().unwrap(); // We know it's Some here
-                            if !is_diverging_call && !current_shim_descriptor.ends_with(")V") {
+                            let shim_descriptor = shim_descriptor.as_ref().expect("no descriptor found for shim?");
+                            if !is_diverging_call && !shim_descriptor.ends_with(")V") {
+                                // Parse the declared JVM return type from the shim's descriptor
+                                let shim_declared_return_jvm_desc =
+                                    match parse_jvm_descriptor_return(&shim_descriptor) {
+                                        Ok(desc) => desc,
+                                        Err(e) => {
+                                            return Err(jvm::Error::VerificationError {
+                                                context: format!("Function {}", self.oomir_func.name),
+                                                message: format!(
+                                                    "Error parsing shim descriptor return type: {}",
+                                                    e
+                                                ),
+                                            });
+                                        }
+                                    };
+
+                                // Parse the OOMIR type corresponding to the shim's return value
+                                let shim_return_oomir_type =
+                                    oomir::Type::from_jvm_descriptor_return_type(shim_descriptor);
+
                                 if let Some(dest_var) = dest {
-                                    let return_type = oomir::Type::from_jvm_descriptor_return_type(
-                                        current_shim_descriptor,
-                                    );
-                                    self.store_result(dest_var, &return_type)?;
+                                    // Now, store the result (which is correctly typed on the stack)
+                                    // Use the OOMIR type derived from the descriptor for storage logic
+                                    self.store_result(dest_var, &shim_return_oomir_type)?;
+
                                 } else {
-                                    let return_type = oomir::Type::from_jvm_descriptor_return_type(
-                                        current_shim_descriptor,
-                                    );
-                                    match get_type_size(&return_type) {
-                                        // Assumes get_type_size works for OOMIR types
+                                    // No destination variable, just pop the result based on its size
+                                    // Use the OOMIR type derived from the descriptor
+                                    match get_type_size(&shim_return_oomir_type) {
                                         1 => self.jvm_instructions.push(JI::Pop),
                                         2 => self.jvm_instructions.push(JI::Pop2),
-                                        _ => { /* Error or ignore void/unhandled */ }
+                                        _ => { /* Void return already handled, ignore size 0 */ }
                                     }
                                 }
                             } else if dest.is_some()
@@ -2492,6 +2509,29 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     get_load_instruction(&object_actual_type, object_var_index)?;
                 self.jvm_instructions.push(load_object_instr.clone()); // Stack: [object_ref]
 
+                // Check if a downcast is necessary before accessing the field.
+                // This is needed if the field belongs to a specific variant ('owner_class')
+                // but the variable currently holds the base enum type ('object_actual_type').
+                let object_jvm_name = object_actual_type.to_jvm_class_name();
+
+                // Compare the JVM name of the variable's static type with the field's owner class.
+                // Also check if owner_class is derived from object_actual_type (basic check for now)
+                // Compare the JVM name of the variable's static type with the field's owner class.
+                // Also check if owner_class is derived from object_actual_type (basic check for now)
+                if let Some(obj_name) = object_jvm_name.clone() {
+                    if obj_name != *owner_class {
+                        println!(
+                        "DEBUG: Adding checkcast to {} for GetField on variable '{}' (static type {:?})",
+                        owner_class, object_var, object_actual_type
+                        );
+                        // Add the Class reference for the target variant type to the constant pool
+                        let cast_target_class_index = self.constant_pool.add_class(owner_class)?;
+                        // Add the checkcast instruction
+                        self.jvm_instructions.push(JI::Checkcast(cast_target_class_index));
+                        // Stack: [object_ref (type: owner_class after checkcast)]
+                    }
+                 }
+
                 // 4. Load the value to be stored onto the stack
                 self.load_operand(value)?; // Stack: [object_ref, value] (value size 1 or 2)
 
@@ -2533,6 +2573,27 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 let load_object_instr =
                     get_load_instruction(&object_actual_type, object_var_index)?;
                 self.jvm_instructions.push(load_object_instr.clone()); // Stack: [object_ref]
+
+                // Check if a downcast is necessary before accessing the field.
+                // This is needed if the field belongs to a specific variant ('owner_class')
+                // but the variable currently holds the base enum type ('object_actual_type').
+                let object_jvm_name = object_actual_type.to_jvm_class_name(); // Get JVM name (e.g., "option")
+
+                // Compare the JVM name of the variable's static type with the field's owner class.
+                // Also check if owner_class is derived from object_actual_type (basic check for now)
+                if let Some(obj_name) = object_jvm_name.clone() {
+                    if obj_name != *owner_class {
+                        println!(
+                        "DEBUG: Adding checkcast to {} for GetField on variable '{}' (static type {:?})",
+                        owner_class, object_var, object_actual_type
+                        );
+                        // Add the Class reference for the target variant type to the constant pool
+                        let cast_target_class_index = self.constant_pool.add_class(owner_class)?;
+                        // Add the checkcast instruction
+                        self.jvm_instructions.push(JI::Checkcast(cast_target_class_index));
+                        // Stack: [object_ref (type: owner_class after checkcast)]
+                    }
+                 }
 
                 // 4. Emit 'getfield' instruction
                 self.jvm_instructions.push(JI::Getfield(field_ref_index)); // Stack: [field_value] (size 1 or 2)

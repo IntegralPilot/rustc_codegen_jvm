@@ -182,4 +182,41 @@ public object Core {
         return value.toString().startsWith(Char(prefixChar).toString())
     }
 
+    @JvmStatic
+    public fun option_unwrap(optionObj: Any?): Any? {
+        if (optionObj == null) {
+             // This shouldn't happen if the codegen is correct, as unwrap is called on an instance.
+             panic_fmt("FATAL: Called option_unwrap on a null reference. This indicates a bug in the code generator.")
+             // Need a return path for the compiler, even though panic throws.
+             throw RuntimeException("Unreachable after panic")
+        }
+
+        // Determine the variant using instanceof (Kotlin 'is')
+        if (optionObj::class.java.name.endsWith("option\$some")) {
+             // It's Some(value). Extract the value from field0.
+             try {
+                 // Use reflection to get the field, assuming we don't know the exact class type statically
+                 // but know the naming convention.
+                 val field = optionObj::class.java.getDeclaredField("field0")
+                 field.isAccessible = true // Ensure we can access it even if not public
+                 return field.get(optionObj)
+             } catch (e: NoSuchFieldException) {
+                 panic_fmt("Internal Compiler Error: option\$some class generated without 'field0'. Exception: ${e.message}")
+                 throw RuntimeException("Unreachable after panic") // For compiler
+             } catch (e: IllegalAccessException) {
+                 panic_fmt("Internal Compiler Error: Cannot access 'field0' in generated option\$some class. Exception: ${e.message}")
+                 throw RuntimeException("Unreachable after panic") // For compiler
+             }
+        } else if (optionObj::class.java.name.endsWith("option\$none")) {
+             // It's None. Panic with the standard message.
+             panic_fmt("called `Option::unwrap()` on a `None` value")
+             throw RuntimeException("Unreachable after panic") // For compiler
+        } else {
+             // Input object was not an expected Option variant. This indicates a codegen bug.
+             val className = optionObj::class.java.name
+             panic_fmt("Internal Compiler Error: Called option_unwrap on an unexpected type: $className. Expected type ending in option\$some or option\$none.")
+             throw RuntimeException("Unreachable after panic") // For compiler
+        }
+    }
+
 }
