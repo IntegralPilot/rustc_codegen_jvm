@@ -83,7 +83,7 @@ All examples live in `tests/binary` and are compiled to JVM bytecode & run/teste
 
 ```bash
 # Clone & enter repo
-git clone https://github.com/your-org/rustc_codegen_jvm.git
+git clone https://github.com/IntegralPilot/rustc_codegen_jvm.git
 cd rustc_codegen_jvm
 
 # Build everything
