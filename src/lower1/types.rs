@@ -163,6 +163,11 @@ pub fn ty_to_oomir_type<'tcx>(
             // Default slice handling
             oomir::Type::Array(Box::new(ty_to_oomir_type(*component_ty, tcx, data_types)))
         }
+        rustc_middle::ty::TyKind::Never => {
+            // Handle the never type
+            println!("Info: Mapping Never type to OOMIR Void");
+            oomir::Type::Void
+        }
         _ => {
             println!("Warning: Unhandled type {:?}", ty);
             oomir::Type::Class("UnsupportedType".to_string())

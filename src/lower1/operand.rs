@@ -426,13 +426,22 @@ pub fn handle_const_value<'tcx>(
                                                 }
                                             } else {
                                                 /* Array element type is not Ref */
-                                                println!(
-                                                    "Warning: Scalar::Ptr points to Ref-to-Array where element type {:?} is not a reference.",
-                                                    elem_ty
-                                                );
-                                                return oomir::Operand::Constant(
-                                                    oomir::Constant::I64(-5),
-                                                ); // Indicate wrong element type
+                                                match read_constant_value_from_memory(tcx, allocation, pointer.into_parts().1, *inner_ty, data_types) {
+                                                    Ok(oomir_const) => {
+                                                        println!(
+                                                            "Info: Successfully read constant value from memory: {:?}",
+                                                            oomir_const
+                                                        );
+                                                        return oomir::Operand::Constant(oomir_const);
+                                                    }
+                                                    Err(e) => {
+                                                        println!(
+                                                            "Warning: Failed to read constant value from memory for allocation {:?}. Error: {:?}",
+                                                            alloc_id, e
+                                                        );
+                                                        return oomir::Operand::Constant(oomir::Constant::I32(-1))
+                                                    }
+                                                }
                                             }
                                         } else {
                                             // Could not determine array length (e.g., generic)

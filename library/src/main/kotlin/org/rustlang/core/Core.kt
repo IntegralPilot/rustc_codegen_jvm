@@ -219,4 +219,29 @@ public object Core {
         }
     }
 
+    @JvmStatic
+    // same as unwrap but return true/false if None instead of exception
+    public fun option_is_none(optionObj: Any?): Boolean {
+        if (optionObj == null) {
+            // This shouldn't happen if the codegen is correct, as unwrap is called on an instance.
+            panic_fmt("FATAL: Called option_is_none on a null reference. This indicates a bug in the code generator.")
+            // Need a return path for the compiler, even though panic throws.
+            throw RuntimeException("Unreachable after panic")
+        }
+
+        // Determine the variant using instanceof (Kotlin 'is')
+        if (optionObj::class.java.name.endsWith("option\$some")) {
+            // It's Some(value). Return false.
+            return false
+        } else if (optionObj::class.java.name.endsWith("option\$none")) {
+            // It's None. Return true.
+            return true
+        } else {
+            // Input object was not an expected Option variant. This indicates a codegen bug.
+            val className = optionObj::class.java.name
+            panic_fmt("Internal Compiler Error: Called option_is_none on an unexpected type: $className. Expected type ending in option\$some or option\$none.")
+            throw RuntimeException("Unreachable after panic") // For compiler
+        }
+    }
+
 }

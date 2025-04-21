@@ -602,7 +602,7 @@ pub fn parse_jvm_descriptor_return(descriptor: &str) -> Result<String, String> {
     println!("Parsing return type from descriptor: {}", descriptor);
 
     // 1. find the parentheses
-    let open_paren = descriptor
+    descriptor
         .find('(')
         .ok_or_else(|| "Descriptor must start with '('".to_string())?;
     let close_paren = descriptor

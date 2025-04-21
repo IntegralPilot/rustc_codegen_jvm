@@ -43,6 +43,10 @@
     "descriptor": "(Ljava/lang/Object;Ljava/lang/Object;)Z",
     "is_static": true
   },
+  "option_is_none": {
+    "descriptor": "(Ljava/lang/Object;)Z",
+    "is_static": true
+  },
   "option_unwrap": {
     "descriptor": "(Ljava/lang/Object;)Ljava/lang/Object;",
     "is_static": true

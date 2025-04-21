@@ -24,14 +24,14 @@ Compile your Rust code into a runnable `.jar` on JVM 8+!
 ---
 
 ## 🔥 Demos
+All examples live in `tests/binary` and are compiled to JVM bytecode & run/tested on the CI on every commit. Some exciting demos made in pure-Rust include:
 
-All examples live in `tests/binary` and are compiled to JVM bytecode & run/tested on the CI on every commit. Some exicting demos made in pure-Rust include:
-
-- **RSA** encryption/decryption (`rsa`) 
-- **Fibonacci** sequence generator (`fibonacci`)  
-- **Collatz conjecture** verifier (`collatz`)  
-- **Large prime** generator (`primes`)
-- Nested data structures: enums, structs, tuples, arrays, slices (`enums`, `structs`)  
+- **[RSA](tests/binary/rsa/src/main.rs)** encryption/decryption  
+- **[Binary search](tests/binary/binsearch/src/main.rs)** algorithm  
+- **[Fibonacci](tests/binary/fibonacci/src/main.rs)** sequence generator  
+- **[Collatz conjecture](tests/binary/collatz/src/main.rs)** verifier  
+- **[Large prime](tests/binary/primes/src/main.rs)** generator  
+- Use of nested data structures: enums, structs, tuples, arrays, slices (**[enums](tests/binary/enums/src/main.rs)**, **[structs](tests/binary/structs/src/main.rs)** - both tests use arrays and tuples)  
 - …and more!
 
 ---
@@ -95,7 +95,7 @@ This will compile:
 - `rustc_codegen_jvm` backend library  
 - `java-linker`  
 - `asm-processor`  
-- Kotlin shim for `core`  
+- Kotlin shim for `core` (once core support is reached, this will no longer be needed)  
 - Generate `config.toml` & `jvm-unknown-unknown.json`  
 
 If you relocate the repo, re-run:
@@ -108,17 +108,17 @@ make gen-files
 ## 🚀 Usage
 
 1. **Configure your project**  
-   In *your* Rust project directory, create or update `.cargo/config.toml` with the generated template.
+   In *your* Rust project directory, create or update `.cargo/config.toml` with the generated template (will be at the root of this repo after running make).
 
 2. **Build with Cargo**  
    ```bash
    cargo build           # debug
-   cargo build --release # optimized
+   cargo build --release # optimized - functionality available slightly impaired 
    ```
 
 3. **Run the `.jar`**  
    ```bash
-   java -jar target/debug/deps/your_crate.jar
+   java -jar target/debug/deps/your_crate*.jar
    ```
 
 ---
