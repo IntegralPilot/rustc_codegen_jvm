@@ -39,6 +39,7 @@ All examples live in `tests/binary` and are compiled to JVM bytecode & run/teste
 ## ✨ Features
 
 - **Minimal `no_std` & `no_core`** programs via `jvm-unknown-unknown`  
+- Optimisations including constant folding and propogation, dead code elimination, and more to generate efficient JVM bytecode
 - Basic `core` support on host target for JVM output  
 - Arithmetic (integers + floats, incl. checked ops)  
 - Comparisons, bitwise & logical ops  
@@ -60,12 +61,19 @@ All examples live in `tests/binary` and are compiled to JVM bytecode & run/teste
 2. **MIR → OOMIR**  
    Custom “Object‑Oriented MIR” simplifies MIR into OOP‑style constructs.  
    _(see `src/lower1.rs`)_  
-3. **OOMIR → JVM Classfile**  
+3. **OOMIR optimiser**
+   Optimises OOMIR using constant folding, dead code elimination, and more.  
+   _(see `src/optimise1.rs`)_  
+   - **Constant Folding**: Evaluates constant expressions at compile time.  
+   - **Constant Propagation**: Replaces variables with their constant values.  
+   - **Dead Code Elimination**: Removes unused code paths.  
+   - **Algebraic Simplification**: Simplifies expressions using algebraic identities.
+4. **OOMIR → JVM Classfile**  
    Translate to `.class` files using `ristretto_classfile`.  
    _(see `src/lower2.rs`)_  
-4. **Post‑Process Stack Map Frames**  
+5. **Post‑Process Stack Map Frames**  
    Kotlin `asm-processor` (ASM library) adds verification frames.  
-5. **Link & Package**  
+6. **Link & Package**  
    `java-linker` bundles `.class` files into a runnable `.jar` with `META-INF/MANIFEST.MF`.
 
 ---

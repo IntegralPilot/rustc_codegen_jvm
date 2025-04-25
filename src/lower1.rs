@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use types::ty_to_oomir_type;
 
 mod control_flow;
-mod operand;
+pub mod operand;
 mod place;
 mod types;
 

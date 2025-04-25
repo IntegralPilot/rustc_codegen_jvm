@@ -1,9 +1,13 @@
 // src/oomir.rs
 //! This is the output of the stage 1 lowering pass of the compiler.
 //! It is responsible for converting the MIR into a lower-level IR, called OOMIR (defined in this file).
+use crate::lower2::BIG_DECIMAL_CLASS;
+
 use super::lower2::BIG_INTEGER_CLASS;
 use ristretto_classfile::attributes::Instruction as JVMInstruction;
 use std::{collections::HashMap, fmt};
+
+pub mod interpret;
 
 // OOMIR definitions
 #[derive(Debug, Clone)]
@@ -41,7 +45,7 @@ pub struct Function {
     pub body: CodeBlock,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Signature {
     pub params: Vec<Type>,
     pub ret: Box<Type>,
@@ -73,7 +77,7 @@ pub struct BasicBlock {
     pub instructions: Vec<Instruction>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Instruction {
     Add {
         dest: String,
@@ -201,18 +205,18 @@ pub enum Instruction {
         size: Operand,
     },
     ArrayStore {
-        array_var: String,
+        array: String,
         index: Operand,
         value: Operand,
     },
     ArrayGet {
         dest: String,
-        array_var: String,
+        array: Operand,
         index: Operand,
     },
     Length {
         dest: String,
-        array_var: String,
+        array: Operand,
     },
     ConstructObject {
         dest: String, // Variable to hold the new object reference
@@ -220,7 +224,7 @@ pub enum Instruction {
                       // Implicitly calls the default constructor <init>()V
     },
     SetField {
-        object_var: String,  // Variable holding the object reference
+        object: String,      // Variable holding the object reference
         field_name: String,  // Name of the field in the class
         value: Operand,      // Value to store in the field
         field_ty: Type,      // Type of the field (needed for JVM descriptor)
@@ -228,7 +232,7 @@ pub enum Instruction {
     },
     GetField {
         dest: String,        // Variable to store the loaded field value
-        object_var: String,  // Variable holding the object reference
+        object: Operand,     // Variable holding the object reference
         field_name: String,  // Name of the field in the class
         field_ty: Type,      // Type of the field (needed for JVM descriptor)
         owner_class: String, // JVM class name where the field is defined
@@ -251,13 +255,13 @@ pub enum Instruction {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Operand {
     Constant(Constant),
     Variable { name: String, ty: Type },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Constant {
     I8(i8),
     I16(i16),
@@ -294,6 +298,162 @@ impl Constant {
             | Constant::Boolean(_) => true,
             Constant::Instance { class_name, .. } => class_name == BIG_INTEGER_CLASS,
             _ => false,
+        }
+    }
+
+    pub fn is_zero(&self) -> bool {
+        match self {
+            Constant::I8(i) => *i == 0,
+            Constant::I16(i) => *i == 0,
+            Constant::I32(i) => *i == 0,
+            Constant::I64(i) => *i == 0,
+            Constant::F32(f) => *f == 0.0,
+            Constant::F64(f) => *f == 0.0,
+            Constant::Char(c) => *c == '\0',
+            Constant::Instance { class_name, params, .. } => {
+                if class_name == BIG_INTEGER_CLASS {
+                    // Check if the params are all zero
+                    let param0 = params[0].clone(); // string of the number to be made
+                    if let Constant::String(s) = param0 {
+                        // Check if the string is "0" or "-0"
+                        return s == "0" || s == "-0";
+                    }
+                } else if class_name == BIG_DECIMAL_CLASS {
+                    // Check if the params are all zero
+                    let param0 = params[0].clone(); 
+                    if let Constant::String(s) = param0 {
+                        // remove all - and .
+                        let s = s.replace("-", "").replace(".", "");
+                        // check if every char is 0
+                        for c in s.chars() {
+                            if c != '0' {
+                                return false;
+                            }
+                        }
+                        return true;
+                    }
+                } 
+                return false;
+            }
+            Constant::Boolean(b) => !*b,
+            _ => false, // Null, String, Array, etc. are not zero
+        }
+    }
+
+    pub fn is_one(&self) -> bool {
+        match self {
+            Constant::I8(i) => *i == 1,
+            Constant::I16(i) => *i == 1,
+            Constant::I32(i) => *i == 1,
+            Constant::I64(i) => *i == 1,
+            Constant::F32(f) => *f == 1.0,
+            Constant::F64(f) => *f == 1.0,
+            Constant::Char(c) => *c == '1',
+            Constant::Boolean(b) => *b,
+            Constant::Instance { class_name, params, .. } => {
+                if class_name == BIG_INTEGER_CLASS {
+                    // Check if the params are all one
+                    let param0 = params[0].clone(); // string of the number to be made
+                    if let Constant::String(s) = param0 {
+                        // Check if the string is "1"
+                        return s == "1";
+                    }
+                } else if class_name == BIG_DECIMAL_CLASS {
+                    // Check if the params are all one
+                    let param0 = params[0].clone(); 
+                    if let Constant::String(s) = param0 {
+                        let mut after_dp = false;
+                        let mut had_before_dp_1 = false;
+                        for c in s.chars() {
+                            if c == '.' {
+                                after_dp = true;
+                                continue;
+                            }
+                            if after_dp {
+                                if c != '0' {
+                                    return false;
+                                }
+                            } else {
+                                if !had_before_dp_1 {
+                                    if c != '0' {
+                                        return false;
+                                    }
+                                    if c == '1' {
+                                        had_before_dp_1 = true;
+                                    }
+                                } else {
+                                    return false;
+                                }
+                            }
+                        }
+                    }
+                }
+                return false;
+            }
+            _ => false, // Null, String, Array, Instance are not one
+        }
+    }
+
+    // Helper to get a zero constant of a type compatible with an operand
+    // there's NO Integer, Float type use I8, F32, F64 etc. etc.
+    pub fn zero_for_operand(op: &Operand) -> Option<Constant> {
+        match op {
+            Operand::Constant(Constant::I8(_)) => Some(Constant::I8(0)),
+            Operand::Constant(Constant::I16(_)) => Some(Constant::I16(0)),
+            Operand::Constant(Constant::I32(_)) => Some(Constant::I32(0)),
+            Operand::Constant(Constant::I64(_)) => Some(Constant::I64(0)),
+            Operand::Constant(Constant::F32(_)) => Some(Constant::F32(0.0)),
+            Operand::Constant(Constant::F64(_)) => Some(Constant::F64(0.0)),
+            Operand::Constant(Constant::Char(_)) => Some(Constant::Char('\0')),
+            Operand::Constant(Constant::Boolean(_)) => Some(Constant::Boolean(false)),
+            Operand::Constant(Constant::Instance { class_name, .. }) => {
+                if class_name == BIG_INTEGER_CLASS {
+                    return Some(Constant::Instance {
+                        class_name: class_name.clone(),
+                        fields: std::collections::HashMap::new(),
+                        params: vec![Constant::String("0".to_string())],
+                    });
+                } else if class_name == BIG_DECIMAL_CLASS {
+                    return Some(Constant::Instance {
+                        class_name: class_name.clone(),
+                        fields: std::collections::HashMap::new(),
+                        params: vec![Constant::String("0".to_string())],
+                    });
+                }
+                 None
+            }
+            _ => None,
+        }
+    }
+
+    // Helper to get a one constant of a type compatible with an operand
+    pub fn one_for_operand(op: &Operand) -> Option<Constant> {
+        match op {
+            Operand::Constant(Constant::I8(_)) => Some(Constant::I8(1)),
+            Operand::Constant(Constant::I16(_)) => Some(Constant::I16(1)),
+            Operand::Constant(Constant::I32(_)) => Some(Constant::I32(1)),
+            Operand::Constant(Constant::I64(_)) => Some(Constant::I64(1)),
+            Operand::Constant(Constant::F32(_)) => Some(Constant::F32(1.0)),
+            Operand::Constant(Constant::F64(_)) => Some(Constant::F64(1.0)),
+            Operand::Constant(Constant::Char(_)) => Some(Constant::Char('1')),
+            Operand::Constant(Constant::Boolean(_)) => Some(Constant::Boolean(true)),
+            Operand::Constant(Constant::Instance { class_name, .. }) => {
+                if class_name == BIG_INTEGER_CLASS {
+                    return Some(Constant::Instance {
+                        class_name: class_name.clone(),
+                        fields: std::collections::HashMap::new(),
+                        params: vec![Constant::String("1".to_string())],
+                    });
+                } else if class_name == BIG_DECIMAL_CLASS {
+                    return Some(Constant::Instance {
+                        class_name: class_name.clone(),
+                        fields: std::collections::HashMap::new(),
+                        params: vec![Constant::String("1".to_string())],
+                    });
+                }
+                 None
+            }
+            _ => None,
         }
     }
 }

@@ -109,6 +109,7 @@ def main():
     parser = argparse.ArgumentParser(description="Tester for Rustc's JVM Codegen Backend")
     parser.add_argument("--release", action="store_true", help="Run cargo in release mode")
     parser.add_argument("--only-run", type=str, help="Comma-separated list of specific test names to run")
+    parser.add_argument("--dont-run", type=str, help="Comma-separated list of specific test names to exclude")
     args = parser.parse_args()
 
     print("🧪 Tester for Rustc's JVM Codegen Backend started!")
@@ -130,6 +131,11 @@ def main():
     if args.only_run:
         requested_tests = set([name.strip() for name in args.only_run.split(",")])
         binary_tests = [t for t in binary_tests if os.path.basename(t) in requested_tests]
+
+    # Exclude tests based on --dont-run
+    if args.dont_run:
+        excluded_tests = set([name.strip() for name in args.dont_run.split(",")])
+        binary_tests = [t for t in binary_tests if os.path.basename(t) not in excluded_tests]
 
     print(f"|- 📦 Running {len(binary_tests)} binary build test(s)...")
     for test_dir in binary_tests:

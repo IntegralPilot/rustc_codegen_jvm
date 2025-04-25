@@ -91,8 +91,7 @@ pub fn ty_to_oomir_type<'tcx>(
             ty_to_oomir_type(*inner_ty, tcx, data_types)
         }
         rustc_middle::ty::TyKind::RawPtr(inner_ty, _) => {
-            println!("Info: Mapping RawPtr({:?}) to OOMIR I64", inner_ty); // Add logging
-            oomir::Type::I64 // Represent raw pointers as integer addresses
+            ty_to_oomir_type(*inner_ty, tcx, data_types)
         }
         rustc_middle::ty::TyKind::Array(component_ty, _) => {
             // Special case for arrays of string references

@@ -117,11 +117,15 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
 
                 // Create a temporary name for the result of this field access.
                 let next_var = format!("{}_{}", current_var, field_index.index());
+                let obj_type = current_type.clone();
                 // Update the type to the field’s type.
                 current_type = ty_to_oomir_type(field_ty, tcx, data_types);
                 instructions.push(oomir::Instruction::GetField {
                     dest: next_var.clone(),
-                    object_var: current_var.clone(),
+                    object: Operand::Variable {
+                        name: current_var.clone(),
+                        ty: obj_type,
+                    },
                     field_name,
                     field_ty: current_type.clone(),
                     owner_class: owner_class_name,
@@ -130,6 +134,7 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
                 current_var = next_var;
             }
             ProjectionElem::Index(index_local) => {
+                let type_before_proj = current_type.clone();
                 // Convert the MIR index operand.
                 let index_operand = convert_operand(
                     &MirOperand::Copy(Place::from(index_local)),
@@ -159,7 +164,10 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
                 };
                 instructions.push(oomir::Instruction::ArrayGet {
                     dest: next_var.clone(),
-                    array_var: current_var.clone(),
+                    array: Operand::Variable {
+                        name: current_var.clone(),
+                        ty: type_before_proj,
+                    },
                     index: index_operand,
                 });
                 current_var = next_var;
@@ -169,6 +177,7 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
                 min_length: _,
                 from_end,
             } => {
+                let type_before_proj = current_type.clone();
                 let next_var = format!("{}_elem", current_var);
                 // Determine element type based on current_type being an array or reference-to-array.
                 current_type = match &current_type {
@@ -192,7 +201,10 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
                     // Simple constant index: array[offset]
                     instructions.push(oomir::Instruction::ArrayGet {
                         dest: next_var.clone(),
-                        array_var: current_var.clone(),
+                        array: Operand::Variable {
+                            name: current_var.clone(),
+                            ty: type_before_proj.clone(),
+                        },
                         index: Operand::Constant(oomir::Constant::I32(offset as i32)),
                     });
                 } else {
@@ -200,7 +212,10 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
                     let len_var = format!("{}_len", current_var);
                     instructions.push(oomir::Instruction::Length {
                         dest: len_var.clone(),
-                        array_var: current_var.clone(),
+                        array: Operand::Variable {
+                            name: current_var.clone(),
+                            ty: type_before_proj.clone(),
+                        },
                     });
                     let calc_idx_var = format!("{}_calc_idx", current_var);
                     instructions.push(oomir::Instruction::Sub {
@@ -213,7 +228,10 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
                     });
                     instructions.push(oomir::Instruction::ArrayGet {
                         dest: next_var.clone(),
-                        array_var: current_var.clone(),
+                        array: Operand::Variable {
+                            name: current_var.clone(),
+                            ty: type_before_proj.clone(),
+                        },
                         index: Operand::Variable {
                             name: calc_idx_var,
                             ty: oomir::Type::I32,
@@ -444,7 +462,7 @@ pub fn emit_instructions_to_set_value<'tcx>(
                 let field_ty = ty_to_oomir_type(*field_mir_ty, tcx, data_types);
 
                 instructions.push(Instruction::SetField {
-                    object_var: base_var_name, // The object/struct retrieved in step 2
+                    object: base_var_name, // The object/struct retrieved in step 2
                     field_name,
                     field_ty,
                     value: source_operand, // The value we want to store
@@ -470,7 +488,7 @@ pub fn emit_instructions_to_set_value<'tcx>(
                     convert_operand(&mir_index_operand, tcx, mir, data_types, &mut instructions);
 
                 instructions.push(Instruction::ArrayStore {
-                    array_var: base_var_name,   // The array retrieved in step 2
+                    array: base_var_name.clone(),
                     index: oomir_index_operand, // The index operand
                     value: source_operand,      // The value to store
                 });
@@ -506,7 +524,10 @@ pub fn emit_instructions_to_set_value<'tcx>(
                     let len_var_name = format!("{}_len_set", base_var_name);
                     instructions.push(Instruction::Length {
                         dest: len_var_name.clone(),
-                        array_var: base_var_name.clone(), // Get length of the base array
+                        array: Operand::Variable {
+                            name: base_var_name.clone(),
+                            ty: base_oomir_type.clone(),
+                        },
                     });
 
                     // Temp name for calculated index (avoid collision)
@@ -529,9 +550,9 @@ pub fn emit_instructions_to_set_value<'tcx>(
                 }
 
                 instructions.push(Instruction::ArrayStore {
-                    array_var: base_var_name, // The array retrieved in step 2
-                    index: index_operand,     // The constant or calculated index
-                    value: source_operand,    // The value to store
+                    array: base_var_name.clone(), // The array retrieved in step 2
+                    index: index_operand,         // The constant or calculated index
+                    value: source_operand,        // The value to store
                 });
             }
 

@@ -100,7 +100,7 @@ pub fn convert_rvalue_to_operand<'a>(
                 for i in 0..array_size {
                     let index_operand = oomir::Operand::Constant(oomir::Constant::I32(i as i32));
                     instructions.push(oomir::Instruction::ArrayStore {
-                        array_var: temp_array_var.clone(), // Store into temp array
+                        array: temp_array_var.clone(),
                         index: index_operand,
                         value: oomir_elem_op.clone(),
                     });
@@ -135,7 +135,14 @@ pub fn convert_rvalue_to_operand<'a>(
             let source_name = place_to_string(source_place, tcx);
             instructions.push(oomir::Instruction::Length {
                 dest: temp_len_var.clone(),
-                array_var: source_name,
+                array: oomir::Operand::Variable {
+                    name: source_name,
+                    ty: ty_to_oomir_type(
+                        source_place.ty(&mir.local_decls, tcx).ty,
+                        tcx,
+                        data_types,
+                    ),
+                },
             });
             result_operand = oomir::Operand::Variable {
                 name: temp_len_var,
@@ -307,7 +314,7 @@ pub fn convert_rvalue_to_operand<'a>(
                     });
                     // Set fields on the *temporary* tuple
                     instructions.push(oomir::Instruction::SetField {
-                        object_var: temp_tuple_var.clone(),
+                        object: temp_tuple_var.clone(),
                         field_name: "field0".to_string(),
                         value: oomir::Operand::Variable {
                             name: tmp_result_var,
@@ -317,7 +324,7 @@ pub fn convert_rvalue_to_operand<'a>(
                         owner_class: tuple_class_name.clone(),
                     });
                     instructions.push(oomir::Instruction::SetField {
-                        object_var: temp_tuple_var.clone(),
+                        object: temp_tuple_var.clone(),
                         field_name: "field1".to_string(),
                         value: oomir::Operand::Variable {
                             name: tmp_overflow_var,
@@ -374,7 +381,7 @@ pub fn convert_rvalue_to_operand<'a>(
                     match oomir_src_operand {
                         oomir::Operand::Variable {
                             name: source_name,
-                            ty: _,
+                            ty: var_ty,
                         } => {
                             // Check if source is actually an array/slice/str type
                             let operand_place = match operand {
@@ -400,7 +407,10 @@ pub fn convert_rvalue_to_operand<'a>(
                                     println!("Info: Detected Length op via PtrMetadata.");
                                     instructions.push(oomir::Instruction::Length {
                                         dest: temp_unop_var.clone(),
-                                        array_var: source_name,
+                                        array: oomir::Operand::Variable {
+                                            name: source_name,
+                                            ty: var_ty,
+                                        },
                                     });
                                 } else {
                                     println!(
@@ -481,7 +491,7 @@ pub fn convert_rvalue_to_operand<'a>(
                         let value_operand =
                             convert_operand(mir_op, tcx, mir, data_types, &mut instructions);
                         instructions.push(oomir::Instruction::SetField {
-                            object_var: temp_aggregate_var.clone(),
+                            object: temp_aggregate_var.clone(),
                             field_name,
                             value: value_operand,
                             field_ty: element_oomir_type,
@@ -510,7 +520,7 @@ pub fn convert_rvalue_to_operand<'a>(
                         let index_operand =
                             oomir::Operand::Constant(oomir::Constant::I32(i as i32));
                         instructions.push(oomir::Instruction::ArrayStore {
-                            array_var: temp_aggregate_var.clone(),
+                            array: temp_aggregate_var.clone(),
                             index: index_operand,
                             value: value_operand,
                         });
@@ -544,7 +554,7 @@ pub fn convert_rvalue_to_operand<'a>(
                                 &mut instructions,
                             );
                             instructions.push(oomir::Instruction::SetField {
-                                object_var: temp_aggregate_var.clone(),
+                                object: temp_aggregate_var.clone(),
                                 field_name,
                                 value: value_operand,
                                 field_ty: field_oomir_type,
@@ -686,7 +696,7 @@ pub fn convert_rvalue_to_operand<'a>(
                                 &mut instructions,
                             );
                             instructions.push(oomir::Instruction::SetField {
-                                object_var: temp_aggregate_var.clone(),
+                                object: temp_aggregate_var.clone(),
                                 field_name,
                                 value: value_operand,
                                 field_ty: field_oomir_type,
@@ -768,34 +778,37 @@ pub fn convert_rvalue_to_operand<'a>(
             // 1. Generate instructions to get the actual value from the place
             let (actual_value_var_name, get_instructions, actual_value_oomir_type) =
                 emit_instructions_to_get_on_own(place, tcx, mir, data_types);
-        
+
             // Add the instructions needed to get the value (e.g., ArrayGet)
             instructions.extend(get_instructions);
-        
+
             // 2. Now operate on the variable holding the actual value
             let temp_discriminant_var = generate_temp_var_name(&base_temp_name);
-        
+
             let place_class_name = match actual_value_oomir_type.clone() {
                 oomir::Type::Class(name) => name.clone(),
                 // Handle potential references if get_on_own returns Ref(Class)
                 oomir::Type::Reference(inner) => {
-                     if let oomir::Type::Class(name) = inner.as_ref() {
+                    if let oomir::Type::Class(name) = inner.as_ref() {
                         name.clone()
-                     } else {
-                         panic!("Discriminant on Ref to non-class type: {:?}", inner)
-                     }
+                    } else {
+                        panic!("Discriminant on Ref to non-class type: {:?}", inner)
+                    }
                 }
-                _ => panic!("Discriminant on non-class type: {:?}", actual_value_oomir_type),
+                _ => panic!(
+                    "Discriminant on non-class type: {:?}",
+                    actual_value_oomir_type
+                ),
             };
-        
+
             let method_name = "getVariantIdx".to_string();
             let method_return_type = oomir::Type::I32;
-        
+
             let method_ty = oomir::Signature {
                 params: vec![],
                 ret: Box::new(method_return_type.clone()),
             };
-        
+
             // 3. Call InvokeVirtual on the CORRECT variable
             instructions.push(oomir::Instruction::InvokeVirtual {
                 class_name: place_class_name.clone(),
@@ -808,13 +821,13 @@ pub fn convert_rvalue_to_operand<'a>(
                     ty: actual_value_oomir_type,
                 },
             });
-        
+
             // 4. The result is the temporary variable holding the discriminant value
             result_operand = oomir::Operand::Variable {
                 name: temp_discriminant_var,
                 ty: method_return_type, // Should be I32
             };
-        }        
+        }
         // Handle other Rvalue variants by generating a placeholder
         _ => {
             println!(

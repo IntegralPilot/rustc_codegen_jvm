@@ -2,7 +2,7 @@ use super::{
     consts::{get_int_const_instr, load_constant},
     helpers::{
         get_cast_instructions, get_load_instruction, get_operand_type, get_store_instruction,
-        get_type_size, parse_jvm_descriptor_params, parse_jvm_descriptor_return
+        get_type_size, parse_jvm_descriptor_params,
     },
     shim::get_shim_metadata,
 };
@@ -151,62 +151,18 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
 
     /// Gets the slot index for a variable, assigning if new.
     fn get_or_assign_local(&mut self, var_name: &str, ty_hint: &oomir::Type) -> u16 {
-        if let Some(existing_index) = self.local_var_map.get(var_name) {
-            if let Some(existing_ty) = self.local_var_types.get(var_name) {
-                // Check for exact type match OR JVM compatibility (e.g., storing I8 into an I32 slot might be okay sometimes, but struct vs array is not)
-                // Let's be strict for now: require exact match to reuse.
-                if existing_ty == ty_hint {
-                    // Types match, reuse the slot
-                    println!(
-                        "Debug: Reusing local '{}' (index {}) with matching type {:?}.",
-                        var_name, existing_index, ty_hint
-                    );
-                    *existing_index
-                } else {
-                    // Types differ. Assign a NEW slot and UPDATE the mapping for var_name.
-                    println!(
-                        "Warning: Type change detected for MIR local '{}'. Existing: {:?} (index {}), New: {:?}. Assigning NEW slot.",
-                        var_name, existing_ty, existing_index, ty_hint
-                    );
-
-                    // Use assign_local's core logic but ensure we update the map for this specific var_name
-                    let index = self.next_local_index;
-                    // --- Overwrite the mapping for var_name ---
-                    self.local_var_map.insert(var_name.to_string(), index);
-                    self.local_var_types
-                        .insert(var_name.to_string(), ty_hint.clone());
-                    // --- Advance next_local_index ---
-                    let size = get_type_size(ty_hint);
-                    self.next_local_index += size;
-                    self.max_locals_used = self.max_locals_used.max(index + size);
-                    println!(
-                        "   -> Assigned NEW index {} for '{}', size {}, next_local_index is now {}",
-                        index, var_name, size, self.next_local_index
-                    );
-                    index // Return the newly assigned index
-                }
-            } else {
-                // Inconsistency: index exists, but type doesn't. Treat as new assignment.
-                println!(
-                    "Error: Local '{}' index {} found but type missing! Assigning NEW slot.",
-                    var_name, existing_index
-                );
-                // This duplicates the logic from the block above - could be refactored
-                let index = self.next_local_index;
-                self.local_var_map.insert(var_name.to_string(), index);
-                self.local_var_types
-                    .insert(var_name.to_string(), ty_hint.clone());
-                let size = get_type_size(ty_hint);
-                self.next_local_index += size;
-                self.max_locals_used = self.max_locals_used.max(index + size);
-                println!(
-                    "   -> Assigned NEW index {} for '{}', size {}, next_local_index is now {}",
-                    index, var_name, size, self.next_local_index
-                );
-                index
-            }
+        if let Some(existing_index) = self.local_var_map.get(var_name).copied() {
+            println!(
+                "Debug: Reusing local '{}' (index {}) with new type hint {:?}.",
+                var_name, existing_index, ty_hint
+            );
+            existing_index
         } else {
-            // Variable is genuinely new (or first time seen in this type context). Use assign_local.
+            // Variable is genuinely new. Use assign_local to get a fresh slot.
+            println!(
+                "Debug: Assigning new local '{}' (type {:?})",
+                var_name, ty_hint
+            );
             self.assign_local(var_name, ty_hint) // assign_local handles map insertion etc.
         }
     }
@@ -218,15 +174,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             .ok_or_else(|| jvm::Error::VerificationError {
                 context: format!("Function {}", self.oomir_func.name),
                 message: format!("Undefined local variable used: {}", var_name),
-            })
-    }
-
-    fn get_local_type(&self, var_name: &str) -> Result<&oomir::Type, jvm::Error> {
-        self.local_var_types
-            .get(var_name)
-            .ok_or_else(|| jvm::Error::VerificationError {
-                context: format!("Function {}", self.oomir_func.name),
-                message: format!("Undefined local variable type requested for: {}", var_name),
             })
     }
 
@@ -557,6 +504,15 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 ),
             }),
         }
+    }
+
+    fn get_local_type(&self, var_name: &str) -> Result<&oomir::Type, jvm::Error> {
+        self.local_var_types
+            .get(var_name)
+            .ok_or_else(|| jvm::Error::VerificationError {
+                context: format!("Function {}", self.oomir_func.name),
+                message: format!("Undefined local variable type requested for: {}", var_name),
+            })
     }
 
     fn translate_comparison_op(
@@ -2093,23 +2049,10 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                             }
 
                             // Store result or pop (using the stored descriptor)
-                            let shim_descriptor = shim_descriptor.as_ref().expect("no descriptor found for shim?");
+                            let shim_descriptor = shim_descriptor
+                                .as_ref()
+                                .expect("no descriptor found for shim?");
                             if !is_diverging_call && !shim_descriptor.ends_with(")V") {
-                                // Parse the declared JVM return type from the shim's descriptor
-                                let shim_declared_return_jvm_desc =
-                                    match parse_jvm_descriptor_return(&shim_descriptor) {
-                                        Ok(desc) => desc,
-                                        Err(e) => {
-                                            return Err(jvm::Error::VerificationError {
-                                                context: format!("Function {}", self.oomir_func.name),
-                                                message: format!(
-                                                    "Error parsing shim descriptor return type: {}",
-                                                    e
-                                                ),
-                                            });
-                                        }
-                                    };
-
                                 // Parse the OOMIR type corresponding to the shim's return value
                                 let shim_return_oomir_type =
                                     oomir::Type::from_jvm_descriptor_return_type(shim_descriptor);
@@ -2118,7 +2061,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                                     // Now, store the result (which is correctly typed on the stack)
                                     // Use the OOMIR type derived from the descriptor for storage logic
                                     self.store_result(dest_var, &shim_return_oomir_type)?;
-
                                 } else {
                                     // No destination variable, just pop the result based on its size
                                     // Use the OOMIR type derived from the descriptor
@@ -2287,12 +2229,12 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             }
 
             OI::ArrayStore {
-                array_var,
+                array,
                 index,
                 value,
             } => {
                 // 1. Get the type of the array variable to find the element type
-                let array_type = self.get_local_type(array_var)?.clone(); // Clone to avoid borrow issues
+                let array_type = self.get_local_type(array)?.clone(); // Clone to avoid borrow issues
                 let element_type = match array_type.clone() {
                     oomir::Type::Array(et) => et,
                     _ => {
@@ -2300,7 +2242,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                             context: format!("Function {}", self.oomir_func.name),
                             message: format!(
                                 "Variable '{}' used in ArrayStore is not an array type, found {:?}",
-                                array_var,
+                                array,
                                 array_type.clone()
                             ),
                         });
@@ -2310,15 +2252,15 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 // 2. Load array reference
                 // Use the full array type when loading the variable
                 let array_operand = oomir::Operand::Variable {
-                    name: array_var.clone(),
+                    name: array.clone(),
                     ty: array_type,
                 };
                 self.load_operand(&array_operand)?; // Stack: [arrayref]
 
-                // 3. Load index
+                // 3. Load value onto the stack
                 self.load_operand(index)?; // Stack: [arrayref, index_int]
 
-                // 4. Load value
+                // 4. Load value onto the stack
                 self.load_operand(value)?; // Stack: [arrayref, index_int, value]
 
                 // 5. Get and add the appropriate array store instruction
@@ -2334,78 +2276,85 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                         })?;
                 self.jvm_instructions.push(store_instr); // Stack: []
             }
-            OI::ArrayGet {
-                dest,
-                array_var,
-                index,
-            } => {
-                // 1. Get the type of the array variable to find the element type
-                let array_type = self.get_local_type(array_var)?.clone(); // Clone to avoid borrow issues
-                let element_type = match &array_type {
-                    // Use reference to avoid move
-                    oomir::Type::Array(et) => et.as_ref(), // Get a reference to the contained element type
+            OI::ArrayGet { dest, array, index } => {
+                // 1. Load array reference
+                self.load_operand(&array)?; // Stack: [arrayref]
+
+                // 2. Determine thw element type by inspecting the array operand's type
+                let array_operand_type = match &array {
+                    OO::Variable { ty, .. } => ty,
+                    OO::Constant(c) => match c {
+                        // Need the type representation for a constant array, e.g.,
+                        oomir::Constant::Array(inner_ty, _) => {
+                            &oomir::Type::Array(inner_ty.clone())
+                        }
+                        _ => {
+                            return Err(jvm::Error::VerificationError {
+                                context: format!("Function {}", self.oomir_func.name),
+                                message: format!(
+                                    "Operand {:?} used in ArrayGet is not an array type, found {:?}",
+                                    array, c
+                                ),
+                            });
+                        }
+                    },
+                };
+
+                // Now extract the element type *from* the array type
+                let element_type = match array_operand_type {
+                    oomir::Type::Array(inner_type) => {
+                        // inner_type is likely Box<oomir::Type>, so deref it
+                        (**inner_type).clone()
+                    }
                     _ => {
-                        // Error: The variable is not an array type
                         return Err(jvm::Error::VerificationError {
                             context: format!("Function {}", self.oomir_func.name),
                             message: format!(
-                                "Variable '{}' used in ArrayGet is not an array type, found {:?}",
-                                array_var, array_type
+                                "Operand {:?} used in ArrayGet is not an array type, found {:?}",
+                                array, array_operand_type
                             ),
                         });
                     }
                 };
 
-                // 2. Load array reference onto the stack
-                // Construct the operand with the correct *array* type for loading the variable
-                let array_operand = oomir::Operand::Variable {
-                    name: array_var.clone(),
-                    ty: array_type.clone(), // Use the full array type here
-                };
-                self.load_operand(&array_operand)?; // Stack: [arrayref]
-
-                // 3. Load index onto the stack
-                // The index operand should always be some integer type, load_operand handles it.
+                // 3. Load index
                 self.load_operand(index)?; // Stack: [arrayref, index_int]
 
-                // 4. Get and add the appropriate array load instruction based on element type
-                let load_instr = element_type
-                    .get_jvm_array_load_instruction() // Use the helper we defined/assumed
+                // 4. Get and add the appropriate array load instruction
+                let load_instr = element_type // Now correctly holds I64, I32, Class(...), etc.
+                    .get_jvm_array_load_instruction() // Should now return laload, iaload, aaload correctly
                     .ok_or_else(|| jvm::Error::VerificationError {
                         context: format!("Function {}", self.oomir_func.name),
                         message: format!(
                             "Cannot determine array load instruction for element type: {:?}",
-                            element_type
+                            element_type // Use the correct element type in error message
                         ),
                     })?;
-                self.jvm_instructions.push(load_instr); // Consumes arrayref and index, pushes value
-                // Stack: [value] (size 1 or 2 depending on element_type)
+                self.jvm_instructions.push(load_instr); // Pushes the correct instruction (e.g., laload)
+                // Stack: [value] (long value in this case)
 
-                // 5. Store the resulting element into the destination variable
-                // The type of the value on the stack is the element_type
-                self.store_result(dest, element_type)?; // Consumes value, Stack: []
+                // 5. Store the resulting element (which has the correct element_type)
+                // store_result now receives I64 and should generate lstore correctly.
+                self.store_result(dest, &element_type)?; // Stack: []
             }
-            OI::Length { dest, array_var } => {
-                // 1. Get the type of the array variable itself
-                let array_actual_type = self.get_local_type(array_var)?.clone();
+            OI::Length { dest, array } => {
+                // 1. Load the array reference onto the stack
+                self.load_operand(array)?; // Stack: [arrayref]
+
+                // 2. Verify that the operand is an array type
+                let array_actual_type = get_operand_type(array);
                 match &array_actual_type {
                     oomir::Type::Array(_) => { /* Okay */ }
                     _ => {
                         return Err(jvm::Error::VerificationError {
                             context: format!("Function {}", self.oomir_func.name),
                             message: format!(
-                                "Variable '{}' used in Length instruction is not an array type, found {:?}",
-                                array_var, array_actual_type
+                                "Operand used in Length instruction is not an array type, found {:?}",
+                                array_actual_type
                             ),
                         });
                     }
                 };
-
-                // 2. Load the array reference onto the stack
-                let array_var_index = self.get_local_index(array_var)?;
-                // Use the actual type retrieved above for loading
-                let load_array_instr = get_load_instruction(&array_actual_type, array_var_index)?;
-                self.jvm_instructions.push(load_array_instr.clone()); // Stack: [arrayref]
 
                 // 3. Emit 'arraylength' instruction
                 //    This consumes the arrayref and pushes the length (int)
@@ -2471,14 +2420,14 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             }
 
             OI::SetField {
-                object_var,
+                object,
                 field_name,
                 value,
                 field_ty,
                 owner_class, // Class where the field is *defined*
             } => {
                 // 1. Get the type of the object variable itself (should be a Class type)
-                let object_actual_type = self.get_local_type(object_var)?.clone();
+                let object_actual_type = self.get_local_type(object)?.clone();
 
                 // We don't strictly *need* object_actual_type for the load instruction itself
                 // if get_load_instruction correctly handles all reference types with Aload,
@@ -2488,7 +2437,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                         context: format!("Function {}", self.oomir_func.name),
                         message: format!(
                             "Variable '{}' used in SetField is not a reference type, found {:?}",
-                            object_var, object_actual_type
+                            object, object_actual_type
                         ),
                     });
                 }
@@ -2504,7 +2453,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
 
                 // 3. Load the object reference onto the stack
                 // Use object_actual_type (which must be a reference type) to get aload
-                let object_var_index = self.get_local_index(object_var)?;
+                let object_var_index = self.get_local_index(object)?;
                 let load_object_instr =
                     get_load_instruction(&object_actual_type, object_var_index)?;
                 self.jvm_instructions.push(load_object_instr.clone()); // Stack: [object_ref]
@@ -2521,16 +2470,17 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 if let Some(obj_name) = object_jvm_name.clone() {
                     if obj_name != *owner_class {
                         println!(
-                        "DEBUG: Adding checkcast to {} for GetField on variable '{}' (static type {:?})",
-                        owner_class, object_var, object_actual_type
+                            "DEBUG: Adding checkcast to {} for GetField on variable '{}' (static type {:?})",
+                            owner_class, object, object_actual_type
                         );
                         // Add the Class reference for the target variant type to the constant pool
                         let cast_target_class_index = self.constant_pool.add_class(owner_class)?;
                         // Add the checkcast instruction
-                        self.jvm_instructions.push(JI::Checkcast(cast_target_class_index));
+                        self.jvm_instructions
+                            .push(JI::Checkcast(cast_target_class_index));
                         // Stack: [object_ref (type: owner_class after checkcast)]
                     }
-                 }
+                }
 
                 // 4. Load the value to be stored onto the stack
                 self.load_operand(value)?; // Stack: [object_ref, value] (value size 1 or 2)
@@ -2541,20 +2491,20 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
 
             OI::GetField {
                 dest,
-                object_var,
+                object,
                 field_name,
                 field_ty,    // Type of the field *value* being retrieved
                 owner_class, // Class where the field is *defined*
             } => {
-                // 1. Get the type of the object variable itself
-                let object_actual_type = self.get_local_type(object_var)?.clone();
+                // 1. Get the type of the object operand itself
+                let object_actual_type = get_operand_type(object);
 
                 if !object_actual_type.is_jvm_reference_type() {
                     return Err(jvm::Error::VerificationError {
                         context: format!("Function {}", self.oomir_func.name),
                         message: format!(
-                            "Variable '{}' used in GetField is not a reference type, found {:?}",
-                            object_var, object_actual_type
+                            "Operand used in GetField is not a reference type, found {:?}",
+                            object_actual_type
                         ),
                     });
                 }
@@ -2569,31 +2519,29 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 )?;
 
                 // 3. Load the object reference onto the stack
-                let object_var_index = self.get_local_index(object_var)?;
-                let load_object_instr =
-                    get_load_instruction(&object_actual_type, object_var_index)?;
-                self.jvm_instructions.push(load_object_instr.clone()); // Stack: [object_ref]
+                self.load_operand(object)?; // Stack: [object_ref]
 
                 // Check if a downcast is necessary before accessing the field.
                 // This is needed if the field belongs to a specific variant ('owner_class')
-                // but the variable currently holds the base enum type ('object_actual_type').
+                // but the operand currently holds the base enum type ('object_actual_type').
                 let object_jvm_name = object_actual_type.to_jvm_class_name(); // Get JVM name (e.g., "option")
 
-                // Compare the JVM name of the variable's static type with the field's owner class.
+                // Compare the JVM name of the operand's static type with the field's owner class.
                 // Also check if owner_class is derived from object_actual_type (basic check for now)
                 if let Some(obj_name) = object_jvm_name.clone() {
                     if obj_name != *owner_class {
                         println!(
-                        "DEBUG: Adding checkcast to {} for GetField on variable '{}' (static type {:?})",
-                        owner_class, object_var, object_actual_type
+                            "DEBUG: Adding checkcast to {} for GetField on operand {:?} (static type {:?})",
+                            owner_class, object, object_actual_type
                         );
                         // Add the Class reference for the target variant type to the constant pool
                         let cast_target_class_index = self.constant_pool.add_class(owner_class)?;
                         // Add the checkcast instruction
-                        self.jvm_instructions.push(JI::Checkcast(cast_target_class_index));
+                        self.jvm_instructions
+                            .push(JI::Checkcast(cast_target_class_index));
                         // Stack: [object_ref (type: owner_class after checkcast)]
                     }
-                 }
+                }
 
                 // 4. Emit 'getfield' instruction
                 self.jvm_instructions.push(JI::Getfield(field_ref_index)); // Stack: [field_value] (size 1 or 2)

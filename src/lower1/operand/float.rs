@@ -1,6 +1,5 @@
 use num_bigint::BigUint;
 use num_traits::{One, ToPrimitive, Zero};
-use std::mem;
 
 /// Convert an `f128` (binary128) to a decimal `String` with up to 34 significant digits,
 /// rounding to nearest, ties-to-even.
@@ -35,7 +34,7 @@ pub fn f128_to_string(x: f128) -> String {
     const EXP_BIAS: i32 = 16383; // binary128 exponent bias
 
     // Transmute to raw bits
-    let bits: u128 = unsafe { mem::transmute(x) };
+    let bits: u128 = x.to_bits();
     let sign_bit = (bits >> 127) != 0;
     let exp_bits = ((bits >> 112) & 0x7fff) as i32;
     let frac_bits = bits & ((1u128 << 112) - 1);

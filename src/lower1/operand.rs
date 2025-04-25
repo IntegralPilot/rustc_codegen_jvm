@@ -426,20 +426,30 @@ pub fn handle_const_value<'tcx>(
                                                 }
                                             } else {
                                                 /* Array element type is not Ref */
-                                                match read_constant_value_from_memory(tcx, allocation, pointer.into_parts().1, *inner_ty, data_types) {
+                                                match read_constant_value_from_memory(
+                                                    tcx,
+                                                    allocation,
+                                                    pointer.into_parts().1,
+                                                    *inner_ty,
+                                                    data_types,
+                                                ) {
                                                     Ok(oomir_const) => {
                                                         println!(
                                                             "Info: Successfully read constant value from memory: {:?}",
                                                             oomir_const
                                                         );
-                                                        return oomir::Operand::Constant(oomir_const);
+                                                        return oomir::Operand::Constant(
+                                                            oomir_const,
+                                                        );
                                                     }
                                                     Err(e) => {
                                                         println!(
                                                             "Warning: Failed to read constant value from memory for allocation {:?}. Error: {:?}",
                                                             alloc_id, e
                                                         );
-                                                        return oomir::Operand::Constant(oomir::Constant::I32(-1))
+                                                        return oomir::Operand::Constant(
+                                                            oomir::Constant::I32(-1),
+                                                        );
                                                     }
                                                 }
                                             }

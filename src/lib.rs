@@ -37,6 +37,7 @@ use std::{any::Any, io::Write, path::Path};
 mod lower1;
 mod lower2;
 mod oomir;
+mod optimise1;
 
 /// An instance of our Java bytecode codegen backend.
 struct MyBackend;
@@ -99,6 +100,20 @@ impl CodegenBackend for MyBackend {
         }
 
         println!("OOMIR module: {:?}", oomir_module);
+
+        println!(
+            "--- Starting OOMIR Optimisation for module: {} ---",
+            crate_name
+        );
+
+        let oomir_module = optimise1::optimise_module(oomir_module);
+
+        println!("Optimised OOMIR module: {:?}", oomir_module);
+
+        println!(
+            "--- Finished OOMIR Optimisation for module: {} ---",
+            crate_name
+        );
 
         println!(
             "--- Starting OOMIR to JVM Bytecode Lowering for module: {} ---",
