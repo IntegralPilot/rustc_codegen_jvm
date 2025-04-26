@@ -38,14 +38,14 @@ pub struct DataType {
     pub super_class: Option<String>, // Name of the super class, if any
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Function {
     pub name: String,
     pub signature: Signature,
     pub body: CodeBlock,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Signature {
     pub params: Vec<Type>,
     pub ret: Box<Type>,
@@ -65,19 +65,19 @@ impl Signature {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CodeBlock {
     pub entry: String,
     pub basic_blocks: HashMap<String, BasicBlock>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BasicBlock {
     pub label: String,
     pub instructions: Vec<Instruction>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Instruction {
     Add {
         dest: String,
@@ -255,7 +255,7 @@ pub enum Instruction {
     },
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash, Eq)]
 pub enum Operand {
     Constant(Constant),
     Variable { name: String, ty: Type },
@@ -284,6 +284,38 @@ pub enum Constant {
         /// Any parameters to the constructor.
         params: Vec<Constant>,
     },
+}
+
+impl Eq for Constant {}
+
+impl std::hash::Hash for Constant {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        match self {
+            Constant::I8(i) => i.hash(state),
+            Constant::I16(i) => i.hash(state),
+            Constant::I32(i) => i.hash(state),
+            Constant::I64(i) => i.hash(state),
+            Constant::F32(f) => f.to_bits().hash(state),
+            Constant::F64(f) => f.to_bits().hash(state),
+            Constant::Boolean(b) => b.hash(state),
+            Constant::Char(c) => c.hash(state),
+            Constant::String(s) => s.hash(state),
+            Constant::Class(s) => s.hash(state),
+            Constant::Array(ty, elements) => {
+                ty.hash(state);
+                elements.hash(state);
+            }
+            Constant::Instance { class_name, fields, params } => {
+                class_name.hash(state);
+                // iterate over the fields and hash them
+                for (key, value) in fields {
+                    key.hash(state);
+                    value.hash(state);
+                }
+                params.hash(state);
+            }
+        }
+    }
 }
 
 // Helper to check if a Constant is integer-like (needed for Switch)

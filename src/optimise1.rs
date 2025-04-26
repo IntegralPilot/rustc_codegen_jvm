@@ -3,9 +3,11 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 mod dataflow;
 mod reachability;
+mod reorganisation;
 
 use dataflow::{process_block_instructions, analyze_constant_propagation};
 use reachability::{get_instruction_successors, find_reachable_blocks};
+use reorganisation::{convert_labels_to_basic_blocks_in_function, eliminate_duplicate_basic_blocks};
 
 // --- Data Structures ---
 
@@ -219,6 +221,10 @@ pub fn optimise_function(
     }
     println!("Optimizing function: {}", function.name);
 
+    // 0. Run needed reorganisation passes
+    convert_labels_to_basic_blocks_in_function(&mut function);
+    eliminate_duplicate_basic_blocks(&mut function);
+
     // 1. Build Initial CFG
     let cfg = build_cfg(&function.body);
     if cfg.is_empty() && !function.body.basic_blocks.is_empty() {
@@ -243,6 +249,9 @@ pub fn optimise_function(
 
     // 3. Transform & Perform Dead Code Elimination
     transform_function(&mut function, &cfg, &analysis_result, data_types);
+
+    // 4. Eliminate duplicate basic blocks (re-pass-through after transformation)
+    eliminate_duplicate_basic_blocks(&mut function);
 
     // TODO: Further optimization passes? (Copy propagation, dead store elimination, etc.)
 
