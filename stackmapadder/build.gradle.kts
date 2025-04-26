@@ -12,14 +12,13 @@ repositories {
 }
 
 dependencies {
-    // ASM Core library
     implementation("org.ow2.asm:asm:9.8")
 
     testImplementation(kotlin("test"))
 }
 
 application {
-    mainClass.set("asmprocessor.ProcessorKt")
+    mainClass.set("stackmapadder.ProcessorKt")
 }
 
 tasks.test {

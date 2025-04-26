@@ -305,7 +305,11 @@ impl std::hash::Hash for Constant {
                 ty.hash(state);
                 elements.hash(state);
             }
-            Constant::Instance { class_name, fields, params } => {
+            Constant::Instance {
+                class_name,
+                fields,
+                params,
+            } => {
                 class_name.hash(state);
                 // iterate over the fields and hash them
                 for (key, value) in fields {
@@ -342,7 +346,9 @@ impl Constant {
             Constant::F32(f) => *f == 0.0,
             Constant::F64(f) => *f == 0.0,
             Constant::Char(c) => *c == '\0',
-            Constant::Instance { class_name, params, .. } => {
+            Constant::Instance {
+                class_name, params, ..
+            } => {
                 if class_name == BIG_INTEGER_CLASS {
                     // Check if the params are all zero
                     let param0 = params[0].clone(); // string of the number to be made
@@ -352,7 +358,7 @@ impl Constant {
                     }
                 } else if class_name == BIG_DECIMAL_CLASS {
                     // Check if the params are all zero
-                    let param0 = params[0].clone(); 
+                    let param0 = params[0].clone();
                     if let Constant::String(s) = param0 {
                         // remove all - and .
                         let s = s.replace("-", "").replace(".", "");
@@ -364,7 +370,7 @@ impl Constant {
                         }
                         return true;
                     }
-                } 
+                }
                 return false;
             }
             Constant::Boolean(b) => !*b,
@@ -382,7 +388,9 @@ impl Constant {
             Constant::F64(f) => *f == 1.0,
             Constant::Char(c) => *c == '1',
             Constant::Boolean(b) => *b,
-            Constant::Instance { class_name, params, .. } => {
+            Constant::Instance {
+                class_name, params, ..
+            } => {
                 if class_name == BIG_INTEGER_CLASS {
                     // Check if the params are all one
                     let param0 = params[0].clone(); // string of the number to be made
@@ -392,7 +400,7 @@ impl Constant {
                     }
                 } else if class_name == BIG_DECIMAL_CLASS {
                     // Check if the params are all one
-                    let param0 = params[0].clone(); 
+                    let param0 = params[0].clone();
                     if let Constant::String(s) = param0 {
                         let mut after_dp = false;
                         let mut had_before_dp_1 = false;
@@ -452,7 +460,7 @@ impl Constant {
                         params: vec![Constant::String("0".to_string())],
                     });
                 }
-                 None
+                None
             }
             _ => None,
         }
@@ -483,7 +491,7 @@ impl Constant {
                         params: vec![Constant::String("1".to_string())],
                     });
                 }
-                 None
+                None
             }
             _ => None,
         }

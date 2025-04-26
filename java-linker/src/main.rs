@@ -4,6 +4,7 @@ use std::fs;
 use std::io::{self, BufReader, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::fs::rename;
 
 use regex::Regex;
 use ristretto_classfile::{ClassFile, MethodAccessFlags};
@@ -24,7 +25,7 @@ fn main() -> Result<(), i32> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 3 {
         eprintln!(
-            "Usage: java-linker <input_files...> -o <output_jar_file> [--asm-processor <processor_jar>] [--known-good <identifier>]"
+            "Usage: java-linker <input_files...> -o <output_jar_file> [--stackmapadder <processor_jar>] [--known-good <identifier>] [--optimizer <optimizer_jar> --proguard-config <config_file>]"
         );
         return Err(1);
     }
@@ -32,6 +33,8 @@ fn main() -> Result<(), i32> {
     let mut input_files: Vec<String> = Vec::new();
     let mut output_file: Option<String> = None;
     let mut processor_jar_path: Option<PathBuf> = None;
+    let mut optimizer_jar_path: Option<PathBuf> = None;
+    let mut proguard_config_path: Option<PathBuf> = None;
     let mut known_good_identifier: Option<String> = None;
 
     // --- Argument Parsing ---
@@ -47,12 +50,12 @@ fn main() -> Result<(), i32> {
                 eprintln!("Error: -o flag requires an output file path");
                 return Err(1);
             }
-        } else if arg == "--asm-processor" {
+        } else if arg == "--stackmapadder" {
             if i + 1 < args.len() {
                 processor_jar_path = Some(PathBuf::from(&args[i + 1]));
                 i += 2;
             } else {
-                eprintln!("Error: --asm-processor flag requires a path");
+                eprintln!("Error: --stackmapadder flag requires a path");
                 return Err(1);
             }
         } else if arg == "--known-good" {
@@ -63,20 +66,49 @@ fn main() -> Result<(), i32> {
                 eprintln!("Error: --known-good flag requires an identifier string");
                 return Err(1);
             }
+        } else if arg == "--optimizer" {
+            if i + 1 < args.len() {
+                optimizer_jar_path = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            } else {
+                eprintln!("Error: --optimizer flag requires a path to the optimizer JAR");
+                return Err(1);
+            }
+        } else if arg == "--proguard-config" {
+            if i + 1 < args.len() {
+                proguard_config_path = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            } else {
+                eprintln!(
+                    "Error: --proguard-config flag requires a path to the ProGuard config file"
+                );
+                return Err(1);
+            }
         // Tentatively accept potential input files or ignored flags
         } else if !arg.starts_with("-") {
-             // Only add if it looks like a class or jar, or isn't clearly a linker flag
-             // This filtering is basic and might need refinement
-             if arg.ends_with(".class") || arg.ends_with(".jar") ||
-                !["-lSystem", "-lc", "-lm", "-arch", "-mmacosx-version-min", "-Wl,-dead_strip", "-nodefaultlibs"].contains(&arg.as_str()) && !arg.contains('=') // Avoid flags like -mmacosx-version-min=11.0
-             {
-                 input_files.push(arg.clone());
-             } else {
-                 eprintln!("Warning: Ignoring likely native linker argument: {}", arg);
-             }
+            // Only add if it looks like a class or jar, or isn't clearly a linker flag
+            // This filtering is basic and might need refinement
+            if arg.ends_with(".class")
+                || arg.ends_with(".jar")
+                || ![
+                    "-lSystem",
+                    "-lc",
+                    "-lm",
+                    "-arch",
+                    "-mmacosx-version-min",
+                    "-Wl,-dead_strip",
+                    "-nodefaultlibs",
+                ]
+                .contains(&arg.as_str())
+                    && !arg.contains('=')
+            // Avoid flags like -mmacosx-version-min=11.0
+            {
+                input_files.push(arg.clone());
+            } else {
+                eprintln!("Warning: Ignoring likely native linker argument: {}", arg);
+            }
             i += 1;
-        }
-        else {
+        } else {
             eprintln!("Warning: Ignoring unknown argument or flag: {}", arg);
             i += 1;
         }
@@ -115,6 +147,30 @@ fn main() -> Result<(), i32> {
         }
     }
 
+    if optimizer_jar_path.is_some() != proguard_config_path.is_some() {
+        eprintln!("Error: --optimizer and --proguard-config must be used together.");
+        return Err(1);
+    }
+
+    if let Some(path) = &optimizer_jar_path {
+        if !path.exists() || !path.is_file() {
+            eprintln!(
+                "Error: Optimizer JAR does not exist or is not a file: {}",
+                path.display()
+            );
+            return Err(1);
+        }
+    }
+    if let Some(path) = &proguard_config_path {
+        if !path.exists() || !path.is_file() {
+            eprintln!(
+                "Error: ProGuard config file does not exist or is not a file: {}",
+                path.display()
+            );
+            return Err(1);
+        }
+    }
+
     // --- Find Main Class (before actual processing) ---
     let main_classes = match find_main_classes_with_ristretto(&input_files) {
         Ok(classes) => classes,
@@ -138,9 +194,12 @@ fn main() -> Result<(), i32> {
     if let Err(err) = create_jar(
         &input_files,
         &output_file_path,
-        main_class_name.as_deref(), // Pass Option<&str>
-        processor_jar_path_opt,     // Pass Option<&Path>
+        main_class_name.as_deref(),
+        processor_jar_path_opt,
+        optimizer_jar_path.as_deref(),
+        proguard_config_path.as_deref(),
         known_good_identifier.as_deref(),
+        &input_files, // Pass original list again for classpath lookups
     ) {
         eprintln!("Error creating JAR: {}", err);
         // Attempt to clean up temp dir explicitly on error if possible (best effort)
@@ -164,14 +223,14 @@ fn find_main_classes_with_ristretto(input_files: &[String]) -> io::Result<Vec<St
     for file_path_str in input_files {
         let path = Path::new(file_path_str);
         if !path.exists() {
-             eprintln!(
+            eprintln!(
                 "Warning (main scan): Input path does not exist: {}. Skipping.",
                 file_path_str
             );
             continue;
         }
         if !path.is_file() {
-             eprintln!(
+            eprintln!(
                 "Warning (main scan): Input path is not a file: {}. Skipping.",
                 file_path_str
             );
@@ -204,7 +263,6 @@ fn find_main_classes_with_ristretto(input_files: &[String]) -> io::Result<Vec<St
                 }
             }
         } else if file_path_str.ends_with(".jar") {
-            println!("Scanning JAR for main method: {}", file_path_str);
             match fs::File::open(path) {
                 Ok(jar_file) => {
                     let reader = BufReader::new(jar_file);
@@ -215,8 +273,7 @@ fn find_main_classes_with_ristretto(input_files: &[String]) -> io::Result<Vec<St
                                     Ok(mut file) => {
                                         if file.is_file() && file.name().ends_with(".class") {
                                             let entry_name = file.name().to_string();
-                                            let mut data =
-                                                Vec::with_capacity(file.size() as usize);
+                                            let mut data = Vec::with_capacity(file.size() as usize);
                                             if let Err(e) = file.read_to_end(&mut data) {
                                                 eprintln!(
                                                     "Warning (main scan): Failed to read entry '{}' in JAR '{}': {}. Skipping entry.",
@@ -276,6 +333,7 @@ fn find_main_classes_with_ristretto(input_files: &[String]) -> io::Result<Vec<St
     Ok(main_classes)
 }
 
+
 /// Helper function to check if class data contains the main method expected by JVM.
 /// Returns Ok(Some(class_name)) if found, Ok(None) if not, Err on parse error or lookup failure.
 fn check_class_data_for_main(
@@ -283,30 +341,27 @@ fn check_class_data_for_main(
     main_method_name: &str,
     main_method_descriptor: &str,
 ) -> io::Result<Option<String>> {
-    let cursor = Cursor::new(data); 
-
     let class_file = match ClassFile::from_bytes(&mut Cursor::new(data.to_vec())) {
         Ok(cf) => cf,
         Err(e) => {
             // Don't return Err for parsing errors here, just indicate no main found
-            // Let the main processing handle deeper errors if needed
-             eprintln!("Debug (check_class_data): Ristretto parse failed: {}", e);
-             return Ok(None);
+            eprintln!("Debug (check_class_data): Ristretto parse failed: {}", e);
+            return Ok(None);
         }
     };
 
     for method in &class_file.methods {
         let flags = &method.access_flags;
         if flags.contains(MethodAccessFlags::PUBLIC) && flags.contains(MethodAccessFlags::STATIC) {
-            // Using fallible pool lookups
             let name_result = class_file.constant_pool.try_get_utf8(method.name_index);
-            let descriptor_result = class_file.constant_pool.try_get_utf8(method.descriptor_index);
+            let descriptor_result = class_file
+                .constant_pool
+                .try_get_utf8(method.descriptor_index);
 
             match (name_result, descriptor_result) {
                 (Ok(name), Ok(descriptor)) => {
                     if name == main_method_name && descriptor == main_method_descriptor {
                         return match class_file.class_name() {
-                             // Ristretto's class_name() returns Result<&String, _>
                             Ok(class_name_ref) => Ok(Some(class_name_ref.replace('/', "."))), // Convert internal name to FQN
                             Err(e) => Err(io::Error::new(
                                 io::ErrorKind::InvalidData,
@@ -318,13 +373,13 @@ fn check_class_data_for_main(
                         };
                     }
                 }
-                 // Ignore errors during lookup for finding main, just means this method isn't it
-                (Err(_), _) | (_, Err(_)) => {}
+                (Err(_), _) | (_, Err(_)) => {} // Ignore lookup errors here
             }
         }
     }
     Ok(None) // No main method found
 }
+
 
 /// Extracts class files from a JAR.
 fn process_jar_file(jar_path: &str) -> io::Result<Vec<(String, Vec<u8>)>> {
@@ -344,121 +399,121 @@ fn process_jar_file(jar_path: &str) -> io::Result<Vec<(String, Vec<u8>)>> {
                 continue;
             }
         };
-        // Ensure it's a file and ends with .class, ignore directories like META-INF/
         if file.is_file() && file.name().ends_with(".class") {
             let mut contents = Vec::with_capacity(file.size() as usize);
             file.read_to_end(&mut contents)?;
-            // Use the file.name() directly as it should contain the full path within the JAR
             class_files.push((file.name().to_string(), contents));
         }
     }
     Ok(class_files)
 }
 
-
 /// Creates the final JAR, staging files and running the ASM processor if specified.
 fn create_jar(
-    input_files: &[String],
-    output_jar_path: &str,
+    input_files_for_content: &[String],
+    final_output_jar_path: &str,
     main_class_name: Option<&str>,
-    processor_jar_path: Option<&Path>,
+    stackmap_adder_jar_path: Option<&Path>,
+    optimizer_jar_path: Option<&Path>,
+    proguard_config_path: Option<&Path>,
     known_good_identifier: Option<&str>,
+    original_input_files: &[String], // Used for classpath searches
 ) -> io::Result<()> {
-
-    // Regex to potentially clean up mangled class names from rustc_codegen_jvm
-    // Assumes format like `prefix-hash.ClassName.class` -> `ClassName.class`
-    let re = Regex::new(r"^[^-]+-[0-9a-fA-F]+\.(?P<name>[^/\\]+\.class)$").unwrap();
-
-    let mut all_classes: Vec<ClassInfo> = Vec::new();
-    let mut processed_data_map: HashMap<String, Vec<u8>> = HashMap::new();
-    let mut added_jar_entries = HashSet::new(); // Tracks JAR entry names to avoid duplicates
-
     // --- Stage 1: Collect all class info ---
     println!("Stage 1: Collecting class file information...");
-    for input_file_path_str in input_files {
+    let re = Regex::new(r"^[^-]+-[0-9a-fA-F]+\.(?P<name>[^/\\]+\.class)$").unwrap();
+    let mut all_classes: Vec<ClassInfo> = Vec::new();
+    let mut added_jar_entries = HashSet::new();
+
+    for input_file_path_str in input_files_for_content {
         let input_path = Path::new(input_file_path_str);
         if !input_path.exists() {
-            eprintln!("Warning (collect): Input file does not exist: {}. Skipping.", input_file_path_str);
+            eprintln!(
+                "Warning (collect): Input file does not exist: {}. Skipping.",
+                input_file_path_str
+            );
             continue;
         }
         if !input_path.is_file() {
-            eprintln!("Warning (collect): Input path is not a file: {}. Skipping.", input_file_path_str);
+             eprintln!(
+                "Warning (collect): Input path is not a file: {}. Skipping.",
+                 input_file_path_str
+            );
             continue;
         }
 
-        // Determine if the source file/JAR is considered "known good"
         let is_known_good_source = known_good_identifier
-                .map(|id| input_file_path_str.contains(id))
-                .unwrap_or(false);
+            .map(|id| input_file_path_str.contains(id))
+            .unwrap_or(false);
 
         if input_file_path_str.ends_with(".jar") {
-            println!("Collecting from JAR: {}", input_file_path_str);
             let class_files_in_jar = match process_jar_file(input_file_path_str) {
                 Ok(cf) => cf,
                 Err(e) => {
-                    eprintln!("Warning (collect): Failed to process JAR file '{}': {}. Skipping.", input_file_path_str, e);
+                    eprintln!(
+                        "Warning (collect): Failed to process JAR file '{}': {}. Skipping.",
+                        input_file_path_str, e
+                    );
                     continue;
                 }
             };
             for (jar_entry_name, data) in class_files_in_jar {
-                // Basic duplicate check based on JAR entry name during collection
-                 if added_jar_entries.insert(jar_entry_name.clone()) {
-                     all_classes.push(ClassInfo {
-                         original_path: format!("{}!/{}", input_file_path_str, jar_entry_name),
-                         jar_entry_name, // Already has correct path like "kotlin/collections/List.class"
-                         data,
-                         is_known_good: is_known_good_source, // Mark based on JAR source
-                     });
-                 } else {
-                    println!("  Skipping duplicate entry during collection: {}", jar_entry_name);
-                 }
+                if added_jar_entries.insert(jar_entry_name.clone()) {
+                    all_classes.push(ClassInfo {
+                        original_path: format!("{}!/{}", input_file_path_str, jar_entry_name),
+                        jar_entry_name,
+                        data,
+                        is_known_good: is_known_good_source,
+                    });
+                }
             }
         } else if input_file_path_str.ends_with(".class") {
-            println!("Collecting class file: {}", input_file_path_str);
-             let original_file_name = input_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let original_file_name = input_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
 
-            // Attempt to clean up the name for the JAR entry
             let jar_entry_name = if let Some(caps) = re.captures(original_file_name) {
-                caps["name"].to_string() // e.g., "option.class"
+                caps["name"].to_string()
             } else {
-                 // Assume simple name if no mangling pattern matches.
-                 // Might need adjustment if classes have packages.
-                 original_file_name.to_string()
+                original_file_name.to_string()
             };
 
             if jar_entry_name.is_empty() || !jar_entry_name.ends_with(".class") {
-                eprintln!("Warning (collect): Could not determine valid JAR entry name for {}. Skipping.", input_file_path_str);
+                eprintln!(
+                    "Warning (collect): Could not determine valid JAR entry name for {}. Skipping.",
+                    input_file_path_str
+                );
                 continue;
             }
 
-            // Check for duplicates before reading file
             if added_jar_entries.insert(jar_entry_name.clone()) {
-                 match fs::read(input_path) {
+                match fs::read(input_path) {
                     Ok(data) => {
                         all_classes.push(ClassInfo {
                             original_path: input_file_path_str.to_string(),
                             jar_entry_name,
                             data,
-                            is_known_good: is_known_good_source, // Mark based on file source
+                            is_known_good: is_known_good_source,
                         });
                     }
                     Err(e) => {
-                        eprintln!("Warning (collect): Failed to read class file '{}': {}. Skipping.", input_file_path_str, e);
-                         // Remove from added set if read fails
-                         added_jar_entries.remove(&jar_entry_name);
+                        eprintln!(
+                            "Warning (collect): Failed to read class file '{}': {}. Skipping.",
+                            input_file_path_str, e
+                        );
+                        added_jar_entries.remove(&jar_entry_name);
                     }
                 }
-            } else {
-                 println!("  Skipping duplicate entry during collection: {} (from {})", jar_entry_name, input_file_path_str);
             }
-        } else {
-             // Ignore other file types silently during collection
         }
     }
     println!("Collected {} unique class entries.", all_classes.len());
     if all_classes.is_empty() {
-        eprintln!("Error: No valid class files found in the input.");
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "No class files found"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "No class files found",
+        ));
     }
 
     // --- Stage 2: Create temp dir and stage all collected files ---
@@ -466,227 +521,338 @@ fn create_jar(
     let temp_dir = tempfile::tempdir()?; // RAII temporary directory
     println!("Temporary directory: {}", temp_dir.path().display());
     for class_info in &all_classes {
-        // Construct the target path inside the temp directory, respecting package structure
         let target_path_in_temp = temp_dir.path().join(&class_info.jar_entry_name);
-
-        // Create parent directories if the jar_entry_name includes slashes
         if let Some(parent_dir) = target_path_in_temp.parent() {
             fs::create_dir_all(parent_dir)?;
         }
         fs::write(&target_path_in_temp, &class_info.data)?;
-         // Minimal logging here, could add verbose flag
-         // println!("  Staged: {} -> {}", class_info.original_path, target_path_in_temp.display());
     }
     println!("Staging complete.");
 
-    // --- Stage 3: Setup classpath and process necessary files ---
-    let classpath_string;
-
-    if let Some(processor_path) = processor_jar_path {
-        println!("Stage 3: Processing class files with ASM processor...");
-        let processor_main_class = "asmprocessor.ProcessorKt"; // Assumed main class
-
+    // --- Stage 3: Process with Stack Map Adder (if specified) ---
+    let mut processed_data_map: HashMap<String, Vec<u8>> = HashMap::new();
+    if let Some(processor_path) = stackmap_adder_jar_path {
+        println!("Stage 3: Processing class files with Stack map adder...");
+        let processor_main_class = "stackmapadder.ProcessorKt";
         let mut classpath_items = Vec::new();
-        // 1. Add the populated temporary directory FIRST
         classpath_items.push(temp_dir.path().to_string_lossy().to_string());
-        // 2. Add the processor JAR itself
         classpath_items.push(processor_path.to_string_lossy().to_string());
 
-        // 3. *** IMPORTANT: Add Kotlin Stdlib to classpath ***
-        // Find the kotlin-stdlib JAR path from the original input files
-        let kotlin_stdlib_path = input_files.iter().find(|f| f.contains("kotlin-stdlib") && f.ends_with(".jar"));
+        let kotlin_stdlib_path = original_input_files
+            .iter()
+            .find(|f| f.contains("kotlin-stdlib") && f.ends_with(".jar"));
+
         if let Some(kt_stdlib) = kotlin_stdlib_path {
-            println!("Adding Kotlin stdlib to processor classpath: {}", kt_stdlib);
-            classpath_items.push(kt_stdlib.clone()); // Add the full path to kotlin-stdlib JAR
+            classpath_items.push(kt_stdlib.clone());
         } else {
-            // Check if the processor is a shadow JAR (might contain stdlib)
-            let is_shadow_jar = processor_path.file_name()
-                .map_or(false, |name| name.to_string_lossy().contains("-all"));
+            let is_shadow_jar = processor_path.file_name().map_or(false, |name| name.to_string_lossy().contains("-all"));
             if !is_shadow_jar {
-                 eprintln!("Warning: Kotlin standard library JAR not found in inputs, and processor doesn't appear to be a shadow JAR. Processing might fail if the processor needs it.");
-            } else {
-                 println!("Processor appears to be a shadow JAR, assuming Kotlin stdlib is included.");
+                 eprintln!("Warning (Stackmap Adder): Kotlin standard library JAR not found in inputs and processor doesn't appear to be a shadow JAR. Processing might fail.");
             }
         }
+        let classpath_string = classpath_items.join(if cfg!(windows) { ";" } else { ":" });
 
-        // Join classpath items with the system-specific separator
-        classpath_string = classpath_items.join(":");
-        println!("Processor Classpath: {}", classpath_string);
-
-        println!("Debug: Verifying contents of temp dir ({}) before processing loop:", temp_dir.path().display());
-        match fs::read_dir(temp_dir.path()) {
-            Ok(entries) => {
-                let mut found_option = false;
-                for entry in entries {
-                    if let Ok(entry) = entry {
-                        let fname = entry.file_name().to_string_lossy().to_string();
-                        println!("  - {}", fname);
-                        if fname == "option.class" {
-                            found_option = true;
-                        }
-                    }
-                }
-                if !found_option {
-                     eprintln!("  ERROR: option.class NOT FOUND in temp dir!");
-                } else {
-                     println!("  OK: option.class found in temp dir.");
-                }
-            }
-            Err(e) => {
-                eprintln!("  Error reading temp dir: {}", e);
-            }
-        }
-
-        // Process each class that isn't known-good
         for class_info in &all_classes {
             if !class_info.is_known_good {
                 let path_in_temp = temp_dir.path().join(&class_info.jar_entry_name);
-
-                // Call the processing function using the staged path
                 match process_with_asm(
                     processor_main_class,
                     &classpath_string,
-                    &path_in_temp, // Path to the input class *in the staged directory*
-                    &class_info.original_path, // Original source path for logging
+                    &path_in_temp,
+                    &class_info.original_path,
                 ) {
                     Ok(processed_data) => {
-                         // Store the processed data, keyed by the JAR entry name
-                         processed_data_map.insert(class_info.jar_entry_name.clone(), processed_data);
-                         println!("  Successfully processed: {}", class_info.original_path);
+                        processed_data_map.insert(class_info.jar_entry_name.clone(), processed_data);
+                         // Overwrite in temp dir as well, optimizer might read from dir or JAR
+                        fs::write(&path_in_temp, processed_data_map.get(&class_info.jar_entry_name).unwrap())?;
                     }
                     Err(e) => {
-                        // Error is already logged in process_with_asm
-                        // Return the error to stop the build immediately
-                        // temp_dir is cleaned up automatically by RAII when function returns
+                        eprintln!("Error during stack map adding: {}", e);
                         return Err(e);
                     }
                 }
-            } else {
-                 println!("  Skipping processing (known good): {}", class_info.original_path);
             }
         }
-        println!("Processing finished.");
+        println!("Stack map adding finished.");
     } else {
-        println!("Stage 3: Skipping ASM processing (no --asm-processor specified).");
+        println!("Stage 3: Skipping stack map adding.");
     }
 
-    // --- Stage 4: Create the final JAR ---
-    println!("Stage 4: Creating final JAR file: {}", output_jar_path);
-    let output_file = fs::File::create(output_jar_path)?;
-    let mut zip_writer = ZipWriter::new(output_file);
-    let options = SimpleFileOptions::default()
-        .compression_method(CompressionMethod::DEFLATE) // Use DEFLATE for compression
-        .unix_permissions(0o644); // Standard file permissions
+    // --- Stage 4: Create Intermediate JAR (Content Only - NO MANIFEST) ---
+    println!("Stage 4: Creating intermediate JAR file (content only)...");
+    let intermediate_jar_path = temp_dir.path().join("intermediate_output.jar");
+    // Pass the processed data map to use the stackmap-added data where available
+    create_jar_content_only(
+        &intermediate_jar_path,
+        &all_classes,
+        &processed_data_map,
+    )?;
+    println!("Intermediate JAR (content only) created: {}", intermediate_jar_path.display());
 
-    // Add Manifest file first
-    let manifest_content = create_manifest_content(main_class_name);
-    zip_writer.start_file("META-INF/MANIFEST.MF", options)?;
-    zip_writer.write_all(manifest_content.as_bytes())?;
-    println!("  Added META-INF/MANIFEST.MF");
 
-    // Use a separate set here just for the final JAR writing phase to be explicit
-    let mut final_jar_entries = HashSet::new();
-    final_jar_entries.insert("META-INF/MANIFEST.MF".to_string()); // Track manifest
+    // --- Stage 5: Run ProGuard Optimizer (if specified) ---
+    let mut jar_before_manifest_path: PathBuf; // This will point to the JAR needing the manifest added
 
-    // Add class files (processed or original)
-    for class_info in &all_classes {
-        // Ensure we only add each unique JAR entry name once to the final JAR
-        if final_jar_entries.insert(class_info.jar_entry_name.clone()) {
-            // Get data: check the processed map first, fallback to original data
-            let data_to_write = processed_data_map
-                .get(&class_info.jar_entry_name)
-                .unwrap_or(&class_info.data); // Fallback to original data if not processed
+    if let (Some(opt_jar_path), Some(pg_config_path)) = (optimizer_jar_path, proguard_config_path) {
+        println!("Stage 5: Running ProGuard Optimizer...");
+        let optimized_output_jar_path = temp_dir.path().join("optimized_output.jar");
 
-            zip_writer.start_file(&class_info.jar_entry_name, options)?;
-            zip_writer.write_all(data_to_write)?;
-
-            if processed_data_map.contains_key(&class_info.jar_entry_name) {
-                println!("  Adding processed: {}", class_info.jar_entry_name);
-            } else {
-                println!("  Adding original:  {}", class_info.jar_entry_name);
+        match run_proguard_optimizer(
+            opt_jar_path,
+            pg_config_path,
+            &intermediate_jar_path, // Input is the content-only intermediate JAR
+            &optimized_output_jar_path, // Output is a new temp file
+            original_input_files,
+        ) {
+            Ok(_) => {
+                println!("ProGuard optimization successful.");
+                // The JAR needing the manifest is the one produced by the optimizer
+                jar_before_manifest_path = optimized_output_jar_path;
             }
-        } else {
-             // This check should ideally be redundant due to collection-phase checks, but belt-and-suspenders
-             println!("  Skipping duplicate entry during final write: {}", class_info.jar_entry_name);
+            Err(e) => {
+                 eprintln!("Error during ProGuard optimization: {}", e);
+                 return Err(e);
+            }
+        }
+        println!("ProGuard optimization finished.");
+    } else {
+        println!("Stage 5: Skipping ProGuard optimization.");
+        // If optimizer wasn't run, the JAR needing the manifest is the intermediate JAR
+        jar_before_manifest_path = intermediate_jar_path;
+    }
+
+    // --- Stage 5.5: Add Manifest to the selected JAR ---
+    println!("Stage 5.5: Adding manifest to final JAR content...");
+    let final_jar_with_manifest_path = temp_dir.path().join("final_with_manifest.jar");
+    add_manifest_to_jar(
+        &jar_before_manifest_path, // Input is the result of Stage 5 (optimized or intermediate)
+        &final_jar_with_manifest_path, // Output is a new temp JAR containing manifest + content
+        main_class_name, // Pass the main class name determined earlier
+    )?;
+    println!("Manifest added. Temporary path: {}", final_jar_with_manifest_path.display());
+
+
+    // --- Stage 6: Finalize Output ---
+    println!("Stage 6: Finalizing output JAR...");
+    // Move or rename the JAR *that now includes the manifest* to the final destination path
+    if let Some(parent) = Path::new(final_output_jar_path).parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let _ = fs::remove_file(final_output_jar_path); // Attempt removal first
+
+    match rename(&final_jar_with_manifest_path, final_output_jar_path) { // Source is the JAR with manifest
+        Ok(_) => {
+             println!(
+                "Final JAR placed at: {}",
+                final_output_jar_path
+            );
+        }
+        Err(e) => {
+            eprintln!(
+                "Error moving temporary JAR '{}' to final destination '{}': {}",
+                final_jar_with_manifest_path.display(), final_output_jar_path, e
+            );
+             eprintln!("Attempting to copy instead...");
+             match fs::copy(&final_jar_with_manifest_path, final_output_jar_path) {
+                Ok(_) => println!("Copy successful."),
+                Err(copy_err) => {
+                     eprintln!("Fallback copy failed: {}", copy_err);
+                     return Err(e);
+                }
+            }
         }
     }
 
-    zip_writer.finish()?; // Finalize the ZIP archive
-    println!("JAR creation finished.");
-    // temp_dir is automatically removed when `temp_dir` goes out of scope here (RAII)
+    // TempDir cleans up automatically on drop.
+    println!("JAR creation process complete.");
     Ok(())
 }
-
 
 /// Executes the external Java ASM processor.
 fn process_with_asm(
     processor_main_class: &str,
     classpath: &str,
-    input_class_path_in_temp: &Path, // Path to class file *inside temp_dir*
-    original_path_for_logging: &str, // Original source file path for messages
+    input_class_path_in_temp: &Path,
+    original_path_for_logging: &str,
 ) -> io::Result<Vec<u8>> {
-
-    // Create a *new* temporary file just for the output of this specific run
-    // This file will be automatically deleted when `temp_out_file` goes out of scope
     let temp_out_file = NamedTempFile::new()?;
-    let temp_out_path = temp_out_file.path().to_path_buf(); // Get the path before it's potentially dropped
+    let temp_out_path = temp_out_file.path().to_path_buf();
 
     let mut cmd = Command::new("java");
     cmd.arg("-cp")
-       .arg(classpath) // The full classpath (temp_dir:processor.jar:kotlin-stdlib.jar)
-       .arg(processor_main_class) // e.g., asmprocessor.ProcessorKt
-       // Pass the path *within the temp dir* as the input file argument
-       .arg(input_class_path_in_temp)
-       // Pass the path to the temporary output file as the second argument
-       .arg(&temp_out_path);
-
-    println!(
-        "Running processor for {} (staged at {}):",
-        original_path_for_logging, input_class_path_in_temp.display()
-    );
-     // For debugging, print the exact command
-     // eprintln!("Executing: {:?}", cmd);
+        .arg(classpath)
+        .arg(processor_main_class)
+        .arg(input_class_path_in_temp)
+        .arg(&temp_out_path);
 
     let output = cmd.output().map_err(|e| {
-        // Add context if the command couldn't even be executed
         io::Error::new(e.kind(), format!("Failed to execute java command: {}", e))
     })?;
 
     if !output.status.success() {
-        // Provide detailed error context if the processor fails
         eprintln!("--- ASM Processor Failed ---");
         eprintln!("Class Source: {}", original_path_for_logging);
         eprintln!("Staged Path: {}", input_class_path_in_temp.display());
         eprintln!("Exit Code: {}", output.status);
-        eprintln!("Command: {:?}", cmd); // Show the exact command run
+        eprintln!("Command: {:?}", cmd);
         eprintln!("Processor STDOUT:\n{}", String::from_utf8_lossy(&output.stdout));
         eprintln!("Processor STDERR:\n{}", String::from_utf8_lossy(&output.stderr));
         eprintln!("--- End ASM Processor Failure ---");
         return Err(io::Error::new(
-            io::ErrorKind::Other, // Use Other for external process failure
+            io::ErrorKind::Other,
             format!("ASM processor failed for class originally from {}", original_path_for_logging),
         ));
     }
 
-    // Read the processed data from the temporary output file
     fs::read(&temp_out_path)
 }
-
 
 /// Creates the content for the META-INF/MANIFEST.MF file.
 fn create_manifest_content(main_class_name: Option<&str>) -> String {
     let mut manifest = String::new();
     manifest.push_str("Manifest-Version: 1.0\r\n");
-    // Identify the creator tool
     manifest.push_str("Created-By: java-linker-rs (rust)\r\n");
-
-    // Add the Main-Class entry if provided
     if let Some(main_class) = main_class_name {
-        // Ensure FQN uses dots, not slashes
         let main_class_fqn = main_class.replace('/', ".");
         manifest.push_str(&format!("Main-Class: {}\r\n", main_class_fqn));
     }
-    // Important: Manifest entries must end with CRLF, and the file must end with a newline
-    manifest.push_str("\r\n"); // Ensure final newline
+    manifest.push_str("\r\n"); // Final newline needed
     manifest
+}
+
+/// Creates an intermediate JAR file containing ONLY the provided class content.
+/// Does NOT add a manifest file.
+fn create_jar_content_only(
+    jar_path: &Path,
+    all_classes: &[ClassInfo],
+    processed_data_map: &HashMap<String, Vec<u8>>, // From stackmap adder
+) -> io::Result<()> {
+    let output_file = fs::File::create(jar_path)?;
+    let mut zip_writer = ZipWriter::new(output_file);
+    let options = SimpleFileOptions::default()
+        .compression_method(CompressionMethod::DEFLATE)
+        .unix_permissions(0o644);
+
+    let mut final_jar_entries = HashSet::new(); // Track added entries
+
+    // Add class files (use processed if available, else original)
+    for class_info in all_classes {
+        if final_jar_entries.insert(class_info.jar_entry_name.clone()) {
+            let data_to_write = processed_data_map
+                .get(&class_info.jar_entry_name)
+                .unwrap_or(&class_info.data); // Fallback to original if not processed
+
+            zip_writer.start_file(&class_info.jar_entry_name, options)?;
+            zip_writer.write_all(data_to_write)?;
+        }
+    }
+
+    zip_writer.finish()?;
+    Ok(())
+}
+
+/// Adds a standard META-INF/MANIFEST.MF to an existing JAR file.
+/// Reads the input JAR, writes a new output JAR including the manifest and all original entries (except any pre-existing manifest).
+fn add_manifest_to_jar(
+    input_jar_path: &Path,
+    output_jar_path: &Path,
+    main_class_name: Option<&str>,
+) -> io::Result<()> {
+    let input_file = fs::File::open(input_jar_path)?;
+    let reader = BufReader::new(input_file);
+    let mut input_archive = ZipArchive::new(reader)?;
+
+    let output_file = fs::File::create(output_jar_path)?;
+    let mut zip_writer = ZipWriter::new(output_file);
+    let options = SimpleFileOptions::default()
+        .compression_method(CompressionMethod::DEFLATE)
+        .unix_permissions(0o644);
+
+    // 1. Add the new Manifest file first
+    let manifest_content = create_manifest_content(main_class_name);
+    zip_writer.start_file("META-INF/MANIFEST.MF", options)?;
+    zip_writer.write_all(manifest_content.as_bytes())?;
+
+    // 2. Copy all entries from the input JAR, *except* for any existing manifest
+    for i in 0..input_archive.len() {
+        let entry = input_archive.by_index(i)?; // Read entry info
+        let entry_name = entry.name();
+
+        // Skip copying if it's the manifest file we potentially just wrote
+        if entry_name == "META-INF/MANIFEST.MF" {
+            continue;
+        }
+
+        // Use raw_copy_file for efficiency (preserves compression, metadata)
+        zip_writer.raw_copy_file(entry)?;
+    }
+
+    zip_writer.finish()?;
+    Ok(())
+}
+
+
+/// Executes the external ProGuard optimizer Kotlin script.
+fn run_proguard_optimizer(
+    optimizer_jar_path: &Path,
+    proguard_config_path: &Path,
+    input_jar_path: &Path,          // The intermediate JAR (content only)
+    output_jar_path: &Path,         // Where the optimizer should write its result
+    original_input_files: &[String], // To find Kotlin stdlib
+) -> io::Result<()> {
+    let optimizer_main_class = "optimise2.ProcessorKt";
+
+    let mut classpath_items = Vec::new();
+    classpath_items.push(optimizer_jar_path.to_string_lossy().to_string());
+
+    let kotlin_stdlib_path = original_input_files
+        .iter()
+        .find(|f| f.contains("kotlin-stdlib") && f.ends_with(".jar"));
+
+    if let Some(kt_stdlib) = kotlin_stdlib_path {
+        classpath_items.push(kt_stdlib.clone());
+    } else {
+         let is_shadow_jar = optimizer_jar_path.file_name().map_or(false, |name| name.to_string_lossy().contains("-all"));
+        if !is_shadow_jar {
+            eprintln!("Warning (Optimizer): Kotlin standard library JAR not found in inputs, and optimizer JAR doesn't appear to be a shadow JAR. Optimization might fail.");
+        }
+    }
+    let classpath_string = classpath_items.join(if cfg!(windows) { ";" } else { ":" });
+
+
+    let mut cmd = Command::new("java");
+    cmd.arg("-cp")
+       .arg(&classpath_string)
+       .arg(optimizer_main_class)
+       .arg(input_jar_path)
+       .arg(output_jar_path)
+       .arg(proguard_config_path);
+
+    let output = cmd.output().map_err(|e| {
+        io::Error::new(e.kind(), format!("Failed to execute optimizer java command: {}", e))
+    })?;
+
+    if !output.status.success() {
+        eprintln!("--- ProGuard Optimizer Failed ---");
+        eprintln!("Input JAR: {}", input_jar_path.display());
+        eprintln!("Output JAR Path: {}", output_jar_path.display());
+        eprintln!("Config File: {}", proguard_config_path.display());
+        eprintln!("Exit Code: {}", output.status);
+        eprintln!("Command: {:?}", cmd);
+        eprintln!("Optimizer STDOUT:\n{}", String::from_utf8_lossy(&output.stdout));
+        eprintln!("Optimizer STDERR:\n{}", String::from_utf8_lossy(&output.stderr));
+        eprintln!("--- End ProGuard Optimizer Failure ---");
+        return Err(io::Error::new(io::ErrorKind::Other, "ProGuard optimizer process failed"));
+    }
+
+     if !output_jar_path.exists() {
+         eprintln!("--- ProGuard Optimizer Error ---");
+         eprintln!("Optimizer process completed successfully, but the output JAR file was not found at: {}", output_jar_path.display());
+         eprintln!("Optimizer STDOUT:\n{}", String::from_utf8_lossy(&output.stdout));
+         eprintln!("Optimizer STDERR:\n{}", String::from_utf8_lossy(&output.stderr));
+         eprintln!("--- End ProGuard Optimizer Error ---");
+          return Err(io::Error::new(io::ErrorKind::NotFound, "ProGuard optimizer did not create the expected output JAR file"));
+     }
+
+    Ok(())
 }

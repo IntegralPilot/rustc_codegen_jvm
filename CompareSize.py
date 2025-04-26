@@ -3,8 +3,8 @@ import os
 import subprocess
 import sys
 import argparse
-import zipfile
 import time
+import glob # Needed for finding pattern-based JARs
 
 def run_command(cmd, cwd=None, check=False):
     """Runs a command and returns its process object."""
@@ -13,7 +13,7 @@ def run_command(cmd, cwd=None, check=False):
                           stdout=subprocess.PIPE,
                           stderr=subprocess.PIPE,
                           text=True,
-                          encoding='utf-8', errors='replace') # Added encoding/errors
+                          encoding='utf-8', errors='replace')
     if check and proc.returncode != 0:
         print(f"❌ Command {' '.join(cmd)} failed (code {proc.returncode})")
         print("------ STDOUT ------")
@@ -24,87 +24,61 @@ def run_command(cmd, cwd=None, check=False):
         sys.exit(proc.returncode)
     return proc
 
-def find_jar(test_dir):
-    """Finds the relevant JAR file within a test directory."""
-    jars = []
-    # Common Cargo output dirs
-    target_dirs = [
-        os.path.join(test_dir, "target", "debug"),
-        os.path.join(test_dir, "target", "release") # Check release too
-    ]
+def find_final_jar(test_dir):
+    """
+    Finds the final output JAR for a given test directory.
+    Prioritizes the location suggested by the hint script.
+    """
+    test_name = os.path.basename(test_dir)
+    possible_locations = []
 
-    # Search target dirs first
-    for build_dir in target_dirs:
-        if os.path.isdir(build_dir):
-            for root, _, files in os.walk(build_dir):
-                for f in files:
-                    if f.endswith(".jar"):
-                        jars.append(os.path.join(root, f))
+    # Prioritize specific target locations first (release then debug)
+    for target_mode in ["release", "debug"]:
+        # Path suggested by hint script
+        jvm_target_path = os.path.join(test_dir, "target", "jvm-unknown-unknown", target_mode, f"{test_name}.jar")
+        if os.path.isfile(jvm_target_path):
+            print(f"|------ Found JAR at specific JVM target path: {jvm_target_path}")
+            return jvm_target_path
 
-    # Fallback: check the root test_dir (avoiding target dirs)
-    for root, dirs, files in os.walk(test_dir):
-        # Prune target directory searching if already checked
-        dirs[:] = [d for d in dirs if os.path.join(root, d) not in target_dirs]
-        for f in files:
-            if f.endswith(".jar"):
-                full_path = os.path.join(root, f)
-                if full_path not in jars: # Avoid duplicates
-                    jars.append(full_path)
+        # Check deps directory (less specific, but common)
+        deps_dir = os.path.join(test_dir, "target", target_mode, "deps")
+        if os.path.isdir(deps_dir):
+            # Look for JARs matching the test name pattern
+            pattern = os.path.join(deps_dir, f"{test_name}-*.jar")
+            matches = glob.glob(pattern)
+            if matches:
+                 # Sort to get a deterministic result if multiple matches (e.g., by timestamp or name)
+                matches.sort()
+                print(f"|------ Found JAR in deps dir: {matches[0]} (matched pattern {pattern})")
+                return matches[0] # Return the first match
 
-    if not jars:
-        # Don't print warning here, let the caller handle None
+            # Fallback: Check for a JAR named exactly like the test (less likely in deps)
+            exact_deps_path = os.path.join(deps_dir, f"{test_name}.jar")
+            if os.path.isfile(exact_deps_path):
+                print(f"|------ Found JAR in deps dir (exact name): {exact_deps_path}")
+                return exact_deps_path
+
+    # If not found in prioritized locations, return None
+    print(f"|------ ⚠️ Could not find final JAR for test '{test_name}' in expected locations.")
+    return None
+
+
+def measure_jar_size(jar_path):
+    """Measures the file size of the specified JAR file."""
+    if not jar_path or not os.path.isfile(jar_path):
+        # find_final_jar already prints a warning if it returns None
         return None
-
-    name = os.path.basename(test_dir)
-    # Prefer JARs matching the directory name
-    for j in jars:
-        if name in os.path.basename(j):
-            # print(f"|------ Found JAR (name match): {j}") # Less verbose
-            return j
-
-    # Fallback to the first found JAR if no name match
-    # print(f"|------ Found JAR (fallback): {jars[0]}") # Less verbose
-    return jars[0]
-
-def measure_class_size(jar_path, class_name):
-    """Measures the size of a specific class file within a JAR."""
-    if not jar_path or not os.path.exists(jar_path):
-         # print(f"|------ ⚠️ JAR path invalid or not found: {jar_path}") # Let caller handle None
-         return None
     try:
-        with zipfile.ZipFile(jar_path, 'r') as z:
-            # Try direct name first (e.g., "MyClass.class")
-            entry_simple = class_name + ".class"
-            # Try common Java package structure (ends with /ClassName.class)
-            entry_suffix = "/" + class_name + ".class"
-
-            possible_entries = []
-            for item in z.infolist():
-                # Check both exact match at root and suffix match for packages
-                if item.filename == entry_simple or item.filename.endswith(entry_suffix):
-                     possible_entries.append(item)
-
-            if not possible_entries:
-                print(f"|------ ⚠️ Class '{class_name}.class' not found in {jar_path}")
-                # Optional: list entries for debugging
-                # print("|-------- Available entries:")
-                # for item in z.infolist(): print(f"|---------- {item.filename}")
-                return None
-
-            # If multiple matches, warn and take the first.
-            if len(possible_entries) > 1:
-                 print(f"|------ ⚠️ Multiple possible class files found for '{class_name}' in {jar_path}. Using first: {possible_entries[0].filename}")
-
-            info = possible_entries[0]
-            # print(f"|------ Measuring class: {info.filename} in {jar_path}")
-            return info.file_size
-
-    except zipfile.BadZipFile:
-        print(f"|------ ⚠️ Bad ZIP file: {jar_path}")
-        return None
+        size = os.path.getsize(jar_path)
+        return size
     except FileNotFoundError:
-         print(f"|------ ⚠️ File not found during measurement: {jar_path}")
-         return None
+        # This case should be rare if os.path.isfile passed, but handle anyway
+        print(f"|------ ⚠️ File not found during size measurement: {jar_path}")
+        return None
+    except OSError as e:
+        print(f"|------ ⚠️ OS error getting size for {jar_path}: {e}")
+        return None
+
 
 def collect_tests(binary_dir, only_run, dont_run):
     """Collects list of test directories based on filters and skip flag."""
@@ -115,11 +89,7 @@ def collect_tests(binary_dir, only_run, dont_run):
         print(f"❌ Error: Test directory '{binary_dir}' not found.")
         sys.exit(1)
 
-    # Initial list of full paths
     candidate_tests = [os.path.join(binary_dir, d) for d in all_dirs]
-    filtered_tests = []
-
-    # Apply only_run and dont_run filters
     if only_run:
         keep = set(n.strip() for n in only_run.split(","))
         candidate_tests = [t for t in candidate_tests if os.path.basename(t) in keep]
@@ -127,321 +97,266 @@ def collect_tests(binary_dir, only_run, dont_run):
         skip = set(n.strip() for n in dont_run.split(","))
         candidate_tests = [t for t in candidate_tests if os.path.basename(t) not in skip]
 
-    # Apply the no_jvm_target.flag filter - if it doesn't exist, skip the test
     final_tests = []
     skipped_no_jvm = []
     skip_flag_name = "no_jvm_target.flag"
     for test_dir in candidate_tests:
         flag_path = os.path.join(test_dir, skip_flag_name)
-        if not os.path.exists(flag_path):
-            skipped_no_jvm.append(os.path.basename(test_dir))
-        else:
+        if os.path.exists(flag_path):
             final_tests.append(test_dir)
 
-    if skipped_no_jvm:
-        print(f"|-- Skipping tests due to '{skip_flag_name}': {', '.join(skipped_no_jvm)}")
-
     if not final_tests:
-         print(f"❌ No tests remain to be processed in '{binary_dir}' after filtering.")
-         # Decide if this should be an error or just an empty run
-         # sys.exit(1) # Exit if no tests is considered an error
-         print("Continuing with zero tests.") # Or just continue
+        print(f"❌ No tests remain to be processed in '{binary_dir}' after filtering.")
+        print("Continuing with zero tests.")
 
     return final_tests
 
-
-def build_tests(tests_to_build):
-    """Cleans and builds each specified test using Cargo."""
-    if not tests_to_build:
-        print("|--- No tests selected for Cargo build.")
-        return # Nothing to do
-
-    print("|--- 🛠️ Building test targets (Cargo)...")
-    for test_dir in tests_to_build:
-        name = os.path.basename(test_dir)
-        print(f"|---- Building test: {name} (in {test_dir})")
-        # Clean first
-        run_command(["cargo", "clean"], cwd=test_dir, check=True)
-        # Then build - ADD --release or other flags if necessary
-        run_command(["cargo", "build"], cwd=test_dir, check=True)
-        # run_command(["cargo", "build", "--release"], cwd=test_dir, check=True)
-    print("|--- ✅ Test building (Cargo) complete.")
-
 def stash_based(tests, binary_dir):
-    """Compares working dir vs. stashed state."""
-    print("|--- 🛠️ Building main project AND tests WITH unstaged changes…")
-    print("|---- Cleaning main project (make clean)...")
+    """Compares working dir vs. stashed state, measures JAR sizes and per-test build times."""
+    # Phase 1A: build main project WITH changes
+    print("|--- 🛠️ Building main project WITH unstaged changes…")
     run_command(["make", "clean"], check=True)
-    print("|---- Building main project (make all)...")
-    run_command(["make", "all"], check=True)
-    build_tests(tests) # Runs cargo clean/build for selected tests
+    run_command(["make", "all"],   check=True)
 
-    sizes_with = {}
-    print("\n|--- 📏 Measuring sizes WITH changes...")
-    for t in tests: # Iterate only over tests that passed the filters
+    # Phase 1B: build each test and time it
+    times_with = {}
+    print("|--- ⏱️ Building tests WITH timing…")
+    for t in tests:
         name = os.path.basename(t)
-        print(f"|---- Measuring test: {name}")
-        jar = find_jar(t)
-        if not jar:
-             print(f"|------ ⚠️ No JAR found for test {name}, skipping measurement.")
-             sizes_with[name] = None
-             continue
-        sz = measure_class_size(jar, name) # Pass class name = dir name
-        sizes_with[name] = sz
-        print(f"|------ [{name}] WITH: {sz if sz is not None else 'N/A'} bytes")
+        print(f"|---- Building test: {name}")
+        t0 = time.time()
+        # Note: The original script didn't specify --release or --target here.
+        # The actual JAR location might depend on how 'make all' configures things.
+        run_command(["cargo", "clean"], cwd=t, check=True)
+        run_command(["cargo", "build"], cwd=t, check=True)
+        elapsed = time.time() - t0
+        times_with[name] = elapsed
+        print(f"|------ [{name}] build took {elapsed:.2f} sec")
 
+    # Measure JAR sizes WITH changes
+    sizes_with = {}
+    print("\n|--- 📏 Measuring JAR sizes WITH changes...")
+    for t in tests:
+        name = os.path.basename(t)
+        jar_path = find_final_jar(t) # Use the new finder
+        sz = measure_jar_size(jar_path) # Use the new measurement function
+        sizes_with[name] = sz
+        status = f"{sz} bytes" if sz is not None else 'N/A (JAR not found/error)'
+        print(f"|------ [{name}] WITH: {status} (path: {jar_path if jar_path else 'None'})")
+
+    # Stash working tree if needed
     print("\n|--- 🧹 Stashing working tree…")
-    # Check if there are changes to stash first
     status_proc = run_command(["git", "status", "--porcelain"])
     if status_proc.stdout.strip():
-        run_command(["git", "stash", "push", "--include-untracked", "--quiet", "-m", "class_size_script_stash"], check=True)
+        run_command(["git", "stash", "push", "--include-untracked", "--quiet", "-m", "jar_size_script_stash"], check=True)
         stashed = True
     else:
         print("|------ Working directory clean, nothing to stash.")
         stashed = False
 
-
-    # --- Build without changes ---
-    print("\n|--- 🛠️ Building main project AND tests at HEAD (no changes)…")
-    print("|---- Cleaning main project (make clean)...")
+    # Phase 2A: build main project at HEAD
+    print("\n|--- 🛠️ Building main project at HEAD (no changes)…")
     run_command(["make", "clean"], check=True)
-    print("|---- Building main project (make all)...")
-    run_command(["make", "all"], check=True)
-    build_tests(tests) # Runs cargo clean/build for selected tests
+    run_command(["make", "all"],   check=True)
 
-    sizes_without = {}
-    print("\n|--- 📏 Measuring sizes WITHOUT changes (HEAD)...")
-    for t in tests: # Iterate only over tests that passed the filters
+    # Phase 2B: build each test at HEAD and time it
+    times_without = {}
+    print("|--- ⏱️ Building tests WITHOUT timing…")
+    for t in tests:
         name = os.path.basename(t)
-        print(f"|---- Measuring test: {name}")
-        jar = find_jar(t)
-        if not jar:
-             print(f"|------ ⚠️ No JAR found for test {name}, skipping measurement.")
-             sizes_without[name] = None
-             continue
-        sz = measure_class_size(jar, name)
-        sizes_without[name] = sz
-        print(f"|------ [{name}] WITHOUT: {sz if sz is not None else 'N/A'} bytes")
+        print(f"|---- Building test: {name}")
+        t0 = time.time()
+        run_command(["cargo", "clean"], cwd=t, check=True)
+        run_command(["cargo", "build"], cwd=t, check=True)
+        elapsed = time.time() - t0
+        times_without[name] = elapsed
+        print(f"|------ [{name}] build took {elapsed:.2f} sec")
 
+    # Measure JAR sizes WITHOUT changes
+    sizes_without = {}
+    print("\n|--- 📏 Measuring JAR sizes WITHOUT changes (HEAD)...")
+    for t in tests:
+        name = os.path.basename(t)
+        jar_path = find_final_jar(t) # Use the new finder
+        sz = measure_jar_size(jar_path) # Use the new measurement function
+        sizes_without[name] = sz
+        status = f"{sz} bytes" if sz is not None else 'N/A (JAR not found/error)'
+        print(f"|------ [{name}] WITHOUT: {status} (path: {jar_path if jar_path else 'None'})")
+
+    # Restore stashed changes
     if stashed:
         print("\n|--- 🔄 Restoring working tree…")
-        # Check if stash exists before trying to pop (using the message)
         stash_list = run_command(["git", "stash", "list"]).stdout
-        if "class_size_script_stash" in stash_list:
-            print("|------ Popping script stash...")
-            run_command(["git", "stash", "pop", "--quiet"]) # Don't check=True, pop can have conflicts
+        if "jar_size_script_stash" in stash_list:
+            run_command(["git", "stash", "pop", "--quiet"])
         else:
-            print("|------ Script stash not found (already popped or error?).")
-    else:
-        print("\n|--- (No stash was created, skipping restore)")
+            print("|------ Script stash not found.")
 
-
-    # report
-    print("\n|--- 📊 Size comparison (stash-based):")
-    ok = True
+    # Report size diffs
+    print("\n|--- 📊 JAR Size comparison (stash-based):")
     failed_measurements = 0
-    if not tests:
-        print("|---- No tests were measured.")
-        return True # Or False if no tests is failure
-
-    for name in sorted(os.path.basename(t) for t in tests): # Iterate based on collected tests
+    for name in sorted(os.path.basename(t) for t in tests):
         w = sizes_with.get(name)
         wo = sizes_without.get(name)
-
         if w is None or wo is None:
             print(f"|---- [{name}] ⚠️ skipped (measurement failed or JAR not found)")
-            # ok = False # Don't mark overall as failed if JAR just wasn't found as expected
             failed_measurements += 1
             continue
-
         delta = w - wo
-        sign = "+" if delta >= 0 else "" # Sign is implicit in negative numbers
-        change_desc = "no change"
-        if delta > 0:
-            change_desc = f"increase {delta:+}"
-        elif delta < 0:
-            change_desc = f"decrease {delta}"
+        change_desc = f"increase {delta:+}" if delta > 0 else f"decrease {delta}" if delta < 0 else "no change"
+        print(f"|---- [{name}] {change_desc} ({wo:,} → {w:,} bytes)") # Added commas for readability
 
-        print(f"|---- [{name}] {change_desc} ({wo} → {w} bytes)")
-
-        # Ensure output directory exists
-        output_dir = os.path.join(binary_dir, name)
-        os.makedirs(output_dir, exist_ok=True)
-        diff_path = os.path.join(output_dir, "class-size.diff")
-        try:
-            with open(diff_path, "w") as f:
-                 f.write(f"WITH:    {w}\nWITHOUT: {wo}\nDELTA:   {delta}\n")
-        except IOError as e:
-            print(f"|------ ⚠️ Could not write diff file {diff_path}: {e}")
-            ok = False
-
-
-    if failed_measurements > 0:
+    if failed_measurements:
         print(f"|---- ⚠️ {failed_measurements} test(s) had measurement failures or missing JARs.")
 
-    return ok
+    # Per-test build-time comparison
+    print("\n|--- ⏱️ Per-test build time (WITH vs WITHOUT):")
+    for name in sorted(times_with):
+        w = times_with[name]
+        wo = times_without.get(name)
+        if wo is None:
+            print(f"|---- [{name}] ⚠️ missing WITHOUT timing")
+            continue
+        delta = w - wo
+        sign = "+" if delta >= 0 else ""
+        print(f"|---- [{name}] WITH {w:.2f}s vs WITHOUT {wo:.2f}s → EXTRA {sign}{delta:.2f}s")
+
+    return True
 
 def commit_based(tests, binary_dir, n):
-    """Compares HEAD vs HEAD~N."""
+    """Compares HEAD vs HEAD~N, measures JAR sizes and per-test build times."""
     print("|--- 🧹 Stashing working-tree changes (if any) for clean checkout…")
-    # Use a specific message for the stash
-    stash_message = "class_size_script_stash_commit"
+    stash_message = "jar_size_script_stash_commit"
     status_proc = run_command(["git", "status", "--porcelain"])
-    stashed = False
     if status_proc.stdout.strip():
         run_command(["git", "stash", "push", "--include-untracked", "--quiet", "-m", stash_message], check=True)
         stashed = True
-        print("|------ Stashed current changes.")
     else:
         print("|------ Working directory clean, nothing to stash.")
+        stashed = False
 
-    orig_head = ""
-    target_commit = ""
+    orig_head = run_command(["git", "rev-parse", "HEAD"], check=True).stdout.strip()
+    print(f"|--- Current HEAD is: {orig_head[:10]}...")
+
     try:
-        orig_head = run_command(["git", "rev-parse", "HEAD"], check=True).stdout.strip()
-        print(f"|--- Current HEAD is: {orig_head[:10]}...") # Short hash
+        target_ref = f"HEAD~{n}"
+        target_hash = run_command(["git", "rev-parse", "--verify", target_ref], check=True).stdout.strip()
+        print(f"|--- Target commit {target_ref} resolved to {target_hash[:10]}...")
+    except SystemExit:
+        print(f"❌ Failed to verify {target_ref}. Aborting.")
+        if stashed:
+            print("|--- 🔄 Popping stash before exit…")
+            run_command(["git", "stash", "pop", "--quiet"])
+        sys.exit(1)
 
-        # Check if HEAD~N exists before trying to check out
-        target_commit = f"HEAD~{n}" # Use relative ref initially
-        print(f"|--- Verifying existence of target commit {target_commit}...")
-        target_hash = run_command(["git", "rev-parse", "--verify", target_commit], check=True).stdout.strip()
-        print(f"|--- Target commit {target_commit} resolved to {target_hash[:10]}...")
-        target_commit = target_hash # Use the actual hash for checkout
-
-    except SystemExit: # Catch exit from run_command check=True failure
-         print(f"❌ Failed to get current HEAD or verify {target_commit}. Aborting.")
-         # Try to pop stash if we stashed anything
-         if stashed:
-             print("|--- 🔄 Popping stash before exiting...")
-             # Check specifically for our stash message
-             stash_list = run_command(["git", "stash", "list"]).stdout
-             if stash_message in stash_list:
-                  run_command(["git", "stash", "pop", "--quiet"])
-             else:
-                  print("|------ Script stash not found.")
-         sys.exit(1)
-
-
-    # --- Build at HEAD ---
-    print(f"\n|--- 🛠️ Building main project AND tests at HEAD ({orig_head[:10]}...)…")
-    print("|---- Cleaning main project (make clean)...")
+    # Phase 1A: build main project at HEAD
+    print(f"\n|--- 🛠️ Building main project at HEAD ({orig_head[:10]})…")
     run_command(["make", "clean"], check=True)
-    print("|---- Building main project (make all)...")
-    run_command(["make", "all"], check=True)
-    build_tests(tests) # Runs cargo clean/build for selected tests
+    run_command(["make", "all"],   check=True)
 
+    # Phase 1B: build & time each test at HEAD
+    times_head = {}
+    print("|--- ⏱️ Building tests at HEAD…")
+    for t in tests:
+        name = os.path.basename(t)
+        print(f"|---- Building test: {name}")
+        t0 = time.time()
+        run_command(["cargo", "clean"], cwd=t, check=True)
+        run_command(["cargo", "build"], cwd=t, check=True)
+        times_head[name] = time.time() - t0
+        print(f"|------ [{name}] HEAD build took {times_head[name]:.2f} sec")
+
+    # Measure JAR sizes at HEAD
     sizes_head = {}
-    print("\n|--- 📏 Measuring sizes at HEAD...")
-    for t in tests: # Iterate only over tests that passed the filters
+    print("\n|--- 📏 Measuring JAR sizes at HEAD...")
+    for t in tests:
         name = os.path.basename(t)
-        print(f"|---- Measuring test: {name}")
-        jar = find_jar(t)
-        if not jar:
-             print(f"|------ ⚠️ No JAR found for test {name}, skipping measurement.")
-             sizes_head[name] = None
-             continue
-        sz = measure_class_size(jar, name)
+        jar_path = find_final_jar(t) # Use the new finder
+        sz = measure_jar_size(jar_path) # Use the new measurement function
         sizes_head[name] = sz
-        print(f"|------ [{name}] HEAD: {sz if sz is not None else 'N/A'} bytes")
+        status = f"{sz} bytes" if sz is not None else 'N/A (JAR not found/error)'
+        print(f"|------ [{name}] HEAD: {status} (path: {jar_path if jar_path else 'None'})")
 
+    # Checkout old commit
+    print(f"\n|--- 🔨 Checking out {target_hash[:10]} (HEAD~{n})…")
+    run_command(["git", "checkout", target_hash, "--quiet"], check=True)
 
-    print(f"\n|--- 🔨 Checking out {target_commit[:10]}…")
-    run_command(["git", "checkout", target_commit, "--quiet"], check=True)
-
-    # --- Build at HEAD~N ---
-    print(f"\n|--- 🛠️ Building main project AND tests at {target_commit[:10]}… (HEAD~{n})")
-    print("|---- Cleaning main project (make clean)...")
+    # Phase 2A: build main project at HEAD~N
+    print(f"\n|--- 🛠️ Building main project at HEAD~{n}…")
     run_command(["make", "clean"], check=True)
-    print("|---- Building main project (make all)...")
-    run_command(["make", "all"], check=True)
-    build_tests(tests) # Runs cargo clean/build for selected tests
+    run_command(["make", "all"],   check=True)
 
-    sizes_old = {}
-    print(f"\n|--- 📏 Measuring sizes at {target_commit[:10]}… (HEAD~{n})")
-    for t in tests: # Iterate only over tests that passed the filters
+    # Phase 2B: build & time each test at HEAD~N
+    times_old = {}
+    print(f"|--- ⏱️ Building tests at HEAD~{n}…")
+    for t in tests:
         name = os.path.basename(t)
-        print(f"|---- Measuring test: {name}")
-        jar = find_jar(t)
-        if not jar:
-             print(f"|------ ⚠️ No JAR found for test {name}, skipping measurement.")
-             sizes_old[name] = None
-             continue
-        sz = measure_class_size(jar, name)
+        print(f"|---- Building test: {name}")
+        t0 = time.time()
+        run_command(["cargo", "clean"], cwd=t, check=True)
+        run_command(["cargo", "build"], cwd=t, check=True)
+        times_old[name] = time.time() - t0
+        print(f"|------ [{name}] HEAD~{n} build took {times_old[name]:.2f} sec")
+
+    # Measure JAR sizes at HEAD~N
+    sizes_old = {}
+    print(f"\n|--- 📏 Measuring JAR sizes at HEAD~{n}…")
+    for t in tests:
+        name = os.path.basename(t)
+        jar_path = find_final_jar(t) # Use the new finder
+        sz = measure_jar_size(jar_path) # Use the new measurement function
         sizes_old[name] = sz
-        print(f"|------ [{name}] HEAD~{n}: {sz if sz is not None else 'N/A'} bytes")
+        status = f"{sz} bytes" if sz is not None else 'N/A (JAR not found/error)'
+        print(f"|------ [{name}] HEAD~{n}: {status} (path: {jar_path if jar_path else 'None'})")
 
-
-    print(f"\n|--- 🔄 Restoring HEAD ({orig_head[:10]}...)…")
+    # Restore original HEAD
+    print(f"\n|--- 🔄 Restoring HEAD ({orig_head[:10]})…")
     run_command(["git", "checkout", orig_head, "--quiet"], check=True)
-
     if stashed:
         print("|--- 🔄 Popping stash…")
-        # Check specifically for our stash message
         stash_list = run_command(["git", "stash", "list"]).stdout
         if stash_message in stash_list:
-            run_command(["git", "stash", "pop", "--quiet"]) # Don't check=True, pop can have conflicts
-        else:
-            print("|------ Script stash not found (already popped or error?).")
+            run_command(["git", "stash", "pop", "--quiet"])
 
-    else:
-         print("|--- (No stash was created)")
-
-
-    # report
-    print(f"\n|--- 📊 Size comparison (HEAD vs HEAD~{n}):")
-    ok = True
+    # Report size diffs
+    print(f"\n|--- 📊 JAR Size comparison (HEAD vs HEAD~{n}):")
     failed_measurements = 0
-    if not tests:
-        print("|---- No tests were measured.")
-        return True # Or False if no tests is failure
-
-    for name in sorted(os.path.basename(t) for t in tests): # Iterate based on collected tests
+    for name in sorted(os.path.basename(t) for t in tests):
         h = sizes_head.get(name)
         o = sizes_old.get(name)
-
         if h is None or o is None:
             print(f"|---- [{name}] ⚠️ skipped (measurement failed or JAR not found)")
-            # ok = False # Don't mark overall as failed if JAR just wasn't found
             failed_measurements += 1
             continue
-
         delta = h - o
-        sign = "+" if delta >= 0 else "" # Sign is implicit in negative numbers
-        change_desc = "no change"
-        if delta > 0:
-            change_desc = f"increase {delta:+}"
-        elif delta < 0:
-            change_desc = f"decrease {delta}"
+        change_desc = f"increase {delta:+}" if delta > 0 else f"decrease {delta}" if delta < 0 else "no change"
+        print(f"|---- [{name}] {change_desc} ({o:,} → {h:,} bytes)") # Added commas for readability
 
-        print(f"|---- [{name}] {change_desc} ({o} → {h} bytes)")
-
-        # Ensure output directory exists
-        output_dir = os.path.join(binary_dir, name)
-        os.makedirs(output_dir, exist_ok=True)
-        diff_path = os.path.join(output_dir, "class-size.diff")
-        try:
-            with open(diff_path, "w") as f:
-                f.write(f"HEAD:     {h}\nHEAD~{n}: {o}\nDELTA:    {delta}\n")
-        except IOError as e:
-            print(f"|------ ⚠️ Could not write diff file {diff_path}: {e}")
-            ok = False
-
-    if failed_measurements > 0:
+    if failed_measurements:
         print(f"|---- ⚠️ {failed_measurements} test(s) had measurement failures or missing JARs.")
 
-    return ok
+    # Per-test build-time comparison
+    print(f"\n|--- ⏱️ Per-test build time (HEAD vs HEAD~{n}):")
+    for name in sorted(times_head):
+        h = times_head[name]
+        o = times_old.get(name)
+        if o is None:
+            print(f"|---- [{name}] ⚠️ missing HEAD~{n} timing")
+            continue
+        delta = h - o
+        sign = "+" if delta >= 0 else ""
+        print(f"|---- [{name}] HEAD {h:.2f}s vs HEAD~{n} {o:.2f}s → EXTRA {sign}{delta:.2f}s")
 
+    return True
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Measure impact on .class size within JARs: stash-based or HEAD~N based.\n"
-                    "Assumes 'make' builds the main project and 'cargo build' within each test dir builds the test JAR.\n"
-                    "Tests with a 'no_jvm_target.flag' file in their directory are skipped.",
-        formatter_class=argparse.RawTextHelpFormatter # Nicer help text
+        description="Measure impact on final JAR size and build time: stash-based or HEAD~N based.", # Updated description
+        formatter_class=argparse.RawTextHelpFormatter
     )
     parser.add_argument(
         "-u", "--undo-commits",
-        metavar="N", # Better help hint
+        metavar="N",
         type=int,
         help="Compare HEAD vs HEAD~N; otherwise compares working dir vs stashed HEAD."
     )
@@ -450,8 +365,8 @@ def main():
         default=os.path.join("tests", "binary"),
         help="Directory containing the test subdirectories (default: tests/binary)"
     )
-    parser.add_argument("--only-run",  help="Comma-separated list of test names (dir names) to include")
-    parser.add_argument("--dont-run",  help="Comma-separated list of test names (dir names) to exclude")
+    parser.add_argument("--only-run",  help="Comma-separated list of test names to include")
+    parser.add_argument("--dont-run",  help="Comma-separated list of test names to exclude")
     args = parser.parse_args()
 
     binary_dir = args.binary_dir
@@ -459,81 +374,41 @@ def main():
         print(f"❌ Error: Specified binary directory not found: {binary_dir}")
         sys.exit(1)
 
-    # Collect tests, applying all filters including the flag file check
     tests = collect_tests(binary_dir, args.only_run, args.dont_run)
-
     if not tests:
         print(f"|- ⚠️ No tests selected to run in '{binary_dir}'. Exiting.")
-        sys.exit(0) # Exit cleanly if no tests are selected/remain
+        sys.exit(0)
 
     print(f"|- 📦 Processing {len(tests)} test(s) in '{binary_dir}'…")
-    # Optional: print list of tests being processed
-    # print("|- Tests to process:", [os.path.basename(t) for t in tests])
-    print("-" * 40) # Separator
+    print("-" * 40)
 
     start_time = time.time()
-    success = False # Default to failure
-    orig_head_for_cleanup = "" # Store original HEAD for potential cleanup
-    stashed_for_cleanup = False # Track if stash was used
-
+    success = False # Default to False
     try:
         if args.undo_commits is None:
             print("|- Mode: Stash-based comparison (Working Directory vs HEAD)")
-            # Need to know if stash_based actually stashed something for potential cleanup
             success = stash_based(tests, binary_dir)
         else:
             if args.undo_commits <= 0:
-                 print("❌ Error: --undo-commits N must be a positive integer.")
-                 sys.exit(1)
+                print("❌ Error: --undo-commits N must be a positive integer.")
+                sys.exit(1)
             print(f"|- Mode: Commit-based comparison (HEAD vs HEAD~{args.undo_commits})")
-            # Store state for potential cleanup in commit_based
-            orig_head_for_cleanup = run_command(["git", "rev-parse", "HEAD"], check=True).stdout.strip()
-            status_proc = run_command(["git", "status", "--porcelain"])
-            stashed_for_cleanup = bool(status_proc.stdout.strip()) # Check if stashing will happen
             success = commit_based(tests, binary_dir, args.undo_commits)
-
     except Exception as e:
-         print(f"\n❌ An unexpected error occurred: {e}")
-         import traceback
-         traceback.print_exc()
-         success = False # Ensure failure state
-
-         # --- Attempt cleanup after error ---
-         print("\n|--- ⚠️ Attempting cleanup after error...")
-         current_head_after_error = run_command(["git", "rev-parse", "--abbrev-ref", "HEAD"]).stdout.strip()
-         current_hash_after_error = run_command(["git", "rev-parse", "HEAD"]).stdout.strip()
-
-         # If we were in commit mode and not back at original HEAD
-         if args.undo_commits is not None and orig_head_for_cleanup and current_hash_after_error != orig_head_for_cleanup:
-              print(f"|------ Restoring original HEAD ({orig_head_for_cleanup[:10]}...)")
-              run_command(["git", "checkout", orig_head_for_cleanup, "--quiet"])
-         else:
-              print(f"|------ Already at original HEAD ({current_head_after_error}) or not in commit mode.")
-
-         # Attempt stash pop if stash might have been created
-         # Check for specific messages if possible, otherwise check general list
-         stash_list = run_command(["git", "stash", "list"]).stdout
-         stash_popped = False
-         for msg in ["class_size_script_stash_commit", "class_size_script_stash"]:
-              if msg in stash_list:
-                   print(f"|------ Popping stash '{msg}'...")
-                   run_command(["git", "stash", "pop", "--quiet"])
-                   stash_popped = True
-                   break # Pop only one
-         if not stash_popped:
-             print("|------ No known script stash found to pop.")
-
-
+        print(f"\n❌ An unexpected error occurred: {e}")
+        import traceback; traceback.print_exc()
+        # success remains False
     finally:
         end_time = time.time()
-        print("-" * 40) # Separator
-        print(f"|- Total time: {end_time - start_time:.2f} seconds")
-
+        print("-" * 40)
+        print(f"|- Total script time: {end_time - start_time:.2f} seconds")
         if success:
-            print("\n|- ✅ Done. Measurements completed (check warnings for skips).")
+            print("\n|- ✅ Done. Measurements completed.")
             sys.exit(0)
         else:
-            print("\n|- ❌ Failed. Some measurements failed, tests were skipped unexpectedly, or an error occurred.")
+            # Make sure to exit non-zero if success is False, even if no exception occurred
+            # (e.g., measurement failures might have happened but didn't raise exceptions)
+            print("\n|- ❌ Failed. Some measurements may have failed or an error occurred.")
             sys.exit(1)
 
 if __name__ == "__main__":

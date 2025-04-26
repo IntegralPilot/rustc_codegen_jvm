@@ -29,15 +29,17 @@ pub fn convert_labels_to_basic_blocks_in_function(function: &mut Function) {
             // Re-fetch the block mutably in each iteration of the outer loop,
             // as `new_blocks_this_pass` might have been merged in the previous pass.
             // Check if the block still exists (it might have been replaced if split started at index 0)
-             if let Some(block) = function.body.basic_blocks.get_mut(&block_name) {
+            if let Some(block) = function.body.basic_blocks.get_mut(&block_name) {
                 let mut split_occurred_in_block = false;
                 let mut original_instructions = std::mem::take(&mut block.instructions); // Temporarily take ownership
                 let mut current_instructions: Vec<Instruction> = Vec::new();
                 let mut current_block_label = block.label.clone(); // Label of the block segment we are currently building
 
                 for (i, instruction) in original_instructions.into_iter().enumerate() {
-                     match instruction {
-                        Instruction::Label { name: next_label_name } => {
+                    match instruction {
+                        Instruction::Label {
+                            name: next_label_name,
+                        } => {
                             // --- Found a label: Finalize the *current* segment ---
                             needs_another_pass = true; // Signal that we changed something
                             split_occurred_in_block = true;
@@ -52,35 +54,47 @@ pub fn convert_labels_to_basic_blocks_in_function(function: &mut Function) {
                             // 2. Update the *current* block (or the first segment)
                             // If i == 0, the original block becomes empty and should be removed later?
                             // No, we update the block associated with current_block_label.
-                             if block.label == current_block_label {
+                            if block.label == current_block_label {
                                 // This is the first segment, update the original block
                                 block.instructions = current_instructions;
-                             } else {
+                            } else {
                                 // This is a subsequent segment, create/update in new_blocks
                                 let segment_block = BasicBlock {
                                     label: current_block_label.clone(),
                                     instructions: current_instructions,
                                 };
-                                if let Some(existing) = new_blocks_this_pass.insert(current_block_label.clone(), segment_block) {
-                                     // This case should ideally not happen if labels are unique and splitting logic is correct
-                                     eprintln!("Warning: Overwriting newly created block segment '{}'", existing.label);
+                                if let Some(existing) = new_blocks_this_pass
+                                    .insert(current_block_label.clone(), segment_block)
+                                {
+                                    // This case should ideally not happen if labels are unique and splitting logic is correct
+                                    eprintln!(
+                                        "Warning: Overwriting newly created block segment '{}'",
+                                        existing.label
+                                    );
                                 }
-                             }
-
+                            }
 
                             // 3. Prepare for the *next* segment starting with the label
                             current_instructions = Vec::new(); // Start fresh instructions
                             current_block_label = next_label_name.clone(); // The new segment gets the label's name
 
                             // 4. Check for conflicts *before* adding the new block placeholder
-                             if block_names.contains(&current_block_label) || new_blocks_this_pass.contains_key(&current_block_label) {
+                            if block_names.contains(&current_block_label)
+                                || new_blocks_this_pass.contains_key(&current_block_label)
+                            {
                                 panic!(
                                     "Label conflict: Label '{}' found inside block '{}' already exists as a block name.",
                                     current_block_label, block_name
                                 );
-                             }
-                             // Add a placeholder so future conflicts are detected immediately
-                             new_blocks_this_pass.insert(current_block_label.clone(), BasicBlock { label: current_block_label.clone(), instructions: vec![]});
+                            }
+                            // Add a placeholder so future conflicts are detected immediately
+                            new_blocks_this_pass.insert(
+                                current_block_label.clone(),
+                                BasicBlock {
+                                    label: current_block_label.clone(),
+                                    instructions: vec![],
+                                },
+                            );
 
                             // Label instruction is consumed, don't add it to any block's list
                         }
@@ -94,7 +108,7 @@ pub fn convert_labels_to_basic_blocks_in_function(function: &mut Function) {
                 // After iterating through all instructions of the original block:
                 // Put the remaining instructions into the correct block
                 if block.label == current_block_label {
-                     // The last segment belongs to the original block
+                    // The last segment belongs to the original block
                     block.instructions = current_instructions;
                 } else {
                     // The last segment is a new block (or updates a placeholder)
@@ -102,7 +116,7 @@ pub fn convert_labels_to_basic_blocks_in_function(function: &mut Function) {
                         label: current_block_label.clone(),
                         instructions: current_instructions,
                     };
-                     new_blocks_this_pass.insert(current_block_label.clone(), final_segment_block);
+                    new_blocks_this_pass.insert(current_block_label.clone(), final_segment_block);
                 }
 
                 // If we split, we break from processing more blocks in this *inner* loop
@@ -110,13 +124,11 @@ pub fn convert_labels_to_basic_blocks_in_function(function: &mut Function) {
                 // However, processing all blocks listed in `block_names` initially is safer
                 // to avoid issues with modifying the map while iterating indirectly.
                 // The `while needs_another_pass` loop handles the reprocessing.
-
-             } // end if let Some(block)
+            } // end if let Some(block)
         } // End loop through block_names
 
         // Merge the newly created blocks from this pass into the main map
         function.body.basic_blocks.extend(new_blocks_this_pass);
-
     } // End while needs_another_pass
 }
 
@@ -197,9 +209,7 @@ pub fn eliminate_duplicate_basic_blocks(func: &mut Function) {
                         }
                     }
                     Instruction::Switch {
-                        targets,
-                        otherwise,
-                        ..
+                        targets, otherwise, ..
                     } => {
                         if let Some(canonical_target) = redirects.get(otherwise) {
                             *otherwise = canonical_target.clone();

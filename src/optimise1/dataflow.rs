@@ -173,13 +173,31 @@ pub fn process_block_instructions(
                 let mut simplified_algebraically = false;
 
                 // --- Check Algebraic Simplifications ---
-                if is_zero(&new_op2) { // a + 0 = a
-                    optimised_instruction = Instruction::Move { dest: dest.clone(), src: new_op1.clone() };
-                    update_state_based_on_operand(&mut current_state, dest, &new_op1, initial_state);
+                if is_zero(&new_op2) {
+                    // a + 0 = a
+                    optimised_instruction = Instruction::Move {
+                        dest: dest.clone(),
+                        src: new_op1.clone(),
+                    };
+                    update_state_based_on_operand(
+                        &mut current_state,
+                        dest,
+                        &new_op1,
+                        initial_state,
+                    );
                     simplified_algebraically = true;
-                } else if is_zero(&new_op1) { // 0 + a = a
-                    optimised_instruction = Instruction::Move { dest: dest.clone(), src: new_op2.clone() };
-                    update_state_based_on_operand(&mut current_state, dest, &new_op2, initial_state);
+                } else if is_zero(&new_op1) {
+                    // 0 + a = a
+                    optimised_instruction = Instruction::Move {
+                        dest: dest.clone(),
+                        src: new_op2.clone(),
+                    };
+                    update_state_based_on_operand(
+                        &mut current_state,
+                        dest,
+                        &new_op2,
+                        initial_state,
+                    );
                     simplified_algebraically = true;
                 }
 
@@ -189,9 +207,12 @@ pub fn process_block_instructions(
                         current_state.insert(dest.clone(), result_const.clone());
                         // If transforming, replace Add with Move constant
                         if transform {
-                            optimised_instruction = Instruction::Move { dest: dest.clone(), src: Operand::Constant(result_const)};
+                            optimised_instruction = Instruction::Move {
+                                dest: dest.clone(),
+                                src: Operand::Constant(result_const),
+                            };
                         } else {
-                            keep_original_instruction = false; 
+                            keep_original_instruction = false;
                         }
                     } else {
                         // Calculation failed -> result not constant
@@ -219,42 +240,70 @@ pub fn process_block_instructions(
                 let mut simplified_algebraically = false;
 
                 // --- Check Algebraic Simplifications ---
-                if is_zero(&new_op2) { // a - 0 = a
-                    optimised_instruction = Instruction::Move { dest: dest.clone(), src: new_op1.clone() };
-                    update_state_based_on_operand(&mut current_state, dest, &new_op1, initial_state);
+                if is_zero(&new_op2) {
+                    // a - 0 = a
+                    optimised_instruction = Instruction::Move {
+                        dest: dest.clone(),
+                        src: new_op1.clone(),
+                    };
+                    update_state_based_on_operand(
+                        &mut current_state,
+                        dest,
+                        &new_op1,
+                        initial_state,
+                    );
                     simplified_algebraically = true;
-                } else if new_op1 == new_op2 { // a - a = 0 (Check operand equality - careful with float)
-                    if let Some(zero_const) = Constant::zero_for_operand(&new_op1) { // Get zero of the correct type
-                        optimised_instruction = Instruction::Move { dest: dest.clone(), src: Operand::Constant(zero_const.clone()) };
+                } else if new_op1 == new_op2 {
+                    // a - a = 0 (Check operand equality - careful with float)
+                    if let Some(zero_const) = Constant::zero_for_operand(&new_op1) {
+                        // Get zero of the correct type
+                        optimised_instruction = Instruction::Move {
+                            dest: dest.clone(),
+                            src: Operand::Constant(zero_const.clone()),
+                        };
                         current_state.insert(dest.clone(), zero_const);
                         simplified_algebraically = true;
                     }
-                } else if is_zero(&new_op1) { // 0 - a = -a
+                } else if is_zero(&new_op1) {
+                    // 0 - a = -a
                     // If 'a' is constant, fold the negation
                     if let Some(c2) = const2.clone() {
                         if let Some(neg_const) = interpret::neg_constant(c2) {
-                             optimised_instruction = Instruction::Move { dest: dest.clone(), src: Operand::Constant(neg_const.clone()) };
-                             current_state.insert(dest.clone(), neg_const);
-                             simplified_algebraically = true;
-                        } else { // Negation failed (e.g. overflow MIN_INT)
-                             current_state.remove(dest);
-                             optimised_instruction = Instruction::Neg { dest: dest.clone(), src: new_op2.clone() }; // Keep as Neg instruction
-                             simplified_algebraically = true; // Still simplified from Sub
+                            optimised_instruction = Instruction::Move {
+                                dest: dest.clone(),
+                                src: Operand::Constant(neg_const.clone()),
+                            };
+                            current_state.insert(dest.clone(), neg_const);
+                            simplified_algebraically = true;
+                        } else {
+                            // Negation failed (e.g. overflow MIN_INT)
+                            current_state.remove(dest);
+                            optimised_instruction = Instruction::Neg {
+                                dest: dest.clone(),
+                                src: new_op2.clone(),
+                            }; // Keep as Neg instruction
+                            simplified_algebraically = true; // Still simplified from Sub
                         }
-                    } else { // 'a' is not constant, replace with Neg instruction
-                        optimised_instruction = Instruction::Neg { dest: dest.clone(), src: new_op2.clone() };
+                    } else {
+                        // 'a' is not constant, replace with Neg instruction
+                        optimised_instruction = Instruction::Neg {
+                            dest: dest.clone(),
+                            src: new_op2.clone(),
+                        };
                         current_state.remove(dest); // Result is not constant
                         simplified_algebraically = true;
                     }
                 }
 
-
                 // --- Constant Folding (only if not already simplified) ---
                 if !simplified_algebraically && let (Some(c1), Some(c2)) = (const1, const2) {
-                   if let Some(result_const) = interpret::subtract_constants(c1, c2) {
+                    if let Some(result_const) = interpret::subtract_constants(c1, c2) {
                         current_state.insert(dest.clone(), result_const.clone());
-                         if transform {
-                            optimised_instruction = Instruction::Move { dest: dest.clone(), src: Operand::Constant(result_const)};
+                        if transform {
+                            optimised_instruction = Instruction::Move {
+                                dest: dest.clone(),
+                                src: Operand::Constant(result_const),
+                            };
                         } else {
                             keep_original_instruction = false;
                         }
@@ -272,7 +321,7 @@ pub fn process_block_instructions(
                 let new_op1 = const1.clone().map_or(op1.clone(), Operand::Constant);
                 let new_op2 = const2.clone().map_or(op2.clone(), Operand::Constant);
 
-                 optimised_instruction = Instruction::Mul {
+                optimised_instruction = Instruction::Mul {
                     dest: dest.clone(),
                     op1: new_op1.clone(),
                     op2: new_op2.clone(),
@@ -281,28 +330,53 @@ pub fn process_block_instructions(
                 let mut simplified_algebraically = false;
 
                 // --- Check Algebraic Simplifications ---
-                 if is_zero(&new_op1) || is_zero(&new_op2) { // a * 0 = 0 or 0 * a = 0
+                if is_zero(&new_op1) || is_zero(&new_op2) {
+                    // a * 0 = 0 or 0 * a = 0
                     if let Some(zero_const) = Constant::zero_for_operand(&new_op1) {
-                        optimised_instruction = Instruction::Move { dest: dest.clone(), src: Operand::Constant(zero_const.clone()) };
+                        optimised_instruction = Instruction::Move {
+                            dest: dest.clone(),
+                            src: Operand::Constant(zero_const.clone()),
+                        };
                         current_state.insert(dest.clone(), zero_const);
                         simplified_algebraically = true;
                     }
-                 } else if is_one(&new_op2) { // a * 1 = a
-                    optimised_instruction = Instruction::Move { dest: dest.clone(), src: new_op1.clone() };
-                    update_state_based_on_operand(&mut current_state, dest, &new_op1, initial_state);
+                } else if is_one(&new_op2) {
+                    // a * 1 = a
+                    optimised_instruction = Instruction::Move {
+                        dest: dest.clone(),
+                        src: new_op1.clone(),
+                    };
+                    update_state_based_on_operand(
+                        &mut current_state,
+                        dest,
+                        &new_op1,
+                        initial_state,
+                    );
                     simplified_algebraically = true;
-                 } else if is_one(&new_op1) { // 1 * a = a
-                     optimised_instruction = Instruction::Move { dest: dest.clone(), src: new_op2.clone() };
-                    update_state_based_on_operand(&mut current_state, dest, &new_op2, initial_state);
+                } else if is_one(&new_op1) {
+                    // 1 * a = a
+                    optimised_instruction = Instruction::Move {
+                        dest: dest.clone(),
+                        src: new_op2.clone(),
+                    };
+                    update_state_based_on_operand(
+                        &mut current_state,
+                        dest,
+                        &new_op2,
+                        initial_state,
+                    );
                     simplified_algebraically = true;
-                 }
+                }
 
-                 // --- Constant Folding ---
-                 if !simplified_algebraically && let (Some(c1), Some(c2)) = (const1, const2) {
-                     if let Some(result_const) = interpret::multiply_constants(c1, c2) {
+                // --- Constant Folding ---
+                if !simplified_algebraically && let (Some(c1), Some(c2)) = (const1, const2) {
+                    if let Some(result_const) = interpret::multiply_constants(c1, c2) {
                         current_state.insert(dest.clone(), result_const.clone());
-                         if transform {
-                            optimised_instruction = Instruction::Move { dest: dest.clone(), src: Operand::Constant(result_const)};
+                        if transform {
+                            optimised_instruction = Instruction::Move {
+                                dest: dest.clone(),
+                                src: Operand::Constant(result_const),
+                            };
                         } else {
                             keep_original_instruction = false;
                         }
@@ -320,7 +394,7 @@ pub fn process_block_instructions(
                 let new_op1 = const1.clone().map_or(op1.clone(), Operand::Constant);
                 let new_op2 = const2.clone().map_or(op2.clone(), Operand::Constant);
 
-                 optimised_instruction = Instruction::Div {
+                optimised_instruction = Instruction::Div {
                     dest: dest.clone(),
                     op1: new_op1.clone(),
                     op2: new_op2.clone(),
@@ -335,31 +409,53 @@ pub fn process_block_instructions(
                     // For optimization, we let runtime handle it. Rust should never allow a div by zero to get into MIR anyway.
                     // We'll just mark dest as non-constant.
                     current_state.remove(dest);
-                } else if is_zero(&new_op1) { // 0 / a = 0 (where a != 0)
+                } else if is_zero(&new_op1) {
+                    // 0 / a = 0 (where a != 0)
                     if let Some(zero_const) = Constant::zero_for_operand(&new_op1) {
-                         optimised_instruction = Instruction::Move { dest: dest.clone(), src: Operand::Constant(zero_const.clone()) };
+                        optimised_instruction = Instruction::Move {
+                            dest: dest.clone(),
+                            src: Operand::Constant(zero_const.clone()),
+                        };
                         current_state.insert(dest.clone(), zero_const);
                         simplified_algebraically = true;
                     }
-                } else if is_one(&new_op2) { // a / 1 = a
-                    optimised_instruction = Instruction::Move { dest: dest.clone(), src: new_op1.clone() };
-                    update_state_based_on_operand(&mut current_state, dest, &new_op1, initial_state);
+                } else if is_one(&new_op2) {
+                    // a / 1 = a
+                    optimised_instruction = Instruction::Move {
+                        dest: dest.clone(),
+                        src: new_op1.clone(),
+                    };
+                    update_state_based_on_operand(
+                        &mut current_state,
+                        dest,
+                        &new_op1,
+                        initial_state,
+                    );
                     simplified_algebraically = true;
-                } else if new_op1 == new_op2 { // a / a = 1 (where a != 0)
+                } else if new_op1 == new_op2 {
+                    // a / a = 1 (where a != 0)
                     // Again, careful with float, identity vs value. Assume ok for now.
-                    if let Some(one_const) = Constant::one_for_operand(&new_op1) { // Get one of the correct type
-                        optimised_instruction = Instruction::Move { dest: dest.clone(), src: Operand::Constant(one_const.clone()) };
+                    if let Some(one_const) = Constant::one_for_operand(&new_op1) {
+                        // Get one of the correct type
+                        optimised_instruction = Instruction::Move {
+                            dest: dest.clone(),
+                            src: Operand::Constant(one_const.clone()),
+                        };
                         current_state.insert(dest.clone(), one_const);
                         simplified_algebraically = true;
                     }
                 }
 
-                 // --- Constant Folding ---
-                 if !simplified_algebraically && let (Some(c1), Some(c2)) = (const1, const2) {
-                     if let Some(result_const) = interpret::divide_constants(c1, c2) { // Assumes divide_constants handles division by zero internally
+                // --- Constant Folding ---
+                if !simplified_algebraically && let (Some(c1), Some(c2)) = (const1, const2) {
+                    if let Some(result_const) = interpret::divide_constants(c1, c2) {
+                        // Assumes divide_constants handles division by zero internally
                         current_state.insert(dest.clone(), result_const.clone());
-                         if transform {
-                            optimised_instruction = Instruction::Move { dest: dest.clone(), src: Operand::Constant(result_const)};
+                        if transform {
+                            optimised_instruction = Instruction::Move {
+                                dest: dest.clone(),
+                                src: Operand::Constant(result_const),
+                            };
                         } else {
                             keep_original_instruction = false;
                         }
@@ -1168,4 +1264,3 @@ fn update_state_based_on_operand(
         }
     }
 }
-

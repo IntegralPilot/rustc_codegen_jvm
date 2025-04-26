@@ -5,9 +5,11 @@ mod dataflow;
 mod reachability;
 mod reorganisation;
 
-use dataflow::{process_block_instructions, analyze_constant_propagation};
-use reachability::{get_instruction_successors, find_reachable_blocks};
-use reorganisation::{convert_labels_to_basic_blocks_in_function, eliminate_duplicate_basic_blocks};
+use dataflow::{analyze_constant_propagation, process_block_instructions};
+use reachability::{find_reachable_blocks, get_instruction_successors};
+use reorganisation::{
+    convert_labels_to_basic_blocks_in_function, eliminate_duplicate_basic_blocks,
+};
 
 // --- Data Structures ---
 
@@ -86,7 +88,6 @@ fn build_cfg(code_block: &CodeBlock) -> HashMap<String, BasicBlockInfo> {
 
     cfg
 }
-
 
 // --- Transformation Phase ---
 

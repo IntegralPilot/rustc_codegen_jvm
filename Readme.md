@@ -72,7 +72,9 @@ All examples live in `tests/binary` and are compiled to JVM bytecode & run/teste
    Translate to `.class` files using `ristretto_classfile`.  
    _(see `src/lower2.rs`)_  
 5. **Post‑Process Stack Map Frames**  
-   Kotlin `asm-processor` (ASM library) adds verification frames.  
+   Kotlin `stackmapadder` (built with ASM library) adds verification frames and applys some further optimisations to the class files.
+6. **JAR Optimisation**
+   `optimise2` (based on `r8`) optimises the final jar file.
 6. **Link & Package**  
    `java-linker` bundles `.class` files into a runnable `.jar` with `META-INF/MANIFEST.MF`.
 
@@ -102,7 +104,8 @@ This will compile:
 
 - `rustc_codegen_jvm` backend library  
 - `java-linker`  
-- `asm-processor`  
+- `stackmapadder` 
+- `optimise2`
 - Kotlin shim for `core` (once core support is reached, this will no longer be needed)  
 - Generate `config.toml` & `jvm-unknown-unknown.json`  
 
@@ -162,7 +165,8 @@ Look for `✅ All tests passed!` or inspect `.generated` files on failure.
 │   ├── lower2.rs          # OOMIR → JVM bytecode
 │   └── oomir.rs           # OOMIR definitions
 ├── java-linker/           # Bundles .class files into .jar
-├── asm-processor/         # Kotlin ASM post‑processor
+├── stackmapadder/         # Kotlin StackMapFrame generator
+├── optimise2/             # Jar optimiser
 ├── tests/binary/          # Integration tests
 ├── library/               # Kotlin shim for Rust core library
 ├── shim-metadata-gen/     # Generates core.json metadata

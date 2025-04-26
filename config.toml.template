@@ -2,7 +2,7 @@
 rustflags = [
   "-Z", "codegen-backend=../../../target/debug/librustc_codegen_jvm.dylib",
   "-C", "linker=../../../java-linker/target/debug/java-linker",
-  "-C", "link-args=../../../library/build/distributions/library-0.1.0/lib/library-0.1.0.jar ../../../library/build/distributions/library-0.1.0/lib/kotlin-stdlib-2.1.20.jar --asm-processor ../../../asm-processor/build/libs/asm-processor-1.0-SNAPSHOT-all.jar --known-good kotlin-stdlib"
+  "-C", "link-args=../../../library/build/distributions/library-0.1.0/lib/library-0.1.0.jar ../../../library/build/distributions/library-0.1.0/lib/kotlin-stdlib-2.1.20.jar --stackmapadder ../../../stackmapadder/build/libs/stackmapadder-1.0-SNAPSHOT-all.jar --known-good kotlin-stdlib --optimizer ../../../optimise2/build/libs/optimise2-1.0-SNAPSHOT-all.jar --proguard-config ../../../proguard/default.pro"
 ]
 
 # Throwing a JVM exception will unwind and give a stack trace, no need for rust to handle unwinding.
