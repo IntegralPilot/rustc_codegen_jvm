@@ -842,7 +842,13 @@ pub fn process_block_instructions(
             }
 
             // --- Instructions that Kill Constants ---
-            Instruction::Call { dest, args, .. } => {
+            Instruction::Call {
+                dest,
+                args,
+                function,
+                ..
+            } => {
+                // Added 'function' for logging
                 // Propagate constants into arguments
                 let new_args: Vec<Operand> = args
                     .iter()
@@ -850,18 +856,66 @@ pub fn process_block_instructions(
                         lookup_const(arg, &current_state).map_or(arg.clone(), Operand::Constant)
                     })
                     .collect();
-                optimised_instruction = Instruction::Call {
-                    dest: dest.clone(),
-                    function: instruction.get_call_func_name().unwrap().clone(),
-                    args: new_args,
-                }; // Adjust based on actual Instruction structure
 
-                // Invalidate the destination variable
+                // Determine if any argument could potentially have side effects
+                // In our case, passing an Array(_) type signals potential mutation.
+                // We should also consider Class(_) types for future object mutations.
+                let mut has_potential_side_effect_arg = false;
+                for arg_operand in &new_args {
+                    // Check the arguments *after* constant prop
+                    let arg_type = match arg_operand {
+                        Operand::Variable { ty, .. } => Some(ty.clone()),
+                        Operand::Constant(c) => Some(Type::from_constant(c)), // Get type from constant
+                    };
+
+                    if let Some(ty) = arg_type {
+                        // Assume Arrays and Classes passed by reference can be mutated
+                        if matches!(ty, Type::Array(_) | Type::Class(_)) {
+                            has_potential_side_effect_arg = true;
+                            break;
+                        }
+                    }
+                }
+
+                // 1. Invalidate the destination variable
                 if let Some(d) = dest {
                     current_state.remove(d);
                 }
-                // Potentially invalidate args if they are pointers/references passed mutably? Needs more info.
-                keep_original_instruction = true;
+
+                // 2. CONSERVATIVE INVALIDATION due to potential side effects:
+                if has_potential_side_effect_arg {
+                    // Keep track of keys to remove to avoid borrowing issues while iterating
+                    let keys_to_remove: Vec<String> = current_state.iter()
+                        .filter_map(|(key, constant_val)| {
+                            // Decide which types are considered "primitive" and immutable
+                            // and won't be affected by side effects through references.
+                            match constant_val {
+                                Constant::I8(_) | Constant::I16(_) | Constant::I32(_) | Constant::I64(_) |
+                                Constant::F32(_) | Constant::F64(_) | Constant::Boolean(_) | Constant::Char(_) |
+                                Constant::String(_) => None, // Keep truly immutable primitives/values
+                                _ => {
+                                     println!(
+                                         "Optimizer: Invalidating potentially mutable constant '{}' due to call to '{}' with array/class arg.",
+                                         key, function
+                                     ); // Debugging
+                                     Some(key.clone()) // Remove others (Array, Instance, Class etc.)
+                                }
+                            }
+                        })
+                        .collect();
+
+                    for key in keys_to_remove {
+                        current_state.remove(&key);
+                    }
+                }
+
+                // Keep the call instruction, but with potentially updated arguments
+                optimised_instruction = Instruction::Call {
+                    dest: dest.clone(),
+                    function: function.clone(), // Use the captured function name
+                    args: new_args,
+                };
+                keep_original_instruction = true; // Always keep the call itself
             }
             Instruction::ArrayStore {
                 array,
@@ -1056,30 +1110,19 @@ pub fn process_block_instructions(
                 size,
             } => {
                 let const_size = lookup_const(size, &current_state);
-                let new_size_op = const_size.clone().map_or(size.clone(), Operand::Constant);
+                let new_size_op = const_size.map_or(size.clone(), Operand::Constant); // Propagate constant size if available
+
                 optimised_instruction = Instruction::NewArray {
                     dest: dest.clone(),
                     element_type: element_type.clone(),
                     size: new_size_op,
                 };
 
-                if let Some(c) = const_size {
-                    if let Some(size) = extract_number_from_operand(Operand::Constant(c)) {
-                        if let Some(array_const) =
-                            interpret::new_array_constant(element_type.clone(), size as usize)
-                        {
-                            current_state.insert(dest.clone(), array_const);
-                            keep_original_instruction = false; // Folded away
-                        } else {
-                            current_state.remove(dest); // Array creation failed or size not right type
-                        }
-                    } else {
-                        // Size not constant
-                        current_state.remove(dest);
-                    }
-                } else {
-                    current_state.remove(dest); // Size not constant
-                }
+                // Do NOT attempt to fold NewArray into a Constant::Array here.
+                // This hides the operation and makes side-effect tracking harder.
+                current_state.remove(dest);
+
+                keep_original_instruction = true;
             }
 
             Instruction::ConstructObject { dest, class_name } => {

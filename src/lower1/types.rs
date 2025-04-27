@@ -87,8 +87,13 @@ pub fn ty_to_oomir_type<'tcx>(
             }
         }
         rustc_middle::ty::TyKind::Str => oomir::Type::String,
-        rustc_middle::ty::TyKind::Ref(_, inner_ty, _) => {
-            ty_to_oomir_type(*inner_ty, tcx, data_types)
+        rustc_middle::ty::TyKind::Ref(_, inner_ty, mutability) => {
+            let pointee_oomir_type = ty_to_oomir_type(*inner_ty, tcx, data_types);
+            if mutability.is_mut() {
+                oomir::Type::MutableReference(Box::new(pointee_oomir_type))
+            } else {
+                pointee_oomir_type
+            }
         }
         rustc_middle::ty::TyKind::RawPtr(inner_ty, _) => {
             ty_to_oomir_type(*inner_ty, tcx, data_types)

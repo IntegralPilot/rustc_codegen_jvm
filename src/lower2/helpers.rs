@@ -56,7 +56,11 @@ pub fn get_load_instruction(ty: &Type, index: u16) -> Result<Instruction, jvm::E
             _ => Instruction::Dload_w(index),
         },
         // Reference-like types
-        Type::Reference(_) | Type::Array(_) | Type::String | Type::Class(_) => match index {
+        Type::Reference(_)
+        | Type::MutableReference(_)
+        | Type::Array(_)
+        | Type::String
+        | Type::Class(_) => match index {
             0 => Instruction::Aload_0,
             1 => Instruction::Aload_1,
             2 => Instruction::Aload_2,
@@ -138,7 +142,7 @@ pub fn get_store_instruction(ty: &Type, index: u16) -> Result<Instruction, jvm::
                 Instruction::Dstore_w(index)
             }
         }
-        Reference(_) | Array(_) | String | Class(_) => {
+        Reference(_) | MutableReference(_) | Array(_) | String | Class(_) => {
             if index <= 3 {
                 match index {
                     0 => Instruction::Astore_0,
@@ -257,11 +261,13 @@ pub fn get_cast_instructions(
         }
 
         // Generic checkcast for all other reference-to-reference
-        if let (Some(internal), Some(_)) = (
+        // Check if both are reference types AND have valid internal names/descriptors
+        if let (Some(_), Some(dest_name)) = (
             src.to_jvm_descriptor_or_internal_name(),
             dest.to_jvm_descriptor_or_internal_name(),
         ) {
-            let dest_idx = cp.add_class(&internal)?;
+            let dest_idx = cp.add_class(&dest_name)?;
+
             return Ok(vec![JI::Checkcast(dest_idx)]);
         }
     }

@@ -10,7 +10,7 @@ use crate::oomir;
 
 use rustc_middle::{
     mir::{
-        BasicBlock, BasicBlockData, Body, Operand as MirOperand, Place, StatementKind,
+        BasicBlock, BasicBlockData, Body, Local, Operand as MirOperand, Place, StatementKind,
         TerminatorKind,
     },
     ty::TyCtxt,
@@ -33,6 +33,8 @@ pub fn convert_basic_block<'tcx>(
     // Use the basic block index as its label.
     let label = format!("bb{}", bb.index());
     let mut instructions = Vec::new();
+    let mut mutable_borrow_arrays: HashMap<Local, (Place<'tcx>, String, oomir::Type)> =
+        HashMap::new();
 
     // Convert each MIR statement in the block.
     for stmt in &bb_data.statements {
@@ -47,6 +49,53 @@ pub fn convert_basic_block<'tcx>(
 
                 // Add instructions needed to calculate the Rvalue
                 instructions.extend(rvalue_instructions);
+
+                if let rustc_middle::mir::Rvalue::Ref(
+                    _,
+                    rustc_middle::mir::BorrowKind::Mut { .. },
+                    borrowed_place,
+                ) = rvalue
+                {
+                    // Check if the destination is a simple local (most common case for &mut assignment)
+                    if place.projection.is_empty() {
+                        if let oomir::Operand::Variable {
+                            name: array_var_name,
+                            ty: array_ty,
+                        } = &source_operand
+                        {
+                            // Extract element type from array type
+                            if let oomir::Type::MutableReference(element_ty) = array_ty {
+                                println!(
+                                    "Info: Tracking mutable borrow array for place {:?} stored in local {:?}. Original: {:?}, ArrayVar: {}, ElementTy: {:?}",
+                                    place, place.local, borrowed_place, array_var_name, element_ty
+                                );
+                                mutable_borrow_arrays.insert(
+                                    place.local, // The local holding the array reference (e.g., _3)
+                                    (
+                                        borrowed_place.clone(), // The original place borrowed (e.g., _1)
+                                        array_var_name.clone(), // The OOMIR name of the array var (e.g., "3_tmp0")
+                                        *element_ty.clone(), // The type of the element in the array
+                                    ),
+                                );
+                            } else {
+                                println!(
+                                    "Warning: Expected type for mutable borrow ref, found {:?}",
+                                    array_ty
+                                );
+                            }
+                        } else {
+                            println!(
+                                "Warning: Expected variable operand for mutable borrow ref assignment result, found {:?}",
+                                source_operand
+                            );
+                        }
+                    } else {
+                        println!(
+                            "Warning: Mutable borrow assigned to complex place {:?}, write-back might not work correctly.",
+                            place
+                        );
+                    }
+                }
 
                 // 2. Generate instructions to store the computed value into the destination place
                 let assignment_instructions = emit_instructions_to_set_value(
@@ -158,25 +207,110 @@ pub fn convert_basic_block<'tcx>(
             } => {
                 println!("the function name is {:?}", func);
                 let function_name = make_jvm_safe(format!("{:?}", func).as_str()); // Get function name - needs refinement to extract actual name
-                let oomir_args = args
-                    .iter()
-                    .map(|arg| convert_operand(&arg.node, tcx, mir, data_types, &mut instructions))
-                    .collect();
-                let dest = Some(format!("{:?}", destination.local));
 
+                // --- Track Argument Origins ---
+                // Store tuples: (Maybe Original MIR Place of Arg, OOMIR Operand for Arg)
+                let mut processed_args: Vec<(Option<Place<'tcx>>, oomir::Operand)> = Vec::new();
+                let mut pre_call_instructions = Vec::new(); // Instructions needed *before* the call for args
+
+                for arg in args {
+                    let mir_op = &arg.node;
+                    // Important: Pass pre_call_instructions here to collect setup code for this arg
+                    let oomir_op =
+                        convert_operand(mir_op, tcx, mir, data_types, &mut pre_call_instructions);
+
+                    // Identify if the MIR operand is a direct use of a local Place
+                    let maybe_arg_place = match mir_op {
+                        MirOperand::Move(p) | MirOperand::Copy(p) if p.projection.is_empty() => {
+                            Some(p.clone())
+                        }
+                        _ => None,
+                    };
+                    processed_args.push((maybe_arg_place, oomir_op));
+                }
+                // Add instructions needed to prepare arguments *before* the call
+                instructions.extend(pre_call_instructions);
+
+                // Collect just the OOMIR operands for the call itself
+                let oomir_args: Vec<oomir::Operand> =
+                    processed_args.iter().map(|(_, op)| op.clone()).collect();
+
+                // Determine destination OOMIR variable name (if any)
+                let dest_var_name = destination.projection.is_empty()
+                    .then(|| format!("_{}", destination.local.index()))
+                    .or_else(|| {
+                         println!("Warning: Call destination {:?} is complex, return value might be lost.", destination);
+                         None // Handle complex destinations if needed later
+                    });
+
+                // --- Emit the Call Instruction ---
                 instructions.push(oomir::Instruction::Call {
-                    dest,
+                    dest: dest_var_name,
                     function: function_name,
                     args: oomir_args,
                 });
 
+                let mut write_back_instrs = Vec::new();
+                for (maybe_arg_place, oomir_arg_operand) in &processed_args {
+                    if let Some(arg_place) = maybe_arg_place {
+                        // Check if the local used for this argument is one we tracked as a mutable borrow array
+                        if let Some((original_place, array_var_name, element_ty)) =
+                            mutable_borrow_arrays.get(&arg_place.local)
+                        {
+                            // Double-check if the operand passed was indeed the variable we expected
+                            if let oomir::Operand::Variable {
+                                name: passed_var_name,
+                                ..
+                            } = oomir_arg_operand
+                            {
+                                println!(
+                                    "Info: Emitting write-back for mutable borrow. Arg Place: {:?}, Original Place: {:?}, Array Var: {}",
+                                    arg_place, original_place, array_var_name
+                                );
+
+                                // Create a temporary variable for the value read from the array
+                                let temp_writeback_var =
+                                    format!("_writeback_{}", original_place.local.index());
+
+                                // 1. Get value from array (using the tracked array_var_name)
+                                let array_operand = oomir::Operand::Variable {
+                                    name: array_var_name.clone(),
+                                    // Reconstruct array type for clarity (though not strictly needed by ArrayGet)
+                                    ty: oomir::Type::Array(Box::new(element_ty.clone())),
+                                };
+                                write_back_instrs.push(oomir::Instruction::ArrayGet {
+                                    dest: temp_writeback_var.clone(),
+                                    array: array_operand,
+                                    index: oomir::Operand::Constant(oomir::Constant::I32(0)), // Always index 0
+                                });
+
+                                // 2. Set value back to original place
+                                let value_to_set = oomir::Operand::Variable {
+                                    name: temp_writeback_var,
+                                    ty: element_ty.clone(), // Use the tracked element type
+                                };
+                                let set_instrs = emit_instructions_to_set_value(
+                                    original_place, // The original Place (_1)
+                                    value_to_set,   // The value read from the array
+                                    tcx,
+                                    mir,
+                                    data_types,
+                                );
+                                write_back_instrs.extend(set_instrs);
+                            }
+                        }
+                    }
+                }
+                instructions.extend(write_back_instrs);
+
+                // --- Add Jump to Target Block (if call returns) ---
                 if let Some(target_bb) = target {
                     let target_label = format!("bb{}", target_bb.index());
                     println!(
                         "Info: Adding Jump to {} after Call in bb{}",
                         target_label,
                         bb.index()
-                    ); // Add log
+                    );
                     instructions.push(oomir::Instruction::Jump {
                         target: target_label,
                     });

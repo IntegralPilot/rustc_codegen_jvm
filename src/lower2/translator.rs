@@ -401,6 +401,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     | Type::Class(_)
                     | Type::String
                     | Type::Reference(_)
+                    | Type::MutableReference(_)
                     | Type::Array(_) => Ok((t1.clone(), None, None)), // Assume comparable for now, specific logic in main function handles details
                     Type::Void => Err(jvm::Error::VerificationError {
                         context: format!("Function {}", self.oomir_func.name),
@@ -1878,6 +1879,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                             oomir::Type::F64 => JI::Dreturn,
                             oomir::Type::Reference(_)
                             | oomir::Type::Array(_)
+                            | oomir::Type::MutableReference(_)
                             | oomir::Type::String
                             | oomir::Type::Class(_) => JI::Areturn,
                             oomir::Type::Void => JI::Return, // Should not happen with Some(op)
@@ -2236,7 +2238,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 // 1. Get the type of the array variable to find the element type
                 let array_type = self.get_local_type(array)?.clone(); // Clone to avoid borrow issues
                 let element_type = match array_type.clone() {
-                    oomir::Type::Array(et) => et,
+                    oomir::Type::Array(et) | oomir::Type::MutableReference(et) => et,
                     _ => {
                         return Err(jvm::Error::VerificationError {
                             context: format!("Function {}", self.oomir_func.name),
@@ -2302,7 +2304,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
 
                 // Now extract the element type *from* the array type
                 let element_type = match array_operand_type {
-                    oomir::Type::Array(inner_type) => {
+                    oomir::Type::Array(inner_type) | oomir::Type::MutableReference(inner_type) => {
                         // inner_type is likely Box<oomir::Type>, so deref it
                         (**inner_type).clone()
                     }
@@ -2344,7 +2346,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 // 2. Verify that the operand is an array type
                 let array_actual_type = get_operand_type(array);
                 match &array_actual_type {
-                    oomir::Type::Array(_) => { /* Okay */ }
+                    oomir::Type::Array(_) | oomir::Type::MutableReference(_) => { /* Okay */ }
                     _ => {
                         return Err(jvm::Error::VerificationError {
                             context: format!("Function {}", self.oomir_func.name),
@@ -2458,30 +2460,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     get_load_instruction(&object_actual_type, object_var_index)?;
                 self.jvm_instructions.push(load_object_instr.clone()); // Stack: [object_ref]
 
-                // Check if a downcast is necessary before accessing the field.
-                // This is needed if the field belongs to a specific variant ('owner_class')
-                // but the variable currently holds the base enum type ('object_actual_type').
-                let object_jvm_name = object_actual_type.to_jvm_class_name();
-
-                // Compare the JVM name of the variable's static type with the field's owner class.
-                // Also check if owner_class is derived from object_actual_type (basic check for now)
-                // Compare the JVM name of the variable's static type with the field's owner class.
-                // Also check if owner_class is derived from object_actual_type (basic check for now)
-                if let Some(obj_name) = object_jvm_name.clone() {
-                    if obj_name != *owner_class {
-                        println!(
-                            "DEBUG: Adding checkcast to {} for GetField on variable '{}' (static type {:?})",
-                            owner_class, object, object_actual_type
-                        );
-                        // Add the Class reference for the target variant type to the constant pool
-                        let cast_target_class_index = self.constant_pool.add_class(owner_class)?;
-                        // Add the checkcast instruction
-                        self.jvm_instructions
-                            .push(JI::Checkcast(cast_target_class_index));
-                        // Stack: [object_ref (type: owner_class after checkcast)]
-                    }
-                }
-
                 // 4. Load the value to be stored onto the stack
                 self.load_operand(value)?; // Stack: [object_ref, value] (value size 1 or 2)
 
@@ -2525,23 +2503,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 // This is needed if the field belongs to a specific variant ('owner_class')
                 // but the operand currently holds the base enum type ('object_actual_type').
                 let object_jvm_name = object_actual_type.to_jvm_class_name(); // Get JVM name (e.g., "option")
-
-                // Compare the JVM name of the operand's static type with the field's owner class.
-                // Also check if owner_class is derived from object_actual_type (basic check for now)
-                if let Some(obj_name) = object_jvm_name.clone() {
-                    if obj_name != *owner_class {
-                        println!(
-                            "DEBUG: Adding checkcast to {} for GetField on operand {:?} (static type {:?})",
-                            owner_class, object, object_actual_type
-                        );
-                        // Add the Class reference for the target variant type to the constant pool
-                        let cast_target_class_index = self.constant_pool.add_class(owner_class)?;
-                        // Add the checkcast instruction
-                        self.jvm_instructions
-                            .push(JI::Checkcast(cast_target_class_index));
-                        // Stack: [object_ref (type: owner_class after checkcast)]
-                    }
-                }
 
                 // 4. Emit 'getfield' instruction
                 self.jvm_instructions.push(JI::Getfield(field_ref_index)); // Stack: [field_value] (size 1 or 2)

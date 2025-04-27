@@ -49,6 +49,8 @@ All examples live in `tests/binary` and are compiled to JVM bytecode & run/teste
 - Arrays & slices with nested indexing  
 - Structs, tuples, enums (both C‑like and Rust‑style)  
 - Executable `.jar` generation for binary crates  
+- Mutable borrowing, references, and dereferencing
+- **Integration tests** for all features
 
 🚧 **Next Milestone:** Full support for the Rust `core` crate.
 

@@ -179,16 +179,7 @@ pub fn read_constant_value_from_memory<'tcx>(
                 elements.push(elem_const);
             }
             // Determine OOMIR element type (assuming ty_to_oomir_type exists)
-            let mut data_types = HashMap::new(); // dummy data types - it's an array not an ADT so nothing will happen to it
-            let oomir_elem_type = ty_to_oomir_type(*elem_ty, tcx, &mut data_types);
-
-            // confirm data_types is empty
-            if !data_types.is_empty() {
-                panic!(
-                    "Data types map is not empty for array type {:?}",
-                    data_types
-                );
-            }
+            let oomir_elem_type = ty_to_oomir_type(*elem_ty, tcx, oomir_data_types);
 
             // find values in the array
             let mut values = Vec::new();

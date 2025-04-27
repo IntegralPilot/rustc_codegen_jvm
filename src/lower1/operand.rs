@@ -1070,14 +1070,50 @@ pub fn handle_const_value<'tcx>(
         }
         ConstValue::ZeroSized => {
             println!("Info: Encountered ZeroSized constant for type {:?}", ty);
-            oomir::Operand::Constant(oomir::Constant::I32(0)) // Placeholder
+            oomir::Operand::Constant(oomir::Constant::I32(0))
         }
-        ConstValue::Indirect {
-            alloc_id: _,
-            offset: _,
-        } => {
-            println!("Warning: Indirect constants not fully handled yet.");
-            oomir::Operand::Constant(oomir::Constant::I32(0)) // Placeholder
+        ConstValue::Indirect { alloc_id, offset } => {
+            println!(
+                "Info: Handling Indirect constant (AllocId: {:?}, Offset: {:?}, Type: {:?})",
+                alloc_id, offset, ty
+            );
+            // Get the allocation where the constant data resides
+            match tcx.global_alloc(alloc_id) {
+                rustc_middle::mir::interpret::GlobalAlloc::Memory(const_allocation) => {
+                    let allocation = const_allocation.inner();
+                    // Use the dedicated function to read the value from memory
+                    match read_constant_value_from_memory(
+                        tcx, allocation,
+                        offset, // The offset provided by ConstValue::Indirect
+                        *ty,    // The type of the constant we are reading
+                        data_types,
+                    ) {
+                        Ok(oomir_const) => {
+                            println!(
+                                "Info: Successfully extracted indirect constant: {:?}",
+                                oomir_const
+                            );
+                            oomir::Operand::Constant(oomir_const)
+                        }
+                        Err(e) => {
+                            println!(
+                                "Error: Failed to read indirect constant of type {:?} from allocation {:?}: {}",
+                                ty, alloc_id, e
+                            );
+                            // Return an error placeholder, maybe distinct from other errors
+                            oomir::Operand::Constant(oomir::Constant::I64(-60))
+                        }
+                    }
+                }
+                other_alloc => {
+                    // This case should be rare for constants defined in code, but handle it defensively.
+                    println!(
+                        "Warning: Indirect constant points to unexpected GlobalAlloc kind: {:?}. AllocId: {:?}, Type: {:?}",
+                        other_alloc, alloc_id, ty
+                    );
+                    oomir::Operand::Constant(oomir::Constant::I64(-61))
+                }
+            }
         }
     }
 }

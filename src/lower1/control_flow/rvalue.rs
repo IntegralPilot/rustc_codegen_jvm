@@ -1,6 +1,6 @@
 use rustc_abi::FieldIdx;
 use rustc_middle::{
-    mir::{BinOp, Body, Operand as MirOperand, Place, Rvalue, UnOp},
+    mir::{BinOp, Body, BorrowKind as MirBorrowKind, Operand as MirOperand, Place, Rvalue, UnOp},
     ty::{ConstKind, TyCtxt, TyKind, inherent::ValueConst},
 };
 use std::collections::HashMap;
@@ -117,17 +117,87 @@ pub fn convert_rvalue_to_operand<'a>(
                 result_operand = get_placeholder_operand(original_dest_place, mir, tcx, data_types);
             }
         }
+        Rvalue::Ref(_region, borrow_kind, source_place) => {
+            match borrow_kind {
+                MirBorrowKind::Mut { .. } => {
+                    // --- MUTABLE BORROW (&mut T) -> Use Array Hack ---
+                    println!(
+                        "Info: Handling Rvalue::Ref(Mut) for place '{}' -> Temp Array Var",
+                        place_to_string(source_place, tcx)
+                    );
 
-        Rvalue::Ref(_region, _borrow_kind, source_place) => {
-            // In many Java-like backends, a reference is often represented by the
-            // value/object itself. Let's assume that for now.
-            let (temp_var_name, get_instructions, temp_var_type) =
-                emit_instructions_to_get_on_own(source_place, tcx, mir, data_types);
-            instructions.extend(get_instructions);
-            result_operand = oomir::Operand::Variable {
-                name: temp_var_name,
-                ty: temp_var_type, // Or potentially wrap in Ref type if needed
-            };
+                    // 1. Get the value of the place being referenced (the 'pointee').
+                    let (pointee_value_var_name, pointee_get_instructions, pointee_oomir_type) =
+                        emit_instructions_to_get_on_own(source_place, tcx, mir, data_types);
+                    instructions.extend(pointee_get_instructions); // Add instructions to get the value
+
+                    // 2. Determine the OOMIR type for the array reference itself.
+                    let array_ref_oomir_type =
+                        oomir::Type::MutableReference(Box::new(pointee_oomir_type.clone()));
+
+                    // 3. Create a temporary variable name for the new array.
+                    let array_ref_var_name = generate_temp_var_name(&base_temp_name);
+
+                    // 4. Emit instruction to allocate the single-element array (new T[1]).
+                    instructions.push(oomir::Instruction::NewArray {
+                        dest: array_ref_var_name.clone(),
+                        element_type: pointee_oomir_type.clone(),
+                        size: oomir::Operand::Constant(oomir::Constant::I32(1)),
+                    });
+
+                    // 5. Emit instruction to store the pointee's value into the array's first element.
+                    let pointee_value_operand = oomir::Operand::Variable {
+                        name: pointee_value_var_name,
+                        ty: pointee_oomir_type,
+                    };
+                    instructions.push(oomir::Instruction::ArrayStore {
+                        array: array_ref_var_name.clone(),
+                        index: oomir::Operand::Constant(oomir::Constant::I32(0)),
+                        value: pointee_value_operand,
+                    });
+
+                    // 6. The result is the reference to the newly created array.
+                    result_operand = oomir::Operand::Variable {
+                        name: array_ref_var_name,
+                        ty: array_ref_oomir_type,
+                    };
+                    println!(
+                        "Info: -> Temp Array Var '{}' ({:?})",
+                        result_operand.get_name().unwrap_or("<unknown>"),
+                        result_operand.get_type()
+                    );
+                }
+
+                MirBorrowKind::Shared | MirBorrowKind::Fake { .. } => {
+                    // Treat Fake like Shared (used for closures etc.)
+                    // --- SHARED BORROW (&T) or others -> Pass Through Value ---
+                    println!(
+                        "Info: Handling Rvalue::Ref({:?}) for place '{}' -> Direct Value",
+                        borrow_kind,
+                        place_to_string(source_place, tcx)
+                    );
+
+                    // 1. Get the value/reference of the place being borrowed directly.
+                    //    `emit_instructions_to_get_on_own` handles loading/accessing the value.
+                    let (pointee_value_var_name, pointee_get_instructions, pointee_oomir_type) =
+                        emit_instructions_to_get_on_own(source_place, tcx, mir, data_types);
+
+                    // 2. Add the instructions needed to get this value.
+                    instructions.extend(pointee_get_instructions);
+
+                    // 3. The result *is* the operand representing the borrowed value itself.
+                    //    No array wrapping is done.
+                    result_operand = oomir::Operand::Variable {
+                        name: pointee_value_var_name,
+                        ty: pointee_oomir_type,
+                    };
+                    println!(
+                        "Info: -> Direct Value Operand '{}' ({:?})",
+                        result_operand.get_name().unwrap_or("<unknown>"),
+                        result_operand.get_type()
+                    );
+                }
+            }
         }
 
         Rvalue::Len(source_place) => {
@@ -793,6 +863,13 @@ pub fn convert_rvalue_to_operand<'a>(
                         name.clone()
                     } else {
                         panic!("Discriminant on Ref to non-class type: {:?}", inner)
+                    }
+                }
+                oomir::Type::MutableReference(inner) => {
+                    if let oomir::Type::Class(name) = inner.as_ref() {
+                        name.clone()
+                    } else {
+                        panic!("Discriminant on MutableRef to non-class type: {:?}", inner)
                     }
                 }
                 _ => panic!(

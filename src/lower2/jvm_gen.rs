@@ -67,7 +67,7 @@ pub(super) fn oomir_type_to_ristretto_field_type(
             let inner_ty = ref2.as_ref();
             oomir_type_to_ristretto_field_type(inner_ty)
         }
-        oomir::Type::Array(inner_ty) => {
+        oomir::Type::Array(inner_ty) | oomir::Type::MutableReference(inner_ty) => {
             let inner_field_type = oomir_type_to_ristretto_field_type(inner_ty);
             jvm::FieldType::Array(Box::new(inner_field_type))
         }
@@ -213,6 +213,7 @@ fn create_code_from_method_name_and_constant_return(
         oomir::Type::F32 => Instruction::Freturn,
         oomir::Type::F64 => Instruction::Dreturn,
         oomir::Type::Reference(_)
+        | oomir::Type::MutableReference(_)
         | oomir::Type::Array(_)
         | oomir::Type::String
         | oomir::Type::Class(_) => Instruction::Areturn,

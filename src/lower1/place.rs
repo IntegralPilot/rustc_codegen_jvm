@@ -241,7 +241,56 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
                 current_var = next_var;
             }
             ProjectionElem::Deref => {
-                // do nothing
+                match type_before_proj {
+                    oomir::Type::MutableReference(_) => {
+                        // Clone the type before potentially modifying it
+                        let type_before_deref = current_type.clone();
+
+                        match type_before_deref.clone() {
+                            oomir::Type::MutableReference(element_type) => {
+                                // Create a temporary variable name for the dereferenced value
+                                let next_var = format!("{}_deref", current_var);
+
+                                println!(
+                                    "Info: Handling Deref: Var '{}' ({:?}) -> Temp Var '{}' (Type: {:?})",
+                                    current_var,
+                                    type_before_deref, // Log the array type
+                                    next_var,
+                                    element_type.as_ref() // Log the element type
+                                );
+
+                                instructions.push(oomir::Instruction::ArrayGet {
+                                    dest: next_var.clone(),
+                                    array: Operand::Variable {
+                                        name: current_var.clone(),
+                                        ty: type_before_deref, // The type is Array(T)
+                                    },
+                                    // Index is always 0 for our reference representation
+                                    index: Operand::Constant(oomir::Constant::I32(0)),
+                                });
+
+                                // Update current_var and current_type for subsequent projections
+                                current_var = next_var;
+                                current_type = element_type.as_ref().clone(); // Type becomes T
+                            }
+                            _ => {
+                                // This could happen with raw pointers (*const T / *mut T)
+                                // which aren't the primary focus here, or if there's a type error.
+                                panic!(
+                                    "Attempted to Deref a non-reference (non-array) type: \
+                             Variable '{}' has type {:?}. Place: {:?}",
+                                    current_var,
+                                    current_type, // Use the original current_type for the error
+                                    place
+                                );
+                                // Or, if supporting raw pointers later, add specific logic here.
+                            }
+                        }
+                    }
+                    _ => {
+                        // no op
+                    }
+                }
             }
             ProjectionElem::Downcast(_, variant_idx) => {
                 // A downcast changes the *effective type* for subsequent projections.
@@ -343,6 +392,16 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
                         },
                     );
                 }
+
+                // insert a Cast instruction to convert the base enum to the variant class
+                instructions.push(oomir::Instruction::Cast {
+                    dest: current_var.clone(),
+                    op: Operand::Variable {
+                        name: current_var.clone(),
+                        ty: type_before_proj,
+                    },
+                    ty: oomir::Type::Class(variant_class_name),
+                });
 
                 println!(
                     "Info: Handled Downcast: Variant {}({}), BaseEnum='{}', New Type (Variant Class): {:?}, Var: {}",
@@ -557,7 +616,26 @@ pub fn emit_instructions_to_set_value<'tcx>(
             }
 
             ProjectionElem::Deref => {
-                // do nothing
+                println!(
+                    "Info: Handling Set via Deref: Target Base Var '{}' ({:?}), Source: {:?}",
+                    base_var_name,
+                    base_oomir_type, // Should be Array(T)
+                    source_operand
+                );
+
+                match &base_oomir_type {
+                    oomir::Type::MutableReference(_element_type) => {
+                        instructions.push(Instruction::ArrayStore {
+                            array: base_var_name.clone(), // The variable holding the array reference
+                            // Index is always 0 for our reference representation
+                            index: Operand::Constant(oomir::Constant::I32(0)),
+                            value: source_operand, // The value being assigned
+                        });
+                    }
+                    _ => {
+                        // no-op - non-mutable reference
+                    }
+                }
             }
             ProjectionElem::Downcast(..) => {
                 // Downcast should not be the last element for an assignment.

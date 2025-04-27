@@ -261,6 +261,21 @@ pub enum Operand {
     Variable { name: String, ty: Type },
 }
 
+impl Operand {
+    pub fn get_name(&self) -> Option<&str> {
+        match self {
+            Operand::Variable { name, .. } => Some(name),
+            _ => None,
+        }
+    }
+    pub fn get_type(&self) -> Option<Type> {
+        match self {
+            Operand::Variable { ty, .. } => Some(ty.clone()),
+            Operand::Constant(c) => Some(Type::from_constant(c)),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Constant {
     I8(i8),
@@ -509,8 +524,9 @@ pub enum Type {
     I64,
     F32,
     F64,
+    MutableReference(Box<Type>), // Same as an Array
     Reference(Box<Type>), // Representing references, not currently constructed but might be useful in future for more complex things.
-    Array(Box<Type>),     // Representing arrays, need to handle dimensions
+    Array(Box<Type>),     // Representing arrays
     String,               // String type
     Class(String),        // For structs, enums, and potentially Objects
 }
@@ -535,7 +551,9 @@ impl Type {
             Type::String => "Ljava/lang/String;".to_string(),
             Type::Class(name) => format!("L{};", name.replace('.', "/")),
             Type::Reference(inner) => inner.to_jvm_descriptor(),
-            Type::Array(element_type) => format!("[{}", element_type.to_jvm_descriptor()),
+            Type::Array(element_type) | Type::MutableReference(element_type) => {
+                format!("[{}", element_type.to_jvm_descriptor())
+            }
         }
     }
 
@@ -608,9 +626,11 @@ impl Type {
             Type::F32 => Some(JVMInstruction::Fastore),
             Type::F64 => Some(JVMInstruction::Dastore),
             // Reference types:
-            Type::String | Type::Class(_) | Type::Array(_) | Type::Reference(_) => {
-                Some(JVMInstruction::Aastore)
-            }
+            Type::String
+            | Type::Class(_)
+            | Type::Array(_)
+            | Type::Reference(_)
+            | Type::MutableReference(_) => Some(JVMInstruction::Aastore),
             Type::Void => None,
         }
     }
@@ -630,9 +650,11 @@ impl Type {
             Type::F32 => Some(JVMInstruction::Faload),
             Type::F64 => Some(JVMInstruction::Daload),
             // Reference types:
-            Type::String | Type::Class(_) | Type::Array(_) | Type::Reference(_) => {
-                Some(JVMInstruction::Aaload)
-            }
+            Type::String
+            | Type::Class(_)
+            | Type::Array(_)
+            | Type::Reference(_)
+            | Type::MutableReference(_) => Some(JVMInstruction::Aaload),
             Type::Void => None,
         }
     }
