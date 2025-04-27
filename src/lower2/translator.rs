@@ -2499,11 +2499,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 // 3. Load the object reference onto the stack
                 self.load_operand(object)?; // Stack: [object_ref]
 
-                // Check if a downcast is necessary before accessing the field.
-                // This is needed if the field belongs to a specific variant ('owner_class')
-                // but the operand currently holds the base enum type ('object_actual_type').
-                let object_jvm_name = object_actual_type.to_jvm_class_name(); // Get JVM name (e.g., "option")
-
                 // 4. Emit 'getfield' instruction
                 self.jvm_instructions.push(JI::Getfield(field_ref_index)); // Stack: [field_value] (size 1 or 2)
 

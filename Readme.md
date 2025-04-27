@@ -73,10 +73,8 @@ All examples live in `tests/binary` and are compiled to JVM bytecode & run/teste
 4. **OOMIR → JVM Classfile**  
    Translate to `.class` files using `ristretto_classfile`.  
    _(see `src/lower2.rs`)_  
-5. **Post‑Process Stack Map Frames**  
-   Kotlin `stackmapadder` (built with ASM library) adds verification frames and applys some further optimisations to the class files.
-6. **JAR Optimisation**
-   `optimise2` (based on `r8`) optimises the final jar file.
+5. **R8 pass**  
+   `r8` adds stack map frames (neeeded to run on JVM 8+) and applies some further optimisations.
 6. **Link & Package**  
    `java-linker` bundles `.class` files into a runnable `.jar` with `META-INF/MANIFEST.MF`.
 
@@ -85,8 +83,7 @@ All examples live in `tests/binary` and are compiled to JVM bytecode & run/teste
 ## 🛠 Prerequisites
 
 - **Rust Nightly** (`rustup default nightly`)  
-- **JDK 8+** (`java` in PATH)  
-- **Gradle** (`gradle` in PATH)  
+- **JDK 8+** (`java` in PATH, and the `JAVA_HOME` environment variable set)
 - **Python 3** (`python3` in PATH)
 
 ---
@@ -106,8 +103,6 @@ This will compile:
 
 - `rustc_codegen_jvm` backend library  
 - `java-linker`  
-- `stackmapadder` 
-- `optimise2`
 - Kotlin shim for `core` (once core support is reached, this will no longer be needed)  
 - Generate `config.toml` & `jvm-unknown-unknown.json`  
 
@@ -167,11 +162,10 @@ Look for `✅ All tests passed!` or inspect `.generated` files on failure.
 │   ├── lower2.rs          # OOMIR → JVM bytecode
 │   └── oomir.rs           # OOMIR definitions
 ├── java-linker/           # Bundles .class files into .jar
-├── stackmapadder/         # Kotlin StackMapFrame generator
-├── optimise2/             # Jar optimiser
 ├── tests/binary/          # Integration tests
 ├── library/               # Kotlin shim for Rust core library
 ├── shim-metadata-gen/     # Generates core.json metadata
+├── proguard/              # .pro rules used for r8
 ├── Makefile               # build & gen-files
 ├── config.toml.template
 ├── jvm-unknown-unknown.json.template

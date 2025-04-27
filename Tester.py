@@ -64,7 +64,7 @@ def process_test(test_dir: str, release_mode: bool):
                   os.path.join(test_dir, "target", "jvm-unknown-unknown", target_dir, f"{test_name}.jar"))
 
     jar_path = os.path.join(test_dir, "target", "jvm-unknown-unknown", target_dir, f"{test_name}.jar")
-    proc = run_command(["java", "-jar", jar_path]) 
+    proc = run_command(["java", "-cp", f"library/build/distributions/library-0.1.0/lib/library-0.1.0.jar:library/build/distributions/library-0.1.0/lib/kotlin-stdlib-2.1.20.jar:{jar_path}", test_name]) 
     
     expected_returncode_file = os.path.join(test_dir, "java-returncode.expected")
     if os.path.exists(expected_returncode_file):

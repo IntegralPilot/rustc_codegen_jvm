@@ -1,7 +1,7 @@
 # === Phony Targets ===
 .PHONY: all help clean rust-components rust clean-rust java-linker clean-java-linker \
-        shim-metadata-gen clean-shim-metadata-gen stackmapadder clean-stackmapadder \
-        library clean-library gen-files clean-gen-files ci optimise2 clean-optimise2
+        shim-metadata-gen clean-shim-metadata-gen vendor-r8 clean-vendor-r8 \
+        library clean-library gen-files clean-gen-files ci
 
 # === Terminal Colors ===
 GREEN  := \033[1;32m
@@ -11,18 +11,16 @@ RESET  := \033[0m
 # === Directory Variables ===
 JAVA_LINKER_DIR := java-linker
 SHIM_METADATA_GEN_DIR := shim-metadata-gen
-STACKMAPADDER_DIR := stackmapadder
-OPTIMISE2_DIR := optimise2
 LIBRARY_DIR := library
 LIBRARY_JAR := $(LIBRARY_DIR)/build/libs/library-0.1.0.jar
 RUST_SOURCES := $(shell find $(SHIM_METADATA_GEN_DIR)/src -type f -name '*.rs')
 
 # === Default Target ===
 ifeq ($(IS_CI),1)
-all: rust java-linker stackmapadder optimise2
+all: rust java-linker vendor-r8
 	@echo "$(GREEN)✨ Build complete in CI mode! ✨$(RESET)"
 else
-all: rust gen-files java-linker stackmapadder optimise2
+all: rust gen-files java-linker vendor-r8
 	@echo "$(GREEN)✨ Build complete! ✨$(RESET)"
 endif
 
@@ -41,7 +39,6 @@ help:
 	@echo "  make rust-components      - Install needed Rust components"
 	@echo "  make rust                 - Build the Rust root project"
 	@echo "  make java-linker          - Build the Java Linker subproject"
-	@echo "  make stackmapadder        - Build the ASM processor"
 	@echo "  make library              - Build the standard library shim"
 	@echo "  make gen-files            - Generate necessary files from templates"
 	@echo "  make clean-*              - Clean individual components"
@@ -96,39 +93,6 @@ clean-shim-metadata-gen-json-files:
 	    rm -f $(SHIM_METADATA_GEN_DIR)/*.json; \
 	fi
 
-# === ASM Processors (Gradle) ===
-stackmapadder:
-	@echo "$(CYAN)⚙️  Building Stack map adder...$(RESET)"
-ifeq ($(IS_CI),1)
-	cd $(STACKMAPADDER_DIR) && gradle --no-daemon shadowJar
-else
-	cd $(STACKMAPADDER_DIR) && gradle shadowJar
-endif
-
-clean-stackmapadder:
-	@echo "$(CYAN)🧹 Cleaning ASM processor...$(RESET)"
-ifeq ($(IS_CI),1)
-	cd $(STACKMAPADDER_DIR) && gradle --no-daemon clean
-else
-	cd $(STACKMAPADDER_DIR) && gradle clean
-endif
-
-optimise2:
-	@echo "$(CYAN)⚙️  Building optimise2...$(RESET)"
-ifeq ($(IS_CI),1)
-	cd $(OPTIMISE2_DIR) && gradle --no-daemon shadowJar
-else
-	cd $(OPTIMISE2_DIR) && gradle shadowJar
-endif
-
-clean-optimise2:
-	@echo "$(CYAN)🧹 Cleaning optimise2...$(RESET)
-ifeq ($(IS_CI),1)
-	cd $(OPTIMISE2_DIR) && gradle --no-daemon clean
-else
-	cd $(OPTIMISE2_DIR) && gradle clean
-endif
-
 # === Standard Library Shim (Gradle) ===
 library: $(LIBRARY_JAR)
 
@@ -158,6 +122,16 @@ clean-gen-files:
 	@echo "$(CYAN)🧹 Cleaning template generated files...$(RESET)"
 	rm -f jvm-unknown-unknown.json config.toml
 
+# === Vendoring of R8 ===
+vendor-r8:
+	@echo "$(CYAN)📦 Vendoring R8...$(RESET)"
+	mkdir -p ./vendor && curl -L -o ./vendor/r8.jar https://maven.google.com/com/android/tools/r8/8.9.35/r8-8.9.35.jar
+	@echo "$(CYAN)📦 R8 vendored!$(RESET)"
+
+clean-vendor-r8:
+	@echo "$(CYAN)🧹 Cleaning vendored R8...$(RESET)"
+	rm -rf ./vendor/r8.jar
+
 # === Clean All ===
-clean: clean-rust clean-java-linker clean-stackmapadder clean-library clean-shim-metadata-gen clean-gen-files
+clean: clean-rust clean-java-linker clean-library clean-shim-metadata-gen clean-gen-files clean-vendor-r8
 	@echo "$(GREEN)🧼 All clean!$(RESET)"
