@@ -83,6 +83,7 @@ All examples live in `tests/binary` and are compiled to JVM bytecode & run/teste
 ## 🛠 Prerequisites
 
 - **Rust Nightly** (`rustup default nightly`)  
+- **Gradle 8.5+** (`gradle` in PATH)
 - **JDK 8+** (`java` in PATH, and the `JAVA_HOME` environment variable set)
 - **Python 3** (`python3` in PATH)
 
