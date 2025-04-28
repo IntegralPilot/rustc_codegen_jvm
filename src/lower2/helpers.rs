@@ -260,6 +260,20 @@ pub fn get_cast_instructions(
             return Ok(vec![JI::Invokevirtual(mref)]);
         }
 
+        // String → short[]
+        if src == &Type::String && dest == &Type::Array(Box::new(Type::I16)) {
+            let core_idx = cp.add_class("org/rustlang/core/Core")?;
+            let mref = cp.add_method_ref(core_idx, "toShortArray", "(Ljava/lang/String;)[S")?;
+            return Ok(vec![Instruction::Invokestatic(mref)]);
+        }
+
+        // short[] → String
+        if src == &Type::Array(Box::new(Type::I16)) && dest == &Type::String {
+            let core_idx = cp.add_class("org/rustlang/core/Core")?;
+            let mref = cp.add_method_ref(core_idx, "fromShortArray", "([S)Ljava/lang/String;")?;
+            return Ok(vec![Instruction::Invokestatic(mref)]);
+        }
+
         // Generic checkcast for all other reference-to-reference
         // Check if both are reference types AND have valid internal names/descriptors
         if let (Some(_), Some(dest_name)) = (

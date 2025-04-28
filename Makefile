@@ -135,3 +135,5 @@ clean-vendor-r8:
 # === Clean All ===
 clean: clean-rust clean-java-linker clean-library clean-shim-metadata-gen clean-gen-files clean-vendor-r8
 	@echo "$(GREEN)🧼 All clean!$(RESET)"
+
+rebuild-shim: clean-library library shim-metadata-gen/core.json rust

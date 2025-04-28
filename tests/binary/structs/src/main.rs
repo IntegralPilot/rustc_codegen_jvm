@@ -3,8 +3,8 @@ struct Inner {
     y: (i32, i32),
 }
 
-struct Outer {
-    label: String,
+struct Outer<'a> {
+    label: &'a str,
     inner_struct: Inner,
     data: [i32; 3],
 }
@@ -12,7 +12,7 @@ struct Outer {
 fn main() {
     // === Nested STRUCT + TUPLE + ARRAY ===
     let mut outer = Outer {
-        label: "start".to_string(),
+        label: "start",
         inner_struct: Inner {
             x: 100,
             y: (5, 10),
@@ -28,7 +28,7 @@ fn main() {
     assert!(outer.data[0] == 1, "Array element at index 0 should be 1");
 
     // === Mutate nested values ===
-   outer.label = "updated".to_string();
+    outer.label = "updated";
     outer.inner_struct.x = 200;
     outer.inner_struct.y.1 = 999;
     outer.data[1] = 42;

@@ -32,15 +32,27 @@
     "is_static": true
   },
   "core_starts_with": {
-    "descriptor": "(Ljava/lang/Object;I)Z",
+    "descriptor": "(Ljava/lang/Object;Ljava/lang/Object;)Z",
     "is_static": true
   },
   "deref": {
     "descriptor": "(Ljava/lang/Object;)Ljava/lang/Object;",
     "is_static": true
   },
+  "encode_utf8_raw": {
+    "descriptor": "(J[[S)[[S",
+    "is_static": true
+  },
   "eq": {
     "descriptor": "(Ljava/lang/Object;Ljava/lang/Object;)Z",
+    "is_static": true
+  },
+  "equal": {
+    "descriptor": "(Ljava/lang/Object;Ljava/lang/Object;)Z",
+    "is_static": true
+  },
+  "fromShortArray": {
+    "descriptor": "([S)Ljava/lang/String;",
     "is_static": true
   },
   "option_is_none": {
@@ -52,7 +64,11 @@
     "is_static": true
   },
   "panic_fmt": {
-    "descriptor": "(Ljava/lang/String;)V",
+    "descriptor": "(Ljava/lang/Object;)V",
+    "is_static": true
+  },
+  "toShortArray": {
+    "descriptor": "(Ljava/lang/String;)[S",
     "is_static": true
   },
   "to_string": {

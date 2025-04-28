@@ -8,9 +8,72 @@ import java.util.Objects
  */
 public object Core {
     @JvmStatic
-    public fun panic_fmt(message: String?) {
-        // note to future self: consider using a more specific Rust exception type if needed
-        throw RuntimeException("Rust panic: " + (message ?: "<no message>"))
+    public fun panic_fmt(arg: Any?) {
+        val message: String = when (arg) {
+            // Case 1: It's already a String (maybe from a different panic path)
+            is String -> {
+                arg ?: "<panic with null message>"
+            }
+            // Case 2: It's likely the 'arguments' object
+            null -> {
+                "<panic with null arguments object>"
+            }
+            else -> {
+                // Attempt to interpret it as the 'arguments' structure via reflection
+                try {
+                    val argClass = arg::class.java // Get the Class object
+                    // --- Expected field names based on OOMIR ---
+                    var piecesField: Field? = null
+                    var argsField: Field? = null // Field for actual format arguments
+
+                    try {
+                        piecesField = argClass.getDeclaredField("pieces")
+                        argsField = argClass.getDeclaredField("args")
+                    } catch (e: NoSuchFieldException) {
+                        // happens usually due to our Reflection and Any? hacking which means r8 optimises the fields away
+                        // won't be an issue once the shim is outgrown and we compile core for real and don't need this hack
+                        throw NoSuchFieldException("<panic: object missing expected fields>")
+                    }
+
+                    piecesField?.isAccessible = true // Allow access even if private
+                    argsField?.isAccessible = true
+                    // fmtField.isAccessible = true
+
+                    val piecesObj = piecesField?.get(arg)
+                    val argsObj = argsField?.get(arg)
+                    // val fmtObj = fmtField.get(arg)
+
+                    // --- Process the extracted fields ---
+
+                    // Basic interpretation: Assume panic!("literal")
+                    // piecesObj should be String[]
+                    if (piecesObj is Array<*> && argsObj is Array<*> && argsObj.isEmpty()) {
+                        // Check if pieces contains Strings and concatenate them
+                        val builder = StringBuilder()
+                        var first = true
+                        for (piece in piecesObj) {
+                            if (!first) builder.append(" ") // Simple concatenation, adjust as needed
+                            builder.append(piece as? String ?: "<non-string piece>")
+                            first = false
+                        }
+                        builder.toString()
+                    } else {
+                        // TODO: Implement full formatting logic here!
+                        // This would involve inspecting 'argsObj', potentially 'fmtObj',
+                        // and interleaving formatted args with pieces.
+                        // For now, a fallback message:
+                        val piecesSummary = if (piecesObj is Array<*>) piecesObj.joinToString() else piecesObj?.toString() ?: "null"
+                        "<panic: complex arguments object received - pieces: [${piecesSummary}] - requires full formatting impl>"
+                    }
+
+                } catch (e: Exception) {
+                    "<panic: error processing arguments object: ${e.message}> (Type: ${arg::class.java.name})"
+                }
+            }
+        }
+
+        // Throw the exception with the determined message
+        throw RuntimeException("Rust panic: $message")
     }
 
     @JvmStatic
@@ -176,12 +239,37 @@ public object Core {
         return value
     }
 
-    @JvmStatic 
-    fun core_starts_with(value: Any, prefixChar: Int): Boolean {
-        // Convert int to char/String and call original or implement directly
-        return value.toString().startsWith(Char(prefixChar).toString())
-    }
+@JvmStatic
+fun core_starts_with(value: Any, prefix: Any): Boolean {
+    // Runtime type check needed here!
+    return when {
+        value is String && prefix is String -> { // Both are strings
+            value.startsWith(prefix)
+        }
+        value is String && prefix is Char -> { // String and Char
+            value.startsWith(prefix)
+        }
+        value is ShortArray && prefix is ShortArray -> {
+            // Calculate logical length of prefix (ends at first 0 or array end)
+            val logicalPrefixLength = prefix.indexOfFirst { it == 0.toShort() }.let {
+                if (it == -1) prefix.size else it
+            }
 
+            // Check if the value is long enough to contain the logical prefix
+            if (logicalPrefixLength > value.size) {
+                false
+            } else {
+                // Compare elements up to the logical prefix length
+                val result = (0 until logicalPrefixLength).all { value[it] == prefix[it] }
+                result
+            }
+        }
+        else -> {
+            // Throw an exception for unexpected type combinations
+            throw IllegalArgumentException("Unsupported types for core_starts_with: ${value::class.simpleName}, ${prefix::class.simpleName}")
+        }
+    }
+}
     @JvmStatic
     public fun option_unwrap(optionObj: Any?): Any? {
         if (optionObj == null) {
@@ -244,4 +332,144 @@ public object Core {
         }
     }
 
+        /**
+     * Shim for `<[T] as SlicePartialEq<T>>::equal`.
+     * Handles comparison of primitive arrays based on OOMIR types.
+     * Primarily expects ByteArray (for u8) or ShortArray (due to I16 OOMIR type from String casts).
+     */
+    @JvmStatic
+    public fun equal(slice1: Any?, slice2: Any?): Boolean {
+        // 1. Identity and Null checks
+        if (slice1 === slice2) return true
+        if (slice1 == null || slice2 == null) return false
+
+        // 2. Type checks and content comparison
+        return when (slice1) {
+            is ByteArray -> slice2 is ByteArray && slice1.contentEquals(slice2)
+            // Handle I16 from OOMIR, which likely corresponds to ShortArray
+            is ShortArray -> slice2 is ShortArray && slice1.contentEquals(slice2)
+             // Handle CharArray as well, just in case I16 is interpreted as Char
+             is CharArray -> slice2 is CharArray && slice1.contentEquals(slice2)
+            // Add other primitive array types if needed for different SlicePartialEq impls
+            is IntArray -> slice2 is IntArray && slice1.contentEquals(slice2)
+            is LongArray -> slice2 is LongArray && slice1.contentEquals(slice2)
+            is FloatArray -> slice2 is FloatArray && slice1.contentEquals(slice2)
+            is DoubleArray -> slice2 is DoubleArray && slice1.contentEquals(slice2)
+            is BooleanArray -> slice2 is BooleanArray && slice1.contentEquals(slice2)
+            // Handle generic object arrays - recursive call to general 'eq' might be needed if elements aren't simple
+            is Array<*> -> slice2 is Array<*> && slice1.contentEquals(slice2) // Note: contentEquals for Array<*> does shallow comparison by default! Deep comparison might need the main `eq` recursively. Let's keep it simple for now.
+            else -> false // Not a recognized array type for comparison
+        }
+    }
+
+    /**
+     * Convert a Java String into a ShortArray, by casting each char to a short.
+     */
+    @JvmStatic
+    public fun toShortArray(s: String?): ShortArray? {
+        if (s == null) return null
+        val len = s.length
+        val arr = ShortArray(len)
+        for (i in 0 until len) {
+            arr[i] = s[i].toShort()
+        }
+        return arr
+    }
+
+    /**
+     * Convert a ShortArray back into a Java String, by casting each short to a char.
+     */
+    @JvmStatic
+    public fun fromShortArray(arr: ShortArray): String? {
+        if (arr == null) {
+            throw NullPointerException("Input ShortArray is null")
+        }
+        val chars = CharArray(arr.size)
+        for (i in arr.indices) {
+            chars[i] = arr[i].toChar()
+        }
+        return String(chars)
+    }
+
+    @JvmStatic
+    public fun encode_utf8_raw(code: Long, dstOuter: Array<ShortArray>): Array<ShortArray> {
+        // --- Modification Start ---
+        // Validate the outer array structure expected from the "array hack"
+        if (dstOuter.isEmpty()) {
+            throw IllegalArgumentException("Outer array wrapper for destination cannot be empty.")
+        }
+        // The actual destination ShortArray is inside the first element of the outer array
+        val dst = dstOuter[0]
+        // --- Modification End ---
+
+
+        // 1. Validate input code point (remains the same)
+        if (code < 0L || code > 0x10FFFFL) {
+            throw IllegalArgumentException("Invalid Unicode code point: $code (must be 0..0x10FFFF)")
+        }
+        // Exclude surrogates U+D800 to U+DFFF (remains the same)
+        if (code >= 0xD800L && code <= 0xDFFFL) {
+             throw IllegalArgumentException("Invalid Unicode code point: $code (surrogate range 0xD800..0xDFFF)")
+        }
+
+        // We can safely cast to Int as valid codes fit (remains the same)
+        val c = code.toInt()
+        var index = 0
+
+        // Helper function to write a byte value into a Short element
+        // Ensures the value is treated as an unsigned byte (0-255)
+        // and stored in the lower 8 bits of the Short.
+        // --- Operates on the inner 'dst' array ---
+        fun writeByteToShortArray(byteValue: Int) {
+            // Use the size of the inner array 'dst' for bounds checking
+            if (index >= dst.size) {
+                 // Determine needed size dynamically based on 'when' branch for a clearer message
+                 val needed = when {
+                    c <= 0x7F -> 1
+                    c <= 0x7FF -> 2
+                    c <= 0xFFFF -> 3
+                    else -> 4 // c <= 0x10FFFF
+                 }
+                 // Report size of the inner array 'dst'
+                 throw IndexOutOfBoundsException("Destination array (inner) too small (index $index >= size ${dst.size}, needed $needed)")
+            }
+            // Mask to get the unsigned byte value and convert to Short
+            // Modify the inner array 'dst'
+            dst[index++] = (byteValue and 0xFF).toShort()
+        }
+
+        // UTF-8 encoding logic (remains the same, uses the helper)
+        when {
+            // 1-byte sequence (ASCII)
+            c <= 0x7F -> {
+                writeByteToShortArray(c) // Byte 1
+            }
+            // 2-byte sequence
+            c <= 0x7FF -> {
+                writeByteToShortArray(0xC0 or (c shr 6))   // Byte 1: 110xxxxx
+                writeByteToShortArray(0x80 or (c and 0x3F)) // Byte 2: 10xxxxxx
+            }
+            // 3-byte sequence
+            c <= 0xFFFF -> {
+                writeByteToShortArray(0xE0 or (c shr 12))           // Byte 1: 1110xxxx
+                writeByteToShortArray(0x80 or ((c shr 6) and 0x3F)) // Byte 2: 10xxxxxx
+                writeByteToShortArray(0x80 or (c and 0x3F))         // Byte 3: 10xxxxxx
+            }
+            // 4-byte sequence
+            c <= 0x10FFFF -> {
+                writeByteToShortArray(0xF0 or (c shr 18))           // Byte 1: 11110xxx
+                writeByteToShortArray(0x80 or ((c shr 12) and 0x3F)) // Byte 2: 10xxxxxx
+                writeByteToShortArray(0x80 or ((c shr 6) and 0x3F)) // Byte 3: 10xxxxxx
+                writeByteToShortArray(0x80 or (c and 0x3F))         // Byte 4: 10xxxxxx
+            }
+        }
+
+        // Bounds check after writing (remains the same logic, uses inner 'dst')
+        val bytesWritten = index
+        if (bytesWritten > dst.size) {
+             throw IndexOutOfBoundsException("Internal error: Wrote $bytesWritten bytes into inner array of size ${dst.size}")
+        }
+
+        return arrayOf(dst)
+    }
 }

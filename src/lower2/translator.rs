@@ -152,10 +152,35 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
     /// Gets the slot index for a variable, assigning if new.
     fn get_or_assign_local(&mut self, var_name: &str, ty_hint: &oomir::Type) -> u16 {
         if let Some(existing_index) = self.local_var_map.get(var_name).copied() {
-            println!(
-                "Debug: Reusing local '{}' (index {}) with new type hint {:?}.",
-                var_name, existing_index, ty_hint
-            );
+            // Check if the existing type matches the hint. If not, update it.
+            if let Some(existing_ty) = self.local_var_types.get(var_name) {
+                if existing_ty != ty_hint {
+                    println!(
+                        "Warning: Reusing local '{}' (index {}) with new type {:?} (previous: {:?}). Updating type.",
+                        var_name, existing_index, ty_hint, existing_ty
+                    );
+                    // Update the type in the map
+                    self.local_var_types.insert(var_name.to_string(), ty_hint.clone());
+                    // Re-check if max_locals_used needs update due to size change
+                    let size = get_type_size(ty_hint);
+                    self.max_locals_used = self.max_locals_used.max(existing_index + size);
+
+                } else {
+                     println!(
+                        "Debug: Reusing local '{}' (index {}) with same type hint {:?}.",
+                        var_name, existing_index, ty_hint
+                    );
+                }
+            } else {
+                 // This case is unlikely if index exists, but handle defensively
+                 println!(
+                    "Warning: Local '{}' has index {} but no type in map. Assigning type {:?}.",
+                    var_name, existing_index, ty_hint
+                 );
+                 self.local_var_types.insert(var_name.to_string(), ty_hint.clone());
+                 let size = get_type_size(ty_hint);
+                 self.max_locals_used = self.max_locals_used.max(existing_index + size);
+            }
             existing_index
         } else {
             // Variable is genuinely new. Use assign_local to get a fresh slot.
@@ -166,7 +191,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             self.assign_local(var_name, ty_hint) // assign_local handles map insertion etc.
         }
     }
-
     fn get_local_index(&self, var_name: &str) -> Result<u16, jvm::Error> {
         self.local_var_map
             .get(var_name)
@@ -2235,10 +2259,23 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 index,
                 value,
             } => {
+                let mut is_string = false;
                 // 1. Get the type of the array variable to find the element type
                 let array_type = self.get_local_type(array)?.clone(); // Clone to avoid borrow issues
                 let element_type = match array_type.clone() {
                     oomir::Type::Array(et) | oomir::Type::MutableReference(et) => et,
+                    oomir::Type::String => {
+                        // convert
+                        let instrs = get_cast_instructions(
+                            &oomir::Type::String,
+                            &oomir::Type::Array(Box::new(oomir::Type::I16)),
+                            &mut self.constant_pool,
+                        )
+                        .unwrap();
+                        self.jvm_instructions.extend(instrs);
+                        is_string = true;
+                        Box::new(oomir::Type::I16)
+                    }
                     _ => {
                         return Err(jvm::Error::VerificationError {
                             context: format!("Function {}", self.oomir_func.name),
@@ -2277,6 +2314,17 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                             ),
                         })?;
                 self.jvm_instructions.push(store_instr); // Stack: []
+
+                // 6. if it's a string, we need to convert it back
+                if is_string {
+                    let instrs = get_cast_instructions(
+                        &oomir::Type::Array(Box::new(oomir::Type::I16)),
+                        &oomir::Type::String,
+                        &mut self.constant_pool,
+                    )
+                    .unwrap();
+                    self.jvm_instructions.extend(instrs);
+                }
             }
             OI::ArrayGet { dest, array, index } => {
                 // 1. Load array reference
@@ -2285,10 +2333,20 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 // 2. Determine thw element type by inspecting the array operand's type
                 let array_operand_type = match &array {
                     OO::Variable { ty, .. } => ty,
-                    OO::Constant(c) => match c {
+                    OO::Constant(c) => match c.clone() {
                         // Need the type representation for a constant array, e.g.,
                         oomir::Constant::Array(inner_ty, _) => {
                             &oomir::Type::Array(inner_ty.clone())
+                        }
+                        oomir::Constant::String(_) => {
+                            let instrs = get_cast_instructions(
+                                &oomir::Type::String,
+                                &oomir::Type::Array(Box::new(oomir::Type::I16)),
+                                &mut self.constant_pool,
+                            )
+                            .unwrap();
+                            self.jvm_instructions.extend(instrs);
+                            &oomir::Type::Array(Box::new(oomir::Type::I16))
                         }
                         _ => {
                             return Err(jvm::Error::VerificationError {
@@ -2347,6 +2405,16 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 let array_actual_type = get_operand_type(array);
                 match &array_actual_type {
                     oomir::Type::Array(_) | oomir::Type::MutableReference(_) => { /* Okay */ }
+                    oomir::Type::String => {
+                        // covert
+                        let instrs = get_cast_instructions(
+                            &oomir::Type::String,
+                            &oomir::Type::Array(Box::new(oomir::Type::I16)),
+                            &mut self.constant_pool,
+                        )
+                        .unwrap();
+                        self.jvm_instructions.extend(instrs);
+                    }
                     _ => {
                         return Err(jvm::Error::VerificationError {
                             context: format!("Function {}", self.oomir_func.name),

@@ -11,3 +11,6 @@ panic = "abort"
 
 [profile.release]
 panic = "abort"
+rustflags = [
+  "-C", "link-args=--release"
+]

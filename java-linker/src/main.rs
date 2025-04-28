@@ -34,6 +34,7 @@ fn main() -> Result<(), i32> {
     let mut output_file: Option<String> = None;
     let mut r8_jar_path: Option<PathBuf> = None;
     let mut proguard_config_path: Option<PathBuf> = None;
+    let mut release_mode = false; // Default to false, can be set by a flag
     let java_lib_path: Option<PathBuf> = env::var("JAVA_HOME").ok().map(PathBuf::from);
 
 
@@ -71,6 +72,9 @@ fn main() -> Result<(), i32> {
                 );
                 return Err(1);
             }
+        } else if arg == "--release" {
+            release_mode = true; // Set release mode
+            i += 1;
         } else if !arg.starts_with('-') {
              // Collect potential input files, differentiating classes and JARs
              if arg.ends_with(".class") {
@@ -174,6 +178,7 @@ fn main() -> Result<(), i32> {
         r8_jar_path.as_deref(),
         proguard_config_path.as_deref(),
         java_lib_path.as_deref(),
+        release_mode,
     ).map_err(|e| {
         eprintln!("Error creating JAR file: {}", e);
         1 // Propagate error code
@@ -354,6 +359,7 @@ fn create_jar(
     r8_jar_path: Option<&Path>,
     proguard_config_path: Option<&Path>,
     java_lib_path: Option<&Path>, // Base Java runtime lib path
+    release_mode: bool
 ) -> io::Result<()> {
     // Regex for stripping cargo hashes from .class filenames
     let re_strip_hash = Regex::new(r"^(?P<name>[^-]+)(?:-[0-9a-fA-F]+)?\.class$").unwrap();
@@ -466,6 +472,7 @@ fn create_jar(
             &intermediate_jar_path, // Program input
             &library_jar_paths, // Additional libs
             &optimized_jar_path, // Output
+            release_mode, // Release mode flag
         ) {
             Ok(_) => {
                 println!("R8 optimization successful. Output: {}", optimized_jar_path.display());
@@ -642,6 +649,7 @@ fn run_r8_optimizer(
     program_input_jar_path: &Path,  // The intermediate JAR with app classes
     library_jar_paths: &[PathBuf], // List of other input JARs (dependencies)
     output_jar_path: &Path,         // Where R8 should write the optimized JAR
+    release_mode: bool,             // Release mode flag
 ) -> io::Result<()> {
     println!("--- Running R8 ---");
     println!("  R8 JAR: {}", r8_jar_path.display());
@@ -662,7 +670,6 @@ fn run_r8_optimizer(
        .arg(r8_jar_path)               // Provide path to r8.jar
        .arg(r8_main_class)             // Specify the main class to run
        // --- R8 specific arguments ---
-       .arg("--release")               // Enable release mode (optimizations, shrinking)
        .arg("--output")                // Specify output path
        .arg(output_jar_path)
        .arg("--pg-conf")               // Specify ProGuard/R8 config file
@@ -675,6 +682,10 @@ fn run_r8_optimizer(
     // Add all the *other* input JARs as libraries
     for lib_path in library_jar_paths {
         cmd.arg("--classpath").arg(lib_path);
+    }
+
+    if release_mode {
+        cmd.arg("--release"); // Add release mode flag if specified
     }
 
     // Add the program input JAR (containing app classes) last

@@ -258,11 +258,7 @@ pub fn convert_basic_block<'tcx>(
                             mutable_borrow_arrays.get(&arg_place.local)
                         {
                             // Double-check if the operand passed was indeed the variable we expected
-                            if let oomir::Operand::Variable {
-                                name: passed_var_name,
-                                ..
-                            } = oomir_arg_operand
-                            {
+                            if let oomir::Operand::Variable { .. } = oomir_arg_operand {
                                 println!(
                                     "Info: Emitting write-back for mutable borrow. Arg Place: {:?}, Original Place: {:?}, Array Var: {}",
                                     arg_place, original_place, array_var_name

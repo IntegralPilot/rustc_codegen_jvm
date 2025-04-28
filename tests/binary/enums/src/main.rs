@@ -6,11 +6,11 @@ struct ConfigData {
 }
 
 #[derive(PartialEq, Clone, Debug)]
-enum ComplexEnum {
+enum ComplexEnum<'a> {
     SimpleVariant,                      // No data
     Count(i64),                         // Single primitive data
     Coords((i32, i32, i32)),            // Tuple data
-    UserData { name: String, age: u8 }, // Struct-like variant
+    UserData { name: &'a str, age: u8 }, // Struct-like variant
     RawData([u8; 8]),                   // Array data
     Settings(ConfigData),               // Struct data
 }
@@ -18,14 +18,14 @@ enum ComplexEnum {
 fn main() {
     // Initialize with one variant
     let mut current_state = ComplexEnum::UserData {
-        name: "Alice".to_string(),
+        name: "Alice",
         age: 30,
     };
 
    // Access initial values using match
     match current_state {
         ComplexEnum::UserData { ref name, age } => {
-            assert!(name == "Alice", "Initial name should be Alice");
+            assert!(*name == "Alice", "Initial name should be Alice");
             assert!(age == 30, "Initial age should be 30");
         }
         _ => panic!("Initial state should be UserData!"),

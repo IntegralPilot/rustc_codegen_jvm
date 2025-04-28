@@ -83,7 +83,10 @@ def process_test(test_dir: str, release_mode: bool):
             print(f"|---- ❌ java exited with code {proc.returncode}")
             return False
 
-    expected_file = os.path.join(test_dir, "java-output.expected")
+    expected_file = os.path.join(test_dir, "java-output.release.expected") if release_mode else os.path.join(test_dir, "java-output.expected")
+    if not os.path.exists(expected_file) and release_mode:
+        expected_file = os.path.join(test_dir, "java-output.expected")
+
     if os.path.exists(expected_file):
         expected_output = read_from_file(expected_file)
         if expected_output.strip() == "":

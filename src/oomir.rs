@@ -626,11 +626,10 @@ impl Type {
             Type::F32 => Some(JVMInstruction::Fastore),
             Type::F64 => Some(JVMInstruction::Dastore),
             // Reference types:
-            Type::String
-            | Type::Class(_)
-            | Type::Array(_)
-            | Type::Reference(_)
-            | Type::MutableReference(_) => Some(JVMInstruction::Aastore),
+            Type::String | Type::Class(_) | Type::Array(_) | Type::Reference(_) => {
+                Some(JVMInstruction::Aastore)
+            }
+            Type::MutableReference(box t) => t.get_jvm_array_store_instruction(),
             Type::Void => None,
         }
     }
@@ -720,6 +719,7 @@ impl Type {
             Type::I64 => Some(("java/lang/Long", "valueOf", "(J)Ljava/lang/Long;")),
             Type::F32 => Some(("java/lang/Float", "valueOf", "(F)Ljava/lang/Float;")),
             Type::F64 => Some(("java/lang/Double", "valueOf", "(D)Ljava/lang/Double;")),
+            Type::Char => Some(("java/lang/Character", "valueOf", "(C)Ljava/lang/Character;")),
             _ => None,
         }
     }

@@ -1,9 +1,7 @@
-use rustc_abi::{
-    FieldIdx, FieldsShape, Float, Integer, Primitive, Size, TagEncoding, VariantIdx, Variants,
-};
+use rustc_abi::{FieldIdx, FieldsShape, Size, TagEncoding, VariantIdx, Variants};
 use rustc_middle::mir::interpret::{AllocRange, GlobalAlloc, Provenance, Scalar};
 use rustc_middle::ty::layout::TyAndLayout;
-use rustc_middle::ty::{AdtDef, GenericArgsRef, ScalarInt, Ty, TyCtxt, TyKind, TypingEnv};
+use rustc_middle::ty::{AdtDef, GenericArgsRef, Ty, TyCtxt, TyKind, TypingEnv};
 use std::collections::HashMap;
 
 use super::{
@@ -344,92 +342,25 @@ fn handle_constant_enum<'tcx>(
 
         // --- Case 2: Multiple Variants (Standard Enums) ---
         Variants::Multiple {
-            tag,
+            tag, // This is the Scalar layout for the tag's storage location
             tag_encoding,
-            tag_field,
+            tag_field, // Index within layout.fields where the tag is stored
             variants: variant_layouts,
         } => {
             println!(
-                "Debug: Enum {:?} has multiple variant layout",
-                adt_def.did()
+                "Debug: Enum {:?} has multiple variant layout. Tag Encoding: {:?}",
+                adt_def.did(),
+                tag_encoding
             );
 
-            // --- Step 1: Locate and Read the Tag (Discriminant) ---
+            // --- Step 1: Locate and Read the Tag/Niche Value ---
 
-            // 1a. Get layout of the tag scalar itself to know its size and type
-            let tag_scalar_layout = tag; // The 'tag' field in Variants::Multiple *is* the Scalar layout
-            let tag_ty = match tag_scalar_layout.primitive() {
-                Primitive::Int(number, signed) => {
-                    // Convert to a Rust type
-                    let rust_ty = match number {
-                        Integer::I8 => {
-                            if signed {
-                                TyKind::Int(rustc_middle::ty::IntTy::I8)
-                            } else {
-                                TyKind::Uint(rustc_middle::ty::UintTy::U8)
-                            }
-                        }
-                        Integer::I16 => {
-                            if signed {
-                                TyKind::Int(rustc_middle::ty::IntTy::I16)
-                            } else {
-                                TyKind::Uint(rustc_middle::ty::UintTy::U16)
-                            }
-                        }
-                        Integer::I32 => {
-                            if signed {
-                                TyKind::Int(rustc_middle::ty::IntTy::I32)
-                            } else {
-                                TyKind::Uint(rustc_middle::ty::UintTy::U32)
-                            }
-                        }
-                        Integer::I64 => {
-                            if signed {
-                                TyKind::Int(rustc_middle::ty::IntTy::I64)
-                            } else {
-                                TyKind::Uint(rustc_middle::ty::UintTy::U64)
-                            }
-                        }
-                        Integer::I128 => {
-                            if signed {
-                                TyKind::Int(rustc_middle::ty::IntTy::I128)
-                            } else {
-                                TyKind::Uint(rustc_middle::ty::UintTy::U128)
-                            }
-                        }
-                    };
-                    tcx.mk_ty_from_kind(rust_ty)
-                }
-                Primitive::Float(number) => {
-                    // Convert to a Rust type
-                    let rust_ty = match number {
-                        Float::F16 => TyKind::Float(rustc_middle::ty::FloatTy::F16),
-                        Float::F32 => TyKind::Float(rustc_middle::ty::FloatTy::F32),
-                        Float::F64 => TyKind::Float(rustc_middle::ty::FloatTy::F64),
-                        Float::F128 => TyKind::Float(rustc_middle::ty::FloatTy::F128),
-                    };
-                    tcx.mk_ty_from_kind(rust_ty)
-                }
-                Primitive::Pointer(_) => {
-                    // Pointer types are not valid for enum tags
-                    return Err(format!(
-                        "Invalid tag type for enum {:?}: Pointer type",
-                        enum_ty
-                    ));
-                }
-            };
-            let tag_layout = tcx
-                .layout_of(TypingEnv::fully_monomorphized().as_query_input(tag_ty))
-                .map_err(|e| {
-                    format!(
-                        "Failed to get layout for enum tag type {:?}: {:?}",
-                        tag_ty, e
-                    )
-                })?;
-            let tag_size = tag_layout.size;
+            // 1a. Get layout information for the tag's storage location
+            // The 'tag' field in Variants::Multiple *is* the Scalar layout
+            let tag_scalar_layout = tag;
+            let tag_size = tag_scalar_layout.size(&tcx.data_layout); // Get size from Scalar layout
 
             // 1b. Find the offset of the tag field within the enum's overall layout.
-            // `tag_field` is the index of the field *within the enum's FieldsShape* that holds the tag.
             let tag_offset_in_enum = layout.fields.offset(*tag_field);
             let absolute_tag_offset = offset + tag_offset_in_enum;
             let absolute_tag_range = AllocRange {
@@ -438,84 +369,73 @@ fn handle_constant_enum<'tcx>(
             };
 
             println!(
-                "Debug: Reading tag for {:?} (type {:?}, size {:?}) at offset {:?} (relative offset {:?}, tag_field index {})",
-                enum_ty, tag_ty, tag_size, absolute_tag_offset, tag_offset_in_enum, tag_field
+                "Debug: Reading tag/niche value for {:?} (storage type {:?}, size {:?}) at offset {:?} (relative offset {:?}, tag_field index {})",
+                enum_ty,
+                tag_scalar_layout.primitive(),
+                tag_size,
+                absolute_tag_offset,
+                tag_offset_in_enum,
+                tag_field
             );
 
-            // 1c. Read the tag value from memory
+            // 1c. Read the tag value from memory (could be Int or Ptr)
             let tag_scalar = allocation
                 .read_scalar(&tcx.data_layout, absolute_tag_range, false)
-                .map_err(|e| format!("Failed to read enum tag for {:?}: {:?}", enum_ty, e))?;
-            let tag_val: ScalarInt = match tag_scalar {
-                Scalar::Int(int) => int,
-                Scalar::Ptr(..) => {
-                    return Err(format!(
-                        "Enum tag for {:?} read as pointer, expected integer",
-                        enum_ty
-                    ));
-                }
-            };
+                .map_err(|e| format!("Failed to read enum tag/niche for {:?}: {:?}", enum_ty, e))?;
 
-            // 1d. Sanity check the size read
-            if tag_val.size() != tag_size {
-                return Err(format!(
-                    "Tag size mismatch for {:?}: read {:?} bytes, but type {:?} has size {:?}",
-                    enum_ty,
-                    tag_val.size(),
-                    tag_ty,
-                    tag_size
-                ));
-            }
-
-            // 1e. Get the raw bits of the tag value
-            let read_tag_bits = tag_val.to_bits(tag_size);
-            println!(
-                "Debug: Read tag value: {:?}, bits: {:#x}",
-                tag_val, read_tag_bits
-            );
+            println!("Debug: Read tag scalar: {:?}", tag_scalar);
 
             // --- Step 2: Determine Active Variant Index based on Tag Encoding ---
 
             match tag_encoding {
                 TagEncoding::Direct => {
                     println!("Debug: Using Direct tag encoding");
-                    // The tag value directly corresponds to the discriminant value (possibly after extension).
+                    // Tag value must be an integer for Direct encoding
+                    let tag_val = match tag_scalar {
+                        Scalar::Int(int) => int,
+                        Scalar::Ptr(..) => {
+                            return Err(format!(
+                                "Enum tag for {:?} with Direct encoding read as pointer, expected integer",
+                                enum_ty
+                            ));
+                        }
+                    };
+
+                    // Sanity check the size read
+                    if tag_val.size() != tag_size {
+                        return Err(format!(
+                            "Direct Tag size mismatch for {:?}: read {:?} bytes, but expected size {:?}",
+                            enum_ty,
+                            tag_val.size(),
+                            tag_size
+                        ));
+                    }
+                    let read_tag_bits = tag_val.to_bits(tag_size);
+                    println!(
+                        "Debug: Read Direct tag value: {:?}, bits: {:#x}",
+                        tag_val, read_tag_bits
+                    );
+
+                    // --- Find matching variant (existing logic seems okay) ---
                     let mut found_idx = None;
                     for (v_idx, v_discr) in adt_def.discriminants(tcx) {
-                        // Compare the read bits with the canonical variant discriminant value, masked to tag size.
                         let mask = (1u128 << tag_size.bits()) - 1;
                         let canonical_discr_val_masked = v_discr.val & mask;
-
                         println!(
                             "Debug: Comparing read_tag_bits {:#x} with variant {:?} discriminant {:#x} (masked: {:#x})",
                             read_tag_bits, v_idx, v_discr.val, canonical_discr_val_masked
                         );
-
                         if read_tag_bits == canonical_discr_val_masked {
                             if found_idx.is_some() {
-                                return Err(format!(
-                                    "Error: Tag value {:#x} matches multiple variants ({:?} and {:?}) for enum {:?}",
-                                    read_tag_bits,
-                                    found_idx.unwrap(),
-                                    v_idx,
-                                    adt_def.did()
-                                ));
+                                return Err(format!("Ambiguous match found for enum variant"));
                             }
                             found_idx = Some(v_idx);
-                            // Optimization: break early if representation is unique (usually is)
-                            // Consider if enums can have aliasing discriminants in some cases.
-                            // If so, we might need to continue searching to detect ambiguity.
-                            // For now, assume first match is correct for Direct encoding.
                             break;
                         }
                     }
-                    active_variant_idx = found_idx.ok_or_else(|| {
-                        format!(
-                            "Read tag value {:?} (bits: {:#x}) using Direct encoding does not match any variant discriminant for enum {:?}",
-                            tag_val, read_tag_bits, adt_def.did()
-                        )
-                    })?;
-                }
+                    active_variant_idx =
+                        found_idx.ok_or_else(|| "No matching variant found".to_string())?;
+                } // End Direct Encoding
 
                 TagEncoding::Niche {
                     untagged_variant,
@@ -526,15 +446,40 @@ fn handle_constant_enum<'tcx>(
                         "Debug: Using Niche tag encoding. Untagged: {:?}, Niche variants: {:?}, Niche start: {:#x}",
                         untagged_variant, niche_variants, niche_start
                     );
-                    // The tag value encodes the discriminant using invalid bit patterns ("niches")
-                    // of the `untagged_variant`'s field at index `tag_field`.
 
-                    // We need to check if the `read_tag_bits` correspond to a niche value
-                    // for any variant within `niche_variants`.
+                    // Extract the bits from the read scalar (Int or Ptr)
+                    // For pointers in niche encoding, we compare the address bits.
+                    let read_value_bits = match tag_scalar {
+                        Scalar::Int(int) => {
+                            if int.size() != tag_size {
+                                return Err(format!(
+                                    "Niche integer tag size mismatch for {:?}: read {:?} bytes, but expected size {:?}",
+                                    enum_ty,
+                                    int.size(),
+                                    tag_size
+                                ));
+                            }
+                            int.to_bits(tag_size)
+                        }
+                        Scalar::Ptr(ptr, _meta) => {
+                            // Pointer size must match tag size for niche encoding
+                            if tag_size != tcx.data_layout.pointer_size {
+                                return Err(format!(
+                                    "Niche pointer tag size mismatch for {:?}: pointer size is {:?}, but tag size is {:?}",
+                                    enum_ty, tcx.data_layout.pointer_size, tag_size
+                                ));
+                            }
+                            // Use the address part of the pointer for comparison.
+                            // The address is usually u64, safely convert to u128.
+                            ptr.into_parts().1.bytes() as u128
+                        }
+                    };
+                    println!("Debug: Read Niche value bits: {:#x}", read_value_bits);
+
+                    // --- Compare read_value_bits with expected niche values (existing logic seems okay) ---
                     let mut found_match = false;
                     let mut matched_idx = *untagged_variant; // Default assumption
 
-                    // Precompute discriminants for relevant variants for lookup
                     let discriminants: HashMap<VariantIdx, u128> = adt_def
                         .discriminants(tcx)
                         .map(|(idx, discr)| (idx, discr.val))
@@ -544,33 +489,17 @@ fn handle_constant_enum<'tcx>(
                         let v_idx = VariantIdx::from_usize(v_idx_int);
                         if v_idx == *untagged_variant {
                             continue;
-                        } // Skip untagged variant itself in niche check
+                        }
 
                         let d = match discriminants.get(&v_idx) {
-                            Some(discr_info) => discr_info,
+                            Some(discr) => discr,
                             None => {
-                                return Err(format!(
-                                    "Internal Error: Could not find discriminant for niche variant {:?} in enum {:?}",
-                                    v_idx,
-                                    adt_def.did()
-                                ));
+                                println!("Warning: No discriminant found for variant {:?}", v_idx);
+                                continue; // Skip this variant if no discriminant is found
                             }
                         };
-
-                        // Calculate the expected niche value for discriminant `d.val`
-                        // Formula: (d - niche_variants.start).wrapping_add(niche_start)
-                        // Note: Ensure arithmetic uses u128 for wrapping and range.
-                        let niche_offset = d.wrapping_sub(
-                            *discriminants.get(niche_variants.start()).ok_or_else(|| {
-                                format!(
-                                    "Missing discriminant for niche start {:?}",
-                                    niche_variants.start()
-                                )
-                            })?,
-                        );
+                        let niche_offset = d.wrapping_sub(*niche_start);
                         let expected_niche_val_u128 = niche_offset.wrapping_add(*niche_start);
-
-                        // Mask the expected niche value to the actual tag size for comparison
                         let mask = (1u128 << tag_size.bits()) - 1;
                         let expected_niche_bits = expected_niche_val_u128 & mask;
 
@@ -579,40 +508,37 @@ fn handle_constant_enum<'tcx>(
                             v_idx, d, expected_niche_bits
                         );
 
-                        if read_tag_bits == expected_niche_bits {
+                        if read_value_bits == expected_niche_bits {
+                            // ... (handle match, check ambiguity) ...
                             println!("Debug: Match found for niche variant {:?}", v_idx);
                             if found_match && matched_idx != v_idx {
-                                // This indicates an overlap or error in niche calculation/definition
-                                return Err(format!(
-                                    "Error: Niche tag value {:#x} matches multiple niche variants ({:?} and {:?}) for enum {:?}",
-                                    read_tag_bits,
-                                    matched_idx,
-                                    v_idx,
-                                    adt_def.did()
-                                ));
+                                return Err(format!("Ambiguous match found for enum variant"));
                             }
                             matched_idx = v_idx;
                             found_match = true;
-                            // Don't break early here, as multiple discriminants *could* theoretically map
-                            // to the same niche value if the tag size is small, although unlikely/error.
-                            // Let the check for multiple matches handle ambiguity.
                         }
                     }
 
                     if found_match {
                         active_variant_idx = matched_idx;
                     } else {
-                        // If it didn't match any niche, it must be the untagged variant
+                        // If it didn't match any niche, it must be the untagged variant,
+                        // *and* the read value should be valid for the untagged variant's field.
+                        // (We implicitly assume this if no niche matches).
                         println!(
-                            "Debug: No niche match found, assuming untagged variant {:?}",
-                            untagged_variant
+                            "Debug: No niche match found for bits {:#x}, assuming untagged variant {:?}",
+                            read_value_bits, untagged_variant
                         );
                         active_variant_idx = *untagged_variant;
                     }
-                }
+                } // End Niche Encoding
             } // End match tag_encoding
 
             // --- Step 3: Get Layout for the Active Variant ---
+            println!(
+                "Debug: Determined active variant index: {:?}",
+                active_variant_idx
+            );
             variant_fields_shape = &variant_layouts[active_variant_idx].fields;
         } // End Variants::Multiple
 
@@ -706,6 +632,50 @@ fn handle_constant_enum<'tcx>(
         base_enum_name,
         make_jvm_safe(&variant_def.ident(tcx).to_string()) // Use ident for correct name
     );
+
+    // the enum in general
+    if !oomir_data_types.contains_key(&base_enum_name) {
+        let mut methods = HashMap::new();
+        methods.insert("getVariantIdx".to_string(), (oomir::Type::I32, None));
+        oomir_data_types.insert(
+            base_enum_name.clone(),
+            oomir::DataType {
+                fields: vec![], // No fields in the abstract class
+                is_abstract: true,
+                methods,
+                super_class: None,
+            },
+        );
+    }
+
+    // this variant
+    if !oomir_data_types.contains_key(&variant_class_name) {
+        let mut fields = vec![];
+        for (i, field) in variant_def.fields.iter().enumerate() {
+            let field_name = format!("field{}", i);
+            let field_type = ty_to_oomir_type(field.ty(tcx, substs), tcx, oomir_data_types);
+            fields.push((field_name, field_type));
+        }
+
+        let mut methods = HashMap::new();
+        methods.insert(
+            "getVariantIdx".to_string(),
+            (
+                oomir::Type::I32,
+                Some(oomir::Constant::I32(active_variant_idx.as_u32() as i32)),
+            ),
+        );
+
+        oomir_data_types.insert(
+            variant_class_name.clone(),
+            oomir::DataType {
+                fields,
+                is_abstract: false,
+                methods,
+                super_class: Some(base_enum_name.clone()),
+            },
+        );
+    }
 
     Ok(oomir::Constant::Instance {
         class_name: variant_class_name,

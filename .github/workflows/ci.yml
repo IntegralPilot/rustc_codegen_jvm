@@ -52,5 +52,9 @@ jobs:
       run: make ci # Use your optimized CI build command
 
     # 10. Run tests
-    - name: Run integration tests
+    - name: Run integration tests (debug mode)
       run: python3 Tester.py
+
+    # 11. Run tests in release mode
+    - name: Run integration tests (release mode)
+      run: python3 Tester.py --release

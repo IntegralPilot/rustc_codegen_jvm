@@ -50,7 +50,7 @@ All examples live in `tests/binary` and are compiled to JVM bytecode & run/teste
 - Structs, tuples, enums (both C‑like and Rust‑style)  
 - Executable `.jar` generation for binary crates  
 - Mutable borrowing, references, and dereferencing
-- **Integration tests** for all features
+- **Integration tests** for all features, in debug and release modes
 
 🚧 **Next Milestone:** Full support for the Rust `core` crate.
 
@@ -117,12 +117,16 @@ make gen-files
 ## 🚀 Usage
 
 1. **Configure your project**  
-   In *your* Rust project directory, create or update `.cargo/config.toml` with the generated template (will be at the root of this repo after running make).
+   In *your* Rust project directory, create or update `.cargo/config.toml` by copying the generated template (will be at the root of this repo after running make). Also, your `Cargo.toml` needs to contain the following (used to pass flags differentiating between debug and release builds to the linker):
+
+   ```toml
+   cargo-features = ["profile-rustflags"]
+   ```
 
 2. **Build with Cargo**  
    ```bash
    cargo build           # debug
-   cargo build --release # optimized - functionality available slightly impaired 
+   cargo build --release # optimized
    ```
 
 3. **Run the `.jar`**  

@@ -1,3 +1,5 @@
+cargo-features = ["profile-rustflags"]
+
 [package]
 name = "ops"
 version = "0.1.0"

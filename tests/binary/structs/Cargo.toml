@@ -1,3 +1,5 @@
+cargo-features = ["profile-rustflags"]
+
 [package]
 name = "structs"
 version = "0.1.0"
