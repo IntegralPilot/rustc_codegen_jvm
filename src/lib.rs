@@ -77,10 +77,6 @@ impl CodegenBackend for MyBackend {
             } = item.kind
             {
                 let def_id = item_id.owner_id.to_def_id();
-                if tcx.generics_of(def_id).count() != 0 {
-                    println!("Skipping generic function: {i}");
-                    continue; // Skip generic functions for now
-                }
                 let instance = rustc_middle::ty::Instance::mono(tcx, def_id);
                 let mut mir = tcx.optimized_mir(instance.def_id()).clone(); // Clone the MIR
 
@@ -122,10 +118,6 @@ impl CodegenBackend for MyBackend {
                     let i = item.ident;
                     let def_id = item.id.owner_id.to_def_id();
 
-                    if tcx.generics_of(def_id).count() != 0 {
-                        println!("Skipping generic impl: {i}");
-                        continue; // Skip generic functions for now
-                    }
                     let instance = rustc_middle::ty::Instance::mono(tcx, def_id);
                     let mut mir = tcx.optimized_mir(instance.def_id()).clone(); // Clone the MIR
 

@@ -905,6 +905,16 @@ pub fn convert_rvalue_to_operand<'a>(
                 ty: method_return_type, // Should be I32
             };
         }
+        Rvalue::CopyForDeref(place) => {
+            // Need to get the value from the source place first
+            let (temp_var_name, get_instructions, temp_var_type) =
+            emit_instructions_to_get_on_own(place, tcx, mir, data_types);
+            instructions.extend(get_instructions);
+            result_operand = oomir::Operand::Variable {
+                name: temp_var_name,
+                ty: temp_var_type,
+            };        
+        }
         // Handle other Rvalue variants by generating a placeholder
         _ => {
             println!(

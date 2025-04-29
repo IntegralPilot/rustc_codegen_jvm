@@ -172,6 +172,10 @@ pub fn ty_to_oomir_type<'tcx>(
             println!("Info: Mapping Never type to OOMIR Void");
             oomir::Type::Void
         }
+        rustc_middle::ty::TyKind::Dynamic(_, _, _) => {
+            // Make it a java/lang/Object which any type that implements it will be as all classes are
+            oomir::Type::Class("java/lang/Object".to_string())
+        }
         _ => {
             println!("Warning: Unhandled type {:?}", ty);
             oomir::Type::Class("UnsupportedType".to_string())

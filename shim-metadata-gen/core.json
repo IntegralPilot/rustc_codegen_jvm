@@ -1,5 +1,5 @@
 {
-  "arguments_new_const": {
+  "arguments_new_const_1": {
     "descriptor": "([Ljava/lang/String;)Ljava/lang/String;",
     "is_static": true
   },
@@ -27,11 +27,15 @@
     "descriptor": "(I)Ljava/lang/String;",
     "is_static": true
   },
-  "core_panic": {
+  "core_panicking_panic": {
     "descriptor": "(Ljava/lang/String;)V",
     "is_static": true
   },
-  "core_starts_with": {
+  "core_slice_u8_starts_with": {
+    "descriptor": "(Ljava/lang/Object;Ljava/lang/Object;)Z",
+    "is_static": true
+  },
+  "core_str_str_starts_with_char": {
     "descriptor": "(Ljava/lang/Object;Ljava/lang/Object;)Z",
     "is_static": true
   },
@@ -51,8 +55,40 @@
     "descriptor": "(Ljava/lang/Object;Ljava/lang/Object;)Z",
     "is_static": true
   },
+  "f128_eq": {
+    "descriptor": "(Ljava/lang/Object;Ljava/lang/Object;)Z",
+    "is_static": true
+  },
+  "f16_eq": {
+    "descriptor": "(Ljava/lang/Object;Ljava/lang/Object;)Z",
+    "is_static": true
+  },
+  "f32_eq": {
+    "descriptor": "(Ljava/lang/Object;Ljava/lang/Object;)Z",
+    "is_static": true
+  },
+  "f32_f32_eq": {
+    "descriptor": "(Ljava/lang/Object;Ljava/lang/Object;)Z",
+    "is_static": true
+  },
+  "f64_eq": {
+    "descriptor": "(Ljava/lang/Object;Ljava/lang/Object;)Z",
+    "is_static": true
+  },
   "fromShortArray": {
     "descriptor": "([S)Ljava/lang/String;",
+    "is_static": true
+  },
+  "i32_i32_i32_eq": {
+    "descriptor": "(Ljava/lang/Object;Ljava/lang/Object;)Z",
+    "is_static": true
+  },
+  "i32_u8_bool_eq": {
+    "descriptor": "(Ljava/lang/Object;Ljava/lang/Object;)Z",
+    "is_static": true
+  },
+  "i64_eq": {
+    "descriptor": "(Ljava/lang/Object;Ljava/lang/Object;)Z",
     "is_static": true
   },
   "option_is_none": {
@@ -63,8 +99,24 @@
     "descriptor": "(Ljava/lang/Object;)Ljava/lang/Object;",
     "is_static": true
   },
+  "option_usize_eq": {
+    "descriptor": "(Ljava/lang/Object;Ljava/lang/Object;)Z",
+    "is_static": true
+  },
+  "option_usize_is_none": {
+    "descriptor": "(Ljava/lang/Object;)Z",
+    "is_static": true
+  },
   "panic_fmt": {
     "descriptor": "(Ljava/lang/Object;)V",
+    "is_static": true
+  },
+  "raw_eq_u8_8": {
+    "descriptor": "(Ljava/lang/Object;Ljava/lang/Object;)Z",
+    "is_static": true
+  },
+  "str_eq": {
+    "descriptor": "(Ljava/lang/String;Ljava/lang/String;)Z",
     "is_static": true
   },
   "toShortArray": {
@@ -73,6 +125,18 @@
   },
   "to_string": {
     "descriptor": "(Ljava/lang/Object;)Ljava/lang/String;",
+    "is_static": true
+  },
+  "u8_8_eq": {
+    "descriptor": "(Ljava/lang/Object;Ljava/lang/Object;)Z",
+    "is_static": true
+  },
+  "u8_eq": {
+    "descriptor": "(Ljava/lang/Object;Ljava/lang/Object;)Z",
+    "is_static": true
+  },
+  "u8_equal": {
+    "descriptor": "(Ljava/lang/Object;Ljava/lang/Object;)Z",
     "is_static": true
   }
 }

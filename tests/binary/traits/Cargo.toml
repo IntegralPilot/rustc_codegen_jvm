@@ -1,0 +1,8 @@
+cargo-features = ["profile-rustflags"]
+
+[package]
+name = "traits"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]

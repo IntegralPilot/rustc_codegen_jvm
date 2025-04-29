@@ -77,7 +77,7 @@ public object Core {
     }
 
     @JvmStatic
-    public fun arguments_new_const(pieces: Array<String>): String {
+    public fun arguments_new_const_1(pieces: Array<String>): String {
         // Concatenate all the string pieces together.
         // This mimics the simplest formatting scenario where pieces are just joined.
         // If the array is empty, it correctly returns an empty string.
@@ -219,10 +219,82 @@ public object Core {
         return false
     }
 
+
+    // variants of eq that just call the main one. need A LOT of these since we are now properly resolving generics
+    // will no longer be needed once we compile the real `core` library which will generate all of these - support is almost there
+    // placeholders just for now
+
     @JvmStatic
-    public fun core_panic(message: String?) {
-        // This is a placeholder for the panic function.
-        // In a real implementation, this would handle the panic appropriately.
+    public fun str_eq(value1: String?, value2: String?): Boolean {
+        return eq(value1, value2)
+    }
+
+    @JvmStatic
+    public fun f16_eq(value1: Any?, value2: Any?): Boolean {
+        return eq(value1, value2)
+    }
+
+    @JvmStatic
+    public fun f32_eq(value1: Any?, value2: Any?): Boolean {
+        return eq(value1, value2)
+    }
+
+    @JvmStatic
+    // (f32, f32) tuple
+    public fun f32_f32_eq(value1: Any?, value2: Any?): Boolean {
+        return eq(value1, value2)
+    }
+
+    @JvmStatic
+    public fun f64_eq(value1: Any?, value2: Any?): Boolean {
+        return eq(value1, value2)
+    }
+
+    @JvmStatic
+    public fun f128_eq(value1: Any?, value2: Any?): Boolean {
+        return eq(value1, value2)
+    }
+
+    @JvmStatic
+    public fun i64_eq(value1: Any?, value2: Any?): Boolean {
+        return eq(value1, value2)
+    }
+
+    @JvmStatic
+    // tuple (i32, i32, i32)
+    public fun i32_i32_i32_eq(value1: Any?, value2: Any?): Boolean {
+        return eq(value1, value2)
+    }
+    
+    @JvmStatic
+    // tuple (i32, u8, bool)
+    public fun i32_u8_bool_eq(value1: Any?, value2: Any?): Boolean {
+        return eq(value1, value2)
+    }
+
+    @JvmStatic
+    // [u8; 8]
+    public fun u8_8_eq(value1: Any?, value2: Any?): Boolean {
+        return eq(value1, value2)
+    }
+
+    @JvmStatic
+    public fun raw_eq_u8_8(slice1: Any?, slice2: Any?): Boolean {
+        return eq(slice1, slice2)
+    }
+
+    @JvmStatic
+    public fun u8_eq(value1: Any?, value2: Any?): Boolean {
+        return eq(value1, value2)
+    }
+    
+    @JvmStatic
+    public fun option_usize_eq(value1: Any?, value2: Any?): Boolean {
+        return eq(value1, value2)
+    }
+
+    @JvmStatic
+    public fun core_panicking_panic(message: String?) {
         throw RuntimeException("Rust panic: " + (message ?: "<no message>"))
     }
 
@@ -240,7 +312,7 @@ public object Core {
     }
 
 @JvmStatic
-fun core_starts_with(value: Any, prefix: Any): Boolean {
+fun core_str_str_starts_with_char(value: Any, prefix: Any): Boolean {
     // Runtime type check needed here!
     return when {
         value is String && prefix is String -> { // Both are strings
@@ -269,6 +341,12 @@ fun core_starts_with(value: Any, prefix: Any): Boolean {
             throw IllegalArgumentException("Unsupported types for core_starts_with: ${value::class.simpleName}, ${prefix::class.simpleName}")
         }
     }
+}
+
+// wrapper that just calls the above
+@JvmStatic
+public fun core_slice_u8_starts_with(value: Any, prefix: Any): Boolean {
+    return core_str_str_starts_with_char(value, prefix)
 }
     @JvmStatic
     public fun option_unwrap(optionObj: Any?): Any? {
@@ -332,7 +410,13 @@ fun core_starts_with(value: Any, prefix: Any): Boolean {
         }
     }
 
-        /**
+    // redirectors for monomorphised versions of the above, to just call the above
+    @JvmStatic
+    public fun option_usize_is_none(optionObj: Any?): Boolean {
+        return option_is_none(optionObj)
+    }
+
+    /**
      * Shim for `<[T] as SlicePartialEq<T>>::equal`.
      * Handles comparison of primitive arrays based on OOMIR types.
      * Primarily expects ByteArray (for u8) or ShortArray (due to I16 OOMIR type from String casts).
@@ -361,6 +445,14 @@ fun core_starts_with(value: Any, prefix: Any): Boolean {
             else -> false // Not a recognized array type for comparison
         }
     }
+
+    // monomorphised versions of the above
+    @JvmStatic
+    // a slice of u8
+    public fun u8_equal(slice1: Any?, slice2: Any?): Boolean {
+        return equal(slice1, slice2)
+    }
+ 
 
     /**
      * Convert a Java String into a ShortArray, by casting each char to a short.

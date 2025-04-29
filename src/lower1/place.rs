@@ -15,50 +15,83 @@ pub fn place_to_string<'tcx>(place: &Place<'tcx>, _tcx: TyCtxt<'tcx>) -> String 
     format!("_{}", place.local.index()) // Start with base local "_N"
 }
 
-/// 1) Remove nested generics completely.
-fn strip_generics(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut depth = 0;
-    for c in s.chars() {
-        match c {
-            '<' => depth += 1,
-            '>' if depth > 0 => depth -= 1,
-            c if depth == 0 => out.push(c),
-            _ => {} // inside <…>, skip
-        }
-    }
-    out
-}
-
 pub fn make_jvm_safe(input: &str) -> String {
-    // 1) Strip out all <…> (including nested)
-    let mut s = strip_generics(input);
+    // --- Static Regex Definitions ---
+    static RE_TRAIT_IMPL: OnceLock<Regex> = OnceLock::new();
+    static RE_NONWORD: OnceLock<Regex> = OnceLock::new();
 
-    // 2) Remove any trailing "::"
-    while s.ends_with("::") {
-        s.truncate(s.len() - 2);
-    }
+    // Regex to specifically capture the implementing type and the method name
+    // from the pattern: <Type as Trait>::Method
+    // - Group 1: The implementing type (e.g., "U32Holder")
+    // - Group 2: The method name (e.g., "getInnerNumber")
+    // It intentionally ignores the trait name part ("as GetInnerNumber").
+    // Added robustness for potential whitespace variations.
+    let re_trait = RE_TRAIT_IMPL.get_or_init(|| {
+        Regex::new(r"^\s*<(.+?)\s+as\s+.*?\s*>\s*::\s*([^:]+)\s*$").unwrap()
+    });
 
-    // 3) Split on "::", drop empty segments, then:
-    //    - if we have at least two parts, join first+last with "_"
-    //    - else if one part, just use that
-    //    - else (shouldn't happen), fall back to the full string
-    let parts: Vec<_> = s.split("::").filter(|p| !p.is_empty()).collect();
-    let combined = if parts.len() >= 2 {
-        format!("{}_{}", parts[0], parts[parts.len() - 1])
-    } else if parts.len() == 1 {
-        parts[0].to_string()
+    // Regex for sequences of characters that are NOT alphanumeric or underscore.
+    // Using \p{Alnum} includes Unicode letters and numbers.
+    let re_nw = RE_NONWORD.get_or_init(|| Regex::new(r"[^a-zA-Z0-9_]+").unwrap());
+
+    // --- Determine Base String ---
+    let base_string = if let Some(caps) = re_trait.captures(input) {
+        // Case 1: Input matches the <Type as Trait>::Method pattern.
+        // Combine the captured Type (group 1) and Method (group 2).
+        // This aims to replicate the naming seen for the definition (e.g., "u32holder_getinnernumber").
+        format!("{}_{}", &caps[1], &caps[2])
     } else {
-        s.clone()
+        // Case 2: Input does not match the specific trait pattern.
+        // Use the original input string. Subsequent cleaning will handle '::', '<>', etc.
+        // This covers cases like "main", "U32Holder", "std::io::Error".
+        input.to_string()
     };
 
-    // 4) Collapse any run of non‑alphanumeric/underscore into a single "_"
-    static RE_NONWORD: OnceLock<Regex> = OnceLock::new();
-    let re_nw = RE_NONWORD.get_or_init(|| Regex::new(r"[^\w]+").unwrap());
-    let cleaned = re_nw.replace_all(&combined, "_");
+    // --- Clean the Base String ---
+    // Replace any run of non-word characters (excluding _) with a single underscore.
+    let cleaned = re_nw.replace_all(&base_string, "_");
 
-    // 5) Trim leading/trailing "_" and lowercase
-    cleaned.trim_matches('_').to_lowercase()
+    // Trim leading and trailing underscores that might result from cleaning.
+    let trimmed = cleaned.trim_matches('_');
+
+    // Convert the result to lowercase.
+    let result = trimmed.to_lowercase();
+
+    // If there's more than 1 _ in a row replace it with a single _
+    let re_dup_underscores = Regex::new(r"_{2,}").unwrap();
+    let result = re_dup_underscores.replace_all(&result, "_").to_string();
+
+    // remove any "impl_" as the word "impl" isn't actually related to the function and it's specific monomorphisation
+    let result = result.replace("impl_", "");
+
+    // --- Handle Potential Empty Result ---
+    // If cleaning and trimming resulted in an empty string:
+    let final_result = if result.is_empty() {
+        // If the original input was *also* empty, return a default or empty.
+        if input.is_empty() {
+            "jvm_empty_input".to_string() // Or just ""
+        } else {
+            // Original input wasn't empty, but cleaning made it so (e.g., input="::" or "<>").
+            // Create a fallback. Hashing the original input is robust.
+            // Using a simple placeholder for now, or re-clean original without trimming maybe.
+            // Let's try cleaning the original input again and using it, potentially keeping underscores.
+            let fallback_cleaned = re_nw.replace_all(input, "_").to_lowercase();
+            // Check if the fallback is just underscores or empty
+            if fallback_cleaned.chars().all(|c| c == '_') {
+                 format!("jvm_fallback_{:x}", md5::compute(input)) // Needs md5 crate
+                 // Or a simpler fixed fallback: "jvm_unnamed_fallback".to_string()
+            } else {
+                // Use the fallback cleaning, maybe trim again just in case
+                 fallback_cleaned.trim_matches('_').to_string()
+            }
+        }
+    } else {
+        result
+    };
+
+    println!("make_jvm_safe: Turned '{}' into '{}'", input, final_result);
+
+    final_result
 }
 
 /// Generates the necessary OOMIR instructions to retrieve the value corresponding

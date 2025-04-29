@@ -2067,7 +2067,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
 
                             // Check for diverging (can use shim_info if available)
                             if function_name == "panic_fmt"
-                                || function_name == "core_panic"
+                                || function_name == "core_panicking_panic"
                                 || function_name == "core_assert_failed"
                             // Or check shim_info.diverges
                             {
