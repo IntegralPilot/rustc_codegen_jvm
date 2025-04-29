@@ -1,11 +1,11 @@
-#[derive(PartialEq, Clone, Debug)]
+#[derive(PartialEq)]
 struct ConfigData {
     id: u32,
     enabled: bool,
     params: (f32, f32), // Nested tuple
 }
 
-#[derive(PartialEq, Clone, Debug)]
+#[derive(PartialEq)]
 enum ComplexEnum<'a> {
     SimpleVariant,                      // No data
     Count(i64),                         // Single primitive data

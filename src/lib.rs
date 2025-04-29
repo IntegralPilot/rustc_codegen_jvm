@@ -31,6 +31,7 @@ use rustc_data_structures::fx::FxIndexMap;
 use rustc_metadata::EncodedMetadata;
 use rustc_middle::dep_graph::{WorkProduct, WorkProductId};
 use rustc_middle::ty::TyCtxt;
+use rustc_hir::{TyKind as HirTyKind, QPath};
 use rustc_session::{Session, config::OutputFilenames};
 use std::{any::Any, io::Write, path::Path};
 
@@ -96,6 +97,55 @@ impl CodegenBackend for MyBackend {
                     .insert(oomir_function.name.clone(), oomir_function);
 
                 oomir_module.merge_data_types(&oomir_result.1);
+            } else if let rustc_hir::ItemKind::Impl(impl_a) = item.kind {
+                let ident = match impl_a.self_ty.kind {
+                    HirTyKind::Path(qpath) => {
+                        match qpath {
+                            QPath::Resolved(_, p) => {
+                                format!("{}", p.segments[0].ident)
+                            }
+                            QPath::TypeRelative(_, ps) => {
+                                format!("{}", ps.ident)
+                            }
+                            _ => {
+                                println!("Warning: {:?} is an unknown qpath", qpath);
+                                "unknown_qpath_kind".into()
+                            }
+                        }
+                    }
+                    _ => {
+                        println!("Warning: {:?} has unknown kind", impl_a.self_ty);
+                        "unknown_type_kind".into()
+                    }
+                };
+                for item in impl_a.items {
+                    let i = item.ident;
+                    let def_id = item.id.owner_id.to_def_id();
+
+                    if tcx.generics_of(def_id).count() != 0 {
+                        println!("Skipping generic impl: {i}");
+                        continue; // Skip generic functions for now
+                    }
+                    let instance = rustc_middle::ty::Instance::mono(tcx, def_id);
+                    let mut mir = tcx.optimized_mir(instance.def_id()).clone(); // Clone the MIR
+
+                    let i = format!("{}_{}", ident, i).to_lowercase();
+    
+                    println!("MIR for function {i}: {:?}", mir);
+    
+                    println!("--- Starting MIR to OOMIR Lowering for function: {i} ---");
+                    let oomir_result = lower1::mir_to_oomir(tcx, instance, &mut mir);
+                    println!("--- Finished MIR to OOMIR Lowering for function: {i} ---");
+    
+                    let mut oomir_function = oomir_result.0;
+                    oomir_function.name = i.clone();
+    
+                    oomir_module
+                        .functions
+                        .insert(i, oomir_function);
+    
+                    oomir_module.merge_data_types(&oomir_result.1);
+                }
             }
         }
 

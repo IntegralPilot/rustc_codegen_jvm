@@ -440,6 +440,9 @@ pub fn convert_basic_block<'tcx>(
                     rustc_middle::mir::AssertKind::NullPointerDereference => {
                         "NullPointerDereference".to_string()
                     }
+                    rustc_middle::mir::AssertKind::ResumedAfterDrop(_) => {
+                        "ResumedAfterDrop".to_string()
+                    }
                 };
 
                 let fail_instructions = vec![oomir::Instruction::ThrowNewWithMessage {
@@ -465,6 +468,8 @@ pub fn convert_basic_block<'tcx>(
                 target,
                 unwind: _,
                 replace: _,
+                drop: _,
+                async_fut: _
             } => {
                 // In simple cases (no custom Drop trait), a MIR drop often just signifies
                 // the end of a scope before control flow continues.

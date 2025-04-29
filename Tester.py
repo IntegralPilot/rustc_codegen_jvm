@@ -45,6 +45,8 @@ def process_test(test_dir: str, release_mode: bool):
         output = f"STDOUT:\n{proc.stdout}\n\nSTDERR:\n{proc.stderr}"
         write_to_file(fail_path, output)
         print(f"|---- ❌ cargo build exited with code {proc.returncode}")
+        print(f"|---- STDERR:")
+        print(proc.stderr)
         return False
 
     print("|--- 🤖 Running with Java...")
