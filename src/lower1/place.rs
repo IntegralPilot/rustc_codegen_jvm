@@ -2,7 +2,7 @@ use super::{
     operand::convert_operand,
     types::{get_field_name_from_index, ty_to_oomir_type},
 };
-use crate::oomir::{self, Instruction, Operand};
+use crate::oomir::{self, DataTypeMethod, Instruction, Operand};
 use regex::Regex;
 use rustc_middle::{
     mir::{Body, Operand as MirOperand, Place, ProjectionElem},
@@ -26,9 +26,8 @@ pub fn make_jvm_safe(input: &str) -> String {
     // - Group 2: The method name (e.g., "getInnerNumber")
     // It intentionally ignores the trait name part ("as GetInnerNumber").
     // Added robustness for potential whitespace variations.
-    let re_trait = RE_TRAIT_IMPL.get_or_init(|| {
-        Regex::new(r"^\s*<(.+?)\s+as\s+.*?\s*>\s*::\s*([^:]+)\s*$").unwrap()
-    });
+    let re_trait = RE_TRAIT_IMPL
+        .get_or_init(|| Regex::new(r"^\s*<(.+?)\s+as\s+.*?\s*>\s*::\s*([^:]+)\s*$").unwrap());
 
     // Regex for sequences of characters that are NOT alphanumeric or underscore.
     // Using \p{Alnum} includes Unicode letters and numbers.
@@ -78,18 +77,16 @@ pub fn make_jvm_safe(input: &str) -> String {
             let fallback_cleaned = re_nw.replace_all(input, "_").to_lowercase();
             // Check if the fallback is just underscores or empty
             if fallback_cleaned.chars().all(|c| c == '_') {
-                 format!("jvm_fallback_{:x}", md5::compute(input)) // Needs md5 crate
-                 // Or a simpler fixed fallback: "jvm_unnamed_fallback".to_string()
+                format!("jvm_fallback_{:x}", md5::compute(input)) // Needs md5 crate
+            // Or a simpler fixed fallback: "jvm_unnamed_fallback".to_string()
             } else {
                 // Use the fallback cleaning, maybe trim again just in case
-                 fallback_cleaned.trim_matches('_').to_string()
+                fallback_cleaned.trim_matches('_').to_string()
             }
         }
     } else {
         result
     };
-
-    println!("make_jvm_safe: Turned '{}' into '{}'", input, final_result);
 
     final_result
 }
@@ -409,7 +406,7 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
                     let mut methods = HashMap::new();
                     methods.insert(
                         "getVariantIdx".to_string(),
-                        (
+                        DataTypeMethod::SimpleConstantReturn(
                             oomir::Type::I32,
                             Some(oomir::Constant::I32(variant_idx.as_u32() as i32)),
                         ),
@@ -417,11 +414,12 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
 
                     data_types.insert(
                         variant_class_name.clone(),
-                        oomir::DataType {
+                        oomir::DataType::Class {
                             fields,
                             is_abstract: false,
                             methods,
                             super_class: Some(base_enum_oomir_name.clone()),
+                            interfaces: vec![],
                         },
                     );
                 }

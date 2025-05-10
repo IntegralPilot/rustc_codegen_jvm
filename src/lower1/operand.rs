@@ -1,5 +1,5 @@
 use super::place::{get_place_type, place_to_string};
-use crate::oomir;
+use crate::{lower1::types::ty_to_oomir_type, oomir};
 
 use super::place::emit_instructions_to_get_on_own;
 use rustc_abi::Size;
@@ -129,8 +129,89 @@ pub fn handle_const_value<'tcx>(
         ConstValue::Scalar(scalar) => {
             match scalar {
                 Scalar::Int(scalar_int) => {
-                    let oomir_const = scalar_int_to_oomir_constant(scalar_int, ty);
-                    oomir::Operand::Constant(oomir_const)
+                    let current_ty: Ty<'_> = ty.clone();
+                    let final_scalar_int = scalar_int;
+
+                    // Check for and unwrap transparent ADTs that wrap a single scalar
+                    if let TyKind::Adt(adt_def, substs) = current_ty.kind() {
+                        // ensure that the ADT gets added to the data_types map (ty_to_oomir_type does this implicitly)
+                        println!("138138138");
+                        let adt_name = match ty_to_oomir_type(*ty, tcx, data_types) {
+                            oomir::Type::Class(class_name) => {
+                                class_name
+                            }
+                            _ => {
+                                panic!("Expected a class type for ADT, but got: {:?}", ty);
+                            }
+                        };
+                        println!(
+                            "Info: Found single scalar ADT {} for constant {:?}",
+                            adt_name, scalar_int
+                        );
+                        // A transparent struct should have one variant
+                        let variant = adt_def
+                            .variants()
+                            .iter()
+                            .next()
+                            .expect("Transparent ADT should have one variant");
+
+                        // Find the single non-ZST field
+                        let non_zst_fields: Vec<_> = variant
+                            .fields
+                            .iter()
+                            .filter(|field_def| {
+                                !tcx.layout_of(PseudoCanonicalInput {
+                                    typing_env: TypingEnv::post_analysis(tcx, field_def.did),
+                                    value: field_def.ty(tcx, substs),
+                                })
+                                .map(|layout| layout.is_zst())
+                                .unwrap_or(false)
+                            })
+                            .collect();
+
+                        if non_zst_fields.len() == 1 {
+                            let field_def = non_zst_fields[0];
+                            let field_name = field_def.ident(tcx).name;
+                            let field_ty = field_def.ty(tcx, substs);
+
+                            // Check if this field itself is a scalar that ScalarInt can represent
+                            // This check might be implicit if field_ty is directly usable by scalar_int_to_oomir_constant
+                            if field_ty.is_scalar() || field_ty.is_bool() || field_ty.is_char() {
+                                // Add more conditions if necessary
+                                println!(
+                                    "Info: Unwrapping transparent ADT {:?} to its scalar field type {:?} for ScalarInt constant",
+                                    current_ty, field_ty
+                                );
+                                let const_inner =
+                                    scalar_int_to_oomir_constant(scalar_int, &field_ty);
+                                let mut hm = HashMap::new();
+                                hm.insert(field_name.to_string(), const_inner);
+                                oomir::Operand::Constant(oomir::Constant::Instance {
+                                    class_name: adt_name,
+                                    fields: hm,
+                                    params: vec![],
+                                })
+                            } else {
+                                // Transparent ADT wraps a non-scalar or complex type.
+                                panic!(
+                                    "Transparent ADT {:?} wraps a non-primitive field {:?}. ScalarInt representation is unusual.",
+                                    ty, field_ty
+                                );
+                            }
+                        } else {
+                            // Transparent ADT with zero or multiple non-ZST fields.
+                            // This is ill-formed for #[repr(transparent)] or unexpected for ScalarInt.
+                            panic!(
+                                "Transparent ADT {:?} does not have exactly one non-ZST field, but was represented as ScalarInt. Fields: {}",
+                                ty,
+                                non_zst_fields.len()
+                            );
+                        }
+                    } else {
+                        let oomir_const =
+                            scalar_int_to_oomir_constant(final_scalar_int, &current_ty);
+                        return oomir::Operand::Constant(oomir_const);
+                    }
                 }
                 Scalar::Ptr(pointer, _) => {
                     let alloc_id = pointer.provenance.alloc_id();
@@ -998,6 +1079,33 @@ pub fn handle_const_value<'tcx>(
                                                     inner_ty, alloc_id, e
                                                 );
                                                 oomir::Operand::Constant(oomir::Constant::I64(-52)) // Placeholder for array read error
+                                            }
+                                        }
+                                    } else if matches!(inner_ty.kind(), TyKind::Tuple(..)) {
+                                        println!(
+                                            "Info: Handling Ref-to-Tuple {:?}. Reading constant data from allocation {:?}.",
+                                            inner_ty, alloc_id
+                                        );
+                                        match read_constant_value_from_memory(
+                                            tcx,
+                                            allocation,
+                                            pointer.into_parts().1, // Offset within the allocation
+                                            *inner_ty,              // The tuple type itself
+                                            data_types,
+                                        ) {
+                                            Ok(oomir_const) => {
+                                                println!(
+                                                    "Info: Successfully extracted constant tuple: {:?}",
+                                                    oomir_const
+                                                );
+                                                oomir::Operand::Constant(oomir_const)
+                                            }
+                                            Err(e) => {
+                                                println!(
+                                                    "Error: Failed to read constant tuple of type {:?} from allocation {:?}: {}",
+                                                    inner_ty, alloc_id, e
+                                                );
+                                                oomir::Operand::Constant(oomir::Constant::I64(-53)) // Placeholder for tuple read error
                                             }
                                         }
                                     } else {

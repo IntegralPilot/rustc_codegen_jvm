@@ -20,7 +20,6 @@ pub struct FunctionTranslator<'a, 'cp> {
     module: &'a oomir::Module,
     oomir_func: &'a oomir::Function,
     constant_pool: &'cp mut ConstantPool,
-    this_class_name: &'a str, // Class name for self-references if needed
 
     local_var_map: HashMap<String, u16>, // OOMIR var name -> JVM local index
     local_var_types: HashMap<String, oomir::Type>, // OOMIR var name -> OOMIR Type
@@ -39,23 +38,24 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
     pub fn new(
         oomir_func: &'a oomir::Function,
         constant_pool: &'cp mut ConstantPool,
-        this_class_name: &'a str,
         module: &'a oomir::Module,
+        is_static: bool,
     ) -> Self {
         let mut translator = FunctionTranslator {
             oomir_func,
             module,
             constant_pool,
-            this_class_name,
             local_var_map: HashMap::new(),
             local_var_types: HashMap::new(),
-            next_local_index: 0, // Start at 0 for static methods
+            next_local_index: if is_static { 0 } else { 1 },
             jvm_instructions: Vec::new(),
             label_to_instr_index: HashMap::new(),
             branch_fixups: Vec::new(),
             current_oomir_block_label: String::new(),
             max_locals_used: 0,
         };
+
+        println!("static: {}, function_name: {}", is_static, oomir_func.name);
 
         // Assign JVM local slots 0, 1, 2... to MIR argument names _1, _2, _3...
         // Assumes static methods where args start at slot 0.
@@ -160,26 +160,27 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                         var_name, existing_index, ty_hint, existing_ty
                     );
                     // Update the type in the map
-                    self.local_var_types.insert(var_name.to_string(), ty_hint.clone());
+                    self.local_var_types
+                        .insert(var_name.to_string(), ty_hint.clone());
                     // Re-check if max_locals_used needs update due to size change
                     let size = get_type_size(ty_hint);
                     self.max_locals_used = self.max_locals_used.max(existing_index + size);
-
                 } else {
-                     println!(
+                    println!(
                         "Debug: Reusing local '{}' (index {}) with same type hint {:?}.",
                         var_name, existing_index, ty_hint
                     );
                 }
             } else {
-                 // This case is unlikely if index exists, but handle defensively
-                 println!(
+                // This case is unlikely if index exists, but handle defensively
+                println!(
                     "Warning: Local '{}' has index {} but no type in map. Assigning type {:?}.",
                     var_name, existing_index, ty_hint
-                 );
-                 self.local_var_types.insert(var_name.to_string(), ty_hint.clone());
-                 let size = get_type_size(ty_hint);
-                 self.max_locals_used = self.max_locals_used.max(existing_index + size);
+                );
+                self.local_var_types
+                    .insert(var_name.to_string(), ty_hint.clone());
+                let size = get_type_size(ty_hint);
+                self.max_locals_used = self.max_locals_used.max(existing_index + size);
             }
             existing_index
         } else {
@@ -344,7 +345,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 load_constant(&mut self.jvm_instructions, &mut self.constant_pool, c)?
             }
             oomir::Operand::Variable { name: var_name, ty } => {
-                let index = self.get_local_index(var_name)?;
+                let index = self.get_or_assign_local(var_name, ty);
                 let load_instr = get_load_instruction(ty, index)?;
                 self.jvm_instructions.push(load_instr);
             }
@@ -423,6 +424,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     | Type::Boolean
                     | Type::Char
                     | Type::Class(_)
+                    | Type::Interface(_)
                     | Type::String
                     | Type::Reference(_)
                     | Type::MutableReference(_)
@@ -1905,7 +1907,8 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                             | oomir::Type::Array(_)
                             | oomir::Type::MutableReference(_)
                             | oomir::Type::String
-                            | oomir::Type::Class(_) => JI::Areturn,
+                            | oomir::Type::Class(_)
+                            | oomir::Type::Interface(_) => JI::Areturn,
                             oomir::Type::Void => JI::Return, // Should not happen with Some(op)
                         };
                         self.jvm_instructions.push(return_instr);
@@ -2150,7 +2153,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     }
 
                     // 2. Add MethodRef
-                    let class_index = self.constant_pool.add_class(self.this_class_name)?;
+                    let class_index = self.constant_pool.add_class(module.name.clone())?;
                     let method_ref_index = self.constant_pool.add_method_ref(
                         class_index,
                         function_name.clone(),
@@ -2259,6 +2262,10 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 index,
                 value,
             } => {
+                println!(
+                    "ArrayStore: array {:?}, index {:?}, value {:?}",
+                    array, index, value
+                );
                 let mut is_string = false;
                 // 1. Get the type of the array variable to find the element type
                 let array_type = self.get_local_type(array)?.clone(); // Clone to avoid borrow issues
@@ -2287,6 +2294,19 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                         });
                     }
                 };
+
+                // check if any instructions are needed to cast the value to the element type
+                let value_type = get_operand_type(value);
+                println!(
+                    "Value type: {:?}, element type {:?}",
+                    value_type, element_type
+                );
+                if value_type != *element_type {
+                    let instrs =
+                        get_cast_instructions(&value_type, &element_type, &mut self.constant_pool)
+                            .unwrap();
+                    self.jvm_instructions.extend(instrs);
+                }
 
                 // 2. Load array reference
                 // Use the full array type when loading the variable
@@ -2593,6 +2613,49 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 self.store_result(dest, ty)?; // Stack: []
             }
 
+            OI::InvokeInterface {
+                class_name,
+                method_name,
+                method_ty,
+                args,
+                dest,
+                operand,
+            } => {
+                // 1. Add Method reference to constant pool
+                let class_index = self.constant_pool.add_class(class_name)?;
+                let method_ref_index = self.constant_pool.add_interface_method_ref(
+                    class_index,
+                    method_name,
+                    &method_ty.to_string(),
+                )?;
+
+                // 2.1 load the operand we're calling this method on
+                self.load_operand(operand)?; // Stack: [object_ref]
+
+                // 2.2 Load arguments onto the stack
+                for arg in args {
+                    self.load_call_argument(arg)?; // Use helper to handle references properly
+                    // stack: [object_ref, args...]
+                }
+
+                // 3. Emit 'invokeinterface' instruction
+                self.jvm_instructions
+                    .push(JI::Invokeinterface(method_ref_index, args.len() as u8 + 1)); // Stack: [result]
+
+                // 4. Handle the return value
+                if let Some(dest_var) = dest {
+                    // Store the result in the destination variable
+                    self.store_result(dest_var, &method_ty.ret)?;
+                } else if *method_ty.ret.as_ref() != oomir::Type::Void {
+                    // Pop the result if it's not void and no destination is provided
+                    match get_type_size(&method_ty.ret) {
+                        1 => self.jvm_instructions.push(JI::Pop),
+                        2 => self.jvm_instructions.push(JI::Pop2),
+                        _ => {}
+                    }
+                }
+            }
+
             OI::InvokeVirtual {
                 dest,
                 class_name,
@@ -2609,14 +2672,14 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     &method_ty.to_string(),
                 )?;
 
-                // 2. Load arguments onto the stack
+                // 2. Load the object reference (self) onto the stack
+                // The object reference is the first argument for instance methods
+                self.load_operand(operand)?; // Stack: [object_ref]
+
+                // 3. Load arguments onto the stack
                 for arg in args {
                     self.load_call_argument(arg)?; // Use helper to handle references properly
                 }
-
-                // 3. Load the object reference (self) onto the stack
-                // The object reference is the first argument for instance methods
-                self.load_operand(operand)?; // Stack: [object_ref, args...]
 
                 // 4. Emit 'invokevirtual' instruction
                 self.jvm_instructions
@@ -2641,20 +2704,35 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
     }
 
     /// Helper to load an operand specifically for a function call argument.
-    /// Handles the case where OOMIR indicates a Ref<Primitive> but we need to load the primitive.
+    /// Handles Reference/MutableReference
     fn load_call_argument(&mut self, operand: &oomir::Operand) -> Result<(), jvm::Error> {
         match operand {
             oomir::Operand::Variable { name: var_name, ty } => {
                 let index = self.get_local_index(var_name)?;
+                let expected_type = self.get_local_type(var_name)?.clone();
                 // Decide which type to use for loading based on whether it's a Ref to Primitive
                 let load_type = match ty {
                     // If the argument is declared as Ref<Primitive>, load the primitive directly
-                    oomir::Type::Reference(inner_ty) if inner_ty.is_jvm_primitive() => {
-                        inner_ty.as_ref() // Use the inner type for loading
+                    oomir::Type::Reference(box inner_ty) if inner_ty.is_jvm_primitive() => {
+                        inner_ty // Use the inner type for loading
+                    }
+                    oomir::Type::MutableReference(box inner_ty) => {
+                        // check the expected type
+                        match expected_type {
+                            oomir::Type::MutableReference(_) => ty,
+                            _ => {
+                                // it's not a MutableReference, so we need to move the value out
+                                self.jvm_instructions.push(get_load_instruction(ty, index)?);
+                                self.jvm_instructions.push(Instruction::Iconst_0);
+                                self.jvm_instructions.push(Instruction::Aaload);
+                                inner_ty
+                            }
+                        }
                     }
                     // Otherwise, use the declared type
                     _ => ty,
                 };
+
                 let load_instr = get_load_instruction(load_type, index)?;
                 self.jvm_instructions.push(load_instr);
             }

@@ -469,7 +469,7 @@ pub fn convert_basic_block<'tcx>(
                 unwind: _,
                 replace: _,
                 drop: _,
-                async_fut: _
+                async_fut: _,
             } => {
                 // In simple cases (no custom Drop trait), a MIR drop often just signifies
                 // the end of a scope before control flow continues.

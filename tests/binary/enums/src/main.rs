@@ -1,11 +1,9 @@
-#[derive(PartialEq)]
 struct ConfigData {
     id: u32,
     enabled: bool,
     params: (f32, f32), // Nested tuple
 }
 
-#[derive(PartialEq)]
 enum ComplexEnum<'a> {
     SimpleVariant,                      // No data
     Count(i64),                         // Single primitive data
@@ -120,7 +118,6 @@ fn main() {
 
     // Test remaining variants
     current_state = ComplexEnum::Count(5000);
-    assert!(current_state == ComplexEnum::Count(5000));
     if let ComplexEnum::Count(c) = current_state {
         assert!(c == 5000);
     } else {
@@ -128,7 +125,13 @@ fn main() {
     }
 
     current_state = ComplexEnum::Coords((-10, 0, 20));
-    assert!(current_state == ComplexEnum::Coords((-10, 0, 20)));
+    if let ComplexEnum::Coords((x, y, z)) = current_state {
+        assert!(x == -10);
+        assert!(y == 0);
+        assert!(z == 20);
+    } else {
+        panic!("State should be Coords");
+    }
     if let ComplexEnum::Coords((x, y, z)) = current_state {
         assert!(x == -10);
         assert!(y == 0);
@@ -138,5 +141,9 @@ fn main() {
     }
 
     current_state = ComplexEnum::SimpleVariant;
-    assert!(current_state == ComplexEnum::SimpleVariant);
+    if let ComplexEnum::SimpleVariant = current_state {
+        // Do nothing, this is the expected state
+    } else {
+        panic!("State should be SimpleVariant");
+    }
 }

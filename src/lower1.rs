@@ -18,8 +18,8 @@ use types::ty_to_oomir_type;
 
 mod control_flow;
 pub mod operand;
-mod place;
-mod types;
+pub mod place;
+pub mod types;
 
 /// Converts a MIR Body into an OOMIR Function.
 /// This function extracts a function’s signature (currently minimal) and builds
@@ -88,6 +88,43 @@ pub fn mir_to_oomir<'tcx>(
         ); // Pass return type here
         basic_blocks.insert(bb_ir.label.clone(), bb_ir);
     }
+
+    /*let mut instrs = vec![];
+
+    // Initialize local variables (excluding return place and arguments)
+    // MIR local indices:
+    // 0: return place
+    // 1..=arg_count: arguments
+    // arg_count+1..: user variables and temporaries
+    for (local_index, local_decl) in mir_cloned.local_decls.iter_enumerated() {
+        // local_index has type Local
+        // local_decl has type &LocalDecl<'tcx>
+
+        // Skip return place (_0) and arguments (_1 to _arg_count)
+        // They are initialized by return value / function call respectively.
+        if local_index.index() == 0 || local_index.index() <= mir_cloned.arg_count {
+            continue; // Skip this local
+        }
+
+        let ty = local_decl.ty;
+        let oomir_ty = ty_to_oomir_type(ty, tcx, data_types);
+
+        // Only add initialization if the type has a default value we can represent
+        let default = oomir_ty.get_default_value(data_types);
+        if default.is_none() {
+            continue;
+        }
+        // Get the underlying usize index for formatting
+        let idx_usize = local_index.index();
+        instrs.push(Instruction::Move {
+            dest: format!("_{}", idx_usize),
+            src: Operand::Constant(default.unwrap()),
+        });
+    }
+
+    // add instrs to the start of the entry block
+    let entry_block = basic_blocks.get_mut(&entry_label).unwrap();
+    entry_block.instructions.splice(0..0, instrs);*/
 
     let codeblock = oomir::CodeBlock {
         basic_blocks,

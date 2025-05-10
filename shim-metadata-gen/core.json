@@ -3,10 +3,6 @@
     "descriptor": "([Ljava/lang/String;)Ljava/lang/String;",
     "is_static": true
   },
-  "arguments_new_v1": {
-    "descriptor": "([Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;",
-    "is_static": true
-  },
   "core_assert_failed": {
     "descriptor": "(Ljava/lang/String;)V",
     "is_static": true
@@ -25,6 +21,10 @@
   },
   "core_fmt_rt_argument_new_display_i32": {
     "descriptor": "(I)Ljava/lang/String;",
+    "is_static": true
+  },
+  "core_fmt_rt_arguments_new_const_1": {
+    "descriptor": "([Ljava/lang/String;)Ljava/lang/String;",
     "is_static": true
   },
   "core_panicking_panic": {
@@ -83,7 +83,7 @@
     "descriptor": "(Ljava/lang/Object;Ljava/lang/Object;)Z",
     "is_static": true
   },
-  "i32_u8_bool_eq": {
+  "i32_u8_eq": {
     "descriptor": "(Ljava/lang/Object;Ljava/lang/Object;)Z",
     "is_static": true
   },

@@ -30,19 +30,17 @@ pub fn convert_labels_to_basic_blocks_in_function(function: &mut Function) {
             // as `new_blocks_this_pass` might have been merged in the previous pass.
             // Check if the block still exists (it might have been replaced if split started at index 0)
             if let Some(block) = function.body.basic_blocks.get_mut(&block_name) {
-                let mut split_occurred_in_block = false;
-                let mut original_instructions = std::mem::take(&mut block.instructions); // Temporarily take ownership
+                let original_instructions = std::mem::take(&mut block.instructions); // Temporarily take ownership
                 let mut current_instructions: Vec<Instruction> = Vec::new();
                 let mut current_block_label = block.label.clone(); // Label of the block segment we are currently building
 
-                for (i, instruction) in original_instructions.into_iter().enumerate() {
+                for (_, instruction) in original_instructions.into_iter().enumerate() {
                     match instruction {
                         Instruction::Label {
                             name: next_label_name,
                         } => {
                             // --- Found a label: Finalize the *current* segment ---
                             needs_another_pass = true; // Signal that we changed something
-                            split_occurred_in_block = true;
 
                             // 1. Add jump if the last instruction wasn't a terminator
                             if !is_terminator(current_instructions.last()) {

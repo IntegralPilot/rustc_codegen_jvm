@@ -1,7 +1,7 @@
 use super::place::make_jvm_safe;
-use crate::oomir;
+use crate::oomir::{self, DataType, DataTypeMethod};
 
-use rustc_middle::ty::{FloatTy, IntTy, Ty, TyCtxt, TyKind, UintTy};
+use rustc_middle::ty::{ExistentialPredicate, FloatTy, IntTy, Ty, TyCtxt, TyKind, UintTy};
 use sha2::Digest;
 use std::collections::HashMap;
 
@@ -60,25 +60,30 @@ pub fn ty_to_oomir_type<'tcx>(
                         .collect::<Vec<_>>();
                     data_types.insert(
                         jvm_name.clone(),
-                        oomir::DataType {
+                        oomir::DataType::Class {
                             fields: oomir_fields,
                             is_abstract: false,
                             methods: HashMap::new(),
                             super_class: None,
+                            interfaces: vec![],
                         },
                     );
                 } else if adt_def.is_enum() {
                     // the enum in general
                     if !data_types.contains_key(&jvm_name) {
                         let mut methods = HashMap::new();
-                        methods.insert("getVariantIdx".to_string(), (oomir::Type::I32, None));
+                        methods.insert(
+                            "getVariantIdx".to_string(),
+                            DataTypeMethod::SimpleConstantReturn(oomir::Type::I32, None),
+                        );
                         data_types.insert(
                             jvm_name.clone(),
-                            oomir::DataType {
+                            oomir::DataType::Class {
                                 fields: vec![], // No fields in the abstract class
                                 is_abstract: true,
                                 methods,
                                 super_class: None,
+                                interfaces: vec![],
                             },
                         );
                     }
@@ -139,11 +144,12 @@ pub fn ty_to_oomir_type<'tcx>(
                     .collect::<Vec<_>>();
 
                 // Create and insert the DataType definition
-                let tuple_data_type = oomir::DataType {
+                let tuple_data_type = oomir::DataType::Class {
                     fields: oomir_fields,
                     is_abstract: false,
                     methods: HashMap::new(),
                     super_class: None,
+                    interfaces: vec![],
                 };
                 data_types.insert(tuple_class_name.clone(), tuple_data_type);
                 println!("   -> Added DataType: {:?}", data_types[&tuple_class_name]);
@@ -172,9 +178,25 @@ pub fn ty_to_oomir_type<'tcx>(
             println!("Info: Mapping Never type to OOMIR Void");
             oomir::Type::Void
         }
-        rustc_middle::ty::TyKind::Dynamic(_, _, _) => {
-            // Make it a java/lang/Object which any type that implements it will be as all classes are
-            oomir::Type::Class("java/lang/Object".to_string())
+        rustc_middle::ty::TyKind::Dynamic(a, _, _) => {
+            let resolved_types = a
+                .iter()
+                .map(|binder| match binder.skip_binder() {
+                    ExistentialPredicate::Trait(trait_ref) => {
+                        let trait_name = tcx.def_path_str(trait_ref.def_id);
+                        let safe_name = make_jvm_safe(&trait_name);
+                        oomir::Type::Interface(safe_name)
+                    }
+                    _ => {
+                        println!("Warning: Unhandled dynamic type {:?}", binder);
+                        oomir::Type::Class("java/lang/Object".to_string())
+                    }
+                })
+                .collect::<Vec<_>>();
+            resolved_types[0].clone()
+        }
+        rustc_middle::ty::TyKind::Param(param_ty) => {
+            oomir::Type::Class(make_jvm_safe(param_ty.name.as_str()))
         }
         _ => {
             println!("Warning: Unhandled type {:?}", ty);
@@ -274,18 +296,21 @@ pub fn get_field_name_from_index(
     data_types
         .get(owner_class_name)
         .ok_or_else(|| format!("DataType not found for class '{}'", owner_class_name))
-        .and_then(|data_type| {
-            data_type
-                .fields
+        .and_then(|data_type| match data_type {
+            DataType::Class { fields, .. } => fields
                 .get(index)
                 .ok_or_else(|| {
                     format!(
                         "Field index {} out of bounds for class '{}' (has {} fields)",
                         index,
                         owner_class_name,
-                        data_type.fields.len()
+                        fields.len()
                     )
                 })
-                .map(|(name, _)| name.clone())
+                .map(|(name, _)| name.clone()),
+            DataType::Interface { .. } => Err(format!(
+                "Expected class, found interface {}",
+                owner_class_name
+            )),
         })
 }

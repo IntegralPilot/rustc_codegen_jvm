@@ -3,6 +3,11 @@ package org.rustlang.core
 import java.lang.reflect.Field
 import java.util.Objects
 
+
+public interface partialeq {
+    
+}
+
 /**
  * Core functions needed by the Rust JVM backend stdlib shim.
  */
@@ -109,16 +114,11 @@ public object Core {
     }
 
     @JvmStatic
-    public fun arguments_new_v1(pieces: Array<String>, args: Array<Any?>): String {
+    public fun core_fmt_rt_arguments_new_const_1(pieces: Array<String>): String {
         val sb = StringBuilder()
         var argIndex = 0
         for (i in pieces.indices) {
-            sb.append(pieces[i]) // Append static piece
-            if (argIndex < args.size) {
-                // Append the corresponding argument (already formatted or convertible via toString)
-                sb.append(args[argIndex]?.toString() ?: "null")
-                argIndex++
-            }
+            sb.append(pieces[i])
         }
         return sb.toString()
     }
@@ -267,8 +267,8 @@ public object Core {
     }
     
     @JvmStatic
-    // tuple (i32, u8, bool)
-    public fun i32_u8_bool_eq(value1: Any?, value2: Any?): Boolean {
+    // tuple (i32, u8)
+    public fun i32_u8_eq(value1: Any?, value2: Any?): Boolean {
         return eq(value1, value2)
     }
 

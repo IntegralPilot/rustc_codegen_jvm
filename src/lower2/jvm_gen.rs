@@ -1,13 +1,14 @@
 // src/lower2/jvm_gen.rs
 
-use super::consts::load_constant;
-use crate::oomir::{self, Type};
+use super::{FunctionTranslator, consts::load_constant};
+use crate::oomir::{self, DataTypeMethod, Signature, Type};
 
 use ristretto_classfile::{
     self as jvm, BaseType, ClassAccessFlags, ClassFile, ConstantPool, FieldAccessFlags,
     MethodAccessFlags, Version,
-    attributes::{Attribute, Instruction},
+    attributes::{Attribute, Instruction, MaxStack},
 };
+use std::collections::HashMap;
 
 /// Creates a default constructor `<init>()V` that just calls `super()`.
 pub(super) fn create_default_constructor(
@@ -71,19 +72,25 @@ pub(super) fn oomir_type_to_ristretto_field_type(
             let inner_field_type = oomir_type_to_ristretto_field_type(inner_ty);
             jvm::FieldType::Array(Box::new(inner_field_type))
         }
-        oomir::Type::Class(name) => jvm::FieldType::Object(name.clone()),
+        oomir::Type::Class(name) | oomir::Type::Interface(name) => {
+            jvm::FieldType::Object(name.clone())
+        }
         oomir::Type::Void => {
             panic!("Void type cannot be used as a field type");
         }
     }
 }
 
-/// Creates a ClassFile (as bytes) for a given OOMIR DataType.
-pub(super) fn create_data_type_classfile(
+/// Creates a ClassFile (as bytes) for a given OOMIR DataType that's a class
+pub(super) fn create_data_type_classfile_for_class(
     // pub(super) or pub(crate)
     class_name_jvm: &str,
-    data_type: &oomir::DataType,
+    fields: Vec<(String, Type)>,
+    is_abstract: bool,
+    methods: HashMap<String, DataTypeMethod>,
     super_class_name_jvm: &str,
+    implements_interfaces: Vec<String>,
+    module: &oomir::Module,
 ) -> jvm::Result<Vec<u8>> {
     let mut cp = ConstantPool::default();
 
@@ -91,9 +98,17 @@ pub(super) fn create_data_type_classfile(
 
     let super_class_index = cp.add_class(super_class_name_jvm)?;
 
+    // --- Process Implemented Interfaces ---
+    let mut interface_indices: Vec<u16> = Vec::with_capacity(implements_interfaces.len());
+    for interface_name in &implements_interfaces {
+        // Add the interface name to the constant pool as a Class reference
+        let interface_index = cp.add_class(interface_name)?;
+        interface_indices.push(interface_index);
+    }
+
     // --- Create Fields ---
-    let mut fields: Vec<jvm::Field> = Vec::new();
-    for (field_name, field_ty) in &data_type.fields {
+    let mut jvm_fields: Vec<jvm::Field> = Vec::new();
+    for (field_name, field_ty) in &fields {
         let name_index = cp.add_utf8(field_name)?;
         let descriptor = field_ty.to_jvm_descriptor(); // Ensure this method exists on oomir::Type
         let descriptor_index = cp.add_utf8(&descriptor)?;
@@ -105,15 +120,13 @@ pub(super) fn create_data_type_classfile(
             field_type: oomir_type_to_ristretto_field_type(field_ty), // Use helper
             attributes: Vec::new(),
         };
-        fields.push(field);
+        jvm_fields.push(field);
         println!("  - Added field: {} {}", field_name, descriptor);
     }
 
     // --- Create Default Constructor ---
     let constructor = create_default_constructor(&mut cp, super_class_index)?;
-    let methods = vec![constructor];
-
-    let is_abstract = data_type.is_abstract;
+    let jvm_methods = vec![constructor];
 
     // --- Assemble ClassFile ---
     let mut class_file = ClassFile {
@@ -128,53 +141,161 @@ pub(super) fn create_data_type_classfile(
             },
         this_class: this_class_index,
         super_class: super_class_index,
-        interfaces: Vec::new(),
-        fields,
-        methods,
+        interfaces: interface_indices,
+        fields: jvm_fields,
+        methods: jvm_methods,
         attributes: Vec::new(),
     };
 
-    // Check for methods
-    for (method_name, tuple) in data_type.methods.iter() {
-        let return_type = &tuple.0;
-        let return_const = &tuple.1;
-        let method_desc = format!("(){}", return_type.to_jvm_descriptor());
+    // Check for jvm_methods
+    for (method_name, method) in methods.iter() {
+        match method {
+            DataTypeMethod::SimpleConstantReturn(return_type, return_const) => {
+                let method_desc = format!("(){}", return_type.to_jvm_descriptor());
 
-        // Add the method to the class file
-        let name_index = class_file.constant_pool.add_utf8(&method_name)?;
-        let descriptor_index = class_file.constant_pool.add_utf8(method_desc)?;
+                // Add the method to the class file
+                let name_index = class_file.constant_pool.add_utf8(&method_name)?;
+                let descriptor_index: u16 = class_file.constant_pool.add_utf8(method_desc)?;
 
-        let mut attributes = vec![];
-        let mut is_abstract = false;
+                let mut attributes = vec![];
+                let mut is_abstract = false;
 
-        match return_const {
-            Some(rc) => attributes.push(create_code_from_method_name_and_constant_return(
-                &rc,
-                &mut class_file.constant_pool,
-            )?),
-            None => {
-                is_abstract = true;
+                match return_const {
+                    Some(rc) => attributes.push(create_code_from_method_name_and_constant_return(
+                        &rc,
+                        &mut class_file.constant_pool,
+                    )?),
+                    None => {
+                        is_abstract = true;
+                    }
+                }
+
+                let jvm_method = jvm::Method {
+                    access_flags: MethodAccessFlags::PUBLIC
+                        | if is_abstract {
+                            MethodAccessFlags::ABSTRACT
+                        } else {
+                            MethodAccessFlags::FINAL
+                        },
+                    name_index,
+                    descriptor_index,
+                    attributes,
+                };
+
+                class_file.methods.push(jvm_method);
+            }
+            DataTypeMethod::Function(function) => {
+                // Translate the function body using its own constant pool reference
+                let translator =
+                    FunctionTranslator::new(function, &mut class_file.constant_pool, module, false);
+                let (jvm_code, max_locals_val) = translator.translate()?;
+
+                let max_stack_val = jvm_code.max_stack(&class_file.constant_pool)?;
+
+                let code_attribute = Attribute::Code {
+                    name_index: class_file.constant_pool.add_utf8("Code")?,
+                    max_stack: max_stack_val,
+                    max_locals: max_locals_val,
+                    code: jvm_code,
+                    exception_table: Vec::new(),
+                    attributes: Vec::new(),
+                };
+
+                let name_index = class_file.constant_pool.add_utf8(method_name)?;
+                let descriptor_index = class_file
+                    .constant_pool
+                    .add_utf8(&function.signature.to_string())?;
+
+                let jvm_method = jvm::Method {
+                    access_flags: MethodAccessFlags::PUBLIC,
+                    name_index,
+                    descriptor_index,
+                    attributes: vec![code_attribute],
+                };
+
+                class_file.methods.push(jvm_method);
             }
         }
-
-        let jvm_method = jvm::Method {
-            access_flags: MethodAccessFlags::PUBLIC
-                | if is_abstract {
-                    MethodAccessFlags::ABSTRACT
-                } else {
-                    MethodAccessFlags::FINAL
-                },
-            name_index,
-            descriptor_index,
-            attributes,
-        };
-
-        class_file.methods.push(jvm_method);
     }
 
     // --- Add SourceFile Attribute ---
     let simple_name = class_name_jvm.split('/').last().unwrap_or(class_name_jvm);
     let source_file_name = format!("{}.rs", simple_name);
+    let source_file_utf8_index = class_file.constant_pool.add_utf8(&source_file_name)?;
+    let source_file_attr_name_index = class_file.constant_pool.add_utf8("SourceFile")?;
+    class_file.attributes.push(Attribute::SourceFile {
+        name_index: source_file_attr_name_index,
+        source_file_index: source_file_utf8_index,
+    });
+
+    // --- Serialize ---
+    let mut byte_vector = Vec::new();
+    class_file.to_bytes(&mut byte_vector)?;
+
+    Ok(byte_vector)
+}
+
+/// Creates a ClassFile (as bytes) for a given OOMIR DataType that's an interface
+pub(super) fn create_data_type_classfile_for_interface(
+    interface_name_jvm: &str, // Renamed for clarity
+    methods: &HashMap<String, Signature>,
+) -> jvm::Result<Vec<u8>> {
+    let mut cp = ConstantPool::default();
+
+    let this_class_index = cp.add_class(interface_name_jvm)?;
+
+    // Interfaces always implicitly extend Object, and must specify it in the classfile
+    let super_class_index = cp.add_class("java/lang/Object")?;
+
+    // --- Create Abstract Methods ---
+    let mut jvm_methods: Vec<jvm::Method> = Vec::new();
+    for (method_name, signature) in methods {
+        // Construct the descriptor: (param1_desc param2_desc ...)return_desc
+        let mut descriptor = String::from("(");
+        for param_type in &signature.params {
+            descriptor.push_str(&param_type.to_jvm_descriptor());
+        }
+        descriptor.push(')');
+        descriptor.push_str(&signature.ret.to_jvm_descriptor());
+
+        let name_index = cp.add_utf8(method_name)?;
+        let descriptor_index = cp.add_utf8(&descriptor)?;
+
+        // Interface methods are implicitly public and abstract (unless 'default' or 'static')
+        // We assume these are the standard abstract interface methods.
+        let jvm_method = jvm::Method {
+            access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::ABSTRACT,
+            name_index,
+            descriptor_index,
+            attributes: Vec::new(), // Abstract methods have no Code attribute
+        };
+        jvm_methods.push(jvm_method);
+        // Consider using tracing or logging
+        // println!("  - Added interface method: {} {}", method_name, descriptor);
+    }
+
+    // --- Assemble ClassFile ---
+    let mut class_file = ClassFile {
+        version: Version::Java8 { minor: 0 }, // Or higher if using default/static methods
+        constant_pool: cp,
+        access_flags: ClassAccessFlags::PUBLIC
+            | ClassAccessFlags::INTERFACE
+            | ClassAccessFlags::ABSTRACT,
+        // Note: ACC_SUPER is generally not set for interfaces, though JVM might tolerate it.
+        this_class: this_class_index,
+        super_class: super_class_index, // Must be java/lang/Object
+        interfaces: Vec::new(),         // Interfaces implemented by *this* interface (if any)
+        fields: Vec::new(), // Interfaces can have static final fields, but not requested here
+        methods: jvm_methods, // Only the abstract methods defined above
+        attributes: Vec::new(), // SourceFile added below
+    };
+
+    // --- Add SourceFile Attribute ---
+    let simple_name = interface_name_jvm
+        .split('/')
+        .last()
+        .unwrap_or(interface_name_jvm);
+    let source_file_name = format!("{}.rs", simple_name); // Or .java
     let source_file_utf8_index = class_file.constant_pool.add_utf8(&source_file_name)?;
     let source_file_attr_name_index = class_file.constant_pool.add_utf8("SourceFile")?;
     class_file.attributes.push(Attribute::SourceFile {
@@ -216,7 +337,8 @@ fn create_code_from_method_name_and_constant_return(
         | oomir::Type::MutableReference(_)
         | oomir::Type::Array(_)
         | oomir::Type::String
-        | oomir::Type::Class(_) => Instruction::Areturn,
+        | oomir::Type::Class(_)
+        | oomir::Type::Interface(_) => Instruction::Areturn,
         oomir::Type::Void => Instruction::Return, // Should not happen with Some(op)
     };
 

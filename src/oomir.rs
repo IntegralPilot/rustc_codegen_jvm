@@ -4,6 +4,7 @@
 use crate::lower2::BIG_DECIMAL_CLASS;
 
 use super::lower2::BIG_INTEGER_CLASS;
+use core::panic;
 use ristretto_classfile::attributes::Instruction as JVMInstruction;
 use std::{collections::HashMap, fmt};
 
@@ -24,18 +25,158 @@ impl Module {
         for (name, data_type) in other {
             if !self.data_types.contains_key(name) {
                 self.data_types.insert(name.clone(), data_type.clone());
+            } else {
+                // try and merge them
+                let cur_data_type = self.data_types.get(name).unwrap().clone();
+                let other_data_type = other.get(name).unwrap();
+                match &cur_data_type {
+                    DataType::Class {
+                        is_abstract,
+                        super_class,
+                        fields,
+                        methods,
+                        interfaces,
+                    } => match other_data_type {
+                        DataType::Class {
+                            is_abstract: o_is_abstract,
+                            super_class: o_super_class,
+                            fields: o_fields,
+                            methods: o_methods,
+                            interfaces: o_interfaces,
+                        } => {
+                            let mut new_is_abstract = false;
+                            if *is_abstract || *o_is_abstract {
+                                new_is_abstract = true;
+                            }
+                            let new_super_class = match super_class {
+                                Some(x) => {
+                                    if x == "java/lang/Object" && o_super_class.is_some() {
+                                        o_super_class
+                                    } else if o_super_class.is_none() {
+                                        super_class
+                                    } else if o_super_class != super_class {
+                                        if o_super_class.clone().unwrap() == "java/lang/Object" {
+                                            super_class
+                                        } else {
+                                            panic!(
+                                                "Incompadible DataTypes (super) for {}: {:?} and {:?}",
+                                                name, cur_data_type, other_data_type
+                                            )
+                                        }
+                                    } else {
+                                        super_class
+                                    }
+                                }
+                                None => o_super_class,
+                            };
+                            let mut new_fields = fields.clone();
+                            new_fields.extend(o_fields.iter().cloned());
+                            let mut new_methods = methods.clone();
+                            new_methods
+                                .extend(o_methods.iter().map(|(k, v)| (k.clone(), v.clone())));
+                            let mut new_interfaces = interfaces.clone();
+                            new_interfaces.extend(o_interfaces.iter().cloned());
+
+                            self.data_types.insert(
+                                name.clone(),
+                                DataType::Class {
+                                    is_abstract: new_is_abstract,
+                                    super_class: new_super_class.clone(),
+                                    fields: new_fields,
+                                    methods: new_methods,
+                                    interfaces: new_interfaces,
+                                },
+                            );
+                        }
+                        _ => {
+                            panic!(
+                                "Incompadible DataTypes (type) for {}: {:?} and {:?}",
+                                name, cur_data_type, other_data_type
+                            )
+                        }
+                    },
+                    DataType::Interface { methods } => match other_data_type {
+                        DataType::Interface { methods: o_methods } => {
+                            let mut new_methods = methods.clone();
+                            new_methods
+                                .extend(o_methods.iter().map(|(k, v)| (k.clone(), v.clone())));
+
+                            self.data_types.remove(name);
+                            self.data_types.insert(
+                                name.clone(),
+                                DataType::Interface {
+                                    methods: new_methods,
+                                },
+                            );
+                        }
+                        _ => {
+                            panic!(
+                                "Incompadible DataTypes (type) for {}: {:?} and {:?}",
+                                name, cur_data_type, other_data_type
+                            )
+                        }
+                    },
+                }
             }
         }
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct DataType {
-    pub is_abstract: bool,           // "abstract" is a keyword in Rust
-    pub fields: Vec<(String, Type)>, // 0 = field name and 1 = type
-    // key = method name, value0 = return type, vaule1 = thing it returns (None if it's an abstract method). Currently methods on datatypes only need to be able to return a thing - there's no accepting arguments or doing anything else.
-    pub methods: HashMap<String, (Type, Option<Constant>)>,
-    pub super_class: Option<String>, // Name of the super class, if any
+pub enum DataTypeMethod {
+    SimpleConstantReturn(Type, Option<Constant>),
+    Function(Function),
+}
+
+#[derive(Debug, Clone)]
+pub enum DataType {
+    Class {
+        is_abstract: bool,
+        super_class: Option<String>,
+        fields: Vec<(String, Type)>,
+        methods: HashMap<String, DataTypeMethod>,
+        interfaces: Vec<String>,
+    },
+    Interface {
+        methods: HashMap<String, Signature>,
+    },
+}
+
+impl DataType {
+    // Remove duplicate methods and fields
+    pub fn clean_duplicates(&mut self) {
+        match self {
+            DataType::Class {
+                is_abstract: _,
+                super_class: _,
+                fields,
+                methods,
+                interfaces: _,
+            } => {
+                // Remove duplicate fields
+                let mut unique_fields = HashMap::new();
+                for (name, ty) in fields.iter() {
+                    unique_fields.insert(name.clone(), ty.clone());
+                }
+                *fields = unique_fields.into_iter().collect();
+
+                // Remove duplicate methods
+                let mut unique_methods = HashMap::new();
+                for (name, method) in methods.iter() {
+                    unique_methods.insert(name.clone(), method.clone());
+                }
+                *methods = unique_methods;
+            }
+            DataType::Interface { methods } => {
+                // Remove duplicate methods
+                let mut unique_methods = HashMap::new();
+                for (name, method) in methods.iter() {
+                    unique_methods.insert(name.clone(), method.clone());
+                }
+                *methods = unique_methods;
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -49,6 +190,20 @@ pub struct Function {
 pub struct Signature {
     pub params: Vec<Type>,
     pub ret: Box<Type>,
+}
+
+impl Signature {
+    /// Replaces all occurrences of `Type::Class(old_name)` with `Type::Class(new_name)`
+    /// in the signature's parameters and return type.
+    pub fn replace_class_in_signature(&mut self, old_class_name: &str, new_class_name: &str) {
+        // Replace in parameters
+        for param_type in self.params.iter_mut() {
+            param_type.replace_class(old_class_name, new_class_name);
+        }
+
+        // Replace in return type (accessing the Type inside the Box)
+        self.ret.replace_class(old_class_name, new_class_name);
+    }
 }
 
 // impl Display for Signature, to make it so we can get the signature as a string suitable for the JVM bytecode, i.e. (I)V etc.
@@ -184,6 +339,14 @@ pub enum Instruction {
         dest: Option<String>, // Optional destination variable for the return value
         function: String,     // Name of the function to call
         args: Vec<Operand>,   // Arguments to the function
+    },
+    InvokeInterface {
+        class_name: String,   // JVM class name (e.g., MyStruct)
+        method_name: String,  // Name of the method to call
+        method_ty: Signature, // Signature of the method (input/output types)
+        args: Vec<Operand>,   // Arguments to the function
+        dest: Option<String>, // Optional destination variable for the return value
+        operand: Operand,     // The object reference (this) for the method call
     },
     Move {
         dest: String,
@@ -514,6 +677,7 @@ impl Constant {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[allow(dead_code)] /* Reference variant currently unused */
 pub enum Type {
     Void,
     Boolean,
@@ -529,6 +693,7 @@ pub enum Type {
     Array(Box<Type>),     // Representing arrays
     String,               // String type
     Class(String),        // For structs, enums, and potentially Objects
+    Interface(String),    // dyn TraitName
 }
 
 impl Type {
@@ -549,7 +714,7 @@ impl Type {
             Type::F32 => "F".to_string(),
             Type::F64 => "D".to_string(),
             Type::String => "Ljava/lang/String;".to_string(),
-            Type::Class(name) => format!("L{};", name.replace('.', "/")),
+            Type::Class(name) | Type::Interface(name) => format!("L{};", name.replace('.', "/")),
             Type::Reference(inner) => inner.to_jvm_descriptor(),
             Type::Array(element_type) | Type::MutableReference(element_type) => {
                 format!("[{}", element_type.to_jvm_descriptor())
@@ -626,9 +791,11 @@ impl Type {
             Type::F32 => Some(JVMInstruction::Fastore),
             Type::F64 => Some(JVMInstruction::Dastore),
             // Reference types:
-            Type::String | Type::Class(_) | Type::Array(_) | Type::Reference(_) => {
-                Some(JVMInstruction::Aastore)
-            }
+            Type::String
+            | Type::Class(_)
+            | Type::Interface(_)
+            | Type::Array(_)
+            | Type::Reference(_) => Some(JVMInstruction::Aastore),
             Type::MutableReference(box t) => t.get_jvm_array_store_instruction(),
             Type::Void => None,
         }
@@ -653,7 +820,8 @@ impl Type {
             | Type::Class(_)
             | Type::Array(_)
             | Type::Reference(_)
-            | Type::MutableReference(_) => Some(JVMInstruction::Aaload),
+            | Type::MutableReference(_)
+            | Type::Interface(_) => Some(JVMInstruction::Aaload),
             Type::Void => None,
         }
     }
@@ -703,7 +871,12 @@ impl Type {
     pub fn is_jvm_reference_type(&self) -> bool {
         matches!(
             self,
-            Type::Reference(_) | Type::Array(_) | Type::String | Type::Class(_)
+            Type::Reference(_)
+                | Type::MutableReference(_)
+                | Type::Array(_)
+                | Type::String
+                | Type::Class(_)
+                | Type::Interface(_)
         )
     }
 
@@ -742,21 +915,42 @@ impl Type {
     /// Provides the JVM internal name or descriptor needed for Checkcast/Anewarray.
     pub fn to_jvm_descriptor_or_internal_name(&self) -> Option<String> {
         match self {
-            Type::Class(name) => Some(name.clone()),
+            Type::Class(name) | Type::Interface(name) => Some(name.clone()),
             Type::Array(_) => Some(self.to_jvm_descriptor()), // Array descriptor works for checkcast/anewarray
             Type::String => Some("java/lang/String".to_string()),
-            Type::Reference(inner) => inner.to_jvm_descriptor_or_internal_name(), // Or handle based on ref semantics
+            Type::Reference(inner) => inner.to_jvm_descriptor_or_internal_name(),
+            Type::MutableReference(inner) => {
+                Type::Array(inner.clone()).to_jvm_descriptor_or_internal_name()
+            } // MutableReference is treated as an array
             _ => None,
         }
     }
 
-    /// Returns the JVM class name for the class or interface.
-    pub fn to_jvm_class_name(&self) -> Option<String> {
+    /// Recursively replaces all occurrences of `Type::Class(old_name)` with `Type::Class(new_name)`.
+    pub fn replace_class(&mut self, old_name: &str, new_name: &str) {
         match self {
-            Type::Class(name) => Some(name.replace('.', "/")),
-            Type::Array(inner) => inner.to_jvm_internal_name(), // Delegate to inner type
-            Type::String => Some("java/lang/String".to_string()),
-            _ => None,
+            Type::Class(name) | Type::Interface(name) => {
+                if name == old_name {
+                    *name = new_name.to_string();
+                }
+            }
+            // Handle nested types recursively
+            Type::MutableReference(inner) | Type::Reference(inner) | Type::Array(inner) => {
+                inner.replace_class(old_name, new_name);
+            }
+            // Primitive types, Void, and String are unaffected
+            Type::Void
+            | Type::Boolean
+            | Type::Char
+            | Type::I8
+            | Type::I16
+            | Type::I32
+            | Type::I64
+            | Type::F32
+            | Type::F64
+            | Type::String => {
+                // No class names to replace here
+            }
         }
     }
 }

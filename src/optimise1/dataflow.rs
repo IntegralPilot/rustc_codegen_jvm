@@ -1169,6 +1169,36 @@ pub fn process_block_instructions(
                 keep_original_instruction = true;
             }
 
+            Instruction::InvokeInterface {
+                class_name,
+                method_name,
+                method_ty,
+                args,
+                dest,
+                operand,
+            } => {
+                // can't do any pre-eval or folding - yet. will add this later
+                // for now if args (Vec<Operand>) or Operand contain a variable that we've made constant, we need to update it to use the constant instead
+                // cause the variable doesn't exisit anymore
+
+                let new_args: Vec<Operand> = args
+                    .iter()
+                    .map(|arg| {
+                        lookup_const(arg, &current_state).map_or(arg.clone(), Operand::Constant)
+                    })
+                    .collect();
+                let new_operand = lookup_const(operand, &current_state);
+                optimised_instruction = Instruction::InvokeInterface {
+                    class_name: class_name.clone(),
+                    method_name: method_name.clone(),
+                    method_ty: method_ty.clone(),
+                    args: new_args,
+                    dest: dest.clone(),
+                    operand: new_operand.map_or(operand.clone(), Operand::Constant),
+                };
+                keep_original_instruction = true;
+            }
+
             Instruction::Jump { .. } => {
                 keep_original_instruction = true;
             }
@@ -1232,13 +1262,6 @@ fn calculate_block_output_state(info: &BasicBlockInfo, in_state: &ConstantMap) -
 }
 
 impl Instruction {
-    fn get_call_func_name(&self) -> Option<&String> {
-        if let Instruction::Call { function, .. } = self {
-            Some(function)
-        } else {
-            None
-        }
-    }
     fn get_set_field_name(&self) -> Option<&String> {
         if let Instruction::SetField { field_name, .. } = self {
             Some(field_name)

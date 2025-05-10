@@ -2,8 +2,11 @@
 
 //! This module converts OOMIR into JVM bytecode.
 
-use crate::oomir;
-use jvm_gen::{create_data_type_classfile, create_default_constructor};
+use crate::oomir::{self, DataType};
+use jvm_gen::{
+    create_data_type_classfile_for_class, create_data_type_classfile_for_interface,
+    create_default_constructor,
+};
 use translator::FunctionTranslator;
 
 use ristretto_classfile::{
@@ -59,8 +62,8 @@ pub fn oomir_to_jvm_bytecode(
             let translator = FunctionTranslator::new(
                 function,
                 &mut main_cp, // Use the main class's constant pool
-                &main_class_name_jvm,
                 module,
+                true,
             );
             let (jvm_code, max_locals_val) = translator.translate()?;
 
@@ -130,16 +133,37 @@ pub fn oomir_to_jvm_bytecode(
     for (dt_name_oomir, data_type) in &module.data_types {
         println!("Generating data type class: {}", dt_name_oomir);
 
-        // Create and serialize the class file for this data type
-        let dt_bytecode = create_data_type_classfile(
-            &dt_name_oomir,
-            data_type,
-            data_type
-                .super_class
-                .as_deref()
-                .unwrap_or("java/lang/Object"),
-        )?;
-        generated_classes.insert(dt_name_oomir.clone(), dt_bytecode);
+        let mut data_type = data_type.clone();
+
+        data_type.clean_duplicates();
+
+        match data_type {
+            DataType::Class {
+                is_abstract,
+                super_class,
+                fields,
+                methods,
+                interfaces,
+            } => {
+                // Create and serialize the class file for this data type
+                let dt_bytecode = create_data_type_classfile_for_class(
+                    &dt_name_oomir,
+                    fields.clone(),
+                    is_abstract,
+                    methods.clone(),
+                    super_class.as_deref().unwrap_or("java/lang/Object"),
+                    interfaces.clone(),
+                    &module,
+                )?;
+                generated_classes.insert(dt_name_oomir.clone(), dt_bytecode);
+            }
+            DataType::Interface { methods } => {
+                // Create and serialize the class file for this data type
+                let dt_bytecode =
+                    create_data_type_classfile_for_interface(&dt_name_oomir, &methods)?;
+                generated_classes.insert(dt_name_oomir.clone(), dt_bytecode);
+            }
+        }
     }
 
     Ok(generated_classes) // Return the map containing all generated classes

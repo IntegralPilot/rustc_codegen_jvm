@@ -2,3 +2,6 @@
 -keep class * {
     <fields>;
 }
+-keepclassmembers class * implements * {
+    <methods>;
+}

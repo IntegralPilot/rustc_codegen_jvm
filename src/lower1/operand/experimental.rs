@@ -8,7 +8,7 @@ use super::{
     super::{place::make_jvm_safe, ty_to_oomir_type, types::generate_tuple_jvm_class_name},
     scalar_int_to_oomir_constant,
 };
-use crate::oomir;
+use crate::oomir::{self, DataTypeMethod};
 
 // Named "experimental" as it provides a new experimental (and not fully complete for every type) constant resolution engine to replace the overly hardcoded one in operand.rs
 // Slowly, operations are being switched over to this new engine.
@@ -636,14 +636,18 @@ fn handle_constant_enum<'tcx>(
     // the enum in general
     if !oomir_data_types.contains_key(&base_enum_name) {
         let mut methods = HashMap::new();
-        methods.insert("getVariantIdx".to_string(), (oomir::Type::I32, None));
+        methods.insert(
+            "getVariantIdx".to_string(),
+            DataTypeMethod::SimpleConstantReturn(oomir::Type::I32, None),
+        );
         oomir_data_types.insert(
             base_enum_name.clone(),
-            oomir::DataType {
+            oomir::DataType::Class {
                 fields: vec![], // No fields in the abstract class
                 is_abstract: true,
                 methods,
                 super_class: None,
+                interfaces: vec![],
             },
         );
     }
@@ -660,7 +664,7 @@ fn handle_constant_enum<'tcx>(
         let mut methods = HashMap::new();
         methods.insert(
             "getVariantIdx".to_string(),
-            (
+            DataTypeMethod::SimpleConstantReturn(
                 oomir::Type::I32,
                 Some(oomir::Constant::I32(active_variant_idx.as_u32() as i32)),
             ),
@@ -668,11 +672,12 @@ fn handle_constant_enum<'tcx>(
 
         oomir_data_types.insert(
             variant_class_name.clone(),
-            oomir::DataType {
+            oomir::DataType::Class {
                 fields,
                 is_abstract: false,
                 methods,
                 super_class: Some(base_enum_name.clone()),
+                interfaces: vec![],
             },
         );
     }

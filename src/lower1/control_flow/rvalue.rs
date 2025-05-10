@@ -1,7 +1,7 @@
 use rustc_abi::FieldIdx;
 use rustc_middle::{
     mir::{BinOp, Body, BorrowKind as MirBorrowKind, Operand as MirOperand, Place, Rvalue, UnOp},
-    ty::{ConstKind, TyCtxt, TyKind, inherent::ValueConst},
+    ty::{ConstKind, TyCtxt, TyKind},
 };
 use std::collections::HashMap;
 
@@ -15,7 +15,7 @@ use super::{
         types::ty_to_oomir_type,
     },
     checked_ops::emit_checked_arithmetic_oomir_instructions,
-    oomir,
+    oomir::{self, DataTypeMethod},
 };
 
 use std::sync::atomic::{AtomicUsize, Ordering}; // For unique temp names
@@ -80,7 +80,7 @@ pub fn convert_rvalue_to_operand<'a>(
                         extract_number_from_operand(handle_const_value(
                             None,
                             tcx.valtree_to_const_val(val),
-                            &val.ty(),
+                            &val.ty,
                             tcx,
                             data_types,
                         ))
@@ -635,11 +635,12 @@ pub fn convert_rvalue_to_operand<'a>(
                         if !data_types.contains_key(&jvm_class_name) {
                             data_types.insert(
                                 jvm_class_name.clone(),
-                                oomir::DataType {
+                                oomir::DataType::Class {
                                     fields: oomir_fields,
                                     is_abstract: false,
                                     methods: HashMap::new(),
                                     super_class: None,
+                                    interfaces: vec![],
                                 },
                             );
                         }
@@ -705,14 +706,18 @@ pub fn convert_rvalue_to_operand<'a>(
                         // the enum in general
                         if !data_types.contains_key(&base_enum_name) {
                             let mut methods = HashMap::new();
-                            methods.insert("getVariantIdx".to_string(), (oomir::Type::I32, None));
+                            methods.insert(
+                                "getVariantIdx".to_string(),
+                                DataTypeMethod::SimpleConstantReturn(oomir::Type::I32, None),
+                            );
                             data_types.insert(
                                 base_enum_name.clone(),
-                                oomir::DataType {
+                                oomir::DataType::Class {
                                     fields: vec![], // No fields in the abstract class
                                     is_abstract: true,
                                     methods,
                                     super_class: None,
+                                    interfaces: vec![],
                                 },
                             );
                         }
@@ -730,7 +735,7 @@ pub fn convert_rvalue_to_operand<'a>(
                             let mut methods = HashMap::new();
                             methods.insert(
                                 "getVariantIdx".to_string(),
-                                (
+                                DataTypeMethod::SimpleConstantReturn(
                                     oomir::Type::I32,
                                     Some(oomir::Constant::I32(variant_idx.as_u32() as i32)),
                                 ),
@@ -738,11 +743,12 @@ pub fn convert_rvalue_to_operand<'a>(
 
                             data_types.insert(
                                 variant_class_name.clone(),
-                                oomir::DataType {
+                                oomir::DataType::Class {
                                     fields,
                                     is_abstract: false,
                                     methods,
                                     super_class: Some(base_enum_name.clone()),
+                                    interfaces: vec![],
                                 },
                             );
                         }
@@ -908,12 +914,12 @@ pub fn convert_rvalue_to_operand<'a>(
         Rvalue::CopyForDeref(place) => {
             // Need to get the value from the source place first
             let (temp_var_name, get_instructions, temp_var_type) =
-            emit_instructions_to_get_on_own(place, tcx, mir, data_types);
+                emit_instructions_to_get_on_own(place, tcx, mir, data_types);
             instructions.extend(get_instructions);
             result_operand = oomir::Operand::Variable {
                 name: temp_var_name,
                 ty: temp_var_type,
-            };        
+            };
         }
         // Handle other Rvalue variants by generating a placeholder
         _ => {

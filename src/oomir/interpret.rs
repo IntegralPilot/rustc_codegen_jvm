@@ -8,13 +8,24 @@ use std::str::FromStr; // Needed for parsing
 
 // --- Error Enum (Optional but Recommended) ---
 // Helps distinguish parsing errors from unsupported operations
-#[derive(Debug)]
 enum InterpretError {
     ParseBigInt(ParseBigIntError),
     ParseBigDecimal(ParseBigDecimalError),
     UnsupportedOperation,
     DivisionByZero,
     Overflow, // For lossy casts back to primitives if needed
+}
+
+impl std::fmt::Debug for InterpretError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InterpretError::ParseBigInt(e) => write!(f, "ParseBigIntError: {:?}", e),
+            InterpretError::ParseBigDecimal(e) => write!(f, "ParseBigDecimalError: {:?}", e),
+            InterpretError::UnsupportedOperation => write!(f, "UnsupportedOperation"),
+            InterpretError::DivisionByZero => write!(f, "DivisionByZero"),
+            InterpretError::Overflow => write!(f, "Overflow"),
+        }
+    }
 }
 
 impl From<ParseBigIntError> for InterpretError {
@@ -735,33 +746,6 @@ pub fn switch_constants(op: Constant, targets: Vec<(Constant, String)>) -> Optio
         }
     }
     None // No match found
-}
-
-// new_array_constant, length_constant, get_field_constant remain the same
-// as they don't involve arithmetic/comparison logic directly.
-
-pub fn new_array_constant(ty: Type, size: usize) -> Option<Constant> {
-    // Create a new array constant of the specified type and size
-    let default_val = match ty {
-        Type::I8 => Constant::I8(0),
-        Type::I16 => Constant::I16(0),
-        Type::I32 => Constant::I32(0),
-        Type::I64 => Constant::I64(0),
-        Type::F32 => Constant::F32(0.0),
-        Type::F64 => Constant::F64(0.0),
-        Type::Boolean => Constant::Boolean(false),
-        Type::Char => Constant::Char('\u{0000}'),
-        // TODO: How to represent default BigInt/BigDecimal? Null or zero?
-        // Let's use zero for now, assuming non-null elements
-        Type::Class(ref cn) if cn == "java/math/BigInteger" => bigint_to_constant(BigInt::zero()),
-        Type::Class(ref cn) if cn == "java/math/BigDecimal" => {
-            bigdecimal_to_constant(BigDecimal::zero())
-        }
-        // Other class types? Null or default constructor? Needs definition.
-        // For now, let's prevent array creation for unhandled types.
-        _ => return None, // Or handle null/default instances
-    };
-    Some(Constant::Array(Box::new(ty), vec![default_val; size]))
 }
 
 pub fn length_constant(array: Constant) -> Option<Constant> {

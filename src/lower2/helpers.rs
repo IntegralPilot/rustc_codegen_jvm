@@ -60,7 +60,8 @@ pub fn get_load_instruction(ty: &Type, index: u16) -> Result<Instruction, jvm::E
         | Type::MutableReference(_)
         | Type::Array(_)
         | Type::String
-        | Type::Class(_) => match index {
+        | Type::Class(_)
+        | Type::Interface(_) => match index {
             0 => Instruction::Aload_0,
             1 => Instruction::Aload_1,
             2 => Instruction::Aload_2,
@@ -142,7 +143,7 @@ pub fn get_store_instruction(ty: &Type, index: u16) -> Result<Instruction, jvm::
                 Instruction::Dstore_w(index)
             }
         }
-        Reference(_) | MutableReference(_) | Array(_) | String | Class(_) => {
+        Reference(_) | MutableReference(_) | Array(_) | String | Class(_) | Interface(_) => {
             if index <= 3 {
                 match index {
                     0 => Instruction::Astore_0,
@@ -272,6 +273,12 @@ pub fn get_cast_instructions(
             let core_idx = cp.add_class("org/rustlang/core/Core")?;
             let mref = cp.add_method_ref(core_idx, "fromShortArray", "([S)Ljava/lang/String;")?;
             return Ok(vec![Instruction::Invokestatic(mref)]);
+        }
+
+        if let Type::MutableReference(box inner) = src {
+            if dest == inner {
+                return Ok(vec![Instruction::Iconst_0, Instruction::Aaload]);
+            }
         }
 
         // Generic checkcast for all other reference-to-reference

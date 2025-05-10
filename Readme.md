@@ -32,7 +32,7 @@ All examples live in `tests/binary` and are compiled to JVM bytecode & run/teste
 - **[Collatz conjecture](tests/binary/collatz/src/main.rs)** verifier  
 - **[Large prime](tests/binary/primes/src/main.rs)** generator  
 - Use of nested data structures: enums, structs, tuples, arrays, slices (**[enums](tests/binary/enums/src/main.rs)**, **[structs](tests/binary/structs/src/main.rs)** - both tests use arrays and tuples)  
-* **[Implementation blocks](tests/binary/impl/src/main.rs)** and **[traits](tests/binary/traits/src/main.rs)**
+* **[Implementation blocks](tests/binary/impl/src/main.rs)** and **[traits](tests/binary/traits/src/main.rs)** (including dynamic dispatch!)
 - …and more!
 
 ---
@@ -52,7 +52,7 @@ All examples live in `tests/binary` and are compiled to JVM bytecode & run/teste
 - Executable `.jar` generation for binary crates  
 - Mutable borrowing, references, and dereferencing
 - Implementations for ADTs, including using and returning `self`, `&self`, `&mut self`
-- Traits!
+- Traits, including dynamic dispatch (`&dyn Trait`)
 - **Integration tests** for all features, in debug and release modes
 
 🚧 **Next Milestone:** Full support for the Rust `core` crate.
