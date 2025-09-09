@@ -21,6 +21,7 @@ extern crate rustc_metadata;
 extern crate rustc_middle;
 extern crate rustc_session;
 extern crate rustc_target;
+extern crate rustc_span;
 
 use oomir::{CodeBlock, Function, Operand, Type};
 use rustc_codegen_ssa::back::archive::{ArArchiveBuilder, ArchiveBuilder, ArchiveBuilderBuilder};
@@ -37,10 +38,13 @@ use rustc_middle::ty::TyCtxt;
 use rustc_session::{Session, config::OutputFilenames};
 use std::{any::Any, io::Write, path::Path};
 
+use misc::ToIdent;
+
 mod lower1;
 mod lower2;
 mod oomir;
 mod optimise1;
+mod misc;
 
 /// An instance of our Java bytecode codegen backend.
 struct MyBackend;
@@ -50,12 +54,7 @@ impl CodegenBackend for MyBackend {
         ""
     }
 
-    fn codegen_crate<'a>(
-        &self,
-        tcx: TyCtxt<'_>,
-        metadata: EncodedMetadata,
-        _need_metadata_module: bool,
-    ) -> Box<dyn Any> {
+    fn codegen_crate<'a>(&self, tcx: TyCtxt<'_>) -> Box<dyn Any> {
         let crate_name = tcx
             .crate_name(rustc_hir::def_id::CRATE_DEF_ID.to_def_id().krate)
             .to_string();
@@ -117,14 +116,21 @@ impl CodegenBackend for MyBackend {
                 };
                 let ident = lower1::place::make_jvm_safe(&ident);
                 let of_trait = match impl_a.of_trait {
-                    Some(trait_ref) => Some(lower1::place::make_jvm_safe(
-                        trait_ref.path.segments.last().unwrap().ident.as_str(),
+                    Some(trait_impl_header) => Some(lower1::place::make_jvm_safe(
+                        trait_impl_header
+                            .trait_ref
+                            .path
+                            .segments
+                            .last()
+                            .unwrap()
+                            .ident
+                            .as_str(),
                     )),
                     None => None,
                 };
                 for item in impl_a.items {
-                    let i = item.ident.as_str();
-                    let def_id = item.id.owner_id.to_def_id();
+                    let i = item.to_ident(tcx).to_string();
+                    let def_id = item.owner_id.to_def_id();
 
                     let instance = rustc_middle::ty::Instance::mono(tcx, def_id);
                     let mut mir = tcx.optimized_mir(instance.def_id()).clone(); // Clone the MIR
@@ -416,13 +422,13 @@ impl CodegenBackend for MyBackend {
                         }
                     }
                 }
-            } else if let rustc_hir::ItemKind::Trait(_, _, ident, _, _, item_refs) = item.kind {
+            } else if let rustc_hir::ItemKind::Trait(_, _, _, ident, _, _, item_refs) = item.kind {
                 let ident = lower1::place::make_jvm_safe(ident.as_str());
                 let mut fn_data = HashMap::new();
                 let mut new_functions = HashMap::new();
                 for item in item_refs {
-                    let name = item.ident.as_str().to_string();
-                    let def_id = item.id.owner_id.to_def_id(); // Get the DefId of the trait item (e.g., get_number)
+                    let name = item.to_ident(tcx).as_str().to_string();
+                    let def_id = item.owner_id.to_def_id(); // Get the DefId of the trait item (e.g., get_number)
                     let mir_sig = tcx.type_of(def_id).skip_binder().fn_sig(tcx);
 
                     let params_ty = mir_sig.inputs();
@@ -546,7 +552,7 @@ impl CodegenBackend for MyBackend {
         Box::new((
             bytecode,
             crate_name,
-            metadata,
+            // metadata,
             CrateInfo::new(tcx, "java_bytecode_basic_class".to_string()),
         ))
     }
@@ -559,11 +565,12 @@ impl CodegenBackend for MyBackend {
     ) -> (CodegenResults, FxIndexMap<WorkProductId, WorkProduct>) {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             // Update the downcast to expect a HashMap now.
-            let (bytecode_map, _, metadata, crate_info) = *ongoing_codegen
+            // panic!("{:#?}", ongoing_codegen.downcast::<std::collections::HashMap<String, Vec<u8>>>());
+            let (bytecode_map, _, crate_info) = *ongoing_codegen
                 .downcast::<(
                     std::collections::HashMap<String, Vec<u8>>,
                     String,
-                    EncodedMetadata,
+                    // EncodedMetadata,
                     CrateInfo,
                 )>()
                 .expect("in join_codegen: ongoing_codegen is not a bytecode map");
@@ -608,8 +615,8 @@ impl CodegenBackend for MyBackend {
             let codegen_results = CodegenResults {
                 modules: compiled_modules,
                 allocator_module: None,
-                metadata_module: None,
-                metadata,
+                // metadata_module: None,
+                // metadata,
                 crate_info,
             };
             (codegen_results, FxIndexMap::default())
@@ -617,10 +624,22 @@ impl CodegenBackend for MyBackend {
         .expect("Could not join_codegen")
     }
 
-    fn link(&self, sess: &Session, codegen_results: CodegenResults, outputs: &OutputFilenames) {
+    fn link(
+        &self,
+        sess: &Session,
+        codegen_results: CodegenResults,
+        metadata: EncodedMetadata,
+        outputs: &OutputFilenames,
+    ) {
         println!("linking!");
         use rustc_codegen_ssa::back::link::link_binary;
-        link_binary(sess, &RlibArchiveBuilder, codegen_results, outputs);
+        link_binary(
+            sess,
+            &RlibArchiveBuilder,
+            codegen_results,
+            metadata,
+            outputs,
+        );
     }
 }
 

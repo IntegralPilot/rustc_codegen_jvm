@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+java-locator = { version = "0.1.9", features = ["locate-jdk-only"] }
 regex = "1.11.1"
 ristretto_classfile = "0.17.0"
 tempfile = "3.19.1"

@@ -89,7 +89,7 @@ pub fn read_constant_value_from_memory<'tcx>(
             // Read the pointer scalar itself from the current allocation
             let ptr_range = AllocRange {
                 start: offset,
-                size: tcx.data_layout.pointer_size,
+                size: tcx.data_layout.pointer_size(),
             };
             let scalar = allocation
                 .read_scalar(&tcx.data_layout, ptr_range, false)
@@ -100,7 +100,7 @@ pub fn read_constant_value_from_memory<'tcx>(
 
             match scalar {
                 Scalar::Ptr(ptr, _) => {
-                    let (inner_alloc_id, inner_offset) = ptr.into_parts();
+                    let (inner_alloc_id, inner_offset) = ptr.into_raw_parts();
                     match tcx.global_alloc(inner_alloc_id.get_alloc_id().unwrap()) {
                         // Assuming AllocId implements Copy
                         GlobalAlloc::Memory(inner_const_alloc) => {
@@ -134,6 +134,9 @@ pub fn read_constant_value_from_memory<'tcx>(
                             // Err(ConstReadError::UnsupportedType("Pointer to Static".to_string()))
                         }
                         GlobalAlloc::VTable(..) => Err("Unsupported type: VTable".to_string()),
+                        GlobalAlloc::TypeId { ty: _ } => {
+                            Err("Unsupported type: TypeId".to_string())
+                        }
                     }
                 }
                 Scalar::Int(scalar) => Ok(scalar_int_to_oomir_constant(scalar, &ty)),
@@ -361,7 +364,7 @@ fn handle_constant_enum<'tcx>(
             let tag_size = tag_scalar_layout.size(&tcx.data_layout); // Get size from Scalar layout
 
             // 1b. Find the offset of the tag field within the enum's overall layout.
-            let tag_offset_in_enum = layout.fields.offset(*tag_field);
+            let tag_offset_in_enum = layout.fields.offset((*tag_field).into());
             let absolute_tag_offset = offset + tag_offset_in_enum;
             let absolute_tag_range = AllocRange {
                 start: absolute_tag_offset,
@@ -375,7 +378,7 @@ fn handle_constant_enum<'tcx>(
                 tag_size,
                 absolute_tag_offset,
                 tag_offset_in_enum,
-                tag_field
+                usize::from(*tag_field)
             );
 
             // 1c. Read the tag value from memory (could be Int or Ptr)
@@ -463,15 +466,15 @@ fn handle_constant_enum<'tcx>(
                         }
                         Scalar::Ptr(ptr, _meta) => {
                             // Pointer size must match tag size for niche encoding
-                            if tag_size != tcx.data_layout.pointer_size {
+                            if tag_size != tcx.data_layout.pointer_size() {
                                 return Err(format!(
                                     "Niche pointer tag size mismatch for {:?}: pointer size is {:?}, but tag size is {:?}",
-                                    enum_ty, tcx.data_layout.pointer_size, tag_size
+                                    enum_ty, tcx.data_layout.pointer_size(), tag_size
                                 ));
                             }
                             // Use the address part of the pointer for comparison.
                             // The address is usually u64, safely convert to u128.
-                            ptr.into_parts().1.bytes() as u128
+                            ptr.into_raw_parts().1.bytes() as u128
                         }
                     };
                     println!("Debug: Read Niche value bits: {:#x}", read_value_bits);
