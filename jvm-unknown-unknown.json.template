@@ -17,6 +17,6 @@
     "tier": 3
   },
   "panic-strategy": "abort",
-  "target-pointer-width": "32",
+  "target-pointer-width": 32,
   "llvm-target": "jvm-unknown-unknown"
 }

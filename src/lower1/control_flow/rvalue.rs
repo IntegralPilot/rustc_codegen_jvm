@@ -200,26 +200,6 @@ pub fn convert_rvalue_to_operand<'a>(
             }
         }
 
-        Rvalue::Len(source_place) => {
-            let temp_len_var = generate_temp_var_name(&base_temp_name);
-            let source_name = place_to_string(source_place, tcx);
-            instructions.push(oomir::Instruction::Length {
-                dest: temp_len_var.clone(),
-                array: oomir::Operand::Variable {
-                    name: source_name,
-                    ty: ty_to_oomir_type(
-                        source_place.ty(&mir.local_decls, tcx).ty,
-                        tcx,
-                        data_types,
-                    ),
-                },
-            });
-            result_operand = oomir::Operand::Variable {
-                name: temp_len_var,
-                ty: oomir::Type::I32,
-            };
-        }
-
         Rvalue::Cast(_cast_kind, operand, target_mir_ty) => {
             let temp_cast_var = generate_temp_var_name(&base_temp_name);
             let oomir_target_type = ty_to_oomir_type(*target_mir_ty, tcx, data_types);

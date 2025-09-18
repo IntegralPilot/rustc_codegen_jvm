@@ -8,3 +8,9 @@ fn main() {
 
 #[lang = "sized"]
 trait Sized {}
+
+#[lang = "meta_sized"]
+trait MetaSized {}
+
+#[lang = "pointee_sized"]
+trait PointeeSized {}
