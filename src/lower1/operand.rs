@@ -120,7 +120,7 @@ pub fn convert_operand<'tcx>(
 
 pub fn handle_const_value<'tcx>(
     constant: Option<&ConstOperand>,
-    const_val: ConstValue<'tcx>,
+    const_val: ConstValue,
     ty: &Ty<'tcx>,
     tcx: TyCtxt<'tcx>,
     data_types: &mut HashMap<String, oomir::DataType>,
@@ -309,7 +309,7 @@ pub fn handle_const_value<'tcx>(
                                                         Ok(elem_layout) => {
                                                             // Sanity check: element layout should be a fat pointer
                                                             let pointer_size =
-                                                                tcx.data_layout.pointer_size;
+                                                                tcx.data_layout.pointer_size();
                                                             let expected_elem_size = pointer_size
                                                                 .checked_mul(2, &tcx.data_layout)
                                                                 .expect(
@@ -388,7 +388,7 @@ pub fn handle_const_value<'tcx>(
                                                                                 .provenance
                                                                                 .alloc_id();
                                                                         let (_, final_offset) =
-                                                                            data_ptr.into_parts();
+                                                                            data_ptr.into_raw_parts();
 
                                                                         // Get the final allocation containing the string bytes
                                                                         match tcx.global_alloc(final_alloc_id.get_alloc_id().unwrap()) {
@@ -510,7 +510,7 @@ pub fn handle_const_value<'tcx>(
                                                 match read_constant_value_from_memory(
                                                     tcx,
                                                     allocation,
-                                                    pointer.into_parts().1,
+                                                    pointer.into_raw_parts().1,
                                                     *inner_ty,
                                                     data_types,
                                                 ) {
@@ -593,7 +593,7 @@ pub fn handle_const_value<'tcx>(
                                         };
 
                                         // Read the inner pointer scalar from the current allocation (`allocation`)
-                                        let pointer_size = tcx.data_layout.pointer_size;
+                                        let pointer_size = tcx.data_layout.pointer_size();
                                         let inner_ptr_range = AllocRange {
                                             start: rustc_abi::Size::ZERO,
                                             size: pointer_size,
@@ -608,7 +608,7 @@ pub fn handle_const_value<'tcx>(
                                             Ok(Scalar::Ptr(inner_ptr, _)) => {
                                                 // Successfully read the inner pointer. Now find where it points.
                                                 let (final_alloc_id, final_offset) =
-                                                    inner_ptr.into_parts(); // Get AllocId and offset
+                                                    inner_ptr.into_raw_parts(); // Get AllocId and offset
 
                                                 // Get the final allocation containing the actual value (e.g., the u8)
                                                 match tcx.global_alloc(
@@ -1000,7 +1000,7 @@ pub fn handle_const_value<'tcx>(
                                         match read_constant_value_from_memory(
                                             tcx,
                                             allocation,
-                                            pointer.into_parts().1,
+                                            pointer.into_raw_parts().1,
                                             *inner_ty,
                                             data_types,
                                         ) {
@@ -1032,7 +1032,7 @@ pub fn handle_const_value<'tcx>(
                                         match read_constant_value_from_memory(
                                             tcx,
                                             allocation,
-                                            pointer.into_parts().1,
+                                            pointer.into_raw_parts().1,
                                             *inner_ty,
                                             data_types,
                                         ) {
@@ -1062,7 +1062,7 @@ pub fn handle_const_value<'tcx>(
                                         match read_constant_value_from_memory(
                                             tcx,
                                             allocation,
-                                            pointer.into_parts().1,
+                                            pointer.into_raw_parts().1,
                                             *inner_ty,
                                             data_types,
                                         ) {
@@ -1089,7 +1089,7 @@ pub fn handle_const_value<'tcx>(
                                         match read_constant_value_from_memory(
                                             tcx,
                                             allocation,
-                                            pointer.into_parts().1, // Offset within the allocation
+                                            pointer.into_raw_parts().1, // Offset within the allocation
                                             *inner_ty,              // The tuple type itself
                                             data_types,
                                         ) {
@@ -1135,7 +1135,7 @@ pub fn handle_const_value<'tcx>(
                 }
             }
         }
-        ConstValue::Slice { data: _, meta: _ } => {
+        ConstValue::Slice { alloc_id: _, meta: _ } => {
             let is_str_slice_or_ref = match ty.kind() {
                 TyKind::Str | TyKind::Slice(_) => true, // Direct str or slice type
                 TyKind::Ref(_, inner_ty, _) => inner_ty.is_str() || inner_ty.is_slice(), // Reference to str or slice

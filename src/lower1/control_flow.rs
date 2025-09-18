@@ -443,6 +443,9 @@ pub fn convert_basic_block<'tcx>(
                     rustc_middle::mir::AssertKind::ResumedAfterDrop(_) => {
                         "ResumedAfterDrop".to_string()
                     }
+                    rustc_middle::mir::AssertKind::InvalidEnumConstruction(_) => {
+                        "InvalidEnumConstruction".to_string()
+                    }
                 };
 
                 let fail_instructions = vec![oomir::Instruction::ThrowNewWithMessage {

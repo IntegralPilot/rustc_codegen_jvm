@@ -125,7 +125,7 @@ clean-gen-files:
 # === Vendoring of R8 ===
 vendor-r8:
 	@echo "$(CYAN)📦 Vendoring R8...$(RESET)"
-	mkdir -p ./vendor && curl -L -o ./vendor/r8.jar https://maven.google.com/com/android/tools/r8/8.9.35/r8-8.9.35.jar
+	mkdir -p ./vendor && curl -L -o ./vendor/r8.jar https://maven.google.com/com/android/tools/r8/8.11.18/r8-8.11.18.jar
 	@echo "$(CYAN)📦 R8 vendored!$(RESET)"
 
 clean-vendor-r8:

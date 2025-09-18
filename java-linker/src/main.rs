@@ -1,9 +1,10 @@
 use std::env;
 use std::fs;
+use std::fs::rename;
 use std::io::{self, BufReader, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::fs::rename;
+use std::str::FromStr;
 
 use regex::Regex;
 use ristretto_classfile::{ClassFile, MethodAccessFlags};
@@ -35,8 +36,16 @@ fn main() -> Result<(), i32> {
     let mut r8_jar_path: Option<PathBuf> = None;
     let mut proguard_config_path: Option<PathBuf> = None;
     let mut release_mode = false; // Default to false, can be set by a flag
-    let java_lib_path: Option<PathBuf> = env::var("JAVA_HOME").ok().map(PathBuf::from);
-
+    let java_lib_path: Option<PathBuf> = if let Ok(java_home) = java_locator::locate_java_home() {
+        let path = PathBuf::from(java_home);
+        println!("Using java found at: {}", path.to_string_lossy());
+        Some(path)
+    } else if let Some(java_home) = env::var("JAVA_HOME").ok().map(PathBuf::from) {
+        println!("Using java found at: {}", java_home.to_string_lossy());
+        Some(java_home)
+    } else {
+        None
+    };
 
     // --- Argument Parsing (Modified) ---
     let mut i = 1;
@@ -76,26 +85,30 @@ fn main() -> Result<(), i32> {
             release_mode = true; // Set release mode
             i += 1;
         } else if !arg.starts_with('-') {
-             // Collect potential input files, differentiating classes and JARs
-             if arg.ends_with(".class") {
-                 input_class_files.push(arg.clone());
-                 i += 1;
-             } else if arg.ends_with(".jar") {
-                 input_jar_files.push(arg.clone());
-                 i += 1;
-             } else {
-                 // If it's not a flag and not a recognized input type, warn or error
-                 eprintln!("Warning: Ignoring unrecognized argument: {}", arg);
-                 i += 1; // Move to the next argument
-             }
+            // Collect potential input files, differentiating classes and JARs
+            if arg.ends_with(".class") {
+                input_class_files.push(arg.clone());
+                i += 1;
+            } else if arg.ends_with(".jar") {
+                input_jar_files.push(arg.clone());
+                i += 1;
+            } else {
+                // If it's not a flag and not a recognized input type, warn or error
+                eprintln!("Warning: Ignoring unrecognized argument: {}", arg);
+                i += 1; // Move to the next argument
+            }
         } else {
-             eprintln!("Warning: Ignoring unknown or unused flag: {}", arg);
-             i += 1;
+            eprintln!("Warning: Ignoring unknown or unused flag: {}", arg);
+            i += 1;
         }
     }
 
     // Combine inputs for scanning, but keep them separate for create_jar
-    let all_input_paths: Vec<String> = input_class_files.iter().cloned().chain(input_jar_files.iter().cloned()).collect();
+    let all_input_paths: Vec<String> = input_class_files
+        .iter()
+        .cloned()
+        .chain(input_jar_files.iter().cloned())
+        .collect();
 
     if all_input_paths.is_empty() {
         eprintln!("Error: No input files (.class or .jar) provided.");
@@ -103,9 +116,7 @@ fn main() -> Result<(), i32> {
     }
 
     let output_file_path = match output_file {
-        Some(path) => {
-            path
-        }
+        Some(path) => path,
         None => {
             eprintln!("Error: Output file (-o) not specified.");
             return Err(1);
@@ -114,15 +125,14 @@ fn main() -> Result<(), i32> {
 
     // --- Validation for R8 flags ---
     if r8_jar_path.is_some() != proguard_config_path.is_some() {
-         eprintln!("Error: --r8-jar and --proguard-config must be used together.");
-         return Err(1);
+        eprintln!("Error: --r8-jar and --proguard-config must be used together.");
+        return Err(1);
     }
 
     if r8_jar_path.is_some() && java_lib_path.is_none() {
-         eprintln!("Error: JAVA_HOME environment variable must be set when using R8.");
-         return Err(1);
+        eprintln!("Error: JAVA_HOME environment variable must be set when using R8.");
+        return Err(1);
     }
-
 
     // Validate R8 JAR, config file, and Java lib paths if provided
     if let Some(ref p) = r8_jar_path {
@@ -133,30 +143,37 @@ fn main() -> Result<(), i32> {
     }
     if let Some(ref c) = proguard_config_path {
         if !c.exists() || !c.is_file() {
-            eprintln!("Error: ProGuard/R8 config not found or not a file: {}", c.display());
+            eprintln!(
+                "Error: ProGuard/R8 config not found or not a file: {}",
+                c.display()
+            );
             return Err(1);
         }
     }
-     if r8_jar_path.is_some() { // Only check java_lib_path if R8 is used
-         if let Some(ref j) = java_lib_path {
+    if r8_jar_path.is_some() {
+        // Only check java_lib_path if R8 is used
+        if let Some(ref j) = java_lib_path {
             if !j.exists() {
-                eprintln!("Error: Derived Java library path not found: {}. Check JAVA_HOME.", j.display());
+                eprintln!(
+                    "Error: Derived Java library path not found: {}. Check JAVA_HOME.",
+                    j.display()
+                );
                 return Err(1);
             }
         } else {
-             // This case was already handled above, but added for clarity
-             eprintln!("Error: Could not derive Java library path from JAVA_HOME (required for R8).");
-             return Err(1);
+            // This case was already handled above, but added for clarity
+            eprintln!(
+                "Error: Could not derive Java library path from JAVA_HOME (required for R8)."
+            );
+            return Err(1);
         }
-     }
-
+    }
 
     // Find main class (scan both .class and .jar inputs)
-    let main_classes = find_main_classes_with_ristretto(&all_input_paths)
-        .map_err(|e| {
-            eprintln!("Error during main class scan: {}", e);
-            1
-        })?;
+    let main_classes = find_main_classes_with_ristretto(&all_input_paths).map_err(|e| {
+        eprintln!("Error during main class scan: {}", e);
+        1
+    })?;
     // --- Main class handling remains the same ---
     if main_classes.len() > 1 {
         eprintln!("Error: Multiple entry-point classes found:");
@@ -168,7 +185,6 @@ fn main() -> Result<(), i32> {
     }
     let main_class_name = main_classes.into_iter().next();
 
-
     // Create the JAR (pass separated inputs)
     create_jar(
         &input_class_files,
@@ -179,7 +195,8 @@ fn main() -> Result<(), i32> {
         proguard_config_path.as_deref(),
         java_lib_path.as_deref(),
         release_mode,
-    ).map_err(|e| {
+    )
+    .map_err(|e| {
         eprintln!("Error creating JAR file: {}", e);
         1 // Propagate error code
     })?;
@@ -262,10 +279,10 @@ fn find_main_classes_with_ristretto(input_files: &[String]) -> io::Result<Vec<St
                                                 main_method_descriptor,
                                             ) {
                                                 Ok(Some(class_name)) => {
-                                                   // println!(
-                                                   //     "  Found main method in: {} (within {})",
-                                                   //     class_name, entry_name
-                                                   // );
+                                                    // println!(
+                                                    //     "  Found main method in: {} (within {})",
+                                                    //     class_name, entry_name
+                                                    // );
                                                     main_classes.push(class_name);
                                                 }
                                                 Ok(None) => {}
@@ -315,7 +332,8 @@ fn check_class_data_for_main(
 ) -> io::Result<Option<String>> {
     let class_file = match ClassFile::from_bytes(&mut Cursor::new(data.to_vec())) {
         Ok(cf) => cf,
-        Err(_e) => { // Ignore parse error details for this check
+        Err(_e) => {
+            // Ignore parse error details for this check
             // Treat parse failure as "no main method found in this file"
             // eprintln!("Debug (check_class_data): Parse error: {}", e); // Optional debug
             return Ok(None);
@@ -326,19 +344,32 @@ fn check_class_data_for_main(
         let flags = &method.access_flags;
         if flags.contains(MethodAccessFlags::PUBLIC) && flags.contains(MethodAccessFlags::STATIC) {
             // Avoid panics if constant pool is malformed, treat as not found
-            let name = class_file.constant_pool.try_get_utf8(method.name_index).ok().cloned();
-            let descriptor = class_file.constant_pool.try_get_utf8(method.descriptor_index).ok().cloned();
-
+            let name = class_file
+                .constant_pool
+                .try_get_utf8(method.name_index)
+                .ok()
+                .cloned();
+            let descriptor = class_file
+                .constant_pool
+                .try_get_utf8(method.descriptor_index)
+                .ok()
+                .cloned();
 
             if let (Some(n), Some(d)) = (name, descriptor) {
-                 if n == main_method_name && d == main_method_descriptor {
+                if n == main_method_name && d == main_method_descriptor {
                     return match class_file.class_name() {
                         Ok(class_name_ref) => Ok(Some(class_name_ref.replace('/', "."))),
                         Err(e) => {
-                             eprintln!("Warning (check_class_data): Found main method but failed to get class name: {}", e);
-                             Err(io::Error::new(
+                            eprintln!(
+                                "Warning (check_class_data): Found main method but failed to get class name: {}",
+                                e
+                            );
+                            Err(io::Error::new(
                                 io::ErrorKind::InvalidData,
-                                format!("Failed to get class name after finding main method: {}", e),
+                                format!(
+                                    "Failed to get class name after finding main method: {}",
+                                    e
+                                ),
                             ))
                         }
                     };
@@ -349,7 +380,6 @@ fn check_class_data_for_main(
     Ok(None)
 }
 
-
 // --- create_jar ---
 fn create_jar(
     input_class_files: &[String], // Separate .class files
@@ -359,7 +389,7 @@ fn create_jar(
     r8_jar_path: Option<&Path>,
     proguard_config_path: Option<&Path>,
     java_lib_path: Option<&Path>, // Base Java runtime lib path
-    release_mode: bool
+    release_mode: bool,
 ) -> io::Result<()> {
     // Regex for stripping cargo hashes from .class filenames
     let re_strip_hash = Regex::new(r"^(?P<name>[^-]+)(?:-[0-9a-fA-F]+)?\.class$").unwrap();
@@ -371,29 +401,41 @@ fn create_jar(
     for path_str in input_class_files {
         let path = Path::new(path_str);
         if !path.exists() {
-             eprintln!("Warning (create_jar): Input class path does not exist: {}. Skipping.", path_str);
-             continue;
+            eprintln!(
+                "Warning (create_jar): Input class path does not exist: {}. Skipping.",
+                path_str
+            );
+            continue;
         }
-         if !path.is_file() {
-             eprintln!("Warning (create_jar): Input class path is not a file: {}. Skipping.", path_str);
-             continue;
-         }
+        if !path.is_file() {
+            eprintln!(
+                "Warning (create_jar): Input class path is not a file: {}. Skipping.",
+                path_str
+            );
+            continue;
+        }
 
-         let file_name_os = path.file_name().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("Invalid class file path: {}", path_str)))?;
-         let file_name = file_name_os.to_string_lossy();
+        let file_name_os = path.file_name().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Invalid class file path: {}", path_str),
+            )
+        })?;
+        let file_name = file_name_os.to_string_lossy();
 
-         // Use the regex to get the base name, default to full name if no match
-         let base_name = re_strip_hash.captures(&file_name)
-             .and_then(|caps| caps.name("name").map(|m| format!("{}.class", m.as_str())))
-             .unwrap_or_else(|| file_name.to_string());
+        // Use the regex to get the base name, default to full name if no match
+        let base_name = re_strip_hash
+            .captures(&file_name)
+            .and_then(|caps| caps.name("name").map(|m| format!("{}.class", m.as_str())))
+            .unwrap_or_else(|| file_name.to_string());
 
-         let jar_entry_name = base_name;
+        let jar_entry_name = base_name;
 
-         let data = fs::read(path)?;
-         app_classes.push(ClassInfo {
-             jar_entry_name,
-             data,
-         });
+        let data = fs::read(path)?;
+        app_classes.push(ClassInfo {
+            jar_entry_name,
+            data,
+        });
     }
 
     // Convert input JAR file strings to PathBufs for R8
@@ -404,16 +446,20 @@ fn create_jar(
         // If no loose classes and no R8, maybe we just need to copy/add manifest to a single input JAR?
         // This case is less likely when used by rustc. For now, error if no app classes.
         // Consider handling the "just add manifest to single input jar" case if needed.
-         if library_jar_paths.len() == 1 && main_class_name.is_some() {
-             println!("Warning: No loose .class files found. Adding manifest to the single input JAR.");
-             let input_jar = &library_jar_paths[0];
-             add_manifest_to_jar(input_jar, Path::new(final_output_jar_path), main_class_name)?;
-             return Ok(()); // Successfully added manifest
-         } else {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "No input .class files found to process."));
-         }
+        if library_jar_paths.len() == 1 && main_class_name.is_some() {
+            println!(
+                "Warning: No loose .class files found. Adding manifest to the single input JAR."
+            );
+            let input_jar = &library_jar_paths[0];
+            add_manifest_to_jar(input_jar, Path::new(final_output_jar_path), main_class_name)?;
+            return Ok(()); // Successfully added manifest
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "No input .class files found to process.",
+            ));
+        }
     }
-
 
     // --- Use a temporary directory ---
     let temp_dir = tempdir()?;
@@ -434,18 +480,24 @@ fn create_jar(
             zip_writer.write_all(&class_info.data)?;
         }
         zip_writer.finish()?;
-        println!("Intermediate JAR created at: {}", intermediate_jar_path.display());
+        println!(
+            "Intermediate JAR created at: {}",
+            intermediate_jar_path.display()
+        );
     } else {
-        println!("No loose application .class files found; intermediate JAR will be empty or skipped.");
+        println!(
+            "No loose application .class files found; intermediate JAR will be empty or skipped."
+        );
         // If app_classes is empty, intermediate_jar_path won't exist. Handle this later.
     }
-
 
     // --- Stage 3: Optional R8 Optimization ---
     // This variable will hold the path to the JAR that needs the manifest added.
     let mut jar_to_add_manifest_to: Option<PathBuf> = None;
 
-    if let (Some(r8_jar), Some(config), Some(lib)) = (r8_jar_path, proguard_config_path, java_lib_path) {
+    if let (Some(r8_jar), Some(config), Some(lib)) =
+        (r8_jar_path, proguard_config_path, java_lib_path)
+    {
         println!("Running R8 optimizer...");
         let optimized_jar_path = temp_dir_path.join("optimized.jar");
 
@@ -454,28 +506,36 @@ fn create_jar(
         // but usually, you need program input. This scenario needs clarification.
         // For now, we require the intermediate JAR to exist if R8 is run.
         if !intermediate_jar_path.exists() && !app_classes.is_empty() {
-             // This shouldn't happen if app_classes wasn't empty, indicates an issue above.
-             return Err(io::Error::new(io::ErrorKind::Other, "Intermediate JAR creation failed unexpectedly."));
+            // This shouldn't happen if app_classes wasn't empty, indicates an issue above.
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "Intermediate JAR creation failed unexpectedly.",
+            ));
         } else if app_classes.is_empty() {
             // What should happen if R8 is requested but there are no application classes?
             // Maybe R8 is just used to process/shrink the libraries themselves based on config?
             // R8 usually requires program input. Let's error for now.
             eprintln!("Error: R8 requested, but no input .class files were provided to process.");
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "R8 requires program input (.class files)."));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "R8 requires program input (.class files).",
+            ));
         }
-
 
         match run_r8_optimizer(
             r8_jar,
             config,
-            lib, // Java runtime lib
+            lib,                    // Java runtime lib
             &intermediate_jar_path, // Program input
-            &library_jar_paths, // Additional libs
-            &optimized_jar_path, // Output
-            release_mode, // Release mode flag
+            &library_jar_paths,     // Additional libs
+            &optimized_jar_path,    // Output
+            release_mode,           // Release mode flag
         ) {
             Ok(_) => {
-                println!("R8 optimization successful. Output: {}", optimized_jar_path.display());
+                println!(
+                    "R8 optimization successful. Output: {}",
+                    optimized_jar_path.display()
+                );
                 jar_to_add_manifest_to = Some(optimized_jar_path); // Use the optimized JAR
             }
             Err(e) => {
@@ -484,7 +544,10 @@ fn create_jar(
                 eprintln!("\n--- R8 FAILED ---");
                 eprintln!("R8 optimization failed. Intermediate files preserved for inspection.");
                 if intermediate_jar_path.exists() {
-                    eprintln!("Intermediate Input JAR: {}", intermediate_jar_path.display());
+                    eprintln!(
+                        "Intermediate Input JAR: {}",
+                        intermediate_jar_path.display()
+                    );
                 }
                 eprintln!("Input Libraries:");
                 for lib_jar in &library_jar_paths {
@@ -495,7 +558,11 @@ fn create_jar(
                 eprintln!("-------------------\n");
                 return Err(io::Error::new(
                     e.kind(),
-                    format!("R8 optimization failed (intermediate files preserved at {}): {}", preserved_path.display(), e),
+                    format!(
+                        "R8 optimization failed (intermediate files preserved at {}): {}",
+                        preserved_path.display(),
+                        e
+                    ),
                 ));
             }
         }
@@ -505,16 +572,25 @@ fn create_jar(
         if intermediate_jar_path.exists() {
             jar_to_add_manifest_to = Some(intermediate_jar_path); // Use the unoptimized app JAR
         } else if library_jar_paths.len() == 1 {
-             // No app classes, no R8, one input JAR -> just add manifest to it (handled earlier, but double-check)
-             println!("Warning: No loose classes and no R8. Will add manifest to the single input JAR: {}", library_jar_paths[0].display());
-             // The actual addition happens below using jar_to_add_manifest_to = None logic
-             jar_to_add_manifest_to = None; // Signal that we need to use the input lib jar directly
+            // No app classes, no R8, one input JAR -> just add manifest to it (handled earlier, but double-check)
+            println!(
+                "Warning: No loose classes and no R8. Will add manifest to the single input JAR: {}",
+                library_jar_paths[0].display()
+            );
+            // The actual addition happens below using jar_to_add_manifest_to = None logic
+            jar_to_add_manifest_to = None; // Signal that we need to use the input lib jar directly
         } else if library_jar_paths.is_empty() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "No input .class or .jar files specified."));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "No input .class or .jar files specified.",
+            ));
         } else {
-             // Multiple library JARs, no app classes, no R8. What should happen? Merge them? Error?
-             // Let's error for now, as the intended output is unclear.
-             return Err(io::Error::new(io::ErrorKind::InvalidInput, "Multiple input JARs provided without .class files or R8 processing. Cannot determine output structure."));
+            // Multiple library JARs, no app classes, no R8. What should happen? Merge them? Error?
+            // Let's error for now, as the intended output is unclear.
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Multiple input JARs provided without .class files or R8 processing. Cannot determine output structure.",
+            ));
         }
     };
 
@@ -525,12 +601,15 @@ fn create_jar(
         Some(path) => path, // Use the R8 output or the intermediate JAR
         None => {
             // This path is taken if no R8 and no app classes, implying we use the single input library JAR
-             if library_jar_paths.len() == 1 {
-                 library_jar_paths[0].clone()
-             } else {
-                 // This state should have been caught earlier
-                 return Err(io::Error::new(io::ErrorKind::Other, "Internal error: Ambiguous source JAR for manifest."));
-             }
+            if library_jar_paths.len() == 1 {
+                library_jar_paths[0].clone()
+            } else {
+                // This state should have been caught earlier
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "Internal error: Ambiguous source JAR for manifest.",
+                ));
+            }
         }
     };
 
@@ -540,8 +619,10 @@ fn create_jar(
         &final_jar_temp_path,
         main_class_name,
     )?;
-    println!("Manifest added. Temporary final JAR at: {}", final_jar_temp_path.display());
-
+    println!(
+        "Manifest added. Temporary final JAR at: {}",
+        final_jar_temp_path.display()
+    );
 
     // --- Stage 5: Move final JAR to destination ---
     if let Some(parent_dir) = Path::new(final_output_jar_path).parent() {
@@ -550,28 +631,36 @@ fn create_jar(
     match rename(&final_jar_temp_path, final_output_jar_path) {
         Ok(_) => {
             //println!("Moved temporary JAR to final destination.");
-        },
+        }
         Err(e) => {
             // Error cross-device link might occur, fall back to copy
             if e.kind() == io::ErrorKind::CrossesDevices {
-                 eprintln!("Warning: Failed to rename temporary JAR across devices ({}). Attempting copy.", e);
-                 fs::copy(&final_jar_temp_path, final_output_jar_path)?;
-                 println!("Copied temporary JAR to final destination.");
-                 // We might want to manually clean up the source temp file after copy, but tempdir should handle it on drop.
+                eprintln!(
+                    "Warning: Failed to rename temporary JAR across devices ({}). Attempting copy.",
+                    e
+                );
+                fs::copy(&final_jar_temp_path, final_output_jar_path)?;
+                println!("Copied temporary JAR to final destination.");
+                // We might want to manually clean up the source temp file after copy, but tempdir should handle it on drop.
             } else {
-                 eprintln!("Error: Failed to move temporary JAR to final destination: {}", e);
-                 // Preserve the temp dir for inspection
-                 let preserved_path = temp_dir.into_path();
-                 eprintln!("Temporary JAR preserved at: {}", final_jar_temp_path.display());
-                 eprintln!("Preserved Directory: {}", preserved_path.display());
-                 return Err(e);
+                eprintln!(
+                    "Error: Failed to move temporary JAR to final destination: {}",
+                    e
+                );
+                // Preserve the temp dir for inspection
+                let preserved_path = temp_dir.into_path();
+                eprintln!(
+                    "Temporary JAR preserved at: {}",
+                    final_jar_temp_path.display()
+                );
+                eprintln!("Preserved Directory: {}", preserved_path.display());
+                return Err(e);
             }
         }
     }
 
     Ok(())
 }
-
 
 // --- add_manifest_to_jar remains the same ---
 fn add_manifest_to_jar(
@@ -608,7 +697,7 @@ fn add_manifest_to_jar(
 
         // Skip the existing manifest directory entry and file entry
         if entry_name == "META-INF/" || entry_name == "META-INF/MANIFEST.MF" {
-             //println!("Debug: Skipping existing manifest entry: {}", entry_name);
+            //println!("Debug: Skipping existing manifest entry: {}", entry_name);
             continue;
         }
 
@@ -639,17 +728,16 @@ fn create_manifest_content(main_class_name: Option<&str>) -> String {
     manifest
 }
 
-
 // --- run_r8_optimizer (Modified) ---
 /// Executes the R8 optimizer using `java -cp r8.jar com.android.tools.r8.R8 ...`.
 fn run_r8_optimizer(
-    r8_jar_path: &Path,             // Path to r8.jar
-    proguard_config_path: &Path,    // Path to R8/ProGuard config file
-    java_runtime_lib_path: &Path,   // Path to base Java runtime library (e.g., rt.jar or jmods)
-    program_input_jar_path: &Path,  // The intermediate JAR with app classes
+    r8_jar_path: &Path,            // Path to r8.jar
+    proguard_config_path: &Path,   // Path to R8/ProGuard config file
+    java_runtime_lib_path: &Path,  // Path to base Java runtime library (e.g., rt.jar or jmods)
+    program_input_jar_path: &Path, // The intermediate JAR with app classes
     library_jar_paths: &[PathBuf], // List of other input JARs (dependencies)
-    output_jar_path: &Path,         // Where R8 should write the optimized JAR
-    release_mode: bool,             // Release mode flag
+    output_jar_path: &Path,        // Where R8 should write the optimized JAR
+    release_mode: bool,            // Release mode flag
 ) -> io::Result<()> {
     println!("--- Running R8 ---");
     println!("  R8 JAR: {}", r8_jar_path.display());
@@ -666,18 +754,18 @@ fn run_r8_optimizer(
     let r8_main_class = "com.android.tools.r8.R8";
 
     let mut cmd = Command::new("java");
-    cmd.arg("-cp")                     // Use classpath option
-       .arg(r8_jar_path)               // Provide path to r8.jar
-       .arg(r8_main_class)             // Specify the main class to run
-       // --- R8 specific arguments ---
-       .arg("--output")                // Specify output path
-       .arg(output_jar_path)
-       .arg("--pg-conf")               // Specify ProGuard/R8 config file
-       .arg(proguard_config_path)
-       // Add the base Java runtime library
-       .arg("--lib")
-       .arg(java_runtime_lib_path)
-       .arg("--classfile");
+    cmd.arg("-cp") // Use classpath option
+        .arg(r8_jar_path) // Provide path to r8.jar
+        .arg(r8_main_class) // Specify the main class to run
+        // --- R8 specific arguments ---
+        .arg("--output") // Specify output path
+        .arg(output_jar_path)
+        .arg("--pg-conf") // Specify ProGuard/R8 config file
+        .arg(proguard_config_path)
+        // Add the base Java runtime library
+        .arg("--lib")
+        .arg(java_runtime_lib_path)
+        .arg("--classfile");
 
     // Add all the *other* input JARs as libraries
     for lib_path in library_jar_paths {
@@ -691,11 +779,13 @@ fn run_r8_optimizer(
     // Add the program input JAR (containing app classes) last
     cmd.arg(program_input_jar_path);
 
-
     println!("Executing command: {:?}", cmd);
 
     let output = cmd.output().map_err(|e| {
-        io::Error::new(e.kind(), format!("Failed to execute R8 java command: {}", e))
+        io::Error::new(
+            e.kind(),
+            format!("Failed to execute R8 java command: {}", e),
+        )
     })?;
 
     // --- Process R8 output ---
@@ -705,12 +795,18 @@ fn run_r8_optimizer(
         eprintln!("Exit Status: {}", output.status); // More specific than just code
         eprintln!("Command: {:?}", cmd);
         if !output.stdout.is_empty() {
-            eprintln!("R8 STDOUT:\n---\n{}\n---", String::from_utf8_lossy(&output.stdout));
+            eprintln!(
+                "R8 STDOUT:\n---\n{}\n---",
+                String::from_utf8_lossy(&output.stdout)
+            );
         } else {
             eprintln!("R8 STDOUT: (empty)");
         }
         if !output.stderr.is_empty() {
-            eprintln!("R8 STDERR:\n---\n{}\n---", String::from_utf8_lossy(&output.stderr));
+            eprintln!(
+                "R8 STDERR:\n---\n{}\n---",
+                String::from_utf8_lossy(&output.stderr)
+            );
         } else {
             eprintln!("R8 STDERR: (empty)");
         }
@@ -720,23 +816,37 @@ fn run_r8_optimizer(
     } else {
         // Print stdout/stderr even on success for info/warnings
         if !output.stdout.is_empty() {
-             println!("R8 STDOUT:\n---\n{}\n---", String::from_utf8_lossy(&output.stdout));
+            println!(
+                "R8 STDOUT:\n---\n{}\n---",
+                String::from_utf8_lossy(&output.stdout)
+            );
         }
         if !output.stderr.is_empty() {
-             // R8 often prints informational messages to stderr
-             println!("R8 STDERR (Info/Warnings):\n---\n{}\n---", String::from_utf8_lossy(&output.stderr));
+            // R8 often prints informational messages to stderr
+            println!(
+                "R8 STDERR (Info/Warnings):\n---\n{}\n---",
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
     }
 
     // Verify the output file was created (important sanity check)
     if !output_jar_path.exists() {
         eprintln!("--- R8 Execution Error ---");
-        eprintln!("R8 process completed successfully (exit code 0), but the output JAR file was not found at: {}", output_jar_path.display());
-        eprintln!("Check R8 output above for potential issues (e.g., empty output due to overly aggressive shrinking).");
+        eprintln!(
+            "R8 process completed successfully (exit code 0), but the output JAR file was not found at: {}",
+            output_jar_path.display()
+        );
+        eprintln!(
+            "Check R8 output above for potential issues (e.g., empty output due to overly aggressive shrinking)."
+        );
         eprintln!("Command was: {:?}", cmd);
         eprintln!("--- End R8 Error ---");
         // Return an error that signals R8 failure, the calling function handles preservation
-        return Err(io::Error::new(io::ErrorKind::NotFound, "R8 did not create the expected output JAR file"));
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "R8 did not create the expected output JAR file",
+        ));
     }
 
     Ok(())
