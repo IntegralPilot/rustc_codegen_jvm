@@ -127,10 +127,6 @@ pub fn convert_basic_block<'tcx>(
                 );
                 // TODO: Need logic similar to emit_instructions_to_set_value but for discriminants
             }
-            StatementKind::Deinit(place) => {
-                println!("Warning: StatementKind::Deinit NYI. Place: {:?}", place);
-                // Often a no-op in GC'd languages unless specific resource cleanup needed
-            }
             // Handle other StatementKind variants if necessary
             _ => {
                 println!("Warning: Unhandled StatementKind: {:?}", stmt.kind);

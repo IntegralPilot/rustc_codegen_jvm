@@ -52,11 +52,11 @@ rust-components:
 ifeq ($(IS_CI),1)
 rust: $(SHIM_METADATA_GEN_DIR)/core.json
 	@echo "$(CYAN)📦 Building Rust root project...$(RESET)"
-	RUSTFLAGS="-Awarnings" cargo build
+	RUSTFLAGS="-Awarnings" cargo build --release
 else
 rust: $(SHIM_METADATA_GEN_DIR)/core.json rust-components
 	@echo "$(CYAN)📦 Building Rust root project...$(RESET)"
-	RUSTFLAGS="-Awarnings" cargo build
+	RUSTFLAGS="-Awarnings" cargo build --release
 endif
 
 clean-rust:
@@ -66,7 +66,7 @@ clean-rust:
 # === Java Linker Subproject ===
 java-linker:
 	@echo "$(CYAN)📦 Building Java Linker...$(RESET)"
-	cd $(JAVA_LINKER_DIR) && RUSTFLAGS="-Awarnings" cargo build
+	cd $(JAVA_LINKER_DIR) && RUSTFLAGS="-Awarnings" cargo build --release
 
 clean-java-linker:
 	@echo "$(CYAN)🧹 Cleaning Java Linker...$(RESET)"

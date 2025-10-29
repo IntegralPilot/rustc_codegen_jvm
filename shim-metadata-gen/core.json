@@ -3,6 +3,10 @@
     "descriptor": "([Ljava/lang/String;)Ljava/lang/String;",
     "is_static": true
   },
+  "compare_bytes": {
+    "descriptor": "(Ljava/lang/Object;Ljava/lang/Object;J)I",
+    "is_static": true
+  },
   "core_assert_failed": {
     "descriptor": "(Ljava/lang/String;)V",
     "is_static": true
@@ -113,6 +117,10 @@
   },
   "raw_eq_u8_8": {
     "descriptor": "(Ljava/lang/Object;Ljava/lang/Object;)Z",
+    "is_static": true
+  },
+  "std_intrinsics_size_of_val_u8": {
+    "descriptor": "(Ljava/lang/Object;)J",
     "is_static": true
   },
   "str_eq": {

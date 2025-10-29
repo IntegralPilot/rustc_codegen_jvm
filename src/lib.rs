@@ -54,6 +54,10 @@ impl CodegenBackend for MyBackend {
         ""
     }
 
+    fn name(&self) -> &'static str {
+        "rustc_codegen_jvm"
+    }
+
     fn codegen_crate<'a>(&self, tcx: TyCtxt<'_>) -> Box<dyn Any> {
         let crate_name = tcx
             .crate_name(rustc_hir::def_id::CRATE_DEF_ID.to_def_id().krate)
@@ -639,6 +643,7 @@ impl CodegenBackend for MyBackend {
             codegen_results,
             metadata,
             outputs,
+            "jvm",
         );
     }
 }

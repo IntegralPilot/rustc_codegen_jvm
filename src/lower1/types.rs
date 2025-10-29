@@ -100,9 +100,23 @@ pub fn ty_to_oomir_type<'tcx>(
                 pointee_oomir_type
             }
         }
-        rustc_middle::ty::TyKind::RawPtr(inner_ty, _) => {
-            ty_to_oomir_type(*inner_ty, tcx, data_types)
-        }
+        rustc_middle::ty::TyKind::RawPtr(ty, _mutability) => {
+            if ty.is_str() {
+                // A raw pointer to a string slice (*const str) is semantically a reference
+                // to string data. Its OOMIR representation should be consistent with &str.
+                oomir::Type::String
+            } else if ty.is_slice() {
+                // A raw pointer to a slice (*const [T]) should be represented as an array of T.
+                let component_ty = ty.sequence_element_type(tcx);
+                let oomir_component_type = ty_to_oomir_type(component_ty, tcx, data_types);
+                oomir::Type::Array(Box::new(oomir_component_type))
+            } else {
+                // For a pointer to a sized type (*const T), use the mutable reference
+                // "array hack" to represent it as a reference that can be written back to.
+                let oomir_pointee_type = ty_to_oomir_type(*ty, tcx, data_types);
+                oomir::Type::MutableReference(Box::new(oomir_pointee_type))
+            }
+        },
         rustc_middle::ty::TyKind::Array(component_ty, _) => {
             // Special case for arrays of string references
             if let TyKind::Ref(_, inner_ty, _) = component_ty.kind() {
@@ -178,22 +192,25 @@ pub fn ty_to_oomir_type<'tcx>(
             println!("Info: Mapping Never type to OOMIR Void");
             oomir::Type::Void
         }
-        rustc_middle::ty::TyKind::Dynamic(a, _, _) => {
-            let resolved_types = a
-                .iter()
-                .map(|binder| match binder.skip_binder() {
+        rustc_middle::ty::TyKind::Dynamic(bound_preds, _region) => {
+            // bound_preds is a collection of `Binder<ExistentialPredicate<'tcx>>` entries.
+            // Iterate and resolve trait predicates into OOMIR interface types.
+            let mut resolved_types: Vec<oomir::Type> = Vec::new();
+            for binder in bound_preds.iter() {
+                match binder.skip_binder() {
                     ExistentialPredicate::Trait(trait_ref) => {
                         let trait_name = tcx.def_path_str(trait_ref.def_id);
                         let safe_name = make_jvm_safe(&trait_name);
-                        oomir::Type::Interface(safe_name)
+                        resolved_types.push(oomir::Type::Interface(safe_name));
                     }
                     _ => {
                         println!("Warning: Unhandled dynamic type {:?}", binder);
-                        oomir::Type::Class("java/lang/Object".to_string())
+                        resolved_types.push(oomir::Type::Class("java/lang/Object".to_string()));
                     }
-                })
-                .collect::<Vec<_>>();
-            resolved_types[0].clone()
+                }
+            }
+            // Return the first resolved bound, or fall back to Object.
+            resolved_types.get(0).cloned().unwrap_or(oomir::Type::Class("java/lang/Object".to_string()))
         }
         rustc_middle::ty::TyKind::Param(param_ty) => {
             oomir::Type::Class(make_jvm_safe(param_ty.name.as_str()))

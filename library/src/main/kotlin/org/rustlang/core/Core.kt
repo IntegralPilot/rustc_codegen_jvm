@@ -564,4 +564,69 @@ public fun core_slice_u8_starts_with(value: Any, prefix: Any): Boolean {
 
         return arrayOf(dst)
     }
+
+    @JvmStatic
+    public fun std_intrinsics_size_of_val_u8(value: Any?): Long {
+        if (value == null) {
+            // size_of_val in Rust operates on a reference, which cannot be null.
+            // Receiving a null here indicates a potential codegen issue.
+            throw NullPointerException("Argument to std_intrinsics_size_of_val_u8 cannot be null.")
+        }
+
+        // The name implies a slice of u8, which is represented as a ByteArray.
+        // We can make this more general to handle other potential slice types as well.
+        return when (value) {
+            // For a byte array, the size in bytes is simply its length.
+            is ByteArray -> value.size.toLong()
+            
+            // Handle other primitive array types for completeness, calculating size in bytes.
+            is ShortArray -> value.size.toLong() * 2
+            is CharArray -> value.size.toLong() * 2
+            is IntArray -> value.size.toLong() * 4
+            is LongArray -> value.size.toLong() * 8
+            is FloatArray -> value.size.toLong() * 4
+            is DoubleArray -> value.size.toLong() * 8
+            is BooleanArray -> value.size.toLong() // JVM representation is 1 byte per boolean in an array.
+
+            else -> {
+                // If it's not an array, size_of_val is not applicable in this context for DSTs.
+                // This indicates an unexpected type was passed.
+                throw IllegalArgumentException("Unsupported type for std_intrinsics_size_of_val: ${value::class.java.name}")
+            }
+        }
+    }
+
+    @JvmStatic
+    public fun compare_bytes(ptr1: Any?, ptr2: Any?, len: Long): Int {
+        if (ptr1 === ptr2) return 0
+        // The intrinsic doesn't expect nulls, this indicates a codegen issue.
+        if (ptr1 == null || ptr2 == null) {
+            throw NullPointerException("compare_bytes received a null pointer")
+        }
+
+        // The representation of &[u8] from a string is ShortArray in this backend
+        if (ptr1 !is ShortArray || ptr2 !is ShortArray) {
+            throw IllegalArgumentException("compare_bytes expects ShortArray arguments, got ${ptr1::class.simpleName} and ${ptr2::class.simpleName}")
+        }
+
+        val arr1 = ptr1 as ShortArray
+        val arr2 = ptr2 as ShortArray
+        val n = len.toInt() // Assuming len fits in Int
+
+        // The 'len' parameter is the number of elements to check
+        val limit = Math.min(Math.min(arr1.size, arr2.size), n)
+
+        for (i in 0 until limit) {
+            // Compare elements directly. Use compareTo for standard signed comparison.
+            val cmp = arr1[i].compareTo(arr2[i])
+            if (cmp != 0) {
+                return cmp
+            }
+        }
+
+        // If we've checked `n` elements and all are equal, the regions are considered equal
+        // for the purpose of this intrinsic. The intrinsic does not compare overall length
+        // if the compared prefix is identical.
+        return 0
+    }
 }
