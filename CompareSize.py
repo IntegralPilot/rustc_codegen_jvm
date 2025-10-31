@@ -98,11 +98,10 @@ def collect_tests(binary_dir, only_run, dont_run):
         candidate_tests = [t for t in candidate_tests if os.path.basename(t) not in skip]
 
     final_tests = []
-    skipped_no_jvm = []
-    skip_flag_name = "no_jvm_target.flag"
+    skip_flag_name = "use_target_json.flag"
     for test_dir in candidate_tests:
         flag_path = os.path.join(test_dir, skip_flag_name)
-        if os.path.exists(flag_path):
+        if not os.path.exists(flag_path):
             final_tests.append(test_dir)
 
     if not final_tests:

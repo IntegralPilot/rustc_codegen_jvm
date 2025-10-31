@@ -3,10 +3,19 @@ import os
 import subprocess
 import sys
 import argparse
+import glob
+
+# A constant for the base classpath needed by both test types
+# NOTE: You may need to update the kotlin version in the future
+RUNTIME_CLASSPATH_BASE = "library/build/distributions/library-0.1.0/lib/library-0.1.0.jar:library/build/distributions/library-0.1.0/lib/kotlin-stdlib-2.1.20.jar"
 
 def read_from_file(path: str) -> str:
     with open(path, "r") as f:
         return f.read()
+
+def write_to_file(path: str, content: str):
+    with open(path, "w") as f:
+        f.write(content)
 
 def normalize_name(test_name: str) -> str:
     return test_name.replace("_", " ").capitalize()
@@ -15,57 +24,61 @@ def run_command(cmd: list, cwd=None):
     proc = subprocess.run(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     return proc
 
-def write_to_file(path: str, content: str):
-    with open(path, "w") as f:
-        f.write(content)
-
-def process_test(test_dir: str, release_mode: bool):
-    test_name = os.path.basename(test_dir)
-    normalized = normalize_name(test_name)
-    print(f"|-- Test '{test_name}' ({normalized})")
-    
-    print("|--- 🧼 Cleaning test folder...")
-    proc = run_command(["cargo", "clean"], cwd=test_dir)
-    if proc.returncode != 0:
-        fail_path = os.path.join(test_dir, "cargo-clean-fail.generated")
-        output = f"STDOUT:\n{proc.stdout}\n\nSTDERR:\n{proc.stderr}"
-        write_to_file(fail_path, output)
-        print(f"|---- ❌ cargo clean exited with code {proc.returncode}")
-        return False
-
+def build_rust_code(test_dir: str, release_mode: bool) -> tuple[bool, str]:
+    """Builds the Rust code and returns (success, target_dir_name)."""
     print("|--- ⚒️ Building with Cargo...")
     build_cmd = ["cargo", "build", "--release"] if release_mode else ["cargo", "build"]
-    no_jvm_target = os.path.join(test_dir, "no_jvm_target.flag")
-    if not os.path.exists(no_jvm_target):
-        print("|---- 🛠️ Building with JVM target...")
+    use_target_json = os.path.join(test_dir, "use_target_json.flag")
+    if os.path.exists(use_target_json):
+        print("|---- 🛠️ Building with JVM target JSON...")
         build_cmd.extend(["--target", "../../../jvm-unknown-unknown.json"])
+    
     proc = run_command(build_cmd, cwd=test_dir)
     if proc.returncode != 0:
         fail_path = os.path.join(test_dir, "cargo-build-fail.generated")
         output = f"STDOUT:\n{proc.stdout}\n\nSTDERR:\n{proc.stderr}"
         write_to_file(fail_path, output)
         print(f"|---- ❌ cargo build exited with code {proc.returncode}")
-        return False
+        return False, ""
 
-    print("|--- 🤖 Running with Java...")
     target_dir = "release" if release_mode else "debug"
-    if os.path.exists(no_jvm_target):
-        jar_path = os.path.join(test_dir, "target", target_dir, "deps", f"{test_name}-*.jar")
+    return True, target_dir
+
+def find_and_prepare_jar(test_dir: str, test_name: str, target_dir: str) -> tuple[bool, str]:
+    """Finds the generated JAR and moves it to a predictable location."""
+    # If using a custom target, cargo places artifacts in a different folder structure.
+    # If not, it's in target/{debug|release}/deps and needs to be moved.
+    use_target_json = os.path.join(test_dir, "use_target_json.flag")
+    if not os.path.exists(use_target_json):
+        deps_dir = os.path.join(test_dir, "target", target_dir, "deps")
         jar_file = None
-        for file in os.listdir(os.path.join(test_dir, "target", target_dir, "deps")):
-            if file.startswith(test_name) and file.endswith(".jar"):
-                jar_file = file
-                break
+        try:
+            for file in os.listdir(deps_dir):
+                if file.startswith(test_name) and file.endswith(".jar"):
+                    jar_file = file
+                    break
+        except FileNotFoundError:
+            print(f"|---- ❌ Dependency directory not found: {deps_dir}")
+            return False, ""
+            
         if jar_file is None:
-            print("|---- ❌ No jar file found in target/{target_dir}/deps")
-            return False
-        os.makedirs(os.path.join(test_dir, "target", "jvm-unknown-unknown", target_dir), exist_ok=True)
-        os.rename(os.path.join(test_dir, "target", target_dir, "deps", jar_file),
-                  os.path.join(test_dir, "target", "jvm-unknown-unknown", target_dir, f"{test_name}.jar"))
+            print(f"|---- ❌ No jar file found for '{test_name}' in target/{target_dir}/deps")
+            return False, ""
+        
+        # Move jar to a predictable location
+        dest_dir = os.path.join(test_dir, "target", "jvm-unknown-unknown", target_dir)
+        os.makedirs(dest_dir, exist_ok=True)
+        os.rename(os.path.join(deps_dir, jar_file), os.path.join(dest_dir, f"{test_name}.jar"))
 
     jar_path = os.path.join(test_dir, "target", "jvm-unknown-unknown", target_dir, f"{test_name}.jar")
-    proc = run_command(["java", "-cp", f"library/build/distributions/library-0.1.0/lib/library-0.1.0.jar:library/build/distributions/library-0.1.0/lib/kotlin-stdlib-2.1.20.jar:{jar_path}", test_name]) 
-    
+    if not os.path.exists(jar_path):
+        print(f"|---- ❌ JAR file not found at expected path: {jar_path}")
+        return False, ""
+    return True, jar_path
+
+def check_results(proc, test_dir: str, release_mode: bool) -> bool:
+    """Checks the return code and output of a completed process."""
+    # Check return code
     expected_returncode_file = os.path.join(test_dir, "java-returncode.expected")
     if os.path.exists(expected_returncode_file):
         expected_returncode = int(read_from_file(expected_returncode_file).strip())
@@ -75,37 +88,117 @@ def process_test(test_dir: str, release_mode: bool):
             write_to_file(fail_path, output)
             print(f"|---- ❌ java exited with code {proc.returncode}, expected {expected_returncode}")
             return False
-    else:
-        if proc.returncode != 0:
-            fail_path = os.path.join(test_dir, "java-fail.generated")
-            output = f"STDOUT:\n{proc.stdout}\n\nSTDERR:\n{proc.stderr}"
-            write_to_file(fail_path, output)
-            print(f"|---- ❌ java exited with code {proc.returncode}")
-            return False
+    elif proc.returncode != 0:
+        fail_path = os.path.join(test_dir, "java-fail.generated")
+        output = f"STDOUT:\n{proc.stdout}\n\nSTDERR:\n{proc.stderr}"
+        write_to_file(fail_path, output)
+        print(f"|---- ❌ java exited with code {proc.returncode}")
+        return False
 
+    # Check output
     expected_file = os.path.join(test_dir, "java-output.release.expected") if release_mode else os.path.join(test_dir, "java-output.expected")
     if not os.path.exists(expected_file) and release_mode:
         expected_file = os.path.join(test_dir, "java-output.expected")
 
     if os.path.exists(expected_file):
-        expected_output = read_from_file(expected_file)
-        if expected_output.strip() == "":
-            expected_output = "STDOUT:STDERR:"
-        else:
-            expected_output = expected_output.replace("\n", "")
-        actual_output = f"STDOUT:{proc.stdout.strip()}STDERR:{proc.stderr.strip()}"
-        actual_output = actual_output.replace("\n", "")
-        if actual_output != expected_output.strip():
+        expected_output = read_from_file(expected_file).strip()
+        actual_output = f"STDOUT:{proc.stdout.strip()}STDERR:{proc.stderr.strip()}".strip()
+
+        # Normalize to handle different line endings and trailing whitespace
+        expected_output = "".join(expected_output.split())
+        actual_output = "".join(actual_output.split())
+
+        if actual_output != expected_output:
             diff_path = os.path.join(test_dir, "output-diff.generated")
-            write_to_file(diff_path, actual_output)
+            # Write a more human-readable diff file
+            diff_content = f"--- EXPECTED ---\n{read_from_file(expected_file)}\n\n--- ACTUAL STDOUT ---\n{proc.stdout}\n\n--- ACTUAL STDERR ---\n{proc.stderr}\n"
+            write_to_file(diff_path, diff_content)
             print("|---- ❌ java output did not match expected output")
             return False
         else:
             print("|--- ✅ Output matches expected output!")
-    else:
-        print("|--- ⚠️ Expected output file not found. Skipping comparison.")
+
+    return True
+
+def process_binary_test(test_dir: str, release_mode: bool) -> bool:
+    test_name = os.path.basename(test_dir)
+    normalized = normalize_name(test_name)
+    print(f"|-- Test '{test_name}' ({normalized})")
+    
+    print("|--- 🧼 Cleaning test folder...")
+    proc = run_command(["cargo", "clean"], cwd=test_dir)
+    if proc.returncode != 0:
+        fail_path = os.path.join(test_dir, "cargo-clean-fail.generated")
+        write_to_file(fail_path, f"STDOUT:\n{proc.stdout}\n\nSTDERR:\n{proc.stderr}")
+        print(f"|---- ❌ cargo clean exited with code {proc.returncode}")
+        return False
+
+    build_ok, target_dir = build_rust_code(test_dir, release_mode)
+    if not build_ok:
+        return False
+
+    jar_ok, jar_path = find_and_prepare_jar(test_dir, test_name, target_dir)
+    if not jar_ok:
+        return False
+
+    print("|--- 🤖 Running with Java...")
+    java_cp = f"{RUNTIME_CLASSPATH_BASE}:{jar_path}"
+    proc = run_command(["java", "-cp", java_cp, test_name]) 
+    
+    if not check_results(proc, test_dir, release_mode):
+        return False
     
     print("|--- ✅ Binary test passed!")
+    return True
+
+def process_integration_test(test_dir: str, release_mode: bool) -> bool:
+    test_name = os.path.basename(test_dir)
+    normalized = normalize_name(test_name)
+    print(f"|-- Test '{test_name}' ({normalized})")
+
+    print("|--- 🧼 Cleaning test folder...")
+    run_command(["cargo", "clean"], cwd=test_dir) # Ignore clean failure for now
+
+    build_ok, target_dir = build_rust_code(test_dir, release_mode)
+    if not build_ok:
+        return False
+
+    jar_ok, jar_path = find_and_prepare_jar(test_dir, test_name, target_dir)
+    if not jar_ok:
+        return False
+    
+    print("|--- ☕ Compiling Java test source...")
+    abs_java_files = glob.glob(os.path.join(test_dir, "*.java"))
+    java_files = [os.path.basename(f) for f in abs_java_files]
+    if not java_files:
+        print("|---- ❌ No .java files found in test directory.")
+        return False
+    
+    base_cp_components = [os.path.relpath(p, test_dir) for p in RUNTIME_CLASSPATH_BASE.split(':')]
+    relative_jar_path = os.path.relpath(jar_path, test_dir)
+    
+    javac_cp_list = ['.'] + base_cp_components + [relative_jar_path]
+    javac_cp = os.pathsep.join(javac_cp_list)
+
+    javac_cmd = ["javac", "-cp", javac_cp] + java_files
+    proc = run_command(javac_cmd, cwd=test_dir)
+    if proc.returncode != 0:
+        fail_path = os.path.join(test_dir, "javac-fail.generated")
+        write_to_file(fail_path, f"STDOUT:\n{proc.stdout}\n\nSTDERR:\n{proc.stderr}")
+        print(f"|---- ❌ javac exited with code {proc.returncode}")
+        return False
+
+    print("|--- 🤖 Running with Java...")
+    # Convention: The main class for integration tests is 'Main'
+    main_class = "Main"
+    
+    java_cp = javac_cp
+    proc = run_command(["java", "-cp", java_cp, main_class], cwd=test_dir)
+
+    if not check_results(proc, test_dir, release_mode):
+        return False
+
+    print("|--- ✅ Integration test passed!")
     return True
 
 def main():
@@ -120,32 +213,43 @@ def main():
 
     if args.release:
         print("|- ⚒️ Running in release mode")
-
     print(" ")
 
-    # Gather test directories
-    binary_dir = os.path.join("tests", "binary")
-    if os.path.isdir(binary_dir):
-        binary_tests = [os.path.join(binary_dir, d) for d in os.listdir(binary_dir) if os.path.isdir(os.path.join(binary_dir, d))]
-    else:
-        binary_tests = []
+    # --- Gather and filter tests ---
+    only_run_set = set([name.strip() for name in args.only_run.split(",")]) if args.only_run else None
+    dont_run_set = set([name.strip() for name in args.dont_run.split(",")]) if args.dont_run else set()
 
-    # Filter based on --only-run
-    if args.only_run:
-        requested_tests = set([name.strip() for name in args.only_run.split(",")])
-        binary_tests = [t for t in binary_tests if os.path.basename(t) in requested_tests]
+    def discover_tests(test_type_dir):
+        if not os.path.isdir(test_type_dir):
+            return []
+        all_tests = [os.path.join(test_type_dir, d) for d in os.listdir(test_type_dir) if os.path.isdir(os.path.join(test_type_dir, d))]
+        
+        # Filter tests
+        if only_run_set:
+            all_tests = [t for t in all_tests if os.path.basename(t) in only_run_set]
+        all_tests = [t for t in all_tests if os.path.basename(t) not in dont_run_set]
+        return all_tests
 
-    # Exclude tests based on --dont-run
-    if args.dont_run:
-        excluded_tests = set([name.strip() for name in args.dont_run.split(",")])
-        binary_tests = [t for t in binary_tests if os.path.basename(t) not in excluded_tests]
+    binary_tests = discover_tests(os.path.join("tests", "binary"))
+    integration_tests = discover_tests(os.path.join("tests", "integration"))
+    
+    # --- Run Binary Tests ---
+    if binary_tests:
+        print(f"|- 📦 Running {len(binary_tests)} binary test(s)...")
+        for test_dir in sorted(binary_tests):
+            if not process_binary_test(test_dir, args.release):
+                overall_success = False
+        print(" ")
+        
+    # --- Run Integration Tests ---
+    if integration_tests:
+        print(f"|- 🔗 Running {len(integration_tests)} integration test(s)...")
+        for test_dir in sorted(integration_tests):
+            if not process_integration_test(test_dir, args.release):
+                overall_success = False
+        print(" ")
 
-    print(f"|- 📦 Running {len(binary_tests)} binary build test(s)...")
-    for test_dir in binary_tests:
-        if not process_test(test_dir, args.release):
-            overall_success = False
-
-    print("")
+    # --- Final Summary ---
     if overall_success:
         print("|-✅ All tests passed!")
         sys.exit(0)

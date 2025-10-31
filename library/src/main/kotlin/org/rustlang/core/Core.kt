@@ -90,31 +90,31 @@ public object Core {
     }
 
     @JvmStatic
-    public fun core_fmt_rt_argument_new_display_i32(value: Int): String {
+    public fun core_fmt_rt_Argument_new_display_i32(value: Int): String {
         // Convert the integer to a string.
         return value.toString()
     }
 
     @JvmStatic
-    public fun core_fmt_rt_argument_new_display(value: Any?): String {
+    public fun core_fmt_rt_Argument_new_display(value: Any?): String {
         // Convert the value to a string.
         return value?.toString() ?: "null"
     }
 
     @JvmStatic
-    public fun core_fmt_rt_argument_new_display_bool(value: Boolean): String {
+    public fun core_fmt_rt_Argument_new_display_bool(value: Boolean): String {
         // Convert the boolean to a string.
         return value.toString()
     }
 
     @JvmStatic
-    public fun core_fmt_rt_argument_new_display_f64(value: Double): String {
+    public fun core_fmt_rt_Argument_new_display_f64(value: Double): String {
         // Convert the double to a string.
         return value.toString()
     }
 
     @JvmStatic
-    public fun core_fmt_rt_arguments_new_const_1(pieces: Array<String>): String {
+    public fun core_fmt_rt_Arguments_new_const_1(pieces: Array<String>): String {
         val sb = StringBuilder()
         var argIndex = 0
         for (i in pieces.indices) {
@@ -289,7 +289,7 @@ public object Core {
     }
     
     @JvmStatic
-    public fun option_usize_eq(value1: Any?, value2: Any?): Boolean {
+    public fun Option_usize_eq(value1: Any?, value2: Any?): Boolean {
         return eq(value1, value2)
     }
 
@@ -349,7 +349,7 @@ public fun core_slice_u8_starts_with(value: Any, prefix: Any): Boolean {
     return core_str_str_starts_with_char(value, prefix)
 }
     @JvmStatic
-    public fun option_unwrap(optionObj: Any?): Any? {
+    public fun Option_unwrap(optionObj: Any?): Any? {
         if (optionObj == null) {
              // This shouldn't happen if the codegen is correct, as unwrap is called on an instance.
              panic_fmt("FATAL: Called option_unwrap on a null reference. This indicates a bug in the code generator.")
@@ -358,7 +358,7 @@ public fun core_slice_u8_starts_with(value: Any, prefix: Any): Boolean {
         }
 
         // Determine the variant using instanceof (Kotlin 'is')
-        if (optionObj::class.java.name.endsWith("option\$some")) {
+        if (optionObj::class.java.name.endsWith("Option\$Some")) {
              // It's Some(value). Extract the value from field0.
              try {
                  // Use reflection to get the field, assuming we don't know the exact class type statically
@@ -367,27 +367,27 @@ public fun core_slice_u8_starts_with(value: Any, prefix: Any): Boolean {
                  field.isAccessible = true // Ensure we can access it even if not public
                  return field.get(optionObj)
              } catch (e: NoSuchFieldException) {
-                 panic_fmt("Internal Compiler Error: option\$some class generated without 'field0'. Exception: ${e.message}")
+                 panic_fmt("Internal Compiler Error: Option\$Some class generated without 'field0'. Exception: ${e.message}")
                  throw RuntimeException("Unreachable after panic") // For compiler
              } catch (e: IllegalAccessException) {
-                 panic_fmt("Internal Compiler Error: Cannot access 'field0' in generated option\$some class. Exception: ${e.message}")
+                 panic_fmt("Internal Compiler Error: Cannot access 'field0' in generated Option\$Some class. Exception: ${e.message}")
                  throw RuntimeException("Unreachable after panic") // For compiler
              }
-        } else if (optionObj::class.java.name.endsWith("option\$none")) {
+        } else if (optionObj::class.java.name.endsWith("Option\$None")) {
              // It's None. Panic with the standard message.
              panic_fmt("called `Option::unwrap()` on a `None` value")
              throw RuntimeException("Unreachable after panic") // For compiler
         } else {
              // Input object was not an expected Option variant. This indicates a codegen bug.
              val className = optionObj::class.java.name
-             panic_fmt("Internal Compiler Error: Called option_unwrap on an unexpected type: $className. Expected type ending in option\$some or option\$none.")
+             panic_fmt("Internal Compiler Error: Called option_unwrap on an unexpected type: $className. Expected type ending in Option\$Some or Option\$None.")
              throw RuntimeException("Unreachable after panic") // For compiler
         }
     }
 
     @JvmStatic
     // same as unwrap but return true/false if None instead of exception
-    public fun option_is_none(optionObj: Any?): Boolean {
+    public fun Option_is_none(optionObj: Any?): Boolean {
         if (optionObj == null) {
             // This shouldn't happen if the codegen is correct, as unwrap is called on an instance.
             panic_fmt("FATAL: Called option_is_none on a null reference. This indicates a bug in the code generator.")
@@ -396,24 +396,24 @@ public fun core_slice_u8_starts_with(value: Any, prefix: Any): Boolean {
         }
 
         // Determine the variant using instanceof (Kotlin 'is')
-        if (optionObj::class.java.name.endsWith("option\$some")) {
+        if (optionObj::class.java.name.endsWith("Option\$Some")) {
             // It's Some(value). Return false.
             return false
-        } else if (optionObj::class.java.name.endsWith("option\$none")) {
+        } else if (optionObj::class.java.name.endsWith("Option\$None")) {
             // It's None. Return true.
             return true
         } else {
             // Input object was not an expected Option variant. This indicates a codegen bug.
             val className = optionObj::class.java.name
-            panic_fmt("Internal Compiler Error: Called option_is_none on an unexpected type: $className. Expected type ending in option\$some or option\$none.")
+            panic_fmt("Internal Compiler Error: Called option_is_none on an unexpected type: $className. Expected type ending in Option\$Some or Option\$None.")
             throw RuntimeException("Unreachable after panic") // For compiler
         }
     }
 
     // redirectors for monomorphised versions of the above, to just call the above
     @JvmStatic
-    public fun option_usize_is_none(optionObj: Any?): Boolean {
-        return option_is_none(optionObj)
+    public fun Option_usize_is_none(optionObj: Any?): Boolean {
+        return Option_is_none(optionObj)
     }
 
     /**

@@ -59,8 +59,8 @@ def investigate_test(test_name: str, release_mode: bool):
     # 4. Build with Cargo and capture output
     print("|-- ⚒️ Building with Cargo and capturing logs...")
     build_cmd = ["cargo", "build", "--release"] if release_mode else ["cargo", "build"]
-    no_jvm_target = os.path.join(test_dir, "no_jvm_target.flag")
-    if not os.path.exists(no_jvm_target):
+    use_target_json = os.path.join(test_dir, "use_target_json.flag")
+    if os.path.exists(use_target_json):
         build_cmd.extend(["--target", "../../../jvm-unknown-unknown.json"])
 
     proc = run_command(build_cmd, cwd=test_dir)
@@ -76,9 +76,9 @@ def investigate_test(test_name: str, release_mode: bool):
     print("|-- 🔎 Locating generated JAR file...")
     target_dir = "release" if release_mode else "debug"
     
-    # Handle the case where no custom target is used ('no_jvm_target.flag' exists)
-    if os.path.exists(no_jvm_target):
-        print("|---- Found 'no_jvm_target.flag', searching for JAR in standard deps folder...")
+    # Handle the case where no custom target JSON is used ('use_target_json.flag' doesn't exist)
+    if not os.path.exists(use_target_json):
+        print("|---- Found 'use_target_json.flag', searching for JAR in standard deps folder...")
         deps_dir = os.path.join(test_dir, "target", target_dir, "deps")
         jar_file_name = None
         if os.path.isdir(deps_dir):

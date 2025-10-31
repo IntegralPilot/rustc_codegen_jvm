@@ -159,7 +159,7 @@ impl CodegenBackend for MyBackend {
                     let instance = rustc_middle::ty::Instance::mono(tcx, def_id);
                     let mut mir = tcx.optimized_mir(instance.def_id()).clone(); // Clone the MIR
 
-                    let i2 = format!("{}_{}", ident, i).to_lowercase();
+                    let i2 = format!("{}_{}", ident, i);
 
                     breadcrumbs::log!(
                         breadcrumbs::LogLevel::Info,
@@ -493,7 +493,7 @@ impl CodegenBackend for MyBackend {
                         params: params_oomir_ty,
                         ret: Box::new(return_oomir_ty.clone()),
                     };
-                    signature.replace_class_in_signature("self", &ident);
+                    signature.replace_class_in_signature("Self", &ident);
 
                     fn_data.insert(name.clone(), signature.clone());
 
@@ -714,7 +714,7 @@ impl CodegenBackend for MyBackend {
 
 struct RustcCodegenJvmLogListener;
 
-const LISTENING_CHANNELS: &[&str] = &[];
+const LISTENING_CHANNELS: &[&str] = &["backend"];
 
 impl breadcrumbs::LogListener for RustcCodegenJvmLogListener {
     fn on_log(&mut self, log: breadcrumbs::Log) {

@@ -53,12 +53,9 @@ pub fn make_jvm_safe(input: &str) -> String {
     // Trim leading and trailing underscores that might result from cleaning.
     let trimmed = cleaned.trim_matches('_');
 
-    // Convert the result to lowercase.
-    let result = trimmed.to_lowercase();
-
     // If there's more than 1 _ in a row replace it with a single _
     let re_dup_underscores = Regex::new(r"_{2,}").unwrap();
-    let result = re_dup_underscores.replace_all(&result, "_").to_string();
+    let result = re_dup_underscores.replace_all(&trimmed, "_").to_string();
 
     // remove any "impl_" as the word "impl" isn't actually related to the function and it's specific monomorphisation
     let result = result.replace("impl_", "");
@@ -74,7 +71,7 @@ pub fn make_jvm_safe(input: &str) -> String {
             // Create a fallback. Hashing the original input is robust.
             // Using a simple placeholder for now, or re-clean original without trimming maybe.
             // Let's try cleaning the original input again and using it, potentially keeping underscores.
-            let fallback_cleaned = re_nw.replace_all(input, "_").to_lowercase();
+            let fallback_cleaned = re_nw.replace_all(input, "_");
             // Check if the fallback is just underscores or empty
             if fallback_cleaned.chars().all(|c| c == '_') {
                 format!("jvm_fallback_{:x}", md5::compute(input)) // Needs md5 crate

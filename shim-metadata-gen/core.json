@@ -1,4 +1,20 @@
 {
+  "Option_is_none": {
+    "descriptor": "(Ljava/lang/Object;)Z",
+    "is_static": true
+  },
+  "Option_unwrap": {
+    "descriptor": "(Ljava/lang/Object;)Ljava/lang/Object;",
+    "is_static": true
+  },
+  "Option_usize_eq": {
+    "descriptor": "(Ljava/lang/Object;Ljava/lang/Object;)Z",
+    "is_static": true
+  },
+  "Option_usize_is_none": {
+    "descriptor": "(Ljava/lang/Object;)Z",
+    "is_static": true
+  },
   "arguments_new_const_1": {
     "descriptor": "([Ljava/lang/String;)Ljava/lang/String;",
     "is_static": true
@@ -11,23 +27,23 @@
     "descriptor": "(Ljava/lang/String;)V",
     "is_static": true
   },
-  "core_fmt_rt_argument_new_display": {
+  "core_fmt_rt_Argument_new_display": {
     "descriptor": "(Ljava/lang/Object;)Ljava/lang/String;",
     "is_static": true
   },
-  "core_fmt_rt_argument_new_display_bool": {
+  "core_fmt_rt_Argument_new_display_bool": {
     "descriptor": "(Z)Ljava/lang/String;",
     "is_static": true
   },
-  "core_fmt_rt_argument_new_display_f64": {
+  "core_fmt_rt_Argument_new_display_f64": {
     "descriptor": "(D)Ljava/lang/String;",
     "is_static": true
   },
-  "core_fmt_rt_argument_new_display_i32": {
+  "core_fmt_rt_Argument_new_display_i32": {
     "descriptor": "(I)Ljava/lang/String;",
     "is_static": true
   },
-  "core_fmt_rt_arguments_new_const_1": {
+  "core_fmt_rt_Arguments_new_const_1": {
     "descriptor": "([Ljava/lang/String;)Ljava/lang/String;",
     "is_static": true
   },
@@ -93,22 +109,6 @@
   },
   "i64_eq": {
     "descriptor": "(Ljava/lang/Object;Ljava/lang/Object;)Z",
-    "is_static": true
-  },
-  "option_is_none": {
-    "descriptor": "(Ljava/lang/Object;)Z",
-    "is_static": true
-  },
-  "option_unwrap": {
-    "descriptor": "(Ljava/lang/Object;)Ljava/lang/Object;",
-    "is_static": true
-  },
-  "option_usize_eq": {
-    "descriptor": "(Ljava/lang/Object;Ljava/lang/Object;)Z",
-    "is_static": true
-  },
-  "option_usize_is_none": {
-    "descriptor": "(Ljava/lang/Object;)Z",
     "is_static": true
   },
   "panic_fmt": {
