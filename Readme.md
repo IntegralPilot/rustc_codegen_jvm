@@ -10,16 +10,16 @@ Compile your Rust code into a runnable `.jar` on JVM 8+!
 
 ## 📖 Table of Contents
 
-1. [Demos](#demos)  
-2. [Features](#features)  
-3. [How It Works](#how-it-works)  
-4. [Prerequisites](#prerequisites)  
-5. [Installation & Build](#installation--build)  
-6. [Usage](#usage)  
-7. [Running Tests](#running-tests)  
-8. [Project Structure](#project-structure)  
-9. [Contributing](#contributing)  
-10. [License](#license)  
+1. [Demos](#-demos)
+2. [Features](#-features)
+3. [How It Works](#️-how-it-works)
+4. [Prerequisites](#-prerequisites)
+5. [Installation & Build](#-installation--build)
+6. [Usage](#-usage)
+7. [Running Tests](#-running-tests)
+8. [Project Structure](#-project-structure)
+9. [Contributing](#-contributing)
+10. [License](#-license) 
 
 ---
 
