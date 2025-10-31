@@ -39,9 +39,13 @@ pub fn find_reachable_blocks(
         reachable.insert(entry_label.to_string());
         worklist.push_back(entry_label.to_string());
     } else if !all_block_labels.is_empty() {
-        println!(
-            "Warning: Entry block '{}' not found in optimized block set.",
-            entry_label
+        breadcrumbs::log!(
+            breadcrumbs::LogLevel::Warn,
+            "optimisation",
+            format!(
+                "Warning: Entry block '{}' not found in optimized block set.",
+                entry_label
+            )
         );
     }
 

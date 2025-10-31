@@ -116,7 +116,7 @@ pub fn ty_to_oomir_type<'tcx>(
                 let oomir_pointee_type = ty_to_oomir_type(*ty, tcx, data_types);
                 oomir::Type::MutableReference(Box::new(oomir_pointee_type))
             }
-        },
+        }
         rustc_middle::ty::TyKind::Array(component_ty, _) => {
             // Special case for arrays of string references
             if let TyKind::Ref(_, inner_ty, _) = component_ty.kind() {
@@ -141,9 +141,13 @@ pub fn ty_to_oomir_type<'tcx>(
 
             // Check if we've already created the DataType for this tuple signature
             if !data_types.contains_key(&tuple_class_name) {
-                println!(
-                    "Info: Defining new tuple type class: {} for MIR type {:?}",
-                    tuple_class_name, ty
+                breadcrumbs::log!(
+                    breadcrumbs::LogLevel::Info,
+                    "type-mapping",
+                    format!(
+                        "Info: Defining new tuple type class: {} for MIR type {:?}",
+                        tuple_class_name, ty
+                    )
                 );
                 // Create the fields ("field0", "field1", ...) and their OOMIR types
                 let oomir_fields = element_mir_tys
@@ -166,11 +170,19 @@ pub fn ty_to_oomir_type<'tcx>(
                     interfaces: vec![],
                 };
                 data_types.insert(tuple_class_name.clone(), tuple_data_type);
-                println!("   -> Added DataType: {:?}", data_types[&tuple_class_name]);
+                breadcrumbs::log!(
+                    breadcrumbs::LogLevel::Info,
+                    "type-mapping",
+                    format!("   -> Added DataType: {:?}", data_types[&tuple_class_name])
+                );
             } else {
-                println!(
-                    "Info: Reusing existing tuple type class: {}",
-                    tuple_class_name
+                breadcrumbs::log!(
+                    breadcrumbs::LogLevel::Info,
+                    "type-mapping",
+                    format!(
+                        "Info: Reusing existing tuple type class: {}",
+                        tuple_class_name
+                    )
                 );
             }
 
@@ -189,7 +201,11 @@ pub fn ty_to_oomir_type<'tcx>(
         }
         rustc_middle::ty::TyKind::Never => {
             // Handle the never type
-            println!("Info: Mapping Never type to OOMIR Void");
+            breadcrumbs::log!(
+                breadcrumbs::LogLevel::Info,
+                "type-mapping",
+                "Info: Mapping Never type to OOMIR Void"
+            );
             oomir::Type::Void
         }
         rustc_middle::ty::TyKind::Dynamic(bound_preds, _region) => {
@@ -204,19 +220,30 @@ pub fn ty_to_oomir_type<'tcx>(
                         resolved_types.push(oomir::Type::Interface(safe_name));
                     }
                     _ => {
-                        println!("Warning: Unhandled dynamic type {:?}", binder);
+                        breadcrumbs::log!(
+                            breadcrumbs::LogLevel::Warn,
+                            "type-mapping",
+                            format!("Warning: Unhandled dynamic type {:?}", binder)
+                        );
                         resolved_types.push(oomir::Type::Class("java/lang/Object".to_string()));
                     }
                 }
             }
             // Return the first resolved bound, or fall back to Object.
-            resolved_types.get(0).cloned().unwrap_or(oomir::Type::Class("java/lang/Object".to_string()))
+            resolved_types
+                .get(0)
+                .cloned()
+                .unwrap_or(oomir::Type::Class("java/lang/Object".to_string()))
         }
         rustc_middle::ty::TyKind::Param(param_ty) => {
             oomir::Type::Class(make_jvm_safe(param_ty.name.as_str()))
         }
         _ => {
-            println!("Warning: Unhandled type {:?}", ty);
+            breadcrumbs::log!(
+                breadcrumbs::LogLevel::Warn,
+                "type-mapping",
+                format!("Warning: Unhandled type {:?}", ty)
+            );
             oomir::Type::Class("UnsupportedType".to_string())
         }
     }
@@ -294,9 +321,13 @@ pub fn mir_int_to_oomir_const<'tcx>(
         }
         _ => {
             // This case should ideally not happen if MIR is well-typed
-            println!(
-                "Warning: Cannot convert MIR integer value {} to OOMIR constant for non-integer type {:?}",
-                value, ty
+            breadcrumbs::log!(
+                breadcrumbs::LogLevel::Warn,
+                "type-mapping",
+                format!(
+                    "Warning: Cannot convert MIR integer value {} to OOMIR constant for non-integer type {:?}",
+                    value, ty
+                )
             );
             oomir::Constant::I32(0) // Default fallback
         }

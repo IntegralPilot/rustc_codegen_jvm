@@ -121,7 +121,11 @@ pub(super) fn create_data_type_classfile_for_class(
             attributes: Vec::new(),
         };
         jvm_fields.push(field);
-        println!("  - Added field: {} {}", field_name, descriptor);
+        breadcrumbs::log!(
+            breadcrumbs::LogLevel::Info,
+            "bytecode-gen",
+            format!("  - Added field: {} {}", field_name, descriptor)
+        );
     }
 
     // --- Create Default Constructor ---
@@ -271,7 +275,11 @@ pub(super) fn create_data_type_classfile_for_interface(
         };
         jvm_methods.push(jvm_method);
         // Consider using tracing or logging
-        // println!("  - Added interface method: {} {}", method_name, descriptor);
+        breadcrumbs::log!(
+            breadcrumbs::LogLevel::Info,
+            "bytecode-gen",
+            format!("  - Added interface method: {} {}", method_name, descriptor)
+        );
     }
 
     // --- Assemble ClassFile ---

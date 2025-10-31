@@ -65,9 +65,13 @@ pub fn convert_labels_to_basic_blocks_in_function(function: &mut Function) {
                                     .insert(current_block_label.clone(), segment_block)
                                 {
                                     // This case should ideally not happen if labels are unique and splitting logic is correct
-                                    eprintln!(
-                                        "Warning: Overwriting newly created block segment '{}'",
-                                        existing.label
+                                    breadcrumbs::log!(
+                                        breadcrumbs::LogLevel::Warn,
+                                        "optimisation",
+                                        format!(
+                                            "Warning: Overwriting newly created block segment '{}'",
+                                            existing.label
+                                        )
                                     );
                                 }
                             }
@@ -231,5 +235,9 @@ pub fn eliminate_duplicate_basic_blocks(func: &mut Function) {
         .retain(|label, _| preserved_labels.contains(label));
 
     // Optional: Add a check or logging for removed blocks
-    // println!("Removed {} duplicate blocks.", redirects.len());
+    breadcrumbs::log!(
+        breadcrumbs::LogLevel::Info,
+        "optimisation",
+        format!("Removed {} duplicate blocks.", redirects.len())
+    );
 }

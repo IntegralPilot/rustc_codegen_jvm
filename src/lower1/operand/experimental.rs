@@ -31,9 +31,13 @@ pub fn read_constant_value_from_memory<'tcx>(
         .layout_of(pci)
         .map_err(|_| "Couldn't get layout.".to_string())?;
 
-    println!(
-        "Debug: Reading constant value for type {:?} at offset {:?} with layout size {:?}",
-        ty, offset, layout.size
+    breadcrumbs::log!(
+        breadcrumbs::LogLevel::Info,
+        "const-eval",
+        format!(
+            "Debug: Reading constant value for type {:?} at offset {:?} with layout size {:?}",
+            ty, offset, layout.size
+        )
     );
 
     match ty.kind() {
@@ -47,7 +51,11 @@ pub fn read_constant_value_from_memory<'tcx>(
             let scalar = allocation
                 .read_scalar(&tcx.data_layout, range, false)
                 .map_err(|e| {
-                    println!("Error reading scalar: {:?}", e);
+                    breadcrumbs::log!(
+                        breadcrumbs::LogLevel::Error,
+                        "const-eval",
+                        format!("Error reading scalar: {:?}", e)
+                    );
                     "Failed to read scalar".to_string()
                 })?;
             let scalar_int = match scalar {
@@ -68,16 +76,24 @@ pub fn read_constant_value_from_memory<'tcx>(
             let bytes: &[u8] = allocation.inspect_with_uninit_and_ptr_outside_interpreter(range);
             match String::from_utf8(bytes.to_vec()) {
                 Ok(s) => {
-                    println!(
-                        "Info: Successfully extracted string constant from allocation: \"{}\"",
-                        s
+                    breadcrumbs::log!(
+                        breadcrumbs::LogLevel::Info,
+                        "const-eval",
+                        format!(
+                            "Info: Successfully extracted string constant from allocation: \"{}\"",
+                            s
+                        )
                     );
                     Ok(oomir::Constant::String(s))
                 }
                 Err(e) => {
-                    println!(
-                        "Warning: Bytes from allocation for &str were not valid UTF-8: {}",
-                        e
+                    breadcrumbs::log!(
+                        breadcrumbs::LogLevel::Warn,
+                        "const-eval",
+                        format!(
+                            "Warning: Bytes from allocation for &str were not valid UTF-8: {}",
+                            e
+                        )
                     );
                     // TODO: make OOMIR support raw bytes?
                     Ok(oomir::Constant::String("Invalid UTF8".to_string()))
@@ -94,7 +110,11 @@ pub fn read_constant_value_from_memory<'tcx>(
             let scalar = allocation
                 .read_scalar(&tcx.data_layout, ptr_range, false)
                 .map_err(|e| {
-                    println!("Error reading pointer scalar: {:?}", e);
+                    breadcrumbs::log!(
+                        breadcrumbs::LogLevel::Error,
+                        "const-eval",
+                        format!("Error reading pointer scalar: {:?}", e)
+                    );
                     "Failed to read pointer scalar".to_string()
                 })?;
 
@@ -116,7 +136,11 @@ pub fn read_constant_value_from_memory<'tcx>(
                         GlobalAlloc::Function { instance } => {
                             // Represent the function pointer, e.g., by its path
                             let func_name = tcx.def_path_str(instance.def_id());
-                            println!("Info: Constant pointer to function: {}", func_name);
+                            breadcrumbs::log!(
+                                breadcrumbs::LogLevel::Info,
+                                "const-eval",
+                                format!("Info: Constant pointer to function: {}", func_name)
+                            );
                             // You might need a specific oomir::Constant variant for this
                             Ok(oomir::Constant::String(format!(
                                 "FunctionPtr({})",
@@ -124,7 +148,11 @@ pub fn read_constant_value_from_memory<'tcx>(
                             ))) // Placeholder
                         }
                         GlobalAlloc::Static(def_id) => {
-                            println!("Info: Constant pointer to static: {:?}", def_id);
+                            breadcrumbs::log!(
+                                breadcrumbs::LogLevel::Info,
+                                "const-eval",
+                                format!("Info: Constant pointer to static: {:?}", def_id)
+                            );
                             // Need to look up the static's allocation - this might involve tcx.eval_static_initializer
                             // For now, return placeholder
                             Ok(oomir::Constant::String(format!("StaticPtr({:?})", def_id))) // Placeholder
@@ -288,11 +316,15 @@ fn handle_constant_struct<'tcx>(
         let field_offset = layout.fields.offset(field_idx.into());
         let field_name = field_def.ident(tcx).to_string();
 
-        println!(
-            "Debug: Reading struct field '{}' ({:?}) at offset {:?}",
-            field_name,
-            field_ty,
-            offset + field_offset
+        breadcrumbs::log!(
+            breadcrumbs::LogLevel::Info,
+            "const-eval",
+            format!(
+                "Debug: Reading struct field '{}' ({:?}) at offset {:?}",
+                field_name,
+                field_ty,
+                offset + field_offset
+            )
         );
 
         let field_const = read_constant_value_from_memory(
@@ -333,10 +365,14 @@ fn handle_constant_enum<'tcx>(
     match &layout.variants {
         // --- Case 1: Single Variant (Structs, Unions, Single-Variant Enums) ---
         Variants::Single { index } => {
-            println!(
-                "Debug: Enum {:?} has single variant layout (index {:?})",
-                adt_def.did(),
-                index
+            breadcrumbs::log!(
+                breadcrumbs::LogLevel::Info,
+                "const-eval",
+                format!(
+                    "Debug: Enum {:?} has single variant layout (index {:?})",
+                    adt_def.did(),
+                    index
+                )
             );
             active_variant_idx = *index;
             // The fields are directly in the main layout
@@ -350,10 +386,14 @@ fn handle_constant_enum<'tcx>(
             tag_field, // Index within layout.fields where the tag is stored
             variants: variant_layouts,
         } => {
-            println!(
-                "Debug: Enum {:?} has multiple variant layout. Tag Encoding: {:?}",
-                adt_def.did(),
-                tag_encoding
+            breadcrumbs::log!(
+                breadcrumbs::LogLevel::Info,
+                "const-eval",
+                format!(
+                    "Debug: Enum {:?} has multiple variant layout. Tag Encoding: {:?}",
+                    adt_def.did(),
+                    tag_encoding
+                )
             );
 
             // --- Step 1: Locate and Read the Tag/Niche Value ---
@@ -371,14 +411,18 @@ fn handle_constant_enum<'tcx>(
                 size: tag_size,
             };
 
-            println!(
-                "Debug: Reading tag/niche value for {:?} (storage type {:?}, size {:?}) at offset {:?} (relative offset {:?}, tag_field index {})",
-                enum_ty,
-                tag_scalar_layout.primitive(),
-                tag_size,
-                absolute_tag_offset,
-                tag_offset_in_enum,
-                usize::from(*tag_field)
+            breadcrumbs::log!(
+                breadcrumbs::LogLevel::Info,
+                "const-eval",
+                format!(
+                    "Debug: Reading tag/niche value for {:?} (storage type {:?}, size {:?}) at offset {:?} (relative offset {:?}, tag_field index {})",
+                    enum_ty,
+                    tag_scalar_layout.primitive(),
+                    tag_size,
+                    absolute_tag_offset,
+                    tag_offset_in_enum,
+                    usize::from(*tag_field)
+                )
             );
 
             // 1c. Read the tag value from memory (could be Int or Ptr)
@@ -386,13 +430,21 @@ fn handle_constant_enum<'tcx>(
                 .read_scalar(&tcx.data_layout, absolute_tag_range, false)
                 .map_err(|e| format!("Failed to read enum tag/niche for {:?}: {:?}", enum_ty, e))?;
 
-            println!("Debug: Read tag scalar: {:?}", tag_scalar);
+            breadcrumbs::log!(
+                breadcrumbs::LogLevel::Info,
+                "const-eval",
+                format!("Debug: Read tag scalar: {:?}", tag_scalar)
+            );
 
             // --- Step 2: Determine Active Variant Index based on Tag Encoding ---
 
             match tag_encoding {
                 TagEncoding::Direct => {
-                    println!("Debug: Using Direct tag encoding");
+                    breadcrumbs::log!(
+                        breadcrumbs::LogLevel::Info,
+                        "const-eval",
+                        "Debug: Using Direct tag encoding"
+                    );
                     // Tag value must be an integer for Direct encoding
                     let tag_val = match tag_scalar {
                         Scalar::Int(int) => int,
@@ -414,9 +466,13 @@ fn handle_constant_enum<'tcx>(
                         ));
                     }
                     let read_tag_bits = tag_val.to_bits(tag_size);
-                    println!(
-                        "Debug: Read Direct tag value: {:?}, bits: {:#x}",
-                        tag_val, read_tag_bits
+                    breadcrumbs::log!(
+                        breadcrumbs::LogLevel::Info,
+                        "const-eval",
+                        format!(
+                            "Debug: Read Direct tag value: {:?}, bits: {:#x}",
+                            tag_val, read_tag_bits
+                        )
                     );
 
                     // --- Find matching variant (existing logic seems okay) ---
@@ -424,9 +480,13 @@ fn handle_constant_enum<'tcx>(
                     for (v_idx, v_discr) in adt_def.discriminants(tcx) {
                         let mask = (1u128 << tag_size.bits()) - 1;
                         let canonical_discr_val_masked = v_discr.val & mask;
-                        println!(
-                            "Debug: Comparing read_tag_bits {:#x} with variant {:?} discriminant {:#x} (masked: {:#x})",
-                            read_tag_bits, v_idx, v_discr.val, canonical_discr_val_masked
+                        breadcrumbs::log!(
+                            breadcrumbs::LogLevel::Info,
+                            "const-eval",
+                            format!(
+                                "Debug: Comparing read_tag_bits {:#x} with variant {:?} discriminant {:#x} (masked: {:#x})",
+                                read_tag_bits, v_idx, v_discr.val, canonical_discr_val_masked
+                            )
                         );
                         if read_tag_bits == canonical_discr_val_masked {
                             if found_idx.is_some() {
@@ -445,9 +505,13 @@ fn handle_constant_enum<'tcx>(
                     niche_variants,
                     niche_start,
                 } => {
-                    println!(
-                        "Debug: Using Niche tag encoding. Untagged: {:?}, Niche variants: {:?}, Niche start: {:#x}",
-                        untagged_variant, niche_variants, niche_start
+                    breadcrumbs::log!(
+                        breadcrumbs::LogLevel::Info,
+                        "const-eval",
+                        format!(
+                            "Debug: Using Niche tag encoding. Untagged: {:?}, Niche variants: {:?}, Niche start: {:#x}",
+                            untagged_variant, niche_variants, niche_start
+                        )
                     );
 
                     // Extract the bits from the read scalar (Int or Ptr)
@@ -469,7 +533,9 @@ fn handle_constant_enum<'tcx>(
                             if tag_size != tcx.data_layout.pointer_size() {
                                 return Err(format!(
                                     "Niche pointer tag size mismatch for {:?}: pointer size is {:?}, but tag size is {:?}",
-                                    enum_ty, tcx.data_layout.pointer_size(), tag_size
+                                    enum_ty,
+                                    tcx.data_layout.pointer_size(),
+                                    tag_size
                                 ));
                             }
                             // Use the address part of the pointer for comparison.
@@ -477,7 +543,11 @@ fn handle_constant_enum<'tcx>(
                             ptr.into_raw_parts().1.bytes() as u128
                         }
                     };
-                    println!("Debug: Read Niche value bits: {:#x}", read_value_bits);
+                    breadcrumbs::log!(
+                        breadcrumbs::LogLevel::Info,
+                        "const-eval",
+                        format!("Debug: Read Niche value bits: {:#x}", read_value_bits)
+                    );
 
                     // --- Compare read_value_bits with expected niche values (existing logic seems okay) ---
                     let mut found_match = false;
@@ -497,7 +567,14 @@ fn handle_constant_enum<'tcx>(
                         let d = match discriminants.get(&v_idx) {
                             Some(discr) => discr,
                             None => {
-                                println!("Warning: No discriminant found for variant {:?}", v_idx);
+                                breadcrumbs::log!(
+                                    breadcrumbs::LogLevel::Warn,
+                                    "const-eval",
+                                    format!(
+                                        "Warning: No discriminant found for variant {:?}",
+                                        v_idx
+                                    )
+                                );
                                 continue; // Skip this variant if no discriminant is found
                             }
                         };
@@ -506,14 +583,22 @@ fn handle_constant_enum<'tcx>(
                         let mask = (1u128 << tag_size.bits()) - 1;
                         let expected_niche_bits = expected_niche_val_u128 & mask;
 
-                        println!(
-                            "Debug: Checking Niche for {:?} (Discr: {:#x}). Expected Niche Bits: {:#x}",
-                            v_idx, d, expected_niche_bits
+                        breadcrumbs::log!(
+                            breadcrumbs::LogLevel::Info,
+                            "const-eval",
+                            format!(
+                                "Debug: Checking Niche for {:?} (Discr: {:#x}). Expected Niche Bits: {:#x}",
+                                v_idx, d, expected_niche_bits
+                            )
                         );
 
                         if read_value_bits == expected_niche_bits {
                             // ... (handle match, check ambiguity) ...
-                            println!("Debug: Match found for niche variant {:?}", v_idx);
+                            breadcrumbs::log!(
+                                breadcrumbs::LogLevel::Info,
+                                "const-eval",
+                                format!("Debug: Match found for niche variant {:?}", v_idx)
+                            );
                             if found_match && matched_idx != v_idx {
                                 return Err(format!("Ambiguous match found for enum variant"));
                             }
@@ -528,9 +613,13 @@ fn handle_constant_enum<'tcx>(
                         // If it didn't match any niche, it must be the untagged variant,
                         // *and* the read value should be valid for the untagged variant's field.
                         // (We implicitly assume this if no niche matches).
-                        println!(
-                            "Debug: No niche match found for bits {:#x}, assuming untagged variant {:?}",
-                            read_value_bits, untagged_variant
+                        breadcrumbs::log!(
+                            breadcrumbs::LogLevel::Info,
+                            "const-eval",
+                            format!(
+                                "Debug: No niche match found for bits {:#x}, assuming untagged variant {:?}",
+                                read_value_bits, untagged_variant
+                            )
                         );
                         active_variant_idx = *untagged_variant;
                     }
@@ -538,9 +627,13 @@ fn handle_constant_enum<'tcx>(
             } // End match tag_encoding
 
             // --- Step 3: Get Layout for the Active Variant ---
-            println!(
-                "Debug: Determined active variant index: {:?}",
-                active_variant_idx
+            breadcrumbs::log!(
+                breadcrumbs::LogLevel::Info,
+                "const-eval",
+                format!(
+                    "Debug: Determined active variant index: {:?}",
+                    active_variant_idx
+                )
             );
             variant_fields_shape = &variant_layouts[active_variant_idx].fields;
         } // End Variants::Multiple
@@ -554,9 +647,13 @@ fn handle_constant_enum<'tcx>(
         }
     } // End match layout.variants
 
-    println!(
-        "Debug: Determined active variant index: {:?}",
-        active_variant_idx
+    breadcrumbs::log!(
+        breadcrumbs::LogLevel::Info,
+        "const-eval",
+        format!(
+            "Debug: Determined active variant index: {:?}",
+            active_variant_idx
+        )
     );
 
     // --- Start: Steps 3 & 4 (Reading Fields - common logic) ---
@@ -608,14 +705,18 @@ fn handle_constant_enum<'tcx>(
 
         let field_name = format!("field{}", i); // Using index as field name for enum variant
 
-        println!(
-            "Debug: Reading enum variant {:?} field '{}' index {} ({:?}) at absolute offset {:?} (relative offset in variant shape: {:?})",
-            variant_def.name,
-            field_name,
-            i,
-            field_ty,
-            absolute_field_offset,
-            field_offset_in_variant_shape
+        breadcrumbs::log!(
+            breadcrumbs::LogLevel::Info,
+            "const-eval",
+            format!(
+                "Debug: Reading enum variant {:?} field '{}' index {} ({:?}) at absolute offset {:?} (relative offset in variant shape: {:?})",
+                variant_def.name,
+                field_name,
+                i,
+                field_ty,
+                absolute_field_offset,
+                field_offset_in_variant_shape
+            )
         );
 
         let field_const = read_constant_value_from_memory(

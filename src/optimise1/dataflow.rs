@@ -114,7 +114,14 @@ pub fn analyze_constant_propagation(
 
             // If the successor's input state changed, update it and add to worklist
             if potential_new_in != successor_current_in {
-                //println!("State change for {:?}: {:?} -> {:?}", successor_label, successor_current_in, potential_new_in); // Debugging
+                breadcrumbs::log!(
+                    breadcrumbs::LogLevel::Info,
+                    "optimisation",
+                    format!(
+                        "State change for {:?}: {:?} -> {:?}",
+                        successor_label, successor_current_in, potential_new_in
+                    )
+                );
                 block_in_state.insert(successor_label.clone(), potential_new_in);
                 if !worklist.contains(&successor_label) {
                     worklist.push_back(successor_label.clone());
@@ -823,14 +830,22 @@ pub fn process_block_instructions(
                         if let Some(target) =
                             interpret::switch_constants(discr_val, targets.clone())
                         {
-                            println!("Switch matched target: {:?}", target);
+                            breadcrumbs::log!(
+                                breadcrumbs::LogLevel::Info,
+                                "optimisation",
+                                format!("Switch matched target: {:?}", target)
+                            );
                             // Match found: replace Switch with Jump to the specific target
                             optimised_instruction = Instruction::Jump { target };
                             // keep_original_instruction should remain true (we keep the new Jump)
                         } else {
-                            println!(
-                                "Switch did not match any target, using otherwise: {:?}",
-                                otherwise
+                            breadcrumbs::log!(
+                                breadcrumbs::LogLevel::Info,
+                                "optimisation",
+                                format!(
+                                    "Switch did not match any target, using otherwise: {:?}",
+                                    otherwise
+                                )
                             );
                             // No explicit target matched: replace Switch with Jump to the otherwise target
                             optimised_instruction = Instruction::Jump {
@@ -894,10 +909,7 @@ pub fn process_block_instructions(
                                 Constant::F32(_) | Constant::F64(_) | Constant::Boolean(_) | Constant::Char(_) |
                                 Constant::String(_) => None, // Keep truly immutable primitives/values
                                 _ => {
-                                     println!(
-                                         "Optimizer: Invalidating potentially mutable constant '{}' due to call to '{}' with array/class arg.",
-                                         key, function
-                                     ); // Debugging
+                                     breadcrumbs::log!(breadcrumbs::LogLevel::Info, "optimisation", format!("Optimizer: Invalidating potentially mutable constant '{}' due to call to '{}' with array/class arg.", key, function)); // Debugging
                                      Some(key.clone()) // Remove others (Array, Instance, Class etc.)
                                 }
                             }

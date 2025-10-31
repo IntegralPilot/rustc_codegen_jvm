@@ -110,9 +110,13 @@ pub fn convert_rvalue_to_operand<'a>(
                     ty: oomir::Type::Array(Box::new(oomir_elem_type)), // Correct array type
                 };
             } else {
-                println!(
-                    "Warning: Rvalue::Repeat applied on non-array type: {:?}",
-                    place_ty
+                breadcrumbs::log!(
+                    breadcrumbs::LogLevel::Warn,
+                    "mir-lowering",
+                    format!(
+                        "Warning: Rvalue::Repeat applied on non-array type: {:?}",
+                        place_ty
+                    )
                 );
                 result_operand = get_placeholder_operand(original_dest_place, mir, tcx, data_types);
             }
@@ -121,9 +125,13 @@ pub fn convert_rvalue_to_operand<'a>(
             match borrow_kind {
                 MirBorrowKind::Mut { .. } => {
                     // --- MUTABLE BORROW (&mut T) -> Use Array Hack ---
-                    println!(
-                        "Info: Handling Rvalue::Ref(Mut) for place '{}' -> Temp Array Var",
-                        place_to_string(source_place, tcx)
+                    breadcrumbs::log!(
+                        breadcrumbs::LogLevel::Info,
+                        "mir-lowering",
+                        format!(
+                            "Info: Handling Rvalue::Ref(Mut) for place '{}' -> Temp Array Var",
+                            place_to_string(source_place, tcx)
+                        )
                     );
 
                     // 1. Get the value of the place being referenced (the 'pointee').
@@ -161,20 +169,28 @@ pub fn convert_rvalue_to_operand<'a>(
                         name: array_ref_var_name,
                         ty: array_ref_oomir_type,
                     };
-                    println!(
-                        "Info: -> Temp Array Var '{}' ({:?})",
-                        result_operand.get_name().unwrap_or("<unknown>"),
-                        result_operand.get_type()
+                    breadcrumbs::log!(
+                        breadcrumbs::LogLevel::Info,
+                        "mir-lowering",
+                        format!(
+                            "Info: -> Temp Array Var '{}' ({:?})",
+                            result_operand.get_name().unwrap_or("<unknown>"),
+                            result_operand.get_type()
+                        )
                     );
                 }
 
                 MirBorrowKind::Shared | MirBorrowKind::Fake { .. } => {
                     // Treat Fake like Shared (used for closures etc.)
                     // --- SHARED BORROW (&T) or others -> Pass Through Value ---
-                    println!(
-                        "Info: Handling Rvalue::Ref({:?}) for place '{}' -> Direct Value",
-                        borrow_kind,
-                        place_to_string(source_place, tcx)
+                    breadcrumbs::log!(
+                        breadcrumbs::LogLevel::Info,
+                        "mir-lowering",
+                        format!(
+                            "Info: Handling Rvalue::Ref({:?}) for place '{}' -> Direct Value",
+                            borrow_kind,
+                            place_to_string(source_place, tcx)
+                        )
                     );
 
                     // 1. Get the value/reference of the place being borrowed directly.
@@ -191,10 +207,14 @@ pub fn convert_rvalue_to_operand<'a>(
                         name: pointee_value_var_name,
                         ty: pointee_oomir_type,
                     };
-                    println!(
-                        "Info: -> Direct Value Operand '{}' ({:?})",
-                        result_operand.get_name().unwrap_or("<unknown>"),
-                        result_operand.get_type()
+                    breadcrumbs::log!(
+                        breadcrumbs::LogLevel::Info,
+                        "mir-lowering",
+                        format!(
+                            "Info: -> Direct Value Operand '{}' ({:?})",
+                            result_operand.get_name().unwrap_or("<unknown>"),
+                            result_operand.get_type()
+                        )
                     );
                 }
             }
@@ -208,13 +228,21 @@ pub fn convert_rvalue_to_operand<'a>(
             let oomir_operand = convert_operand(operand, tcx, mir, data_types, &mut instructions);
 
             if oomir_target_type == oomir_source_type {
-                println!("Info: Handling Rvalue::Cast (Same OOMIR Types) -> Temp Move.");
+                breadcrumbs::log!(
+                    breadcrumbs::LogLevel::Info,
+                    "mir-lowering",
+                    "Info: Handling Rvalue::Cast (Same OOMIR Types) -> Temp Move."
+                );
                 instructions.push(oomir::Instruction::Move {
                     dest: temp_cast_var.clone(),
                     src: oomir_operand,
                 });
             } else {
-                println!("Info: Handling Rvalue::Cast (Different OOMIR Types) -> Temp Cast.");
+                breadcrumbs::log!(
+                    breadcrumbs::LogLevel::Info,
+                    "mir-lowering",
+                    "Info: Handling Rvalue::Cast (Different OOMIR Types) -> Temp Cast."
+                );
                 instructions.push(oomir::Instruction::Cast {
                     op: oomir_operand,
                     ty: oomir_target_type.clone(),
@@ -394,7 +422,11 @@ pub fn convert_rvalue_to_operand<'a>(
                 }
                 _ => {
                     /* Handle Offset, etc. or panic */
-                    println!("Warning: Unhandled binary op {:?}", bin_op);
+                    breadcrumbs::log!(
+                        breadcrumbs::LogLevel::Warn,
+                        "mir-lowering",
+                        format!("Warning: Unhandled binary op {:?}", bin_op)
+                    );
                     result_operand =
                         get_placeholder_operand(original_dest_place, mir, tcx, data_types);
                     // No instruction needed for placeholder
@@ -454,7 +486,11 @@ pub fn convert_rvalue_to_operand<'a>(
                                     _ => false,
                                 };
                                 if is_target_for_length {
-                                    println!("Info: Detected Length op via PtrMetadata.");
+                                    breadcrumbs::log!(
+                                        breadcrumbs::LogLevel::Info,
+                                        "mir-lowering",
+                                        "Info: Detected Length op via PtrMetadata."
+                                    );
                                     instructions.push(oomir::Instruction::Length {
                                         dest: temp_unop_var.clone(),
                                         array: oomir::Operand::Variable {
@@ -463,25 +499,37 @@ pub fn convert_rvalue_to_operand<'a>(
                                         },
                                     });
                                 } else {
-                                    println!(
-                                        "Warning: PtrMetadata on unexpected type {:?}. Emitting placeholder.",
-                                        op_place_ty
+                                    breadcrumbs::log!(
+                                        breadcrumbs::LogLevel::Warn,
+                                        "mir-lowering",
+                                        format!(
+                                            "Warning: PtrMetadata on unexpected type {:?}. Emitting placeholder.",
+                                            op_place_ty
+                                        )
                                     );
                                     // No instruction needed for placeholder, result_operand set below
                                 }
                             } else {
                                 // PtrMetadata on constant? Invalid MIR?
-                                println!(
-                                    "Warning: PtrMetadata on constant operand {:?}. Emitting placeholder.",
-                                    operand
+                                breadcrumbs::log!(
+                                    breadcrumbs::LogLevel::Warn,
+                                    "mir-lowering",
+                                    format!(
+                                        "Warning: PtrMetadata on constant operand {:?}. Emitting placeholder.",
+                                        operand
+                                    )
                                 );
                             }
                         }
                         _ => {
                             // PtrMetadata on constant? Invalid MIR?
-                            println!(
-                                "Warning: PtrMetadata on constant operand {:?}. Emitting placeholder.",
-                                operand
+                            breadcrumbs::log!(
+                                breadcrumbs::LogLevel::Warn,
+                                "mir-lowering",
+                                format!(
+                                    "Warning: PtrMetadata on constant operand {:?}. Emitting placeholder.",
+                                    operand
+                                )
                             );
                         }
                     }
@@ -519,9 +567,13 @@ pub fn convert_rvalue_to_operand<'a>(
                         oomir::Type::Class(name) => name.clone(),
                         _ => panic!("Tuple aggregate type error"),
                     };
-                    println!(
-                        "Info: Handling Tuple Aggregate -> Temp Var '{}'",
-                        temp_aggregate_var
+                    breadcrumbs::log!(
+                        breadcrumbs::LogLevel::Info,
+                        "mir-lowering",
+                        format!(
+                            "Info: Handling Tuple Aggregate -> Temp Var '{}'",
+                            temp_aggregate_var
+                        )
                     );
                     instructions.push(oomir::Instruction::ConstructObject {
                         dest: temp_aggregate_var.clone(),
@@ -550,9 +602,13 @@ pub fn convert_rvalue_to_operand<'a>(
                     }
                 }
                 rustc_middle::mir::AggregateKind::Array(mir_element_ty) => {
-                    println!(
-                        "Info: Handling Array Aggregate -> Temp Var '{}'",
-                        temp_aggregate_var
+                    breadcrumbs::log!(
+                        breadcrumbs::LogLevel::Info,
+                        "mir-lowering",
+                        format!(
+                            "Info: Handling Array Aggregate -> Temp Var '{}'",
+                            temp_aggregate_var
+                        )
                     );
                     let oomir_element_type = ty_to_oomir_type(*mir_element_ty, tcx, data_types);
                     let array_size = operands.len();
@@ -582,9 +638,13 @@ pub fn convert_rvalue_to_operand<'a>(
                         let variant = adt_def.variant(*variant_idx);
                         let rust_path = tcx.def_path_str(adt_def.did());
                         let jvm_class_name = make_jvm_safe(&rust_path).replace("::", "/");
-                        println!(
-                            "Info: Handling Struct Aggregate -> Temp Var '{}' (Class: {})",
-                            temp_aggregate_var, jvm_class_name
+                        breadcrumbs::log!(
+                            breadcrumbs::LogLevel::Info,
+                            "mir-lowering",
+                            format!(
+                                "Info: Handling Struct Aggregate -> Temp Var '{}' (Class: {})",
+                                temp_aggregate_var, jvm_class_name
+                            )
                         );
                         instructions.push(oomir::Instruction::ConstructObject {
                             dest: temp_aggregate_var.clone(),
@@ -633,9 +693,13 @@ pub fn convert_rvalue_to_operand<'a>(
                             make_jvm_safe(&variant_def.name.to_string())
                         );
 
-                        println!(
-                            "Info: Handling Enum Aggregate (Variant: {}) -> Temp Var '{}' (Class: {})",
-                            variant_def.name, temp_aggregate_var, variant_class_name
+                        breadcrumbs::log!(
+                            breadcrumbs::LogLevel::Info,
+                            "mir-lowering",
+                            format!(
+                                "Info: Handling Enum Aggregate (Variant: {}) -> Temp Var '{}' (Class: {})",
+                                variant_def.name, temp_aggregate_var, variant_class_name
+                            )
                         );
 
                         /*
@@ -761,7 +825,11 @@ pub fn convert_rvalue_to_operand<'a>(
                         }
                     } else {
                         // Union
-                        println!("Warning: Unhandled ADT Aggregate Kind -> Temp Placeholder");
+                        breadcrumbs::log!(
+                            breadcrumbs::LogLevel::Warn,
+                            "mir-lowering",
+                            format!("Warning: Unhandled ADT Aggregate Kind -> Temp Placeholder")
+                        );
                         // make a placeholder (Class("java/lang/Object"))
                         instructions.push(oomir::Instruction::ConstructObject {
                             dest: temp_aggregate_var.clone(),
@@ -771,7 +839,11 @@ pub fn convert_rvalue_to_operand<'a>(
                 }
                 _ => {
                     /* Unknown aggregate */
-                    println!("Warning: Unhandled Aggregate Kind -> Temp Placeholder");
+                    breadcrumbs::log!(
+                        breadcrumbs::LogLevel::Warn,
+                        "mir-lowering",
+                        format!("Warning: Unhandled Aggregate Kind -> Temp Placeholder")
+                    );
                     // No instructions needed for placeholder, result set below
                 }
             }
@@ -796,11 +868,15 @@ pub fn convert_rvalue_to_operand<'a>(
                     // in the target code. The subsequent PtrMetadata operation will
                     // operate on the operand representing the place itself.
                     // So, we just pass the place's operand through.
-                    println!(
-                        "Info: Handling Rvalue::RawPtr(FakeForPtrMetadata) for place '{:?}'. Passing through place operand '{}' ({:?}).",
-                        place_to_string(place, tcx), // Use place_to_string for readability
-                        place_temp_var_name,
-                        place_temp_var_type
+                    breadcrumbs::log!(
+                        breadcrumbs::LogLevel::Info,
+                        "mir-lowering",
+                        format!(
+                            "Info: Handling Rvalue::RawPtr(FakeForPtrMetadata) for place '{:?}'. Passing through place operand '{}' ({:?}).",
+                            place_to_string(place, tcx),
+                            place_temp_var_name,
+                            place_temp_var_type
+                        )
                     );
                     result_operand = oomir::Operand::Variable {
                         name: place_temp_var_name, // Use the operand computed for the place
@@ -813,12 +889,16 @@ pub fn convert_rvalue_to_operand<'a>(
                     // Really, we shouldn't be getting these kinds of things unless
                     // `unsafe` is being used in a strange way, and it is a non-goal of this
                     // project to support native-like non-trivial unsafe.
-                    println!(
-                        "Warning: Handling Rvalue::RawPtr({:?}) for place '{:?}' by using the place's operand '{}' ({:?}). True pointer semantics (arithmetic, etc.) not fully supported.",
-                        kind,
-                        place_to_string(place, tcx),
-                        place_temp_var_name,
-                        place_temp_var_type
+                    breadcrumbs::log!(
+                        breadcrumbs::LogLevel::Warn,
+                        "mir-lowering",
+                        format!(
+                            "Warning: Handling Rvalue::RawPtr({:?}) for place '{:?}' by using the place's operand '{}' ({:?}). True pointer semantics (arithmetic, etc.) not fully supported.",
+                            kind,
+                            place_to_string(place, tcx),
+                            place_temp_var_name,
+                            place_temp_var_type
+                        )
                     );
 
                     let pointer_oomir_type = place_temp_var_type.clone();
@@ -903,9 +983,13 @@ pub fn convert_rvalue_to_operand<'a>(
         }
         // Handle other Rvalue variants by generating a placeholder
         _ => {
-            println!(
-                "Warning: Unhandled Rvalue: {:?} for temp based on {:?}. Emitting placeholder.",
-                rvalue, original_dest_place
+            breadcrumbs::log!(
+                breadcrumbs::LogLevel::Warn,
+                "mir-lowering",
+                format!(
+                    "Warning: Unhandled Rvalue: {:?} for temp based on {:?}. Emitting placeholder.",
+                    rvalue, original_dest_place
+                )
             );
             result_operand = get_placeholder_operand(original_dest_place, mir, tcx, data_types);
             // No instructions needed to "calculate" a placeholder

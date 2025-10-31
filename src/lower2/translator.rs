@@ -55,7 +55,11 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             max_locals_used: 0,
         };
 
-        println!("static: {}, function_name: {}", is_static, oomir_func.name);
+        breadcrumbs::log!(
+            breadcrumbs::LogLevel::Info,
+            "bytecode-gen",
+            format!("static: {}, function_name: {}", is_static, oomir_func.name)
+        );
 
         // Assign JVM local slots 0, 1, 2... to MIR argument names _1, _2, _3...
         // Assumes static methods where args start at slot 0.
@@ -81,9 +85,13 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 .is_some()
             {
                 // This shouldn't happen if MIR locals truly start after parameters
-                println!(
-                    "Warning: OOMIR parameter name '{}' potentially clashed with an existing mapping during parameter assignment.",
-                    param_oomir_name
+                breadcrumbs::log!(
+                    breadcrumbs::LogLevel::Warn,
+                    "bytecode-gen",
+                    format!(
+                        "Warning: OOMIR parameter name '{}' potentially clashed with an existing mapping during parameter assignment.",
+                        param_oomir_name
+                    )
                 );
             }
             if translator
@@ -91,9 +99,13 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 .insert(param_oomir_name.clone(), param_ty.clone())
                 .is_some()
             {
-                println!(
-                    "Warning: OOMIR parameter name '{}' potentially clashed with an existing type mapping during parameter assignment.",
-                    param_oomir_name
+                breadcrumbs::log!(
+                    breadcrumbs::LogLevel::Warn,
+                    "bytecode-gen",
+                    format!(
+                        "Warning: OOMIR parameter name '{}' potentially clashed with an existing type mapping during parameter assignment.",
+                        param_oomir_name
+                    )
                 );
             }
         }
@@ -117,9 +129,13 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 .insert(var_name.to_string(), ty.clone())
                 .is_some()
             {
-                println!(
-                    "Internal Warning: Type map already had entry for supposedly new local '{}'",
-                    var_name
+                breadcrumbs::log!(
+                    breadcrumbs::LogLevel::Warn,
+                    "bytecode-gen",
+                    format!(
+                        "Internal Warning: Type map already had entry for supposedly new local '{}'",
+                        var_name
+                    )
                 );
             }
 
@@ -132,16 +148,24 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             // If it IS hit, it means assign_local was called when the variable already exists.
             // This might happen with parameters if called carelessly after initial setup.
             let existing_index = self.local_var_map[var_name];
-            println!(
-                "Warning: assign_local called for existing variable '{}' (index {}). Reusing index.",
-                var_name, existing_index
+            breadcrumbs::log!(
+                breadcrumbs::LogLevel::Warn,
+                "bytecode-gen",
+                format!(
+                    "Warning: assign_local called for existing variable '{}' (index {}). Reusing index.",
+                    var_name, existing_index
+                )
             );
             // Should we verify type consistency here too? Probably.
             if let Some(existing_ty) = self.local_var_types.get(var_name) {
                 if existing_ty != ty {
-                    println!(
-                        "   -> CRITICAL WARNING: assign_local type mismatch for '{}'! Existing: {:?}, New: {:?}. Keeping existing index but this indicates a flaw!",
-                        var_name, existing_ty, ty
+                    breadcrumbs::log!(
+                        breadcrumbs::LogLevel::Warn,
+                        "bytecode-gen",
+                        format!(
+                            "   -> CRITICAL WARNING: assign_local type mismatch for '{}'! Existing: {:?}, New: {:?}. Keeping existing index but this indicates a flaw!",
+                            var_name, existing_ty, ty
+                        )
                     );
                 }
             }
@@ -155,9 +179,13 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             // Check if the existing type matches the hint. If not, update it.
             if let Some(existing_ty) = self.local_var_types.get(var_name) {
                 if existing_ty != ty_hint {
-                    println!(
-                        "Warning: Reusing local '{}' (index {}) with new type {:?} (previous: {:?}). Updating type.",
-                        var_name, existing_index, ty_hint, existing_ty
+                    breadcrumbs::log!(
+                        breadcrumbs::LogLevel::Warn,
+                        "bytecode-gen",
+                        format!(
+                            "Warning: Reusing local '{}' (index {}) with new type {:?} (previous: {:?}). Updating type.",
+                            var_name, existing_index, ty_hint, existing_ty
+                        )
                     );
                     // Update the type in the map
                     self.local_var_types
@@ -166,16 +194,24 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     let size = get_type_size(ty_hint);
                     self.max_locals_used = self.max_locals_used.max(existing_index + size);
                 } else {
-                    println!(
-                        "Debug: Reusing local '{}' (index {}) with same type hint {:?}.",
-                        var_name, existing_index, ty_hint
+                    breadcrumbs::log!(
+                        breadcrumbs::LogLevel::Info,
+                        "bytecode-gen",
+                        format!(
+                            "Debug: Reusing local '{}' (index {}) with same type hint {:?}.",
+                            var_name, existing_index, ty_hint
+                        )
                     );
                 }
             } else {
                 // This case is unlikely if index exists, but handle defensively
-                println!(
-                    "Warning: Local '{}' has index {} but no type in map. Assigning type {:?}.",
-                    var_name, existing_index, ty_hint
+                breadcrumbs::log!(
+                    breadcrumbs::LogLevel::Warn,
+                    "bytecode-gen",
+                    format!(
+                        "Warning: Local '{}' has index {} but no type in map. Assigning type {:?}.",
+                        var_name, existing_index, ty_hint
+                    )
                 );
                 self.local_var_types
                     .insert(var_name.to_string(), ty_hint.clone());
@@ -185,9 +221,13 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             existing_index
         } else {
             // Variable is genuinely new. Use assign_local to get a fresh slot.
-            println!(
-                "Debug: Assigning new local '{}' (type {:?})",
-                var_name, ty_hint
+            breadcrumbs::log!(
+                breadcrumbs::LogLevel::Info,
+                "bytecode-gen",
+                format!(
+                    "Debug: Assigning new local '{}' (type {:?})",
+                    var_name, ty_hint
+                )
             );
             self.assign_local(var_name, ty_hint) // assign_local handles map insertion etc.
         }
@@ -1938,9 +1978,13 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     // This *could* happen if a label name conflicts with a basic block name,
                     // or if the label generation logic somehow creates duplicates.
                     // Should be investigated if it occurs. Might indicate an issue in lower1's label generation.
-                    println!(
-                        "Warning: Overwriting existing entry in label_to_instr_index for label '{}'. Old index: {}, New index: {}",
-                        name, old_idx, current_jvm_instr_index
+                    breadcrumbs::log!(
+                        breadcrumbs::LogLevel::Warn,
+                        "bytecode-gen",
+                        format!(
+                            "Warning: Overwriting existing entry in label_to_instr_index for label '{}'. Old index: {}, New index: {}",
+                            name, old_idx, current_jvm_instr_index
+                        )
                     );
                     // Depending on requirements, you might want to error here instead of warning.
                 }
@@ -2115,9 +2159,13 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     } // End Ok(shim_map)
                     Err(e) => {
                         // Metadata loading failed, print warning and fall through
-                        println!(
-                            "Warning: Failed to get shim metadata: {}. Falling back to intra-module call attempt for '{}'.",
-                            e, function_name
+                        breadcrumbs::log!(
+                            breadcrumbs::LogLevel::Warn,
+                            "bytecode-gen",
+                            format!(
+                                "Warning: Failed to get shim metadata: {}. Falling back to intra-module call attempt for '{}'.",
+                                e, function_name
+                            )
                         );
                     }
                 } // End Shim Lookup
@@ -2262,9 +2310,13 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 index,
                 value,
             } => {
-                println!(
-                    "ArrayStore: array {:?}, index {:?}, value {:?}",
-                    array, index, value
+                breadcrumbs::log!(
+                    breadcrumbs::LogLevel::Info,
+                    "bytecode-gen",
+                    format!(
+                        "ArrayStore: array {:?}, index {:?}, value {:?}",
+                        array, index, value
+                    )
                 );
                 let mut is_string = false;
                 // 1. Get the type of the array variable to find the element type
@@ -2297,9 +2349,13 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
 
                 // check if any instructions are needed to cast the value to the element type
                 let value_type = get_operand_type(value);
-                println!(
-                    "Value type: {:?}, element type {:?}",
-                    value_type, element_type
+                breadcrumbs::log!(
+                    breadcrumbs::LogLevel::Info,
+                    "bytecode-gen",
+                    format!(
+                        "Value type: {:?}, element type {:?}",
+                        value_type, element_type
+                    )
                 );
                 if value_type != *element_type {
                     let instrs =

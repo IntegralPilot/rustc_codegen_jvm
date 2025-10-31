@@ -20,8 +20,8 @@ extern crate rustc_hir;
 extern crate rustc_metadata;
 extern crate rustc_middle;
 extern crate rustc_session;
-extern crate rustc_target;
 extern crate rustc_span;
+extern crate rustc_target;
 
 use oomir::{CodeBlock, Function, Operand, Type};
 use rustc_codegen_ssa::back::archive::{ArArchiveBuilder, ArchiveBuilder, ArchiveBuilderBuilder};
@@ -42,9 +42,9 @@ use misc::ToIdent;
 
 mod lower1;
 mod lower2;
+mod misc;
 mod oomir;
 mod optimise1;
-mod misc;
 
 /// An instance of our Java bytecode codegen backend.
 struct MyBackend;
@@ -86,11 +86,23 @@ impl CodegenBackend for MyBackend {
                 let instance = rustc_middle::ty::Instance::mono(tcx, def_id);
                 let mut mir = tcx.optimized_mir(instance.def_id()).clone(); // Clone the MIR
 
-                println!("MIR for function {i}: {:?}", mir);
+                breadcrumbs::log!(
+                    breadcrumbs::LogLevel::Info,
+                    "backend",
+                    format!("MIR for function {i}: {:?}", mir)
+                );
 
-                println!("--- Starting MIR to OOMIR Lowering for function: {i} ---");
+                breadcrumbs::log!(
+                    breadcrumbs::LogLevel::Info,
+                    "mir-lowering",
+                    format!("--- Starting MIR to OOMIR Lowering for function: {i} ---")
+                );
                 let oomir_result = lower1::mir_to_oomir(tcx, instance, &mut mir);
-                println!("--- Finished MIR to OOMIR Lowering for function: {i} ---");
+                breadcrumbs::log!(
+                    breadcrumbs::LogLevel::Info,
+                    "mir-lowering",
+                    format!("--- Finished MIR to OOMIR Lowering for function: {i} ---")
+                );
 
                 let oomir_function = oomir_result.0;
 
@@ -109,12 +121,20 @@ impl CodegenBackend for MyBackend {
                             format!("{}", ps.ident)
                         }
                         _ => {
-                            println!("Warning: {:?} is an unknown qpath", qpath);
+                            breadcrumbs::log!(
+                                breadcrumbs::LogLevel::Warn,
+                                "backend",
+                                format!("Warning: {:?} is an unknown qpath", qpath)
+                            );
                             "unknown_qpath_kind".into()
                         }
                     },
                     _ => {
-                        println!("Warning: {:?} has unknown kind", impl_a.self_ty);
+                        breadcrumbs::log!(
+                            breadcrumbs::LogLevel::Warn,
+                            "backend",
+                            format!("Warning: {:?} has unknown kind", impl_a.self_ty)
+                        );
                         "unknown_type_kind".into()
                     }
                 };
@@ -141,11 +161,23 @@ impl CodegenBackend for MyBackend {
 
                     let i2 = format!("{}_{}", ident, i).to_lowercase();
 
-                    println!("MIR for function {i2}: {:?}", mir);
+                    breadcrumbs::log!(
+                        breadcrumbs::LogLevel::Info,
+                        "backend",
+                        format!("MIR for function {i2}: {:?}", mir)
+                    );
 
-                    println!("--- Starting MIR to OOMIR Lowering for function: {i2} ---");
+                    breadcrumbs::log!(
+                        breadcrumbs::LogLevel::Info,
+                        "mir-lowering",
+                        format!("--- Starting MIR to OOMIR Lowering for function: {i2} ---")
+                    );
                     let oomir_result = lower1::mir_to_oomir(tcx, instance, &mut mir);
-                    println!("--- Finished MIR to OOMIR Lowering for function: {i2} ---");
+                    breadcrumbs::log!(
+                        breadcrumbs::LogLevel::Info,
+                        "mir-lowering",
+                        format!("--- Finished MIR to OOMIR Lowering for function: {i2} ---")
+                    );
 
                     let mut oomir_function = oomir_result.0;
                     oomir_function.name = i.to_string();
@@ -248,7 +280,11 @@ impl CodegenBackend for MyBackend {
                         helper_sig.params = new_params;
                     }
 
-                    println!("Function signature: {:?}", oomir_function.signature);
+                    breadcrumbs::log!(
+                        breadcrumbs::LogLevel::Info,
+                        "backend",
+                        format!("Function signature: {:?}", oomir_function.signature)
+                    );
 
                     let mut instructions = vec![];
 
@@ -264,7 +300,11 @@ impl CodegenBackend for MyBackend {
                         idx += 1;
                     }
 
-                    println!("Function args: {:?}", args);
+                    breadcrumbs::log!(
+                        breadcrumbs::LogLevel::Info,
+                        "backend",
+                        format!("Function args: {:?}", args)
+                    );
 
                     let mut bbs = HashMap::new();
 
@@ -526,31 +566,55 @@ impl CodegenBackend for MyBackend {
             }
         }
 
-        println!("OOMIR module: {:?}", oomir_module);
+        breadcrumbs::log!(
+            breadcrumbs::LogLevel::Info,
+            "backend",
+            format!("OOMIR module: {:?}", oomir_module)
+        );
 
-        println!(
-            "--- Starting OOMIR Optimisation for module: {} ---",
-            crate_name
+        breadcrumbs::log!(
+            breadcrumbs::LogLevel::Info,
+            "optimisation",
+            format!(
+                "--- Starting OOMIR Optimisation for module: {} ---",
+                crate_name
+            )
         );
 
         let oomir_module = optimise1::optimise_module(oomir_module);
 
-        println!("Optimised OOMIR module: {:?}", oomir_module);
-
-        println!(
-            "--- Finished OOMIR Optimisation for module: {} ---",
-            crate_name
+        breadcrumbs::log!(
+            breadcrumbs::LogLevel::Info,
+            "optimisation",
+            format!("Optimised OOMIR module: {:?}", oomir_module)
         );
 
-        println!(
-            "--- Starting OOMIR to JVM Bytecode Lowering for module: {} ---",
-            crate_name
+        breadcrumbs::log!(
+            breadcrumbs::LogLevel::Info,
+            "optimisation",
+            format!(
+                "--- Finished OOMIR Optimisation for module: {} ---",
+                crate_name
+            )
+        );
+
+        breadcrumbs::log!(
+            breadcrumbs::LogLevel::Info,
+            "bytecode-gen",
+            format!(
+                "--- Starting OOMIR to JVM Bytecode Lowering for module: {} ---",
+                crate_name
+            )
         );
         let bytecode = lower2::oomir_to_jvm_bytecode(&oomir_module, tcx).unwrap();
         //let bytecode = vec![0; 1024];
-        println!(
-            "--- Finished OOMIR to JVM Bytecode Lowering for module: {} ---",
-            crate_name
+        breadcrumbs::log!(
+            breadcrumbs::LogLevel::Info,
+            "bytecode-gen",
+            format!(
+                "--- Finished OOMIR to JVM Bytecode Lowering for module: {} ---",
+                crate_name
+            )
         );
 
         Box::new((
@@ -635,7 +699,7 @@ impl CodegenBackend for MyBackend {
         metadata: EncodedMetadata,
         outputs: &OutputFilenames,
     ) {
-        println!("linking!");
+        breadcrumbs::log!(breadcrumbs::LogLevel::Info, "backend", "linking!");
         use rustc_codegen_ssa::back::link::link_binary;
         link_binary(
             sess,
@@ -648,9 +712,26 @@ impl CodegenBackend for MyBackend {
     }
 }
 
+struct RustcCodegenJvmLogListener;
+
+const LISTENING_CHANNELS: &[&str] = &[];
+
+impl breadcrumbs::LogListener for RustcCodegenJvmLogListener {
+    fn on_log(&mut self, log: breadcrumbs::Log) {
+        if log.level.is_at_least(breadcrumbs::LogLevel::Warn)
+            || LISTENING_CHANNELS.contains(&log.channel.as_str())
+        {
+            println!("{}", log);
+        } else {
+            log.remove();
+        }
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "Rust" fn __rustc_codegen_backend() -> Box<dyn CodegenBackend> {
     std::alloc::set_alloc_error_hook(custom_alloc_error_hook);
+    breadcrumbs::init!(RustcCodegenJvmLogListener);
     Box::new(MyBackend)
 }
 

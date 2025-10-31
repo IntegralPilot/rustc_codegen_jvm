@@ -281,12 +281,16 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
                                 // Create a temporary variable name for the dereferenced value
                                 let next_var = format!("{}_deref", current_var);
 
-                                println!(
-                                    "Info: Handling Deref: Var '{}' ({:?}) -> Temp Var '{}' (Type: {:?})",
-                                    current_var,
-                                    type_before_deref, // Log the array type
-                                    next_var,
-                                    element_type.as_ref() // Log the element type
+                                breadcrumbs::log!(
+                                    breadcrumbs::LogLevel::Info,
+                                    "place-lowering",
+                                    format!(
+                                        "Info: Handling Deref: Var '{}' ({:?}) -> Temp Var '{}' (Type: {:?})",
+                                        current_var,
+                                        type_before_deref,
+                                        next_var,
+                                        element_type.as_ref()
+                                    )
                                 );
 
                                 instructions.push(oomir::Instruction::ArrayGet {
@@ -392,9 +396,13 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
 
                 // Verify this class exists in data_types
                 if !data_types.contains_key(&variant_class_name) {
-                    println!(
-                        "Info: Downcast resulted in variant class name '{}' which is not yet in data_types! Will insert it.",
-                        variant_class_name
+                    breadcrumbs::log!(
+                        breadcrumbs::LogLevel::Info,
+                        "place-lowering",
+                        format!(
+                            "Info: Downcast resulted in variant class name '{}' which is not yet in data_types! Will insert it.",
+                            variant_class_name
+                        )
                     );
                     let mut fields = vec![];
                     for (i, field) in variant_def.fields.iter().enumerate() {
@@ -434,20 +442,28 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
                     ty: oomir::Type::Class(variant_class_name),
                 });
 
-                println!(
-                    "Info: Handled Downcast: Variant {}({}), BaseEnum='{}', New Type (Variant Class): {:?}, Var: {}",
-                    variant_def.name, // Use actual name from variant_def
-                    variant_idx.index(),
-                    base_enum_oomir_name,
-                    current_type, // Should now be Class("complexenum$userdata")
-                    current_var
+                breadcrumbs::log!(
+                    breadcrumbs::LogLevel::Info,
+                    "place-lowering",
+                    format!(
+                        "Info: Handled Downcast: Variant {}({}), BaseEnum='{}', New Type (Variant Class): {:?}, Var: {}",
+                        variant_def.name,
+                        variant_idx.index(),
+                        base_enum_oomir_name,
+                        current_type,
+                        current_var
+                    )
                 );
             }
             // Will add more projection kinds when needed.
             _ => {
-                println!(
-                    "Warning: Unhandled projection element in nested access: {:?}. Skipping.",
-                    proj
+                breadcrumbs::log!(
+                    breadcrumbs::LogLevel::Warn,
+                    "place-lowering",
+                    format!(
+                        "Warning: Unhandled projection element in nested access: {:?}. Skipping.",
+                        proj
+                    )
                 );
             }
         }
@@ -647,11 +663,13 @@ pub fn emit_instructions_to_set_value<'tcx>(
             }
 
             ProjectionElem::Deref => {
-                println!(
-                    "Info: Handling Set via Deref: Target Base Var '{}' ({:?}), Source: {:?}",
-                    base_var_name,
-                    base_oomir_type, // Should be Array(T)
-                    source_operand
+                breadcrumbs::log!(
+                    breadcrumbs::LogLevel::Info,
+                    "place-lowering",
+                    format!(
+                        "Info: Handling Set via Deref: Target Base Var '{}' ({:?}), Source: {:?}",
+                        base_var_name, base_oomir_type, source_operand
+                    )
                 );
 
                 match &base_oomir_type {

@@ -59,9 +59,13 @@ fn build_cfg(code_block: &CodeBlock) -> HashMap<String, BasicBlockInfo> {
                     if cfg_keys.contains(succ_label) {
                         true
                     } else {
-                        eprintln!(
-                            "Warning: Block '{}' refers to non-existent successor '{}'",
-                            label, succ_label
+                        breadcrumbs::log!(
+                            breadcrumbs::LogLevel::Warn,
+                            "optimisation",
+                            format!(
+                                "Warning: Block '{}' refers to non-existent successor '{}'",
+                                label, succ_label
+                            )
                         );
                         false
                     }
@@ -69,7 +73,11 @@ fn build_cfg(code_block: &CodeBlock) -> HashMap<String, BasicBlockInfo> {
                 .collect();
             all_successors.insert(label.clone(), valid_successors);
         } else {
-            eprintln!("Warning: Block '{}' has no instructions.", label);
+            breadcrumbs::log!(
+                breadcrumbs::LogLevel::Warn,
+                "optimisation",
+                format!("Warning: Block '{}' has no instructions.", label)
+            );
             all_successors.insert(label.clone(), vec![]);
         }
     }
@@ -135,9 +143,13 @@ fn transform_function(
             }
         } else {
             // This case should likely not happen if we just inserted it
-            eprintln!(
-                "Internal Warning: optimized block {} not found immediately after insertion.",
-                label
+            breadcrumbs::log!(
+                breadcrumbs::LogLevel::Warn,
+                "optimisation",
+                format!(
+                    "Internal Warning: optimized block {} not found immediately after insertion.",
+                    label
+                )
             );
         }
         optimized_successors.insert(label.clone(), current_successors);
@@ -161,9 +173,13 @@ fn transform_function(
         } else {
             // This suggests reachable_labels contains a label not in intermediate map,
             // which would be an internal error (shouldn't happen if all_original_labels was used correctly).
-            eprintln!(
-                "Internal Error: Reachable label '{}' not found in intermediate blocks.",
-                label
+            breadcrumbs::log!(
+                breadcrumbs::LogLevel::Error,
+                "optimisation",
+                format!(
+                    "Internal Error: Reachable label '{}' not found in intermediate blocks.",
+                    label
+                )
             );
         }
     }
@@ -171,27 +187,45 @@ fn transform_function(
     // --- Entry Point Handling & Cleanup ---
     // Check reachability against the original cfg's keyset size or existence check
     if !reachable_labels.contains(&function.body.entry) && !cfg.is_empty() {
-        eprintln!(
-            "Warning: Original entry block '{}' became unreachable in function '{}'.",
-            function.body.entry, function.name
+        breadcrumbs::log!(
+            breadcrumbs::LogLevel::Warn,
+            "optimisation",
+            format!(
+                "Warning: Original entry block '{}' became unreachable in function '{}'.",
+                function.body.entry, function.name
+            )
         );
         if final_basic_blocks.is_empty() {
-            println!(
-                "Function '{}' appears fully optimized away or is empty.",
-                function.name
+            breadcrumbs::log!(
+                breadcrumbs::LogLevel::Info,
+                "optimisation",
+                format!(
+                    "Function '{}' appears fully optimized away or is empty.",
+                    function.name
+                )
             );
             function.body.basic_blocks.clear();
         } else {
-            eprintln!(
-                "ERROR: Function '{}' has reachable blocks but the original entry '{}' is not reachable. The resulting IR may be invalid.",
-                function.name, function.body.entry
+            breadcrumbs::log!(
+                breadcrumbs::LogLevel::Error,
+                "optimisation",
+                format!(
+                    "ERROR: Function '{}' has reachable blocks but the original entry '{}' is not reachable. The resulting IR may be invalid.",
+                    function.name, function.body.entry
+                )
             );
             // Attempt to recover by picking a new entry point (arbitrarily)
             if let Some(new_entry_label) = final_basic_blocks.keys().next() {
-                eprintln!("Attempting to set new entry point to '{}'", new_entry_label);
+                breadcrumbs::log!(
+                    breadcrumbs::LogLevel::Warn,
+                    "optimisation",
+                    format!("Attempting to set new entry point to '{}'", new_entry_label)
+                );
                 function.body.entry = new_entry_label.clone();
             } else {
-                eprintln!(
+                breadcrumbs::log!(
+                    breadcrumbs::LogLevel::Error,
+                    "optimisation",
                     "CRITICAL ERROR: final_basic_blocks is not empty but has no keys after entry removal."
                 );
                 // Maybe clear blocks if we can't even find a new entry?
@@ -200,7 +234,11 @@ fn transform_function(
         }
     // Handle case where original entry existed but function optimized to empty
     } else if final_basic_blocks.is_empty() && cfg.contains_key(&function.body.entry) {
-        println!("Function '{}' optimized to be empty.", function.name);
+        breadcrumbs::log!(
+            breadcrumbs::LogLevel::Info,
+            "optimisation",
+            format!("Function '{}' optimized to be empty.", function.name)
+        );
         function.body.basic_blocks.clear();
     }
 
@@ -214,13 +252,21 @@ pub fn optimise_function(
     data_types: &HashMap<String, DataType>,
 ) -> Function {
     if function.body.basic_blocks.is_empty() {
-        println!(
-            "Skipping optimization for empty function: {}",
-            function.name
+        breadcrumbs::log!(
+            breadcrumbs::LogLevel::Info,
+            "optimisation",
+            format!(
+                "Skipping optimization for empty function: {}",
+                function.name
+            )
         );
         return function;
     }
-    println!("Optimizing function: {}", function.name);
+    breadcrumbs::log!(
+        breadcrumbs::LogLevel::Info,
+        "optimisation",
+        format!("Optimizing function: {}", function.name)
+    );
 
     // 0. Run needed reorganisation passes
     convert_labels_to_basic_blocks_in_function(&mut function);
@@ -229,9 +275,13 @@ pub fn optimise_function(
     // 1. Build Initial CFG
     let cfg = build_cfg(&function.body);
     if cfg.is_empty() && !function.body.basic_blocks.is_empty() {
-        eprintln!(
-            "Warning: CFG construction failed for non-empty function {}",
-            function.name
+        breadcrumbs::log!(
+            breadcrumbs::LogLevel::Warn,
+            "optimisation",
+            format!(
+                "Warning: CFG construction failed for non-empty function {}",
+                function.name
+            )
         );
         return function; // Avoid panic if CFG fails
     }
@@ -239,9 +289,13 @@ pub fn optimise_function(
     // 2. Perform Dataflow Analysis (Constant Propagation)
     // Ensure entry point exists in CFG before analysis
     if !cfg.contains_key(&function.body.entry) && !cfg.is_empty() {
-        eprintln!(
-            "ERROR: Entry block '{}' not found in CFG for function {}. Skipping optimization.",
-            function.body.entry, function.name
+        breadcrumbs::log!(
+            breadcrumbs::LogLevel::Error,
+            "optimisation",
+            format!(
+                "ERROR: Entry block '{}' not found in CFG for function {}. Skipping optimization.",
+                function.body.entry, function.name
+            )
         );
         // This might happen if the entry block itself has no instructions or references invalid blocks.
         return function;
@@ -256,21 +310,37 @@ pub fn optimise_function(
 
     // TODO: Further optimization passes? (Copy propagation, dead store elimination, etc.)
 
-    println!("Finished optimizing function: {}", function.name);
+    breadcrumbs::log!(
+        breadcrumbs::LogLevel::Info,
+        "optimisation",
+        format!("Finished optimizing function: {}", function.name)
+    );
     function
 }
 
 pub fn optimise_module(module: Module) -> Module {
     let old_funcs = module.functions;
     let mut new_funcs = HashMap::new();
-    println!("Optimizing module: {}", module.name);
+    breadcrumbs::log!(
+        breadcrumbs::LogLevel::Info,
+        "optimisation",
+        format!("Optimizing module: {}", module.name)
+    );
     for (name, func) in old_funcs {
-        println!("Optimizing function: {}", name);
+        breadcrumbs::log!(
+            breadcrumbs::LogLevel::Info,
+            "optimisation",
+            format!("Optimizing function: {}", name)
+        );
         // Pass data_types needed for analysis/transformation
         let new_func = optimise_function(func, &module.data_types);
         new_funcs.insert(name, new_func);
     }
-    println!("Optimization complete for module: {}", module.name);
+    breadcrumbs::log!(
+        breadcrumbs::LogLevel::Info,
+        "optimisation",
+        format!("Optimization complete for module: {}", module.name)
+    );
     Module {
         name: module.name,
         functions: new_funcs,

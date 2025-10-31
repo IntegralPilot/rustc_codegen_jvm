@@ -44,9 +44,13 @@ pub fn convert_operand<'tcx>(
                             handle_const_value(None, constval, &const_ty, tcx, data_types)
                         }
                         _ => {
-                            println!(
-                                "Warning: unhandled constant kind for a Ty const: {:?}",
-                                kind
+                            breadcrumbs::log!(
+                                breadcrumbs::LogLevel::Warn,
+                                "const-eval",
+                                format!(
+                                    "Warning: unhandled constant kind for a Ty const: {:?}",
+                                    kind
+                                )
                             );
                             oomir::Operand::Constant(oomir::Constant::I32(-1))
                         }
@@ -63,20 +67,28 @@ pub fn convert_operand<'tcx>(
                     match tcx.const_eval_resolve(typing_env, uv, span) {
                         Ok(const_val) => {
                             // Evaluation succeeded!
-                            println!(
-                                "Successfully evaluated Unevaluated constant ({:?} at {:?}): {:?}",
-                                uv, span, const_val
+                            breadcrumbs::log!(
+                                breadcrumbs::LogLevel::Info,
+                                "const-eval",
+                                format!(
+                                    "Successfully evaluated Unevaluated constant ({:?} at {:?}): {:?}",
+                                    uv, span, const_val
+                                )
                             );
                             // Now handle the resulting ConstValue using the existing function
                             handle_const_value(Some(constant), const_val, &ty, tcx, data_types)
                         }
                         Err(ErrorHandled::Reported(error_reported, ..)) => {
                             // An error occurred during evaluation and rustc has already reported it.
-                            println!(
-                                "ERROR: Const evaluation failed for {:?} (already reported) at {:?}. Error: {:?}",
-                                uv,
-                                span,
-                                error_reported // error_reported is a DiagnosticBuilder emission guarantee token
+                            breadcrumbs::log!(
+                                breadcrumbs::LogLevel::Error,
+                                "const-eval",
+                                format!(
+                                    "ERROR: Const evaluation failed for {:?} (already reported) at {:?}. Error: {:?}",
+                                    uv,
+                                    span,
+                                    error_reported // error_reported is a DiagnosticBuilder emission guarantee token
+                                )
                             );
                             // You might want to propagate this error or panic.
                             oomir::Operand::Constant(oomir::Constant::I32(-1)) // Error placeholder
@@ -85,9 +97,13 @@ pub fn convert_operand<'tcx>(
                             // The constant couldn't be evaluated because it depends on generic
                             // parameters that weren't fully specified. This is often an error
                             // for final codegen.
-                            println!(
-                                "Warning: Could not evaluate Unevaluated constant {:?} at {:?} due to generics.",
-                                uv, span
+                            breadcrumbs::log!(
+                                breadcrumbs::LogLevel::Warn,
+                                "const-eval",
+                                format!(
+                                    "Warning: Could not evaluate Unevaluated constant {:?} at {:?} due to generics.",
+                                    uv, span
+                                )
                             );
                             oomir::Operand::Constant(oomir::Constant::I32(-2)) // Placeholder for generic error
                         }
@@ -135,18 +151,20 @@ pub fn handle_const_value<'tcx>(
                     // Check for and unwrap transparent ADTs that wrap a single scalar
                     if let TyKind::Adt(adt_def, substs) = current_ty.kind() {
                         // ensure that the ADT gets added to the data_types map (ty_to_oomir_type does this implicitly)
-                        println!("138138138");
+                        breadcrumbs::log!(breadcrumbs::LogLevel::Info, "const-eval", "138138138");
                         let adt_name = match ty_to_oomir_type(*ty, tcx, data_types) {
-                            oomir::Type::Class(class_name) => {
-                                class_name
-                            }
+                            oomir::Type::Class(class_name) => class_name,
                             _ => {
                                 panic!("Expected a class type for ADT, but got: {:?}", ty);
                             }
                         };
-                        println!(
-                            "Info: Found single scalar ADT {} for constant {:?}",
-                            adt_name, scalar_int
+                        breadcrumbs::log!(
+                            breadcrumbs::LogLevel::Info,
+                            "const-eval",
+                            format!(
+                                "Info: Found single scalar ADT {} for constant {:?}",
+                                adt_name, scalar_int
+                            )
                         );
                         // A transparent struct should have one variant
                         let variant = adt_def
@@ -178,9 +196,13 @@ pub fn handle_const_value<'tcx>(
                             // This check might be implicit if field_ty is directly usable by scalar_int_to_oomir_constant
                             if field_ty.is_scalar() || field_ty.is_bool() || field_ty.is_char() {
                                 // Add more conditions if necessary
-                                println!(
-                                    "Info: Unwrapping transparent ADT {:?} to its scalar field type {:?} for ScalarInt constant",
-                                    current_ty, field_ty
+                                breadcrumbs::log!(
+                                    breadcrumbs::LogLevel::Info,
+                                    "const-eval",
+                                    format!(
+                                        "Info: Unwrapping transparent ADT {:?} to its scalar field type {:?} for ScalarInt constant",
+                                        current_ty, field_ty
+                                    )
                                 );
                                 let const_inner =
                                     scalar_int_to_oomir_constant(scalar_int, &field_ty);
@@ -236,17 +258,11 @@ pub fn handle_const_value<'tcx>(
 
                             match constant_oomir {
                                 Ok(oomir_constant) => {
-                                    println!(
-                                        "Info: Successfully read constant value from memory: {:?}",
-                                        oomir_constant
-                                    );
+                                    breadcrumbs::log!(breadcrumbs::LogLevel::Info, "const-eval", format!("Info: Successfully read constant value from memory: {:?}", oomir_constant));
                                     return oomir::Operand::Constant(oomir_constant)
                                 }
                                 Err(e) => {
-                                    println!(
-                                        "Warning: Failed to read constant value from memory for allocation {:?}. Error: {:?}",
-                                        alloc_id, e
-                                    );
+                                    breadcrumbs::log!(breadcrumbs::LogLevel::Warn, "const-eval", format!("Warning: Failed to read constant value from memory for allocation {:?}. Error: {:?}", alloc_id, e));
                                     return oomir::Operand::Constant(oomir::Constant::I32(-1))
                                 }
                             }*/
@@ -266,16 +282,24 @@ pub fn handle_const_value<'tcx>(
                                 TyKind::Ref(_, inner_ty, _) if inner_ty.is_str() => {
                                     match String::from_utf8(bytes.to_vec()) {
                                         Ok(s) => {
-                                            println!(
-                                                "Info: Successfully extracted string constant from allocation: \"{}\"",
-                                                s
+                                            breadcrumbs::log!(
+                                                breadcrumbs::LogLevel::Info,
+                                                "const-eval",
+                                                format!(
+                                                    "Info: Successfully extracted string constant from allocation: \"{}\"",
+                                                    s
+                                                )
                                             );
                                             oomir::Operand::Constant(oomir::Constant::String(s))
                                         }
                                         Err(e) => {
-                                            println!(
-                                                "Warning: Bytes from allocation {:?} for &str were not valid UTF-8: {}",
-                                                alloc_id, e
+                                            breadcrumbs::log!(
+                                                breadcrumbs::LogLevel::Warn,
+                                                "const-eval",
+                                                format!(
+                                                    "Warning: Bytes from allocation {:?} for &str were not valid UTF-8: {}",
+                                                    alloc_id, e
+                                                )
                                             );
                                             // TODO: make OOMIR support raw bytes?
                                             oomir::Operand::Constant(oomir::Constant::String(
@@ -294,9 +318,13 @@ pub fn handle_const_value<'tcx>(
                                             // Check if the element type is &str
                                             if let TyKind::Ref(_, str_ty, _) = elem_ty.kind() {
                                                 if str_ty.is_str() {
-                                                    println!(
-                                                        "Info: Handling Ref-to-[&str; {}]. Reading inner fat pointers from allocation {:?}.",
-                                                        array_len, alloc_id
+                                                    breadcrumbs::log!(
+                                                        breadcrumbs::LogLevel::Info,
+                                                        "const-eval",
+                                                        format!(
+                                                            "Info: Handling Ref-to-[&str; {}]. Reading inner fat pointers from allocation {:?}.",
+                                                            array_len, alloc_id
+                                                        )
                                                     );
 
                                                     // Get layout of the element type (&str, which is a fat pointer)
@@ -320,11 +348,15 @@ pub fn handle_const_value<'tcx>(
                                                                 || elem_layout.size
                                                                     != expected_elem_size
                                                             {
-                                                                println!(
-                                                                    "Warning: Layout of element type {:?} doesn't look like a fat pointer (&str). Size: {:?}, Expected: {:?}",
-                                                                    elem_ty,
-                                                                    elem_layout.size,
-                                                                    expected_elem_size
+                                                                breadcrumbs::log!(
+                                                                    breadcrumbs::LogLevel::Warn,
+                                                                    "const-eval",
+                                                                    format!(
+                                                                        "Warning: Layout of element type {:?} doesn't look like a fat pointer (&str). Size: {:?}, Expected: {:?}",
+                                                                        elem_ty,
+                                                                        elem_layout.size,
+                                                                        expected_elem_size
+                                                                    )
                                                                 );
                                                                 return oomir::Operand::Constant(
                                                                     oomir::Constant::I64(-1),
@@ -388,7 +420,8 @@ pub fn handle_const_value<'tcx>(
                                                                                 .provenance
                                                                                 .alloc_id();
                                                                         let (_, final_offset) =
-                                                                            data_ptr.into_raw_parts();
+                                                                            data_ptr
+                                                                                .into_raw_parts();
 
                                                                         // Get the final allocation containing the string bytes
                                                                         match tcx.global_alloc(final_alloc_id.get_alloc_id().unwrap()) {
@@ -406,27 +439,27 @@ pub fn handle_const_value<'tcx>(
                                                                                         // Convert to string
                                                                                         match String::from_utf8(final_bytes.to_vec()) {
                                                                                             Ok(s) => {
-                                                                                                println!("Info: Successfully extracted string const at index {}: \"{}\"", i, s);
+                                                                                                                                breadcrumbs::log!(breadcrumbs::LogLevel::Info, "const-eval", format!("Info: Successfully extracted string const at index {}: \"{}\"", i, s));
                                                                                                 string_constants.push(oomir::Constant::String(s));
                                                                                             }
                                                                                             Err(e) => {
-                                                                                                println!("Warning: Final string bytes (idx {}) from allocation {:?} were not valid UTF-8: {}", i, final_alloc_id, e);
+                                                                                                breadcrumbs::log!(breadcrumbs::LogLevel::Warn, "const-eval", format!("Warning: Final string bytes (idx {}) from allocation {:?} were not valid UTF-8: {}", i, final_alloc_id, e));
                                                                                                 string_constants.push(oomir::Constant::String("Invalid UTF8 (Inner)".to_string()));
                                                                                             }
                                                                                         }
                                                                                     } else {
-                                                                                         println!("Warning: Calculated string slice range {}..{} (idx {}) out of bounds for allocation {:?} size {}", start_byte, end_byte, i, final_alloc_id, final_alloc.size().bytes());
+                                                                                        breadcrumbs::log!(breadcrumbs::LogLevel::Warn, "const-eval", format!("Warning: Calculated string slice range {}..{} (idx {}) out of bounds for allocation {:?} size {}", start_byte, end_byte, i, final_alloc_id, final_alloc.size().bytes()));
                                                                                          encountered_error = true;
                                                                                          break; // Stop processing this array
                                                                                     }
                                                                                 } else {
-                                                                                    println!("Warning: String slice length calculation overflowed (idx {})", i);
+                                                                                    breadcrumbs::log!(breadcrumbs::LogLevel::Warn, "const-eval", format!("Warning: String slice length calculation overflowed (idx {})", i));
                                                                                     encountered_error = true;
                                                                                     break; // Stop processing this array
                                                                                 }
                                                                             }
                                                                             _ => {
-                                                                                println!("Warning: Inner string pointer (idx {}) {:?} points to unexpected GlobalAlloc kind {:?}", i, data_ptr, tcx.global_alloc(final_alloc_id));
+                                                                                breadcrumbs::log!(breadcrumbs::LogLevel::Warn, "const-eval", format!("Warning: Inner string pointer (idx {}) {:?} points to unexpected GlobalAlloc kind {:?}", i, data_ptr, tcx.global_alloc(final_alloc_id)));
                                                                                 encountered_error = true;
                                                                                 break; // Stop processing this array
                                                                             }
@@ -434,26 +467,17 @@ pub fn handle_const_value<'tcx>(
                                                                     }
                                                                     // Error handling for reading scalars for this element
                                                                     (Err(e), _) => {
-                                                                        println!(
-                                                                            "Error reading inner string data pointer scalar (idx {}) from allocation {:?}: {:?}",
-                                                                            i, alloc_id, e
-                                                                        );
+                                                                        breadcrumbs::log!(breadcrumbs::LogLevel::Error, "const-eval", format!("Error reading inner string data pointer scalar (idx {}) from allocation {:?}: {:?}", i, alloc_id, e));
                                                                         encountered_error = true;
                                                                         break; // Stop processing this array
                                                                     }
                                                                     (_, Err(e)) => {
-                                                                        println!(
-                                                                            "Error reading inner string length scalar (idx {}) from allocation {:?}: {:?}",
-                                                                            i, alloc_id, e
-                                                                        );
+                                                                        breadcrumbs::log!(breadcrumbs::LogLevel::Error, "const-eval", format!("Error reading inner string length scalar (idx {}) from allocation {:?}: {:?}", i, alloc_id, e));
                                                                         encountered_error = true;
                                                                         break; // Stop processing this array
                                                                     }
                                                                     (Ok(data), Ok(len)) => {
-                                                                        println!(
-                                                                            "Warning: Read unexpected scalar types for fat pointer (idx {}). Data: {:?}, Len: {:?}",
-                                                                            i, data, len
-                                                                        );
+                                                                        breadcrumbs::log!(breadcrumbs::LogLevel::Warn, "const-eval", format!("Warning: Read unexpected scalar types for fat pointer (idx {}). Data: {:?}, Len: {:?}", i, data, len));
                                                                         encountered_error = true;
                                                                         break; // Stop processing this array
                                                                     }
@@ -462,18 +486,26 @@ pub fn handle_const_value<'tcx>(
 
                                                             // Check if errors occurred during the loop
                                                             if encountered_error {
-                                                                println!(
-                                                                    "Warning: Encountered errors while processing elements of array constant in allocation {:?}. Returning error placeholder.",
-                                                                    alloc_id
+                                                                breadcrumbs::log!(
+                                                                    breadcrumbs::LogLevel::Warn,
+                                                                    "const-eval",
+                                                                    format!(
+                                                                        "Warning: Encountered errors while processing elements of array constant in allocation {:?}. Returning error placeholder.",
+                                                                        alloc_id
+                                                                    )
                                                                 );
                                                                 return oomir::Operand::Constant(
                                                                     oomir::Constant::I64(-2),
                                                                 ); // Indicate partial/failed array read
                                                             } else {
                                                                 // Success: return the array of string constants
-                                                                println!(
-                                                                    "Info: Successfully extracted array of {} string constants from allocation {:?}.",
-                                                                    array_len, alloc_id
+                                                                breadcrumbs::log!(
+                                                                    breadcrumbs::LogLevel::Info,
+                                                                    "const-eval",
+                                                                    format!(
+                                                                        "Info: Successfully extracted array of {} string constants from allocation {:?}.",
+                                                                        array_len, alloc_id
+                                                                    )
                                                                 );
                                                                 return oomir::Operand::Constant(
                                                                     oomir::Constant::Array(
@@ -486,9 +518,13 @@ pub fn handle_const_value<'tcx>(
                                                             }
                                                         }
                                                         Err(e) => {
-                                                            println!(
-                                                                "Error getting layout for element type {:?}: {:?}",
-                                                                elem_ty, e
+                                                            breadcrumbs::log!(
+                                                                breadcrumbs::LogLevel::Error,
+                                                                "const-eval",
+                                                                format!(
+                                                                    "Error getting layout for element type {:?}: {:?}",
+                                                                    elem_ty, e
+                                                                )
                                                             );
                                                             oomir::Operand::Constant(
                                                                 oomir::Constant::I64(-3),
@@ -497,9 +533,13 @@ pub fn handle_const_value<'tcx>(
                                                     }
                                                 } else {
                                                     /* Array element type is Ref, but not to str */
-                                                    println!(
-                                                        "Warning: Scalar::Ptr points to Ref-to-Array where element type {:?} is Ref but not &str.",
-                                                        elem_ty
+                                                    breadcrumbs::log!(
+                                                        breadcrumbs::LogLevel::Warn,
+                                                        "const-eval",
+                                                        format!(
+                                                            "Warning: Scalar::Ptr points to Ref-to-Array where element type {:?} is Ref but not &str.",
+                                                            elem_ty
+                                                        )
                                                     );
                                                     return oomir::Operand::Constant(
                                                         oomir::Constant::I64(-4),
@@ -515,18 +555,26 @@ pub fn handle_const_value<'tcx>(
                                                     data_types,
                                                 ) {
                                                     Ok(oomir_const) => {
-                                                        println!(
-                                                            "Info: Successfully read constant value from memory: {:?}",
-                                                            oomir_const
+                                                        breadcrumbs::log!(
+                                                            breadcrumbs::LogLevel::Info,
+                                                            "const-eval",
+                                                            format!(
+                                                                "Info: Successfully read constant value from memory: {:?}",
+                                                                oomir_const
+                                                            )
                                                         );
                                                         return oomir::Operand::Constant(
                                                             oomir_const,
                                                         );
                                                     }
                                                     Err(e) => {
-                                                        println!(
-                                                            "Warning: Failed to read constant value from memory for allocation {:?}. Error: {:?}",
-                                                            alloc_id, e
+                                                        breadcrumbs::log!(
+                                                            breadcrumbs::LogLevel::Warn,
+                                                            "const-eval",
+                                                            format!(
+                                                                "Warning: Failed to read constant value from memory for allocation {:?}. Error: {:?}",
+                                                                alloc_id, e
+                                                            )
                                                         );
                                                         return oomir::Operand::Constant(
                                                             oomir::Constant::I32(-1),
@@ -536,9 +584,13 @@ pub fn handle_const_value<'tcx>(
                                             }
                                         } else {
                                             // Could not determine array length (e.g., generic)
-                                            println!(
-                                                "Warning: Scalar::Ptr points to Ref-to-Array but could not determine constant length: {:?}",
-                                                array_len_const
+                                            breadcrumbs::log!(
+                                                breadcrumbs::LogLevel::Warn,
+                                                "const-eval",
+                                                format!(
+                                                    "Warning: Scalar::Ptr points to Ref-to-Array but could not determine constant length: {:?}",
+                                                    array_len_const
+                                                )
                                             );
                                             return oomir::Operand::Constant(oomir::Constant::I64(
                                                 -6,
@@ -546,22 +598,34 @@ pub fn handle_const_value<'tcx>(
                                         }
                                     } else if inner_ty.is_str() {
                                         // Handle the case where the inner type is a reference to a string slice
-                                        println!(
-                                            "Info: Scalar::Ptr points to Ref to str type {:?}. Mapping to OOMIR String.",
-                                            inner_ty
+                                        breadcrumbs::log!(
+                                            breadcrumbs::LogLevel::Info,
+                                            "const-eval",
+                                            format!(
+                                                "Info: Scalar::Ptr points to Ref to str type {:?}. Mapping to OOMIR String.",
+                                                inner_ty
+                                            )
                                         );
                                         match String::from_utf8(bytes.to_vec()) {
                                             Ok(s) => {
-                                                println!(
-                                                    "Info: Successfully extracted string constant from allocation: \"{}\"",
-                                                    s
+                                                breadcrumbs::log!(
+                                                    breadcrumbs::LogLevel::Info,
+                                                    "const-eval",
+                                                    format!(
+                                                        "Info: Successfully extracted string constant from allocation: \"{}\"",
+                                                        s
+                                                    )
                                                 );
                                                 oomir::Operand::Constant(oomir::Constant::String(s))
                                             }
                                             Err(e) => {
-                                                println!(
-                                                    "Warning: Bytes from allocation {:?} for &str were not valid UTF-8: {}",
-                                                    alloc_id, e
+                                                breadcrumbs::log!(
+                                                    breadcrumbs::LogLevel::Warn,
+                                                    "const-eval",
+                                                    format!(
+                                                        "Warning: Bytes from allocation {:?} for &str were not valid UTF-8: {}",
+                                                        alloc_id, e
+                                                    )
                                                 );
                                                 oomir::Operand::Constant(oomir::Constant::String(
                                                     "Invalid UTF8".to_string(),
@@ -569,9 +633,13 @@ pub fn handle_const_value<'tcx>(
                                             }
                                         }
                                     } else if inner_ty.is_ref() {
-                                        println!(
-                                            "Info: Scalar::Ptr points to Ref-to-Ref type {:?}. Reading inner pointer.",
-                                            ty // The original type, like &&u8 or &&str
+                                        breadcrumbs::log!(
+                                            breadcrumbs::LogLevel::Info,
+                                            "const-eval",
+                                            format!(
+                                                "Info: Scalar::Ptr points to Ref-to-Ref type {:?}. Reading inner pointer.",
+                                                ty
+                                            )
                                         );
 
                                         // Get the type of the inner reference (e.g., &u8 or &str)
@@ -582,9 +650,13 @@ pub fn handle_const_value<'tcx>(
                                             TyKind::Ref(_, ty, _) => *ty,
                                             _ => {
                                                 // This case should technically not be reachable if inner_ty.is_ref() was true
-                                                println!(
-                                                    "Warning: Inner type {:?} of Ref-to-Ref was not itself a Ref? Original type: {:?}",
-                                                    inner_ref_ty, ty
+                                                breadcrumbs::log!(
+                                                    breadcrumbs::LogLevel::Warn,
+                                                    "const-eval",
+                                                    format!(
+                                                        "Warning: Inner type {:?} of Ref-to-Ref was not itself a Ref? Original type: {:?}",
+                                                        inner_ref_ty, ty
+                                                    )
                                                 );
                                                 return oomir::Operand::Constant(
                                                     oomir::Constant::I64(-20),
@@ -627,8 +699,12 @@ pub fn handle_const_value<'tcx>(
                                                                 if next_inner_ty.is_str() {
                                                                     // It's actually &&str
                                                                     // We need the length too, which requires reading the fat pointer from the first allocation
-                                                                    println!(
-                                                                        "Info: Detected &&str, reading fat pointer from initial allocation."
+                                                                    breadcrumbs::log!(
+                                                                        breadcrumbs::LogLevel::Info,
+                                                                        "const-eval",
+                                                                        format!(
+                                                                            "Info: Detected &&str, reading fat pointer from initial allocation."
+                                                                        )
                                                                     );
 
                                                                     // Read the length part from the first allocation
@@ -666,11 +742,11 @@ pub fn handle_const_value<'tcx>(
                                                                                         let final_bytes = final_alloc.inspect_with_uninit_and_ptr_outside_interpreter(final_range);
                                                                                         match String::from_utf8(final_bytes.to_vec()) {
                                                                                             Ok(s) => {
-                                                                                                 println!("Info: Successfully extracted string const from &&str indirection: \"{}\"", s);
-                                                                                                 return oomir::Operand::Constant(oomir::Constant::String(s));
+                                                                                                breadcrumbs::log!(breadcrumbs::LogLevel::Info, "const-eval", format!("Info: Successfully extracted string const from &&str indirection: \"{}\"", s));
+                                                                                                return oomir::Operand::Constant(oomir::Constant::String(s));
                                                                                             }
                                                                                             Err(e) => {
-                                                                                                println!("Warning: Final string bytes from allocation {:?} (via &&str) were not valid UTF-8: {}", final_alloc_id, e);
+                                                                                                breadcrumbs::log!(breadcrumbs::LogLevel::Warn, "const-eval", format!("Warning: Final string bytes from allocation {:?} (via &&str) were not valid UTF-8: {}", final_alloc_id, e));
                                                                                                 return oomir::Operand::Constant(oomir::Constant::String("Invalid UTF8 (Inner)".to_string()));
                                                                                             }
                                                                                         }
@@ -681,16 +757,11 @@ pub fn handle_const_value<'tcx>(
                                                                             }
                                                                         }
                                                                         Err(e) => {
-                                                                            println!(
-                                                                                "Error reading length scalar for &&str: {:?}",
-                                                                                e
-                                                                            );
+                                                                            breadcrumbs::log!(breadcrumbs::LogLevel::Error, "const-eval", format!("Error reading length scalar for &&str: {:?}", e));
                                                                             return oomir::Operand::Constant(oomir::Constant::I64(-13));
                                                                         }
                                                                         Ok(_) => {
-                                                                            println!(
-                                                                                "Warning: Expected Int scalar for &&str length, got something else."
-                                                                            );
+                                                                            breadcrumbs::log!(breadcrumbs::LogLevel::Warn, "const-eval", format!("Warning: Expected Int scalar for &&str length, got something else."));
                                                                             return oomir::Operand::Constant(oomir::Constant::I64(-14));
                                                                         }
                                                                     }
@@ -723,12 +794,7 @@ pub fn handle_const_value<'tcx>(
 
                                                                     // Ensure we don't try to read zero bytes if offset is at the end
                                                                     if available_bytes_count == 0 {
-                                                                        println!(
-                                                                            "Warning: Calculated available bytes is zero. Offset: {:?}, Alloc size: {:?}, Type: {:?}",
-                                                                            final_offset,
-                                                                            alloc_size,
-                                                                            next_inner_ty
-                                                                        );
+                                                                        breadcrumbs::log!(breadcrumbs::LogLevel::Warn, "const-eval", format!("Warning: Calculated available bytes is zero. Offset: {:?}, Alloc size: {:?}, Type: {:?}", final_offset, alloc_size, next_inner_ty));
                                                                         return oomir::Operand::Constant(oomir::Constant::I64(-31)); // Indicate zero available bytes error
                                                                     }
 
@@ -746,16 +812,18 @@ pub fn handle_const_value<'tcx>(
                                                                         end_offset_bytes
                                                                             - start_offset_bytes;
 
-                                                                    println!(
-                                                                        "Debug: Reading final value for type {:?}. \
-                         Final Alloc ID: {:?}, Offset: {} bytes, Alloc Size: {} bytes, \
-                         Available Bytes: {}, Reading Range: {:?}",
-                                                                        next_inner_ty,
-                                                                        final_alloc_id,
-                                                                        start_offset_bytes,
-                                                                        alloc_size.bytes(),
-                                                                        available_bytes_count,
-                                                                        final_range_to_read
+                                                                    breadcrumbs::log!(
+                                                                        breadcrumbs::LogLevel::Info,
+                                                                        "const-eval",
+                                                                        format!(
+                                                                            "Debug: Reading final value for type {:?}. Final Alloc ID: {:?}, Offset: {} bytes, Alloc Size: {} bytes, Available Bytes: {}, Reading Range: {:?}",
+                                                                            next_inner_ty,
+                                                                            final_alloc_id,
+                                                                            start_offset_bytes,
+                                                                            alloc_size.bytes(),
+                                                                            available_bytes_count,
+                                                                            final_range_to_read
+                                                                        )
                                                                     );
 
                                                                     // Read the raw bytes using the calculated range based on available data
@@ -767,20 +835,20 @@ pub fn handle_const_value<'tcx>(
                                                                     if final_bytes.len()
                                                                         != final_size
                                                                     {
-                                                                        println!(
-                                                                            "Warning: Read {} bytes via get_bytes, but expected size was {}. Type: {:?}",
-                                                                            final_bytes.len(),
-                                                                            final_size,
-                                                                            next_inner_ty
-                                                                        );
+                                                                        breadcrumbs::log!(breadcrumbs::LogLevel::Warn, "const-eval", format!("Warning: Read {} bytes via get_bytes, but expected size was {}. Type: {:?}", final_bytes.len(), final_size, next_inner_ty));
                                                                         // Decide how to handle this size mismatch - maybe proceed if enough bytes?
                                                                         // For now, let's return an error placeholder.
                                                                         return oomir::Operand::Constant(oomir::Constant::I64(-30)); // Indicate size mismatch error
                                                                     }
 
-                                                                    println!(
-                                                                        "Info: Read raw bytes {:?} for type {:?} via Ref-to-Ref.",
-                                                                        final_bytes, next_inner_ty
+                                                                    breadcrumbs::log!(
+                                                                        breadcrumbs::LogLevel::Info,
+                                                                        "const-eval",
+                                                                        format!(
+                                                                            "Info: Read raw bytes {:?} for type {:?} via Ref-to-Ref.",
+                                                                            final_bytes,
+                                                                            next_inner_ty
+                                                                        )
                                                                     );
 
                                                                     // Determine the expected size based on the type's layout
@@ -926,19 +994,20 @@ pub fn handle_const_value<'tcx>(
                                                                             return oomir::Operand::Constant(oomir_const);
                                                                         }
                                                                         Err(e) => {
-                                                                            println!(
-                                                                                "Error creating ScalarInt from bytes for type {:?}: {}",
-                                                                                next_inner_ty, e
-                                                                            );
+                                                                            breadcrumbs::log!(breadcrumbs::LogLevel::Error, "const-eval", format!("Error creating ScalarInt from bytes for type {:?}: {}", next_inner_ty, e));
                                                                             return oomir::Operand::Constant(oomir::Constant::I64(-33)); // Indicate ScalarInt creation error
                                                                         }
                                                                     }
                                                                 }
                                                             }
                                                             Err(e) => {
-                                                                println!(
-                                                                    "Error getting layout for innermost type {:?}: {:?}",
-                                                                    next_inner_ty, e
+                                                                breadcrumbs::log!(
+                                                                    breadcrumbs::LogLevel::Error,
+                                                                    "const-eval",
+                                                                    format!(
+                                                                        "Error getting layout for innermost type {:?}: {:?}",
+                                                                        next_inner_ty, e
+                                                                    )
                                                                 );
                                                                 return oomir::Operand::Constant(
                                                                     oomir::Constant::I64(-15),
@@ -947,13 +1016,17 @@ pub fn handle_const_value<'tcx>(
                                                         }
                                                     }
                                                     _ => {
-                                                        println!(
-                                                            "Warning: Inner pointer {:?} (via Ref-to-Ref) points to unexpected GlobalAlloc kind {:?}",
-                                                            inner_ptr,
-                                                            tcx.global_alloc(
-                                                                final_alloc_id
-                                                                    .get_alloc_id()
-                                                                    .unwrap()
+                                                        breadcrumbs::log!(
+                                                            breadcrumbs::LogLevel::Warn,
+                                                            "const-eval",
+                                                            format!(
+                                                                "Warning: Inner pointer {:?} (via Ref-to-Ref) points to unexpected GlobalAlloc kind {:?}",
+                                                                inner_ptr,
+                                                                tcx.global_alloc(
+                                                                    final_alloc_id
+                                                                        .get_alloc_id()
+                                                                        .unwrap()
+                                                                )
                                                             )
                                                         );
                                                         return oomir::Operand::Constant(
@@ -964,18 +1037,26 @@ pub fn handle_const_value<'tcx>(
                                             }
                                             // Error handling for reading the inner pointer itself
                                             Err(e) => {
-                                                println!(
-                                                    "Error reading inner pointer scalar (for Ref-to-Ref) from allocation {:?}: {:?}",
-                                                    alloc_id, e
+                                                breadcrumbs::log!(
+                                                    breadcrumbs::LogLevel::Error,
+                                                    "const-eval",
+                                                    format!(
+                                                        "Error reading inner pointer scalar (for Ref-to-Ref) from allocation {:?}: {:?}",
+                                                        alloc_id, e
+                                                    )
                                                 );
                                                 return oomir::Operand::Constant(
                                                     oomir::Constant::I64(-12),
                                                 );
                                             }
                                             Ok(other_scalar) => {
-                                                println!(
-                                                    "Warning: Expected inner pointer (Scalar::Ptr) when handling Ref-to-Ref, but got {:?}.",
-                                                    other_scalar
+                                                breadcrumbs::log!(
+                                                    breadcrumbs::LogLevel::Warn,
+                                                    "const-eval",
+                                                    format!(
+                                                        "Warning: Expected inner pointer (Scalar::Ptr) when handling Ref-to-Ref, but got {:?}.",
+                                                        other_scalar
+                                                    )
                                                 );
                                                 return oomir::Operand::Constant(
                                                     oomir::Constant::I64(-25),
@@ -989,9 +1070,13 @@ pub fn handle_const_value<'tcx>(
                                             _ => panic!("Expected ADT type"),
                                         };*/
 
-                                        println!(
-                                            "Info: Handling Ref-to-ADT {:?}. Reading constant data from allocation {:?}.",
-                                            inner_ty, alloc_id
+                                        breadcrumbs::log!(
+                                            breadcrumbs::LogLevel::Info,
+                                            "const-eval",
+                                            format!(
+                                                "Info: Handling Ref-to-ADT {:?}. Reading constant data from allocation {:?}.",
+                                                inner_ty, alloc_id
+                                            )
                                         );
 
                                         // We need a way to read the constant value from the allocation based on its type.
@@ -1006,16 +1091,24 @@ pub fn handle_const_value<'tcx>(
                                         ) {
                                             Ok(oomir_const) => {
                                                 // Successfully read the constant ADT value
-                                                println!(
-                                                    "Info: Successfully extracted constant ADT: {:?}",
-                                                    oomir_const
+                                                breadcrumbs::log!(
+                                                    breadcrumbs::LogLevel::Info,
+                                                    "const-eval",
+                                                    format!(
+                                                        "Info: Successfully extracted constant ADT: {:?}",
+                                                        oomir_const
+                                                    )
                                                 );
                                                 oomir::Operand::Constant(oomir_const)
                                             }
                                             Err(e) => {
-                                                println!(
-                                                    "Error: Failed to read constant ADT of type {:?} from allocation {:?}: {}",
-                                                    inner_ty, alloc_id, e
+                                                breadcrumbs::log!(
+                                                    breadcrumbs::LogLevel::Error,
+                                                    "const-eval",
+                                                    format!(
+                                                        "Error: Failed to read constant ADT of type {:?} from allocation {:?}: {}",
+                                                        inner_ty, alloc_id, e
+                                                    )
                                                 );
                                                 // Return an error placeholder or panic, depending on desired robustness
                                                 oomir::Operand::Constant(oomir::Constant::I64(-50)) // Placeholder for ADT read error
@@ -1023,9 +1116,13 @@ pub fn handle_const_value<'tcx>(
                                         }
                                     } else if inner_ty.is_scalar() {
                                         // Handle scalar types (e.g., i32, f64, etc.) using the experimental resolution engine
-                                        println!(
-                                            "Info: Handling Ref-to-scalar {:?}. Reading constant value from allocation {:?}.",
-                                            inner_ty, alloc_id
+                                        breadcrumbs::log!(
+                                            breadcrumbs::LogLevel::Info,
+                                            "const-eval",
+                                            format!(
+                                                "Info: Handling Ref-to-scalar {:?}. Reading constant value from allocation {:?}",
+                                                inner_ty, alloc_id
+                                            )
                                         );
 
                                         // Read the constant value from the allocation
@@ -1037,25 +1134,37 @@ pub fn handle_const_value<'tcx>(
                                             data_types,
                                         ) {
                                             Ok(oomir_const) => {
-                                                println!(
-                                                    "Info: Successfully extracted constant scalar: {:?}",
-                                                    oomir_const
+                                                breadcrumbs::log!(
+                                                    breadcrumbs::LogLevel::Info,
+                                                    "const-eval",
+                                                    format!(
+                                                        "Info: Successfully extracted constant scalar: {:?}",
+                                                        oomir_const
+                                                    )
                                                 );
                                                 oomir::Operand::Constant(oomir_const)
                                             }
                                             Err(e) => {
-                                                println!(
-                                                    "Error: Failed to read constant scalar of type {:?} from allocation {:?}: {}",
-                                                    inner_ty, alloc_id, e
+                                                breadcrumbs::log!(
+                                                    breadcrumbs::LogLevel::Error,
+                                                    "const-eval",
+                                                    format!(
+                                                        "Error: Failed to read constant scalar of type {:?} from allocation {:?}: {}",
+                                                        inner_ty, alloc_id, e
+                                                    )
                                                 );
                                                 oomir::Operand::Constant(oomir::Constant::I64(-51)) // Placeholder for scalar read error
                                             }
                                         }
                                     } else if inner_ty.is_array() {
                                         // Handle array types
-                                        println!(
-                                            "Info: Handling Ref-to-array {:?}. Reading constant value from allocation {:?}.",
-                                            inner_ty, alloc_id
+                                        breadcrumbs::log!(
+                                            breadcrumbs::LogLevel::Info,
+                                            "const-eval",
+                                            format!(
+                                                "Info: Handling Ref-to-array {:?}. Reading constant value from allocation {:?}",
+                                                inner_ty, alloc_id
+                                            )
                                         );
 
                                         // Read the constant value from the allocation
@@ -1067,75 +1176,112 @@ pub fn handle_const_value<'tcx>(
                                             data_types,
                                         ) {
                                             Ok(oomir_const) => {
-                                                println!(
-                                                    "Info: Successfully extracted constant array: {:?}",
-                                                    oomir_const
+                                                breadcrumbs::log!(
+                                                    breadcrumbs::LogLevel::Info,
+                                                    "const-eval",
+                                                    format!(
+                                                        "Info: Successfully extracted constant array: {:?}",
+                                                        oomir_const
+                                                    )
                                                 );
                                                 oomir::Operand::Constant(oomir_const)
                                             }
                                             Err(e) => {
-                                                println!(
-                                                    "Error: Failed to read constant array of type {:?} from allocation {:?}: {}",
-                                                    inner_ty, alloc_id, e
+                                                breadcrumbs::log!(
+                                                    breadcrumbs::LogLevel::Error,
+                                                    "const-eval",
+                                                    format!(
+                                                        "Error: Failed to read constant array of type {:?} from allocation {:?}: {}",
+                                                        inner_ty, alloc_id, e
+                                                    )
                                                 );
                                                 oomir::Operand::Constant(oomir::Constant::I64(-52)) // Placeholder for array read error
                                             }
                                         }
                                     } else if matches!(inner_ty.kind(), TyKind::Tuple(..)) {
-                                        println!(
-                                            "Info: Handling Ref-to-Tuple {:?}. Reading constant data from allocation {:?}.",
-                                            inner_ty, alloc_id
+                                        breadcrumbs::log!(
+                                            breadcrumbs::LogLevel::Info,
+                                            "const-eval",
+                                            format!(
+                                                "Info: Handling Ref-to-Tuple {:?}. Reading constant data from allocation {:?}",
+                                                inner_ty, alloc_id
+                                            )
                                         );
                                         match read_constant_value_from_memory(
                                             tcx,
                                             allocation,
                                             pointer.into_raw_parts().1, // Offset within the allocation
-                                            *inner_ty,              // The tuple type itself
+                                            *inner_ty,                  // The tuple type itself
                                             data_types,
                                         ) {
                                             Ok(oomir_const) => {
-                                                println!(
-                                                    "Info: Successfully extracted constant tuple: {:?}",
-                                                    oomir_const
+                                                breadcrumbs::log!(
+                                                    breadcrumbs::LogLevel::Info,
+                                                    "const-eval",
+                                                    format!(
+                                                        "Info: Successfully extracted constant tuple: {:?}",
+                                                        oomir_const
+                                                    )
                                                 );
                                                 oomir::Operand::Constant(oomir_const)
                                             }
                                             Err(e) => {
-                                                println!(
-                                                    "Error: Failed to read constant tuple of type {:?} from allocation {:?}: {}",
-                                                    inner_ty, alloc_id, e
+                                                breadcrumbs::log!(
+                                                    breadcrumbs::LogLevel::Error,
+                                                    "const-eval",
+                                                    format!(
+                                                        "Error: Failed to read constant tuple of type {:?} from allocation {:?}: {}",
+                                                        inner_ty, alloc_id, e
+                                                    )
                                                 );
                                                 oomir::Operand::Constant(oomir::Constant::I64(-53)) // Placeholder for tuple read error
                                             }
                                         }
                                     } else {
                                         // Inner type of the Ref is not an Array, str, ADT or another Ref
-                                        println!(
-                                            "Warning: Scalar::Ptr points to Ref to non-Array, non-str, non-Ref, non-ADT type {:?}. Not a recognized pattern.",
-                                            inner_ty
+                                        breadcrumbs::log!(
+                                            breadcrumbs::LogLevel::Warn,
+                                            "const-eval",
+                                            format!(
+                                                "Warning: Scalar::Ptr points to Ref to non-Array, non-str, non-Ref, non-ADT type {:?}. Not a recognized pattern.",
+                                                inner_ty
+                                            )
                                         );
                                         // Fall through to default handling or return specific error
                                         oomir::Operand::Constant(oomir::Constant::I64(-7)) // Indicate not ref-to-array or str or ref
                                     }
                                 }
                                 _ => {
-                                    println!(
-                                        "Warning: Scalar::Ptr points to an allocation, but the type {:?} is not a recognized string or slice ref.",
-                                        ty
+                                    breadcrumbs::log!(
+                                        breadcrumbs::LogLevel::Warn,
+                                        "const-eval",
+                                        format!(
+                                            "Warning: Scalar::Ptr points to an allocation, but the type {:?} is not a recognized string or slice ref.",
+                                            ty
+                                        )
                                     );
                                     oomir::Operand::Constant(oomir::Constant::I64(0))
                                 }
                             }
                         }
                         _ => {
-                            println!("Warning: Pointer to non-memory allocation not handled yet.");
+                            breadcrumbs::log!(
+                                breadcrumbs::LogLevel::Warn,
+                                "const-eval",
+                                format!(
+                                    "Warning: Pointer to non-memory allocation not handled yet."
+                                )
+                            );
                             oomir::Operand::Constant(oomir::Constant::I32(0))
                         }
                     }
                 }
             }
         }
-        ConstValue::Slice { alloc_id: _, meta: _ } => {
+        ConstValue::Slice {
+            alloc_id: _,
+            meta: _,
+        } => {
             let is_str_slice_or_ref = match ty.kind() {
                 TyKind::Str | TyKind::Slice(_) => true, // Direct str or slice type
                 TyKind::Ref(_, inner_ty, _) => inner_ty.is_str() || inner_ty.is_slice(), // Reference to str or slice
@@ -1145,13 +1291,21 @@ pub fn handle_const_value<'tcx>(
                 match const_val.try_get_slice_bytes_for_diagnostics(tcx) {
                     Some(bytes) => match String::from_utf8(bytes.to_vec()) {
                         Ok(s) => {
-                            println!("Info: Correctly extracted string constant: \"{}\"", s);
+                            breadcrumbs::log!(
+                                breadcrumbs::LogLevel::Info,
+                                "const-eval",
+                                format!("Info: Correctly extracted string constant: \"{}\"", s)
+                            );
                             oomir::Operand::Constant(oomir::Constant::String(s))
                         }
                         Err(_) => {
-                            println!(
-                                "Warning: Slice constant bytes are not valid UTF-8: {:?}",
-                                bytes
+                            breadcrumbs::log!(
+                                breadcrumbs::LogLevel::Warn,
+                                "const-eval",
+                                format!(
+                                    "Warning: Slice constant bytes are not valid UTF-8: {:?}",
+                                    bytes
+                                )
                             );
                             oomir::Operand::Constant(oomir::Constant::String(
                                 "Invalid UTF8".to_string(),
@@ -1159,9 +1313,13 @@ pub fn handle_const_value<'tcx>(
                         }
                     },
                     None => {
-                        println!(
-                            "Warning: Could not get slice bytes for diagnostics for: {:?}",
-                            constant
+                        breadcrumbs::log!(
+                            breadcrumbs::LogLevel::Warn,
+                            "const-eval",
+                            format!(
+                                "Warning: Could not get slice bytes for diagnostics for: {:?}",
+                                constant
+                            )
                         );
                         oomir::Operand::Constant(oomir::Constant::String(
                             "SliceReadError".to_string(),
@@ -1169,21 +1327,33 @@ pub fn handle_const_value<'tcx>(
                     }
                 }
             } else {
-                println!(
-                    "Warning: ConstValue::Slice found for non-slice type: {:?}",
-                    ty
+                breadcrumbs::log!(
+                    breadcrumbs::LogLevel::Warn,
+                    "const-eval",
+                    format!(
+                        "Warning: ConstValue::Slice found for non-slice type: {:?}",
+                        ty
+                    )
                 );
                 oomir::Operand::Constant(oomir::Constant::String("NonSliceTypeError".to_string()))
             }
         }
         ConstValue::ZeroSized => {
-            println!("Info: Encountered ZeroSized constant for type {:?}", ty);
+            breadcrumbs::log!(
+                breadcrumbs::LogLevel::Info,
+                "const-eval",
+                format!("Info: Encountered ZeroSized constant for type {:?}", ty)
+            );
             oomir::Operand::Constant(oomir::Constant::I32(0))
         }
         ConstValue::Indirect { alloc_id, offset } => {
-            println!(
-                "Info: Handling Indirect constant (AllocId: {:?}, Offset: {:?}, Type: {:?})",
-                alloc_id, offset, ty
+            breadcrumbs::log!(
+                breadcrumbs::LogLevel::Info,
+                "const-eval",
+                format!(
+                    "Info: Handling Indirect constant (AllocId: {:?}, Offset: {:?}, Type: {:?})",
+                    alloc_id, offset, ty
+                )
             );
             // Get the allocation where the constant data resides
             match tcx.global_alloc(alloc_id) {
@@ -1197,16 +1367,24 @@ pub fn handle_const_value<'tcx>(
                         data_types,
                     ) {
                         Ok(oomir_const) => {
-                            println!(
-                                "Info: Successfully extracted indirect constant: {:?}",
-                                oomir_const
+                            breadcrumbs::log!(
+                                breadcrumbs::LogLevel::Info,
+                                "const-eval",
+                                format!(
+                                    "Info: Successfully extracted indirect constant: {:?}",
+                                    oomir_const
+                                )
                             );
                             oomir::Operand::Constant(oomir_const)
                         }
                         Err(e) => {
-                            println!(
-                                "Error: Failed to read indirect constant of type {:?} from allocation {:?}: {}",
-                                ty, alloc_id, e
+                            breadcrumbs::log!(
+                                breadcrumbs::LogLevel::Error,
+                                "const-eval",
+                                format!(
+                                    "Error: Failed to read indirect constant of type {:?} from allocation {:?}: {}",
+                                    ty, alloc_id, e
+                                )
                             );
                             // Return an error placeholder, maybe distinct from other errors
                             oomir::Operand::Constant(oomir::Constant::I64(-60))
@@ -1215,9 +1393,13 @@ pub fn handle_const_value<'tcx>(
                 }
                 other_alloc => {
                     // This case should be rare for constants defined in code, but handle it defensively.
-                    println!(
-                        "Warning: Indirect constant points to unexpected GlobalAlloc kind: {:?}. AllocId: {:?}, Type: {:?}",
-                        other_alloc, alloc_id, ty
+                    breadcrumbs::log!(
+                        breadcrumbs::LogLevel::Warn,
+                        "const-eval",
+                        format!(
+                            "Warning: Indirect constant points to unexpected GlobalAlloc kind: {:?}. AllocId: {:?}, Type: {:?}",
+                            other_alloc, alloc_id, ty
+                        )
                     );
                     oomir::Operand::Constant(oomir::Constant::I64(-61))
                 }
@@ -1235,20 +1417,28 @@ pub fn get_placeholder_operand<'tcx>(
     let dest_oomir_type = get_place_type(dest_place, mir, tcx, data_types);
     if dest_oomir_type.is_jvm_reference_type() {
         // Destination needs a reference, use Null placeholder
-        println!(
-            "Info: Generating Object placeholder for unhandled assignment to reference type var '{}' ({:?})",
-            place_to_string(dest_place, tcx), // Recalculate name if needed, or use dest_name
-            dest_oomir_type
+        breadcrumbs::log!(
+            breadcrumbs::LogLevel::Info,
+            "const-eval",
+            format!(
+                "Info: Generating Object placeholder for unhandled assignment to reference type var '{}' ({:?})",
+                place_to_string(dest_place, tcx),
+                dest_oomir_type
+            )
         );
         oomir::Operand::Constant(oomir::Constant::Class(
             "java/lang/Object".to_string(), // Use Object as a placeholder
         ))
     } else {
         // Destination is likely a primitive, use I32(0) as placeholder
-        println!(
-            "Info: Generating I32(0) placeholder for unhandled assignment to primitive type var '{}' ({:?})",
-            place_to_string(dest_place, tcx),
-            dest_oomir_type
+        breadcrumbs::log!(
+            breadcrumbs::LogLevel::Info,
+            "const-eval",
+            format!(
+                "Info: Generating I32(0) placeholder for unhandled assignment to primitive type var '{}' ({:?})",
+                place_to_string(dest_place, tcx),
+                dest_oomir_type
+            )
         );
         oomir::Operand::Constant(oomir::Constant::I32(0))
     }

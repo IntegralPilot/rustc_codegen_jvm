@@ -126,12 +126,20 @@ pub fn oomir_to_jvm_bytecode(
         class_file.to_bytes(&mut byte_vector)?;
         generated_classes.insert(main_class_name_jvm.clone(), byte_vector);
 
-        println!("Generated main class: {}", main_class_name_jvm);
+        breadcrumbs::log!(
+            breadcrumbs::LogLevel::Info,
+            "bytecode-gen",
+            format!("Generated main class: {}", main_class_name_jvm)
+        );
     }
 
     // --- 2. Generate Class Files for Data Types ---
     for (dt_name_oomir, data_type) in &module.data_types {
-        println!("Generating data type class: {}", dt_name_oomir);
+        breadcrumbs::log!(
+            breadcrumbs::LogLevel::Info,
+            "bytecode-gen",
+            format!("Generating data type class: {}", dt_name_oomir)
+        );
 
         let mut data_type = data_type.clone();
 

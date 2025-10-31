@@ -65,9 +65,17 @@ pub fn convert_basic_block<'tcx>(
                         {
                             // Extract element type from array type
                             if let oomir::Type::MutableReference(element_ty) = array_ty {
-                                println!(
-                                    "Info: Tracking mutable borrow array for place {:?} stored in local {:?}. Original: {:?}, ArrayVar: {}, ElementTy: {:?}",
-                                    place, place.local, borrowed_place, array_var_name, element_ty
+                                breadcrumbs::log!(
+                                    breadcrumbs::LogLevel::Info,
+                                    "mir-lowering",
+                                    format!(
+                                        "Info: Tracking mutable borrow array for place {:?} stored in local {:?}. Original: {:?}, ArrayVar: {}, ElementTy: {:?}",
+                                        place,
+                                        place.local,
+                                        borrowed_place,
+                                        array_var_name,
+                                        element_ty
+                                    )
                                 );
                                 mutable_borrow_arrays.insert(
                                     place.local, // The local holding the array reference (e.g., _3)
@@ -78,21 +86,33 @@ pub fn convert_basic_block<'tcx>(
                                     ),
                                 );
                             } else {
-                                println!(
-                                    "Warning: Expected type for mutable borrow ref, found {:?}",
-                                    array_ty
+                                breadcrumbs::log!(
+                                    breadcrumbs::LogLevel::Warn,
+                                    "mir-lowering",
+                                    format!(
+                                        "Warning: Expected type for mutable borrow ref, found {:?}",
+                                        array_ty
+                                    )
                                 );
                             }
                         } else {
-                            println!(
-                                "Warning: Expected variable operand for mutable borrow ref assignment result, found {:?}",
-                                source_operand
+                            breadcrumbs::log!(
+                                breadcrumbs::LogLevel::Warn,
+                                "mir-lowering",
+                                format!(
+                                    "Warning: Expected variable operand for mutable borrow ref assignment result, found {:?}",
+                                    source_operand
+                                )
                             );
                         }
                     } else {
-                        println!(
-                            "Warning: Mutable borrow assigned to complex place {:?}, write-back might not work correctly.",
-                            place
+                        breadcrumbs::log!(
+                            breadcrumbs::LogLevel::Warn,
+                            "mir-lowering",
+                            format!(
+                                "Warning: Mutable borrow assigned to complex place {:?}, write-back might not work correctly.",
+                                place
+                            )
                         );
                     }
                 }
@@ -121,15 +141,23 @@ pub fn convert_basic_block<'tcx>(
                 place,
                 variant_index,
             } => {
-                println!(
-                    "Warning: StatementKind::SetDiscriminant NYI. Place: {:?}, Index: {:?}",
-                    place, variant_index
+                breadcrumbs::log!(
+                    breadcrumbs::LogLevel::Warn,
+                    "mir-lowering",
+                    format!(
+                        "Warning: StatementKind::SetDiscriminant NYI. Place: {:?}, Index: {:?}",
+                        place, variant_index
+                    )
                 );
                 // TODO: Need logic similar to emit_instructions_to_set_value but for discriminants
             }
             // Handle other StatementKind variants if necessary
             _ => {
-                println!("Warning: Unhandled StatementKind: {:?}", stmt.kind);
+                breadcrumbs::log!(
+                    breadcrumbs::LogLevel::Warn,
+                    "mir-lowering",
+                    format!("Warning: Unhandled StatementKind: {:?}", stmt.kind)
+                );
             }
         }
     }
@@ -173,8 +201,8 @@ pub fn convert_basic_block<'tcx>(
                         // Convert MIR value (u128) to appropriate OOMIR constant based on discr_ty
                         let oomir_const = mir_int_to_oomir_const(value, discr_ty, tcx); // Use helper
                         // Check if the constant type is suitable for a JVM switch
-                        if !oomir_const.is_integer_like() {
-                             println!("Warning: SwitchInt target value {:?} for type {:?} cannot be directly used in JVM switch. Block: {}", oomir_const, discr_ty, label);
+                    if !oomir_const.is_integer_like() {
+                        breadcrumbs::log!(breadcrumbs::LogLevel::Warn, "mir-lowering", format!("Warning: SwitchInt target value {:?} for type {:?} cannot be directly used in JVM switch. Block: {}", oomir_const, discr_ty, label));
                              // Decide on fallback: error, skip target, default value?
                              // For now, let's potentially create an invalid switch target for lower2 to handle/error on.
                         }
@@ -201,7 +229,11 @@ pub fn convert_basic_block<'tcx>(
                 target,
                 ..
             } => {
-                println!("the function name is {:?}", func);
+                breadcrumbs::log!(
+                    breadcrumbs::LogLevel::Info,
+                    "mir-lowering",
+                    format!("the function name is {:?}", func)
+                );
                 let function_name = make_jvm_safe(format!("{:?}", func).as_str()); // Get function name - needs refinement to extract actual name
 
                 // --- Track Argument Origins ---
@@ -235,7 +267,7 @@ pub fn convert_basic_block<'tcx>(
                 let dest_var_name = destination.projection.is_empty()
                     .then(|| format!("_{}", destination.local.index()))
                     .or_else(|| {
-                         println!("Warning: Call destination {:?} is complex, return value might be lost.", destination);
+                         breadcrumbs::log!(breadcrumbs::LogLevel::Warn, "mir-lowering", format!("Warning: Call destination {:?} is complex, return value might be lost.", destination));
                          None // Handle complex destinations if needed later
                     });
 
@@ -255,9 +287,13 @@ pub fn convert_basic_block<'tcx>(
                         {
                             // Double-check if the operand passed was indeed the variable we expected
                             if let oomir::Operand::Variable { .. } = oomir_arg_operand {
-                                println!(
-                                    "Info: Emitting write-back for mutable borrow. Arg Place: {:?}, Original Place: {:?}, Array Var: {}",
-                                    arg_place, original_place, array_var_name
+                                breadcrumbs::log!(
+                                    breadcrumbs::LogLevel::Info,
+                                    "mir-lowering",
+                                    format!(
+                                        "Info: Emitting write-back for mutable borrow. Arg Place: {:?}, Original Place: {:?}, Array Var: {}",
+                                        arg_place, original_place, array_var_name
+                                    )
                                 );
 
                                 // Create a temporary variable for the value read from the array
@@ -298,19 +334,27 @@ pub fn convert_basic_block<'tcx>(
                 // --- Add Jump to Target Block (if call returns) ---
                 if let Some(target_bb) = target {
                     let target_label = format!("bb{}", target_bb.index());
-                    println!(
-                        "Info: Adding Jump to {} after Call in bb{}",
-                        target_label,
-                        bb.index()
+                    breadcrumbs::log!(
+                        breadcrumbs::LogLevel::Info,
+                        "mir-lowering",
+                        format!(
+                            "Info: Adding Jump to {} after Call in bb{}",
+                            target_label,
+                            bb.index()
+                        )
                     );
                     instructions.push(oomir::Instruction::Jump {
                         target: target_label,
                     });
                 } else {
                     // Function diverges (e.g., panic!) - No jump needed.
-                    println!(
-                        "Info: Call in bb{} has no return target (diverges).",
-                        bb.index()
+                    breadcrumbs::log!(
+                        breadcrumbs::LogLevel::Info,
+                        "mir-lowering",
+                        format!(
+                            "Info: Call in bb{} has no return target (diverges).",
+                            bb.index()
+                        )
                     );
                 }
             }
@@ -340,10 +384,10 @@ pub fn convert_basic_block<'tcx>(
                         ty: field_oomir_type,
                     };
                 } else {
-                    println!(
-                        // Log constant case
-                        "Info: Assert condition uses constant operand {:?}",
-                        cond
+                    breadcrumbs::log!(
+                        breadcrumbs::LogLevel::Info,
+                        "mir-lowering",
+                        format!("Info: Assert condition uses constant operand {:?}", cond)
                     );
                     // Condition is likely a constant itself
                     condition_operand =
@@ -366,10 +410,13 @@ pub fn convert_basic_block<'tcx>(
                 // The `expected` field tells us what the non-panic value should be.
                 // We want to branch to the failure block if `condition_operand != expected`.
 
-                println!(
-                    // Log the comparison generation
-                    "Info: Generating Assert comparison: '{}' = ({:?}) == {:?}",
-                    comparison_dest, condition_operand, *expected
+                breadcrumbs::log!(
+                    breadcrumbs::LogLevel::Info,
+                    "mir-lowering",
+                    format!(
+                        "Info: Generating Assert comparison: '{}' = ({:?}) == {:?}",
+                        comparison_dest, condition_operand, *expected
+                    )
                 );
 
                 instructions.push(oomir::Instruction::Eq {
@@ -382,10 +429,13 @@ pub fn convert_basic_block<'tcx>(
                 let success_block = format!("bb{}", target.index()); // Success path
                 let failure_block = format!("assert_fail_{}", bb.index()); // Failure path label
 
-                println!(
-                    // Log the branch generation
-                    "Info: Generating Assert branch: if '{}' == true goto {} else goto {}",
-                    comparison_dest, success_block, failure_block
+                breadcrumbs::log!(
+                    breadcrumbs::LogLevel::Info,
+                    "mir-lowering",
+                    format!(
+                        "Info: Generating Assert branch: if '{}' == true goto {} else goto {}",
+                        comparison_dest, success_block, failure_block
+                    )
                 );
 
                 instructions.push(oomir::Instruction::Branch {
@@ -448,10 +498,10 @@ pub fn convert_basic_block<'tcx>(
                     exception_class: "java/lang/RuntimeException".to_string(), // Or ArithmeticException for overflows?
                     message: panic_message,
                 }];
-                println!(
-                    // Log the failure block creation
-                    "Info: Creating failure block '{}'",
-                    failure_block
+                breadcrumbs::log!(
+                    breadcrumbs::LogLevel::Info,
+                    "mir-lowering",
+                    format!("Info: Creating failure block '{}'", failure_block)
                 );
                 basic_blocks.insert(
                     // Ensure 'basic_blocks' map is mutable and passed in
@@ -478,10 +528,14 @@ pub fn convert_basic_block<'tcx>(
                 // as standard GC handles memory. If explicit resource cleanup (like file.close())
                 // were needed, this would require much more complex handling (e.g., try-finally).
 
-                println!(
-                    "Info: Handling Drop terminator for place {:?}. Jumping to target bb{}.",
-                    place_to_string(dropped_place, tcx), // Log which variable is conceptually dropped
-                    target.index()
+                breadcrumbs::log!(
+                    breadcrumbs::LogLevel::Info,
+                    "mir-lowering",
+                    format!(
+                        "Info: Handling Drop terminator for place {:?}. Jumping to target bb{}.",
+                        place_to_string(dropped_place, tcx),
+                        target.index()
+                    )
                 );
 
                 let target_label = format!("bb{}", target.index());
@@ -497,7 +551,11 @@ pub fn convert_basic_block<'tcx>(
             }
             // Other terminator kinds (like Resume, etc.) will be added as needed.
             _ => {
-                println!("Warning: Unhandled terminator {:?}", terminator.kind);
+                breadcrumbs::log!(
+                    breadcrumbs::LogLevel::Warn,
+                    "mir-lowering",
+                    format!("Warning: Unhandled terminator {:?}", terminator.kind)
+                );
             }
         }
     }

@@ -16,7 +16,7 @@ impl ToIdent for &ImplItemId {
 impl ToIdent for &TraitItemId {
     // TODO: Filter results to get exactly what we need, instead of relying on iterating.
     fn to_ident(&self, tcx: TyCtxt<'_>) -> Ident {
-        println!("associated items: ");
+        breadcrumbs::log!(breadcrumbs::LogLevel::Info, "utils", "associated items: ");
         tcx.associated_item(self.owner_id).ident(tcx)
     }
 }
