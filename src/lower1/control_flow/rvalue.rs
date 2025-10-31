@@ -1,7 +1,7 @@
 use rustc_abi::FieldIdx;
 use rustc_middle::{
     mir::{BinOp, Body, BorrowKind as MirBorrowKind, Operand as MirOperand, Place, Rvalue, UnOp},
-    ty::{ConstKind, TyCtxt, TyKind},
+    ty::{ConstKind, Instance, TyCtxt, TyKind},
 };
 use std::collections::HashMap;
 
@@ -38,6 +38,7 @@ pub fn convert_rvalue_to_operand<'a>(
     original_dest_place: &Place<'a>, // Used for naming temps
     mir: &Body<'a>,
     tcx: TyCtxt<'a>,
+    instance: Instance<'a>,
     data_types: &mut HashMap<String, oomir::DataType>,
 ) -> (Vec<oomir::Instruction>, oomir::Operand) {
     let mut instructions = Vec::new();
@@ -50,7 +51,7 @@ pub fn convert_rvalue_to_operand<'a>(
                 MirOperand::Copy(src_place) | MirOperand::Move(src_place) => {
                     // Need to get the value from the source place first
                     let (temp_var_name, get_instructions, temp_var_type) =
-                        emit_instructions_to_get_on_own(src_place, tcx, mir, data_types);
+                        emit_instructions_to_get_on_own(src_place, tcx, instance, mir, data_types);
                     instructions.extend(get_instructions);
                     result_operand = oomir::Operand::Variable {
                         name: temp_var_name,
@@ -60,7 +61,7 @@ pub fn convert_rvalue_to_operand<'a>(
                 MirOperand::Constant(_) => {
                     // Constant is already an operand, no extra instructions
                     result_operand =
-                        convert_operand(mir_operand, tcx, mir, data_types, &mut instructions);
+                        convert_operand(mir_operand, tcx, instance, mir, data_types, &mut instructions);
                 }
             }
         }
@@ -73,7 +74,7 @@ pub fn convert_rvalue_to_operand<'a>(
             if let rustc_middle::ty::TyKind::Array(elem_ty, _) = place_ty.kind() {
                 let oomir_elem_type = ty_to_oomir_type(elem_ty.clone(), tcx, data_types);
                 let oomir_elem_op =
-                    convert_operand(element_op, tcx, mir, data_types, &mut instructions);
+                    convert_operand(element_op, tcx, instance, mir, data_types, &mut instructions);
                 let array_size = match len_const.kind() {
                     ConstKind::Value(val) => {
                         /* ... extract size ... */
@@ -118,7 +119,7 @@ pub fn convert_rvalue_to_operand<'a>(
                         place_ty
                     )
                 );
-                result_operand = get_placeholder_operand(original_dest_place, mir, tcx, data_types);
+                result_operand = get_placeholder_operand(original_dest_place, mir, tcx, instance, data_types);
             }
         }
         Rvalue::Ref(_region, borrow_kind, source_place) => {
@@ -136,7 +137,7 @@ pub fn convert_rvalue_to_operand<'a>(
 
                     // 1. Get the value of the place being referenced (the 'pointee').
                     let (pointee_value_var_name, pointee_get_instructions, pointee_oomir_type) =
-                        emit_instructions_to_get_on_own(source_place, tcx, mir, data_types);
+                        emit_instructions_to_get_on_own(source_place, tcx, instance, mir, data_types);
                     instructions.extend(pointee_get_instructions); // Add instructions to get the value
 
                     // 2. Determine the OOMIR type for the array reference itself.
@@ -196,7 +197,7 @@ pub fn convert_rvalue_to_operand<'a>(
                     // 1. Get the value/reference of the place being borrowed directly.
                     //    `emit_instructions_to_get_on_own` handles loading/accessing the value.
                     let (pointee_value_var_name, pointee_get_instructions, pointee_oomir_type) =
-                        emit_instructions_to_get_on_own(source_place, tcx, mir, data_types);
+                        emit_instructions_to_get_on_own(source_place, tcx, instance, mir, data_types);
 
                     // 2. Add the instructions needed to get this value.
                     instructions.extend(pointee_get_instructions);
@@ -225,7 +226,7 @@ pub fn convert_rvalue_to_operand<'a>(
             let oomir_target_type = ty_to_oomir_type(*target_mir_ty, tcx, data_types);
             let source_mir_ty = operand.ty(&mir.local_decls, tcx);
             let oomir_source_type = ty_to_oomir_type(source_mir_ty, tcx, data_types);
-            let oomir_operand = convert_operand(operand, tcx, mir, data_types, &mut instructions);
+            let oomir_operand = convert_operand(operand, tcx, instance, mir, data_types, &mut instructions);
 
             if oomir_target_type == oomir_source_type {
                 breadcrumbs::log!(
@@ -257,10 +258,10 @@ pub fn convert_rvalue_to_operand<'a>(
 
         Rvalue::BinaryOp(bin_op, box (op1, op2)) => {
             let temp_binop_var = generate_temp_var_name(&base_temp_name);
-            let oomir_op1 = convert_operand(op1, tcx, mir, data_types, &mut instructions);
-            let oomir_op2 = convert_operand(op2, tcx, mir, data_types, &mut instructions);
+            let oomir_op1 = convert_operand(op1, tcx, instance, mir, data_types, &mut instructions);
+            let oomir_op2 = convert_operand(op2, tcx, instance, mir, data_types, &mut instructions);
             // Determine result type based on operands or destination hint
-            let oomir_result_type = get_place_type(original_dest_place, mir, tcx, data_types);
+            let oomir_result_type = get_place_type(original_dest_place, mir, tcx, instance, data_types);
 
             match bin_op {
                 BinOp::Add => instructions.push(oomir::Instruction::Add {
@@ -362,7 +363,7 @@ pub fn convert_rvalue_to_operand<'a>(
                     let op_oomir_ty = ty_to_oomir_type(result_mir_ty, tcx, data_types);
                     // ... get tuple_class_name ...
                     let tuple_class_type =
-                        get_place_type(original_dest_place, mir, tcx, data_types);
+                        get_place_type(original_dest_place, mir, tcx, instance, data_types);
                     let tuple_class_name = match &tuple_class_type {
                         oomir::Type::Class(name) => name.clone(),
                         _ => panic!("..."),
@@ -428,7 +429,7 @@ pub fn convert_rvalue_to_operand<'a>(
                         format!("Warning: Unhandled binary op {:?}", bin_op)
                     );
                     result_operand =
-                        get_placeholder_operand(original_dest_place, mir, tcx, data_types);
+                        get_placeholder_operand(original_dest_place, mir, tcx, instance, data_types);
                     // No instruction needed for placeholder
                     return (instructions, result_operand);
                 }
@@ -442,11 +443,11 @@ pub fn convert_rvalue_to_operand<'a>(
         Rvalue::UnaryOp(operation, operand) => {
             let temp_unop_var = generate_temp_var_name(&base_temp_name);
             let oomir_src_operand =
-                convert_operand(operand, tcx, mir, data_types, &mut instructions);
+                convert_operand(operand, tcx, instance, mir, data_types, &mut instructions);
             // Determine result type (often same as operand, except for PtrMetadata)
             let oomir_result_type = match operation {
                 UnOp::PtrMetadata => oomir::Type::I32,
-                _ => get_place_type(original_dest_place, mir, tcx, data_types), // Use dest type hint
+                _ => get_place_type(original_dest_place, mir, tcx, instance, data_types), // Use dest type hint
             };
 
             match operation {
@@ -546,7 +547,7 @@ pub fn convert_rvalue_to_operand<'a>(
             /* Allow PtrMetadata failure */
             {
                 // If no instruction *actually* assigned to temp_unop_var, it's likely a placeholder case
-                result_operand = get_placeholder_operand(original_dest_place, mir, tcx, data_types);
+                result_operand = get_placeholder_operand(original_dest_place, mir, tcx, instance, data_types);
             } else {
                 result_operand = oomir::Operand::Variable {
                     name: temp_unop_var.clone(),
@@ -559,7 +560,7 @@ pub fn convert_rvalue_to_operand<'a>(
             // Create a temporary variable to hold the aggregate
             let temp_aggregate_var = generate_temp_var_name(&base_temp_name);
             // Get the type from the original destination place
-            let aggregate_oomir_type = get_place_type(original_dest_place, mir, tcx, data_types);
+            let aggregate_oomir_type = get_place_type(original_dest_place, mir, tcx, instance, data_types);
 
             match kind {
                 rustc_middle::mir::AggregateKind::Tuple => {
@@ -591,7 +592,7 @@ pub fn convert_rvalue_to_operand<'a>(
                         let element_oomir_type =
                             ty_to_oomir_type(element_mir_ty.clone(), tcx, data_types);
                         let value_operand =
-                            convert_operand(mir_op, tcx, mir, data_types, &mut instructions);
+                            convert_operand(mir_op, tcx, instance, mir, data_types, &mut instructions);
                         instructions.push(oomir::Instruction::SetField {
                             object: temp_aggregate_var.clone(),
                             field_name,
@@ -622,7 +623,7 @@ pub fn convert_rvalue_to_operand<'a>(
                     // Store elements into the temporary array
                     for (i, mir_operand) in operands.iter().enumerate() {
                         let value_operand =
-                            convert_operand(mir_operand, tcx, mir, data_types, &mut instructions);
+                            convert_operand(mir_operand, tcx, instance, mir, data_types, &mut instructions);
                         let index_operand =
                             oomir::Operand::Constant(oomir::Constant::I32(i as i32));
                         instructions.push(oomir::Instruction::ArrayStore {
@@ -659,6 +660,7 @@ pub fn convert_rvalue_to_operand<'a>(
                             let value_operand = convert_operand(
                                 mir_operand,
                                 tcx,
+                                instance,
                                 mir,
                                 data_types,
                                 &mut instructions,
@@ -811,6 +813,7 @@ pub fn convert_rvalue_to_operand<'a>(
                             let value_operand = convert_operand(
                                 &operands[FieldIdx::from_usize(i)],
                                 tcx,
+                                instance,
                                 mir,
                                 data_types,
                                 &mut instructions,
@@ -857,7 +860,7 @@ pub fn convert_rvalue_to_operand<'a>(
             // Get the operand and instructions for the *place* being pointed to.
             // We need this regardless of the RawPtrKind.
             let (place_temp_var_name, place_get_instructions, place_temp_var_type) =
-                emit_instructions_to_get_on_own(place, tcx, mir, data_types);
+                emit_instructions_to_get_on_own(place, tcx, instance, mir, data_types);
 
             instructions.extend(place_get_instructions);
 
@@ -913,7 +916,7 @@ pub fn convert_rvalue_to_operand<'a>(
         Rvalue::Discriminant(place) => {
             // 1. Generate instructions to get the actual value from the place
             let (actual_value_var_name, get_instructions, actual_value_oomir_type) =
-                emit_instructions_to_get_on_own(place, tcx, mir, data_types);
+                emit_instructions_to_get_on_own(place, tcx, instance, mir, data_types);
 
             // Add the instructions needed to get the value (e.g., ArrayGet)
             instructions.extend(get_instructions);
@@ -974,7 +977,7 @@ pub fn convert_rvalue_to_operand<'a>(
         Rvalue::CopyForDeref(place) => {
             // Need to get the value from the source place first
             let (temp_var_name, get_instructions, temp_var_type) =
-                emit_instructions_to_get_on_own(place, tcx, mir, data_types);
+                emit_instructions_to_get_on_own(place, tcx, instance, mir, data_types);
             instructions.extend(get_instructions);
             result_operand = oomir::Operand::Variable {
                 name: temp_var_name,
@@ -991,7 +994,7 @@ pub fn convert_rvalue_to_operand<'a>(
                     rvalue, original_dest_place
                 )
             );
-            result_operand = get_placeholder_operand(original_dest_place, mir, tcx, data_types);
+            result_operand = get_placeholder_operand(original_dest_place, mir, tcx, instance, data_types);
             // No instructions needed to "calculate" a placeholder
         }
     }

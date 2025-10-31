@@ -13,7 +13,7 @@ use rustc_middle::{
         BasicBlock, BasicBlockData, Body, Local, Operand as MirOperand, Place, StatementKind,
         TerminatorKind,
     },
-    ty::TyCtxt,
+    ty::{Instance, TyCtxt},
 };
 use std::collections::HashMap;
 
@@ -25,6 +25,7 @@ pub fn convert_basic_block<'tcx>(
     bb: BasicBlock,
     bb_data: &BasicBlockData<'tcx>,
     tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
     mir: &Body<'tcx>,
     return_oomir_type: &oomir::Type, // Pass function return type
     basic_blocks: &mut HashMap<String, oomir::BasicBlock>,
@@ -44,7 +45,7 @@ pub fn convert_basic_block<'tcx>(
                 let (rvalue_instructions, source_operand) = rvalue::convert_rvalue_to_operand(
                     // Call the refactored function
                     rvalue, place, // Pass original destination for temp naming hints
-                    mir, tcx, data_types,
+                    mir, tcx, instance, data_types,
                 );
 
                 // Add instructions needed to calculate the Rvalue
@@ -122,6 +123,7 @@ pub fn convert_basic_block<'tcx>(
                     place,          // The actual destination Place
                     source_operand, // The OOMIR operand holding the value from the Rvalue
                     tcx,
+                    instance,
                     mir,
                     data_types,
                 );
@@ -173,6 +175,7 @@ pub fn convert_basic_block<'tcx>(
                     let return_operand = convert_operand(
                         &MirOperand::Move(Place::return_place()),
                         tcx,
+                        instance,
                         mir,
                         data_types,
                         &mut instructions,
@@ -190,7 +193,7 @@ pub fn convert_basic_block<'tcx>(
             }
             TerminatorKind::SwitchInt { discr, targets, .. } => {
                 // --- GENERAL SwitchInt Handling ---
-                let discr_operand = convert_operand(discr, tcx, mir, data_types, &mut instructions);
+                let discr_operand = convert_operand(discr, tcx, instance, mir, data_types, &mut instructions);
                 // Get the actual type of the discriminant from MIR local declarations
                 let discr_ty = discr.ty(&mir.local_decls, tcx);
 
@@ -236,20 +239,120 @@ pub fn convert_basic_block<'tcx>(
                 );
 
                 // Try to detect if this is a closure call
-                let (function_name, is_closure_call) =
-                    if let Some(closure_info) = super::closures::extract_closure_info(func, tcx) {
-                        // This is a closure call - generate the proper closure function name
-                        (
-                            super::closures::generate_closure_function_name(
-                                tcx,
-                                closure_info.closure_def_id,
-                            ),
-                            true,
-                        )
+                let (function_name, is_closure_call) = if let Some(closure_info) =
+                    super::closures::extract_closure_info(func, tcx)
+                {
+                    // This is a closure call - generate the proper closure function name
+                    (
+                        super::closures::generate_closure_function_name(
+                            tcx,
+                            closure_info.closure_def_id,
+                        ),
+                        true,
+                    )
+                } else {
+                    // Regular function or generic instantiation
+                    if let rustc_middle::mir::Operand::Constant(box c) = func {
+                        let fn_ty = c.const_.ty();
+                        if let rustc_middle::ty::TyKind::FnDef(def_id, args) = fn_ty.kind() {
+                            breadcrumbs::log!(
+                                breadcrumbs::LogLevel::Info,
+                                "mir-lowering",
+                                format!("FnDef detected: def_id={:?}, is_local={}, args={:?}", def_id, def_id.is_local(), args)
+                            );
+                            if def_id.is_local() {
+                                // Check if this is a trait method call
+                                if let Some(assoc_item) = tcx.opt_associated_item(*def_id) {
+                                    breadcrumbs::log!(
+                                        breadcrumbs::LogLevel::Info,
+                                        "mir-lowering",
+                                        format!("Associated item found: {:?}, trait_item_def_id={:?}, container={:?}", assoc_item, assoc_item.trait_item_def_id(), assoc_item.container)
+                                    );
+                                    // Check if this is a trait method (check if parent is a trait)
+                                    let is_trait_method = tcx.is_trait(tcx.parent(*def_id));
+                                    
+                                    if is_trait_method {
+                                        // Trait method call: check if it's monomorphized to a concrete type
+                                        if let Some(first_arg) = args.get(0) {
+                                            if let Some(ty) = first_arg.as_type() {
+                                                // Check if it's NOT a trait object (dyn Trait)
+                                                if !matches!(ty.kind(), rustc_middle::ty::TyKind::Dynamic(..)) {
+                                                    // Concrete type - use Type_method naming
+                                                    let type_name = super::types::ty_to_oomir_type(ty, tcx, &mut Default::default());
+                                                    let method_name = tcx.item_name(*def_id).to_string();
+                                                    // Extract class name from Type
+                                                    let class_name = match type_name {
+                                                        oomir::Type::Class(name) => name,
+                                                        oomir::Type::Reference(box oomir::Type::Class(name)) => name,
+                                                        oomir::Type::MutableReference(box oomir::Type::Class(name)) => name,
+                                                        _ => {
+                                                            // Fallback for unexpected types
+                                                            format!("{:?}", type_name)
+                                                        }
+                                                    };
+                                                    let full_name = format!("{}_{}", class_name, method_name);
+                                                    breadcrumbs::log!(
+                                                        breadcrumbs::LogLevel::Info,
+                                                        "mir-lowering",
+                                                        format!("Trait method call with concrete type: def_id={:?}, ty={:?}, using name: {}", def_id, ty, full_name)
+                                                    );
+                                                    (full_name, false)
+                                                } else {
+                                                    // Dynamic trait object - use dyn_Trait_method naming
+                                                    let trait_name = if let rustc_middle::ty::TyKind::Dynamic(preds, _) = ty.kind() {
+                                                        // Extract trait name from trait object
+                                                        if let Some(principal) = preds.principal() {
+                                                            let trait_ref = principal.skip_binder();
+                                                            tcx.item_name(trait_ref.def_id).to_string()
+                                                        } else {
+                                                            "Unknown".to_string()
+                                                        }
+                                                    } else {
+                                                        "Unknown".to_string()
+                                                    };
+                                                    let method_name = tcx.item_name(*def_id).to_string();
+                                                    let full_name = format!("dyn_{}_{}", trait_name, method_name);
+                                                    breadcrumbs::log!(
+                                                        breadcrumbs::LogLevel::Info,
+                                                        "mir-lowering",
+                                                        format!("Trait method call with dyn trait object, using name: {}", full_name)
+                                                    );
+                                                    (full_name, false)
+                                                }
+                                            } else {
+                                                // No type in args, use monomorphized name
+                                                (super::naming::mono_fn_name_from_call_operand(func, tcx).unwrap(), false)
+                                            }
+                                        } else {
+                                            // No args, use monomorphized name
+                                            (super::naming::mono_fn_name_from_call_operand(func, tcx).unwrap(), false)
+                                        }
+                                    } else {
+                                        // Not a trait method, use monomorphized name
+                                        (super::naming::mono_fn_name_from_call_operand(func, tcx).unwrap(), false)
+                                    }
+                                } else {
+                                    // Not an associated item, use monomorphized name
+                                    (super::naming::mono_fn_name_from_call_operand(func, tcx).unwrap(), false)
+                                }
+                            } else {
+                                // External function: check for special cases, otherwise use path-based key for shims
+                                let def_path = tcx.def_path_str(*def_id);
+                                
+                                // Special case: core::str::<impl str>::len maps to our Kotlin shim's len method
+                                if def_path.contains("::str::") && def_path.ends_with("::len") {
+                                    ("len".to_string(), false)
+                                } else {
+                                    (make_jvm_safe(format!("{:?}", func).as_str()), false)
+                                }
+                            }
+                        } else {
+                            (make_jvm_safe(format!("{:?}", func).as_str()), false)
+                        }
                     } else {
-                        // Regular function call - use the old method
                         (make_jvm_safe(format!("{:?}", func).as_str()), false)
-                    };
+                    }
+                };
 
                 // --- Track Argument Origins ---
                 // Store tuples: (Maybe Original MIR Place of Arg, OOMIR Operand for Arg)
@@ -269,7 +372,7 @@ pub fn convert_basic_block<'tcx>(
                     let mir_op = &arg.node;
                     // Important: Pass pre_call_instructions here to collect setup code for this arg
                     let oomir_op =
-                        convert_operand(mir_op, tcx, mir, data_types, &mut pre_call_instructions);
+                        convert_operand(mir_op, tcx, instance, mir, data_types, &mut pre_call_instructions);
 
                     // Identify if the MIR operand is a direct use of a local Place
                     let maybe_arg_place = match mir_op {
@@ -345,6 +448,7 @@ pub fn convert_basic_block<'tcx>(
                                     original_place, // The original Place (_1)
                                     value_to_set,   // The value read from the array
                                     tcx,
+                                    instance,
                                     mir,
                                     data_types,
                                 );
@@ -400,7 +504,7 @@ pub fn convert_basic_block<'tcx>(
                 if let Some(place) = condition_place_opt {
                     // Now, check if this place has a field projection
                     let (temp_dest, instrs, field_oomir_type) =
-                        emit_instructions_to_get_on_own(place, tcx, mir, data_types);
+                        emit_instructions_to_get_on_own(place, tcx, instance, mir, data_types);
                     instructions.extend(instrs);
                     // Use the temporary variable as the condition operand
                     condition_operand = oomir::Operand::Variable {
@@ -415,7 +519,7 @@ pub fn convert_basic_block<'tcx>(
                     );
                     // Condition is likely a constant itself
                     condition_operand =
-                        convert_operand(cond, tcx, mir, data_types, &mut instructions);
+                        convert_operand(cond, tcx, instance, mir, data_types, &mut instructions);
                 }
                 // --- End of condition operand handling ---
 

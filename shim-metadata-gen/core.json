@@ -111,6 +111,10 @@
     "descriptor": "(Ljava/lang/Object;Ljava/lang/Object;)Z",
     "is_static": true
   },
+  "len": {
+    "descriptor": "(Ljava/lang/String;)I",
+    "is_static": true
+  },
   "panic_fmt": {
     "descriptor": "(Ljava/lang/Object;)V",
     "is_static": true

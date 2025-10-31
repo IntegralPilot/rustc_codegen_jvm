@@ -378,6 +378,23 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         Ok((self.jvm_instructions, self.max_locals_used))
     }
 
+    /// Parses a variable name like "_1" into its numeric index, if applicable.
+    #[allow(dead_code)]
+    fn parse_local_index(var_name: &str) -> Option<u16> {
+        if let Some(rest) = var_name.strip_prefix('_') {
+            if let Ok(n) = rest.parse::<u16>() {
+                return Some(n);
+            }
+        }
+        None
+    }
+
+    /// Convenience wrapper to parse argument-like local indices (e.g., "_1").
+    #[allow(dead_code)]
+    fn parse_arg_index(var_name: &str) -> Option<u16> {
+        Self::parse_local_index(var_name)
+    }
+
     /// Appends JVM instructions for loading an operand onto the stack.
     fn load_operand(&mut self, operand: &oomir::Operand) -> Result<(), jvm::Error> {
         match operand {
@@ -385,6 +402,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 load_constant(&mut self.jvm_instructions, &mut self.constant_pool, c)?
             }
             oomir::Operand::Variable { name: var_name, ty } => {
+                // Use the provided type directly - OOMIR variables should have correct types
                 let index = self.get_or_assign_local(var_name, ty);
                 let load_instr = get_load_instruction(ty, index)?;
                 self.jvm_instructions.push(load_instr);
@@ -396,6 +414,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
     /// Appends JVM instructions for storing the value currently on top of the stack
     /// into a local variable.
     fn store_result(&mut self, dest_var: &str, ty: &oomir::Type) -> Result<(), jvm::Error> {
+        // Use the provided type directly - OOMIR variables should have correct types
         let index: u16 = self.get_or_assign_local(dest_var, ty);
         let store_instr = get_store_instruction(ty, index)?;
         self.jvm_instructions.push(store_instr);

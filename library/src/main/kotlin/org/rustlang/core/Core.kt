@@ -130,6 +130,12 @@ public object Core {
     }
 
     @JvmStatic
+    public fun len(str: String): Int {
+        // Return the length of the string in characters (code points, not bytes)
+        return str.length
+    }
+
+    @JvmStatic
     public fun eq(value1: Any?, value2: Any?): Boolean {
         // 1. Identity and Null checks
         if (value1 === value2) { // Same reference or both null

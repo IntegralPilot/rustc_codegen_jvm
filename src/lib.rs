@@ -142,6 +142,11 @@ impl CodegenBackend for MyBackend {
         let mut closures_to_lower: std::collections::HashSet<rustc_hir::def_id::DefId> =
             std::collections::HashSet::new();
 
+        // Track monomorphized function instances to lower and avoid duplicates by name
+        let mut fn_instances_to_lower: Vec<(rustc_middle::ty::Instance<'_>, String)> = Vec::new();
+        let mut seen_fn_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        use rustc_middle::ty::TypingEnv;
+
         // Iterate through all items in the crate and find functions
         let module_items = tcx.hir_crate_items(());
 
@@ -156,6 +161,21 @@ impl CodegenBackend for MyBackend {
             } = item.kind
             {
                 let def_id = item_id.owner_id.to_def_id();
+
+                // Skip directly lowering generic functions; collect concrete instantiations instead
+                let generics = tcx.generics_of(def_id);
+                if !generics.own_params.is_empty() {
+                    breadcrumbs::log!(
+                        breadcrumbs::LogLevel::Info,
+                        "backend",
+                        format!(
+                            "Skipping direct lowering of generic function {} (DefId: {:?}); will lower its monomorphized instances",
+                            i, def_id
+                        )
+                    );
+                    continue;
+                }
+
                 let instance = rustc_middle::ty::Instance::mono(tcx, def_id);
                 let mut mir = tcx.optimized_mir(instance.def_id()).clone(); // Clone the MIR
 
@@ -170,17 +190,13 @@ impl CodegenBackend for MyBackend {
                     for mentioned in mentioned_items.iter() {
                         // Check if this mentioned item is a closure
                         if let rustc_middle::mir::MentionedItem::Fn(fn_ty) = &mentioned.node {
-                            if let rustc_middle::ty::TyKind::FnDef(_fn_def_id, fn_args) =
-                                fn_ty.kind()
+                            if let rustc_middle::ty::TyKind::FnDef(fn_def_id, fn_args) = fn_ty.kind()
                             {
                                 // Check the first argument to see if it's a closure type
+                                let mut is_closure = false;
                                 if let Some(first_arg) = fn_args.get(0) {
                                     if let Some(ty) = first_arg.as_type() {
-                                        if let rustc_middle::ty::TyKind::Closure(
-                                            closure_def_id,
-                                            _,
-                                        ) = ty.kind()
-                                        {
+                                        if let rustc_middle::ty::TyKind::Closure(closure_def_id, _,) = ty.kind() {
                                             breadcrumbs::log!(
                                                 breadcrumbs::LogLevel::Info,
                                                 "closure-discovery",
@@ -190,6 +206,45 @@ impl CodegenBackend for MyBackend {
                                                 )
                                             );
                                             closures_to_lower.insert(*closure_def_id);
+                                            is_closure = true;
+                                        }
+                                    }
+                                }
+                                if !is_closure {
+                                    // Non-closure function reference; enqueue monomorphized instance
+                                    let typing_env = TypingEnv::fully_monomorphized();
+                                    // Only lower functions defined in this crate
+                                    if fn_def_id.is_local() {
+                                        let instance = rustc_middle::ty::Instance::expect_resolve(
+                                            tcx,
+                                            typing_env,
+                                            *fn_def_id,
+                                            *fn_args,
+                                            rustc_span::DUMMY_SP,
+                                        );
+                                        // Skip virtual trait method calls (handled via trait objects at runtime)
+                                        if let rustc_middle::ty::InstanceKind::Virtual(_, _) = instance.def {
+                                            breadcrumbs::log!(
+                                                breadcrumbs::LogLevel::Info,
+                                                "backend",
+                                                format!("Skipping virtual instance: {:?}", instance)
+                                            );
+                                            continue;
+                                        }
+                                        // Skip trait method implementations (already lowered by impl block code with Type_method naming)
+                                        if let Some(assoc_item) = tcx.opt_associated_item(*fn_def_id) {
+                                            if assoc_item.trait_item_def_id().is_some() {
+                                                breadcrumbs::log!(
+                                                    breadcrumbs::LogLevel::Info,
+                                                    "backend",
+                                                    format!("Skipping trait impl method: {:?}", fn_def_id)
+                                                );
+                                                continue;
+                                            }
+                                        }
+                                        let name = lower1::naming::mono_fn_name_from_instance(tcx, instance);
+                                        if seen_fn_names.insert(name.clone()) {
+                                            fn_instances_to_lower.push((instance, name));
                                         }
                                     }
                                 }
@@ -262,6 +317,20 @@ impl CodegenBackend for MyBackend {
                     let i = item.to_ident(tcx).to_string();
                     let def_id = item.owner_id.to_def_id();
 
+                    // Skip direct lowering of generic methods; rely on monomorphized uses
+                    let generics = tcx.generics_of(def_id);
+                    if !generics.own_params.is_empty() {
+                        breadcrumbs::log!(
+                            breadcrumbs::LogLevel::Info,
+                            "backend",
+                            format!(
+                                "Skipping direct lowering of generic impl method {} (DefId: {:?})",
+                                i, def_id
+                            )
+                        );
+                        continue;
+                    }
+
                     let instance = rustc_middle::ty::Instance::mono(tcx, def_id);
                     let mut mir = tcx.optimized_mir(instance.def_id()).clone(); // Clone the MIR
 
@@ -277,9 +346,8 @@ impl CodegenBackend for MyBackend {
                     if let Some(mentioned_items) = &mir.mentioned_items {
                         for mentioned in mentioned_items.iter() {
                             if let rustc_middle::mir::MentionedItem::Fn(fn_ty) = &mentioned.node {
-                                if let rustc_middle::ty::TyKind::FnDef(_fn_def_id, fn_args) =
-                                    fn_ty.kind()
-                                {
+                                if let rustc_middle::ty::TyKind::FnDef(fn_def_id, fn_args) = fn_ty.kind() {
+                                    let mut is_closure = false;
                                     if let Some(first_arg) = fn_args.get(0) {
                                         if let Some(ty) = first_arg.as_type() {
                                             if let rustc_middle::ty::TyKind::Closure(
@@ -296,6 +364,43 @@ impl CodegenBackend for MyBackend {
                                                     )
                                                 );
                                                 closures_to_lower.insert(*closure_def_id);
+                                                is_closure = true;
+                                            }
+                                        }
+                                    }
+                                    if !is_closure {
+                                        let typing_env = TypingEnv::fully_monomorphized();
+                                        if fn_def_id.is_local() {
+                                            let instance = rustc_middle::ty::Instance::expect_resolve(
+                                                tcx,
+                                                typing_env,
+                                                *fn_def_id,
+                                                *fn_args,
+                                                rustc_span::DUMMY_SP,
+                                            );
+                                            // Skip virtual trait method calls (handled via trait objects at runtime)
+                                            if let rustc_middle::ty::InstanceKind::Virtual(_, _) = instance.def {
+                                                breadcrumbs::log!(
+                                                    breadcrumbs::LogLevel::Info,
+                                                    "backend",
+                                                    format!("Skipping virtual instance: {:?}", instance)
+                                                );
+                                                continue;
+                                            }
+                                            // Skip trait method implementations (already lowered by impl block code with Type_method naming)
+                                            if let Some(assoc_item) = tcx.opt_associated_item(*fn_def_id) {
+                                                if assoc_item.trait_item_def_id().is_some() {
+                                                    breadcrumbs::log!(
+                                                        breadcrumbs::LogLevel::Info,
+                                                        "backend",
+                                                        format!("Skipping trait impl method: {:?}", fn_def_id)
+                                                    );
+                                                    continue;
+                                                }
+                                            }
+                                            let name = lower1::naming::mono_fn_name_from_instance(tcx, instance);
+                                            if seen_fn_names.insert(name.clone()) {
+                                                fn_instances_to_lower.push((instance, name));
                                             }
                                         }
                                     }
@@ -701,6 +806,19 @@ impl CodegenBackend for MyBackend {
                     oomir_module.functions.insert(name.clone(), function);
                 }
             }
+        }
+
+        // Lower all discovered monomorphized function instances
+        for (instance, name) in fn_instances_to_lower {
+            let mut mir = tcx.instance_mir(instance.def).clone();
+            breadcrumbs::log!(
+                breadcrumbs::LogLevel::Info,
+                "mir-lowering",
+                format!("--- Lowering monomorphized function instance: {} ---", name)
+            );
+            let (oomir_function, data_types) = lower1::mir_to_oomir(tcx, instance, &mut mir, Some(name.clone()));
+            oomir_module.functions.insert(name, oomir_function);
+            oomir_module.merge_data_types(&data_types);
         }
 
         // Now lower all discovered closures

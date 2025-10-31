@@ -9,7 +9,7 @@ use rustc_middle::{
         interpret::{AllocRange, ErrorHandled, GlobalAlloc, Provenance, Scalar},
     },
     ty::{
-        ConstKind, FloatTy, IntTy, PseudoCanonicalInput, ScalarInt, Ty, TyCtxt, TyKind, TypingEnv,
+        ConstKind, FloatTy, Instance, IntTy, PseudoCanonicalInput, ScalarInt, Ty, TyCtxt, TyKind, TypingEnv,
         UintTy,
     },
 };
@@ -25,6 +25,7 @@ use float::f128_to_string;
 pub fn convert_operand<'tcx>(
     mir_op: &MirOperand<'tcx>,
     tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
     mir: &Body<'tcx>,
     data_types: &mut HashMap<String, oomir::DataType>,
     instructions: &mut Vec<oomir::Instruction>,
@@ -114,14 +115,14 @@ pub fn convert_operand<'tcx>(
         MirOperand::Copy(place) | MirOperand::Move(place) => {
             if place.projection.is_empty() {
                 let var_name = place_to_string(place, tcx);
-                let oomir_type = get_place_type(place, mir, tcx, data_types);
+                let oomir_type = get_place_type(place, mir, tcx, instance, data_types);
                 oomir::Operand::Variable {
                     name: var_name,
                     ty: oomir_type,
                 }
             } else {
                 let (final_var_name, get_instructions, final_type) =
-                    emit_instructions_to_get_on_own(place, tcx, mir, data_types);
+                    emit_instructions_to_get_on_own(place, tcx, instance, mir, data_types);
 
                 instructions.extend(get_instructions);
 
@@ -1412,9 +1413,10 @@ pub fn get_placeholder_operand<'tcx>(
     dest_place: &Place<'tcx>,
     mir: &Body<'tcx>,
     tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
     data_types: &mut HashMap<String, oomir::DataType>,
 ) -> oomir::Operand {
-    let dest_oomir_type = get_place_type(dest_place, mir, tcx, data_types);
+    let dest_oomir_type = get_place_type(dest_place, mir, tcx, instance, data_types);
     if dest_oomir_type.is_jvm_reference_type() {
         // Destination needs a reference, use Null placeholder
         breadcrumbs::log!(

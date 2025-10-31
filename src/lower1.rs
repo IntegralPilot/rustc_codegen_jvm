@@ -21,6 +21,7 @@ mod control_flow;
 pub mod operand;
 pub mod place;
 pub mod types;
+pub mod naming;
 
 pub use closures::{ClosureCallInfo, extract_closure_info, generate_closure_function_name};
 
@@ -40,19 +41,29 @@ pub fn mir_to_oomir<'tcx>(
     use rustc_middle::ty::TyKind;
 
     // Get a function name from the instance or use the provided override.
-    // Closures don't have proper item names, so we must use an override for them.
-    let fn_name = fn_name_override.unwrap_or_else(|| tcx.item_name(instance.def_id()).to_string());
+    // Prefer monomorphized naming to disambiguate generic instantiations.
+    let fn_name = fn_name_override
+        .unwrap_or_else(|| naming::mono_fn_name_from_instance(tcx, instance));
 
     // Extract function signature
     // Closures require special handling - we must use as_closure().sig() instead of fn_sig()
-    let instance_ty = tcx.type_of(instance.def_id()).skip_binder();
+    // Instantiate the function's item type with this instance's generic args, so
+    // generic functions get concrete param/return types.
+    let instance_ty = tcx
+        .type_of(instance.def_id())
+        .instantiate(tcx, instance.args);
     let (params_ty, return_ty) = match instance_ty.kind() {
         TyKind::Closure(_def_id, args) => {
             let sig = args.as_closure().sig();
             (sig.inputs(), sig.output())
         }
+        TyKind::FnDef(def_id, _args) => {
+            // For FnDef, compute the signature from the instantiated item type
+            let mir_sig = instance_ty.fn_sig(tcx);
+            (mir_sig.inputs(), mir_sig.output())
+        }
         _ => {
-            // Regular function - use fn_sig()
+            // Regular function pointer or other callable types
             let mir_sig = instance_ty.fn_sig(tcx);
             (mir_sig.inputs(), mir_sig.output())
         }
@@ -102,6 +113,7 @@ pub fn mir_to_oomir<'tcx>(
             bb,
             bb_data,
             tcx,
+            instance,
             &mir_cloned,
             &return_oomir_ty,
             &mut basic_blocks,

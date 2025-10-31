@@ -6,7 +6,7 @@ use crate::oomir::{self, DataTypeMethod, Instruction, Operand};
 use regex::Regex;
 use rustc_middle::{
     mir::{Body, Operand as MirOperand, Place, ProjectionElem},
-    ty::{TyCtxt, TyKind},
+    ty::{Instance, TyCtxt, TyKind},
 };
 use std::{collections::HashMap, sync::OnceLock};
 
@@ -98,6 +98,7 @@ pub fn make_jvm_safe(input: &str) -> String {
 pub fn emit_instructions_to_get_recursive<'tcx>(
     place: &Place<'tcx>,
     tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
     mir: &Body<'tcx>,
     data_types: &mut HashMap<String, oomir::DataType>,
 ) -> (String, Vec<Instruction>, oomir::Type) {
@@ -107,7 +108,7 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
         projection: tcx.mk_place_elems(&[]),
     };
     let mut current_var = place_to_string(&current_place, tcx);
-    let mut current_type = get_place_type(&current_place, mir, tcx, data_types);
+    let mut current_type = get_place_type(&current_place, mir, tcx, instance, data_types);
     let mut instructions = vec![];
 
     // Iterate over each projection element in the order they appear.
@@ -166,6 +167,7 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
                 let index_operand = convert_operand(
                     &MirOperand::Copy(Place::from(index_local)),
                     tcx,
+                    instance,
                     mir,
                     data_types,
                     &mut instructions,
@@ -474,23 +476,27 @@ pub fn get_place_type<'tcx>(
     place: &Place<'tcx>,
     mir: &Body<'tcx>,
     tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
     data_types: &mut HashMap<String, oomir::DataType>,
 ) -> oomir::Type {
     let place_ty = place.ty(&mir.local_decls, tcx);
-    ty_to_oomir_type(place_ty.ty, tcx, data_types)
+    // Instantiate the type with the instance's generic arguments to get concrete types
+    let instantiated_ty = rustc_middle::ty::EarlyBinder::bind(place_ty.ty).instantiate(tcx, instance.args);
+    ty_to_oomir_type(instantiated_ty, tcx, data_types)
 }
 
-/// Generates OOMIR instructions to “get” the value from a Place.
+/// Generates OOMIR instructions to "get" the value from a Place.
 /// This function now supports nested projections by calling
 /// `emit_instructions_to_get_recursive`.
 pub fn emit_instructions_to_get_on_own<'tcx>(
     place: &Place<'tcx>,
     tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
     mir: &Body<'tcx>,
     data_types: &mut HashMap<String, oomir::DataType>,
 ) -> (String, Vec<Instruction>, oomir::Type) {
     // Delegate the recursive handling.
-    emit_instructions_to_get_recursive(place, tcx, mir, data_types)
+    emit_instructions_to_get_recursive(place, tcx, instance, mir, data_types)
 }
 
 /// Generates OOMIR instructions to store the `source_operand` value into the `dest_place`.
@@ -502,6 +508,7 @@ pub fn emit_instructions_to_set_value<'tcx>(
     dest_place: &Place<'tcx>,
     source_operand: Operand, // The OOMIR value to store
     tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
     mir: &Body<'tcx>,
     data_types: &mut HashMap<String, oomir::DataType>,
 ) -> Vec<Instruction> {
@@ -530,7 +537,7 @@ pub fn emit_instructions_to_set_value<'tcx>(
         //    we'll call ArrayStore on.
         //    We use `get_on_own` which internally handles recursion if base_place itself is nested.
         let (base_var_name, get_base_instructions, base_oomir_type) =
-            emit_instructions_to_get_on_own(&base_place, tcx, mir, data_types);
+            emit_instructions_to_get_on_own(&base_place, tcx, instance, mir, data_types);
         instructions.extend(get_base_instructions); // Add instructions to get the base
 
         // 3. Generate the final store instruction based on the *last* projection.
@@ -588,7 +595,7 @@ pub fn emit_instructions_to_set_value<'tcx>(
                 // Convert the MIR index operand (_local) to an OOMIR operand
                 let mir_index_operand = MirOperand::Copy(Place::from(*index_local)); // Or Move? Copy usually safer.
                 let oomir_index_operand =
-                    convert_operand(&mir_index_operand, tcx, mir, data_types, &mut instructions);
+                    convert_operand(&mir_index_operand, tcx, instance, mir, data_types, &mut instructions);
 
                 instructions.push(Instruction::ArrayStore {
                     array: base_var_name.clone(),
