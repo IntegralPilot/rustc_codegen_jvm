@@ -99,43 +99,49 @@ All examples live in `tests/binary` and are compiled to JVM bytecode & run/teste
 git clone https://github.com/IntegralPilot/rustc_codegen_jvm.git
 cd rustc_codegen_jvm
 
-# Build everything
-make all
+# Build all components using the build script.
+# This single command handles all dependencies and recompiles only what's necessary.
+
+# On Linux or macOS:
+./build.py all
+
+# On Windows, or if the above gives a "permission denied" error:
+python3 build.py all
 ```
 
-This will compile:
+This will intelligently build all necessary components in the correct order:
 
-- `rustc_codegen_jvm` backend library  
-- `java-linker`  
-- Kotlin shim for `core` (once core support is reached, this will no longer be needed)  
-- Generate `config.toml` & `jvm-unknown-unknown.json`  
+-   The Kotlin library shim (`library/`)
+-   The shim metadata file (`core.json`)
+-   The `java-linker` executable
+-   The `rustc_codegen_jvm` backend library
+-   Configuration files (`config.toml`, `jvm-unknown-unknown.json`)
+-   Vendored dependencies like R8
 
-If you relocate the repo, re-run:
-```bash
-make gen-files
-```
+The script uses timestamp checking, so subsequent runs of `./build.py` will be very fast, only rebuilding parts of the project that have changed.
 
 ---
 
 ## 🚀 Usage
 
-1. **Configure your project**  
-   In *your* Rust project directory, create or update `.cargo/config.toml` by copying the generated template (will be at the root of this repo after running make). Also, your `Cargo.toml` needs to contain the following (used to pass flags differentiating between debug and release builds to the linker):
+1.  **Configure your project**
+    In *your* Rust project directory, create or update `.cargo/config.toml` by copying the generated template (it will be at the root of this repository after running the build script). Also, your `Cargo.toml` needs to contain the following (used to pass flags differentiating between debug and release builds to the linker):
 
-   ```toml
-   cargo-features = ["profile-rustflags"]
-   ```
+    ```toml
+    cargo-features = ["profile-rustflags"]
+    ```
 
-2. **Build with Cargo**  
-   ```bash
-   cargo build           # debug
-   cargo build --release # optimized
-   ```
+2.  **Build with Cargo**
+    ```bash
+    cargo build           # debug
+    cargo build --release # optimized
+    ```
 
-3. **Run the `.jar`**  
-   ```bash
-   java -jar target/debug/deps/your_crate*.jar
-   ```
+3.  **Run the `.jar`**
+    ```bash
+    java -jar target/debug/deps/your_crate*.jar # debug
+    java -jar target/release/deps/your_crate*.jar # release
+    ```
 
 ---
 
@@ -144,16 +150,21 @@ make gen-files
 Ensure the toolchain is built:
 
 ```bash
-make all
-# If you moved the repo:
-make gen-files
+# On Linux/macOS:
+./build.py all
+
+# On Windows:
+python3 build.py all
 ```
 
-Then:
+Then, run the test suite:
 
 ```bash
+# Run tests in debug mode
 python3 Tester.py
-# or with --release for release‑mode tests
+
+# Run tests in release mode
+python3 Tester.py --release
 ```
 
 Look for `✅ All tests passed!` or inspect `.generated` files on failure.
@@ -164,21 +175,20 @@ Look for `✅ All tests passed!` or inspect `.generated` files on failure.
 
 ```
 .
-├── src/                   # rustc_codegen_jvm backend
+├── src/                      # rustc_codegen_jvm backend
 │   ├── lib.rs
-│   ├── lower1.rs          # MIR → OOMIR
-│   ├── lower2.rs          # OOMIR → JVM bytecode
-│   └── oomir.rs           # OOMIR definitions
-├── java-linker/           # Bundles .class files into .jar
-├── tests/binary/          # Integration tests
-├── library/               # Kotlin shim for Rust core library
-├── shim-metadata-gen/     # Generates core.json metadata
-├── proguard/              # .pro rules used for r8
-├── Makefile               # build & gen-files
+│   ├── lower1.rs             # MIR → OOMIR
+│   ├── lower2.rs             # OOMIR → JVM bytecode
+│   └── oomir.rs              # OOMIR definitions
+├── java-linker/              # Bundles .class files into .jar
+├── tests/binary/             # Integration tests
+├── library/                  # Kotlin shim for Rust core library
+├── shim-metadata-gen/        # Generates core.json metadata
+├── proguard/                 # .pro rules used for r8
+├── build.py                  # Main build script (replaces Makefile)
 ├── config.toml.template
 ├── jvm-unknown-unknown.json.template
-├── Tester.py              # test runner
-├── GenerateFiles.py       # regenerates config & target spec
+├── Tester.py                 # Test runner script
 └── LICENSE, LICENSE-Apache
 ```
 
@@ -192,6 +202,6 @@ Contributions, issues & PRs welcome! :)
 
 ## 📄 License
 
-Dual‑licensed under **MIT** OR **Apache 2.0** at your option:  
-<https://opensource.org/licenses/MIT>  
+Dual‑licensed under **MIT** OR **Apache 2.0** at your option:
+<https://opensource.org/licenses/MIT>
 <https://www.apache.org/licenses/LICENSE-2.0>

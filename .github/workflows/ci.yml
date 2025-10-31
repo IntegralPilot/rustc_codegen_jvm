@@ -39,17 +39,17 @@ jobs:
     - name: Set up Gradle
       uses: gradle/actions/setup-gradle@v4
 
-    # 7. Make just the files needed to cargo cache
-    - name: Make Gen Files
-      run: make gen-files
+    # 7. make just the files needed to cargo cache
+    - name: Gen Files
+      run: python3 build.py gen-files
       
     # 8. Cargo Caching (Crucial for speed)
     - name: Cache cargo dependencies
       uses: Swatinem/rust-cache@v2
     
-    # 9. Build using the CI-specific make target
+    # 9. Build using the CI-specific target
     - name: Build CI Target
-      run: make ci # Use your optimized CI build command
+      run: python3 build.py ci
 
     # 10. Run tests
     - name: Run integration tests (debug mode)
