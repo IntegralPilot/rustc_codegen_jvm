@@ -49,6 +49,75 @@ mod optimise1;
 /// An instance of our Java bytecode codegen backend.
 struct MyBackend;
 
+/// Helper function to lower a closure definition to OOMIR
+///
+/// This function is called when we encounter a closure call and need to ensure
+/// the closure's implementation is available in the OOMIR module.
+fn lower_closure_to_oomir<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    closure_def_id: rustc_hir::def_id::DefId,
+    oomir_module: &mut oomir::Module,
+) {
+    // Generate the closure function name
+    let closure_name = lower1::generate_closure_function_name(tcx, closure_def_id);
+
+    // Check if we've already lowered this closure
+    if oomir_module.functions.contains_key(&closure_name) {
+        breadcrumbs::log!(
+            breadcrumbs::LogLevel::Info,
+            "closure-lowering",
+            format!("Closure {} already lowered, skipping", closure_name)
+        );
+        return;
+    }
+
+    breadcrumbs::log!(
+        breadcrumbs::LogLevel::Info,
+        "closure-lowering",
+        format!(
+            "Lowering closure: {} (DefId: {:?})",
+            closure_name, closure_def_id
+        )
+    );
+
+    // Get the closure's MIR using expect_resolve with fully monomorphized typing environment
+    // We use fully_monomorphized() since we've already filtered out closures with captures.
+    use rustc_middle::ty::TypingEnv;
+    let typing_env = TypingEnv::fully_monomorphized();
+    let generic_args = rustc_middle::ty::GenericArgs::empty();
+
+    let instance = rustc_middle::ty::Instance::expect_resolve(
+        tcx,
+        typing_env,
+        closure_def_id,
+        generic_args,
+        rustc_span::DUMMY_SP,
+    );
+
+    let mut mir = tcx.optimized_mir(instance.def_id()).clone();
+
+    breadcrumbs::log!(
+        breadcrumbs::LogLevel::Info,
+        "closure-lowering",
+        format!("Closure MIR for {}: {:?}", closure_name, mir)
+    );
+
+    // Lower the closure MIR to OOMIR, providing the closure name as an override
+    // since closures don't have proper item names in rustc
+    let (oomir_function, data_types) =
+        lower1::mir_to_oomir(tcx, instance, &mut mir, Some(closure_name.clone()));
+
+    breadcrumbs::log!(
+        breadcrumbs::LogLevel::Info,
+        "closure-lowering",
+        format!("Successfully lowered closure: {}", closure_name)
+    );
+
+    // Add the closure function to the module
+    oomir_module.functions.insert(closure_name, oomir_function);
+    oomir_module.merge_data_types(&data_types);
+}
+
 impl CodegenBackend for MyBackend {
     fn locale_resource(&self) -> &'static str {
         ""
@@ -68,6 +137,10 @@ impl CodegenBackend for MyBackend {
             functions: std::collections::HashMap::new(),
             data_types: std::collections::HashMap::new(),
         };
+
+        // Track closures we need to lower
+        let mut closures_to_lower: std::collections::HashSet<rustc_hir::def_id::DefId> =
+            std::collections::HashSet::new();
 
         // Iterate through all items in the crate and find functions
         let module_items = tcx.hir_crate_items(());
@@ -92,12 +165,45 @@ impl CodegenBackend for MyBackend {
                     format!("MIR for function {i}: {:?}", mir)
                 );
 
+                // Collect closures from mentioned_items in the MIR
+                if let Some(mentioned_items) = &mir.mentioned_items {
+                    for mentioned in mentioned_items.iter() {
+                        // Check if this mentioned item is a closure
+                        if let rustc_middle::mir::MentionedItem::Fn(fn_ty) = &mentioned.node {
+                            if let rustc_middle::ty::TyKind::FnDef(_fn_def_id, fn_args) =
+                                fn_ty.kind()
+                            {
+                                // Check the first argument to see if it's a closure type
+                                if let Some(first_arg) = fn_args.get(0) {
+                                    if let Some(ty) = first_arg.as_type() {
+                                        if let rustc_middle::ty::TyKind::Closure(
+                                            closure_def_id,
+                                            _,
+                                        ) = ty.kind()
+                                        {
+                                            breadcrumbs::log!(
+                                                breadcrumbs::LogLevel::Info,
+                                                "closure-discovery",
+                                                format!(
+                                                    "Found closure {:?} in function {}",
+                                                    closure_def_id, i
+                                                )
+                                            );
+                                            closures_to_lower.insert(*closure_def_id);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 breadcrumbs::log!(
                     breadcrumbs::LogLevel::Info,
                     "mir-lowering",
                     format!("--- Starting MIR to OOMIR Lowering for function: {i} ---")
                 );
-                let oomir_result = lower1::mir_to_oomir(tcx, instance, &mut mir);
+                let oomir_result = lower1::mir_to_oomir(tcx, instance, &mut mir, None);
                 breadcrumbs::log!(
                     breadcrumbs::LogLevel::Info,
                     "mir-lowering",
@@ -167,12 +273,43 @@ impl CodegenBackend for MyBackend {
                         format!("MIR for function {i2}: {:?}", mir)
                     );
 
+                    // Collect closures from mentioned_items in the MIR
+                    if let Some(mentioned_items) = &mir.mentioned_items {
+                        for mentioned in mentioned_items.iter() {
+                            if let rustc_middle::mir::MentionedItem::Fn(fn_ty) = &mentioned.node {
+                                if let rustc_middle::ty::TyKind::FnDef(_fn_def_id, fn_args) =
+                                    fn_ty.kind()
+                                {
+                                    if let Some(first_arg) = fn_args.get(0) {
+                                        if let Some(ty) = first_arg.as_type() {
+                                            if let rustc_middle::ty::TyKind::Closure(
+                                                closure_def_id,
+                                                _,
+                                            ) = ty.kind()
+                                            {
+                                                breadcrumbs::log!(
+                                                    breadcrumbs::LogLevel::Info,
+                                                    "closure-discovery",
+                                                    format!(
+                                                        "Found closure {:?} in impl method {}",
+                                                        closure_def_id, i2
+                                                    )
+                                                );
+                                                closures_to_lower.insert(*closure_def_id);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     breadcrumbs::log!(
                         breadcrumbs::LogLevel::Info,
                         "mir-lowering",
                         format!("--- Starting MIR to OOMIR Lowering for function: {i2} ---")
                     );
-                    let oomir_result = lower1::mir_to_oomir(tcx, instance, &mut mir);
+                    let oomir_result = lower1::mir_to_oomir(tcx, instance, &mut mir, None);
                     breadcrumbs::log!(
                         breadcrumbs::LogLevel::Info,
                         "mir-lowering",
@@ -566,6 +703,37 @@ impl CodegenBackend for MyBackend {
             }
         }
 
+        // Now lower all discovered closures
+        breadcrumbs::log!(
+            breadcrumbs::LogLevel::Info,
+            "closure-lowering",
+            format!(
+                "Attempting to lower {} discovered closures",
+                closures_to_lower.len()
+            )
+        );
+
+        for closure_def_id in closures_to_lower {
+            // Check if this closure captures any variables (has upvars)
+            // Closures that don't capture anything can be lowered with Instance::mono
+            let upvars = tcx.upvars_mentioned(closure_def_id);
+
+            if upvars.is_some() && !upvars.unwrap().is_empty() {
+                breadcrumbs::log!(
+                    breadcrumbs::LogLevel::Warn,
+                    "closure-lowering",
+                    format!(
+                        "Closure {} captures variables ({} upvars), skipping for now",
+                        lower1::generate_closure_function_name(tcx, closure_def_id),
+                        upvars.unwrap().len()
+                    )
+                );
+                continue;
+            }
+
+            lower_closure_to_oomir(tcx, closure_def_id, &mut oomir_module);
+        }
+
         breadcrumbs::log!(
             breadcrumbs::LogLevel::Info,
             "backend",
@@ -714,7 +882,7 @@ impl CodegenBackend for MyBackend {
 
 struct RustcCodegenJvmLogListener;
 
-const LISTENING_CHANNELS: &[&str] = &["backend"];
+const LISTENING_CHANNELS: &[&str] = &[];
 
 impl breadcrumbs::LogListener for RustcCodegenJvmLogListener {
     fn on_log(&mut self, log: breadcrumbs::Log) {

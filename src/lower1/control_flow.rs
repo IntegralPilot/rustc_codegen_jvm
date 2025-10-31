@@ -234,14 +234,38 @@ pub fn convert_basic_block<'tcx>(
                     "mir-lowering",
                     format!("the function name is {:?}", func)
                 );
-                let function_name = make_jvm_safe(format!("{:?}", func).as_str()); // Get function name - needs refinement to extract actual name
+
+                // Try to detect if this is a closure call
+                let (function_name, is_closure_call) =
+                    if let Some(closure_info) = super::closures::extract_closure_info(func, tcx) {
+                        // This is a closure call - generate the proper closure function name
+                        (
+                            super::closures::generate_closure_function_name(
+                                tcx,
+                                closure_info.closure_def_id,
+                            ),
+                            true,
+                        )
+                    } else {
+                        // Regular function call - use the old method
+                        (make_jvm_safe(format!("{:?}", func).as_str()), false)
+                    };
 
                 // --- Track Argument Origins ---
                 // Store tuples: (Maybe Original MIR Place of Arg, OOMIR Operand for Arg)
                 let mut processed_args: Vec<(Option<Place<'tcx>>, oomir::Operand)> = Vec::new();
                 let mut pre_call_instructions = Vec::new(); // Instructions needed *before* the call for args
 
-                for arg in args {
+                // For closure calls, skip the first argument (the closure itself)
+                // The MIR representation of closure.call((args)) is Fn::call(&closure, (args))
+                // We only want to pass (args) to the lowered closure function
+                let args_to_process = if is_closure_call && !args.is_empty() {
+                    &args[1..] // Skip the first argument (the closure reference)
+                } else {
+                    args
+                };
+
+                for arg in args_to_process {
                     let mir_op = &arg.node;
                     // Important: Pass pre_call_instructions here to collect setup code for this arg
                     let oomir_op =
