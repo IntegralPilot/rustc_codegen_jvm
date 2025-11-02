@@ -6,8 +6,11 @@ import argparse
 import glob
 
 # A constant for the base classpath needed by both test types
-# NOTE: You may need to update the kotlin version in the future
-RUNTIME_CLASSPATH_BASE = "library/build/distributions/library-0.1.0/lib/library-0.1.0.jar:library/build/distributions/library-0.1.0/lib/kotlin-stdlib-2.1.20.jar"
+# NOTE: We may need to update the kotlin version in the future
+RUNTIME_CLASSPATH_BASE = os.pathsep.join([
+    "library/build/distributions/library-0.1.0/lib/library-0.1.0.jar",
+    "library/build/distributions/library-0.1.0/lib/kotlin-stdlib-2.1.20.jar",
+])
 
 def read_from_file(path: str) -> str:
     with open(path, "r") as f:

@@ -221,7 +221,11 @@ pub fn load_constant(
             // 2. Determine constructor parameter types and signature descriptor
             let param_types = params
                 .iter()
-                .map(Type::from_constant) // Get oomir::Type from each oomir::Constant
+                .enumerate()
+                .map(|(i, const_val)| {
+                    let ty = Type::from_constant(const_val);
+                    (format!("arg{}", i), ty)
+                })
                 .collect::<Vec<_>>();
 
             let constructor_signature = Signature {

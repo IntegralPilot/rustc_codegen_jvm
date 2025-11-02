@@ -78,6 +78,21 @@ pub fn oomir_to_jvm_bytecode(
                 attributes: Vec::new(),
             };
 
+            // Create MethodParameters attribute to preserve parameter names
+            let mut parameters_for_attribute = Vec::new();
+            for (name, _) in &function.signature.params {
+                let name_index = main_cp.add_utf8(name)?;
+                parameters_for_attribute.push(jvm::attributes::MethodParameter {
+                    name_index,
+                    access_flags: MethodAccessFlags::empty(), // No special flags
+                });
+            }
+            let method_parameters_attribute_name_index = main_cp.add_utf8("MethodParameters")?;
+            let method_parameters_attribute = Attribute::MethodParameters {
+                name_index: method_parameters_attribute_name_index,
+                parameters: parameters_for_attribute,
+            };
+
             let mut method = jvm::Method::default();
             // Assume static for now, adjust if instance methods are needed
             method.access_flags = MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC;
@@ -88,6 +103,11 @@ pub fn oomir_to_jvm_bytecode(
             method.name_index = name_index;
             method.descriptor_index = descriptor_index;
             method.attributes.push(code_attribute);
+            // Add MethodParameters attribute (skip for constructors as they often have synthetic params)
+            if function.name != "<init>" {
+                println!("Adding MethodParameters attribute for function: {}: {:?}", function.name, method_parameters_attribute);
+                method.attributes.push(method_parameters_attribute);
+            }
 
             methods.push(method);
         }

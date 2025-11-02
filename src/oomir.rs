@@ -188,7 +188,7 @@ pub struct Function {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Signature {
-    pub params: Vec<Type>,
+    pub params: Vec<(String, Type)>,
     pub ret: Box<Type>,
 }
 
@@ -197,7 +197,7 @@ impl Signature {
     /// in the signature's parameters and return type.
     pub fn replace_class_in_signature(&mut self, old_class_name: &str, new_class_name: &str) {
         // Replace in parameters
-        for param_type in self.params.iter_mut() {
+        for (_param_name, param_type) in self.params.iter_mut() {
             param_type.replace_class(old_class_name, new_class_name);
         }
 
@@ -211,8 +211,8 @@ impl Signature {
     pub fn to_string(&self) -> String {
         let mut result = String::new();
         result.push('(');
-        for param in &self.params {
-            result.push_str(&param.to_jvm_descriptor());
+        for (_param_name, param_type) in &self.params {
+            result.push_str(&param_type.to_jvm_descriptor());
         }
         result.push(')');
         result.push_str(&self.ret.to_jvm_descriptor());
@@ -958,7 +958,7 @@ impl Type {
 impl fmt::Display for Signature {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "(")?;
-        for param_ty in &self.params {
+        for (_param_name, param_ty) in &self.params {
             write!(f, "{}", param_ty.to_jvm_descriptor())?;
         }
         write!(f, "){}", self.ret.to_jvm_descriptor())

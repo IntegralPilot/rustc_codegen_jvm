@@ -70,7 +70,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             let param_translator_name = format!("param_{}", i);
             // The name used in the OOMIR body, corresponding to MIR convention (_1, _2, ...)
             let param_oomir_name = format!("_{}", i + 1);
-            let param_ty = &oomir_func.signature.params[i];
+            let (_param_name, param_ty) = &oomir_func.signature.params[i];
 
             // Use assign_local to allocate the slot using the *translator* name first.
             // This ensures the slot is reserved and next_local_index advances correctly.

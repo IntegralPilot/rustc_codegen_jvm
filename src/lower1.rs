@@ -71,15 +71,38 @@ pub fn mir_to_oomir<'tcx>(
 
     let data_types = &mut HashMap::new();
 
-    let params_oomir_ty: Vec<oomir::Type> = params_ty
+    let params_oomir: Vec<(String, oomir::Type)> = params_ty
         .skip_binder()
         .iter()
-        .map(|ty| ty_to_oomir_type(*ty, tcx, data_types))
+        .enumerate()
+        .map(|(i, ty)| {
+            // Arguments start at MIR local 1. The index `i` starts at 0.
+            let local_index = rustc_middle::mir::Local::from_usize(i + 1);
+            
+            // Try to find the parameter name from var_debug_info
+            let param_name = mir.var_debug_info
+                .iter()
+                .find_map(|var_info| {
+                    // Check if this debug info entry is for our parameter
+                    if let rustc_middle::mir::VarDebugInfoContents::Place(place) = &var_info.value {
+                        if place.local == local_index && place.projection.is_empty() {
+                            return Some(var_info.name.to_string());
+                        }
+                    }
+                    None
+                })
+                .unwrap_or_else(|| format!("arg{}", i));
+                
+            let oomir_type = ty_to_oomir_type(*ty, tcx, data_types);
+            
+            // Return the (name, type) tuple
+            (param_name, oomir_type)
+        })
         .collect();
     let return_oomir_ty: oomir::Type = ty_to_oomir_type(return_ty.skip_binder(), tcx, data_types);
 
     let mut signature = oomir::Signature {
-        params: params_oomir_ty,
+        params: params_oomir,
         ret: Box::new(return_oomir_ty.clone()), // Clone here to pass to convert_basic_block
     };
 
@@ -91,9 +114,9 @@ pub fn mir_to_oomir<'tcx>(
             if fn_name == "main" {
                 // manually override the signature to match the JVM main method
                 signature = oomir::Signature {
-                    params: vec![oomir::Type::Array(Box::new(oomir::Type::Class(
+                    params: vec![("args".to_string(), oomir::Type::Array(Box::new(oomir::Type::Class(
                         "java/lang/String".to_string(),
-                    )))],
+                    ))))],
                     ret: Box::new(oomir::Type::Void),
                 };
             }
@@ -132,7 +155,7 @@ pub fn mir_to_oomir<'tcx>(
         // But we receive: local 1 = tuple containing all args
 
         // Get the tuple parameter type (should be the first parameter in the signature)
-        if let Some(tuple_param_ty) = signature.params.first() {
+        if let Some((_tuple_param_name, tuple_param_ty)) = signature.params.first() {
             // Check if it's a tuple/struct type that we need to unpack
             if let oomir::Type::Class(class_name) = tuple_param_ty {
                 // Get the data type definition to see its fields

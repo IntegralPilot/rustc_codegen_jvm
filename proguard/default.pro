@@ -5,3 +5,5 @@
 -keepclassmembers class * implements * {
     <methods>;
 }
+
+-keepattributes MethodParameters

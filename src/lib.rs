@@ -427,12 +427,12 @@ impl CodegenBackend for MyBackend {
                     // Replace self references with the trait name as to match signatures with the one we've put on the interface
                     if of_trait.is_some() {
                         match oomir_function.signature.params.get(0) {
-                            Some(Type::Class(name)) => {
+                            Some((param_name, Type::Class(name))) => {
                                 if *name != ident {
                                     continue;
                                 }
                                 oomir_function.signature.params[0] =
-                                    Type::Class(of_trait.clone().unwrap());
+                                    (param_name.clone(), Type::Class(of_trait.clone().unwrap()));
 
                                 // insert a Cast instruction to cast the trait (interface) object to the specific type of this class
                                 // this is needed because the method signature will be different than what MIR expects
@@ -456,12 +456,15 @@ impl CodegenBackend for MyBackend {
                                     );
                                 }
                             }
-                            Some(Type::MutableReference(box Type::Class(name))) => {
+                            Some((param_name, Type::MutableReference(box Type::Class(name)))) => {
                                 if *name != ident {
                                     continue;
                                 }
-                                oomir_function.signature.params[0] = Type::MutableReference(
-                                    Box::new(Type::Class(of_trait.clone().unwrap())),
+                                oomir_function.signature.params[0] = (
+                                    param_name.clone(),
+                                    Type::MutableReference(
+                                        Box::new(Type::Class(of_trait.clone().unwrap())),
+                                    ),
                                 );
 
                                 // insert a Cast instruction to cast the trait (interface) object to the specific type of this class
@@ -500,23 +503,23 @@ impl CodegenBackend for MyBackend {
                         let mut new_params = vec![];
                         // replace any MutableReference(Class(of_trait)) or Class(of_trait) with MutableReference(Class(ident))/ Class(ident)
                         // this is just for the helper function, the actual method will use oomir_function.signature and we're only modifying helper_sig
-                        for arg in &oomir_function.signature.params {
-                            if let Type::MutableReference(box Type::Class(name)) = arg {
+                        for (param_name, param_ty) in &oomir_function.signature.params {
+                            if let Type::MutableReference(box Type::Class(name)) = param_ty {
                                 if *name == of_trait.clone().unwrap() {
-                                    new_params.push(Type::MutableReference(Box::new(Type::Class(
+                                    new_params.push((param_name.clone(), Type::MutableReference(Box::new(Type::Class(
                                         ident.clone(),
-                                    ))));
+                                    )))));
                                 } else {
-                                    new_params.push(arg.clone());
+                                    new_params.push((param_name.clone(), param_ty.clone()));
                                 }
-                            } else if let Type::Class(name) = arg {
+                            } else if let Type::Class(name) = param_ty {
                                 if *name == of_trait.clone().unwrap() {
-                                    new_params.push(Type::Class(ident.clone()));
+                                    new_params.push((param_name.clone(), Type::Class(ident.clone())));
                                 } else {
-                                    new_params.push(arg.clone());
+                                    new_params.push((param_name.clone(), param_ty.clone()));
                                 }
                             } else {
-                                new_params.push(arg.clone());
+                                new_params.push((param_name.clone(), param_ty.clone()));
                             }
                         }
                         helper_sig.params = new_params;
@@ -531,12 +534,11 @@ impl CodegenBackend for MyBackend {
                     let mut instructions = vec![];
 
                     let mut idx = 1;
-                    for arg in &oomir_function.signature.params {
+                    for (_param_name, param_ty) in &oomir_function.signature.params {
                         let arg_name = format!("_{idx}");
-                        let arg_ty = arg.clone();
                         let arg = Operand::Variable {
                             name: arg_name.clone(),
-                            ty: arg_ty,
+                            ty: param_ty.clone(),
                         };
                         args.push(arg);
                         idx += 1;
@@ -723,16 +725,22 @@ impl CodegenBackend for MyBackend {
                     let data_types = &mut HashMap::new(); // Consider if this should be shared across loop iterations or functions
 
                     // Use skip_binder here too, as inputs/outputs are bound by the same binder as the fn_sig
-                    let params_oomir_ty: Vec<oomir::Type> = params_ty
+                    let params_oomir: Vec<(String, oomir::Type)> = params_ty
                         .skip_binder()
                         .iter()
-                        .map(|ty| lower1::types::ty_to_oomir_type(*ty, tcx, data_types))
+                        .enumerate()
+                        .map(|(i, ty)| {
+                            // For trait methods, we don't have MIR, so use generic names
+                            let param_name = format!("arg{}", i);
+                            let oomir_type = lower1::types::ty_to_oomir_type(*ty, tcx, data_types);
+                            (param_name, oomir_type)
+                        })
                         .collect();
                     let return_oomir_ty: oomir::Type =
                         lower1::types::ty_to_oomir_type(return_ty.skip_binder(), tcx, data_types);
 
                     let mut signature = oomir::Signature {
-                        params: params_oomir_ty,
+                        params: params_oomir,
                         ret: Box::new(return_oomir_ty.clone()),
                     };
                     signature.replace_class_in_signature("Self", &ident);
@@ -741,9 +749,8 @@ impl CodegenBackend for MyBackend {
 
                     let mut args = vec![];
                     let mut idx = 1;
-                    for arg in signature.clone().params {
+                    for (_arg_name_from_sig, arg_ty) in signature.clone().params {
                         let arg_name = format!("_{idx}");
-                        let arg_ty = arg.clone();
                         let arg = Operand::Variable {
                             name: arg_name.clone(),
                             ty: arg_ty,

@@ -205,16 +205,37 @@ pub(super) fn create_data_type_classfile_for_class(
                     attributes: Vec::new(),
                 };
 
+                // Create MethodParameters attribute to preserve parameter names
+                let mut parameters_for_attribute = Vec::new();
+                for (name, _) in &function.signature.params {
+                    let name_index = class_file.constant_pool.add_utf8(name)?;
+                    parameters_for_attribute.push(jvm::attributes::MethodParameter {
+                        name_index,
+                        access_flags: MethodAccessFlags::empty(), // No special flags
+                    });
+                }
+                let method_parameters_attribute_name_index = class_file.constant_pool.add_utf8("MethodParameters")?;
+                let method_parameters_attribute = Attribute::MethodParameters {
+                    name_index: method_parameters_attribute_name_index,
+                    parameters: parameters_for_attribute,
+                };
+
                 let name_index = class_file.constant_pool.add_utf8(method_name)?;
                 let descriptor_index = class_file
                     .constant_pool
                     .add_utf8(&function.signature.to_string())?;
 
+                let mut attributes_vec = vec![code_attribute];
+                // Skip MethodParameters for constructors and getVariantIdx
+                if method_name != "<init>" && method_name != "getVariantIdx" {
+                    attributes_vec.push(method_parameters_attribute);
+                }
+
                 let jvm_method = jvm::Method {
                     access_flags: MethodAccessFlags::PUBLIC,
                     name_index,
                     descriptor_index,
-                    attributes: vec![code_attribute],
+                    attributes: attributes_vec,
                 };
 
                 class_file.methods.push(jvm_method);
@@ -256,7 +277,7 @@ pub(super) fn create_data_type_classfile_for_interface(
     for (method_name, signature) in methods {
         // Construct the descriptor: (param1_desc param2_desc ...)return_desc
         let mut descriptor = String::from("(");
-        for param_type in &signature.params {
+        for (_param_name, param_type) in &signature.params {
             descriptor.push_str(&param_type.to_jvm_descriptor());
         }
         descriptor.push(')');
