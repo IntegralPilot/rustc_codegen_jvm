@@ -402,10 +402,10 @@ public fun core_slice_u8_starts_with(value: Any, prefix: Any): Boolean {
         }
 
         // Determine the variant using instanceof (Kotlin 'is')
-        if (optionObj::class.java.name.endsWith("Option\$Some")) {
+        if (optionObj::class.java.name.endsWith("\$Some")) {
             // It's Some(value). Return false.
             return false
-        } else if (optionObj::class.java.name.endsWith("Option\$None")) {
+        } else if (optionObj::class.java.name.endsWith("\$None")) {
             // It's None. Return true.
             return true
         } else {

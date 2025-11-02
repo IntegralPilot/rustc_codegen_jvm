@@ -18,10 +18,10 @@ use types::ty_to_oomir_type;
 
 mod closures;
 mod control_flow;
+pub mod naming;
 pub mod operand;
 pub mod place;
 pub mod types;
-pub mod naming;
 
 pub use closures::{ClosureCallInfo, extract_closure_info, generate_closure_function_name};
 
@@ -42,8 +42,8 @@ pub fn mir_to_oomir<'tcx>(
 
     // Get a function name from the instance or use the provided override.
     // Prefer monomorphized naming to disambiguate generic instantiations.
-    let fn_name = fn_name_override
-        .unwrap_or_else(|| naming::mono_fn_name_from_instance(tcx, instance));
+    let fn_name =
+        fn_name_override.unwrap_or_else(|| naming::mono_fn_name_from_instance(tcx, instance));
 
     // Extract function signature
     // Closures require special handling - we must use as_closure().sig() instead of fn_sig()
@@ -78,9 +78,10 @@ pub fn mir_to_oomir<'tcx>(
         .map(|(i, ty)| {
             // Arguments start at MIR local 1. The index `i` starts at 0.
             let local_index = rustc_middle::mir::Local::from_usize(i + 1);
-            
+
             // Try to find the parameter name from var_debug_info
-            let param_name = mir.var_debug_info
+            let param_name = mir
+                .var_debug_info
                 .iter()
                 .find_map(|var_info| {
                     // Check if this debug info entry is for our parameter
@@ -92,14 +93,15 @@ pub fn mir_to_oomir<'tcx>(
                     None
                 })
                 .unwrap_or_else(|| format!("arg{}", i));
-                
-            let oomir_type = ty_to_oomir_type(*ty, tcx, data_types);
-            
+
+            let oomir_type = ty_to_oomir_type(*ty, tcx, data_types, instance);
+
             // Return the (name, type) tuple
             (param_name, oomir_type)
         })
         .collect();
-    let return_oomir_ty: oomir::Type = ty_to_oomir_type(return_ty.skip_binder(), tcx, data_types);
+    let return_oomir_ty: oomir::Type =
+        ty_to_oomir_type(return_ty.skip_binder(), tcx, data_types, instance);
 
     let mut signature = oomir::Signature {
         params: params_oomir,
@@ -114,9 +116,12 @@ pub fn mir_to_oomir<'tcx>(
             if fn_name == "main" {
                 // manually override the signature to match the JVM main method
                 signature = oomir::Signature {
-                    params: vec![("args".to_string(), oomir::Type::Array(Box::new(oomir::Type::Class(
-                        "java/lang/String".to_string(),
-                    ))))],
+                    params: vec![(
+                        "args".to_string(),
+                        oomir::Type::Array(Box::new(oomir::Type::Class(
+                            "java/lang/String".to_string(),
+                        ))),
+                    )],
                     ret: Box::new(oomir::Type::Void),
                 };
             }

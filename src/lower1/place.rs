@@ -147,7 +147,7 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
                 let next_var = format!("{}_{}", current_var, field_index.index());
                 let obj_type = current_type.clone();
                 // Update the type to the field’s type.
-                current_type = ty_to_oomir_type(field_ty, tcx, data_types);
+                current_type = ty_to_oomir_type(field_ty, tcx, data_types, instance);
                 instructions.push(oomir::Instruction::GetField {
                     dest: next_var.clone(),
                     object: Operand::Variable {
@@ -406,7 +406,8 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
                     let mut fields = vec![];
                     for (i, field) in variant_def.fields.iter().enumerate() {
                         let field_name = format!("field{}", i);
-                        let field_type = ty_to_oomir_type(field.ty(tcx, substs), tcx, data_types);
+                        let field_type =
+                            ty_to_oomir_type(field.ty(tcx, substs), tcx, data_types, instance);
                         fields.push((field_name, field_type));
                     }
 
@@ -481,8 +482,9 @@ pub fn get_place_type<'tcx>(
 ) -> oomir::Type {
     let place_ty = place.ty(&mir.local_decls, tcx);
     // Instantiate the type with the instance's generic arguments to get concrete types
-    let instantiated_ty = rustc_middle::ty::EarlyBinder::bind(place_ty.ty).instantiate(tcx, instance.args);
-    ty_to_oomir_type(instantiated_ty, tcx, data_types)
+    let instantiated_ty =
+        rustc_middle::ty::EarlyBinder::bind(place_ty.ty).instantiate(tcx, instance.args);
+    ty_to_oomir_type(instantiated_ty, tcx, data_types, instance)
 }
 
 /// Generates OOMIR instructions to "get" the value from a Place.
@@ -569,7 +571,7 @@ pub fn emit_instructions_to_set_value<'tcx>(
                     Ok(name) => name,
                     Err(e) => panic!("Error getting field name for SetField: {}", e),
                 };
-                let field_ty = ty_to_oomir_type(*field_mir_ty, tcx, data_types);
+                let field_ty = ty_to_oomir_type(*field_mir_ty, tcx, data_types, instance);
 
                 instructions.push(Instruction::SetField {
                     object: base_var_name, // The object/struct retrieved in step 2
@@ -594,8 +596,14 @@ pub fn emit_instructions_to_set_value<'tcx>(
 
                 // Convert the MIR index operand (_local) to an OOMIR operand
                 let mir_index_operand = MirOperand::Copy(Place::from(*index_local)); // Or Move? Copy usually safer.
-                let oomir_index_operand =
-                    convert_operand(&mir_index_operand, tcx, instance, mir, data_types, &mut instructions);
+                let oomir_index_operand = convert_operand(
+                    &mir_index_operand,
+                    tcx,
+                    instance,
+                    mir,
+                    data_types,
+                    &mut instructions,
+                );
 
                 instructions.push(Instruction::ArrayStore {
                     array: base_var_name.clone(),

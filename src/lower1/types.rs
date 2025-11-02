@@ -1,7 +1,10 @@
 use super::place::make_jvm_safe;
 use crate::oomir::{self, DataType, DataTypeMethod};
 
-use rustc_middle::ty::{ExistentialPredicate, FloatTy, IntTy, Ty, TyCtxt, TyKind, UintTy};
+use rustc_middle::ty::{
+    AdtDef, ExistentialPredicate, FloatTy, GenericArgsRef, IntTy, Ty, TyCtxt, TyKind, TypingEnv,
+    UintTy,
+};
 use sha2::Digest;
 use std::collections::HashMap;
 
@@ -10,8 +13,14 @@ pub fn ty_to_oomir_type<'tcx>(
     ty: Ty<'tcx>,
     tcx: TyCtxt<'tcx>,
     data_types: &mut HashMap<String, oomir::DataType>,
+    instance_context: rustc_middle::ty::Instance<'tcx>,
 ) -> oomir::Type {
-    match ty.kind() {
+    let resolved_ty = tcx.instantiate_and_normalize_erasing_regions(
+        instance_context.args,
+        TypingEnv::fully_monomorphized(),
+        rustc_middle::ty::EarlyBinder::bind(ty),
+    );
+    match resolved_ty.kind() {
         rustc_middle::ty::TyKind::Bool => oomir::Type::Boolean,
         rustc_middle::ty::TyKind::Char => oomir::Type::Char,
         rustc_middle::ty::TyKind::Int(int_ty) => match int_ty {
@@ -40,12 +49,66 @@ pub fn ty_to_oomir_type<'tcx>(
             // Get the full path string for the ADT
             let full_path_str = tcx.def_path_str(adt_def.did());
 
+            println!("{full_path_str} Substs: {:?}", substs);
+
             if full_path_str == "String" || full_path_str == "std::string::String" {
                 oomir::Type::String
             } else {
-                let full_path_str = tcx.def_path_str(adt_def.did());
                 let safe_name = make_jvm_safe(&full_path_str);
-                let jvm_name = safe_name.replace("::", "/").replace('.', "/");
+                let base_jvm = safe_name.replace("::", "/").replace('.', "/");
+
+                // Build readable generic tokens from substitutions (if any)
+                let mut generic_tokens: Vec<String> = Vec::new();
+                for arg in substs.iter() {
+                    if let Some(arg_ty) = arg.as_type() {
+                        let oomir_ty = ty_to_oomir_type(arg_ty, tcx, data_types, instance_context);
+                        let token = readable_oomir_type_name(&oomir_ty);
+                        generic_tokens.push(sanitize_name_token(&token));
+                    } else {
+                        // placeholder for non-type generic args (lifetimes/consts)
+                        generic_tokens.push("_".to_string());
+                    }
+                }
+
+                // Attach generics to the last path segment for readability
+                let (prefix, last_segment) = match base_jvm.rsplit_once('/') {
+                    Some((p, l)) => (p.to_string(), l.to_string()),
+                    None => ("".to_string(), base_jvm.clone()),
+                };
+
+                let mut last_with_gens = last_segment.clone();
+                if !generic_tokens.is_empty() {
+                    last_with_gens = format!("{}_{}", last_segment, generic_tokens.join("_"));
+                }
+
+                let mut jvm_name_full = if prefix.is_empty() {
+                    last_with_gens.clone()
+                } else {
+                    format!("{}/{}", prefix, last_with_gens)
+                };
+
+                // If the name is too long, fall back to hashed form
+                if jvm_name_full.len() > MAX_TUPLE_NAME_LEN {
+                    let mut name_parts = String::new();
+                    name_parts.push_str(&base_jvm);
+                    name_parts.push_str("_");
+                    for arg in substs.iter() {
+                        if let Some(arg_ty) = arg.as_type() {
+                            let oomir_ty =
+                                ty_to_oomir_type(arg_ty, tcx, data_types, instance_context);
+                            name_parts.push_str(&oomir_ty.to_jvm_descriptor());
+                            name_parts.push_str("_");
+                        }
+                    }
+                    let hash = short_hash(&name_parts, 10);
+                    let hashed_last = format!("{}_{}", last_segment, hash);
+                    jvm_name_full = if prefix.is_empty() {
+                        hashed_last
+                    } else {
+                        format!("{}/{}", prefix, hashed_last)
+                    };
+                }
+
                 if adt_def.is_struct() {
                     let variant = adt_def.variant(0usize.into());
                     let oomir_fields = variant
@@ -54,12 +117,13 @@ pub fn ty_to_oomir_type<'tcx>(
                         .map(|field_def| {
                             let field_name = field_def.ident(tcx).to_string();
                             let field_mir_ty = field_def.ty(tcx, substs);
-                            let field_oomir_type = ty_to_oomir_type(field_mir_ty, tcx, data_types);
+                            let field_oomir_type =
+                                ty_to_oomir_type(field_mir_ty, tcx, data_types, instance_context);
                             (field_name, field_oomir_type)
                         })
                         .collect::<Vec<_>>();
                     data_types.insert(
-                        jvm_name.clone(),
+                        jvm_name_full.clone(),
                         oomir::DataType::Class {
                             fields: oomir_fields,
                             is_abstract: false,
@@ -70,14 +134,14 @@ pub fn ty_to_oomir_type<'tcx>(
                     );
                 } else if adt_def.is_enum() {
                     // the enum in general
-                    if !data_types.contains_key(&jvm_name) {
+                    if !data_types.contains_key(&jvm_name_full) {
                         let mut methods = HashMap::new();
                         methods.insert(
                             "getVariantIdx".to_string(),
                             DataTypeMethod::SimpleConstantReturn(oomir::Type::I32, None),
                         );
                         data_types.insert(
-                            jvm_name.clone(),
+                            jvm_name_full.clone(),
                             oomir::DataType::Class {
                                 fields: vec![], // No fields in the abstract class
                                 is_abstract: true,
@@ -88,12 +152,12 @@ pub fn ty_to_oomir_type<'tcx>(
                         );
                     }
                 }
-                oomir::Type::Class(jvm_name)
+                oomir::Type::Class(jvm_name_full)
             }
         }
         rustc_middle::ty::TyKind::Str => oomir::Type::String,
         rustc_middle::ty::TyKind::Ref(_, inner_ty, mutability) => {
-            let pointee_oomir_type = ty_to_oomir_type(*inner_ty, tcx, data_types);
+            let pointee_oomir_type = ty_to_oomir_type(*inner_ty, tcx, data_types, instance_context);
             if mutability.is_mut() {
                 oomir::Type::MutableReference(Box::new(pointee_oomir_type))
             } else {
@@ -108,12 +172,13 @@ pub fn ty_to_oomir_type<'tcx>(
             } else if ty.is_slice() {
                 // A raw pointer to a slice (*const [T]) should be represented as an array of T.
                 let component_ty = ty.sequence_element_type(tcx);
-                let oomir_component_type = ty_to_oomir_type(component_ty, tcx, data_types);
+                let oomir_component_type =
+                    ty_to_oomir_type(component_ty, tcx, data_types, instance_context);
                 oomir::Type::Array(Box::new(oomir_component_type))
             } else {
                 // For a pointer to a sized type (*const T), use the mutable reference
                 // "array hack" to represent it as a reference that can be written back to.
-                let oomir_pointee_type = ty_to_oomir_type(*ty, tcx, data_types);
+                let oomir_pointee_type = ty_to_oomir_type(*ty, tcx, data_types, instance_context);
                 oomir::Type::MutableReference(Box::new(oomir_pointee_type))
             }
         }
@@ -125,7 +190,12 @@ pub fn ty_to_oomir_type<'tcx>(
                 }
             }
             // Default array handling
-            oomir::Type::Array(Box::new(ty_to_oomir_type(*component_ty, tcx, data_types)))
+            oomir::Type::Array(Box::new(ty_to_oomir_type(
+                *component_ty,
+                tcx,
+                data_types,
+                instance_context,
+            )))
         }
         rustc_middle::ty::TyKind::Tuple(tuple_elements) => {
             // Handle the unit type () -> Void
@@ -137,7 +207,8 @@ pub fn ty_to_oomir_type<'tcx>(
             let element_mir_tys: Vec<Ty<'tcx>> = tuple_elements.iter().collect(); // Collect MIR types
 
             // Generate the JVM class name for this specific tuple type
-            let tuple_class_name = generate_tuple_jvm_class_name(&element_mir_tys, tcx, data_types);
+            let tuple_class_name =
+                generate_tuple_jvm_class_name(&element_mir_tys, tcx, data_types, instance_context);
 
             // Check if we've already created the DataType for this tuple signature
             if !data_types.contains_key(&tuple_class_name) {
@@ -156,7 +227,8 @@ pub fn ty_to_oomir_type<'tcx>(
                     .map(|(i, &elem_ty)| {
                         let field_name = format!("field{}", i);
                         // Recursively convert element type to OOMIR type
-                        let field_oomir_type = ty_to_oomir_type(elem_ty, tcx, data_types);
+                        let field_oomir_type =
+                            ty_to_oomir_type(elem_ty, tcx, data_types, instance_context);
                         (field_name, field_oomir_type)
                     })
                     .collect::<Vec<_>>();
@@ -197,7 +269,12 @@ pub fn ty_to_oomir_type<'tcx>(
                 }
             }
             // Default slice handling
-            oomir::Type::Array(Box::new(ty_to_oomir_type(*component_ty, tcx, data_types)))
+            oomir::Type::Array(Box::new(ty_to_oomir_type(
+                *component_ty,
+                tcx,
+                data_types,
+                instance_context,
+            )))
         }
         rustc_middle::ty::TyKind::Never => {
             // Handle the never type
@@ -258,6 +335,113 @@ fn short_hash(input: &str, length: usize) -> String {
     full_hash[..length].to_string()
 }
 
+// Maximum length for a readable tuple name (including the "Tuple_" prefix).
+// If the human-readable name exceeds this, we fall back to the hashed name.
+const MAX_TUPLE_NAME_LEN: usize = 64;
+
+// Produce a compact, human readable token for an OOMIR type to use in tuple class names.
+fn readable_oomir_type_name(t: &oomir::Type) -> String {
+    use oomir::Type;
+    match t {
+        Type::Boolean => "bool".to_string(),
+        Type::Char => "char".to_string(),
+        Type::I8 => "i8".to_string(),
+        Type::I16 => "i16".to_string(),
+        Type::I32 => "i32".to_string(),
+        Type::I64 => "i64".to_string(),
+        Type::F32 => "f32".to_string(),
+        Type::F64 => "f64".to_string(),
+        Type::String => "String".to_string(),
+        Type::Void => "Void".to_string(),
+        Type::Class(name) => {
+            // take last path segment for readability (e.g. java/lang/String -> String)
+            name.rsplit('/').next().unwrap_or(name).to_string()
+        }
+        Type::Array(inner) => format!("{}Array", readable_oomir_type_name(inner)),
+        Type::MutableReference(inner) => format!("Ref{}", readable_oomir_type_name(inner)),
+        Type::Interface(name) => {
+            // prefix interfaces with I to avoid conflicts with classes
+            let seg = name.rsplit('/').next().unwrap_or(name);
+            format!("I{}", seg)
+        }
+        // Fallback for any other variants
+        _ => "Unsupported".to_string(),
+    }
+}
+
+// Sanitize token so it contains only ASCII alphanumeric characters and underscores.
+fn sanitize_name_token(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect()
+}
+
+/// Generate a JVM-safe class name for an ADT (struct/enum) including readable generic
+/// substitution tokens. Falls back to a hashed last segment when the full name is too long.
+pub fn generate_adt_jvm_class_name<'tcx>(
+    adt_def: &AdtDef<'tcx>,
+    substs: GenericArgsRef<'tcx>,
+    tcx: TyCtxt<'tcx>,
+    data_types: &mut HashMap<String, oomir::DataType>,
+    instance_context: rustc_middle::ty::Instance<'tcx>,
+) -> String {
+    let full_path_str = tcx.def_path_str(adt_def.did());
+    let safe_name = make_jvm_safe(&full_path_str);
+    let base_jvm = safe_name.replace("::", "/").replace('.', "/");
+
+    // Build readable generic tokens from substitutions (if any)
+    let mut generic_tokens: Vec<String> = Vec::new();
+    for arg in substs.iter() {
+        if let Some(arg_ty) = arg.as_type() {
+            let oomir_ty = ty_to_oomir_type(arg_ty, tcx, data_types, instance_context);
+            let token = readable_oomir_type_name(&oomir_ty);
+            generic_tokens.push(sanitize_name_token(&token));
+        } else {
+            generic_tokens.push("_".to_string());
+        }
+    }
+
+    // Attach generics to the last path segment for readability
+    let (prefix, last_segment) = match base_jvm.rsplit_once('/') {
+        Some((p, l)) => (p.to_string(), l.to_string()),
+        None => ("".to_string(), base_jvm.clone()),
+    };
+
+    let mut last_with_gens = last_segment.clone();
+    if !generic_tokens.is_empty() {
+        last_with_gens = format!("{}_{}", last_segment, generic_tokens.join("_"));
+    }
+
+    let mut jvm_name_full = if prefix.is_empty() {
+        last_with_gens.clone()
+    } else {
+        format!("{}/{}", prefix, last_with_gens)
+    };
+
+    // If the name is too long, fall back to hashed form
+    if jvm_name_full.len() > MAX_TUPLE_NAME_LEN {
+        let mut name_parts = String::new();
+        name_parts.push_str(&base_jvm);
+        name_parts.push_str("_");
+        for arg in substs.iter() {
+            if let Some(arg_ty) = arg.as_type() {
+                let oomir_ty = ty_to_oomir_type(arg_ty, tcx, data_types, instance_context);
+                name_parts.push_str(&oomir_ty.to_jvm_descriptor());
+                name_parts.push_str("_");
+            }
+        }
+        let hash = short_hash(&name_parts, 10);
+        let hashed_last = format!("{}_{}", last_segment, hash);
+        jvm_name_full = if prefix.is_empty() {
+            hashed_last
+        } else {
+            format!("{}/{}", prefix, hashed_last)
+        };
+    }
+
+    jvm_name_full
+}
+
 /// Generates a JVM class name for a tuple type based on its element types.
 /// The name is derived from the hash of the element types to ensure uniqueness.
 /// The hash is truncated to a specified length to avoid excessively long names.
@@ -265,20 +449,34 @@ pub fn generate_tuple_jvm_class_name<'tcx>(
     element_tys: &[Ty<'tcx>],
     tcx: TyCtxt<'tcx>,
     data_types: &mut HashMap<String, oomir::DataType>, // Needed for recursive calls
+    instance_context: rustc_middle::ty::Instance<'tcx>,
 ) -> String {
-    let mut name_parts = String::new();
+    // First attempt: build a human-readable name like `Tuple_i32_String`
+    let mut tokens: Vec<String> = Vec::new();
     for ty in element_tys {
-        // convert to oomir type
-        let ty = ty_to_oomir_type(*ty, tcx, data_types);
-        name_parts.push_str(&ty.to_jvm_descriptor());
-        name_parts.push_str("_");
+        let oomir_ty = ty_to_oomir_type(*ty, tcx, data_types, instance_context);
+        let token = readable_oomir_type_name(&oomir_ty);
+        tokens.push(sanitize_name_token(&token));
     }
 
-    // now hash the name parts
-    // with a length of 10, the chanxce of a collision is approx 1 in 1.1 trillion
-    let hash = short_hash(&name_parts, 10);
+    let readable_name = format!("Tuple_{}", tokens.join("_"));
 
-    format!("Tuple_{}", hash)
+    // If the readable name is within bounds, use it. Otherwise fall back to a hash
+    if readable_name.len() <= MAX_TUPLE_NAME_LEN {
+        readable_name
+    } else {
+        // build hashed name using JVM descriptors (previous behaviour)
+        let mut name_parts = String::new();
+        for ty in element_tys {
+            // convert to oomir type
+            let ty = ty_to_oomir_type(*ty, tcx, data_types, instance_context);
+            name_parts.push_str(&ty.to_jvm_descriptor());
+            name_parts.push_str("_");
+        }
+        // with a length of 10, the chance of a collision is tiny
+        let hash = short_hash(&name_parts, 10);
+        format!("Tuple_{}", hash)
+    }
 }
 
 // A helper function to convert MIR integer values to OOMIR Constants, respecting type

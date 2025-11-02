@@ -1,11 +1,15 @@
 use rustc_abi::{FieldIdx, FieldsShape, Size, TagEncoding, VariantIdx, Variants};
 use rustc_middle::mir::interpret::{AllocRange, GlobalAlloc, Provenance, Scalar};
 use rustc_middle::ty::layout::TyAndLayout;
-use rustc_middle::ty::{AdtDef, GenericArgsRef, Ty, TyCtxt, TyKind, TypingEnv};
+use rustc_middle::ty::{AdtDef, GenericArgsRef, Instance, Ty, TyCtxt, TyKind, TypingEnv};
 use std::collections::HashMap;
 
 use super::{
-    super::{place::make_jvm_safe, ty_to_oomir_type, types::generate_tuple_jvm_class_name},
+    super::{
+        place::make_jvm_safe,
+        ty_to_oomir_type,
+        types::{generate_adt_jvm_class_name, generate_tuple_jvm_class_name},
+    },
     scalar_int_to_oomir_constant,
 };
 use crate::oomir::{self, DataTypeMethod};
@@ -25,6 +29,7 @@ pub fn read_constant_value_from_memory<'tcx>(
     offset: Size,
     ty: Ty<'tcx>,
     oomir_data_types: &mut HashMap<String, oomir::DataType>,
+    instance: rustc_middle::ty::Instance<'tcx>,
 ) -> Result<oomir::Constant, String> {
     let pci = TypingEnv::fully_monomorphized().as_query_input(ty);
     let layout = tcx
@@ -131,6 +136,7 @@ pub fn read_constant_value_from_memory<'tcx>(
                                 inner_offset,
                                 *inner_ty,
                                 oomir_data_types,
+                                instance,
                             )
                         }
                         GlobalAlloc::Function { instance } => {
@@ -204,11 +210,12 @@ pub fn read_constant_value_from_memory<'tcx>(
                     elem_offset,
                     *elem_ty,
                     oomir_data_types,
+                    instance,
                 )?;
                 elements.push(elem_const);
             }
             // Determine OOMIR element type (assuming ty_to_oomir_type exists)
-            let oomir_elem_type = ty_to_oomir_type(*elem_ty, tcx, oomir_data_types);
+            let oomir_elem_type = ty_to_oomir_type(*elem_ty, tcx, oomir_data_types, instance);
 
             // find values in the array
             let mut values = Vec::new();
@@ -221,6 +228,7 @@ pub fn read_constant_value_from_memory<'tcx>(
                     elem_offset,
                     *elem_ty,
                     oomir_data_types,
+                    instance,
                 )?;
                 values.push(elem_const);
             }
@@ -243,6 +251,7 @@ pub fn read_constant_value_from_memory<'tcx>(
                     *adt_def,
                     substs,
                     oomir_data_types,
+                    instance,
                 )
             } else if adt_def.is_enum() {
                 handle_constant_enum(
@@ -254,6 +263,7 @@ pub fn read_constant_value_from_memory<'tcx>(
                     *adt_def,
                     substs,
                     oomir_data_types,
+                    instance,
                 )
             } else {
                 // Union
@@ -276,13 +286,15 @@ pub fn read_constant_value_from_memory<'tcx>(
                             offset + field_offset,
                             field_ty,
                             oomir_data_types,
+                            instance,
                         )?;
                         fields_map.insert(format!("field{}", i), field_const); // Use numbered field names
                     }
                 }
                 _ => return Err("Unsupported tuple layout".to_string()),
             }
-            let tuple_class_name = generate_tuple_jvm_class_name(field_tys, tcx, oomir_data_types);
+            let tuple_class_name =
+                generate_tuple_jvm_class_name(field_tys, tcx, oomir_data_types, instance);
             Ok(oomir::Constant::Instance {
                 class_name: tuple_class_name,
                 fields: fields_map,
@@ -306,6 +318,7 @@ fn handle_constant_struct<'tcx>(
     adt_def: AdtDef<'tcx>,
     substs: GenericArgsRef<'tcx>,
     oomir_data_types: &mut HashMap<String, oomir::DataType>,
+    instance: Instance<'tcx>,
 ) -> Result<oomir::Constant, String> {
     let variant = adt_def.variant(VariantIdx::from_usize(0)); // Structs have one variant
     let mut fields_map = HashMap::new();
@@ -333,6 +346,7 @@ fn handle_constant_struct<'tcx>(
             offset + field_offset,
             field_ty,
             oomir_data_types,
+            instance,
         )?;
         fields_map.insert(field_name, field_const);
     }
@@ -358,6 +372,7 @@ fn handle_constant_enum<'tcx>(
     adt_def: AdtDef<'tcx>,
     substs: GenericArgsRef<'tcx>,
     oomir_data_types: &mut HashMap<String, oomir::DataType>,
+    instance: Instance<'tcx>,
 ) -> Result<oomir::Constant, String> {
     let active_variant_idx: VariantIdx;
     let variant_fields_shape: &FieldsShape<FieldIdx>; // Holds the layout of fields for the active variant
@@ -725,12 +740,14 @@ fn handle_constant_enum<'tcx>(
             absolute_field_offset, // Use the absolute offset in the allocation
             field_ty,
             oomir_data_types,
+            instance,
         )?;
         fields_map.insert(field_name, field_const);
     }
 
     // 4. Construct the OOMIR constant
-    let base_enum_name = make_jvm_safe(&tcx.def_path_str(adt_def.did())).replace("::", "/");
+    let base_enum_name =
+        generate_adt_jvm_class_name(&adt_def, substs, tcx, oomir_data_types, instance);
     let variant_class_name = format!(
         "{}${}", // Using '$' as inner class separator is common in JVM
         base_enum_name,
@@ -761,7 +778,8 @@ fn handle_constant_enum<'tcx>(
         let mut fields = vec![];
         for (i, field) in variant_def.fields.iter().enumerate() {
             let field_name = format!("field{}", i);
-            let field_type = ty_to_oomir_type(field.ty(tcx, substs), tcx, oomir_data_types);
+            let field_type =
+                ty_to_oomir_type(field.ty(tcx, substs), tcx, oomir_data_types, instance);
             fields.push((field_name, field_type));
         }
 

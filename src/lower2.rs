@@ -105,7 +105,6 @@ pub fn oomir_to_jvm_bytecode(
             method.attributes.push(code_attribute);
             // Add MethodParameters attribute (skip for constructors as they often have synthetic params)
             if function.name != "<init>" {
-                println!("Adding MethodParameters attribute for function: {}: {:?}", function.name, method_parameters_attribute);
                 method.attributes.push(method_parameters_attribute);
             }
 

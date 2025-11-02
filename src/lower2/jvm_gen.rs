@@ -214,7 +214,8 @@ pub(super) fn create_data_type_classfile_for_class(
                         access_flags: MethodAccessFlags::empty(), // No special flags
                     });
                 }
-                let method_parameters_attribute_name_index = class_file.constant_pool.add_utf8("MethodParameters")?;
+                let method_parameters_attribute_name_index =
+                    class_file.constant_pool.add_utf8("MethodParameters")?;
                 let method_parameters_attribute = Attribute::MethodParameters {
                     name_index: method_parameters_attribute_name_index,
                     parameters: parameters_for_attribute,

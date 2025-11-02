@@ -190,13 +190,18 @@ impl CodegenBackend for MyBackend {
                     for mentioned in mentioned_items.iter() {
                         // Check if this mentioned item is a closure
                         if let rustc_middle::mir::MentionedItem::Fn(fn_ty) = &mentioned.node {
-                            if let rustc_middle::ty::TyKind::FnDef(fn_def_id, fn_args) = fn_ty.kind()
+                            if let rustc_middle::ty::TyKind::FnDef(fn_def_id, fn_args) =
+                                fn_ty.kind()
                             {
                                 // Check the first argument to see if it's a closure type
                                 let mut is_closure = false;
                                 if let Some(first_arg) = fn_args.get(0) {
                                     if let Some(ty) = first_arg.as_type() {
-                                        if let rustc_middle::ty::TyKind::Closure(closure_def_id, _,) = ty.kind() {
+                                        if let rustc_middle::ty::TyKind::Closure(
+                                            closure_def_id,
+                                            _,
+                                        ) = ty.kind()
+                                        {
                                             breadcrumbs::log!(
                                                 breadcrumbs::LogLevel::Info,
                                                 "closure-discovery",
@@ -223,26 +228,38 @@ impl CodegenBackend for MyBackend {
                                             rustc_span::DUMMY_SP,
                                         );
                                         // Skip virtual trait method calls (handled via trait objects at runtime)
-                                        if let rustc_middle::ty::InstanceKind::Virtual(_, _) = instance.def {
+                                        if let rustc_middle::ty::InstanceKind::Virtual(_, _) =
+                                            instance.def
+                                        {
                                             breadcrumbs::log!(
                                                 breadcrumbs::LogLevel::Info,
                                                 "backend",
-                                                format!("Skipping virtual instance: {:?}", instance)
+                                                format!(
+                                                    "Skipping virtual instance: {:?}",
+                                                    instance
+                                                )
                                             );
                                             continue;
                                         }
                                         // Skip trait method implementations (already lowered by impl block code with Type_method naming)
-                                        if let Some(assoc_item) = tcx.opt_associated_item(*fn_def_id) {
+                                        if let Some(assoc_item) =
+                                            tcx.opt_associated_item(*fn_def_id)
+                                        {
                                             if assoc_item.trait_item_def_id().is_some() {
                                                 breadcrumbs::log!(
                                                     breadcrumbs::LogLevel::Info,
                                                     "backend",
-                                                    format!("Skipping trait impl method: {:?}", fn_def_id)
+                                                    format!(
+                                                        "Skipping trait impl method: {:?}",
+                                                        fn_def_id
+                                                    )
                                                 );
                                                 continue;
                                             }
                                         }
-                                        let name = lower1::naming::mono_fn_name_from_instance(tcx, instance);
+                                        let name = lower1::naming::mono_fn_name_from_instance(
+                                            tcx, instance,
+                                        );
                                         if seen_fn_names.insert(name.clone()) {
                                             fn_instances_to_lower.push((instance, name));
                                         }
@@ -273,6 +290,26 @@ impl CodegenBackend for MyBackend {
 
                 oomir_module.merge_data_types(&oomir_result.1);
             } else if let rustc_hir::ItemKind::Impl(impl_a) = item.kind {
+                // Get the DefId of the impl block itself. The `item_id` from the
+                // outer loop refers to the `impl` item.
+                let impl_def_id = item_id.owner_id.to_def_id();
+                let impl_generics = tcx.generics_of(impl_def_id);
+
+                // If the `impl` block itself has generic parameters (e.g., `impl<T> for Foo<T>`),
+                // we must skip direct lowering of all its methods. They are not
+                // concrete and will be lowered when their monomorphized instances
+                // are discovered in the MIR of other functions.
+                if !impl_generics.own_params.is_empty() {
+                    breadcrumbs::log!(
+                        breadcrumbs::LogLevel::Info,
+                        "backend",
+                        format!(
+                            "Skipping direct lowering of entire generic impl block (DefId: {:?})",
+                            impl_def_id
+                        )
+                    );
+                    continue; // Skip to the next item in the crate
+                }
                 let ident = match impl_a.self_ty.kind {
                     HirTyKind::Path(qpath) => match qpath {
                         QPath::Resolved(_, p) => {
@@ -346,7 +383,9 @@ impl CodegenBackend for MyBackend {
                     if let Some(mentioned_items) = &mir.mentioned_items {
                         for mentioned in mentioned_items.iter() {
                             if let rustc_middle::mir::MentionedItem::Fn(fn_ty) = &mentioned.node {
-                                if let rustc_middle::ty::TyKind::FnDef(fn_def_id, fn_args) = fn_ty.kind() {
+                                if let rustc_middle::ty::TyKind::FnDef(fn_def_id, fn_args) =
+                                    fn_ty.kind()
+                                {
                                     let mut is_closure = false;
                                     if let Some(first_arg) = fn_args.get(0) {
                                         if let Some(ty) = first_arg.as_type() {
@@ -371,34 +410,47 @@ impl CodegenBackend for MyBackend {
                                     if !is_closure {
                                         let typing_env = TypingEnv::fully_monomorphized();
                                         if fn_def_id.is_local() {
-                                            let instance = rustc_middle::ty::Instance::expect_resolve(
-                                                tcx,
-                                                typing_env,
-                                                *fn_def_id,
-                                                *fn_args,
-                                                rustc_span::DUMMY_SP,
-                                            );
+                                            let instance =
+                                                rustc_middle::ty::Instance::expect_resolve(
+                                                    tcx,
+                                                    typing_env,
+                                                    *fn_def_id,
+                                                    *fn_args,
+                                                    rustc_span::DUMMY_SP,
+                                                );
                                             // Skip virtual trait method calls (handled via trait objects at runtime)
-                                            if let rustc_middle::ty::InstanceKind::Virtual(_, _) = instance.def {
+                                            if let rustc_middle::ty::InstanceKind::Virtual(_, _) =
+                                                instance.def
+                                            {
                                                 breadcrumbs::log!(
                                                     breadcrumbs::LogLevel::Info,
                                                     "backend",
-                                                    format!("Skipping virtual instance: {:?}", instance)
+                                                    format!(
+                                                        "Skipping virtual instance: {:?}",
+                                                        instance
+                                                    )
                                                 );
                                                 continue;
                                             }
                                             // Skip trait method implementations (already lowered by impl block code with Type_method naming)
-                                            if let Some(assoc_item) = tcx.opt_associated_item(*fn_def_id) {
+                                            if let Some(assoc_item) =
+                                                tcx.opt_associated_item(*fn_def_id)
+                                            {
                                                 if assoc_item.trait_item_def_id().is_some() {
                                                     breadcrumbs::log!(
                                                         breadcrumbs::LogLevel::Info,
                                                         "backend",
-                                                        format!("Skipping trait impl method: {:?}", fn_def_id)
+                                                        format!(
+                                                            "Skipping trait impl method: {:?}",
+                                                            fn_def_id
+                                                        )
                                                     );
                                                     continue;
                                                 }
                                             }
-                                            let name = lower1::naming::mono_fn_name_from_instance(tcx, instance);
+                                            let name = lower1::naming::mono_fn_name_from_instance(
+                                                tcx, instance,
+                                            );
                                             if seen_fn_names.insert(name.clone()) {
                                                 fn_instances_to_lower.push((instance, name));
                                             }
@@ -462,9 +514,9 @@ impl CodegenBackend for MyBackend {
                                 }
                                 oomir_function.signature.params[0] = (
                                     param_name.clone(),
-                                    Type::MutableReference(
-                                        Box::new(Type::Class(of_trait.clone().unwrap())),
-                                    ),
+                                    Type::MutableReference(Box::new(Type::Class(
+                                        of_trait.clone().unwrap(),
+                                    ))),
                                 );
 
                                 // insert a Cast instruction to cast the trait (interface) object to the specific type of this class
@@ -506,15 +558,19 @@ impl CodegenBackend for MyBackend {
                         for (param_name, param_ty) in &oomir_function.signature.params {
                             if let Type::MutableReference(box Type::Class(name)) = param_ty {
                                 if *name == of_trait.clone().unwrap() {
-                                    new_params.push((param_name.clone(), Type::MutableReference(Box::new(Type::Class(
-                                        ident.clone(),
-                                    )))));
+                                    new_params.push((
+                                        param_name.clone(),
+                                        Type::MutableReference(Box::new(Type::Class(
+                                            ident.clone(),
+                                        ))),
+                                    ));
                                 } else {
                                     new_params.push((param_name.clone(), param_ty.clone()));
                                 }
                             } else if let Type::Class(name) = param_ty {
                                 if *name == of_trait.clone().unwrap() {
-                                    new_params.push((param_name.clone(), Type::Class(ident.clone())));
+                                    new_params
+                                        .push((param_name.clone(), Type::Class(ident.clone())));
                                 } else {
                                     new_params.push((param_name.clone(), param_ty.clone()));
                                 }
@@ -724,6 +780,11 @@ impl CodegenBackend for MyBackend {
 
                     let data_types = &mut HashMap::new(); // Consider if this should be shared across loop iterations or functions
 
+                    let instance = rustc_middle::ty::Instance::new_raw(
+                        def_id,
+                        rustc_middle::ty::GenericArgs::identity_for_item(tcx, def_id),
+                    );
+
                     // Use skip_binder here too, as inputs/outputs are bound by the same binder as the fn_sig
                     let params_oomir: Vec<(String, oomir::Type)> = params_ty
                         .skip_binder()
@@ -732,12 +793,17 @@ impl CodegenBackend for MyBackend {
                         .map(|(i, ty)| {
                             // For trait methods, we don't have MIR, so use generic names
                             let param_name = format!("arg{}", i);
-                            let oomir_type = lower1::types::ty_to_oomir_type(*ty, tcx, data_types);
+                            let oomir_type =
+                                lower1::types::ty_to_oomir_type(*ty, tcx, data_types, instance);
                             (param_name, oomir_type)
                         })
                         .collect();
-                    let return_oomir_ty: oomir::Type =
-                        lower1::types::ty_to_oomir_type(return_ty.skip_binder(), tcx, data_types);
+                    let return_oomir_ty: oomir::Type = lower1::types::ty_to_oomir_type(
+                        return_ty.skip_binder(),
+                        tcx,
+                        data_types,
+                        instance,
+                    );
 
                     let mut signature = oomir::Signature {
                         params: params_oomir,
@@ -823,7 +889,8 @@ impl CodegenBackend for MyBackend {
                 "mir-lowering",
                 format!("--- Lowering monomorphized function instance: {} ---", name)
             );
-            let (oomir_function, data_types) = lower1::mir_to_oomir(tcx, instance, &mut mir, Some(name.clone()));
+            let (oomir_function, data_types) =
+                lower1::mir_to_oomir(tcx, instance, &mut mir, Some(name.clone()));
             oomir_module.functions.insert(name, oomir_function);
             oomir_module.merge_data_types(&data_types);
         }

@@ -7,8 +7,8 @@ use rustc_middle::{
     mir::Operand as MirOperand,
     ty::{GenericArgsRef, Instance, Ty, TyCtxt, TyKind},
 };
-use std::collections::HashMap;
 use sha2::Digest;
+use std::collections::HashMap;
 
 /// Generate a JVM-safe function name for a (possibly monomorphized) function instance.
 ///
@@ -23,7 +23,7 @@ pub fn mono_fn_name_from_instance<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'t
     let mut desc = String::new();
     for arg in instance.args.iter() {
         if let Some(ty) = arg.as_type() {
-            let t = ty_to_oomir_type(ty, tcx, &mut data_types);
+            let t = ty_to_oomir_type(ty, tcx, &mut data_types, instance);
             desc.push_str(&t.to_jvm_descriptor());
             desc.push('_');
         }
@@ -42,6 +42,7 @@ pub fn mono_fn_name_from_def_args<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: DefId,
     args: GenericArgsRef<'tcx>,
+    instance: Instance<'tcx>,
 ) -> String {
     let base = tcx.item_name(def_id).to_string();
     let base = make_jvm_safe(&base);
@@ -50,7 +51,7 @@ pub fn mono_fn_name_from_def_args<'tcx>(
     let mut desc = String::new();
     for arg in args.iter() {
         if let Some(ty) = arg.as_type() {
-            let t = ty_to_oomir_type(ty, tcx, &mut data_types);
+            let t = ty_to_oomir_type(ty, tcx, &mut data_types, instance);
             desc.push_str(&t.to_jvm_descriptor());
             desc.push('_');
         }
@@ -69,11 +70,16 @@ pub fn mono_fn_name_from_def_args<'tcx>(
 pub fn mono_fn_name_from_call_operand<'tcx>(
     func: &MirOperand<'tcx>,
     tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
 ) -> Option<String> {
-    let MirOperand::Constant(box c) = func else { return None; };
+    let MirOperand::Constant(box c) = func else {
+        return None;
+    };
     let fn_ty: Ty<'tcx> = c.const_.ty();
     match fn_ty.kind() {
-        TyKind::FnDef(def_id, args) => Some(mono_fn_name_from_def_args(tcx, *def_id, *args)),
+        TyKind::FnDef(def_id, args) => {
+            Some(mono_fn_name_from_def_args(tcx, *def_id, *args, instance))
+        }
         _ => None,
     }
 }

@@ -9,8 +9,8 @@ use rustc_middle::{
         interpret::{AllocRange, ErrorHandled, GlobalAlloc, Provenance, Scalar},
     },
     ty::{
-        ConstKind, FloatTy, Instance, IntTy, PseudoCanonicalInput, ScalarInt, Ty, TyCtxt, TyKind, TypingEnv,
-        UintTy,
+        ConstKind, FloatTy, Instance, IntTy, PseudoCanonicalInput, ScalarInt, Ty, TyCtxt, TyKind,
+        TypingEnv, UintTy,
     },
 };
 use std::collections::HashMap;
@@ -34,7 +34,7 @@ pub fn convert_operand<'tcx>(
         MirOperand::Constant(box constant) => {
             match constant.const_ {
                 Const::Val(const_val, ty) => {
-                    handle_const_value(Some(constant), const_val, &ty, tcx, data_types)
+                    handle_const_value(Some(constant), const_val, &ty, tcx, data_types, instance)
                 }
                 Const::Ty(const_ty, ty_const) => {
                     // ty_const is NOT a type, naming is b/c it's a ty::Const (as opposed to mir::Const)
@@ -42,7 +42,7 @@ pub fn convert_operand<'tcx>(
                     match kind {
                         ConstKind::Value(val) => {
                             let constval = tcx.valtree_to_const_val(val);
-                            handle_const_value(None, constval, &const_ty, tcx, data_types)
+                            handle_const_value(None, constval, &const_ty, tcx, data_types, instance)
                         }
                         _ => {
                             breadcrumbs::log!(
@@ -77,7 +77,14 @@ pub fn convert_operand<'tcx>(
                                 )
                             );
                             // Now handle the resulting ConstValue using the existing function
-                            handle_const_value(Some(constant), const_val, &ty, tcx, data_types)
+                            handle_const_value(
+                                Some(constant),
+                                const_val,
+                                &ty,
+                                tcx,
+                                data_types,
+                                instance,
+                            )
                         }
                         Err(ErrorHandled::Reported(error_reported, ..)) => {
                             // An error occurred during evaluation and rustc has already reported it.
@@ -141,6 +148,7 @@ pub fn handle_const_value<'tcx>(
     ty: &Ty<'tcx>,
     tcx: TyCtxt<'tcx>,
     data_types: &mut HashMap<String, oomir::DataType>,
+    instance: Instance<'tcx>,
 ) -> oomir::Operand {
     match const_val {
         ConstValue::Scalar(scalar) => {
@@ -153,7 +161,7 @@ pub fn handle_const_value<'tcx>(
                     if let TyKind::Adt(adt_def, substs) = current_ty.kind() {
                         // ensure that the ADT gets added to the data_types map (ty_to_oomir_type does this implicitly)
                         breadcrumbs::log!(breadcrumbs::LogLevel::Info, "const-eval", "138138138");
-                        let adt_name = match ty_to_oomir_type(*ty, tcx, data_types) {
+                        let adt_name = match ty_to_oomir_type(*ty, tcx, data_types, instance) {
                             oomir::Type::Class(class_name) => class_name,
                             _ => {
                                 panic!("Expected a class type for ADT, but got: {:?}", ty);
@@ -554,6 +562,7 @@ pub fn handle_const_value<'tcx>(
                                                     pointer.into_raw_parts().1,
                                                     *inner_ty,
                                                     data_types,
+                                                    instance,
                                                 ) {
                                                     Ok(oomir_const) => {
                                                         breadcrumbs::log!(
@@ -1089,6 +1098,7 @@ pub fn handle_const_value<'tcx>(
                                             pointer.into_raw_parts().1,
                                             *inner_ty,
                                             data_types,
+                                            instance,
                                         ) {
                                             Ok(oomir_const) => {
                                                 // Successfully read the constant ADT value
@@ -1133,6 +1143,7 @@ pub fn handle_const_value<'tcx>(
                                             pointer.into_raw_parts().1,
                                             *inner_ty,
                                             data_types,
+                                            instance,
                                         ) {
                                             Ok(oomir_const) => {
                                                 breadcrumbs::log!(
@@ -1175,6 +1186,7 @@ pub fn handle_const_value<'tcx>(
                                             pointer.into_raw_parts().1,
                                             *inner_ty,
                                             data_types,
+                                            instance,
                                         ) {
                                             Ok(oomir_const) => {
                                                 breadcrumbs::log!(
@@ -1214,6 +1226,7 @@ pub fn handle_const_value<'tcx>(
                                             pointer.into_raw_parts().1, // Offset within the allocation
                                             *inner_ty,                  // The tuple type itself
                                             data_types,
+                                            instance,
                                         ) {
                                             Ok(oomir_const) => {
                                                 breadcrumbs::log!(
@@ -1365,7 +1378,7 @@ pub fn handle_const_value<'tcx>(
                         tcx, allocation,
                         offset, // The offset provided by ConstValue::Indirect
                         *ty,    // The type of the constant we are reading
-                        data_types,
+                        data_types, instance,
                     ) {
                         Ok(oomir_const) => {
                             breadcrumbs::log!(

@@ -193,7 +193,8 @@ pub fn convert_basic_block<'tcx>(
             }
             TerminatorKind::SwitchInt { discr, targets, .. } => {
                 // --- GENERAL SwitchInt Handling ---
-                let discr_operand = convert_operand(discr, tcx, instance, mir, data_types, &mut instructions);
+                let discr_operand =
+                    convert_operand(discr, tcx, instance, mir, data_types, &mut instructions);
                 // Get the actual type of the discriminant from MIR local declarations
                 let discr_ty = discr.ty(&mir.local_decls, tcx);
 
@@ -258,7 +259,12 @@ pub fn convert_basic_block<'tcx>(
                             breadcrumbs::log!(
                                 breadcrumbs::LogLevel::Info,
                                 "mir-lowering",
-                                format!("FnDef detected: def_id={:?}, is_local={}, args={:?}", def_id, def_id.is_local(), args)
+                                format!(
+                                    "FnDef detected: def_id={:?}, is_local={}, args={:?}",
+                                    def_id,
+                                    def_id.is_local(),
+                                    args
+                                )
                             );
                             if def_id.is_local() {
                                 // Check if this is a trait method call
@@ -266,79 +272,141 @@ pub fn convert_basic_block<'tcx>(
                                     breadcrumbs::log!(
                                         breadcrumbs::LogLevel::Info,
                                         "mir-lowering",
-                                        format!("Associated item found: {:?}, trait_item_def_id={:?}, container={:?}", assoc_item, assoc_item.trait_item_def_id(), assoc_item.container)
+                                        format!(
+                                            "Associated item found: {:?}, trait_item_def_id={:?}, container={:?}",
+                                            assoc_item,
+                                            assoc_item.trait_item_def_id(),
+                                            assoc_item.container
+                                        )
                                     );
                                     // Check if this is a trait method (check if parent is a trait)
                                     let is_trait_method = tcx.is_trait(tcx.parent(*def_id));
-                                    
+
                                     if is_trait_method {
                                         // Trait method call: check if it's monomorphized to a concrete type
                                         if let Some(first_arg) = args.get(0) {
                                             if let Some(ty) = first_arg.as_type() {
                                                 // Check if it's NOT a trait object (dyn Trait)
-                                                if !matches!(ty.kind(), rustc_middle::ty::TyKind::Dynamic(..)) {
+                                                if !matches!(
+                                                    ty.kind(),
+                                                    rustc_middle::ty::TyKind::Dynamic(..)
+                                                ) {
                                                     // Concrete type - use Type_method naming
-                                                    let type_name = super::types::ty_to_oomir_type(ty, tcx, &mut Default::default());
-                                                    let method_name = tcx.item_name(*def_id).to_string();
+                                                    let type_name = super::types::ty_to_oomir_type(
+                                                        ty,
+                                                        tcx,
+                                                        &mut Default::default(),
+                                                        instance,
+                                                    );
+                                                    let method_name =
+                                                        tcx.item_name(*def_id).to_string();
                                                     // Extract class name from Type
                                                     let class_name = match type_name {
                                                         oomir::Type::Class(name) => name,
-                                                        oomir::Type::Reference(box oomir::Type::Class(name)) => name,
-                                                        oomir::Type::MutableReference(box oomir::Type::Class(name)) => name,
+                                                        oomir::Type::Reference(
+                                                            box oomir::Type::Class(name),
+                                                        ) => name,
+                                                        oomir::Type::MutableReference(
+                                                            box oomir::Type::Class(name),
+                                                        ) => name,
                                                         _ => {
                                                             // Fallback for unexpected types
                                                             format!("{:?}", type_name)
                                                         }
                                                     };
-                                                    let full_name = format!("{}_{}", class_name, method_name);
+                                                    let full_name =
+                                                        format!("{}_{}", class_name, method_name);
                                                     breadcrumbs::log!(
                                                         breadcrumbs::LogLevel::Info,
                                                         "mir-lowering",
-                                                        format!("Trait method call with concrete type: def_id={:?}, ty={:?}, using name: {}", def_id, ty, full_name)
+                                                        format!(
+                                                            "Trait method call with concrete type: def_id={:?}, ty={:?}, using name: {}",
+                                                            def_id, ty, full_name
+                                                        )
                                                     );
                                                     (full_name, false)
                                                 } else {
                                                     // Dynamic trait object - use dyn_Trait_method naming
-                                                    let trait_name = if let rustc_middle::ty::TyKind::Dynamic(preds, _) = ty.kind() {
-                                                        // Extract trait name from trait object
-                                                        if let Some(principal) = preds.principal() {
-                                                            let trait_ref = principal.skip_binder();
-                                                            tcx.item_name(trait_ref.def_id).to_string()
+                                                    let trait_name =
+                                                        if let rustc_middle::ty::TyKind::Dynamic(
+                                                            preds,
+                                                            _,
+                                                        ) = ty.kind()
+                                                        {
+                                                            // Extract trait name from trait object
+                                                            if let Some(principal) =
+                                                                preds.principal()
+                                                            {
+                                                                let trait_ref =
+                                                                    principal.skip_binder();
+                                                                tcx.item_name(trait_ref.def_id)
+                                                                    .to_string()
+                                                            } else {
+                                                                "Unknown".to_string()
+                                                            }
                                                         } else {
                                                             "Unknown".to_string()
-                                                        }
-                                                    } else {
-                                                        "Unknown".to_string()
-                                                    };
-                                                    let method_name = tcx.item_name(*def_id).to_string();
-                                                    let full_name = format!("dyn_{}_{}", trait_name, method_name);
+                                                        };
+                                                    let method_name =
+                                                        tcx.item_name(*def_id).to_string();
+                                                    let full_name = format!(
+                                                        "dyn_{}_{}",
+                                                        trait_name, method_name
+                                                    );
                                                     breadcrumbs::log!(
                                                         breadcrumbs::LogLevel::Info,
                                                         "mir-lowering",
-                                                        format!("Trait method call with dyn trait object, using name: {}", full_name)
+                                                        format!(
+                                                            "Trait method call with dyn trait object, using name: {}",
+                                                            full_name
+                                                        )
                                                     );
                                                     (full_name, false)
                                                 }
                                             } else {
                                                 // No type in args, use monomorphized name
-                                                (super::naming::mono_fn_name_from_call_operand(func, tcx).unwrap(), false)
+                                                (
+                                                    super::naming::mono_fn_name_from_call_operand(
+                                                        func, tcx, instance,
+                                                    )
+                                                    .unwrap(),
+                                                    false,
+                                                )
                                             }
                                         } else {
                                             // No args, use monomorphized name
-                                            (super::naming::mono_fn_name_from_call_operand(func, tcx).unwrap(), false)
+                                            (
+                                                super::naming::mono_fn_name_from_call_operand(
+                                                    func, tcx, instance,
+                                                )
+                                                .unwrap(),
+                                                false,
+                                            )
                                         }
                                     } else {
                                         // Not a trait method, use monomorphized name
-                                        (super::naming::mono_fn_name_from_call_operand(func, tcx).unwrap(), false)
+                                        (
+                                            super::naming::mono_fn_name_from_call_operand(
+                                                func, tcx, instance,
+                                            )
+                                            .unwrap(),
+                                            false,
+                                        )
                                     }
                                 } else {
                                     // Not an associated item, use monomorphized name
-                                    (super::naming::mono_fn_name_from_call_operand(func, tcx).unwrap(), false)
+                                    (
+                                        super::naming::mono_fn_name_from_call_operand(
+                                            func, tcx, instance,
+                                        )
+                                        .unwrap(),
+                                        false,
+                                    )
                                 }
                             } else {
                                 // External function: check for special cases, otherwise use path-based key for shims
                                 let def_path = tcx.def_path_str(*def_id);
-                                
+
                                 // Special case: core::str::<impl str>::len maps to our Kotlin shim's len method
                                 if def_path.contains("::str::") && def_path.ends_with("::len") {
                                     ("len".to_string(), false)
@@ -371,8 +439,14 @@ pub fn convert_basic_block<'tcx>(
                 for arg in args_to_process {
                     let mir_op = &arg.node;
                     // Important: Pass pre_call_instructions here to collect setup code for this arg
-                    let oomir_op =
-                        convert_operand(mir_op, tcx, instance, mir, data_types, &mut pre_call_instructions);
+                    let oomir_op = convert_operand(
+                        mir_op,
+                        tcx,
+                        instance,
+                        mir,
+                        data_types,
+                        &mut pre_call_instructions,
+                    );
 
                     // Identify if the MIR operand is a direct use of a local Place
                     let maybe_arg_place = match mir_op {
