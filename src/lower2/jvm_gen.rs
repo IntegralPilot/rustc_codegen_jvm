@@ -6,7 +6,7 @@ use crate::oomir::{self, DataTypeMethod, Signature, Type};
 use ristretto_classfile::{
     self as jvm, BaseType, ClassAccessFlags, ClassFile, ConstantPool, FieldAccessFlags,
     MethodAccessFlags, Version,
-    attributes::{Attribute, Instruction, MaxStack},
+    attributes::{Attribute, Instruction, MaxStack, InnerClass, NestedClassAccessFlags},
 };
 use std::collections::HashMap;
 
@@ -91,6 +91,7 @@ pub(super) fn create_data_type_classfile_for_class(
     super_class_name_jvm: &str,
     implements_interfaces: Vec<String>,
     module: &oomir::Module,
+    subclasses: Vec<String>,
 ) -> jvm::Result<Vec<u8>> {
     let mut cp = ConstantPool::default();
 
@@ -242,6 +243,51 @@ pub(super) fn create_data_type_classfile_for_class(
                 class_file.methods.push(jvm_method);
             }
         }
+    }
+
+    // --- Add InnerClasses Attribute (for nested/member classes) ---
+    if !subclasses.is_empty() {
+        let mut inner_classes_vec: Vec<InnerClass> = Vec::with_capacity(subclasses.len());
+
+        for subclass_name in &subclasses {
+            // Ensure subclass class_info is in the constant pool
+            let class_info_index = class_file.constant_pool.add_class(subclass_name)?;
+
+            // The outer class is this class
+            let outer_class_info_index = class_file.this_class;
+
+            // Derive simple name: part after last '$'. If there's no '$', treat as unnamed (0).
+            let simple_name_part = subclass_name.rsplit('$').next().unwrap_or(subclass_name);
+
+            // If the simple name looks like an anonymous class (all digits), set name_index = 0
+            let name_index = if simple_name_part.chars().all(|c| c.is_ascii_digit()) {
+                0
+            } else if simple_name_part == *subclass_name && !subclass_name.contains('$') {
+                // No '$' present -> not an inner/member class; leave name_index = 0
+                0
+            } else {
+                class_file
+                    .constant_pool
+                    .add_utf8(simple_name_part)?
+            };
+
+            // Default to PUBLIC | STATIC for generated nested classes. This can be adjusted
+            // if more precise access info becomes available.
+            let access_flags = NestedClassAccessFlags::PUBLIC | NestedClassAccessFlags::STATIC;
+
+            inner_classes_vec.push(InnerClass {
+                class_info_index,
+                outer_class_info_index,
+                name_index,
+                access_flags,
+            });
+        }
+
+        let inner_classes_attr_name_index = class_file.constant_pool.add_utf8("InnerClasses")?;
+        class_file.attributes.push(Attribute::InnerClasses {
+            name_index: inner_classes_attr_name_index,
+            classes: inner_classes_vec,
+        });
     }
 
     // --- Add SourceFile Attribute ---

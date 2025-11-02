@@ -172,6 +172,12 @@ pub fn oomir_to_jvm_bytecode(
                 methods,
                 interfaces,
             } => {
+                let mut subclasses = Vec::new();
+                for (other_dt_name, _) in &module.data_types {
+                    if other_dt_name.starts_with(&format!("{}$", dt_name_oomir)) {
+                        subclasses.push(other_dt_name.clone());
+                    }
+                }
                 // Create and serialize the class file for this data type
                 let dt_bytecode = create_data_type_classfile_for_class(
                     &dt_name_oomir,
@@ -181,6 +187,7 @@ pub fn oomir_to_jvm_bytecode(
                     super_class.as_deref().unwrap_or("java/lang/Object"),
                     interfaces.clone(),
                     &module,
+                    subclasses,
                 )?;
                 generated_classes.insert(dt_name_oomir.clone(), dt_bytecode);
             }

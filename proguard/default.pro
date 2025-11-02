@@ -1,4 +1,4 @@
--keep public class * { public static void main(java.lang.String[]); }
+-keep public class *
 -keep class * {
     <fields>;
 }
@@ -7,3 +7,5 @@
 }
 
 -keepattributes MethodParameters
+-keepattributes InnerClasses
+-keepattributes EnclosingMethod

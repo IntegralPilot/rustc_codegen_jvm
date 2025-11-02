@@ -127,7 +127,17 @@ def process_binary_test(test_dir: str, release_mode: bool) -> bool:
     test_name = os.path.basename(test_dir)
     normalized = normalize_name(test_name)
     print(f"|-- Test '{test_name}' ({normalized})")
-    
+
+    # If running in release mode, allow tests to opt-out by creating a
+    # `no_release.flag` file containing a short justification. When present
+    # we skip the test and show the justification to the user.
+    no_release_file = os.path.join(test_dir, "no_release.flag")
+    if release_mode and os.path.exists(no_release_file):
+        reason = read_from_file(no_release_file).strip()
+        # Per request: show the justification when skipping
+        print(f"Skipping: {reason}")
+        return True
+
     print("|--- 🧼 Cleaning test folder...")
     proc = run_command(["cargo", "clean"], cwd=test_dir)
     if proc.returncode != 0:
@@ -158,6 +168,16 @@ def process_integration_test(test_dir: str, release_mode: bool) -> bool:
     test_name = os.path.basename(test_dir)
     normalized = normalize_name(test_name)
     print(f"|-- Test '{test_name}' ({normalized})")
+
+    # If running in release mode, allow tests to opt-out by creating a
+    # `no_release.flag` file containing a short justification. When present
+    # we skip the test and show the justification to the user.
+    no_release_file = os.path.join(test_dir, "no_release.flag")
+    if release_mode and os.path.exists(no_release_file):
+        reason = read_from_file(no_release_file).strip()
+        # Per request: show the justification when skipping
+        print(f"Skipping: {reason}")
+        return True
 
     print("|--- 🧼 Cleaning test folder...")
     run_command(["cargo", "clean"], cwd=test_dir) # Ignore clean failure for now
