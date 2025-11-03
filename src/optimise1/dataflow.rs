@@ -1181,6 +1181,30 @@ pub fn process_block_instructions(
                 keep_original_instruction = true;
             }
 
+            Instruction::InvokeStatic {
+                dest,
+                class_name,
+                method_name,
+                method_ty,
+                args,
+            } => {
+                // Propagate constants in arguments
+                let new_args: Vec<Operand> = args
+                    .iter()
+                    .map(|arg| {
+                        lookup_const(arg, &current_state).map_or(arg.clone(), Operand::Constant)
+                    })
+                    .collect();
+                optimised_instruction = Instruction::InvokeStatic {
+                    dest: dest.clone(),
+                    class_name: class_name.clone(),
+                    method_name: method_name.clone(),
+                    method_ty: method_ty.clone(),
+                    args: new_args,
+                };
+                keep_original_instruction = true;
+            }
+
             Instruction::InvokeInterface {
                 class_name,
                 method_name,

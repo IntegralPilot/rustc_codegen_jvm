@@ -18,7 +18,11 @@ use rustc_middle::{
 use std::collections::HashMap;
 
 mod checked_ops;
+mod checked_intrinsic_registry;
+pub mod checked_intrinsics;
 mod rvalue;
+
+pub use checked_intrinsic_registry::take_needed_intrinsics;
 
 /// Convert a single MIR basic block into an OOMIR basic block.
 pub fn convert_basic_block<'tcx>(

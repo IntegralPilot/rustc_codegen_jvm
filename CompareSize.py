@@ -114,8 +114,8 @@ def stash_based(tests, binary_dir):
     """Compares working dir vs. stashed state, measures JAR sizes and per-test build times."""
     # Phase 1A: build main project WITH changes
     print("|--- 🛠️ Building main project WITH unstaged changes…")
-    run_command(["make", "clean"], check=True)
-    run_command(["make", "all"],   check=True)
+    run_command(["./build.py", "clean"], check=True)
+    run_command(["./build.py", "all"],   check=True)
 
     # Phase 1B: build each test and time it
     times_with = {}
@@ -125,7 +125,7 @@ def stash_based(tests, binary_dir):
         print(f"|---- Building test: {name}")
         t0 = time.time()
         # Note: The original script didn't specify --release or --target here.
-        # The actual JAR location might depend on how 'make all' configures things.
+        # The actual JAR location might depend on how './build.py all' configures things.
         run_command(["cargo", "clean"], cwd=t, check=True)
         run_command(["cargo", "build"], cwd=t, check=True)
         elapsed = time.time() - t0
@@ -155,8 +155,8 @@ def stash_based(tests, binary_dir):
 
     # Phase 2A: build main project at HEAD
     print("\n|--- 🛠️ Building main project at HEAD (no changes)…")
-    run_command(["make", "clean"], check=True)
-    run_command(["make", "all"],   check=True)
+    run_command(["./build.py", "clean"], check=True)
+    run_command(["./build.py", "all"],   check=True)
 
     # Phase 2B: build each test at HEAD and time it
     times_without = {}
@@ -250,8 +250,8 @@ def commit_based(tests, binary_dir, n):
 
     # Phase 1A: build main project at HEAD
     print(f"\n|--- 🛠️ Building main project at HEAD ({orig_head[:10]})…")
-    run_command(["make", "clean"], check=True)
-    run_command(["make", "all"],   check=True)
+    run_command(["./build.py", "clean"], check=True)
+    run_command(["./build.py", "all"],   check=True)
 
     # Phase 1B: build & time each test at HEAD
     times_head = {}
@@ -282,8 +282,8 @@ def commit_based(tests, binary_dir, n):
 
     # Phase 2A: build main project at HEAD~N
     print(f"\n|--- 🛠️ Building main project at HEAD~{n}…")
-    run_command(["make", "clean"], check=True)
-    run_command(["make", "all"],   check=True)
+    run_command(["./build.py", "clean"], check=True)
+    run_command(["./build.py", "all"],   check=True)
 
     # Phase 2B: build & time each test at HEAD~N
     times_old = {}

@@ -37,14 +37,59 @@ def build_rust_code(test_dir: str, release_mode: bool) -> tuple[bool, str]:
         build_cmd.extend(["--target", "../../../jvm-unknown-unknown.json"])
     
     proc = run_command(build_cmd, cwd=test_dir)
+    target_dir = "release" if release_mode else "debug"
+    
     if proc.returncode != 0:
         fail_path = os.path.join(test_dir, "cargo-build-fail.generated")
         output = f"STDOUT:\n{proc.stdout}\n\nSTDERR:\n{proc.stderr}"
         write_to_file(fail_path, output)
         print(f"|---- ❌ cargo build exited with code {proc.returncode}")
+        
+        # Check if this is an R8 linking error (indicates invalid JVM bytecode)
+        error_output = proc.stdout + proc.stderr
+        if "R8" in error_output:
+            print("|---- 🔍 Detected R8 error - attempting to run with -noverify for better diagnostics...")
+            test_name = os.path.basename(test_dir)
+            
+            # Try to run the main class with -noverify to get actual JVM error
+            deps_dir = os.path.join(test_dir, "target", target_dir, "deps")
+            if os.path.exists(deps_dir):
+                # Check if the main class file exists
+                main_class = os.path.join(deps_dir, f"{test_name}.class")
+                if os.path.exists(main_class):
+                    # Build classpath: runtime libraries + deps directory
+                    java_cp = f"{RUNTIME_CLASSPATH_BASE}{os.pathsep}{deps_dir}"
+                    verify_proc = run_command(
+                        ["java", "-noverify", "-cp", java_cp, test_name]
+                    )
+                    
+                    # Always write output if we got any
+                    verify_output = f"\n\n--- JVM OUTPUT WITH -noverify ---\n"
+                    verify_output += f"Command: java -noverify -cp {java_cp} {test_name}\n"
+                    verify_output += f"STDOUT:\n{verify_proc.stdout}\n\nSTDERR:\n{verify_proc.stderr}\n"
+                    verify_output += f"Return code: {verify_proc.returncode}\n"
+                    
+                    # Append to the fail file
+                    full_output = output + verify_output
+                    write_to_file(fail_path, full_output)
+                    print("|---- 📝 JVM diagnostics written to cargo-build-fail.generated")
+                    
+                    # Show relevant error info
+                    if verify_proc.stderr:
+                        # Filter out the deprecation warning about -noverify
+                        error_lines = [line for line in verify_proc.stderr.split('\n') 
+                                     if '-noverify' not in line and '-Xverify:none' not in line and line.strip()]
+                        if error_lines:
+                            print(f"|---- JVM error: {error_lines[0][:200]}")
+                    elif verify_proc.returncode != 0:
+                        print(f"|---- JVM exited with code {verify_proc.returncode}")
+                else:
+                    print(f"|---- ⚠️ Main class file not found: {main_class}")
+            else:
+                print(f"|---- ⚠️ Deps directory not found: {deps_dir}")
+        
         return False, ""
 
-    target_dir = "release" if release_mode else "debug"
     return True, target_dir
 
 def find_and_prepare_jar(test_dir: str, test_name: str, target_dir: str) -> tuple[bool, str]:

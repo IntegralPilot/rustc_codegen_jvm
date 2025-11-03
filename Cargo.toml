@@ -10,6 +10,7 @@ libc = "0.2.172"
 md5 = "0.7.0"
 num-bigint = "0.4.6"
 num-traits = "0.2.19"
+once_cell = "1.20.2"
 regex = "1.11.1"
 ristretto_classfile = "0.18.1"
 serde = { version = "1.0.219", features = ["derive"] }

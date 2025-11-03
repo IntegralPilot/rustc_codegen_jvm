@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use types::ty_to_oomir_type;
 
 mod closures;
-mod control_flow;
+pub mod control_flow;
 pub mod naming;
 pub mod operand;
 pub mod place;
@@ -204,6 +204,7 @@ pub fn mir_to_oomir<'tcx>(
             name: fn_name,
             signature,
             body: codeblock,
+            is_static: false,
         },
         data_types.clone(),
     )

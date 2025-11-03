@@ -184,6 +184,7 @@ pub struct Function {
     pub name: String,
     pub signature: Signature,
     pub body: CodeBlock,
+    pub is_static: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -415,6 +416,13 @@ pub enum Instruction {
         method_ty: Signature, // Signature of the method (input/output types)
         args: Vec<Operand>,   // Arguments to the function
         operand: Operand,     // The object reference (this) for the method call
+    },
+    InvokeStatic {
+        dest: Option<String>, // Optional destination variable for the return value
+        class_name: String,   // JVM class name
+        method_name: String,  // Name of the static method to call
+        method_ty: Signature, // Signature of the method (input/output types)
+        args: Vec<Operand>,   // Arguments to the function
     },
 }
 

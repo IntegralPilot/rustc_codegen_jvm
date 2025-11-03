@@ -193,7 +193,7 @@ pub(super) fn create_data_type_classfile_for_class(
             DataTypeMethod::Function(function) => {
                 // Translate the function body using its own constant pool reference
                 let translator =
-                    FunctionTranslator::new(function, &mut class_file.constant_pool, module, false);
+                    FunctionTranslator::new(function, &mut class_file.constant_pool, module, function.is_static);
                 let (jvm_code, max_locals_val) = translator.translate()?;
 
                 let max_stack_val = jvm_code.max_stack(&class_file.constant_pool)?;
@@ -234,8 +234,12 @@ pub(super) fn create_data_type_classfile_for_class(
                     attributes_vec.push(method_parameters_attribute);
                 }
 
+                let mut access_flags = MethodAccessFlags::PUBLIC;
+                if function.is_static {
+                    access_flags |= MethodAccessFlags::STATIC;
+                }
                 let jvm_method = jvm::Method {
-                    access_flags: MethodAccessFlags::PUBLIC,
+                    access_flags,
                     name_index,
                     descriptor_index,
                     attributes: attributes_vec,

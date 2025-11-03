@@ -682,6 +682,7 @@ impl CodegenBackend for MyBackend {
                                 entry: "bb0".into(),
                                 basic_blocks: bbs,
                             },
+                            is_static: false,
                         },
                     );
 
@@ -867,6 +868,7 @@ impl CodegenBackend for MyBackend {
                             entry: "bb0".into(),
                             basic_blocks: bbs,
                         },
+                        is_static: false,
                     };
 
                     new_functions.insert(format!("dyn_{}_{}", ident, name), function);
@@ -931,6 +933,24 @@ impl CodegenBackend for MyBackend {
             "backend",
             format!("OOMIR module: {:?}", oomir_module)
         );
+
+        // Emit checked arithmetic intrinsics for all needed operations
+        breadcrumbs::log!(
+            breadcrumbs::LogLevel::Info,
+            "intrinsics",
+            "Emitting checked arithmetic intrinsics..."
+        );
+        let needed_intrinsics = lower1::control_flow::take_needed_intrinsics();
+        if !needed_intrinsics.is_empty() {
+            breadcrumbs::log!(
+                breadcrumbs::LogLevel::Info,
+                "intrinsics",
+                format!("Emitting {} intrinsics: {:?}", needed_intrinsics.len(), needed_intrinsics)
+            );
+            let intrinsic_class = 
+                lower1::control_flow::checked_intrinsics::emit_all_needed_intrinsics(&needed_intrinsics);
+            oomir_module.data_types.insert("RustcCodegenJVMIntrinsics".to_string(), intrinsic_class);
+        }
 
         breadcrumbs::log!(
             breadcrumbs::LogLevel::Info,
@@ -1074,7 +1094,7 @@ impl CodegenBackend for MyBackend {
 
 struct RustcCodegenJvmLogListener;
 
-const LISTENING_CHANNELS: &[&str] = &[];
+const LISTENING_CHANNELS: &[&str] = &["backend"];
 
 impl breadcrumbs::LogListener for RustcCodegenJvmLogListener {
     fn on_log(&mut self, log: breadcrumbs::Log) {
