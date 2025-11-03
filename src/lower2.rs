@@ -173,9 +173,22 @@ pub fn oomir_to_jvm_bytecode(
                 interfaces,
             } => {
                 let mut subclasses = Vec::new();
+                let mut nest_host = None;
+                // does our class name contain '$'?
+                let mut potential_nest_host = None;
+                if dt_name_oomir.contains('$') {
+                    // strip everything after the last '$', including $
+                    let last_dollar_index = dt_name_oomir.rfind('$').unwrap();
+                    potential_nest_host = Some(dt_name_oomir[..last_dollar_index].to_string());
+                }
                 for (other_dt_name, _) in &module.data_types {
                     if other_dt_name.starts_with(&format!("{}$", dt_name_oomir)) {
                         subclasses.push(other_dt_name.clone());
+                    }
+                    if let Some(potential_nest_host) = &potential_nest_host {
+                        if other_dt_name == potential_nest_host {
+                            nest_host = Some(potential_nest_host.clone());
+                        }
                     }
                 }
                 // Create and serialize the class file for this data type
@@ -188,6 +201,7 @@ pub fn oomir_to_jvm_bytecode(
                     interfaces.clone(),
                     &module,
                     subclasses,
+                    nest_host,
                 )?;
                 generated_classes.insert(dt_name_oomir.clone(), dt_bytecode);
             }

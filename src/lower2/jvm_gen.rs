@@ -92,6 +92,7 @@ pub(super) fn create_data_type_classfile_for_class(
     implements_interfaces: Vec<String>,
     module: &oomir::Module,
     subclasses: Vec<String>,
+    nest_host: Option<String>,
 ) -> jvm::Result<Vec<u8>> {
     let mut cp = ConstantPool::default();
 
@@ -246,7 +247,7 @@ pub(super) fn create_data_type_classfile_for_class(
     }
 
     // --- Add InnerClasses Attribute (for nested/member classes) ---
-    if !subclasses.is_empty() {
+    if !subclasses.is_empty() || nest_host.is_some() {
         let mut inner_classes_vec: Vec<InnerClass> = Vec::with_capacity(subclasses.len());
 
         for subclass_name in &subclasses {
@@ -275,6 +276,26 @@ pub(super) fn create_data_type_classfile_for_class(
             // if more precise access info becomes available.
             let access_flags = NestedClassAccessFlags::PUBLIC | NestedClassAccessFlags::STATIC;
 
+            inner_classes_vec.push(InnerClass {
+                class_info_index,
+                outer_class_info_index,
+                name_index,
+                access_flags,
+            });
+        }
+
+        // If this class has a nest host, add it as well
+        // make it like [us]=class Host$[us] of class Host
+        if let Some(nest_host_name) = nest_host {
+            let class_info_index = class_file.constant_pool.add_class(class_name_jvm)?;
+            let outer_class_info_index = class_file.constant_pool.add_class(&nest_host_name)?;
+            let name_index =  class_file
+                    .constant_pool
+                    .add_utf8(class_name_jvm
+                        .rsplit('$')
+                        .next()
+                        .unwrap_or(class_name_jvm))?;
+            let access_flags = NestedClassAccessFlags::PUBLIC | NestedClassAccessFlags::STATIC;
             inner_classes_vec.push(InnerClass {
                 class_info_index,
                 outer_class_info_index,
