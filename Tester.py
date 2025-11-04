@@ -9,7 +9,7 @@ import glob
 # NOTE: We may need to update the kotlin version in the future
 RUNTIME_CLASSPATH_BASE = os.pathsep.join([
     "library/build/distributions/library-0.1.0/lib/library-0.1.0.jar",
-    "library/build/distributions/library-0.1.0/lib/kotlin-stdlib-2.1.20.jar",
+    "library/build/distributions/library-0.1.0/lib/kotlin-stdlib-2.1.21.jar",
 ])
 
 def read_from_file(path: str) -> str:
