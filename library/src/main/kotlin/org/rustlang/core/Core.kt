@@ -82,6 +82,13 @@ public object Core {
     }
 
     @JvmStatic
+    public fun std_rt_panic_fmt(arg: Any?) {
+        // Newer Rust nightly uses std::rt::panic_fmt instead of core::panicking::panic_fmt
+        // Just delegate to panic_fmt which has the same behavior
+        panic_fmt(arg)
+    }
+
+    @JvmStatic
     public fun arguments_new_const_1(pieces: Array<String>): String {
         // Concatenate all the string pieces together.
         // This mimics the simplest formatting scenario where pieces are just joined.
@@ -121,6 +128,13 @@ public object Core {
             sb.append(pieces[i])
         }
         return sb.toString()
+    }
+
+    @JvmStatic
+    public fun Arguments_from_str(msg: String): String {
+        // Arguments::from_str creates a simple Arguments from a static string
+        // In our simplified model, we just return the string as-is
+        return msg
     }
 
     @JvmStatic 
@@ -572,6 +586,13 @@ public fun core_slice_u8_starts_with(value: Any, prefix: Any): Boolean {
     }
 
     @JvmStatic
+    public fun std_char_encode_utf8_raw(code: Long, dstOuter: Array<ShortArray>): Array<ShortArray> {
+        // New Rust nightly uses std::char::encode_utf8_raw instead of core path
+        // Delegate to existing implementation
+        return encode_utf8_raw(code, dstOuter)
+    }
+
+    @JvmStatic
     public fun std_intrinsics_size_of_val_u8(value: Any?): Long {
         if (value == null) {
             // size_of_val in Rust operates on a reference, which cannot be null.
@@ -634,5 +655,11 @@ public fun core_slice_u8_starts_with(value: Any, prefix: Any): Boolean {
         // for the purpose of this intrinsic. The intrinsic does not compare overall length
         // if the compared prefix is identical.
         return 0
+    }
+
+    @JvmStatic
+    public fun compare_bytes(ptr1: Any?, ptr2: Any?, len: Int): Int {
+        // Overload for when length is passed as Int (release mode optimization)
+        return compare_bytes(ptr1, ptr2, len.toLong())
     }
 }

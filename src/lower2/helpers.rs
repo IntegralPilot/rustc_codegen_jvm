@@ -268,6 +268,16 @@ pub fn get_cast_instructions(
             return Ok(vec![Instruction::Invokestatic(mref)]);
         }
 
+        // String → &[i16] (mutable reference to i16, actually means string-as-slice → short array)
+        // MutableReference(I16) maps to [S on JVM
+        // This happens in optimized panic formatting
+        if src == &Type::String && matches!(dest, Type::MutableReference(box Type::I16)) {
+            let core_idx = cp.add_class("org/rustlang/core/Core")?;
+            let mref = cp.add_method_ref(core_idx, "toShortArray", "(Ljava/lang/String;)[S")?;
+            // Just convert to short array - same as String → Array(I16)
+            return Ok(vec![Instruction::Invokestatic(mref)]);
+        }
+
         // short[] → String
         if src == &Type::Array(Box::new(Type::I16)) && dest == &Type::String {
             let core_idx = cp.add_class("org/rustlang/core/Core")?;
@@ -281,6 +291,32 @@ pub fn get_cast_instructions(
             }
         }
 
+        // MutableReference(T) → NonNull<T> (wrapping a reference in NonNull class)
+        // NonNull has a single field 'pointer' of type MutableReference(T)
+        if let Type::MutableReference(box inner_src) = src {
+            if let Type::Class(class_name) = dest {
+                if class_name.starts_with("NonNull_") {
+                    // Construct NonNull object and set its pointer field
+                    let nonnull_idx = cp.add_class(class_name)?;
+                    let ctor = cp.add_method_ref(nonnull_idx, "<init>", "()V")?;
+                    
+                    // The field type is MutableReference(inner), which is [<inner_descriptor>
+                    let field_descriptor = format!("[{}", inner_src.to_jvm_descriptor());
+                    
+                    let field_idx = cp.add_field_ref(nonnull_idx, "pointer", &field_descriptor)?;
+                    
+                    return Ok(vec![
+                        JI::New(nonnull_idx),      // new NonNull
+                        JI::Dup,                   // dup for constructor
+                        JI::Invokespecial(ctor),   // call <init>
+                        JI::Dup_x1,                // stack: nonnull, value, nonnull
+                        JI::Swap,                  // stack: nonnull, nonnull, value
+                        JI::Putfield(field_idx),   // nonnull.pointer = value
+                    ]);
+                }
+            }
+        }
+
         // Generic checkcast for all other reference-to-reference
         // Check if both are reference types AND have valid internal names/descriptors
         if let (Some(_), Some(dest_name)) = (
@@ -290,6 +326,18 @@ pub fn get_cast_instructions(
             let dest_idx = cp.add_class(&dest_name)?;
 
             return Ok(vec![JI::Checkcast(dest_idx)]);
+        }
+    }
+
+    // Special case: I32 → NonNull<T> (tagged pointer optimization from Rust)
+    // On JVM we can't represent tagged pointers, so we just push null
+    // This typically happens in optimized panic formatting code
+    if src.is_jvm_primitive_like() {
+        if let Type::Class(class_name) = dest {
+            if class_name.starts_with("NonNull_") {
+                // Pop the i32, push null
+                return Ok(vec![JI::Pop, JI::Aconst_null]);
+            }
         }
     }
 

@@ -139,6 +139,13 @@ pub fn convert_operand<'tcx>(
                 }
             }
         }
+        MirOperand::RuntimeChecks(runtime_checks) => {
+            // RuntimeChecks represent compile-time-known boolean constants
+            // for runtime checking flags (UB checks, contract checks, overflow checks).
+            // Evaluate them to a boolean constant.
+            let value = runtime_checks.value(&tcx.sess);
+            oomir::Operand::Constant(oomir::Constant::Boolean(value))
+        }
     }
 }
 

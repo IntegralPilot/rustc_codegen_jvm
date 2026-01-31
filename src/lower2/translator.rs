@@ -63,50 +63,53 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
 
         // Assign JVM local slots 0, 1, 2... to MIR argument names _1, _2, _3...
         // Assumes static methods where args start at slot 0.
-        // Assumes OOMIR uses MIR's _1, _2 naming convention for args passed from lower1.rs.
+        // Note: For synthetic parameters (like main's String[] args), we allocate the slot
+        // but don't map it to MIR locals since MIR doesn't reference them.
         let num_params = oomir_func.signature.params.len();
         for i in 0..num_params {
-            // Internal name for translator logic (optional, but helps clarity if complex logic added later)
             let param_translator_name = format!("param_{}", i);
-            // The name used in the OOMIR body, corresponding to MIR convention (_1, _2, ...)
-            let param_oomir_name = format!("_{}", i + 1);
-            let (_param_name, param_ty) = &oomir_func.signature.params[i];
+            let (param_name, param_ty) = &oomir_func.signature.params[i];
 
-            // Use assign_local to allocate the slot using the *translator* name first.
-            // This ensures the slot is reserved and next_local_index advances correctly.
+            // Allocate the slot for this parameter
             let assigned_index = translator.assign_local(param_translator_name.as_str(), param_ty);
 
-            // Now, explicitly map the OOMIR name (_1, _2, ...) to the *same* slot index
-            // and store its type information using the OOMIR name as the key.
-            // This allows instructions in the body using "_1" to find the correct slot.
-            if translator
-                .local_var_map
-                .insert(param_oomir_name.clone(), assigned_index)
-                .is_some()
-            {
-                // This shouldn't happen if MIR locals truly start after parameters
-                breadcrumbs::log!(
-                    breadcrumbs::LogLevel::Warn,
-                    "bytecode-gen",
-                    format!(
-                        "Warning: OOMIR parameter name '{}' potentially clashed with an existing mapping during parameter assignment.",
-                        param_oomir_name
-                    )
-                );
-            }
-            if translator
-                .local_var_types
-                .insert(param_oomir_name.clone(), param_ty.clone())
-                .is_some()
-            {
-                breadcrumbs::log!(
-                    breadcrumbs::LogLevel::Warn,
-                    "bytecode-gen",
-                    format!(
-                        "Warning: OOMIR parameter name '{}' potentially clashed with an existing type mapping during parameter assignment.",
-                        param_oomir_name
-                    )
-                );
+            // Only create MIR local mapping (_1, _2, ...) if this is a real MIR parameter,
+            // not a synthetic one added for JVM compatibility (like main's args).
+            // We detect synthetic params by checking if the param name matches the pattern
+            // used by the MIR-to-OOMIR lowering vs. names added by signature overrides.
+            // Real MIR params would have been numbered, synthetic ones have descriptive names.
+            if param_name != "args" && !(oomir_func.name == "main" && i == 0) {
+                // This looks like a real MIR parameter, map it to _1, _2, etc.
+                let param_oomir_name = format!("_{}", i + 1);
+                
+                if translator
+                    .local_var_map
+                    .insert(param_oomir_name.clone(), assigned_index)
+                    .is_some()
+                {
+                    breadcrumbs::log!(
+                        breadcrumbs::LogLevel::Warn,
+                        "bytecode-gen",
+                        format!(
+                            "Warning: OOMIR parameter name '{}' potentially clashed with an existing mapping during parameter assignment.",
+                            param_oomir_name
+                        )
+                    );
+                }
+                if translator
+                    .local_var_types
+                    .insert(param_oomir_name.clone(), param_ty.clone())
+                    .is_some()
+                {
+                    breadcrumbs::log!(
+                        breadcrumbs::LogLevel::Warn,
+                        "bytecode-gen",
+                        format!(
+                            "Warning: OOMIR parameter name '{}' potentially clashed with an existing type mapping during parameter assignment.",
+                            param_oomir_name
+                        )
+                    );
+                }
             }
         }
 
@@ -402,10 +405,23 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 load_constant(&mut self.jvm_instructions, &mut self.constant_pool, c)?
             }
             oomir::Operand::Variable { name: var_name, ty } => {
-                // Use the provided type directly - OOMIR variables should have correct types
-                let index = self.get_or_assign_local(var_name, ty);
-                let load_instr = get_load_instruction(ty, index)?;
-                self.jvm_instructions.push(load_instr);
+                // Special case: If this is an uninitialized Object variable (likely a dead closure reference),
+                // just push null instead of trying to load from an uninitialized local
+                if !self.local_var_map.contains_key(var_name) 
+                    && matches!(ty, oomir::Type::Class(name) if name == "java/lang/Object")
+                {
+                    breadcrumbs::log!(
+                        breadcrumbs::LogLevel::Info,
+                        "bytecode-gen",
+                        format!("Loading uninitialized closure placeholder '{}' as null", var_name)
+                    );
+                    self.jvm_instructions.push(Instruction::Aconst_null);
+                } else {
+                    // Use the provided type directly - OOMIR variables should have correct types
+                    let index = self.get_or_assign_local(var_name, ty);
+                    let load_instr = get_load_instruction(ty, index)?;
+                    self.jvm_instructions.push(load_instr);
+                }
             }
         }
         Ok(())
@@ -2133,6 +2149,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
 
                             // Check for diverging (can use shim_info if available)
                             if function_name == "panic_fmt"
+                                || function_name == "std_rt_panic_fmt"
                                 || function_name == "core_panicking_panic"
                                 || function_name == "core_assert_failed"
                             // Or check shim_info.diverges

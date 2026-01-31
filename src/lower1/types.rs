@@ -315,6 +315,18 @@ pub fn ty_to_oomir_type<'tcx>(
         rustc_middle::ty::TyKind::Param(param_ty) => {
             oomir::Type::Class(make_jvm_safe(param_ty.name.as_str()))
         }
+        rustc_middle::ty::TyKind::Closure(def_id, _substs) => {
+            // Closures are lowered to separate functions, so the closure object itself
+            // is just metadata that gets optimized away in release mode.
+            // In debug mode, it may still be referenced but never actually used.
+            // Map to a simple Object type - the actual logic is in the lowered function.
+            breadcrumbs::log!(
+                breadcrumbs::LogLevel::Info,
+                "type-mapping",
+                format!("Mapping closure {:?} to Object (closure lowered to function)", def_id)
+            );
+            oomir::Type::Class("java/lang/Object".to_string())
+        }
         _ => {
             breadcrumbs::log!(
                 breadcrumbs::LogLevel::Warn,

@@ -25,6 +25,7 @@ pub mod types;
 
 pub use closures::{ClosureCallInfo, extract_closure_info, generate_closure_function_name};
 
+
 /// Converts a MIR Body into an OOMIR Function.
 /// This function extracts a function's signature (currently minimal) and builds
 /// a control flow graph of basic blocks.

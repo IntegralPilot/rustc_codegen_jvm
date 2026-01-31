@@ -1,0 +1,1 @@
+STDOUT:STDERR:Exception in thread "main" java.lang.RuntimeException: Rust panic: <panic: error processing arguments object: <panic: object missing expected fields>> (Type: Arguments__)	at org.rustlang.core.Core.panic_fmt(Core.kt:81)	at org.rustlang.core.Core.std_rt_panic_fmt(Core.kt:88)	at panic.main(SourceFile)

@@ -1,4 +1,8 @@
 {
+  "Arguments_from_str": {
+    "descriptor": "(Ljava/lang/String;)Ljava/lang/String;",
+    "is_static": true
+  },
   "Option_is_none": {
     "descriptor": "(Ljava/lang/Object;)Z",
     "is_static": true
@@ -20,7 +24,7 @@
     "is_static": true
   },
   "compare_bytes": {
-    "descriptor": "(Ljava/lang/Object;Ljava/lang/Object;J)I",
+    "descriptor": "(Ljava/lang/Object;Ljava/lang/Object;I)I",
     "is_static": true
   },
   "core_assert_failed": {
@@ -123,8 +127,16 @@
     "descriptor": "(Ljava/lang/Object;Ljava/lang/Object;)Z",
     "is_static": true
   },
+  "std_char_encode_utf8_raw": {
+    "descriptor": "(J[[S)[[S",
+    "is_static": true
+  },
   "std_intrinsics_size_of_val_u8": {
     "descriptor": "(Ljava/lang/Object;)J",
+    "is_static": true
+  },
+  "std_rt_panic_fmt": {
+    "descriptor": "(Ljava/lang/Object;)V",
     "is_static": true
   },
   "str_eq": {

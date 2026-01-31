@@ -58,8 +58,8 @@ pub fn convert_rvalue_to_operand<'a>(
                         ty: temp_var_type,
                     };
                 }
-                MirOperand::Constant(_) => {
-                    // Constant is already an operand, no extra instructions
+                MirOperand::Constant(_) | MirOperand::RuntimeChecks(_) => {
+                    // Constant/RuntimeChecks are already operands, no extra instructions
                     result_operand = convert_operand(
                         mir_operand,
                         tcx,
