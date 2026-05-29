@@ -3,6 +3,7 @@
 use super::{
     FunctionTranslator,
     consts::{get_int_const_instr, load_constant},
+    helpers::{get_load_instruction, get_type_size, oomir_function_stack_floor},
 };
 use crate::oomir::{self, AdtHelperKind, DataTypeMethod, Signature, Type};
 
@@ -49,6 +50,174 @@ pub(super) fn create_default_constructor(
         name_index: init_name_index,
         descriptor_index: init_desc_index,
         attributes: vec![code_attribute],
+    })
+}
+
+fn create_field_constructor(
+    cp: &mut ConstantPool,
+    this_class_index: u16,
+    super_class_index: u16,
+    fields: &[(String, Type)],
+) -> jvm::Result<jvm::Method> {
+    let code_attr_name_index = cp.add_utf8("Code")?;
+    let init_name_index = cp.add_utf8("<init>")?;
+    let descriptor = format!(
+        "({})V",
+        fields
+            .iter()
+            .map(|(_, ty)| ty.to_jvm_descriptor())
+            .collect::<String>()
+    );
+    let init_desc_index = cp.add_utf8(&descriptor)?;
+    let super_init_ref_index = cp.add_method_ref(super_class_index, "<init>", "()V")?;
+
+    let mut instructions = vec![
+        Instruction::Aload_0,
+        Instruction::Invokespecial(super_init_ref_index),
+    ];
+    let mut next_local = 1;
+    let mut max_field_stack = 1;
+
+    for (field_name, field_ty) in fields {
+        let field_ref =
+            cp.add_field_ref(this_class_index, field_name, &field_ty.to_jvm_descriptor())?;
+        instructions.push(Instruction::Aload_0);
+        instructions.push(get_load_instruction(field_ty, next_local)?);
+        instructions.push(Instruction::Putfield(field_ref));
+
+        let field_size = get_type_size(field_ty);
+        max_field_stack = max_field_stack.max(1 + field_size);
+        next_local += field_size;
+    }
+
+    instructions.push(Instruction::Return);
+
+    let mut parameters = Vec::new();
+    for (field_name, _) in fields {
+        let name_index = cp.add_utf8(field_name)?;
+        parameters.push(jvm::attributes::MethodParameter {
+            name_index,
+            access_flags: MethodAccessFlags::empty(),
+        });
+    }
+    let method_parameters_attribute_name_index = cp.add_utf8("MethodParameters")?;
+
+    Ok(jvm::Method {
+        access_flags: MethodAccessFlags::PUBLIC,
+        name_index: init_name_index,
+        descriptor_index: init_desc_index,
+        attributes: vec![
+            Attribute::Code {
+                name_index: code_attr_name_index,
+                max_stack: max_field_stack,
+                max_locals: next_local,
+                code: instructions,
+                exception_table: Vec::new(),
+                attributes: Vec::new(),
+            },
+            Attribute::MethodParameters {
+                name_index: method_parameters_attribute_name_index,
+                parameters,
+            },
+        ],
+    })
+}
+
+fn return_instruction_for_type(ty: &Type) -> Instruction {
+    match ty {
+        Type::I8 | Type::I16 | Type::I32 | Type::Boolean | Type::Char => Instruction::Ireturn,
+        Type::I64 => Instruction::Lreturn,
+        Type::F32 => Instruction::Freturn,
+        Type::F64 => Instruction::Dreturn,
+        Type::Void => Instruction::Return,
+        Type::Reference(_)
+        | Type::MutableReference(_)
+        | Type::Array(_)
+        | Type::String
+        | Type::Class(_)
+        | Type::Interface(_) => Instruction::Areturn,
+    }
+}
+
+fn create_static_instance_bridge(
+    cp: &mut ConstantPool,
+    class_name_jvm: &str,
+    method_name: &str,
+    function: &oomir::Function,
+) -> jvm::Result<jvm::Method> {
+    debug_assert!(
+        !function.signature.is_static && !function.signature.params.is_empty(),
+        "static receiver bridges require the first signature parameter to be self"
+    );
+    let code_attr_name_index = cp.add_utf8("Code")?;
+    let name_index = cp.add_utf8(method_name)?;
+
+    // OOMIR instance method signatures retain self as params[0], while the real
+    // JVM instance method descriptor omits it. The static bridge makes that
+    // receiver explicit again and delegates to the instance method.
+    let mut bridge_params = function.signature.params.clone();
+    if let Some((_, receiver_ty)) = bridge_params.first_mut() {
+        *receiver_ty = Type::Class(class_name_jvm.to_string());
+    }
+
+    let bridge_signature = Signature {
+        params: bridge_params,
+        ret: function.signature.ret.clone(),
+        is_static: true,
+    };
+    let bridge_descriptor = bridge_signature.to_string();
+    let descriptor_index = cp.add_utf8(&bridge_descriptor)?;
+
+    let class_index = cp.add_class(class_name_jvm)?;
+    let instance_method_ref =
+        cp.add_method_ref(class_index, method_name, &function.signature.to_string())?;
+
+    let mut instructions = Vec::new();
+    let mut next_local = 0;
+    let mut max_stack = 0;
+    for (_, param_ty) in &bridge_signature.params {
+        instructions.push(get_load_instruction(param_ty, next_local)?);
+        let size = get_type_size(param_ty);
+        max_stack += size;
+        next_local += size;
+    }
+    instructions.push(Instruction::Invokevirtual(instance_method_ref));
+    instructions.push(return_instruction_for_type(bridge_signature.ret.as_ref()));
+
+    let mut parameters = Vec::new();
+    for (param_name, _) in &bridge_signature.params {
+        let name_index = cp.add_utf8(param_name)?;
+        parameters.push(jvm::attributes::MethodParameter {
+            name_index,
+            access_flags: MethodAccessFlags::empty(),
+        });
+    }
+    let method_parameters_attribute_name_index = cp.add_utf8("MethodParameters")?;
+
+    let return_stack = if *bridge_signature.ret == Type::Void {
+        0
+    } else {
+        get_type_size(bridge_signature.ret.as_ref())
+    };
+
+    Ok(jvm::Method {
+        access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
+        name_index,
+        descriptor_index,
+        attributes: vec![
+            Attribute::Code {
+                name_index: code_attr_name_index,
+                max_stack: max_stack.max(return_stack),
+                max_locals: next_local,
+                code: instructions,
+                exception_table: Vec::new(),
+                attributes: Vec::new(),
+            },
+            Attribute::MethodParameters {
+                name_index: method_parameters_attribute_name_index,
+                parameters,
+            },
+        ],
     })
 }
 
@@ -232,8 +401,14 @@ pub(super) fn create_data_type_classfile_for_class(
         );
     }
 
-    // --- Create Default Constructor ---
-    let constructor = create_default_constructor(&mut cp, super_class_index)?;
+    // --- Create Constructor ---
+    // Fielded Rust structs/enums must be initialized with all fields. Only genuinely
+    // fieldless classes keep a no-args constructor.
+    let constructor = if fields.is_empty() {
+        create_default_constructor(&mut cp, super_class_index)?
+    } else {
+        create_field_constructor(&mut cp, this_class_index, super_class_index, &fields)?
+    };
     let jvm_methods = vec![constructor];
 
     // --- Assemble ClassFile ---
@@ -308,7 +483,9 @@ pub(super) fn create_data_type_classfile_for_class(
                 );
                 let (jvm_code, max_locals_val) = translator.translate()?;
 
-                let max_stack_val = jvm_code.max_stack(&class_file.constant_pool)?;
+                let max_stack_val = jvm_code
+                    .max_stack(&class_file.constant_pool)?
+                    .max(oomir_function_stack_floor(function));
 
                 let code_attribute = Attribute::Code {
                     name_index: class_file.constant_pool.add_utf8("Code")?,
@@ -371,6 +548,14 @@ pub(super) fn create_data_type_classfile_for_class(
                 };
 
                 class_file.methods.push(jvm_method);
+                if !function.signature.is_static && !function.signature.params.is_empty() {
+                    class_file.methods.push(create_static_instance_bridge(
+                        &mut class_file.constant_pool,
+                        class_name_jvm,
+                        method_name,
+                        function,
+                    )?);
+                }
             }
             DataTypeMethod::AdtHelperMethod { kind } => {
                 let jvm_method = match kind {

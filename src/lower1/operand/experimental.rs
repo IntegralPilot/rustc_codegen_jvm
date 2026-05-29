@@ -276,6 +276,7 @@ pub fn read_constant_value_from_memory<'tcx>(
             // Similar to structs, but fields accessed by index.
             // OOMIR might represent tuples as generic structs or have a dedicated type.
             let mut fields_map = HashMap::new();
+            let mut params = Vec::new();
             match layout.fields {
                 FieldsShape::Arbitrary { ref offsets, .. } => {
                     for (i, field_ty) in field_tys.iter().enumerate() {
@@ -288,6 +289,7 @@ pub fn read_constant_value_from_memory<'tcx>(
                             oomir_data_types,
                             instance,
                         )?;
+                        params.push(field_const.clone());
                         fields_map.insert(format!("field{}", i), field_const); // Use numbered field names
                     }
                 }
@@ -298,7 +300,7 @@ pub fn read_constant_value_from_memory<'tcx>(
             Ok(oomir::Constant::Instance {
                 class_name: tuple_class_name,
                 fields: fields_map,
-                params: vec![],
+                params,
             })
         }
 
@@ -322,6 +324,7 @@ fn handle_constant_struct<'tcx>(
 ) -> Result<oomir::Constant, String> {
     let variant = adt_def.variant(VariantIdx::from_usize(0)); // Structs have one variant
     let mut fields_map = HashMap::new();
+    let mut params = Vec::new();
 
     for (i, field_def) in variant.fields.iter().enumerate() {
         let field_idx = FieldIdx::from_usize(i);
@@ -348,6 +351,7 @@ fn handle_constant_struct<'tcx>(
             oomir_data_types,
             instance,
         )?;
+        params.push(field_const.clone());
         fields_map.insert(field_name, field_const);
     }
 
@@ -357,7 +361,7 @@ fn handle_constant_struct<'tcx>(
     Ok(oomir::Constant::Instance {
         class_name,
         fields: fields_map,
-        params: vec![],
+        params,
     })
 }
 
@@ -673,6 +677,7 @@ fn handle_constant_enum<'tcx>(
 
     // 3. Read the fields of the active variant using its specific layout (`variant_fields_shape`)
     let mut fields_map = HashMap::new();
+    let mut params = Vec::new();
     for (i, field_def) in variant_def.fields.iter().enumerate() {
         let field_idx = FieldIdx::from_usize(i);
         let field_ty = field_def.ty(tcx, substs).skip_norm_wip();
@@ -744,6 +749,7 @@ fn handle_constant_enum<'tcx>(
             oomir_data_types,
             instance,
         )?;
+        params.push(field_const.clone());
         fields_map.insert(field_name, field_const);
     }
 
@@ -813,6 +819,6 @@ fn handle_constant_enum<'tcx>(
     Ok(oomir::Constant::Instance {
         class_name: variant_class_name,
         fields: fields_map,
-        params: vec![],
+        params,
     })
 }

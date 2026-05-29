@@ -7,7 +7,10 @@ use super::lower2::BIG_INTEGER_CLASS;
 use breadcrumbs::LogLevel;
 use core::panic;
 use ristretto_classfile::attributes::Instruction as JVMInstruction;
-use std::{collections::HashMap, fmt};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+};
 
 pub mod interpret;
 
@@ -162,12 +165,9 @@ impl DataType {
                 methods,
                 interfaces: _,
             } => {
-                // Remove duplicate fields
-                let mut unique_fields = HashMap::new();
-                for (name, ty) in fields.iter() {
-                    unique_fields.insert(name.clone(), ty.clone());
-                }
-                *fields = unique_fields.into_iter().collect();
+                // Remove duplicate fields while preserving the original declaration order.
+                let mut seen_fields = HashSet::new();
+                fields.retain(|(name, _)| seen_fields.insert(name.clone()));
 
                 // Remove duplicate methods
                 let mut unique_methods = HashMap::new();
@@ -420,9 +420,9 @@ pub enum Instruction {
         array: Operand,
     },
     ConstructObject {
-        dest: String, // Variable to hold the new object reference
-        class_name: String, // JVM class name (e.g., my_crate/MyStruct)
-                      // Implicitly calls the default constructor <init>()V
+        dest: String,               // Variable to hold the new object reference
+        class_name: String,         // JVM class name (e.g., my_crate/MyStruct)
+        args: Vec<(Operand, Type)>, // Constructor arguments in field declaration order.
     },
     SetField {
         object: String,      // Variable holding the object reference
@@ -486,6 +486,9 @@ impl Operand {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Constant {
+    /// A typed JVM null. The type is needed when null appears in a constructor
+    /// argument list, because constructor descriptors are exact.
+    Null(Type),
     I8(i8),
     I16(i16),
     I32(i32),
@@ -514,6 +517,10 @@ impl Eq for Constant {}
 impl std::hash::Hash for Constant {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         match self {
+            Constant::Null(ty) => {
+                0.hash(state);
+                ty.hash(state);
+            }
             Constant::I8(i) => i.hash(state),
             Constant::I16(i) => i.hash(state),
             Constant::I32(i) => i.hash(state),
@@ -877,6 +884,7 @@ impl Type {
     /// Create a Type from a Constant.
     pub fn from_constant(constant: &Constant) -> Self {
         match constant {
+            Constant::Null(ty) => ty.clone(),
             Constant::I8(_) => Type::I8,
             Constant::I16(_) => Type::I16,
             Constant::I32(_) => Type::I32,

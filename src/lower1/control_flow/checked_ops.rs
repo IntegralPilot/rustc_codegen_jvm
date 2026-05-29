@@ -59,26 +59,22 @@ pub fn emit_checked_arithmetic_oomir_instructions(
         generated_instructions.push(Instruction::ConstructObject {
             dest: tmp_pair.clone(),
             class_name: class_name.to_string(),
-        });
-        generated_instructions.push(Instruction::SetField {
-            object: tmp_pair.clone(),
-            field_name: "field0".to_string(),
-            value: Operand::Variable {
-                name: tmp_result.clone(),
-                ty: op_ty.clone(),
-            },
-            field_ty: op_ty.clone(),
-            owner_class: class_name.to_string(),
-        });
-        generated_instructions.push(Instruction::SetField {
-            object: tmp_pair.clone(),
-            field_name: "field1".to_string(),
-            value: Operand::Variable {
-                name: tmp_overflow.clone(),
-                ty: Type::Boolean,
-            },
-            field_ty: Type::Boolean,
-            owner_class: class_name.to_string(),
+            args: vec![
+                (
+                    Operand::Variable {
+                        name: tmp_result.clone(),
+                        ty: op_ty.clone(),
+                    },
+                    op_ty.clone(),
+                ),
+                (
+                    Operand::Variable {
+                        name: tmp_overflow.clone(),
+                        ty: Type::Boolean,
+                    },
+                    Type::Boolean,
+                ),
+            ],
         });
 
         return (generated_instructions, tmp_pair, tmp_result, tmp_overflow);

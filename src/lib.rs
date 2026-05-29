@@ -28,7 +28,7 @@ use rustc_codegen_ssa::back::archive::{ArArchiveBuilder, ArchiveBuilder, Archive
 use rustc_codegen_ssa::{
     CompiledModule, CompiledModules, CrateInfo, ModuleKind, traits::CodegenBackend,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use rustc_data_structures::fx::FxIndexMap;
 use rustc_hir::{QPath, TyKind as HirTyKind};
@@ -123,6 +123,124 @@ fn lower_closure_to_oomir<'tcx>(
     oomir_module.merge_data_types(&data_types);
 }
 
+fn placeholder_operand_for_constructor_field(ty: &Type) -> Operand {
+    let constant = match ty {
+        Type::Boolean => oomir::Constant::Boolean(false),
+        Type::Char => oomir::Constant::Char('\0'),
+        Type::I8 => oomir::Constant::I8(0),
+        Type::I16 => oomir::Constant::I16(0),
+        Type::I32 => oomir::Constant::I32(0),
+        Type::I64 => oomir::Constant::I64(0),
+        Type::F32 => oomir::Constant::F32(0.0),
+        Type::F64 => oomir::Constant::F64(0.0),
+        Type::String
+        | Type::Class(_)
+        | Type::Interface(_)
+        | Type::Array(_)
+        | Type::MutableReference(_)
+        | Type::Reference(_) => oomir::Constant::Null(ty.clone()),
+        Type::Void => panic!("unexpected Void field type in constructor placeholder"),
+    };
+    Operand::Constant(constant)
+}
+
+fn constructor_args_from_fields(
+    fields: &[(String, Type)],
+    values: &[(&str, Operand)],
+) -> Vec<(Operand, Type)> {
+    fields
+        .iter()
+        .map(|(field_name, field_ty)| {
+            let operand = values
+                .iter()
+                .find_map(|(name, operand)| (*name == field_name).then(|| operand.clone()))
+                .unwrap_or_else(|| {
+                    breadcrumbs::log!(
+                        breadcrumbs::LogLevel::Info,
+                        "shim",
+                        format!(
+                            "Info: Using constructor placeholder for missing shim field '{}' ({:?})",
+                            field_name, field_ty
+                        )
+                    );
+                    placeholder_operand_for_constructor_field(field_ty)
+                });
+            (operand, field_ty.clone())
+        })
+        .collect()
+}
+
+fn pad_construct_object_args_in_function(
+    function: &mut oomir::Function,
+    class_fields: &HashMap<String, Vec<(String, Type)>>,
+) {
+    for block in function.body.basic_blocks.values_mut() {
+        for instruction in &mut block.instructions {
+            let oomir::Instruction::ConstructObject {
+                class_name, args, ..
+            } = instruction
+            else {
+                continue;
+            };
+
+            let Some(fields) = class_fields.get(class_name) else {
+                continue;
+            };
+
+            if args.len() >= fields.len() {
+                continue;
+            }
+
+            for (field_name, field_ty) in fields.iter().skip(args.len()) {
+                breadcrumbs::log!(
+                    breadcrumbs::LogLevel::Info,
+                    "shim",
+                    format!(
+                        "Info: Padding constructor for '{}' with placeholder field '{}' ({:?})",
+                        class_name, field_name, field_ty
+                    )
+                );
+                args.push((
+                    placeholder_operand_for_constructor_field(field_ty),
+                    field_ty.clone(),
+                ));
+            }
+        }
+    }
+}
+
+fn pad_construct_object_args_for_field_constructors(oomir_module: &mut oomir::Module) {
+    let class_fields: HashMap<String, Vec<(String, Type)>> = oomir_module
+        .data_types
+        .iter()
+        .filter_map(|(class_name, data_type)| match data_type {
+            oomir::DataType::Class { fields, .. } => {
+                let mut fields = fields.clone();
+                let mut seen_fields = HashSet::new();
+                fields.retain(|(name, _)| seen_fields.insert(name.clone()));
+                Some((class_name.clone(), fields))
+            }
+            oomir::DataType::Interface { .. } => None,
+        })
+        .collect();
+
+    for function in oomir_module.functions.values_mut() {
+        pad_construct_object_args_in_function(function, &class_fields);
+    }
+
+    for data_type in oomir_module.data_types.values_mut() {
+        let oomir::DataType::Class { methods, .. } = data_type else {
+            continue;
+        };
+
+        for method in methods.values_mut() {
+            if let oomir::DataTypeMethod::Function(function) = method {
+                pad_construct_object_args_in_function(function, &class_fields);
+            }
+        }
+    }
+}
+
 fn install_fmt_arguments_shim(oomir_module: &mut oomir::Module) {
     let class_name = "Arguments__".to_string();
     let Some(oomir::DataType::Class {
@@ -154,6 +272,7 @@ fn install_fmt_arguments_shim(oomir_module: &mut oomir::Module) {
             ty
         });
 
+    let from_str_fields = fields.clone();
     methods.entry("from_str".to_string()).or_insert_with(|| {
         let block = oomir::BasicBlock {
             label: "bb0".to_string(),
@@ -161,16 +280,16 @@ fn install_fmt_arguments_shim(oomir_module: &mut oomir::Module) {
                 oomir::Instruction::ConstructObject {
                     dest: "_args".to_string(),
                     class_name: class_name.clone(),
-                },
-                oomir::Instruction::SetField {
-                    object: "_args".to_string(),
-                    field_name: "message".to_string(),
-                    value: Operand::Variable {
-                        name: "_1".to_string(),
-                        ty: Type::String,
-                    },
-                    field_ty: Type::String,
-                    owner_class: class_name.clone(),
+                    args: constructor_args_from_fields(
+                        &from_str_fields,
+                        &[(
+                            "message",
+                            Operand::Variable {
+                                name: "_1".to_string(),
+                                ty: Type::String,
+                            },
+                        )],
+                    ),
                 },
                 oomir::Instruction::Return {
                     operand: Some(Operand::Variable {
@@ -194,6 +313,7 @@ fn install_fmt_arguments_shim(oomir_module: &mut oomir::Module) {
         })
     });
 
+    let new_fields = fields.clone();
     methods.entry("new".to_string()).or_insert_with(|| {
         let argument_class = "core_fmt_rt_Argument__".to_string();
         let block = oomir::BasicBlock {
@@ -228,16 +348,32 @@ fn install_fmt_arguments_shim(oomir_module: &mut oomir::Module) {
                 oomir::Instruction::ConstructObject {
                     dest: "_args".to_string(),
                     class_name: class_name.clone(),
-                },
-                oomir::Instruction::SetField {
-                    object: "_args".to_string(),
-                    field_name: "message".to_string(),
-                    value: Operand::Variable {
-                        name: "_message".to_string(),
-                        ty: Type::String,
-                    },
-                    field_ty: Type::String,
-                    owner_class: class_name.clone(),
+                    args: constructor_args_from_fields(
+                        &new_fields,
+                        &[
+                            (
+                                "message",
+                                Operand::Variable {
+                                    name: "_message".to_string(),
+                                    ty: Type::String,
+                                },
+                            ),
+                            (
+                                "template",
+                                Operand::Variable {
+                                    name: "_1".to_string(),
+                                    ty: Type::Array(Box::new(Type::I16)),
+                                },
+                            ),
+                            (
+                                "args",
+                                Operand::Variable {
+                                    name: "_2".to_string(),
+                                    ty: Type::Array(Box::new(Type::Class(argument_class.clone()))),
+                                },
+                            ),
+                        ],
+                    ),
                 },
                 oomir::Instruction::Return {
                     operand: Some(Operand::Variable {
@@ -371,14 +507,11 @@ fn install_fmt_argument_shim(oomir_module: &mut oomir::Module) {
         fields.push(("value".to_string(), Type::String));
     }
 
+    let argument_fields = fields.clone();
     methods.entry("new_display".to_string()).or_insert_with(|| {
         let block = oomir::BasicBlock {
             label: "bb0".to_string(),
             instructions: vec![
-                oomir::Instruction::ConstructObject {
-                    dest: "_arg".to_string(),
-                    class_name: class_name.clone(),
-                },
                 oomir::Instruction::InvokeStatic {
                     dest: Some("_value".to_string()),
                     class_name: "java/lang/String".to_string(),
@@ -393,15 +526,19 @@ fn install_fmt_argument_shim(oomir_module: &mut oomir::Module) {
                         ty: Type::I32,
                     }],
                 },
-                oomir::Instruction::SetField {
-                    object: "_arg".to_string(),
-                    field_name: "value".to_string(),
-                    value: Operand::Variable {
-                        name: "_value".to_string(),
-                        ty: Type::String,
-                    },
-                    field_ty: Type::String,
-                    owner_class: class_name.clone(),
+                oomir::Instruction::ConstructObject {
+                    dest: "_arg".to_string(),
+                    class_name: class_name.clone(),
+                    args: constructor_args_from_fields(
+                        &argument_fields,
+                        &[(
+                            "value",
+                            Operand::Variable {
+                                name: "_value".to_string(),
+                                ty: Type::String,
+                            },
+                        )],
+                    ),
                 },
                 oomir::Instruction::Return {
                     operand: Some(Operand::Variable {
@@ -1265,6 +1402,7 @@ impl CodegenBackend for MyBackend {
 
         install_fmt_argument_shim(&mut oomir_module);
         install_fmt_arguments_shim(&mut oomir_module);
+        pad_construct_object_args_for_field_constructors(&mut oomir_module);
 
         breadcrumbs::log!(
             breadcrumbs::LogLevel::Info,

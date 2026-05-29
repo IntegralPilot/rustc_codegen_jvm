@@ -3,6 +3,7 @@
 //! This module converts OOMIR into JVM bytecode.
 
 use crate::oomir::{self, DataType};
+use helpers::oomir_function_stack_floor;
 use jvm_gen::{
     create_data_type_classfile_for_class, create_data_type_classfile_for_interface,
     create_default_constructor,
@@ -69,7 +70,9 @@ pub fn oomir_to_jvm_bytecode(
             );
             let (jvm_code, max_locals_val) = translator.translate()?;
 
-            let max_stack_val = jvm_code.max_stack(&main_cp)?;
+            let max_stack_val = jvm_code
+                .max_stack(&main_cp)?
+                .max(oomir_function_stack_floor(function));
 
             let code_attribute = Attribute::Code {
                 name_index: code_attribute_name_index,

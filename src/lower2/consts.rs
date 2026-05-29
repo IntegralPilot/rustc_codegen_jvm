@@ -1,5 +1,5 @@
 use super::helpers::are_types_jvm_compatible;
-use crate::oomir::{self, Signature, Type};
+use crate::oomir::{self, Type};
 use ristretto_classfile::{
     self as jvm, ConstantPool,
     attributes::{ArrayType, Instruction},
@@ -118,6 +118,9 @@ pub fn load_constant(
                 JI::Ldc_w(index)
             });
         }
+        OC::Null(_) => {
+            instructions_to_add.push(JI::Aconst_null);
+        }
         OC::Class(c) => {
             let index = cp.add_class(c)?;
             instructions_to_add.push(if let Ok(idx8) = u8::try_from(index) {
@@ -218,23 +221,25 @@ pub fn load_constant(
             // 1. Add Class reference to constant pool
             let class_index = cp.add_class(class_name)?;
 
-            // 2. Determine constructor parameter types and signature descriptor
-            let param_types = params
-                .iter()
-                .enumerate()
-                .map(|(i, const_val)| {
-                    let ty = Type::from_constant(const_val);
-                    (format!("arg{}", i), ty)
-                })
-                .collect::<Vec<_>>();
+            if params.is_empty() && !fields.is_empty() {
+                return Err(jvm::Error::VerificationError {
+                    context: format!("Attempting to load constant {:?}", constant),
+                    message: format!(
+                        "Constant::Instance for fielded class '{}' has no constructor parameters",
+                        class_name
+                    ),
+                });
+            }
+            let constructor_params = params.iter().collect::<Vec<_>>();
 
-            let constructor_signature = Signature {
-                ret: Box::new(Type::Void), // Constructors are void methods in bytecode
-                params: param_types,
-                is_static: false,
-            };
-            // Assuming Signature::to_string() produces the correct JVM descriptor format, e.g., "(Ljava/lang/String;I)V"
-            let constructor_descriptor = constructor_signature.to_string();
+            // 2. Determine constructor signature descriptor.
+            let constructor_descriptor = format!(
+                "({})V",
+                constructor_params
+                    .iter()
+                    .map(|const_val| Type::from_constant(const_val).to_jvm_descriptor())
+                    .collect::<String>()
+            );
 
             // 3. Add Method reference for the constructor "<init>" with the determined signature
             let constructor_ref_index = cp.add_method_ref(
@@ -251,7 +256,7 @@ pub fn load_constant(
             instructions_to_add.push(JI::Dup); // Stack: [uninitialized_ref, uninitialized_ref]
 
             // c. Load constructor parameters onto the stack IN ORDER
-            for param_const in params {
+            for param_const in constructor_params {
                 // Recursively load the constant value for the parameter.
                 // Append the instructions directly to our temporary list.
                 load_constant(&mut instructions_to_add, cp, param_const)?;

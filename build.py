@@ -259,7 +259,8 @@ def all_tasks():
     """Runs all necessary build tasks in the correct order."""
     if not Config.IS_CI:
         install_rust_components()
-        generate_config_files()
+
+    generate_config_files()
     
     # The order defines the dependency chain.
     build_library()

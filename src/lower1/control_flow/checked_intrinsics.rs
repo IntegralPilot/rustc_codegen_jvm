@@ -263,26 +263,22 @@ pub fn emit_checked_arithmetic_intrinsic(
     instrs.push(Instruction::ConstructObject {
         dest: tmp_struct.clone(),
         class_name: result_struct_name.clone(),
-    });
-    instrs.push(Instruction::SetField {
-        object: tmp_struct.clone(),
-        field_name: "field0".to_string(),
-        value: Operand::Variable {
-            name: result.clone(),
-            ty: ty.clone(),
-        },
-        field_ty: ty.clone(),
-        owner_class: result_struct_name.clone(),
-    });
-    instrs.push(Instruction::SetField {
-        object: tmp_struct.clone(),
-        field_name: "field1".to_string(),
-        value: Operand::Variable {
-            name: overflow.clone(),
-            ty: Type::Boolean,
-        },
-        field_ty: Type::Boolean,
-        owner_class: result_struct_name.clone(),
+        args: vec![
+            (
+                Operand::Variable {
+                    name: result.clone(),
+                    ty: ty.clone(),
+                },
+                ty.clone(),
+            ),
+            (
+                Operand::Variable {
+                    name: overflow.clone(),
+                    ty: Type::Boolean,
+                },
+                Type::Boolean,
+            ),
+        ],
     });
     instrs.push(Instruction::Return {
         operand: Some(Operand::Variable {

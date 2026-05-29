@@ -235,11 +235,11 @@ pub fn handle_const_value<'tcx>(
                             match inner_operand {
                                 oomir::Operand::Constant(inner_constant) => {
                                     let mut hm = HashMap::new();
-                                    hm.insert(field_name.to_string(), inner_constant);
+                                    hm.insert(field_name.to_string(), inner_constant.clone());
                                     oomir::Operand::Constant(oomir::Constant::Instance {
                                         class_name: adt_name,
                                         fields: hm,
-                                        params: vec![],
+                                        params: vec![inner_constant],
                                     })
                                 }
                                 _ => panic!(

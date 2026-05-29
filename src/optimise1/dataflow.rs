@@ -1137,17 +1137,29 @@ pub fn process_block_instructions(
                 keep_original_instruction = true;
             }
 
-            Instruction::ConstructObject { dest, class_name } => {
-                // for now, we can make it constant using constant::Instance
-                current_state.insert(
-                    dest.clone(),
-                    Constant::Instance {
-                        class_name: class_name.clone(),
-                        fields: HashMap::new(),
-                        params: vec![],
-                    },
-                );
-                keep_original_instruction = false; // Folded away
+            Instruction::ConstructObject {
+                dest,
+                class_name,
+                args,
+            } => {
+                let new_args = args
+                    .iter()
+                    .map(|(arg, ty)| {
+                        (
+                            lookup_const(arg, &current_state)
+                                .map_or(arg.clone(), Operand::Constant),
+                            ty.clone(),
+                        )
+                    })
+                    .collect();
+
+                optimised_instruction = Instruction::ConstructObject {
+                    dest: dest.clone(),
+                    class_name: class_name.clone(),
+                    args: new_args,
+                };
+                current_state.remove(dest);
+                keep_original_instruction = true;
             }
 
             Instruction::InvokeVirtual {

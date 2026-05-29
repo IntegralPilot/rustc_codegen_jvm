@@ -13,6 +13,20 @@ pub fn get_type_size(ty: &Type) -> u16 {
     }
 }
 
+pub fn oomir_function_stack_floor(function: &oomir::Function) -> u16 {
+    let mut floor = 0;
+    for block in function.body.basic_blocks.values() {
+        for instruction in &block.instructions {
+            if let oomir::Instruction::ConstructObject { args, .. } = instruction {
+                let constructor_stack =
+                    2 + args.iter().map(|(_, ty)| get_type_size(ty)).sum::<u16>();
+                floor = floor.max(constructor_stack);
+            }
+        }
+    }
+    floor
+}
+
 /// Gets the appropriate type-specific load instruction.
 pub fn get_load_instruction(ty: &Type, index: u16) -> Result<Instruction, jvm::Error> {
     Ok(match ty {

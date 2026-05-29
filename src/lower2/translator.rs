@@ -83,18 +83,15 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             }
         }
 
-        // Calculate MIR argument offset
-        // For instance methods: _2, _3, ... map to params[0], params[1], ...
-        // For static methods: _1, _2, ... map to params[0], params[1], ...
-        let mir_arg_offset = if is_static { 1 } else { 2 };
-
         // Assign JVM local slots to MIR argument names
         let num_params = oomir_func.signature.params.len();
-        for i in 0..num_params {
+        let first_explicit_param = if is_static { 0 } else { 1 };
+        for i in first_explicit_param..num_params {
             // Internal name for translator logic
             let param_translator_name: String = format!("param_{}", i);
-            // The name used in the OOMIR body (offset by mir_arg_offset)
-            let param_oomir_name = format!("_{}", i + mir_arg_offset);
+            // Signature params are aligned with MIR locals: param[0] is _1.
+            // For instance methods, _1 is the implicit JVM receiver in slot 0.
+            let param_oomir_name = format!("_{}", i + 1);
             let (_param_name, param_ty) = &oomir_func.signature.params[i];
             let is_synthetic_jvm_main_arg = is_static
                 && oomir_func.name == "main"
@@ -448,6 +445,50 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 self.jvm_instructions.push(load_instr);
             }
         }
+        Ok(())
+    }
+
+    fn load_operand_as(
+        &mut self,
+        operand: &oomir::Operand,
+        expected_ty: &oomir::Type,
+    ) -> Result<(), jvm::Error> {
+        let actual_ty = get_operand_type(operand);
+        if actual_ty != *expected_ty
+            && let oomir::Type::Class(class_name) = expected_ty
+            && class_name.starts_with("NonNull_")
+            && !matches!(operand, oomir::Operand::Constant(oomir::Constant::Null(_)))
+        {
+            return self.construct_non_null_wrapper_from_operand(operand, &actual_ty, class_name);
+        }
+        self.load_operand(operand)?;
+        if actual_ty != *expected_ty
+            && actual_ty.to_jvm_descriptor() != expected_ty.to_jvm_descriptor()
+        {
+            let cast_instructions =
+                get_cast_instructions(&actual_ty, expected_ty, self.constant_pool)?;
+            self.jvm_instructions.extend(cast_instructions);
+        }
+        Ok(())
+    }
+
+    fn construct_non_null_wrapper_from_operand(
+        &mut self,
+        operand: &oomir::Operand,
+        operand_ty: &oomir::Type,
+        class_name: &str,
+    ) -> Result<(), jvm::Error> {
+        let class_index = self.constant_pool.add_class(class_name)?;
+        let constructor_descriptor = format!("({})V", operand_ty.to_jvm_descriptor());
+        let constructor_ref_index =
+            self.constant_pool
+                .add_method_ref(class_index, "<init>", &constructor_descriptor)?;
+
+        self.jvm_instructions.push(Instruction::New(class_index));
+        self.jvm_instructions.push(Instruction::Dup);
+        self.load_operand(operand)?;
+        self.jvm_instructions
+            .push(Instruction::Invokespecial(constructor_ref_index));
         Ok(())
     }
 
@@ -2639,15 +2680,24 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     .push(JI::Invokespecial(constructor_ref_index));
                 self.jvm_instructions.push(JI::Athrow);
             }
-            OI::ConstructObject { dest, class_name } => {
+            OI::ConstructObject {
+                dest,
+                class_name,
+                args,
+            } => {
                 // 1. Add Class reference to constant pool
                 let class_index = self.constant_pool.add_class(class_name)?;
 
-                // 2. Add Method reference for the default constructor "<init>()V"
+                let constructor_descriptor = format!(
+                    "({})V",
+                    args.iter()
+                        .map(|(_, ty)| ty.to_jvm_descriptor())
+                        .collect::<String>()
+                );
                 let constructor_ref_index = self.constant_pool.add_method_ref(
                     class_index,
-                    "<init>", // Standard name for constructors
-                    "()V",    // Standard descriptor for default constructor
+                    "<init>",
+                    &constructor_descriptor,
                 )?;
 
                 // 3. Emit 'new' instruction
@@ -2655,6 +2705,10 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
 
                 // 4. Emit 'dup' instruction
                 self.jvm_instructions.push(JI::Dup); // Stack: [uninitialized_ref, uninitialized_ref]
+
+                for (arg, arg_ty) in args {
+                    self.load_operand_as(arg, arg_ty)?;
+                }
 
                 // 5. Emit 'invokespecial' to call the constructor
                 self.jvm_instructions
@@ -2706,7 +2760,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 self.jvm_instructions.push(load_object_instr.clone()); // Stack: [object_ref]
 
                 // 4. Load the value to be stored onto the stack
-                self.load_operand(value)?; // Stack: [object_ref, value] (value size 1 or 2)
+                self.load_operand_as(value, field_ty)?; // Stack: [object_ref, value] (value size 1 or 2)
 
                 // 5. Emit 'putfield' instruction
                 self.jvm_instructions.push(JI::Putfield(field_ref_index)); // Stack: []
@@ -2752,18 +2806,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 self.store_result(dest, field_ty)?; // Stack: []
             }
             OI::Cast { op, ty, dest } => {
-                // 1. Load the operand on the stack
-                self.load_operand(op)?; // Stack: [value]
-
-                let old_ty = get_operand_type(op);
-
-                // 2. Get cast instructions
-                let instructions = get_cast_instructions(&old_ty, ty, self.constant_pool)?;
-
-                // 3. Emit the cast instructions
-                for instr in instructions {
-                    self.jvm_instructions.push(instr);
-                }
+                self.load_operand_as(op, ty)?;
 
                 // 4. Store the casted value into the destination variable
                 //    The type for storage is the new type (ty)
@@ -2835,8 +2878,12 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 let receiver_type = operand.get_type();
                 let is_mutable_ref =
                     matches!(receiver_type, Some(oomir::Type::MutableReference(_)));
+                let is_this_receiver = matches!(
+                    operand,
+                    OO::Variable { name, .. } if name == "_1" && !self.oomir_func.signature.is_static
+                );
 
-                if is_mutable_ref {
+                if is_mutable_ref && !is_this_receiver {
                     // Load the array reference
                     self.load_operand(operand)?; // Stack: [arrayref]
                     // Load index 0

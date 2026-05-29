@@ -65,6 +65,7 @@ fn adapt_value_for_field(
             instructions.push(oomir::Instruction::ConstructObject {
                 dest: temp_name.clone(),
                 class_name: class_name.clone(),
+                args: Vec::new(),
             });
             return oomir::Operand::Variable {
                 name: temp_name,
@@ -344,6 +345,7 @@ pub fn convert_rvalue_to_operand<'a>(
                                 instructions.push(oomir::Instruction::ConstructObject {
                                     dest: closure_var_name.clone(),
                                     class_name,
+                                    args: Vec::new(),
                                 });
                                 result_operand = oomir::Operand::Variable {
                                     name: closure_var_name,
@@ -410,13 +412,9 @@ pub fn convert_rvalue_to_operand<'a>(
                     "mir-lowering",
                     "Info: Handling Rvalue::Cast to NonNull wrapper."
                 );
-                instructions.push(oomir::Instruction::ConstructObject {
-                    dest: temp_cast_var.clone(),
-                    class_name: class_name.clone(),
-                });
-
+                let mut constructor_args = Vec::new();
                 if let Some(oomir::DataType::Class { fields, .. }) = data_types.get(class_name) {
-                    if let Some((field_name, field_ty)) = fields.first().cloned() {
+                    if let Some((_field_name, field_ty)) = fields.first().cloned() {
                         let value_ty = oomir_operand.get_type().unwrap_or(oomir_source_type);
                         let needs_cast = field_ty != value_ty
                             && field_ty.to_jvm_descriptor() != value_ty.to_jvm_descriptor();
@@ -424,7 +422,7 @@ pub fn convert_rvalue_to_operand<'a>(
                             value_ty.is_jvm_primitive_like() && field_ty.is_jvm_reference_type();
 
                         let value_operand = if needs_cast && primitive_sentinel_for_reference {
-                            None
+                            oomir::Operand::Constant(oomir::Constant::Null(field_ty.clone()))
                         } else if needs_cast {
                             let cast_value_name = format!("{}_value", temp_cast_var);
                             instructions.push(oomir::Instruction::Cast {
@@ -432,25 +430,22 @@ pub fn convert_rvalue_to_operand<'a>(
                                 ty: field_ty.clone(),
                                 dest: cast_value_name.clone(),
                             });
-                            Some(oomir::Operand::Variable {
+                            oomir::Operand::Variable {
                                 name: cast_value_name,
                                 ty: field_ty.clone(),
-                            })
+                            }
                         } else {
-                            Some(oomir_operand)
+                            oomir_operand
                         };
 
-                        if let Some(value_operand) = value_operand {
-                            instructions.push(oomir::Instruction::SetField {
-                                object: temp_cast_var.clone(),
-                                field_name,
-                                value: value_operand,
-                                field_ty,
-                                owner_class: class_name.clone(),
-                            });
-                        }
+                        constructor_args.push((value_operand, field_ty));
                     }
                 }
+                instructions.push(oomir::Instruction::ConstructObject {
+                    dest: temp_cast_var.clone(),
+                    class_name: class_name.clone(),
+                    args: constructor_args,
+                });
             } else if oomir_target_type == oomir_source_type {
                 breadcrumbs::log!(
                     breadcrumbs::LogLevel::Info,
@@ -786,14 +781,9 @@ pub fn convert_rvalue_to_operand<'a>(
                             temp_aggregate_var
                         )
                     );
-                    instructions.push(oomir::Instruction::ConstructObject {
-                        dest: temp_aggregate_var.clone(),
-                        class_name: tuple_class_name.clone(),
-                    });
-                    // Set fields on the temporary variable
                     let place_ty = original_dest_place.ty(&mir.local_decls, tcx).ty;
+                    let mut constructor_args = Vec::new();
                     for (i, mir_op) in operands.iter().enumerate() {
-                        let field_name = format!("field{}", i);
                         let element_mir_ty = if let TyKind::Tuple(elements) = place_ty.kind() {
                             elements[i]
                         } else {
@@ -816,14 +806,13 @@ pub fn convert_rvalue_to_operand<'a>(
                             data_types,
                             &mut instructions,
                         );
-                        instructions.push(oomir::Instruction::SetField {
-                            object: temp_aggregate_var.clone(),
-                            field_name,
-                            value: value_operand,
-                            field_ty: element_oomir_type,
-                            owner_class: tuple_class_name.clone(),
-                        });
+                        constructor_args.push((value_operand, element_oomir_type));
                     }
+                    instructions.push(oomir::Instruction::ConstructObject {
+                        dest: temp_aggregate_var.clone(),
+                        class_name: tuple_class_name.clone(),
+                        args: constructor_args,
+                    });
                 }
                 rustc_middle::mir::AggregateKind::Array(mir_element_ty) => {
                     breadcrumbs::log!(
@@ -876,18 +865,14 @@ pub fn convert_rvalue_to_operand<'a>(
                             temp_aggregate_var, closure_class_name
                         )
                     );
-                    instructions.push(oomir::Instruction::ConstructObject {
-                        dest: temp_aggregate_var.clone(),
-                        class_name: closure_class_name.clone(),
-                    });
-
                     let closure_fields = match data_types.get(&closure_class_name) {
                         Some(oomir::DataType::Class { fields, .. }) => fields.clone(),
                         _ => Vec::new(),
                     };
 
+                    let mut constructor_args = Vec::new();
                     for (i, mir_operand) in operands.iter().enumerate() {
-                        let (field_name, field_ty) =
+                        let (_field_name, field_ty) =
                             closure_fields.get(i).cloned().unwrap_or_else(|| {
                                 (
                                     format!("arg{}", i),
@@ -909,14 +894,13 @@ pub fn convert_rvalue_to_operand<'a>(
                             data_types,
                             &mut instructions,
                         );
-                        instructions.push(oomir::Instruction::SetField {
-                            object: temp_aggregate_var.clone(),
-                            field_name,
-                            value: value_operand,
-                            field_ty,
-                            owner_class: closure_class_name.clone(),
-                        });
+                        constructor_args.push((value_operand, field_ty));
                     }
+                    instructions.push(oomir::Instruction::ConstructObject {
+                        dest: temp_aggregate_var.clone(),
+                        class_name: closure_class_name.clone(),
+                        args: constructor_args,
+                    });
                 }
                 rustc_middle::mir::AggregateKind::Adt(def_id, variant_idx, substs, _, _) => {
                     let adt_def = tcx.adt_def(*def_id);
@@ -933,11 +917,6 @@ pub fn convert_rvalue_to_operand<'a>(
                                 temp_aggregate_var, jvm_class_name
                             )
                         );
-                        instructions.push(oomir::Instruction::ConstructObject {
-                            dest: temp_aggregate_var.clone(),
-                            class_name: jvm_class_name.clone(),
-                        });
-                        // Set fields on the temporary struct object
                         let oomir_fields: Vec<(String, oomir::Type)> = variant
                             .fields
                             .iter()
@@ -953,35 +932,6 @@ pub fn convert_rvalue_to_operand<'a>(
                                 )
                             })
                             .collect();
-                        for (field_def, mir_operand) in variant.fields.iter().zip(operands.iter()) {
-                            let field_name = field_def.ident(tcx).to_string();
-                            let field_mir_ty = field_def.ty(tcx, substs).skip_norm_wip();
-                            let field_oomir_type =
-                                ty_to_oomir_type(field_mir_ty, tcx, data_types, instance);
-                            let value_operand = convert_operand(
-                                mir_operand,
-                                tcx,
-                                instance,
-                                mir,
-                                data_types,
-                                &mut instructions,
-                            );
-                            let value_operand = adapt_value_for_field(
-                                value_operand,
-                                &field_oomir_type,
-                                &temp_aggregate_var,
-                                data_types,
-                                &mut instructions,
-                            );
-                            instructions.push(oomir::Instruction::SetField {
-                                object: temp_aggregate_var.clone(),
-                                field_name,
-                                value: value_operand,
-                                field_ty: field_oomir_type,
-                                owner_class: jvm_class_name.clone(),
-                            });
-                        }
-                        // Ensure DataType exists
                         if !data_types.contains_key(&jvm_class_name) {
                             let mut methods = HashMap::new();
                             methods.insert(
@@ -995,7 +945,7 @@ pub fn convert_rvalue_to_operand<'a>(
                             data_types.insert(
                                 jvm_class_name.clone(),
                                 oomir::DataType::Class {
-                                    fields: oomir_fields,
+                                    fields: oomir_fields.clone(),
                                     is_abstract: false,
                                     methods,
                                     super_class: None,
@@ -1014,6 +964,34 @@ pub fn convert_rvalue_to_operand<'a>(
                                 }
                             });
                         }
+
+                        let mut constructor_args = Vec::new();
+                        for (field_def, mir_operand) in variant.fields.iter().zip(operands.iter()) {
+                            let field_mir_ty = field_def.ty(tcx, substs).skip_norm_wip();
+                            let field_oomir_type =
+                                ty_to_oomir_type(field_mir_ty, tcx, data_types, instance);
+                            let value_operand = convert_operand(
+                                mir_operand,
+                                tcx,
+                                instance,
+                                mir,
+                                data_types,
+                                &mut instructions,
+                            );
+                            let value_operand = adapt_value_for_field(
+                                value_operand,
+                                &field_oomir_type,
+                                &temp_aggregate_var,
+                                data_types,
+                                &mut instructions,
+                            );
+                            constructor_args.push((value_operand, field_oomir_type));
+                        }
+                        instructions.push(oomir::Instruction::ConstructObject {
+                            dest: temp_aggregate_var.clone(),
+                            class_name: jvm_class_name.clone(),
+                            args: constructor_args,
+                        });
                     } else if adt_def.is_enum() {
                         let variant_def = adt_def.variant(*variant_idx);
                         let base_enum_name = generate_adt_jvm_class_name(
@@ -1247,15 +1225,8 @@ pub fn convert_rvalue_to_operand<'a>(
                             );
                         }
 
-                        // Construct the enum variant object
-                        instructions.push(oomir::Instruction::ConstructObject {
-                            dest: temp_aggregate_var.clone(),
-                            class_name: variant_class_name.clone(),
-                        });
-
-                        // Set fields
+                        let mut constructor_args = Vec::new();
                         for (i, field) in variant_def.fields.iter().enumerate() {
-                            let field_name = format!("field{}", i);
                             let field_mir_ty = field.ty(tcx, substs).skip_norm_wip();
                             let field_oomir_type =
                                 ty_to_oomir_type(field_mir_ty, tcx, data_types, instance);
@@ -1274,14 +1245,13 @@ pub fn convert_rvalue_to_operand<'a>(
                                 data_types,
                                 &mut instructions,
                             );
-                            instructions.push(oomir::Instruction::SetField {
-                                object: temp_aggregate_var.clone(),
-                                field_name,
-                                value: value_operand,
-                                field_ty: field_oomir_type,
-                                owner_class: variant_class_name.clone(),
-                            });
+                            constructor_args.push((value_operand, field_oomir_type));
                         }
+                        instructions.push(oomir::Instruction::ConstructObject {
+                            dest: temp_aggregate_var.clone(),
+                            class_name: variant_class_name.clone(),
+                            args: constructor_args,
+                        });
                     } else {
                         // Union
                         breadcrumbs::log!(
@@ -1293,6 +1263,7 @@ pub fn convert_rvalue_to_operand<'a>(
                         instructions.push(oomir::Instruction::ConstructObject {
                             dest: temp_aggregate_var.clone(),
                             class_name: "java/lang/Object".to_string(),
+                            args: Vec::new(),
                         });
                     }
                 }
