@@ -1,5 +1,5 @@
-use crate::oomir::{Constant, Instruction, Operand, Type};
 use super::checked_intrinsic_registry;
+use crate::oomir::{Constant, Instruction, Operand, Type};
 
 pub fn emit_checked_arithmetic_oomir_instructions(
     dest_base_name: &str,
@@ -18,7 +18,8 @@ pub fn emit_checked_arithmetic_oomir_instructions(
     let tmp_overflow = format!("{}_{}_chk_ovf_{}", dest_base_name, operation, unique_id);
 
     // For BigInt/BigDec, overflow doesn't happen in the fixed-size sense.
-    if matches!(op_ty, Type::Class(c) if c == crate::lower2::BIG_INTEGER_CLASS || c == crate::lower2::BIG_DECIMAL_CLASS) {
+    if matches!(op_ty, Type::Class(c) if c == crate::lower2::BIG_INTEGER_CLASS || c == crate::lower2::BIG_DECIMAL_CLASS)
+    {
         let op_instr = match operation {
             "add" => Instruction::Add {
                 dest: tmp_result.clone(),
@@ -35,14 +36,17 @@ pub fn emit_checked_arithmetic_oomir_instructions(
                 op1: op1.clone(),
                 op2: op2.clone(),
             },
-            _ => panic!("Unsupported checked operation for BigInt/BigDec: {}", operation),
+            _ => panic!(
+                "Unsupported checked operation for BigInt/BigDec: {}",
+                operation
+            ),
         };
         generated_instructions.push(op_instr);
         generated_instructions.push(Instruction::Move {
             dest: tmp_overflow.clone(),
             src: Operand::Constant(Constant::Boolean(false)),
         });
-        
+
         // Construct a tuple for consistency with the primitive integer case
         // Determine the tuple type based on the BigInteger/BigDecimal type
         // Note: Use the readable name form that matches types.rs:readable_oomir_type_name
@@ -51,7 +55,7 @@ pub fn emit_checked_arithmetic_oomir_instructions(
             Type::Class(c) if c == crate::lower2::BIG_DECIMAL_CLASS => "Tuple_BigDecimal_bool",
             _ => unreachable!(),
         };
-        
+
         generated_instructions.push(Instruction::ConstructObject {
             dest: tmp_pair.clone(),
             class_name: class_name.to_string(),
@@ -59,18 +63,24 @@ pub fn emit_checked_arithmetic_oomir_instructions(
         generated_instructions.push(Instruction::SetField {
             object: tmp_pair.clone(),
             field_name: "field0".to_string(),
-            value: Operand::Variable { name: tmp_result.clone(), ty: op_ty.clone() },
+            value: Operand::Variable {
+                name: tmp_result.clone(),
+                ty: op_ty.clone(),
+            },
             field_ty: op_ty.clone(),
             owner_class: class_name.to_string(),
         });
         generated_instructions.push(Instruction::SetField {
             object: tmp_pair.clone(),
             field_name: "field1".to_string(),
-            value: Operand::Variable { name: tmp_overflow.clone(), ty: Type::Boolean },
+            value: Operand::Variable {
+                name: tmp_overflow.clone(),
+                ty: Type::Boolean,
+            },
             field_ty: Type::Boolean,
             owner_class: class_name.to_string(),
         });
-        
+
         return (generated_instructions, tmp_pair, tmp_result, tmp_overflow);
     }
 
@@ -89,7 +99,10 @@ pub fn emit_checked_arithmetic_oomir_instructions(
         ("mul", Type::I64) => ("__oomir_checked_mul_i64", "i64"),
         ("mul", Type::I16) => ("__oomir_checked_mul_i16", "i16"),
         ("mul", Type::I8) => ("__oomir_checked_mul_i8", "i8"),
-        _ => panic!("Unsupported checked arithmetic operation/type: {} {:?}", operation, op_ty),
+        _ => panic!(
+            "Unsupported checked arithmetic operation/type: {} {:?}",
+            operation, op_ty
+        ),
     };
 
     // Register that this intrinsic is needed
@@ -104,8 +117,12 @@ pub fn emit_checked_arithmetic_oomir_instructions(
         class_name: "RustcCodegenJVMIntrinsics".to_string(),
         method_name: fn_name.to_string(),
         method_ty: crate::oomir::Signature {
-            params: vec![("a".to_string(), op_ty.clone()), ("b".to_string(), op_ty.clone())],
+            params: vec![
+                ("a".to_string(), op_ty.clone()),
+                ("b".to_string(), op_ty.clone()),
+            ],
             ret: Box::new(Type::Class(tuple_type_name.clone())),
+            is_static: true,
         },
         args: vec![op1.clone(), op2.clone()],
     });
@@ -114,14 +131,20 @@ pub fn emit_checked_arithmetic_oomir_instructions(
     // Use GetField to extract them
     generated_instructions.push(Instruction::GetField {
         dest: tmp_result.clone(),
-        object: Operand::Variable { name: tmp_pair.clone(), ty: Type::Class(tuple_type_name.clone()) },
+        object: Operand::Variable {
+            name: tmp_pair.clone(),
+            ty: Type::Class(tuple_type_name.clone()),
+        },
         field_name: "field0".to_string(),
         field_ty: op_ty.clone(),
         owner_class: tuple_type_name.clone(),
     });
     generated_instructions.push(Instruction::GetField {
         dest: tmp_overflow.clone(),
-        object: Operand::Variable { name: tmp_pair.clone(), ty: Type::Class(tuple_type_name.clone()) },
+        object: Operand::Variable {
+            name: tmp_pair.clone(),
+            ty: Type::Class(tuple_type_name.clone()),
+        },
         field_name: "field1".to_string(),
         field_ty: Type::Boolean,
         owner_class: tuple_type_name.clone(),

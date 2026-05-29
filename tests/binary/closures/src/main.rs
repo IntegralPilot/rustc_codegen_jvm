@@ -9,4 +9,10 @@ fn main() {
     assert!(add(-5, -5) == -10);
     assert!(add(-3, 2) == -1);
     assert!(add(-2, 3) == 1);
+
+    // A capturing closure
+    let offset = 11;
+    let add_offset = |value: i32| value + offset;
+    assert!(add_offset(0) == 11);
+    assert!(add_offset(31) == 42);
 }

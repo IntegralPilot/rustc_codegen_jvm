@@ -78,72 +78,136 @@ def investigate_test(test_name: str, release_mode: bool):
     
     # Handle the case where no custom target JSON is used ('use_target_json.flag' doesn't exist)
     if not os.path.exists(use_target_json):
-        print("|---- Found 'use_target_json.flag', searching for JAR in standard deps folder...")
-        deps_dir = os.path.join(test_dir, "target", target_dir, "deps")
+        print("|---- No 'use_target_json.flag' found, searching for JAR in standard deps folder...")
+        deps_dir_temp = os.path.join(test_dir, "target", target_dir, "deps")
         jar_file_name = None
-        if os.path.isdir(deps_dir):
-            for file in os.listdir(deps_dir):
+        if os.path.isdir(deps_dir_temp):
+            for file in os.listdir(deps_dir_temp):
                 if file.startswith(test_name) and file.endswith(".jar"):
                     jar_file_name = file
                     break
         
-        if jar_file_name is None:
-            print(f"|---- ❌ No JAR file found in {deps_dir}. Cannot continue.")
-            return
-
-        # Move the jar to the location expected by the rest of the script for consistency
-        src_path = os.path.join(deps_dir, jar_file_name)
-        dest_dir = os.path.join(test_dir, "target", "jvm-unknown-unknown", target_dir)
-        os.makedirs(dest_dir, exist_ok=True)
-        dest_path = os.path.join(dest_dir, f"{test_name}.jar")
-        shutil.move(src_path, dest_path)
-        print(f"|---- Moved JAR to {dest_path}")
+        if jar_file_name is not None:
+            # Move the jar to the location expected by the rest of the script for consistency
+            src_path = os.path.join(deps_dir_temp, jar_file_name)
+            dest_dir = os.path.join(test_dir, "target", "jvm-unknown-unknown", target_dir)
+            os.makedirs(dest_dir, exist_ok=True)
+            dest_path = os.path.join(dest_dir, f"{test_name}.jar")
+            shutil.move(src_path, dest_path)
+            print(f"|---- Moved JAR to {dest_path}")
+        else:
+            print(f"|---- ⚠️ No JAR file found in {deps_dir_temp}. Will attempt to use raw classfiles later.")
 
     jar_path = os.path.join(test_dir, "target", "jvm-unknown-unknown", target_dir, f"{test_name}.jar")
 
+    # Check if JAR exists, if not fall back to using raw classfiles from deps
+    use_raw_classfiles = False
+    deps_dir = None
+    
     if not os.path.exists(jar_path):
-        print(f"|---- ❌ JAR file not found at expected path: {jar_path}")
-        print("|---- Investigation cannot proceed without a JAR file. Exiting.")
-        return
+        print(f"|---- ⚠️ JAR file not found at expected path: {jar_path}")
+        print("|---- Attempting to use raw .class files from deps directory...")
         
-    print(f"|---- ✅ Found JAR: {jar_path}")
+        # Fall back to using the deps directory
+        deps_dir = os.path.join(test_dir, "target", target_dir, "deps")
+        if os.path.exists(deps_dir):
+            main_class = os.path.join(deps_dir, f"{test_name}.class")
+            if os.path.exists(main_class):
+                print(f"|---- ✅ Found main class file: {main_class}")
+                print(f"|---- Continuing investigation with raw classfiles from: {deps_dir}")
+                use_raw_classfiles = True
+            else:
+                print(f"|---- ❌ Main class file not found: {main_class}")
+                print("|---- Investigation cannot proceed. Exiting.")
+                return
+        else:
+            print(f"|---- ❌ Deps directory not found: {deps_dir}")
+            print("|---- Investigation cannot proceed. Exiting.")
+            return
+    else:
+        print(f"|---- ✅ Found JAR: {jar_path}")
 
-    # 6. Analyze the JAR file
-    # 6a. `jar tf` - List JAR contents
-    print("|-- 🔍 Listing JAR contents (jar tf)...")
-    proc = run_command(["jar", "tf", jar_path])
-    write_to_file(os.path.join(investigation_dir, "jar_contents.txt"), proc.stdout)
-    
-    # 6b. `jar xf` - Extract JAR
-    print("|-- 📦 Extracting JAR contents for analysis...")
-    run_command(["jar", "xf", os.path.abspath(jar_path)], cwd=extracted_jar_dir)
-    
-    # 6c. `javap -v -p` on all .class files
-    print("|-- 뜯 Decompiling .class files (javap -v -p)...")
-    class_count = 0
-    for root, _, files in os.walk(extracted_jar_dir):
-        for file in files:
+    # 6. Analyze the class files
+    if use_raw_classfiles and deps_dir is not None:
+        # Using raw classfiles from deps directory
+        print("|-- 📋 Listing class files from deps directory...")
+        class_files = []
+        for file in os.listdir(deps_dir):
             if file.endswith(".class"):
-                class_count += 1
-                class_file_path = os.path.join(root, file)
-                relative_path = os.path.relpath(class_file_path, extracted_jar_dir)
-                
-                # Create a mirrored directory structure for the output
-                output_path_dir = os.path.join(javap_dir, os.path.dirname(relative_path))
-                output_file_path = os.path.join(output_path_dir, os.path.basename(relative_path).replace(".class", ".javap.txt"))
+                class_files.append(file)
+        
+        contents_txt = "\n".join(sorted(class_files))
+        write_to_file(os.path.join(investigation_dir, "class_files_list.txt"), contents_txt)
+        print(f"|---- Found {len(class_files)} class file(s)")
+        
+        # Copy class files to extracted_jar_dir for consistency
+        print("|-- 📦 Copying class files for analysis...")
+        for file in class_files:
+            src = os.path.join(deps_dir, file)
+            dst = os.path.join(extracted_jar_dir, file)
+            shutil.copy(src, dst)
+        
+        # 6c. `javap -v -p` on all .class files
+        print("|-- 뜯 Decompiling .class files (javap -v -p)...")
+        class_count = 0
+        for file in class_files:
+            class_count += 1
+            class_file_path = os.path.join(extracted_jar_dir, file)
+            output_file_path = os.path.join(javap_dir, file.replace(".class", ".javap.txt"))
 
-                # Run javap on the .class file
-                proc = run_command(["javap", "-v", "-p", class_file_path])
-                output_content = f"--- COMMAND ---\njavap -v -p {class_file_path}\n\n--- STDOUT ---\n{proc.stdout}\n\n--- STDERR ---\n{proc.stderr}"
-                write_to_file(output_file_path, output_content)
+            # Run javap on the .class file
+            proc = run_command(["javap", "-v", "-p", class_file_path])
+            output_content = f"--- COMMAND ---\njavap -v -p {class_file_path}\n\n--- STDOUT ---\n{proc.stdout}\n\n--- STDERR ---\n{proc.stderr}"
+            write_to_file(output_file_path, output_content)
 
-    print(f"|---- ✅ Decompiled {class_count} class file(s).")
+        print(f"|---- ✅ Decompiled {class_count} class file(s).")
+    else:
+        # Using JAR file
+        # 6a. `jar tf` - List JAR contents
+        print("|-- 🔍 Listing JAR contents (jar tf)...")
+        proc = run_command(["jar", "tf", jar_path])
+        write_to_file(os.path.join(investigation_dir, "jar_contents.txt"), proc.stdout)
+        
+        # 6b. `jar xf` - Extract JAR
+        print("|-- 📦 Extracting JAR contents for analysis...")
+        run_command(["jar", "xf", os.path.abspath(jar_path)], cwd=extracted_jar_dir)
+        
+        # 6c. `javap -v -p` on all .class files
+        print("|-- 뜯 Decompiling .class files (javap -v -p)...")
+        class_count = 0
+        for root, _, files in os.walk(extracted_jar_dir):
+            for file in files:
+                if file.endswith(".class"):
+                    class_count += 1
+                    class_file_path = os.path.join(root, file)
+                    relative_path = os.path.relpath(class_file_path, extracted_jar_dir)
+                    
+                    # Create a mirrored directory structure for the output
+                    output_path_dir = os.path.join(javap_dir, os.path.dirname(relative_path))
+                    output_file_path = os.path.join(output_path_dir, os.path.basename(relative_path).replace(".class", ".javap.txt"))
+
+                    # Run javap on the .class file
+                    proc = run_command(["javap", "-v", "-p", class_file_path])
+                    output_content = f"--- COMMAND ---\njavap -v -p {class_file_path}\n\n--- STDOUT ---\n{proc.stdout}\n\n--- STDERR ---\n{proc.stderr}"
+                    write_to_file(output_file_path, output_content)
+
+        print(f"|---- ✅ Decompiled {class_count} class file(s).")
     
     # 7. Run with Java and capture output
     print("|-- 🤖 Running with Java and capturing logs...")
     # This classpath is copied from the original script. It assumes the script is run from the project root.
-    classpath = f"library/build/distributions/library-0.1.0/lib/library-0.1.0.jar:library/build/distributions/library-0.1.0/lib/kotlin-stdlib-2.1.20.jar:{jar_path}"
-    java_cmd = ["java", "-cp", classpath, test_name]
+    runtime_libs = "library/build/distributions/library-0.1.0/lib/library-0.1.0.jar:library/build/distributions/library-0.1.0/lib/kotlin-stdlib-2.1.20.jar"
+    
+    if use_raw_classfiles and deps_dir is not None:
+        # Use deps directory in classpath instead of JAR
+        # Use -noverify because stackmap frames aren't generated yet
+        classpath = f"{runtime_libs}:{deps_dir}"
+        print(f"|---- Using deps directory in classpath: {deps_dir}")
+        java_cmd = ["java", "-noverify", "-cp", classpath, test_name]
+    else:
+        # Use JAR file
+        classpath = f"{runtime_libs}:{jar_path}"
+        java_cmd = ["java", "-cp", classpath, test_name]
     
     proc = run_command(java_cmd)
     

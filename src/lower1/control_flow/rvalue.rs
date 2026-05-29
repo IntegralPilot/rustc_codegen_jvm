@@ -28,6 +28,54 @@ fn generate_temp_var_name(base_name: &str) -> String {
     format!("{}_tmp{}", make_jvm_safe(base_name), count)
 }
 
+fn adapt_value_for_field(
+    value_operand: oomir::Operand,
+    field_ty: &oomir::Type,
+    temp_base_name: &str,
+    data_types: &HashMap<String, oomir::DataType>,
+    instructions: &mut Vec<oomir::Instruction>,
+) -> oomir::Operand {
+    let Some(value_ty) = value_operand.get_type() else {
+        return value_operand;
+    };
+
+    if let oomir::Type::Class(class_name) = field_ty
+        && !value_ty.is_jvm_reference_type()
+    {
+        let temp_name = generate_temp_var_name(temp_base_name);
+        if class_name == "java/lang/Object" {
+            instructions.push(oomir::Instruction::Cast {
+                op: value_operand,
+                ty: field_ty.clone(),
+                dest: temp_name.clone(),
+            });
+            return oomir::Operand::Variable {
+                name: temp_name,
+                ty: field_ty.clone(),
+            };
+        }
+
+        let is_marker_class = class_name.starts_with("PhantomData_")
+            || matches!(
+                data_types.get(class_name),
+                Some(oomir::DataType::Class { fields, .. }) if fields.is_empty()
+            );
+
+        if is_marker_class {
+            instructions.push(oomir::Instruction::ConstructObject {
+                dest: temp_name.clone(),
+                class_name: class_name.clone(),
+            });
+            return oomir::Operand::Variable {
+                name: temp_name,
+                ty: field_ty.clone(),
+            };
+        }
+    }
+
+    value_operand
+}
+
 /// Evaluates an Rvalue and returns the resulting OOMIR Operand and any
 /// intermediate instructions needed to calculate it.
 ///
@@ -45,8 +93,19 @@ pub fn convert_rvalue_to_operand<'a>(
     let result_operand: oomir::Operand;
     let base_temp_name = place_to_string(original_dest_place, tcx); // For temp naming
 
+    breadcrumbs::log!(
+        breadcrumbs::LogLevel::Info,
+        "mir-lowering",
+        format!(
+            "convert_rvalue_to_operand: rvalue={:?}, original_dest_place={:?}, dest_ty={:?}",
+            rvalue,
+            original_dest_place,
+            original_dest_place.ty(&mir.local_decls, tcx).ty
+        )
+    );
+
     match rvalue {
-        Rvalue::Use(mir_operand) => {
+        Rvalue::Use(mir_operand, _) => {
             match mir_operand {
                 MirOperand::Copy(src_place) | MirOperand::Move(src_place) => {
                     // Need to get the value from the source place first
@@ -58,8 +117,8 @@ pub fn convert_rvalue_to_operand<'a>(
                         ty: temp_var_type,
                     };
                 }
-                MirOperand::Constant(_) | MirOperand::RuntimeChecks(_) => {
-                    // Constant/RuntimeChecks are already operands, no extra instructions
+                MirOperand::Constant(_) => {
+                    // Constant is already an operand, no extra instructions
                     result_operand = convert_operand(
                         mir_operand,
                         tcx,
@@ -68,6 +127,9 @@ pub fn convert_rvalue_to_operand<'a>(
                         data_types,
                         &mut instructions,
                     );
+                }
+                MirOperand::RuntimeChecks(_) => {
+                    todo!("RuntimeChecks operand not yet supported")
                 }
             }
         }
@@ -137,9 +199,50 @@ pub fn convert_rvalue_to_operand<'a>(
             }
         }
         Rvalue::Ref(_region, borrow_kind, source_place) => {
+            // Check if the result type (destination place type) is a trait object reference
+            let dest_ty = original_dest_place.ty(&mir.local_decls, tcx).ty;
+            breadcrumbs::log!(
+                breadcrumbs::LogLevel::Info,
+                "mir-lowering",
+                format!(
+                    "Rvalue::Ref start: original_dest_place={:?}, dest_ty={:?}, borrow_kind={:?}, source_place={:?}, source_ty={:?}",
+                    original_dest_place,
+                    dest_ty,
+                    borrow_kind,
+                    source_place,
+                    source_place.ty(&mir.local_decls, tcx).ty
+                )
+            );
+            let is_trait_object = match dest_ty.kind() {
+                rustc_middle::ty::TyKind::Ref(_, pointee_ty, _) => {
+                    let is_dyn =
+                        matches!(pointee_ty.kind(), rustc_middle::ty::TyKind::Dynamic(_, _));
+                    breadcrumbs::log!(
+                        breadcrumbs::LogLevel::Info,
+                        "mir-lowering",
+                        format!(
+                            "Rvalue::Ref dest_ty is Ref: pointee_ty={:?}, is_dyn={}, is_trait_object={}",
+                            pointee_ty, is_dyn, is_dyn
+                        )
+                    );
+                    is_dyn
+                }
+                _ => {
+                    breadcrumbs::log!(
+                        breadcrumbs::LogLevel::Info,
+                        "mir-lowering",
+                        format!(
+                            "Rvalue::Ref dest_ty is not Ref: {:?}, is_trait_object=false",
+                            dest_ty
+                        )
+                    );
+                    false
+                }
+            };
+
             match borrow_kind {
-                MirBorrowKind::Mut { .. } => {
-                    // --- MUTABLE BORROW (&mut T) -> Use Array Hack ---
+                MirBorrowKind::Mut { .. } if !is_trait_object => {
+                    // --- MUTABLE BORROW (&mut T) -> Use Array Hack (but NOT for trait objects) ---
                     breadcrumbs::log!(
                         breadcrumbs::LogLevel::Info,
                         "mir-lowering",
@@ -200,8 +303,7 @@ pub fn convert_rvalue_to_operand<'a>(
                         )
                     );
                 }
-
-                MirBorrowKind::Shared | MirBorrowKind::Fake { .. } => {
+                MirBorrowKind::Mut { .. } | MirBorrowKind::Shared | MirBorrowKind::Fake { .. } => {
                     // Treat Fake like Shared (used for closures etc.)
                     // --- SHARED BORROW (&T) or others -> Pass Through Value ---
                     breadcrumbs::log!(
@@ -214,26 +316,71 @@ pub fn convert_rvalue_to_operand<'a>(
                         )
                     );
 
-                    // 1. Get the value/reference of the place being borrowed directly.
-                    //    `emit_instructions_to_get_on_own` handles loading/accessing the value.
-                    let (pointee_value_var_name, pointee_get_instructions, pointee_oomir_type) =
-                        emit_instructions_to_get_on_own(
-                            source_place,
-                            tcx,
-                            instance,
-                            mir,
-                            data_types,
-                        );
+                    let source_mir_ty = source_place.ty(&mir.local_decls, tcx).ty;
+                    if matches!(source_mir_ty.kind(), TyKind::Closure(..)) {
+                        let closure_oomir_type =
+                            ty_to_oomir_type(source_mir_ty, tcx, data_types, instance);
+                        if let oomir::Type::Class(class_name) = closure_oomir_type.clone() {
+                            let has_captures = matches!(
+                                data_types.get(&class_name),
+                                Some(oomir::DataType::Class { fields, .. }) if !fields.is_empty()
+                            );
+                            if has_captures {
+                                let (temp_var_name, get_instructions, temp_var_type) =
+                                    emit_instructions_to_get_on_own(
+                                        source_place,
+                                        tcx,
+                                        instance,
+                                        mir,
+                                        data_types,
+                                    );
+                                instructions.extend(get_instructions);
+                                result_operand = oomir::Operand::Variable {
+                                    name: temp_var_name,
+                                    ty: temp_var_type,
+                                };
+                            } else {
+                                let closure_var_name = generate_temp_var_name(&base_temp_name);
+                                instructions.push(oomir::Instruction::ConstructObject {
+                                    dest: closure_var_name.clone(),
+                                    class_name,
+                                });
+                                result_operand = oomir::Operand::Variable {
+                                    name: closure_var_name,
+                                    ty: closure_oomir_type,
+                                };
+                            }
+                        } else {
+                            result_operand = get_placeholder_operand(
+                                original_dest_place,
+                                mir,
+                                tcx,
+                                instance,
+                                data_types,
+                            );
+                        }
+                    } else {
+                        // 1. Get the value/reference of the place being borrowed directly.
+                        //    `emit_instructions_to_get_on_own` handles loading/accessing the value.
+                        let (pointee_value_var_name, pointee_get_instructions, pointee_oomir_type) =
+                            emit_instructions_to_get_on_own(
+                                source_place,
+                                tcx,
+                                instance,
+                                mir,
+                                data_types,
+                            );
 
-                    // 2. Add the instructions needed to get this value.
-                    instructions.extend(pointee_get_instructions);
+                        // 2. Add the instructions needed to get this value.
+                        instructions.extend(pointee_get_instructions);
 
-                    // 3. The result *is* the operand representing the borrowed value itself.
-                    //    No array wrapping is done.
-                    result_operand = oomir::Operand::Variable {
-                        name: pointee_value_var_name,
-                        ty: pointee_oomir_type,
-                    };
+                        // 3. The result *is* the operand representing the borrowed value itself.
+                        //    No array wrapping is done.
+                        result_operand = oomir::Operand::Variable {
+                            name: pointee_value_var_name,
+                            ty: pointee_oomir_type,
+                        };
+                    }
                     breadcrumbs::log!(
                         breadcrumbs::LogLevel::Info,
                         "mir-lowering",
@@ -255,7 +402,56 @@ pub fn convert_rvalue_to_operand<'a>(
             let oomir_operand =
                 convert_operand(operand, tcx, instance, mir, data_types, &mut instructions);
 
-            if oomir_target_type == oomir_source_type {
+            if let oomir::Type::Class(class_name) = &oomir_target_type
+                && class_name.starts_with("NonNull_")
+            {
+                breadcrumbs::log!(
+                    breadcrumbs::LogLevel::Info,
+                    "mir-lowering",
+                    "Info: Handling Rvalue::Cast to NonNull wrapper."
+                );
+                instructions.push(oomir::Instruction::ConstructObject {
+                    dest: temp_cast_var.clone(),
+                    class_name: class_name.clone(),
+                });
+
+                if let Some(oomir::DataType::Class { fields, .. }) = data_types.get(class_name) {
+                    if let Some((field_name, field_ty)) = fields.first().cloned() {
+                        let value_ty = oomir_operand.get_type().unwrap_or(oomir_source_type);
+                        let needs_cast = field_ty != value_ty
+                            && field_ty.to_jvm_descriptor() != value_ty.to_jvm_descriptor();
+                        let primitive_sentinel_for_reference =
+                            value_ty.is_jvm_primitive_like() && field_ty.is_jvm_reference_type();
+
+                        let value_operand = if needs_cast && primitive_sentinel_for_reference {
+                            None
+                        } else if needs_cast {
+                            let cast_value_name = format!("{}_value", temp_cast_var);
+                            instructions.push(oomir::Instruction::Cast {
+                                op: oomir_operand,
+                                ty: field_ty.clone(),
+                                dest: cast_value_name.clone(),
+                            });
+                            Some(oomir::Operand::Variable {
+                                name: cast_value_name,
+                                ty: field_ty.clone(),
+                            })
+                        } else {
+                            Some(oomir_operand)
+                        };
+
+                        if let Some(value_operand) = value_operand {
+                            instructions.push(oomir::Instruction::SetField {
+                                object: temp_cast_var.clone(),
+                                field_name,
+                                value: value_operand,
+                                field_ty,
+                                owner_class: class_name.clone(),
+                            });
+                        }
+                    }
+                }
+            } else if oomir_target_type == oomir_source_type {
                 breadcrumbs::log!(
                     breadcrumbs::LogLevel::Info,
                     "mir-lowering",
@@ -292,17 +488,17 @@ pub fn convert_rvalue_to_operand<'a>(
                 get_place_type(original_dest_place, mir, tcx, instance, data_types);
 
             match bin_op {
-                BinOp::Add => instructions.push(oomir::Instruction::Add {
+                BinOp::Add | BinOp::AddUnchecked => instructions.push(oomir::Instruction::Add {
                     dest: temp_binop_var.clone(),
                     op1: oomir_op1,
                     op2: oomir_op2,
                 }),
-                BinOp::Sub => instructions.push(oomir::Instruction::Sub {
+                BinOp::Sub | BinOp::SubUnchecked => instructions.push(oomir::Instruction::Sub {
                     dest: temp_binop_var.clone(),
                     op1: oomir_op1,
                     op2: oomir_op2,
                 }),
-                BinOp::Mul => instructions.push(oomir::Instruction::Mul {
+                BinOp::Mul | BinOp::MulUnchecked => instructions.push(oomir::Instruction::Mul {
                     dest: temp_binop_var.clone(),
                     op1: oomir_op1,
                     op2: oomir_op2,
@@ -332,12 +528,12 @@ pub fn convert_rvalue_to_operand<'a>(
                     op1: oomir_op1,
                     op2: oomir_op2,
                 }),
-                BinOp::Shl => instructions.push(oomir::Instruction::Shl {
+                BinOp::Shl | BinOp::ShlUnchecked => instructions.push(oomir::Instruction::Shl {
                     dest: temp_binop_var.clone(),
                     op1: oomir_op1,
                     op2: oomir_op2,
                 }),
-                BinOp::Shr => instructions.push(oomir::Instruction::Shr {
+                BinOp::Shr | BinOp::ShrUnchecked => instructions.push(oomir::Instruction::Shr {
                     dest: temp_binop_var.clone(),
                     op1: oomir_op1,
                     op2: oomir_op2,
@@ -413,8 +609,12 @@ pub fn convert_rvalue_to_operand<'a>(
                         oomir::Type::I16 => "Tuple_i16_bool".to_string(),
                         oomir::Type::I32 => "Tuple_i32_bool".to_string(),
                         oomir::Type::I64 => "Tuple_i64_bool".to_string(),
-                        oomir::Type::Class(c) if c == crate::lower2::BIG_INTEGER_CLASS => "Tuple_BigInteger_bool".to_string(),
-                        oomir::Type::Class(c) if c == crate::lower2::BIG_DECIMAL_CLASS => "Tuple_BigDecimal_bool".to_string(),
+                        oomir::Type::Class(c) if c == crate::lower2::BIG_INTEGER_CLASS => {
+                            "Tuple_BigInteger_bool".to_string()
+                        }
+                        oomir::Type::Class(c) if c == crate::lower2::BIG_DECIMAL_CLASS => {
+                            "Tuple_BigDecimal_bool".to_string()
+                        }
                         _ => panic!("Unsupported type for checked arithmetic: {:?}", op_oomir_ty),
                     };
                     // Return the object as the operand
@@ -609,6 +809,13 @@ pub fn convert_rvalue_to_operand<'a>(
                             data_types,
                             &mut instructions,
                         );
+                        let value_operand = adapt_value_for_field(
+                            value_operand,
+                            &element_oomir_type,
+                            &temp_aggregate_var,
+                            data_types,
+                            &mut instructions,
+                        );
                         instructions.push(oomir::Instruction::SetField {
                             object: temp_aggregate_var.clone(),
                             field_name,
@@ -656,6 +863,61 @@ pub fn convert_rvalue_to_operand<'a>(
                         });
                     }
                 }
+                rustc_middle::mir::AggregateKind::Closure(_, _) => {
+                    let closure_class_name = match &aggregate_oomir_type {
+                        oomir::Type::Class(name) => name.clone(),
+                        _ => panic!("Closure aggregate type error"),
+                    };
+                    breadcrumbs::log!(
+                        breadcrumbs::LogLevel::Info,
+                        "mir-lowering",
+                        format!(
+                            "Info: Handling Closure Aggregate -> Temp Var '{}' (Class: {})",
+                            temp_aggregate_var, closure_class_name
+                        )
+                    );
+                    instructions.push(oomir::Instruction::ConstructObject {
+                        dest: temp_aggregate_var.clone(),
+                        class_name: closure_class_name.clone(),
+                    });
+
+                    let closure_fields = match data_types.get(&closure_class_name) {
+                        Some(oomir::DataType::Class { fields, .. }) => fields.clone(),
+                        _ => Vec::new(),
+                    };
+
+                    for (i, mir_operand) in operands.iter().enumerate() {
+                        let (field_name, field_ty) =
+                            closure_fields.get(i).cloned().unwrap_or_else(|| {
+                                (
+                                    format!("arg{}", i),
+                                    oomir::Type::Class("java/lang/Object".to_string()),
+                                )
+                            });
+                        let value_operand = convert_operand(
+                            mir_operand,
+                            tcx,
+                            instance,
+                            mir,
+                            data_types,
+                            &mut instructions,
+                        );
+                        let value_operand = adapt_value_for_field(
+                            value_operand,
+                            &field_ty,
+                            &temp_aggregate_var,
+                            data_types,
+                            &mut instructions,
+                        );
+                        instructions.push(oomir::Instruction::SetField {
+                            object: temp_aggregate_var.clone(),
+                            field_name,
+                            value: value_operand,
+                            field_ty,
+                            owner_class: closure_class_name.clone(),
+                        });
+                    }
+                }
                 rustc_middle::mir::AggregateKind::Adt(def_id, variant_idx, substs, _, _) => {
                     let adt_def = tcx.adt_def(*def_id);
                     if adt_def.is_struct() {
@@ -676,10 +938,24 @@ pub fn convert_rvalue_to_operand<'a>(
                             class_name: jvm_class_name.clone(),
                         });
                         // Set fields on the temporary struct object
-                        let oomir_fields = /* ... collect field info ... */ variant.fields.iter().map(|f| (f.ident(tcx).to_string(), ty_to_oomir_type(f.ty(tcx, substs), tcx, data_types, instance))).collect();
+                        let oomir_fields: Vec<(String, oomir::Type)> = variant
+                            .fields
+                            .iter()
+                            .map(|f| {
+                                (
+                                    f.ident(tcx).to_string(),
+                                    ty_to_oomir_type(
+                                        f.ty(tcx, substs).skip_norm_wip(),
+                                        tcx,
+                                        data_types,
+                                        instance,
+                                    ),
+                                )
+                            })
+                            .collect();
                         for (field_def, mir_operand) in variant.fields.iter().zip(operands.iter()) {
                             let field_name = field_def.ident(tcx).to_string();
-                            let field_mir_ty = field_def.ty(tcx, substs);
+                            let field_mir_ty = field_def.ty(tcx, substs).skip_norm_wip();
                             let field_oomir_type =
                                 ty_to_oomir_type(field_mir_ty, tcx, data_types, instance);
                             let value_operand = convert_operand(
@@ -687,6 +963,13 @@ pub fn convert_rvalue_to_operand<'a>(
                                 tcx,
                                 instance,
                                 mir,
+                                data_types,
+                                &mut instructions,
+                            );
+                            let value_operand = adapt_value_for_field(
+                                value_operand,
+                                &field_oomir_type,
+                                &temp_aggregate_var,
                                 data_types,
                                 &mut instructions,
                             );
@@ -700,16 +983,36 @@ pub fn convert_rvalue_to_operand<'a>(
                         }
                         // Ensure DataType exists
                         if !data_types.contains_key(&jvm_class_name) {
+                            let mut methods = HashMap::new();
+                            methods.insert(
+                                "eq".to_string(),
+                                DataTypeMethod::AdtHelperMethod {
+                                    kind: oomir::AdtHelperKind::PartialEqClass {
+                                        fields: oomir_fields.clone(),
+                                    },
+                                },
+                            );
                             data_types.insert(
                                 jvm_class_name.clone(),
                                 oomir::DataType::Class {
                                     fields: oomir_fields,
                                     is_abstract: false,
-                                    methods: HashMap::new(),
+                                    methods,
                                     super_class: None,
                                     interfaces: vec![],
                                 },
                             );
+                        } else if let Some(oomir::DataType::Class {
+                            fields, methods, ..
+                        }) = data_types.get_mut(&jvm_class_name)
+                        {
+                            methods.entry("eq".to_string()).or_insert_with(|| {
+                                DataTypeMethod::AdtHelperMethod {
+                                    kind: oomir::AdtHelperKind::PartialEqClass {
+                                        fields: fields.clone(),
+                                    },
+                                }
+                            });
                         }
                     } else if adt_def.is_enum() {
                         let variant_def = adt_def.variant(*variant_idx);
@@ -776,23 +1079,137 @@ pub fn convert_rvalue_to_operand<'a>(
                         ```
                         */
 
-                        // the enum in general
-                        if !data_types.contains_key(&base_enum_name) {
-                            let mut methods = HashMap::new();
-                            methods.insert(
-                                "getVariantIdx".to_string(),
-                                DataTypeMethod::SimpleConstantReturn(oomir::Type::I32, None),
-                            );
-                            data_types.insert(
-                                base_enum_name.clone(),
-                                oomir::DataType::Class {
-                                    fields: vec![], // No fields in the abstract class
-                                    is_abstract: true,
-                                    methods,
-                                    super_class: None,
-                                    interfaces: vec![],
-                                },
-                            );
+                        // the enum in general - always ensure helper methods are present
+                        {
+                            let variants_info: Vec<_> = adt_def
+                                .variants()
+                                .iter()
+                                .map(|v| {
+                                    let v_name = make_jvm_safe(&v.name.to_string());
+                                    let v_fields: Vec<oomir::Type> = v
+                                        .fields
+                                        .iter()
+                                        .map(|f| {
+                                            ty_to_oomir_type(
+                                                f.ty(tcx, substs).skip_norm_wip(),
+                                                tcx,
+                                                data_types,
+                                                instance,
+                                            )
+                                        })
+                                        .collect();
+                                    (v_name, v_fields)
+                                })
+                                .collect();
+
+                            if !data_types.contains_key(&base_enum_name) {
+                                let mut methods = HashMap::new();
+                                methods.insert(
+                                    "getVariantIdx".to_string(),
+                                    DataTypeMethod::SimpleConstantReturn(oomir::Type::I32, None),
+                                );
+
+                                // Add AdtHelperMethod for PartialEq
+                                methods.insert(
+                                    "eq".to_string(),
+                                    DataTypeMethod::AdtHelperMethod {
+                                        kind: oomir::AdtHelperKind::PartialEqEnum {
+                                            variants: variants_info.clone(),
+                                        },
+                                    },
+                                );
+
+                                // Add is_none/is_some for two-variant enums (like Option)
+                                if adt_def.variants().len() == 2 {
+                                    // Find the actual variant indices by name
+                                    let mut none_variant_idx = 1u32;
+                                    let mut some_variant_idx = 0u32;
+                                    for (idx, v) in adt_def.variants().iter().enumerate() {
+                                        let name = v.name.to_string();
+                                        if name == "None" {
+                                            none_variant_idx = idx as u32;
+                                        } else if name == "Some" {
+                                            some_variant_idx = idx as u32;
+                                        }
+                                    }
+                                    methods.insert(
+                                        "is_none".to_string(),
+                                        DataTypeMethod::AdtHelperMethod {
+                                            kind: oomir::AdtHelperKind::IsVariant {
+                                                variant_idx: none_variant_idx,
+                                            },
+                                        },
+                                    );
+                                    methods.insert(
+                                        "is_some".to_string(),
+                                        DataTypeMethod::AdtHelperMethod {
+                                            kind: oomir::AdtHelperKind::IsVariant {
+                                                variant_idx: some_variant_idx,
+                                            },
+                                        },
+                                    );
+                                }
+
+                                data_types.insert(
+                                    base_enum_name.clone(),
+                                    oomir::DataType::Class {
+                                        fields: vec![],
+                                        is_abstract: true,
+                                        methods,
+                                        super_class: None,
+                                        interfaces: vec![],
+                                    },
+                                );
+                            } else {
+                                // Merge helper methods into existing enum class
+                                if let oomir::DataType::Class { methods, .. } =
+                                    data_types.get_mut(&base_enum_name).unwrap()
+                                {
+                                    if !methods.contains_key("eq") {
+                                        methods.insert(
+                                            "eq".to_string(),
+                                            DataTypeMethod::AdtHelperMethod {
+                                                kind: oomir::AdtHelperKind::PartialEqEnum {
+                                                    variants: variants_info.clone(),
+                                                },
+                                            },
+                                        );
+                                    }
+                                    if adt_def.variants().len() == 2 {
+                                        // Find the actual variant indices by name
+                                        let mut none_variant_idx = 1u32;
+                                        let mut some_variant_idx = 0u32;
+                                        for (idx, v) in adt_def.variants().iter().enumerate() {
+                                            let name = v.name.to_string();
+                                            if name == "None" {
+                                                none_variant_idx = idx as u32;
+                                            } else if name == "Some" {
+                                                some_variant_idx = idx as u32;
+                                            }
+                                        }
+                                        if !methods.contains_key("is_none") {
+                                            methods.insert(
+                                                "is_none".to_string(),
+                                                DataTypeMethod::AdtHelperMethod {
+                                                    kind: oomir::AdtHelperKind::IsVariant {
+                                                        variant_idx: none_variant_idx,
+                                                    },
+                                                },
+                                            );
+                                        }
+                                        if !methods.contains_key("is_some") {
+                                            methods.insert(
+                                                "is_some".to_string(),
+                                                DataTypeMethod::AdtHelperMethod {
+                                                    kind: oomir::AdtHelperKind::IsVariant {
+                                                        variant_idx: some_variant_idx,
+                                                    },
+                                                },
+                                            );
+                                        }
+                                    }
+                                }
+                            }
                         }
 
                         // this variant
@@ -801,7 +1218,7 @@ pub fn convert_rvalue_to_operand<'a>(
                             for (i, field) in variant_def.fields.iter().enumerate() {
                                 let field_name = format!("field{}", i);
                                 let field_type = ty_to_oomir_type(
-                                    field.ty(tcx, substs),
+                                    field.ty(tcx, substs).skip_norm_wip(),
                                     tcx,
                                     data_types,
                                     instance,
@@ -839,7 +1256,7 @@ pub fn convert_rvalue_to_operand<'a>(
                         // Set fields
                         for (i, field) in variant_def.fields.iter().enumerate() {
                             let field_name = format!("field{}", i);
-                            let field_mir_ty = field.ty(tcx, substs);
+                            let field_mir_ty = field.ty(tcx, substs).skip_norm_wip();
                             let field_oomir_type =
                                 ty_to_oomir_type(field_mir_ty, tcx, data_types, instance);
                             let value_operand = convert_operand(
@@ -847,6 +1264,13 @@ pub fn convert_rvalue_to_operand<'a>(
                                 tcx,
                                 instance,
                                 mir,
+                                data_types,
+                                &mut instructions,
+                            );
+                            let value_operand = adapt_value_for_field(
+                                value_operand,
+                                &field_oomir_type,
+                                &temp_aggregate_var,
                                 data_types,
                                 &mut instructions,
                             );
@@ -985,6 +1409,7 @@ pub fn convert_rvalue_to_operand<'a>(
             let method_ty = oomir::Signature {
                 params: vec![],
                 ret: Box::new(method_return_type.clone()),
+                is_static: false,
             };
 
             // 3. Call InvokeVirtual on the CORRECT variable

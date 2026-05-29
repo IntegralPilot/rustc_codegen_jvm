@@ -40,6 +40,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         constant_pool: &'cp mut ConstantPool,
         module: &'a oomir::Module,
         is_static: bool,
+        owner_class_name: Option<&str>,
     ) -> Self {
         let mut translator = FunctionTranslator {
             oomir_func,
@@ -61,55 +62,84 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             format!("static: {}, function_name: {}", is_static, oomir_func.name)
         );
 
-        // Assign JVM local slots 0, 1, 2... to MIR argument names _1, _2, _3...
-        // Assumes static methods where args start at slot 0.
-        // Note: For synthetic parameters (like main's String[] args), we allocate the slot
-        // but don't map it to MIR locals since MIR doesn't reference them.
+        // For instance methods, map _1 (self) to JVM Slot 0
+        if !is_static {
+            if let Some(class_name) = owner_class_name {
+                // _1 is the receiver (this), maps to JVM Slot 0
+                translator.local_var_map.insert("_1".to_string(), 0);
+                translator
+                    .local_var_types
+                    .insert("_1".to_string(), Type::Class(class_name.to_string()));
+                translator.max_locals_used = translator.max_locals_used.max(1);
+
+                breadcrumbs::log!(
+                    breadcrumbs::LogLevel::Info,
+                    "bytecode-gen",
+                    format!(
+                        "Mapped _1 (self) to JVM Slot 0 with type Class({})",
+                        class_name
+                    )
+                );
+            }
+        }
+
+        // Calculate MIR argument offset
+        // For instance methods: _2, _3, ... map to params[0], params[1], ...
+        // For static methods: _1, _2, ... map to params[0], params[1], ...
+        let mir_arg_offset = if is_static { 1 } else { 2 };
+
+        // Assign JVM local slots to MIR argument names
         let num_params = oomir_func.signature.params.len();
         for i in 0..num_params {
-            let param_translator_name = format!("param_{}", i);
-            let (param_name, param_ty) = &oomir_func.signature.params[i];
+            // Internal name for translator logic
+            let param_translator_name: String = format!("param_{}", i);
+            // The name used in the OOMIR body (offset by mir_arg_offset)
+            let param_oomir_name = format!("_{}", i + mir_arg_offset);
+            let (_param_name, param_ty) = &oomir_func.signature.params[i];
+            let is_synthetic_jvm_main_arg = is_static
+                && oomir_func.name == "main"
+                && i == 0
+                && matches!(
+                    param_ty,
+                    Type::Array(inner)
+                        if matches!(inner.as_ref(), Type::Class(name) if name == "java/lang/String")
+                );
 
-            // Allocate the slot for this parameter
+            // Use assign_local to allocate the slot
             let assigned_index = translator.assign_local(param_translator_name.as_str(), param_ty);
 
-            // Only create MIR local mapping (_1, _2, ...) if this is a real MIR parameter,
-            // not a synthetic one added for JVM compatibility (like main's args).
-            // We detect synthetic params by checking if the param name matches the pattern
-            // used by the MIR-to-OOMIR lowering vs. names added by signature overrides.
-            // Real MIR params would have been numbered, synthetic ones have descriptive names.
-            if param_name != "args" && !(oomir_func.name == "main" && i == 0) {
-                // This looks like a real MIR parameter, map it to _1, _2, etc.
-                let param_oomir_name = format!("_{}", i + 1);
-                
-                if translator
-                    .local_var_map
-                    .insert(param_oomir_name.clone(), assigned_index)
-                    .is_some()
-                {
-                    breadcrumbs::log!(
-                        breadcrumbs::LogLevel::Warn,
-                        "bytecode-gen",
-                        format!(
-                            "Warning: OOMIR parameter name '{}' potentially clashed with an existing mapping during parameter assignment.",
-                            param_oomir_name
-                        )
-                    );
-                }
-                if translator
-                    .local_var_types
-                    .insert(param_oomir_name.clone(), param_ty.clone())
-                    .is_some()
-                {
-                    breadcrumbs::log!(
-                        breadcrumbs::LogLevel::Warn,
-                        "bytecode-gen",
-                        format!(
-                            "Warning: OOMIR parameter name '{}' potentially clashed with an existing type mapping during parameter assignment.",
-                            param_oomir_name
-                        )
-                    );
-                }
+            if is_synthetic_jvm_main_arg {
+                continue;
+            }
+
+            // Map the OOMIR name to the same slot index
+            if translator
+                .local_var_map
+                .insert(param_oomir_name.clone(), assigned_index)
+                .is_some()
+            {
+                breadcrumbs::log!(
+                    breadcrumbs::LogLevel::Warn,
+                    "bytecode-gen",
+                    format!(
+                        "Warning: OOMIR parameter name '{}' clashed with an existing mapping during parameter assignment.",
+                        param_oomir_name
+                    )
+                );
+            }
+            if translator
+                .local_var_types
+                .insert(param_oomir_name.clone(), param_ty.clone())
+                .is_some()
+            {
+                breadcrumbs::log!(
+                    breadcrumbs::LogLevel::Warn,
+                    "bytecode-gen",
+                    format!(
+                        "Warning: OOMIR parameter name '{}' clashed with an existing type mapping during parameter assignment.",
+                        param_oomir_name
+                    )
+                );
             }
         }
 
@@ -405,23 +435,17 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 load_constant(&mut self.jvm_instructions, &mut self.constant_pool, c)?
             }
             oomir::Operand::Variable { name: var_name, ty } => {
-                // Special case: If this is an uninitialized Object variable (likely a dead closure reference),
-                // just push null instead of trying to load from an uninitialized local
-                if !self.local_var_map.contains_key(var_name) 
-                    && matches!(ty, oomir::Type::Class(name) if name == "java/lang/Object")
-                {
-                    breadcrumbs::log!(
-                        breadcrumbs::LogLevel::Info,
-                        "bytecode-gen",
-                        format!("Loading uninitialized closure placeholder '{}' as null", var_name)
-                    );
-                    self.jvm_instructions.push(Instruction::Aconst_null);
-                } else {
-                    // Use the provided type directly - OOMIR variables should have correct types
-                    let index = self.get_or_assign_local(var_name, ty);
-                    let load_instr = get_load_instruction(ty, index)?;
-                    self.jvm_instructions.push(load_instr);
-                }
+                // For instance methods, _1 is mapped to slot 0 as the raw 'this' pointer
+                // Use the actual JVM type from local_var_types if available (for _1 in instance methods)
+                // Otherwise use the OOMIR operand type
+                let actual_ty = self
+                    .local_var_types
+                    .get(var_name)
+                    .cloned()
+                    .unwrap_or_else(|| ty.clone());
+                let index = self.get_or_assign_local(var_name, &actual_ty);
+                let load_instr = get_load_instruction(&actual_ty, index)?;
+                self.jvm_instructions.push(load_instr);
             }
         }
         Ok(())
@@ -430,7 +454,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
     /// Appends JVM instructions for storing the value currently on top of the stack
     /// into a local variable.
     fn store_result(&mut self, dest_var: &str, ty: &oomir::Type) -> Result<(), jvm::Error> {
-        // Use the provided type directly - OOMIR variables should have correct types
+        // Assign or update the local variable slot with the provided type
         let index: u16 = self.get_or_assign_local(dest_var, ty);
         let store_instr = get_store_instruction(ty, index)?;
         self.jvm_instructions.push(store_instr);
@@ -2124,7 +2148,12 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                             // --- Continue with Shim Call Invocation ---
 
                             // Add MethodRef for the actual shim function
-                            let kotlin_shim_class = "org/rustlang/core/Core"; // Or get from shim_info if varies
+                            let kotlin_shim_class =
+                                if function_name == "panic" || function_name == "panic_fmt" {
+                                    "org/rustlang/core/panicking"
+                                } else {
+                                    "org/rustlang/core/Core"
+                                };
                             let class_index = self.constant_pool.add_class(kotlin_shim_class)?;
                             let method_ref_index = self.constant_pool.add_method_ref(
                                 class_index,
@@ -2148,8 +2177,8 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                             }
 
                             // Check for diverging (can use shim_info if available)
-                            if function_name == "panic_fmt"
-                                || function_name == "std_rt_panic_fmt"
+                            if function_name == "panic"
+                                || function_name == "panic_fmt"
                                 || function_name == "core_panicking_panic"
                                 || function_name == "core_assert_failed"
                             // Or check shim_info.diverges
@@ -2183,13 +2212,14 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                                 && !is_diverging_call
                                 && shim_info.descriptor.ends_with(")V")
                             {
-                                return Err(jvm::Error::VerificationError {
-                                    context: format!("Function {}", self.oomir_func.name),
-                                    message: format!(
-                                        "Attempting to store void result from shim '{}'",
+                                breadcrumbs::log!(
+                                    breadcrumbs::LogLevel::Info,
+                                    "bytecode-gen",
+                                    format!(
+                                        "Info: Ignoring store for void return from shim '{}'",
                                         function_name
-                                    ),
-                                });
+                                    )
+                                );
                             }
                         } // End if shim_info found by name
                     } // End Ok(shim_map)
@@ -2439,61 +2469,95 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 }
             }
             OI::ArrayGet { dest, array, index } => {
-                // 1. Load array reference
-                self.load_operand(&array)?; // Stack: [arrayref]
+                // Special case: In instance methods, _1 is 'this' (raw object at slot 0), not an array
+                // If OOMIR tries to unbox it with ArrayGet, we should treat it as a simple move
+                let is_this_unbox = match (&array, index) {
+                    (OO::Variable { name, ty }, OO::Constant(oomir::Constant::I32(0))) => {
+                        name == "_1"
+                            && !self.oomir_func.signature.is_static
+                            && matches!(ty, oomir::Type::MutableReference(_))
+                    }
+                    _ => false,
+                };
 
-                // 2. Determine thw element type by inspecting the array operand's type
-                let array_operand_type = match &array {
-                    OO::Variable { ty, .. } => ty,
-                    OO::Constant(c) => match c.clone() {
-                        // Need the type representation for a constant array, e.g.,
-                        oomir::Constant::Array(inner_ty, _) => {
-                            &oomir::Type::Array(inner_ty.clone())
-                        }
-                        oomir::Constant::String(_) => {
-                            let instrs = get_cast_instructions(
-                                &oomir::Type::String,
-                                &oomir::Type::Array(Box::new(oomir::Type::I16)),
-                                &mut self.constant_pool,
-                            )
-                            .unwrap();
-                            self.jvm_instructions.extend(instrs);
-                            &oomir::Type::Array(Box::new(oomir::Type::I16))
+                if is_this_unbox {
+                    // This is dereferencing _1 (this) in an instance method
+                    // _1 is already the raw object at slot 0, so just load and store it
+                    self.load_operand(&array)?; // Loads 'this' from slot 0
+
+                    // Get the inner type (the actual class type)
+                    let element_type = if let OO::Variable {
+                        ty: oomir::Type::MutableReference(inner),
+                        ..
+                    } = &array
+                    {
+                        (**inner).clone()
+                    } else {
+                        return Err(jvm::Error::VerificationError {
+                            context: format!("Function {}", self.oomir_func.name),
+                            message: format!("Expected MutableReference for _1, found {:?}", array),
+                        });
+                    };
+
+                    self.store_result(dest, &element_type)?;
+                } else {
+                    // Normal array access
+                    // 1. Load array reference
+                    self.load_operand(&array)?; // Stack: [arrayref]
+
+                    // 2. Determine thw element type by inspecting the array operand's type
+                    let array_operand_type = match &array {
+                        OO::Variable { ty, .. } => ty,
+                        OO::Constant(c) => match c.clone() {
+                            // Need the type representation for a constant array, e.g.,
+                            oomir::Constant::Array(inner_ty, _) => {
+                                &oomir::Type::Array(inner_ty.clone())
+                            }
+                            oomir::Constant::String(_) => {
+                                let instrs = get_cast_instructions(
+                                    &oomir::Type::String,
+                                    &oomir::Type::Array(Box::new(oomir::Type::I16)),
+                                    &mut self.constant_pool,
+                                )
+                                .unwrap();
+                                self.jvm_instructions.extend(instrs);
+                                &oomir::Type::Array(Box::new(oomir::Type::I16))
+                            }
+                            _ => {
+                                return Err(jvm::Error::VerificationError {
+                                    context: format!("Function {}", self.oomir_func.name),
+                                    message: format!(
+                                        "Operand {:?} used in ArrayGet is not an array type, found {:?}",
+                                        array, c
+                                    ),
+                                });
+                            }
+                        },
+                    };
+
+                    // Now extract the element type *from* the array type
+                    let element_type = match array_operand_type {
+                        oomir::Type::Array(inner_type)
+                        | oomir::Type::MutableReference(inner_type) => {
+                            // inner_type is likely Box<oomir::Type>, so deref it
+                            (**inner_type).clone()
                         }
                         _ => {
                             return Err(jvm::Error::VerificationError {
                                 context: format!("Function {}", self.oomir_func.name),
                                 message: format!(
                                     "Operand {:?} used in ArrayGet is not an array type, found {:?}",
-                                    array, c
+                                    array, array_operand_type
                                 ),
                             });
                         }
-                    },
-                };
+                    };
 
-                // Now extract the element type *from* the array type
-                let element_type = match array_operand_type {
-                    oomir::Type::Array(inner_type) | oomir::Type::MutableReference(inner_type) => {
-                        // inner_type is likely Box<oomir::Type>, so deref it
-                        (**inner_type).clone()
-                    }
-                    _ => {
-                        return Err(jvm::Error::VerificationError {
-                            context: format!("Function {}", self.oomir_func.name),
-                            message: format!(
-                                "Operand {:?} used in ArrayGet is not an array type, found {:?}",
-                                array, array_operand_type
-                            ),
-                        });
-                    }
-                };
+                    // 3. Load index
+                    self.load_operand(index)?; // Stack: [arrayref, index_int]
 
-                // 3. Load index
-                self.load_operand(index)?; // Stack: [arrayref, index_int]
-
-                // 4. Get and add the appropriate array load instruction
-                let load_instr = element_type // Now correctly holds I64, I32, Class(...), etc.
+                    // 4. Get and add the appropriate array load instruction
+                    let load_instr = element_type // Now correctly holds I64, I32, Class(...), etc.
                     .get_jvm_array_load_instruction() // Should now return laload, iaload, aaload correctly
                     .ok_or_else(|| jvm::Error::VerificationError {
                         context: format!("Function {}", self.oomir_func.name),
@@ -2502,12 +2566,13 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                             element_type // Use the correct element type in error message
                         ),
                     })?;
-                self.jvm_instructions.push(load_instr); // Pushes the correct instruction (e.g., laload)
-                // Stack: [value] (long value in this case)
+                    self.jvm_instructions.push(load_instr); // Pushes the correct instruction (e.g., laload)
+                    // Stack: [value] (long value in this case)
 
-                // 5. Store the resulting element (which has the correct element_type)
-                // store_result now receives I64 and should generate lstore correctly.
-                self.store_result(dest, &element_type)?; // Stack: []
+                    // 5. Store the resulting element (which has the correct element_type)
+                    // store_result now receives I64 and should generate lstore correctly.
+                    self.store_result(dest, &element_type)?; // Stack: []
+                }
             }
             OI::Length { dest, array } => {
                 // 1. Load the array reference onto the stack
@@ -2765,8 +2830,22 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 )?;
 
                 // 2. Load the object reference (self) onto the stack
-                // The object reference is the first argument for instance methods
-                self.load_operand(operand)?; // Stack: [object_ref]
+                // If operand is a MutableReference, it's represented as a single-element array,
+                // so we need to load the array and then use aaload to get element 0.
+                let receiver_type = operand.get_type();
+                let is_mutable_ref =
+                    matches!(receiver_type, Some(oomir::Type::MutableReference(_)));
+
+                if is_mutable_ref {
+                    // Load the array reference
+                    self.load_operand(operand)?; // Stack: [arrayref]
+                    // Load index 0
+                    self.jvm_instructions.push(JI::Iconst_0); // Stack: [arrayref, 0]
+                    // Get element at index 0
+                    self.jvm_instructions.push(JI::Aaload); // Stack: [objectref]
+                } else {
+                    self.load_operand(operand)?; // Stack: [object_ref]
+                }
 
                 // 3. Load arguments onto the stack
                 for arg in args {
@@ -2839,25 +2918,10 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         match operand {
             oomir::Operand::Variable { name: var_name, ty } => {
                 let index = self.get_local_index(var_name)?;
-                let expected_type = self.get_local_type(var_name)?.clone();
-                // Decide which type to use for loading based on whether it's a Ref to Primitive
                 let load_type = match ty {
                     // If the argument is declared as Ref<Primitive>, load the primitive directly
                     oomir::Type::Reference(box inner_ty) if inner_ty.is_jvm_primitive() => {
                         inner_ty // Use the inner type for loading
-                    }
-                    oomir::Type::MutableReference(box inner_ty) => {
-                        // check the expected type
-                        match expected_type {
-                            oomir::Type::MutableReference(_) => ty,
-                            _ => {
-                                // it's not a MutableReference, so we need to move the value out
-                                self.jvm_instructions.push(get_load_instruction(ty, index)?);
-                                self.jvm_instructions.push(Instruction::Iconst_0);
-                                self.jvm_instructions.push(Instruction::Aaload);
-                                inner_ty
-                            }
-                        }
                     }
                     // Otherwise, use the declared type
                     _ => ty,

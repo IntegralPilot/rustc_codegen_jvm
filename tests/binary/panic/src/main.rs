@@ -2,5 +2,6 @@
 // Tester.py compares the actual panic output (message + backtrace) with the expected output
 
 fn main() {
-    panic!("This is a panic message!");
+    let value = 42;
+    panic!("This is a formatted panic message: {}", value);
 }

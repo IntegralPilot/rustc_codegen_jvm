@@ -325,7 +325,7 @@ fn handle_constant_struct<'tcx>(
 
     for (i, field_def) in variant.fields.iter().enumerate() {
         let field_idx = FieldIdx::from_usize(i);
-        let field_ty = field_def.ty(tcx, substs);
+        let field_ty = field_def.ty(tcx, substs).skip_norm_wip();
         let field_offset = layout.fields.offset(field_idx.into());
         let field_name = field_def.ident(tcx).to_string();
 
@@ -375,8 +375,6 @@ fn handle_constant_enum<'tcx>(
     instance: Instance<'tcx>,
 ) -> Result<oomir::Constant, String> {
     let active_variant_idx: VariantIdx;
-    let variant_fields_shape: &FieldsShape<FieldIdx>; // Holds the layout of fields for the active variant
-
     match &layout.variants {
         // --- Case 1: Single Variant (Structs, Unions, Single-Variant Enums) ---
         Variants::Single { index } => {
@@ -390,8 +388,6 @@ fn handle_constant_enum<'tcx>(
                 )
             );
             active_variant_idx = *index;
-            // The fields are directly in the main layout
-            variant_fields_shape = &layout.fields;
         }
 
         // --- Case 2: Multiple Variants (Standard Enums) ---
@@ -399,7 +395,7 @@ fn handle_constant_enum<'tcx>(
             tag, // This is the Scalar layout for the tag's storage location
             tag_encoding,
             tag_field, // Index within layout.fields where the tag is stored
-            variants: variant_layouts,
+            variants: _variant_layouts,
         } => {
             breadcrumbs::log!(
                 breadcrumbs::LogLevel::Info,
@@ -650,7 +646,6 @@ fn handle_constant_enum<'tcx>(
                     active_variant_idx
                 )
             );
-            variant_fields_shape = &variant_layouts[active_variant_idx].fields;
         } // End Variants::Multiple
 
         // --- Case 3: Empty Enum (Uninhabited) ---
@@ -680,7 +675,7 @@ fn handle_constant_enum<'tcx>(
     let mut fields_map = HashMap::new();
     for (i, field_def) in variant_def.fields.iter().enumerate() {
         let field_idx = FieldIdx::from_usize(i);
-        let field_ty = field_def.ty(tcx, substs);
+        let field_ty = field_def.ty(tcx, substs).skip_norm_wip();
 
         // Calculate the offset of the field *within the variant's data area*.
         // `variant_fields_shape.offset()` gives the offset relative to the start of *this variant's fields*.
@@ -713,7 +708,14 @@ fn handle_constant_enum<'tcx>(
         // This mapping isn't directly available.
 
         // Sticking with the previous logic: relative offset within variant shape.
-        let field_offset_in_variant_shape = variant_fields_shape.offset(field_idx.into());
+        let field_offset_in_variant_shape = match &layout.variants {
+            Variants::Single { .. } => layout.fields.offset(field_idx.into()),
+            Variants::Multiple {
+                variants: variant_layouts,
+                ..
+            } => variant_layouts[active_variant_idx].field_offsets[field_idx],
+            Variants::Empty => unreachable!("empty enums have no active variant fields"),
+        };
 
         // Calculate absolute offset relative to the start of the *whole allocation* `offset`.
         let absolute_field_offset = offset + field_offset_in_variant_shape;
@@ -778,8 +780,12 @@ fn handle_constant_enum<'tcx>(
         let mut fields = vec![];
         for (i, field) in variant_def.fields.iter().enumerate() {
             let field_name = format!("field{}", i);
-            let field_type =
-                ty_to_oomir_type(field.ty(tcx, substs), tcx, oomir_data_types, instance);
+            let field_type = ty_to_oomir_type(
+                field.ty(tcx, substs).skip_norm_wip(),
+                tcx,
+                oomir_data_types,
+                instance,
+            );
             fields.push((field_name, field_type));
         }
 

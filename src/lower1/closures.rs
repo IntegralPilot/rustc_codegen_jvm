@@ -110,7 +110,7 @@ pub fn extract_closure_info<'tcx>(
                 format!(
                     "Found closure: DefId={:?}, path={}",
                     closure_def_id,
-                    tcx.def_path_str(closure_def_id)
+                    tcx.def_path_str(*closure_def_id)
                 )
             );
 

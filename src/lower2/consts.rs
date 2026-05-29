@@ -231,6 +231,7 @@ pub fn load_constant(
             let constructor_signature = Signature {
                 ret: Box::new(Type::Void), // Constructors are void methods in bytecode
                 params: param_types,
+                is_static: false,
             };
             // Assuming Signature::to_string() produces the correct JVM descriptor format, e.g., "(Ljava/lang/String;I)V"
             let constructor_descriptor = constructor_signature.to_string();

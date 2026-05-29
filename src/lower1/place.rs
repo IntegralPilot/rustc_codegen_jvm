@@ -18,6 +18,7 @@ pub fn place_to_string<'tcx>(place: &Place<'tcx>, _tcx: TyCtxt<'tcx>) -> String 
 pub fn make_jvm_safe(input: &str) -> String {
     // --- Static Regex Definitions ---
     static RE_TRAIT_IMPL: OnceLock<Regex> = OnceLock::new();
+    static RE_TRAIT_IMPL_PATH: OnceLock<Regex> = OnceLock::new();
     static RE_NONWORD: OnceLock<Regex> = OnceLock::new();
 
     // Regex to specifically capture the implementing type and the method name
@@ -29,6 +30,11 @@ pub fn make_jvm_safe(input: &str) -> String {
     let re_trait = RE_TRAIT_IMPL
         .get_or_init(|| Regex::new(r"^\s*<(.+?)\s+as\s+.*?\s*>\s*::\s*([^:]+)\s*$").unwrap());
 
+    // Regex to capture "Type as Trait" pattern (without angle brackets)
+    // This handles def_path_str output like "SimpleAdder as Calculator::calculate"
+    let re_trait_path =
+        RE_TRAIT_IMPL_PATH.get_or_init(|| Regex::new(r"(.+?)\s+as\s+([^:]+?)(?:::|$)").unwrap());
+
     // Regex for sequences of characters that are NOT alphanumeric or underscore.
     // Using \p{Alnum} includes Unicode letters and numbers.
     let re_nw = RE_NONWORD.get_or_init(|| Regex::new(r"[^a-zA-Z0-9_]+").unwrap());
@@ -39,6 +45,10 @@ pub fn make_jvm_safe(input: &str) -> String {
         // Combine the captured Type (group 1) and Method (group 2).
         // This aims to replicate the naming seen for the definition (e.g., "u32holder_getinnernumber").
         format!("{}_{}", &caps[1], &caps[2])
+    } else if let Some(caps) = re_trait_path.captures(input) {
+        // Case 1b: Input matches "Type as Trait" pattern.
+        // Extract just the trait name (group 2), ignoring the implementing type.
+        caps[2].to_string()
     } else {
         // Case 2: Input does not match the specific trait pattern.
         // Use the original input string. Subsequent cleaning will handle '::', '<>', etc.
@@ -406,8 +416,12 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
                     let mut fields = vec![];
                     for (i, field) in variant_def.fields.iter().enumerate() {
                         let field_name = format!("field{}", i);
-                        let field_type =
-                            ty_to_oomir_type(field.ty(tcx, substs), tcx, data_types, instance);
+                        let field_type = ty_to_oomir_type(
+                            field.ty(tcx, substs).skip_norm_wip(),
+                            tcx,
+                            data_types,
+                            instance,
+                        );
                         fields.push((field_name, field_type));
                     }
 
@@ -482,8 +496,9 @@ pub fn get_place_type<'tcx>(
 ) -> oomir::Type {
     let place_ty = place.ty(&mir.local_decls, tcx);
     // Instantiate the type with the instance's generic arguments to get concrete types
-    let instantiated_ty =
-        rustc_middle::ty::EarlyBinder::bind(place_ty.ty).instantiate(tcx, instance.args);
+    let instantiated_ty = rustc_middle::ty::EarlyBinder::bind(place_ty.ty)
+        .instantiate(tcx, instance.args)
+        .skip_norm_wip();
     ty_to_oomir_type(instantiated_ty, tcx, data_types, instance)
 }
 

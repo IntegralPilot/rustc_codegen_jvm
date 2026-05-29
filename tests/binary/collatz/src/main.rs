@@ -13,9 +13,7 @@ fn check_up_to(current: u32, limit: u32) {
         return;
     } else {
         let result = collatz(current);
-        if result != 1 {
-            panic!("The collatz conjecture broke? This shouldn't happen.");
-        }
+        assert!(result == 1);
         check_up_to(current + 1, limit);
     }
 }

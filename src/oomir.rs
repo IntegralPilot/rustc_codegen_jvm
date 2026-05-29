@@ -4,6 +4,7 @@
 use crate::lower2::BIG_DECIMAL_CLASS;
 
 use super::lower2::BIG_INTEGER_CLASS;
+use breadcrumbs::LogLevel;
 use core::panic;
 use ristretto_classfile::attributes::Instruction as JVMInstruction;
 use std::{collections::HashMap, fmt};
@@ -126,6 +127,14 @@ impl Module {
 pub enum DataTypeMethod {
     SimpleConstantReturn(Type, Option<Constant>),
     Function(Function),
+    AdtHelperMethod { kind: AdtHelperKind },
+}
+
+#[derive(Debug, Clone)]
+pub enum AdtHelperKind {
+    IsVariant { variant_idx: u32 },
+    PartialEqEnum { variants: Vec<(String, Vec<Type>)> },
+    PartialEqClass { fields: Vec<(String, Type)> },
 }
 
 #[derive(Debug, Clone)]
@@ -184,26 +193,41 @@ pub struct Function {
     pub name: String,
     pub signature: Signature,
     pub body: CodeBlock,
-    pub is_static: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Signature {
     pub params: Vec<(String, Type)>,
     pub ret: Box<Type>,
+    pub is_static: bool,
 }
 
 impl Signature {
     /// Replaces all occurrences of `Type::Class(old_name)` with `Type::Class(new_name)`
     /// in the signature's parameters and return type.
-    pub fn replace_class_in_signature(&mut self, old_class_name: &str, new_class_name: &str) {
+    /// Returns a tuple (params_changed, return_changed) indicating whether any replacements were made.
+    pub fn replace_class_in_signature(
+        &mut self,
+        old_class_name: &str,
+        new_class_name: &str,
+    ) -> (bool, bool) {
+        let mut params_changed = false;
+        let mut return_changed = false;
+
         // Replace in parameters
         for (_param_name, param_type) in self.params.iter_mut() {
-            param_type.replace_class(old_class_name, new_class_name);
+            let result = param_type.replace_class(old_class_name, new_class_name);
+            if result {
+                params_changed = true;
+            }
         }
 
         // Replace in return type (accessing the Type inside the Box)
-        self.ret.replace_class(old_class_name, new_class_name);
+        if self.ret.replace_class(old_class_name, new_class_name) {
+            return_changed = true;
+        }
+
+        (params_changed, return_changed)
     }
 }
 
@@ -212,7 +236,20 @@ impl Signature {
     pub fn to_string(&self) -> String {
         let mut result = String::new();
         result.push('(');
-        for (_param_name, param_type) in &self.params {
+        // For instance methods where the first parameter is self, skip it since
+        // the JVM receiver is implicit in invokevirtual/invokeinterface.
+        let has_self = !self.is_static && !self.params.is_empty() && {
+            matches!(
+                &self.params[0].1,
+                Type::Class(_) | Type::Interface(_) | Type::MutableReference(_)
+            )
+        };
+        let params_to_iterate = if has_self {
+            &self.params[1..]
+        } else {
+            &self.params[..]
+        };
+        for (_param_name, param_type) in params_to_iterate {
             result.push_str(&param_type.to_jvm_descriptor());
         }
         result.push(')');
@@ -342,7 +379,7 @@ pub enum Instruction {
         args: Vec<Operand>,   // Arguments to the function
     },
     InvokeInterface {
-        class_name: String,   // JVM class name (e.g., MyStruct)
+        class_name: String,   // JVM interface name (e.g., MyTrait)
         method_name: String,  // Name of the method to call
         method_ty: Signature, // Signature of the method (input/output types)
         args: Vec<Operand>,   // Arguments to the function
@@ -724,7 +761,10 @@ impl Type {
             Type::String => "Ljava/lang/String;".to_string(),
             Type::Class(name) | Type::Interface(name) => format!("L{};", name.replace('.', "/")),
             Type::Reference(inner) => inner.to_jvm_descriptor(),
-            Type::Array(element_type) | Type::MutableReference(element_type) => {
+            Type::MutableReference(inner) => {
+                format!("[{}", inner.to_jvm_descriptor())
+            }
+            Type::Array(element_type) => {
                 format!("[{}", element_type.to_jvm_descriptor())
             }
         }
@@ -935,16 +975,18 @@ impl Type {
     }
 
     /// Recursively replaces all occurrences of `Type::Class(old_name)` with `Type::Class(new_name)`.
-    pub fn replace_class(&mut self, old_name: &str, new_name: &str) {
+    pub fn replace_class(&mut self, old_name: &str, new_name: &str) -> bool {
         match self {
             Type::Class(name) | Type::Interface(name) => {
                 if name == old_name {
                     *name = new_name.to_string();
+                    return true;
                 }
+                false
             }
             // Handle nested types recursively
             Type::MutableReference(inner) | Type::Reference(inner) | Type::Array(inner) => {
-                inner.replace_class(old_name, new_name);
+                inner.replace_class(old_name, new_name)
             }
             // Primitive types, Void, and String are unaffected
             Type::Void
@@ -958,7 +1000,23 @@ impl Type {
             | Type::F64
             | Type::String => {
                 // No class names to replace here
+                false
             }
+        }
+    }
+
+    /// Gets the name of the class to call methods on, if applicable.
+    pub fn get_class_name(&self) -> Option<&str> {
+        breadcrumbs::log!(
+            LogLevel::Info,
+            "class_name_fetching",
+            format!("Fetching class name for type: {:?}", self)
+        );
+        match self {
+            Type::Class(name) | Type::Interface(name) => Some(name),
+            Type::String => Some("org/rustlang/primitives/RustString"),
+            Type::Array(inner) | Type::MutableReference(inner) => inner.get_class_name(),
+            _ => None,
         }
     }
 }
@@ -966,7 +1024,20 @@ impl Type {
 impl fmt::Display for Signature {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "(")?;
-        for (_param_name, param_ty) in &self.params {
+        // For instance methods where the first parameter is self, skip it since
+        // the JVM receiver is implicit in invokevirtual/invokeinterface.
+        let has_self = !self.is_static && !self.params.is_empty() && {
+            matches!(
+                &self.params[0].1,
+                Type::Class(_) | Type::Interface(_) | Type::MutableReference(_)
+            )
+        };
+        let params_to_iterate = if has_self {
+            &self.params[1..]
+        } else {
+            &self.params[..]
+        };
+        for (_param_name, param_ty) in params_to_iterate {
             write!(f, "{}", param_ty.to_jvm_descriptor())?;
         }
         write!(f, "){}", self.ret.to_jvm_descriptor())

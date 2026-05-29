@@ -13,16 +13,53 @@ use rustc_middle::{
         BasicBlock, BasicBlockData, Body, Local, Operand as MirOperand, Place, StatementKind,
         TerminatorKind,
     },
-    ty::{Instance, TyCtxt},
+    ty::{Instance, TyCtxt, TyKind, TypingEnv},
 };
 use std::collections::HashMap;
 
-mod checked_ops;
 mod checked_intrinsic_registry;
 pub mod checked_intrinsics;
+mod checked_ops;
 mod rvalue;
 
 pub use checked_intrinsic_registry::take_needed_intrinsics;
+
+fn tracked_string_for_mir_operand(
+    operand: &MirOperand<'_>,
+    local_string_values: &HashMap<Local, String>,
+) -> Option<String> {
+    match operand {
+        MirOperand::Copy(place) | MirOperand::Move(place) if place.projection.is_empty() => {
+            local_string_values.get(&place.local).cloned()
+        }
+        _ => None,
+    }
+}
+
+fn infer_string_value(
+    rvalue: &rustc_middle::mir::Rvalue<'_>,
+    source_operand: &oomir::Operand,
+    local_string_values: &HashMap<Local, String>,
+) -> Option<String> {
+    if let oomir::Operand::Constant(oomir::Constant::String(value)) = source_operand {
+        return Some(value.clone());
+    }
+
+    match rvalue {
+        rustc_middle::mir::Rvalue::Use(operand, _)
+        | rustc_middle::mir::Rvalue::Cast(_, operand, _) => {
+            tracked_string_for_mir_operand(operand, local_string_values)
+        }
+        rustc_middle::mir::Rvalue::RawPtr(_, place)
+        | rustc_middle::mir::Rvalue::Ref(_, _, place) => {
+            local_string_values.get(&place.local).cloned()
+        }
+        rustc_middle::mir::Rvalue::Aggregate(_, operands) => operands
+            .iter()
+            .find_map(|operand| tracked_string_for_mir_operand(operand, local_string_values)),
+        _ => None,
+    }
+}
 
 /// Convert a single MIR basic block into an OOMIR basic block.
 pub fn convert_basic_block<'tcx>(
@@ -40,11 +77,17 @@ pub fn convert_basic_block<'tcx>(
     let mut instructions = Vec::new();
     let mut mutable_borrow_arrays: HashMap<Local, (Place<'tcx>, String, oomir::Type)> =
         HashMap::new();
+    let mut local_string_values: HashMap<Local, String> = HashMap::new();
 
     // Convert each MIR statement in the block.
     for stmt in &bb_data.statements {
         match &stmt.kind {
             StatementKind::Assign(box (place, rvalue)) => {
+                breadcrumbs::log!(
+                    breadcrumbs::LogLevel::Info,
+                    "mir-lowering",
+                    format!("Assign statement: place={:?}, rvalue={:?}", place, rvalue)
+                );
                 // 1. Evaluate the Rvalue to get the source operand and temp instructions
                 let (rvalue_instructions, source_operand) = rvalue::convert_rvalue_to_operand(
                     // Call the refactored function
@@ -55,48 +98,90 @@ pub fn convert_basic_block<'tcx>(
                 // Add instructions needed to calculate the Rvalue
                 instructions.extend(rvalue_instructions);
 
+                let tracked_string_value =
+                    infer_string_value(rvalue, &source_operand, &local_string_values);
+
+                if let rustc_middle::mir::Rvalue::Aggregate(_, operands) = rvalue
+                    && let oomir::Operand::Variable {
+                        name: args_object,
+                        ty: oomir::Type::Class(class_name),
+                    } = &source_operand
+                    && class_name == "Arguments__"
+                    && let Some(message) = operands.iter().find_map(|operand| {
+                        tracked_string_for_mir_operand(operand, &local_string_values)
+                    })
+                {
+                    instructions.push(oomir::Instruction::SetField {
+                        object: args_object.clone(),
+                        field_name: "message".to_string(),
+                        value: oomir::Operand::Constant(oomir::Constant::String(message)),
+                        field_ty: oomir::Type::String,
+                        owner_class: class_name.clone(),
+                    });
+                }
+
                 if let rustc_middle::mir::Rvalue::Ref(
                     _,
                     rustc_middle::mir::BorrowKind::Mut { .. },
                     borrowed_place,
                 ) = rvalue
                 {
-                    // Check if the destination is a simple local (most common case for &mut assignment)
-                    if place.projection.is_empty() {
-                        if let oomir::Operand::Variable {
-                            name: array_var_name,
-                            ty: array_ty,
-                        } = &source_operand
-                        {
-                            // Extract element type from array type
-                            if let oomir::Type::MutableReference(element_ty) = array_ty {
-                                breadcrumbs::log!(
-                                    breadcrumbs::LogLevel::Info,
-                                    "mir-lowering",
-                                    format!(
-                                        "Info: Tracking mutable borrow array for place {:?} stored in local {:?}. Original: {:?}, ArrayVar: {}, ElementTy: {:?}",
-                                        place,
-                                        place.local,
-                                        borrowed_place,
-                                        array_var_name,
-                                        element_ty
-                                    )
-                                );
-                                mutable_borrow_arrays.insert(
-                                    place.local, // The local holding the array reference (e.g., _3)
-                                    (
-                                        borrowed_place.clone(), // The original place borrowed (e.g., _1)
-                                        array_var_name.clone(), // The OOMIR name of the array var (e.g., "3_tmp0")
-                                        *element_ty.clone(), // The type of the element in the array
-                                    ),
-                                );
+                    let dest_ty = place.ty(&mir.local_decls, tcx).ty;
+                    let borrowed_is_trait_object = match dest_ty.kind() {
+                        rustc_middle::ty::TyKind::Ref(_, pointee_ty, _) => {
+                            matches!(pointee_ty.kind(), rustc_middle::ty::TyKind::Dynamic(_, _))
+                        }
+                        _ => false,
+                    };
+                    if borrowed_is_trait_object {
+                        // Trait objects do not use the MutableReference array wrapper
+                    } else {
+                        // Check if the destination is a simple local (most common case for &mut assignment)
+                        if place.projection.is_empty() {
+                            if let oomir::Operand::Variable {
+                                name: array_var_name,
+                                ty: array_ty,
+                            } = &source_operand
+                            {
+                                // Extract element type from array type
+                                if let oomir::Type::MutableReference(element_ty) = array_ty {
+                                    breadcrumbs::log!(
+                                        breadcrumbs::LogLevel::Info,
+                                        "mir-lowering",
+                                        format!(
+                                            "Info: Tracking mutable borrow array for place {:?} stored in local {:?}. Original: {:?}, ArrayVar: {}, ElementTy: {:?}",
+                                            place,
+                                            place.local,
+                                            borrowed_place,
+                                            array_var_name,
+                                            element_ty
+                                        )
+                                    );
+                                    mutable_borrow_arrays.insert(
+                                        place.local, // The local holding the array reference (e.g., _3)
+                                        (
+                                            borrowed_place.clone(), // The original place borrowed (e.g., _1)
+                                            array_var_name.clone(), // The OOMIR name of the array var (e.g., "3_tmp0")
+                                            *element_ty.clone(), // The type of the element in the array
+                                        ),
+                                    );
+                                } else {
+                                    breadcrumbs::log!(
+                                        breadcrumbs::LogLevel::Warn,
+                                        "mir-lowering",
+                                        format!(
+                                            "Warning: Expected type for mutable borrow ref, found {:?}",
+                                            array_ty
+                                        )
+                                    );
+                                }
                             } else {
                                 breadcrumbs::log!(
                                     breadcrumbs::LogLevel::Warn,
                                     "mir-lowering",
                                     format!(
-                                        "Warning: Expected type for mutable borrow ref, found {:?}",
-                                        array_ty
+                                        "Warning: Expected variable operand for mutable borrow ref assignment result, found {:?}",
+                                        source_operand
                                     )
                                 );
                             }
@@ -105,20 +190,11 @@ pub fn convert_basic_block<'tcx>(
                                 breadcrumbs::LogLevel::Warn,
                                 "mir-lowering",
                                 format!(
-                                    "Warning: Expected variable operand for mutable borrow ref assignment result, found {:?}",
-                                    source_operand
+                                    "Warning: Mutable borrow assigned to complex place {:?}, write-back might not work correctly.",
+                                    place
                                 )
                             );
                         }
-                    } else {
-                        breadcrumbs::log!(
-                            breadcrumbs::LogLevel::Warn,
-                            "mir-lowering",
-                            format!(
-                                "Warning: Mutable borrow assigned to complex place {:?}, write-back might not work correctly.",
-                                place
-                            )
-                        );
                     }
                 }
 
@@ -134,10 +210,16 @@ pub fn convert_basic_block<'tcx>(
 
                 // Add the final assignment instructions (Move, SetField, ArrayStore)
                 instructions.extend(assignment_instructions);
+
+                if place.projection.is_empty() {
+                    if let Some(value) = tracked_string_value {
+                        local_string_values.insert(place.local, value);
+                    } else {
+                        local_string_values.remove(&place.local);
+                    }
+                }
             }
-            StatementKind::StorageLive(_)
-            | StatementKind::StorageDead(_)
-            | StatementKind::Retag(_, _) => {
+            StatementKind::StorageLive(_) | StatementKind::StorageDead(_) => {
                 // no-op, currently
             }
             StatementKind::Nop => {
@@ -237,260 +319,326 @@ pub fn convert_basic_block<'tcx>(
                 target,
                 ..
             } => {
-                breadcrumbs::log!(
-                    breadcrumbs::LogLevel::Info,
-                    "mir-lowering",
-                    format!("the function name is {:?}", func)
-                );
-
-                // Try to detect if this is a closure call
-                let (function_name, is_closure_call) = if let Some(closure_info) =
-                    super::closures::extract_closure_info(func, tcx)
-                {
-                    // This is a closure call - generate the proper closure function name
-                    (
-                        super::closures::generate_closure_function_name(
+                // --- Argument Processing ---
+                let mut pre_call_instructions = Vec::new();
+                let oomir_operands: Vec<oomir::Operand> = args
+                    .iter()
+                    .map(|arg| {
+                        convert_operand(
+                            &arg.node,
                             tcx,
-                            closure_info.closure_def_id,
-                        ),
-                        true,
+                            instance,
+                            mir,
+                            data_types,
+                            &mut pre_call_instructions,
+                        )
+                    })
+                    .collect();
+                instructions.extend(pre_call_instructions);
+
+                let dest_var_name = destination
+                    .projection
+                    .is_empty()
+                    .then(|| format!("_{}", destination.local.index()));
+
+                // --- Call Type Dispatch ---
+                let func_ty = func.ty(mir, tcx);
+                if let rustc_middle::ty::TyKind::FnDef(def_id, substs) = func_ty.kind() {
+                    // Resolve the instance
+                    let func_instance = rustc_middle::ty::Instance::resolve_for_fn_ptr(
+                        tcx,
+                        TypingEnv::post_analysis(tcx, mir.source.def_id()),
+                        *def_id,
+                        substs,
                     )
-                } else {
-                    // Regular function or generic instantiation
-                    if let rustc_middle::mir::Operand::Constant(box c) = func {
-                        let fn_ty = c.const_.ty();
-                        if let rustc_middle::ty::TyKind::FnDef(def_id, args) = fn_ty.kind() {
-                            breadcrumbs::log!(
-                                breadcrumbs::LogLevel::Info,
-                                "mir-lowering",
-                                format!(
-                                    "FnDef detected: def_id={:?}, is_local={}, args={:?}",
-                                    def_id,
-                                    def_id.is_local(),
-                                    args
-                                )
-                            );
-                            if def_id.is_local() {
-                                // Check if this is a trait method call
-                                if let Some(assoc_item) = tcx.opt_associated_item(*def_id) {
-                                    breadcrumbs::log!(
-                                        breadcrumbs::LogLevel::Info,
-                                        "mir-lowering",
-                                        format!(
-                                            "Associated item found: {:?}, trait_item_def_id={:?}, container={:?}",
-                                            assoc_item,
-                                            assoc_item.trait_item_def_id(),
-                                            assoc_item.container
-                                        )
-                                    );
-                                    // Check if this is a trait method (check if parent is a trait)
-                                    let is_trait_method = tcx.is_trait(tcx.parent(*def_id));
+                    .unwrap();
 
-                                    if is_trait_method {
-                                        // Trait method call: check if it's monomorphized to a concrete type
-                                        if let Some(first_arg) = args.get(0) {
-                                            if let Some(ty) = first_arg.as_type() {
-                                                // Check if it's NOT a trait object (dyn Trait)
-                                                if !matches!(
-                                                    ty.kind(),
-                                                    rustc_middle::ty::TyKind::Dynamic(..)
-                                                ) {
-                                                    // Concrete type - use Type_method naming
-                                                    let type_name = super::types::ty_to_oomir_type(
-                                                        ty,
-                                                        tcx,
-                                                        &mut Default::default(),
-                                                        instance,
-                                                    );
-                                                    let method_name =
-                                                        tcx.item_name(*def_id).to_string();
-                                                    // Extract class name from Type
-                                                    let class_name = match type_name {
-                                                        oomir::Type::Class(name) => name,
-                                                        oomir::Type::Reference(
-                                                            box oomir::Type::Class(name),
-                                                        ) => name,
-                                                        oomir::Type::MutableReference(
-                                                            box oomir::Type::Class(name),
-                                                        ) => name,
-                                                        _ => {
-                                                            // Fallback for unexpected types
-                                                            format!("{:?}", type_name)
-                                                        }
-                                                    };
-                                                    let full_name =
-                                                        format!("{}_{}", class_name, method_name);
-                                                    breadcrumbs::log!(
-                                                        breadcrumbs::LogLevel::Info,
-                                                        "mir-lowering",
-                                                        format!(
-                                                            "Trait method call with concrete type: def_id={:?}, ty={:?}, using name: {}",
-                                                            def_id, ty, full_name
-                                                        )
-                                                    );
-                                                    (full_name, false)
-                                                } else {
-                                                    // Dynamic trait object - use dyn_Trait_method naming
-                                                    let trait_name =
-                                                        if let rustc_middle::ty::TyKind::Dynamic(
-                                                            preds,
-                                                            _,
-                                                        ) = ty.kind()
-                                                        {
-                                                            // Extract trait name from trait object
-                                                            if let Some(principal) =
-                                                                preds.principal()
-                                                            {
-                                                                let trait_ref =
-                                                                    principal.skip_binder();
-                                                                tcx.item_name(trait_ref.def_id)
-                                                                    .to_string()
-                                                            } else {
-                                                                "Unknown".to_string()
-                                                            }
-                                                        } else {
-                                                            "Unknown".to_string()
-                                                        };
-                                                    let method_name =
-                                                        tcx.item_name(*def_id).to_string();
-                                                    let full_name = format!(
-                                                        "dyn_{}_{}",
-                                                        trait_name, method_name
-                                                    );
-                                                    breadcrumbs::log!(
-                                                        breadcrumbs::LogLevel::Info,
-                                                        "mir-lowering",
-                                                        format!(
-                                                            "Trait method call with dyn trait object, using name: {}",
-                                                            full_name
-                                                        )
-                                                    );
-                                                    (full_name, false)
-                                                }
-                                            } else {
-                                                // No type in args, use monomorphized name
-                                                (
-                                                    super::naming::mono_fn_name_from_call_operand(
-                                                        func, tcx, instance,
-                                                    )
-                                                    .unwrap(),
-                                                    false,
-                                                )
-                                            }
-                                        } else {
-                                            // No args, use monomorphized name
-                                            (
-                                                super::naming::mono_fn_name_from_call_operand(
-                                                    func, tcx, instance,
-                                                )
-                                                .unwrap(),
-                                                false,
-                                            )
-                                        }
-                                    } else {
-                                        // Not a trait method, use monomorphized name
-                                        (
-                                            super::naming::mono_fn_name_from_call_operand(
-                                                func, tcx, instance,
-                                            )
-                                            .unwrap(),
-                                            false,
-                                        )
-                                    }
-                                } else {
-                                    // Not an associated item, use monomorphized name
-                                    (
-                                        super::naming::mono_fn_name_from_call_operand(
-                                            func, tcx, instance,
-                                        )
-                                        .unwrap(),
-                                        false,
-                                    )
-                                }
+                    let instance_ty = tcx
+                        .type_of(func_instance.def_id())
+                        .instantiate(tcx, func_instance.args)
+                        .skip_norm_wip();
+                    let (fn_inputs, fn_output) = match instance_ty.kind() {
+                        TyKind::Closure(_, args) => {
+                            let sig = args.as_closure().sig();
+                            (
+                                sig.inputs().skip_binder().to_vec(),
+                                sig.output().skip_binder(),
+                            )
+                        }
+                        _ => {
+                            let sig = instance_ty.fn_sig(tcx).skip_binder();
+                            (sig.inputs().to_vec(), sig.output())
+                        }
+                    };
+
+                    let oomir_output_type =
+                        super::types::ty_to_oomir_type(fn_output, tcx, data_types, instance);
+
+                    let effective_dest = if matches!(oomir_output_type, oomir::Type::Void) {
+                        None
+                    } else {
+                        dest_var_name.clone()
+                    };
+
+                    let oomir_input_types: Vec<oomir::Type> = fn_inputs
+                        .iter()
+                        .map(|ty| super::types::ty_to_oomir_type(*ty, tcx, data_types, instance))
+                        .collect();
+
+                    let oomir_params: Vec<(String, oomir::Type)> = oomir_input_types
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, ty)| (format!("arg{}", i), ty))
+                        .collect();
+
+                    let mut method_signature = oomir::Signature {
+                        params: oomir_params,
+                        ret: Box::new(oomir_output_type),
+                        is_static: false,
+                    };
+
+                    let assoc_item = tcx.opt_associated_item(func_instance.def_id());
+
+                    if let Some(item) = assoc_item {
+                        if item.is_method() {
+                            // --- Instance Method (has 'self') ---
+                            let receiver_mir_ty = args[0].node.ty(mir, tcx);
+                            let receiver_operand = oomir_operands[0].clone();
+
+                            // Keep the self parameter in the signature. Signature::to_string()
+                            // is responsible for omitting the implicit JVM receiver.
+                            method_signature.is_static = false;
+
+                            // Separate args for InvokeInterface/InvokeVirtual (receiver handled via 'operand')
+                            let method_args = oomir_operands[1..].to_vec();
+                            let method_name = tcx.item_name(func_instance.def_id()).to_string();
+
+                            if let rustc_middle::ty::TyKind::Dynamic(preds, ..) =
+                                receiver_mir_ty.kind()
+                            {
+                                let principal = preds.principal().unwrap().skip_binder();
+                                let trait_name = tcx.def_path_str(principal.def_id);
+
+                                instructions.push(oomir::Instruction::InvokeInterface {
+                                    class_name: make_jvm_safe(&trait_name),
+                                    method_name,
+                                    method_ty: method_signature,
+                                    args: method_args,
+                                    dest: effective_dest,
+                                    operand: receiver_operand,
+                                });
                             } else {
-                                // External function: check for special cases, otherwise use path-based key for shims
-                                let def_path = tcx.def_path_str(*def_id);
+                                // Check if this method is declared in a trait (interface)
+                                let container_id = item.container_id(tcx);
+                                let is_trait_method = matches!(
+                                    tcx.def_kind(container_id),
+                                    rustc_hir::def::DefKind::Trait
+                                );
 
-                                // Special case: core::str::<impl str>::len maps to our Kotlin shim's len method
-                                if def_path.contains("::str::") && def_path.ends_with("::len") {
-                                    ("len".to_string(), false)
+                                // Check if the receiver operand is an interface type (after any casts)
+                                let receiver_oomir_ty = receiver_operand.get_type();
+
+                                // Use InvokeInterface if:
+                                // 1. The receiver type is explicitly an Interface type, OR
+                                // 2. The method is declared in a trait (which maps to an interface)
+                                let use_interface =
+                                    if let Some(oomir::Type::Interface(interface_name)) =
+                                        receiver_oomir_ty
+                                    {
+                                        Some(interface_name.clone())
+                                    } else if is_trait_method {
+                                        // Get the trait name and convert to interface name
+                                        let trait_name = tcx.def_path_str(container_id);
+                                        Some(make_jvm_safe(&trait_name))
+                                    } else {
+                                        None
+                                    };
+
+                                if let Some(interface_name) = use_interface {
+                                    // The method is from an interface - use InvokeInterface
+                                    instructions.push(oomir::Instruction::InvokeInterface {
+                                        class_name: interface_name,
+                                        method_name,
+                                        method_ty: method_signature,
+                                        args: method_args,
+                                        dest: effective_dest,
+                                        operand: receiver_operand,
+                                    });
                                 } else {
-                                    (make_jvm_safe(format!("{:?}", func).as_str()), false)
+                                    // The receiver is a concrete class - use InvokeVirtual
+                                    let class_type = super::types::ty_to_oomir_type(
+                                        receiver_mir_ty,
+                                        tcx,
+                                        data_types,
+                                        instance,
+                                    );
+                                    let primitive_shim_class = match &class_type {
+                                        oomir::Type::String => {
+                                            Some("org/rustlang/primitives/RustString".to_string())
+                                        }
+                                        oomir::Type::F32 => {
+                                            Some("org/rustlang/primitives/F32".to_string())
+                                        }
+                                        oomir::Type::F64 => {
+                                            Some("org/rustlang/primitives/F64".to_string())
+                                        }
+                                        oomir::Type::Array(inner)
+                                            if matches!(inner.as_ref(), oomir::Type::I16)
+                                                && method_name == "starts_with" =>
+                                        {
+                                            Some("org/rustlang/core/Core".to_string())
+                                        }
+                                        _ => None,
+                                    };
+
+                                    if let Some(class_name) = primitive_shim_class {
+                                        let mut static_signature = method_signature;
+                                        static_signature.is_static = true;
+                                        instructions.push(oomir::Instruction::InvokeStatic {
+                                            class_name,
+                                            method_name,
+                                            method_ty: static_signature,
+                                            args: oomir_operands.clone(),
+                                            dest: effective_dest,
+                                        });
+                                    } else {
+                                        let class_name_opt = class_type
+                                            .get_class_name()
+                                            .map(|s| s.to_string())
+                                            .or_else(|| {
+                                                Some(format!(
+                                                    "org/rustlang/primitives/{}",
+                                                    make_jvm_safe(&format!("{:?}", class_type))
+                                                ))
+                                            });
+
+                                        instructions.push(oomir::Instruction::InvokeVirtual {
+                                            class_name: class_name_opt.unwrap(),
+                                            method_name,
+                                            method_ty: method_signature,
+                                            args: method_args,
+                                            dest: effective_dest,
+                                            operand: receiver_operand,
+                                        });
+                                    }
                                 }
                             }
                         } else {
-                            (make_jvm_safe(format!("{:?}", func).as_str()), false)
+                            // --- Associated Static Function (NO 'self') ---
+                            let method_name = tcx.item_name(func_instance.def_id()).to_string();
+                            method_signature.is_static = true;
+
+                            let container_id = item.container_id(tcx);
+                            let self_ty_opt = if matches!(
+                                tcx.def_kind(container_id),
+                                rustc_hir::def::DefKind::Impl { .. }
+                            ) {
+                                Some(
+                                    tcx.type_of(container_id)
+                                        .instantiate(tcx, func_instance.args)
+                                        .skip_norm_wip(),
+                                )
+                            } else {
+                                func_instance.args.types().next()
+                            };
+
+                            let mut generated = false;
+                            if let Some(self_ty) = self_ty_opt {
+                                let class_type = super::types::ty_to_oomir_type(
+                                    self_ty, tcx, data_types, instance,
+                                );
+
+                                if let Some(class_name) = class_type.get_class_name() {
+                                    instructions.push(oomir::Instruction::InvokeStatic {
+                                        class_name: class_name.to_string(),
+                                        method_name: method_name.clone(),
+                                        method_ty: method_signature.clone(),
+                                        args: oomir_operands.clone(),
+                                        dest: effective_dest.clone(), // use effective_dest
+                                    });
+                                    generated = true;
+                                }
+                            }
+
+                            if !generated {
+                                instructions.push(oomir::Instruction::Call {
+                                    function: method_name,
+                                    args: oomir_operands.clone(),
+                                    dest: effective_dest, // use effective_dest
+                                });
+                            }
                         }
                     } else {
-                        (make_jvm_safe(format!("{:?}", func).as_str()), false)
+                        // --- Free Function ---
+                        let is_closure_call = matches!(instance_ty.kind(), TyKind::Closure(..));
+                        let function = if is_closure_call {
+                            super::generate_closure_function_name(tcx, func_instance.def_id())
+                        } else {
+                            super::naming::mono_fn_name_from_instance(tcx, func_instance)
+                                .method_name
+                        };
+                        let call_args = if is_closure_call && !oomir_operands.is_empty() {
+                            let closure_has_captures = match oomir_operands[0].get_type() {
+                                Some(ty) => ty
+                                    .get_class_name()
+                                    .and_then(|class_name| data_types.get(class_name))
+                                    .is_some_and(|data_type| {
+                                        matches!(
+                                            data_type,
+                                            oomir::DataType::Class { fields, .. } if !fields.is_empty()
+                                        )
+                                    }),
+                                None => false,
+                            };
+
+                            if closure_has_captures {
+                                oomir_operands.clone()
+                            } else {
+                                oomir_operands[1..].to_vec()
+                            }
+                        } else {
+                            oomir_operands.clone()
+                        };
+                        method_signature.is_static = true;
+
+                        instructions.push(oomir::Instruction::Call {
+                            function,
+                            args: call_args,
+                            dest: effective_dest, // use effective_dest
+                        });
                     }
-                };
-
-                // --- Track Argument Origins ---
-                // Store tuples: (Maybe Original MIR Place of Arg, OOMIR Operand for Arg)
-                let mut processed_args: Vec<(Option<Place<'tcx>>, oomir::Operand)> = Vec::new();
-                let mut pre_call_instructions = Vec::new(); // Instructions needed *before* the call for args
-
-                // For closure calls, skip the first argument (the closure itself)
-                // The MIR representation of closure.call((args)) is Fn::call(&closure, (args))
-                // We only want to pass (args) to the lowered closure function
-                let args_to_process = if is_closure_call && !args.is_empty() {
-                    &args[1..] // Skip the first argument (the closure reference)
                 } else {
-                    args
-                };
+                    // Fallback for function pointers
+                    let legacy_name = make_jvm_safe(format!("{:?}", func).as_str());
+                    instructions.push(oomir::Instruction::Call {
+                        dest: dest_var_name, // Note: Function pointers might also need Void check eventually
+                        function: legacy_name,
+                        args: oomir_operands.clone(),
+                    });
+                }
 
-                for arg in args_to_process {
-                    let mir_op = &arg.node;
-                    // Important: Pass pre_call_instructions here to collect setup code for this arg
-                    let oomir_op = convert_operand(
-                        mir_op,
-                        tcx,
-                        instance,
-                        mir,
-                        data_types,
-                        &mut pre_call_instructions,
-                    );
+                // --- Post-call Logic (Unchanged) ---
+                let mut write_back_instrs = Vec::new();
 
-                    // Identify if the MIR operand is a direct use of a local Place
-                    let maybe_arg_place = match mir_op {
-                        MirOperand::Move(p) | MirOperand::Copy(p) if p.projection.is_empty() => {
-                            Some(p.clone())
+                let mut operand_to_place_map = HashMap::new();
+                for (mir_arg, oomir_op) in args.iter().zip(oomir_operands.iter()) {
+                    if let MirOperand::Move(p) | MirOperand::Copy(p) = &mir_arg.node {
+                        if p.projection.is_empty() {
+                            operand_to_place_map.insert(oomir_op.clone(), p.clone());
                         }
+                    }
+                }
+
+                for (mir_arg, oomir_arg_operand) in args.iter().zip(oomir_operands.iter()) {
+                    let maybe_arg_place: Option<Place<'tcx>> = match &mir_arg.node {
+                        MirOperand::Move(p) | MirOperand::Copy(p) => Some(p.clone()),
                         _ => None,
                     };
-                    processed_args.push((maybe_arg_place, oomir_op));
-                }
-                // Add instructions needed to prepare arguments *before* the call
-                instructions.extend(pre_call_instructions);
 
-                // Collect just the OOMIR operands for the call itself
-                let oomir_args: Vec<oomir::Operand> =
-                    processed_args.iter().map(|(_, op)| op.clone()).collect();
-
-                // Determine destination OOMIR variable name (if any)
-                let dest_var_name = destination.projection.is_empty()
-                    .then(|| format!("_{}", destination.local.index()))
-                    .or_else(|| {
-                         breadcrumbs::log!(breadcrumbs::LogLevel::Warn, "mir-lowering", format!("Warning: Call destination {:?} is complex, return value might be lost.", destination));
-                         None // Handle complex destinations if needed later
-                    });
-
-                // --- Emit the Call Instruction ---
-                instructions.push(oomir::Instruction::Call {
-                    dest: dest_var_name,
-                    function: function_name,
-                    args: oomir_args,
-                });
-
-                let mut write_back_instrs = Vec::new();
-                for (maybe_arg_place, oomir_arg_operand) in &processed_args {
                     if let Some(arg_place) = maybe_arg_place {
-                        // Check if the local used for this argument is one we tracked as a mutable borrow array
                         if let Some((original_place, array_var_name, element_ty)) =
                             mutable_borrow_arrays.get(&arg_place.local)
                         {
-                            // Double-check if the operand passed was indeed the variable we expected
                             if let oomir::Operand::Variable { .. } = oomir_arg_operand {
                                 breadcrumbs::log!(
                                     breadcrumbs::LogLevel::Info,
@@ -501,30 +649,26 @@ pub fn convert_basic_block<'tcx>(
                                     )
                                 );
 
-                                // Create a temporary variable for the value read from the array
                                 let temp_writeback_var =
                                     format!("_writeback_{}", original_place.local.index());
 
-                                // 1. Get value from array (using the tracked array_var_name)
                                 let array_operand = oomir::Operand::Variable {
                                     name: array_var_name.clone(),
-                                    // Reconstruct array type for clarity (though not strictly needed by ArrayGet)
                                     ty: oomir::Type::Array(Box::new(element_ty.clone())),
                                 };
                                 write_back_instrs.push(oomir::Instruction::ArrayGet {
                                     dest: temp_writeback_var.clone(),
                                     array: array_operand,
-                                    index: oomir::Operand::Constant(oomir::Constant::I32(0)), // Always index 0
+                                    index: oomir::Operand::Constant(oomir::Constant::I32(0)),
                                 });
 
-                                // 2. Set value back to original place
                                 let value_to_set = oomir::Operand::Variable {
                                     name: temp_writeback_var,
-                                    ty: element_ty.clone(), // Use the tracked element type
+                                    ty: element_ty.clone(),
                                 };
                                 let set_instrs = emit_instructions_to_set_value(
-                                    original_place, // The original Place (_1)
-                                    value_to_set,   // The value read from the array
+                                    original_place,
+                                    value_to_set,
                                     tcx,
                                     instance,
                                     mir,
@@ -537,31 +681,11 @@ pub fn convert_basic_block<'tcx>(
                 }
                 instructions.extend(write_back_instrs);
 
-                // --- Add Jump to Target Block (if call returns) ---
                 if let Some(target_bb) = target {
                     let target_label = format!("bb{}", target_bb.index());
-                    breadcrumbs::log!(
-                        breadcrumbs::LogLevel::Info,
-                        "mir-lowering",
-                        format!(
-                            "Info: Adding Jump to {} after Call in bb{}",
-                            target_label,
-                            bb.index()
-                        )
-                    );
                     instructions.push(oomir::Instruction::Jump {
                         target: target_label,
                     });
-                } else {
-                    // Function diverges (e.g., panic!) - No jump needed.
-                    breadcrumbs::log!(
-                        breadcrumbs::LogLevel::Info,
-                        "mir-lowering",
-                        format!(
-                            "Info: Call in bb{} has no return target (diverges).",
-                            bb.index()
-                        )
-                    );
                 }
             }
             TerminatorKind::Assert {
@@ -755,7 +879,15 @@ pub fn convert_basic_block<'tcx>(
                     message: "Unreachable code reached".to_string(),
                 });
             }
-            // Other terminator kinds (like Resume, etc.) will be added as needed.
+            TerminatorKind::UnwindResume => {
+                // "Resume" implies we are in a cleanup block, we finished cleanup,
+                // and now we must continue unwinding (rethrow the exception).
+                instructions.push(oomir::Instruction::ThrowNewWithMessage {
+                    exception_class: "java/lang/RuntimeException".to_string(),
+                    message: "Panic unwinding resumed.".to_string(),
+                });
+            }
+            // Other terminator kinds will be added as needed.
             _ => {
                 breadcrumbs::log!(
                     breadcrumbs::LogLevel::Warn,

@@ -59,11 +59,13 @@ pub fn oomir_to_jvm_bytecode(
             let descriptor_index = main_cp.add_utf8(&function.signature.to_string())?;
 
             // Translate the function body using its own constant pool reference
+            // Free functions at module level don't have an owner class
             let translator = FunctionTranslator::new(
                 function,
                 &mut main_cp, // Use the main class's constant pool
                 module,
                 true,
+                None, // No owner class for free functions
             );
             let (jvm_code, max_locals_val) = translator.translate()?;
 

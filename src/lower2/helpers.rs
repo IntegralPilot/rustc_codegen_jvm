@@ -197,6 +197,38 @@ pub fn get_cast_instructions(
             if cn == BIG_DECIMAL_CLASS {
                 return prim_to_bigdec(src, cp);
             }
+            if cn == "java/lang/Object" {
+                let wrapper_method = match src {
+                    Type::Boolean => Some(("java/lang/Boolean", "(Z)Ljava/lang/Boolean;")),
+                    Type::Char => Some(("java/lang/Character", "(C)Ljava/lang/Character;")),
+                    Type::I8 | Type::I16 | Type::I32 => {
+                        Some(("java/lang/Integer", "(I)Ljava/lang/Integer;"))
+                    }
+                    Type::I64 => Some(("java/lang/Long", "(J)Ljava/lang/Long;")),
+                    Type::F32 => Some(("java/lang/Float", "(F)Ljava/lang/Float;")),
+                    Type::F64 => Some(("java/lang/Double", "(D)Ljava/lang/Double;")),
+                    _ => None,
+                };
+
+                if let Some((wrapper, descriptor)) = wrapper_method {
+                    let wrapper_idx = cp.add_class(wrapper)?;
+                    let mref = cp.add_method_ref(wrapper_idx, "valueOf", descriptor)?;
+                    return Ok(vec![JI::Invokestatic(mref)]);
+                }
+            }
+            if cn.starts_with("NonNull_") {
+                let class_idx = cp.add_class(cn)?;
+                let init = cp.add_method_ref(class_idx, "<init>", "()V")?;
+                let mut instrs = Vec::new();
+                match get_type_size(src) {
+                    2 => instrs.push(JI::Pop2),
+                    _ => instrs.push(JI::Pop),
+                }
+                instrs.push(JI::New(class_idx));
+                instrs.push(JI::Dup);
+                instrs.push(JI::Invokespecial(init));
+                return Ok(instrs);
+            }
         }
     }
 
@@ -261,60 +293,48 @@ pub fn get_cast_instructions(
             return Ok(vec![JI::Invokevirtual(mref)]);
         }
 
-        // String → short[]
-        if src == &Type::String && dest == &Type::Array(Box::new(Type::I16)) {
-            let core_idx = cp.add_class("org/rustlang/core/Core")?;
-            let mref = cp.add_method_ref(core_idx, "toShortArray", "(Ljava/lang/String;)[S")?;
-            return Ok(vec![Instruction::Invokestatic(mref)]);
+        if let Type::Class(cn) = dest {
+            if cn.starts_with("NonNull_") {
+                let class_idx = cp.add_class(cn)?;
+                let init = cp.add_method_ref(class_idx, "<init>", "()V")?;
+                return Ok(vec![
+                    JI::Pop,
+                    JI::New(class_idx),
+                    JI::Dup,
+                    JI::Invokespecial(init),
+                ]);
+            }
         }
 
-        // String → &[i16] (mutable reference to i16, actually means string-as-slice → short array)
-        // MutableReference(I16) maps to [S on JVM
-        // This happens in optimized panic formatting
-        if src == &Type::String && matches!(dest, Type::MutableReference(box Type::I16)) {
+        // String → short[] (also used for raw/slice pointer stand-ins).
+        if src == &Type::String
+            && (dest == &Type::Array(Box::new(Type::I16))
+                || dest == &Type::MutableReference(Box::new(Type::I16)))
+        {
             let core_idx = cp.add_class("org/rustlang/core/Core")?;
             let mref = cp.add_method_ref(core_idx, "toShortArray", "(Ljava/lang/String;)[S")?;
-            // Just convert to short array - same as String → Array(I16)
             return Ok(vec![Instruction::Invokestatic(mref)]);
         }
 
         // short[] → String
-        if src == &Type::Array(Box::new(Type::I16)) && dest == &Type::String {
+        if (src == &Type::Array(Box::new(Type::I16))
+            || src == &Type::MutableReference(Box::new(Type::I16)))
+            && dest == &Type::String
+        {
             let core_idx = cp.add_class("org/rustlang/core/Core")?;
             let mref = cp.add_method_ref(core_idx, "fromShortArray", "([S)Ljava/lang/String;")?;
             return Ok(vec![Instruction::Invokestatic(mref)]);
         }
 
         if let Type::MutableReference(box inner) = src {
-            if dest == inner {
-                return Ok(vec![Instruction::Iconst_0, Instruction::Aaload]);
-            }
-        }
-
-        // MutableReference(T) → NonNull<T> (wrapping a reference in NonNull class)
-        // NonNull has a single field 'pointer' of type MutableReference(T)
-        if let Type::MutableReference(box inner_src) = src {
-            if let Type::Class(class_name) = dest {
-                if class_name.starts_with("NonNull_") {
-                    // Construct NonNull object and set its pointer field
-                    let nonnull_idx = cp.add_class(class_name)?;
-                    let ctor = cp.add_method_ref(nonnull_idx, "<init>", "()V")?;
-                    
-                    // The field type is MutableReference(inner), which is [<inner_descriptor>
-                    let field_descriptor = format!("[{}", inner_src.to_jvm_descriptor());
-                    
-                    let field_idx = cp.add_field_ref(nonnull_idx, "pointer", &field_descriptor)?;
-                    
-                    return Ok(vec![
-                        JI::New(nonnull_idx),      // new NonNull
-                        JI::Dup,                   // dup for constructor
-                        JI::Invokespecial(ctor),   // call <init>
-                        JI::Dup_x1,                // stack: nonnull, value, nonnull
-                        JI::Swap,                  // stack: nonnull, nonnull, value
-                        JI::Putfield(field_idx),   // nonnull.pointer = value
-                    ]);
+            let mut instrs = vec![JI::Iconst_0, JI::Aaload];
+            if dest != inner {
+                if let Some(dest_name) = dest.to_jvm_descriptor_or_internal_name() {
+                    let dest_idx = cp.add_class(&dest_name)?;
+                    instrs.push(JI::Checkcast(dest_idx));
                 }
             }
+            return Ok(instrs);
         }
 
         // Generic checkcast for all other reference-to-reference
@@ -326,18 +346,6 @@ pub fn get_cast_instructions(
             let dest_idx = cp.add_class(&dest_name)?;
 
             return Ok(vec![JI::Checkcast(dest_idx)]);
-        }
-    }
-
-    // Special case: I32 → NonNull<T> (tagged pointer optimization from Rust)
-    // On JVM we can't represent tagged pointers, so we just push null
-    // This typically happens in optimized panic formatting code
-    if src.is_jvm_primitive_like() {
-        if let Type::Class(class_name) = dest {
-            if class_name.starts_with("NonNull_") {
-                // Pop the i32, push null
-                return Ok(vec![JI::Pop, JI::Aconst_null]);
-            }
         }
     }
 

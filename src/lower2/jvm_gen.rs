@@ -1,12 +1,15 @@
 // src/lower2/jvm_gen.rs
 
-use super::{FunctionTranslator, consts::load_constant};
-use crate::oomir::{self, DataTypeMethod, Signature, Type};
+use super::{
+    FunctionTranslator,
+    consts::{get_int_const_instr, load_constant},
+};
+use crate::oomir::{self, AdtHelperKind, DataTypeMethod, Signature, Type};
 
 use ristretto_classfile::{
     self as jvm, BaseType, ClassAccessFlags, ClassFile, ConstantPool, FieldAccessFlags,
     MethodAccessFlags, Version,
-    attributes::{Attribute, Instruction, MaxStack, InnerClass, NestedClassAccessFlags},
+    attributes::{Attribute, InnerClass, Instruction, MaxStack, NestedClassAccessFlags},
 };
 use std::collections::HashMap;
 
@@ -79,6 +82,105 @@ pub(super) fn oomir_type_to_ristretto_field_type(
             panic!("Void type cannot be used as a field type");
         }
     }
+}
+
+fn patch_branch_target(instructions: &mut [Instruction], branch_index: usize, target: u16) {
+    match &mut instructions[branch_index] {
+        Instruction::Ifeq(offset)
+        | Instruction::Ifne(offset)
+        | Instruction::If_icmpne(offset)
+        | Instruction::If_acmpne(offset) => *offset = target,
+        other => panic!("Cannot patch non-branch instruction: {:?}", other),
+    }
+}
+
+fn has_generated_eq(module: &oomir::Module, class_name: &str) -> bool {
+    match module.data_types.get(class_name) {
+        Some(oomir::DataType::Class { methods, .. }) => methods.contains_key("eq"),
+        Some(oomir::DataType::Interface { methods }) => methods.contains_key("eq"),
+        None => false,
+    }
+}
+
+fn append_boolean_false_check(instructions: &mut Vec<Instruction>, false_fixups: &mut Vec<usize>) {
+    false_fixups.push(instructions.len());
+    instructions.push(Instruction::Ifeq(0));
+}
+
+fn append_field_equality_check(
+    module: &oomir::Module,
+    cp: &mut ConstantPool,
+    instructions: &mut Vec<Instruction>,
+    false_fixups: &mut Vec<usize>,
+    variant_class_idx: u16,
+    field_name: &str,
+    field_ty: &Type,
+) -> jvm::Result<()> {
+    let field_ref =
+        cp.add_field_ref(variant_class_idx, field_name, &field_ty.to_jvm_descriptor())?;
+
+    instructions.push(Instruction::Aload_0);
+    instructions.push(Instruction::Checkcast(variant_class_idx));
+    instructions.push(Instruction::Getfield(field_ref));
+    instructions.push(Instruction::Aload_1);
+    instructions.push(Instruction::Checkcast(variant_class_idx));
+    instructions.push(Instruction::Getfield(field_ref));
+
+    match field_ty {
+        Type::I64 => {
+            instructions.push(Instruction::Lcmp);
+            false_fixups.push(instructions.len());
+            instructions.push(Instruction::Ifne(0));
+        }
+        Type::F32 => {
+            instructions.push(Instruction::Fcmpl);
+            false_fixups.push(instructions.len());
+            instructions.push(Instruction::Ifne(0));
+        }
+        Type::F64 => {
+            instructions.push(Instruction::Dcmpl);
+            false_fixups.push(instructions.len());
+            instructions.push(Instruction::Ifne(0));
+        }
+        Type::I8 | Type::I16 | Type::I32 | Type::Boolean | Type::Char => {
+            false_fixups.push(instructions.len());
+            instructions.push(Instruction::If_icmpne(0));
+        }
+        Type::String => {
+            let string_class_idx = cp.add_class("java/lang/String")?;
+            let equals_ref =
+                cp.add_method_ref(string_class_idx, "equals", "(Ljava/lang/Object;)Z")?;
+            instructions.push(Instruction::Invokevirtual(equals_ref));
+            append_boolean_false_check(instructions, false_fixups);
+        }
+        Type::Class(class_name) if has_generated_eq(module, class_name) => {
+            let class_idx = cp.add_class(class_name)?;
+            let eq_desc = format!("(L{};)Z", class_name);
+            let eq_ref = cp.add_method_ref(class_idx, "eq", &eq_desc)?;
+            instructions.push(Instruction::Invokevirtual(eq_ref));
+            append_boolean_false_check(instructions, false_fixups);
+        }
+        Type::Interface(interface_name) if has_generated_eq(module, interface_name) => {
+            let interface_idx = cp.add_class(interface_name)?;
+            let eq_desc = format!("(L{};)Z", interface_name);
+            let eq_ref = cp.add_interface_method_ref(interface_idx, "eq", &eq_desc)?;
+            instructions.push(Instruction::Invokeinterface(eq_ref, 2));
+            append_boolean_false_check(instructions, false_fixups);
+        }
+        Type::Class(_) | Type::Interface(_) => {
+            let object_class_idx = cp.add_class("java/lang/Object")?;
+            let equals_ref =
+                cp.add_method_ref(object_class_idx, "equals", "(Ljava/lang/Object;)Z")?;
+            instructions.push(Instruction::Invokevirtual(equals_ref));
+            append_boolean_false_check(instructions, false_fixups);
+        }
+        _ => {
+            false_fixups.push(instructions.len());
+            instructions.push(Instruction::If_acmpne(0));
+        }
+    }
+
+    Ok(())
 }
 
 /// Creates a ClassFile (as bytes) for a given OOMIR DataType that's a class
@@ -192,8 +294,18 @@ pub(super) fn create_data_type_classfile_for_class(
             }
             DataTypeMethod::Function(function) => {
                 // Translate the function body using its own constant pool reference
-                let translator =
-                    FunctionTranslator::new(function, &mut class_file.constant_pool, module, function.is_static);
+                let owner_class = if !function.signature.is_static {
+                    Some(class_name_jvm)
+                } else {
+                    None
+                };
+                let translator = FunctionTranslator::new(
+                    function,
+                    &mut class_file.constant_pool,
+                    module,
+                    function.signature.is_static,
+                    owner_class,
+                );
                 let (jvm_code, max_locals_val) = translator.translate()?;
 
                 let max_stack_val = jvm_code.max_stack(&class_file.constant_pool)?;
@@ -208,8 +320,21 @@ pub(super) fn create_data_type_classfile_for_class(
                 };
 
                 // Create MethodParameters attribute to preserve parameter names
+                // For instance methods where the first param is self, skip it as it's implicit in JVM
                 let mut parameters_for_attribute = Vec::new();
-                for (name, _) in &function.signature.params {
+                let has_self =
+                    !function.signature.is_static && !function.signature.params.is_empty() && {
+                        matches!(
+                            &function.signature.params[0].1,
+                            Type::Class(_) | Type::MutableReference(_)
+                        )
+                    };
+                let params_to_iterate = if has_self {
+                    &function.signature.params[1..]
+                } else {
+                    &function.signature.params[..]
+                };
+                for (name, _) in params_to_iterate {
                     let name_index = class_file.constant_pool.add_utf8(name)?;
                     parameters_for_attribute.push(jvm::attributes::MethodParameter {
                         name_index,
@@ -235,7 +360,7 @@ pub(super) fn create_data_type_classfile_for_class(
                 }
 
                 let mut access_flags = MethodAccessFlags::PUBLIC;
-                if function.is_static {
+                if function.signature.is_static {
                     access_flags |= MethodAccessFlags::STATIC;
                 }
                 let jvm_method = jvm::Method {
@@ -245,6 +370,220 @@ pub(super) fn create_data_type_classfile_for_class(
                     attributes: attributes_vec,
                 };
 
+                class_file.methods.push(jvm_method);
+            }
+            DataTypeMethod::AdtHelperMethod { kind } => {
+                let jvm_method = match kind {
+                    AdtHelperKind::IsVariant { variant_idx } => {
+                        // Signature: ()Z - returns boolean
+                        let method_desc = "()Z";
+                        let name_index = class_file.constant_pool.add_utf8(method_name)?;
+                        let descriptor_index = class_file.constant_pool.add_utf8(method_desc)?;
+
+                        // Get the getVariantIdx method reference on THIS class
+                        let this_class_idx = class_file.this_class;
+                        let get_variant_idx_ref = class_file.constant_pool.add_method_ref(
+                            this_class_idx,
+                            "getVariantIdx",
+                            "()I",
+                        )?;
+
+                        let idx = *variant_idx as u16;
+                        // Offsets are instruction indices, not byte offsets:
+                        // 0: aload_0
+                        // 1: invokevirtual - getVariantIdx()
+                        // 2: iconst_X     - push variant index to compare
+                        // 3: if_icmpne 6  - if not equal, jump to instruction 6 (iconst_0)
+                        // 4: iconst_1     - push true
+                        // 5: goto 7       - jump to instruction 7 (ireturn)
+                        // 6: iconst_0     - push false
+                        // 7: ireturn
+                        let push_iconst = match idx {
+                            0 => Instruction::Iconst_0,
+                            1 => Instruction::Iconst_1,
+                            2 => Instruction::Iconst_2,
+                            3 => Instruction::Iconst_3,
+                            4 => Instruction::Iconst_4,
+                            5 => Instruction::Iconst_5,
+                            _ => Instruction::Bipush(idx as i8),
+                        };
+
+                        let instructions = vec![
+                            Instruction::Aload_0,
+                            Instruction::Invokevirtual(get_variant_idx_ref),
+                            push_iconst,
+                            Instruction::If_icmpne(6), // Jump to instruction index 6
+                            Instruction::Iconst_1,
+                            Instruction::Goto(7), // Jump to instruction index 7
+                            Instruction::Iconst_0,
+                            Instruction::Ireturn,
+                        ];
+
+                        let max_stack = 2u16;
+                        let max_locals = 1u16;
+
+                        let code_attribute = Attribute::Code {
+                            name_index: class_file.constant_pool.add_utf8("Code")?,
+                            max_stack,
+                            max_locals,
+                            code: instructions,
+                            exception_table: Vec::new(),
+                            attributes: Vec::new(),
+                        };
+
+                        jvm::Method {
+                            access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::FINAL,
+                            name_index,
+                            descriptor_index,
+                            attributes: vec![code_attribute],
+                        }
+                    }
+                    AdtHelperKind::PartialEqEnum { variants } => {
+                        // Signature: (LObject;)Z - takes another enum instance, returns boolean
+                        let method_desc = format!("(L{};)Z", class_name_jvm);
+                        let name_index = class_file.constant_pool.add_utf8(method_name)?;
+                        let descriptor_index = class_file.constant_pool.add_utf8(&method_desc)?;
+
+                        // Get the getVariantIdx method reference on THIS class
+                        let this_class_idx = class_file.this_class;
+                        let get_variant_idx_ref = class_file.constant_pool.add_method_ref(
+                            this_class_idx,
+                            "getVariantIdx",
+                            "()I",
+                        )?;
+
+                        let mut instructions = vec![
+                            Instruction::Aload_0,
+                            Instruction::Invokevirtual(get_variant_idx_ref),
+                            Instruction::Aload_1,
+                            Instruction::Invokevirtual(get_variant_idx_ref),
+                        ];
+                        let mut false_fixups = vec![instructions.len()];
+                        instructions.push(Instruction::If_icmpne(0));
+
+                        for (variant_idx, (variant_name, fields)) in variants.iter().enumerate() {
+                            if fields.is_empty() {
+                                continue;
+                            }
+
+                            let variant_class_name = format!("{class_name_jvm}${variant_name}");
+                            if !module.data_types.contains_key(&variant_class_name) {
+                                continue;
+                            }
+
+                            instructions.push(Instruction::Aload_0);
+                            instructions.push(Instruction::Invokevirtual(get_variant_idx_ref));
+                            instructions.push(get_int_const_instr(
+                                &mut class_file.constant_pool,
+                                variant_idx as i32,
+                            ));
+                            let next_variant_fixup = instructions.len();
+                            instructions.push(Instruction::If_icmpne(0));
+
+                            let variant_class_idx =
+                                class_file.constant_pool.add_class(&variant_class_name)?;
+
+                            for (field_idx, field_ty) in fields.iter().enumerate() {
+                                append_field_equality_check(
+                                    module,
+                                    &mut class_file.constant_pool,
+                                    &mut instructions,
+                                    &mut false_fixups,
+                                    variant_class_idx,
+                                    &format!("field{field_idx}"),
+                                    field_ty,
+                                )?;
+                            }
+
+                            instructions.push(Instruction::Iconst_1);
+                            instructions.push(Instruction::Ireturn);
+
+                            let next_variant_target = instructions.len() as u16;
+                            patch_branch_target(
+                                &mut instructions,
+                                next_variant_fixup,
+                                next_variant_target,
+                            );
+                        }
+
+                        instructions.push(Instruction::Iconst_1);
+                        instructions.push(Instruction::Ireturn);
+
+                        let false_target = instructions.len() as u16;
+                        instructions.push(Instruction::Iconst_0);
+                        instructions.push(Instruction::Ireturn);
+
+                        for fixup in false_fixups {
+                            patch_branch_target(&mut instructions, fixup, false_target);
+                        }
+
+                        let max_stack = 4u16;
+                        let max_locals = 2u16;
+
+                        let code_attribute = Attribute::Code {
+                            name_index: class_file.constant_pool.add_utf8("Code")?,
+                            max_stack,
+                            max_locals,
+                            code: instructions,
+                            exception_table: Vec::new(),
+                            attributes: Vec::new(),
+                        };
+
+                        jvm::Method {
+                            access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::FINAL,
+                            name_index,
+                            descriptor_index,
+                            attributes: vec![code_attribute],
+                        }
+                    }
+                    AdtHelperKind::PartialEqClass { fields } => {
+                        let method_desc = format!("(L{};)Z", class_name_jvm);
+                        let name_index = class_file.constant_pool.add_utf8(method_name)?;
+                        let descriptor_index = class_file.constant_pool.add_utf8(&method_desc)?;
+
+                        let this_class_idx = class_file.this_class;
+                        let mut instructions = Vec::new();
+                        let mut false_fixups = Vec::new();
+
+                        for (field_name, field_ty) in fields {
+                            append_field_equality_check(
+                                module,
+                                &mut class_file.constant_pool,
+                                &mut instructions,
+                                &mut false_fixups,
+                                this_class_idx,
+                                field_name,
+                                field_ty,
+                            )?;
+                        }
+
+                        instructions.push(Instruction::Iconst_1);
+                        instructions.push(Instruction::Ireturn);
+                        let false_target = instructions.len() as u16;
+                        instructions.push(Instruction::Iconst_0);
+                        instructions.push(Instruction::Ireturn);
+
+                        for fixup in false_fixups {
+                            patch_branch_target(&mut instructions, fixup, false_target);
+                        }
+
+                        let code_attribute = Attribute::Code {
+                            name_index: class_file.constant_pool.add_utf8("Code")?,
+                            max_stack: 4,
+                            max_locals: 2,
+                            code: instructions,
+                            exception_table: Vec::new(),
+                            attributes: Vec::new(),
+                        };
+
+                        jvm::Method {
+                            access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::FINAL,
+                            name_index,
+                            descriptor_index,
+                            attributes: vec![code_attribute],
+                        }
+                    }
+                };
                 class_file.methods.push(jvm_method);
             }
         }
@@ -271,9 +610,7 @@ pub(super) fn create_data_type_classfile_for_class(
                 // No '$' present -> not an inner/member class; leave name_index = 0
                 0
             } else {
-                class_file
-                    .constant_pool
-                    .add_utf8(simple_name_part)?
+                class_file.constant_pool.add_utf8(simple_name_part)?
             };
 
             // Default to PUBLIC | STATIC for generated nested classes. This can be adjusted
@@ -293,12 +630,9 @@ pub(super) fn create_data_type_classfile_for_class(
         if let Some(nest_host_name) = nest_host {
             let class_info_index = class_file.constant_pool.add_class(class_name_jvm)?;
             let outer_class_info_index = class_file.constant_pool.add_class(&nest_host_name)?;
-            let name_index =  class_file
-                    .constant_pool
-                    .add_utf8(class_name_jvm
-                        .rsplit('$')
-                        .next()
-                        .unwrap_or(class_name_jvm))?;
+            let name_index = class_file
+                .constant_pool
+                .add_utf8(class_name_jvm.rsplit('$').next().unwrap_or(class_name_jvm))?;
             let access_flags = NestedClassAccessFlags::PUBLIC | NestedClassAccessFlags::STATIC;
             inner_classes_vec.push(InnerClass {
                 class_info_index,
@@ -358,10 +692,16 @@ pub(super) fn create_data_type_classfile_for_interface(
         let name_index = cp.add_utf8(method_name)?;
         let descriptor_index = cp.add_utf8(&descriptor)?;
 
+        let flags = if signature.is_static {
+            MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC | MethodAccessFlags::ABSTRACT
+        } else {
+            MethodAccessFlags::PUBLIC | MethodAccessFlags::ABSTRACT
+        };
+
         // Interface methods are implicitly public and abstract (unless 'default' or 'static')
         // We assume these are the standard abstract interface methods.
         let jvm_method = jvm::Method {
-            access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::ABSTRACT,
+            access_flags: flags,
             name_index,
             descriptor_index,
             attributes: Vec::new(), // Abstract methods have no Code attribute

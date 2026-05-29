@@ -2,11 +2,26 @@ use super::place::make_jvm_safe;
 use crate::oomir::{self, DataType, DataTypeMethod};
 
 use rustc_middle::ty::{
-    AdtDef, ExistentialPredicate, FloatTy, GenericArgsRef, IntTy, Ty, TyCtxt, TyKind, TypingEnv,
+    AdtDef,
+    ExistentialPredicate,
+    FloatTy,
+    GenericArgsRef,
+    IntTy,
+    Ty,
+    TyCtxt,
+    TyKind,
+    TypeVisitableExt, // Added TypeVisitableExt to check for params
+    TypingEnv,
     UintTy,
 };
 use sha2::Digest;
 use std::collections::HashMap;
+
+/// OOMIR doesn't have a Never type (because the JVM doesn't), so we map it to Void.
+/// So when we need to know if a MIR type is Never, we can use this helper.
+pub fn ty_is_never<'tcx>(ty: Ty<'tcx>) -> bool {
+    matches!(ty.kind(), TyKind::Never)
+}
 
 /// Converts a Rust MIR type (`Ty`) to an OOMIR type (`oomir::Type`).
 pub fn ty_to_oomir_type<'tcx>(
@@ -15,11 +30,21 @@ pub fn ty_to_oomir_type<'tcx>(
     data_types: &mut HashMap<String, oomir::DataType>,
     instance_context: rustc_middle::ty::Instance<'tcx>,
 ) -> oomir::Type {
-    let resolved_ty = tcx.instantiate_and_normalize_erasing_regions(
-        instance_context.args,
-        TypingEnv::fully_monomorphized(),
-        rustc_middle::ty::EarlyBinder::bind(ty),
-    );
+    // Check if the instance args contain generic parameters.
+    let has_params = instance_context.args.has_param();
+
+    let resolved_ty = if has_params {
+        rustc_middle::ty::EarlyBinder::bind(ty)
+            .instantiate(tcx, instance_context.args)
+            .skip_norm_wip()
+    } else {
+        let instantiated =
+            rustc_middle::ty::EarlyBinder::bind(ty).instantiate(tcx, instance_context.args);
+        match tcx.try_normalize_erasing_regions(TypingEnv::fully_monomorphized(), instantiated) {
+            Ok(normalized) => normalized,
+            Err(_) => instantiated.skip_norm_wip(),
+        }
+    };
     match resolved_ty.kind() {
         rustc_middle::ty::TyKind::Bool => oomir::Type::Boolean,
         rustc_middle::ty::TyKind::Char => oomir::Type::Char,
@@ -48,8 +73,6 @@ pub fn ty_to_oomir_type<'tcx>(
         rustc_middle::ty::TyKind::Adt(adt_def, substs) => {
             // Get the full path string for the ADT
             let full_path_str = tcx.def_path_str(adt_def.did());
-
-            println!("{full_path_str} Substs: {:?}", substs);
 
             if full_path_str == "String" || full_path_str == "std::string::String" {
                 oomir::Type::String
@@ -116,18 +139,27 @@ pub fn ty_to_oomir_type<'tcx>(
                         .iter()
                         .map(|field_def| {
                             let field_name = field_def.ident(tcx).to_string();
-                            let field_mir_ty = field_def.ty(tcx, substs);
+                            let field_mir_ty = field_def.ty(tcx, substs).skip_norm_wip();
                             let field_oomir_type =
                                 ty_to_oomir_type(field_mir_ty, tcx, data_types, instance_context);
                             (field_name, field_oomir_type)
                         })
                         .collect::<Vec<_>>();
+                    let mut methods = HashMap::new();
+                    methods.insert(
+                        "eq".to_string(),
+                        DataTypeMethod::AdtHelperMethod {
+                            kind: oomir::AdtHelperKind::PartialEqClass {
+                                fields: oomir_fields.clone(),
+                            },
+                        },
+                    );
                     data_types.insert(
                         jvm_name_full.clone(),
                         oomir::DataType::Class {
                             fields: oomir_fields,
                             is_abstract: false,
-                            methods: HashMap::new(),
+                            methods,
                             super_class: None,
                             interfaces: vec![],
                         },
@@ -156,9 +188,16 @@ pub fn ty_to_oomir_type<'tcx>(
             }
         }
         rustc_middle::ty::TyKind::Str => oomir::Type::String,
+        rustc_middle::ty::TyKind::Pat(inner_ty, _) => {
+            ty_to_oomir_type(*inner_ty, tcx, data_types, instance_context)
+        }
         rustc_middle::ty::TyKind::Ref(_, inner_ty, mutability) => {
             let pointee_oomir_type = ty_to_oomir_type(*inner_ty, tcx, data_types, instance_context);
-            if mutability.is_mut() {
+            // For trait objects (&dyn Trait, &mut dyn Trait), represent as direct Interface
+            // rather than using the array wrapper, since we call virtual methods on the object
+            if matches!(inner_ty.kind(), rustc_middle::ty::TyKind::Dynamic(_, _)) {
+                pointee_oomir_type
+            } else if mutability.is_mut() {
                 oomir::Type::MutableReference(Box::new(pointee_oomir_type))
             } else {
                 pointee_oomir_type
@@ -179,7 +218,11 @@ pub fn ty_to_oomir_type<'tcx>(
                 // For a pointer to a sized type (*const T), use the mutable reference
                 // "array hack" to represent it as a reference that can be written back to.
                 let oomir_pointee_type = ty_to_oomir_type(*ty, tcx, data_types, instance_context);
-                oomir::Type::MutableReference(Box::new(oomir_pointee_type))
+                if matches!(oomir_pointee_type, oomir::Type::Void) {
+                    oomir::Type::Class("java/lang/Object".to_string())
+                } else {
+                    oomir::Type::MutableReference(Box::new(oomir_pointee_type))
+                }
             }
         }
         rustc_middle::ty::TyKind::Array(component_ty, _) => {
@@ -233,11 +276,21 @@ pub fn ty_to_oomir_type<'tcx>(
                     })
                     .collect::<Vec<_>>();
 
+                let mut methods = HashMap::new();
+                methods.insert(
+                    "eq".to_string(),
+                    DataTypeMethod::AdtHelperMethod {
+                        kind: oomir::AdtHelperKind::PartialEqClass {
+                            fields: oomir_fields.clone(),
+                        },
+                    },
+                );
+
                 // Create and insert the DataType definition
                 let tuple_data_type = oomir::DataType::Class {
                     fields: oomir_fields,
                     is_abstract: false,
-                    methods: HashMap::new(),
+                    methods,
                     super_class: None,
                     interfaces: vec![],
                 };
@@ -248,6 +301,18 @@ pub fn ty_to_oomir_type<'tcx>(
                     format!("   -> Added DataType: {:?}", data_types[&tuple_class_name])
                 );
             } else {
+                if let Some(oomir::DataType::Class {
+                    fields, methods, ..
+                }) = data_types.get_mut(&tuple_class_name)
+                {
+                    methods.entry("eq".to_string()).or_insert_with(|| {
+                        DataTypeMethod::AdtHelperMethod {
+                            kind: oomir::AdtHelperKind::PartialEqClass {
+                                fields: fields.clone(),
+                            },
+                        }
+                    });
+                }
                 breadcrumbs::log!(
                     breadcrumbs::LogLevel::Info,
                     "type-mapping",
@@ -296,6 +361,23 @@ pub fn ty_to_oomir_type<'tcx>(
                         let safe_name = make_jvm_safe(&trait_name);
                         resolved_types.push(oomir::Type::Interface(safe_name));
                     }
+                    ExistentialPredicate::AutoTrait(def_id) => {
+                        // Auto traits like Send/Sync — treat as interfaces as well.
+                        let trait_name = tcx.def_path_str(def_id);
+                        let safe_name = make_jvm_safe(&trait_name);
+                        resolved_types.push(oomir::Type::Interface(safe_name));
+                    }
+                    ExistentialPredicate::Projection(_) => {
+                        breadcrumbs::log!(
+                            breadcrumbs::LogLevel::Warn,
+                            "type-mapping",
+                            format!(
+                                "Warning: Unhandled dynamic projection predicate {:?}",
+                                binder
+                            )
+                        );
+                        resolved_types.push(oomir::Type::Class("java/lang/Object".to_string()));
+                    }
                     _ => {
                         breadcrumbs::log!(
                             breadcrumbs::LogLevel::Warn,
@@ -315,16 +397,62 @@ pub fn ty_to_oomir_type<'tcx>(
         rustc_middle::ty::TyKind::Param(param_ty) => {
             oomir::Type::Class(make_jvm_safe(param_ty.name.as_str()))
         }
-        rustc_middle::ty::TyKind::Closure(def_id, _substs) => {
-            // Closures are lowered to separate functions, so the closure object itself
-            // is just metadata that gets optimized away in release mode.
-            // In debug mode, it may still be referenced but never actually used.
-            // Map to a simple Object type - the actual logic is in the lowered function.
-            breadcrumbs::log!(
-                breadcrumbs::LogLevel::Info,
-                "type-mapping",
-                format!("Mapping closure {:?} to Object (closure lowered to function)", def_id)
-            );
+        rustc_middle::ty::TyKind::Closure(def_id, args) => {
+            let full_path_str = tcx.def_path_str(*def_id);
+            let safe_name = make_jvm_safe(&full_path_str);
+
+            // Define the closure class struct if not already present
+            if !data_types.contains_key(&safe_name) {
+                let closure_args = args.as_closure();
+                let upvar_tys = closure_args.upvar_tys();
+
+                let mut fields = Vec::new();
+                for (i, upvar_ty) in upvar_tys.iter().enumerate() {
+                    let field_name = format!("arg{}", i);
+                    // Recursively resolve capture types
+                    let field_oomir_ty =
+                        ty_to_oomir_type(upvar_ty, tcx, data_types, instance_context);
+                    fields.push((field_name, field_oomir_ty));
+                }
+
+                data_types.insert(
+                    safe_name.clone(),
+                    oomir::DataType::Class {
+                        fields,
+                        is_abstract: false,
+                        methods: HashMap::new(), // 'call' is handled via MIR lowering logic
+                        super_class: Some("java/lang/Object".to_string()),
+                        interfaces: vec![],
+                    },
+                );
+            }
+            oomir::Type::Class(safe_name)
+        }
+        rustc_middle::ty::TyKind::FnDef(def_id, _args) => {
+            // Named functions are Zero-Sized Types (ZSTs).
+            // We generate a singleton class so generics like Map<Iter, MyFunc>
+            // produce unique JVM class names.
+            let full_path_str = tcx.def_path_str(*def_id);
+            let safe_name = make_jvm_safe(&full_path_str);
+
+            if !data_types.contains_key(&safe_name) {
+                data_types.insert(
+                    safe_name.clone(),
+                    oomir::DataType::Class {
+                        fields: vec![], // No state
+                        is_abstract: false,
+                        methods: HashMap::new(),
+                        super_class: Some("java/lang/Object".to_string()),
+                        interfaces: vec![],
+                    },
+                );
+            }
+            oomir::Type::Class(safe_name)
+        }
+        rustc_middle::ty::TyKind::Alias(_alias_ty) => {
+            // This handles associated types and projections (like Self::Output)
+            // that couldn't be normalized because we are in a generic context.
+            // We map them to java/lang/Object, effectively erasing them.
             oomir::Type::Class("java/lang/Object".to_string())
         }
         _ => {
@@ -333,14 +461,14 @@ pub fn ty_to_oomir_type<'tcx>(
                 "type-mapping",
                 format!("Warning: Unhandled type {:?}", ty)
             );
-            oomir::Type::Class("UnsupportedType".to_string())
+            oomir::Type::Class("java/lang/Object".to_string())
         }
     }
 }
 
 /// Generates a short hash of the input string.
 /// The hash is truncated to the specified length to ensure it fits within JVM class name constraints.
-fn short_hash(input: &str, length: usize) -> String {
+pub fn short_hash(input: &str, length: usize) -> String {
     let mut hasher = sha2::Sha256::new();
     hasher.update(input);
     let full_hash = format!("{:x}", hasher.finalize());
@@ -352,7 +480,7 @@ fn short_hash(input: &str, length: usize) -> String {
 const MAX_TUPLE_NAME_LEN: usize = 64;
 
 // Produce a compact, human readable token for an OOMIR type to use in tuple class names.
-fn readable_oomir_type_name(t: &oomir::Type) -> String {
+pub fn readable_oomir_type_name(t: &oomir::Type) -> String {
     use oomir::Type;
     match t {
         Type::Boolean => "bool".to_string(),
@@ -382,7 +510,7 @@ fn readable_oomir_type_name(t: &oomir::Type) -> String {
 }
 
 // Sanitize token so it contains only ASCII alphanumeric characters and underscores.
-fn sanitize_name_token(s: &str) -> String {
+pub fn sanitize_name_token(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect()

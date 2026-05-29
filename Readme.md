@@ -53,6 +53,7 @@ All examples live in `tests/binary` and are compiled to JVM bytecode & run/teste
 - Mutable borrowing, references, and dereferencing
 - Implementations for ADTs, including using and returning `self`, `&self`, `&mut self`
 - Traits, including dynamic dispatch (`&dyn Trait`)
+- Closures, including capturing closures
 - **Integration tests** for all features, in debug and release modes
 
 🚧 **Next Milestone:** Full support for the Rust `core` crate.

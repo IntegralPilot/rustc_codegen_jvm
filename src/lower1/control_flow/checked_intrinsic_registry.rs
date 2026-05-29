@@ -1,15 +1,14 @@
 // checked_intrinsic_registry.rs
 // Global registry to track which checked arithmetic intrinsics are needed
 
+use once_cell::sync::Lazy;
 use std::collections::HashSet;
 use std::sync::Mutex;
-use once_cell::sync::Lazy;
 
 /// Global registry of needed checked arithmetic intrinsics
 /// Format: (operation, type) e.g., ("add", "i32")
-static NEEDED_INTRINSICS: Lazy<Mutex<HashSet<(String, String)>>> = Lazy::new(|| {
-    Mutex::new(HashSet::new())
-});
+static NEEDED_INTRINSICS: Lazy<Mutex<HashSet<(String, String)>>> =
+    Lazy::new(|| Mutex::new(HashSet::new()));
 
 /// Register that a checked arithmetic intrinsic is needed
 pub fn register_intrinsic(operation: &str, ty: &str) {

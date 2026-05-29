@@ -23,8 +23,7 @@ pub mod operand;
 pub mod place;
 pub mod types;
 
-pub use closures::{ClosureCallInfo, extract_closure_info, generate_closure_function_name};
-
+pub use closures::generate_closure_function_name;
 
 /// Converts a MIR Body into an OOMIR Function.
 /// This function extracts a function's signature (currently minimal) and builds
@@ -38,13 +37,14 @@ pub fn mir_to_oomir<'tcx>(
     instance: Instance<'tcx>,
     mir: &mut Body<'tcx>,
     fn_name_override: Option<String>,
+    is_static: bool,
 ) -> (oomir::Function, HashMap<String, oomir::DataType>) {
     use rustc_middle::ty::TyKind;
 
     // Get a function name from the instance or use the provided override.
     // Prefer monomorphized naming to disambiguate generic instantiations.
-    let fn_name =
-        fn_name_override.unwrap_or_else(|| naming::mono_fn_name_from_instance(tcx, instance));
+    let fn_name = fn_name_override
+        .unwrap_or_else(|| naming::mono_fn_name_from_instance(tcx, instance).method_name);
 
     // Extract function signature
     // Closures require special handling - we must use as_closure().sig() instead of fn_sig()
@@ -52,13 +52,14 @@ pub fn mir_to_oomir<'tcx>(
     // generic functions get concrete param/return types.
     let instance_ty = tcx
         .type_of(instance.def_id())
-        .instantiate(tcx, instance.args);
+        .instantiate(tcx, instance.args)
+        .skip_norm_wip();
     let (params_ty, return_ty) = match instance_ty.kind() {
         TyKind::Closure(_def_id, args) => {
             let sig = args.as_closure().sig();
             (sig.inputs(), sig.output())
         }
-        TyKind::FnDef(def_id, _args) => {
+        TyKind::FnDef(_def_id, _args) => {
             // For FnDef, compute the signature from the instantiated item type
             let mir_sig = instance_ty.fn_sig(tcx);
             (mir_sig.inputs(), mir_sig.output())
@@ -71,8 +72,12 @@ pub fn mir_to_oomir<'tcx>(
     };
 
     let data_types = &mut HashMap::new();
+    let closure_has_captures = matches!(
+        instance_ty.kind(),
+        TyKind::Closure(_, args) if !args.as_closure().upvar_tys().is_empty()
+    );
 
-    let params_oomir: Vec<(String, oomir::Type)> = params_ty
+    let mut params_oomir: Vec<(String, oomir::Type)> = params_ty
         .skip_binder()
         .iter()
         .enumerate()
@@ -101,12 +106,19 @@ pub fn mir_to_oomir<'tcx>(
             (param_name, oomir_type)
         })
         .collect();
+
+    if closure_has_captures {
+        let closure_env_ty = ty_to_oomir_type(instance_ty, tcx, data_types, instance);
+        params_oomir.insert(0, ("closure_env".to_string(), closure_env_ty));
+    }
+
     let return_oomir_ty: oomir::Type =
         ty_to_oomir_type(return_ty.skip_binder(), tcx, data_types, instance);
 
     let mut signature = oomir::Signature {
         params: params_oomir,
         ret: Box::new(return_oomir_ty.clone()), // Clone here to pass to convert_basic_block
+        is_static,
     };
 
     // check if txc.entry_fn() matches the DefId of the function
@@ -124,6 +136,7 @@ pub fn mir_to_oomir<'tcx>(
                         ))),
                     )],
                     ret: Box::new(oomir::Type::Void),
+                    is_static: true,
                 };
             }
         }
@@ -161,7 +174,9 @@ pub fn mir_to_oomir<'tcx>(
         // But we receive: local 1 = tuple containing all args
 
         // Get the tuple parameter type (should be the first parameter in the signature)
-        if let Some((_tuple_param_name, tuple_param_ty)) = signature.params.first() {
+        let tuple_param_index = if closure_has_captures { 1 } else { 0 };
+        let tuple_param_local = if closure_has_captures { "_2" } else { "_1" };
+        if let Some((_tuple_param_name, tuple_param_ty)) = signature.params.get(tuple_param_index) {
             // Check if it's a tuple/struct type that we need to unpack
             if let oomir::Type::Class(class_name) = tuple_param_ty {
                 // Get the data type definition to see its fields
@@ -175,7 +190,7 @@ pub fn mir_to_oomir<'tcx>(
                         instrs.push(oomir::Instruction::GetField {
                             dest: format!("_{}", local_var_index),
                             object: oomir::Operand::Variable {
-                                name: "_1".to_string(),
+                                name: tuple_param_local.to_string(),
                                 ty: tuple_param_ty.clone(),
                             },
                             field_name: field_name.clone(),
@@ -205,7 +220,6 @@ pub fn mir_to_oomir<'tcx>(
             name: fn_name,
             signature,
             body: codeblock,
-            is_static: false,
         },
         data_types.clone(),
     )

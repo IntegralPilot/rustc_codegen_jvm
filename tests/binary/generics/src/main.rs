@@ -28,6 +28,20 @@ impl<T, U> Pair<T, U> {
     }
 }
 
+struct Wrapper<T> {
+    value: T,
+}
+
+impl<T> Wrapper<T> {
+    fn new(value: T) -> Self {
+        Wrapper { value }
+    }
+
+    fn value(self) -> T {
+        self.value
+    }
+}
+
 fn main() {
     let a = identity(42);
     let b = identity("hello");
@@ -47,4 +61,10 @@ fn main() {
     let nested_pair = Pair::new(pair, swapped);
     assert!(nested_pair.first.first == 10);
     assert!(nested_pair.second.0 == "two");
+
+    let wrapped_int = Wrapper::new(123);
+    assert!(wrapped_int.value() == 123);
+
+    let wrapped_str = Wrapper::new("generic method");
+    assert!(wrapped_str.value().len() == 14);
 }
