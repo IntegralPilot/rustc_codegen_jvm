@@ -1537,6 +1537,7 @@ impl CodegenBackend for MyBackend {
                     name: name.clone(),
                     kind: ModuleKind::Regular,
                     object: Some(file_path),
+                    global_asm_object: None,
                     bytecode: None,
                     dwarf_object: None,
                     llvm_ir: None,

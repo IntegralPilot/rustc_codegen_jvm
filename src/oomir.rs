@@ -7,6 +7,7 @@ use super::lower2::BIG_INTEGER_CLASS;
 use breadcrumbs::LogLevel;
 use core::panic;
 use ristretto_classfile::attributes::Instruction as JVMInstruction;
+use sha2::Digest;
 use std::{
     collections::{HashMap, HashSet},
     fmt,
@@ -203,6 +204,33 @@ pub struct Signature {
 }
 
 impl Signature {
+    pub fn to_jvm_descriptor_with_explicit_params(&self) -> String {
+        let mut result = String::new();
+        result.push('(');
+        for (_param_name, param_type) in &self.params {
+            result.push_str(&param_type.to_jvm_descriptor());
+        }
+        result.push(')');
+        result.push_str(&self.ret.to_jvm_descriptor());
+        result
+    }
+
+    pub fn fn_ptr_interface_name(&self) -> String {
+        let descriptor = self.to_jvm_descriptor_with_explicit_params();
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(descriptor.as_bytes());
+        let hash = format!("{:x}", hasher.finalize());
+        format!("FnPtr_{}", &hash[..16])
+    }
+
+    pub fn fn_ptr_interface_method_signature(&self) -> Signature {
+        Signature {
+            params: self.params.clone(),
+            ret: self.ret.clone(),
+            is_static: false,
+        }
+    }
+
     /// Replaces all occurrences of `Type::Class(old_name)` with `Type::Class(new_name)`
     /// in the signature's parameters and return type.
     /// Returns a tuple (params_changed, return_changed) indicating whether any replacements were made.
@@ -377,6 +405,12 @@ pub enum Instruction {
         dest: Option<String>, // Optional destination variable for the return value
         function: String,     // Name of the function to call
         args: Vec<Operand>,   // Arguments to the function
+    },
+    CallIndirect {
+        dest: Option<String>,       // Optional destination variable for the return value
+        function_ptr: Box<Operand>, // Operand holding the function pointer object
+        args: Vec<Operand>,         // Arguments to the function
+        signature: Signature,       // Function pointer signature
     },
     InvokeInterface {
         class_name: String,   // JVM interface name (e.g., MyTrait)

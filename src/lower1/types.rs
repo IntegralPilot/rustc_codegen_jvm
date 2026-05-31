@@ -23,6 +23,69 @@ pub fn ty_is_never<'tcx>(ty: Ty<'tcx>) -> bool {
     matches!(ty.kind(), TyKind::Never)
 }
 
+pub fn fn_ptr_signature_from_ty<'tcx>(
+    ty: Ty<'tcx>,
+    tcx: TyCtxt<'tcx>,
+    data_types: &mut HashMap<String, oomir::DataType>,
+    instance_context: rustc_middle::ty::Instance<'tcx>,
+) -> oomir::Signature {
+    let sig = ty.fn_sig(tcx).skip_binder();
+    let params = sig
+        .inputs()
+        .iter()
+        .enumerate()
+        .map(|(i, ty)| {
+            (
+                format!("arg{}", i),
+                ty_to_oomir_type(*ty, tcx, data_types, instance_context),
+            )
+        })
+        .collect();
+    let ret = ty_to_oomir_type(sig.output(), tcx, data_types, instance_context);
+
+    oomir::Signature {
+        params,
+        ret: Box::new(ret),
+        is_static: true,
+    }
+}
+
+pub fn ensure_fn_ptr_interface(
+    signature: &oomir::Signature,
+    data_types: &mut HashMap<String, oomir::DataType>,
+) -> String {
+    let interface_name = signature.fn_ptr_interface_name();
+    let method_signature = signature.fn_ptr_interface_method_signature();
+
+    match data_types.get_mut(&interface_name) {
+        Some(oomir::DataType::Interface { methods }) => {
+            methods
+                .entry("call".to_string())
+                .or_insert(method_signature);
+        }
+        Some(oomir::DataType::Class { .. }) => {
+            breadcrumbs::log!(
+                breadcrumbs::LogLevel::Warn,
+                "type-mapping",
+                format!(
+                    "Function pointer interface name '{}' already exists as a class",
+                    interface_name
+                )
+            );
+        }
+        None => {
+            data_types.insert(
+                interface_name.clone(),
+                oomir::DataType::Interface {
+                    methods: HashMap::from([("call".to_string(), method_signature)]),
+                },
+            );
+        }
+    }
+
+    interface_name
+}
+
 /// Converts a Rust MIR type (`Ty`) to an OOMIR type (`oomir::Type`).
 pub fn ty_to_oomir_type<'tcx>(
     ty: Ty<'tcx>,
@@ -359,12 +422,22 @@ pub fn ty_to_oomir_type<'tcx>(
                     ExistentialPredicate::Trait(trait_ref) => {
                         let trait_name = tcx.def_path_str(trait_ref.def_id);
                         let safe_name = make_jvm_safe(&trait_name);
+                        data_types.entry(safe_name.clone()).or_insert_with(|| {
+                            oomir::DataType::Interface {
+                                methods: HashMap::new(),
+                            }
+                        });
                         resolved_types.push(oomir::Type::Interface(safe_name));
                     }
                     ExistentialPredicate::AutoTrait(def_id) => {
                         // Auto traits like Send/Sync — treat as interfaces as well.
                         let trait_name = tcx.def_path_str(def_id);
                         let safe_name = make_jvm_safe(&trait_name);
+                        data_types.entry(safe_name.clone()).or_insert_with(|| {
+                            oomir::DataType::Interface {
+                                methods: HashMap::new(),
+                            }
+                        });
                         resolved_types.push(oomir::Type::Interface(safe_name));
                     }
                     ExistentialPredicate::Projection(_) => {
@@ -427,6 +500,12 @@ pub fn ty_to_oomir_type<'tcx>(
                 );
             }
             oomir::Type::Class(safe_name)
+        }
+        rustc_middle::ty::TyKind::FnPtr(_, _) => {
+            let signature =
+                fn_ptr_signature_from_ty(resolved_ty, tcx, data_types, instance_context);
+            let interface_name = ensure_fn_ptr_interface(&signature, data_types);
+            oomir::Type::Interface(interface_name)
         }
         rustc_middle::ty::TyKind::FnDef(def_id, _args) => {
             // Named functions are Zero-Sized Types (ZSTs).

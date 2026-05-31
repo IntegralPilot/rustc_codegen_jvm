@@ -929,6 +929,79 @@ pub fn process_block_instructions(
                 };
                 keep_original_instruction = true; // Always keep the call itself
             }
+            Instruction::CallIndirect {
+                dest,
+                function_ptr,
+                args,
+                signature,
+            } => {
+                // Propagate constants into function pointer and arguments
+                let new_function_ptr = match function_ptr.as_ref() {
+                    Operand::Variable { name, ty } => lookup_const(
+                        &Operand::Variable {
+                            name: name.clone(),
+                            ty: ty.clone(),
+                        },
+                        &current_state,
+                    )
+                    .map_or(function_ptr.as_ref().clone(), Operand::Constant),
+                    other => other.clone(),
+                };
+                let new_args: Vec<Operand> = args
+                    .iter()
+                    .map(|arg| {
+                        lookup_const(arg, &current_state).map_or(arg.clone(), Operand::Constant)
+                    })
+                    .collect();
+
+                // Determine if any argument could potentially have side effects
+                let mut has_potential_side_effect_arg = false;
+                for arg_operand in &new_args {
+                    let arg_type = match arg_operand {
+                        Operand::Variable { ty, .. } => Some(ty.clone()),
+                        Operand::Constant(c) => Some(Type::from_constant(c)),
+                    };
+                    if let Some(ty) = arg_type {
+                        if matches!(ty, Type::Array(_) | Type::Class(_)) {
+                            has_potential_side_effect_arg = true;
+                            break;
+                        }
+                    }
+                }
+
+                // 1. Invalidate the destination variable
+                if let Some(d) = dest {
+                    current_state.remove(d);
+                }
+
+                // 2. CONSERVATIVE INVALIDATION due to potential side effects:
+                if has_potential_side_effect_arg {
+                    let keys_to_remove: Vec<String> = current_state.iter()
+                        .filter_map(|(key, constant_val)| {
+                            match constant_val {
+                                Constant::I8(_) | Constant::I16(_) | Constant::I32(_) | Constant::I64(_) |
+                                Constant::F32(_) | Constant::F64(_) | Constant::Boolean(_) | Constant::Char(_) |
+                                Constant::String(_) => None,
+                                _ => {
+                                    breadcrumbs::log!(breadcrumbs::LogLevel::Info, "optimisation", format!("Optimizer: Invalidating potentially mutable constant '{}' due to indirect call with array/class arg.", key));
+                                    Some(key.clone())
+                                }
+                            }
+                        })
+                        .collect();
+                    for key in keys_to_remove {
+                        current_state.remove(&key);
+                    }
+                }
+
+                optimised_instruction = Instruction::CallIndirect {
+                    dest: dest.clone(),
+                    function_ptr: Box::new(new_function_ptr),
+                    args: new_args,
+                    signature: signature.clone(),
+                };
+                keep_original_instruction = true;
+            }
             Instruction::ArrayStore {
                 array,
                 index,

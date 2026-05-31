@@ -1,7 +1,10 @@
 use rustc_abi::FieldIdx;
 use rustc_middle::{
-    mir::{BinOp, Body, BorrowKind as MirBorrowKind, Operand as MirOperand, Place, Rvalue, UnOp},
-    ty::{ConstKind, Instance, TyCtxt, TyKind},
+    mir::{
+        BinOp, Body, BorrowKind as MirBorrowKind, CastKind, Operand as MirOperand, Place, Rvalue,
+        UnOp,
+    },
+    ty::{ConstKind, Instance, TyCtxt, TyKind, TypingEnv, adjustment::PointerCoercion},
 };
 use std::collections::HashMap;
 
@@ -12,7 +15,10 @@ use super::{
             handle_const_value,
         },
         place::{emit_instructions_to_get_on_own, get_place_type, make_jvm_safe, place_to_string},
-        types::{generate_adt_jvm_class_name, ty_to_oomir_type},
+        types::{
+            ensure_fn_ptr_interface, fn_ptr_signature_from_ty, generate_adt_jvm_class_name,
+            short_hash, ty_to_oomir_type,
+        },
     },
     checked_ops::emit_checked_arithmetic_oomir_instructions,
     oomir::{self, DataTypeMethod},
@@ -75,6 +81,118 @@ fn adapt_value_for_field(
     }
 
     value_operand
+}
+
+fn ensure_fn_pointer_adapter_class(
+    data_types: &mut HashMap<String, oomir::DataType>,
+    target_function: Option<&str>,
+    signature: &oomir::Signature,
+    interface_name: &str,
+) -> String {
+    let descriptor = signature.to_jvm_descriptor_with_explicit_params();
+    let target_name = target_function.unwrap_or("unsupported");
+    let hash = short_hash(&format!("{target_name}:{descriptor}"), 10);
+    let base_name: String = make_jvm_safe(target_name).chars().take(80).collect();
+    let class_name = format!("FnPtrImpl_{}_{}", base_name, hash);
+
+    let mut method_params = Vec::with_capacity(signature.params.len() + 1);
+    method_params.push(("self".to_string(), oomir::Type::Class(class_name.clone())));
+    method_params.extend(signature.params.iter().cloned());
+
+    let instructions = if let Some(target_function) = target_function {
+        let call_dest = if *signature.ret == oomir::Type::Void {
+            None
+        } else {
+            Some("_ret".to_string())
+        };
+        let call_args = signature
+            .params
+            .iter()
+            .enumerate()
+            .map(|(i, (_, ty))| oomir::Operand::Variable {
+                name: format!("_{}", i + 2),
+                ty: ty.clone(),
+            })
+            .collect();
+
+        let mut instructions = vec![oomir::Instruction::Call {
+            dest: call_dest.clone(),
+            function: target_function.to_string(),
+            args: call_args,
+        }];
+
+        instructions.push(oomir::Instruction::Return {
+            operand: call_dest.map(|name| oomir::Operand::Variable {
+                name,
+                ty: signature.ret.as_ref().clone(),
+            }),
+        });
+        instructions
+    } else {
+        vec![oomir::Instruction::ThrowNewWithMessage {
+            exception_class: "java/lang/UnsupportedOperationException".to_string(),
+            message: format!("Unsupported non-local function pointer: {target_name}"),
+        }]
+    };
+
+    let call_method = oomir::DataTypeMethod::Function(oomir::Function {
+        name: "call".to_string(),
+        signature: oomir::Signature {
+            params: method_params,
+            ret: signature.ret.clone(),
+            is_static: false,
+        },
+        body: oomir::CodeBlock {
+            entry: "bb0".to_string(),
+            basic_blocks: HashMap::from([(
+                "bb0".to_string(),
+                oomir::BasicBlock {
+                    label: "bb0".to_string(),
+                    instructions,
+                },
+            )]),
+        },
+    });
+
+    match data_types.get_mut(&class_name) {
+        Some(oomir::DataType::Class {
+            methods,
+            interfaces,
+            ..
+        }) => {
+            methods.entry("call".to_string()).or_insert(call_method);
+            if !interfaces
+                .iter()
+                .any(|interface| interface == interface_name)
+            {
+                interfaces.push(interface_name.to_string());
+            }
+        }
+        Some(oomir::DataType::Interface { .. }) => {
+            breadcrumbs::log!(
+                breadcrumbs::LogLevel::Warn,
+                "mir-lowering",
+                format!(
+                    "Function pointer adapter name '{}' already exists as an interface",
+                    class_name
+                )
+            );
+        }
+        None => {
+            data_types.insert(
+                class_name.clone(),
+                oomir::DataType::Class {
+                    fields: vec![],
+                    is_abstract: false,
+                    methods: HashMap::from([("call".to_string(), call_method)]),
+                    super_class: Some("java/lang/Object".to_string()),
+                    interfaces: vec![interface_name.to_string()],
+                },
+            );
+        }
+    }
+
+    class_name
 }
 
 /// Evaluates an Rvalue and returns the resulting OOMIR Operand and any
@@ -396,82 +514,213 @@ pub fn convert_rvalue_to_operand<'a>(
             }
         }
 
-        Rvalue::Cast(_cast_kind, operand, target_mir_ty) => {
+        Rvalue::Cast(cast_kind, operand, target_mir_ty) => {
             let temp_cast_var = generate_temp_var_name(&base_temp_name);
             let oomir_target_type = ty_to_oomir_type(*target_mir_ty, tcx, data_types, instance);
             let source_mir_ty = operand.ty(&mir.local_decls, tcx);
-            let oomir_source_type = ty_to_oomir_type(source_mir_ty, tcx, data_types, instance);
-            let oomir_operand =
-                convert_operand(operand, tcx, instance, mir, data_types, &mut instructions);
 
-            if let oomir::Type::Class(class_name) = &oomir_target_type
-                && class_name.starts_with("NonNull_")
-            {
-                breadcrumbs::log!(
-                    breadcrumbs::LogLevel::Info,
-                    "mir-lowering",
-                    "Info: Handling Rvalue::Cast to NonNull wrapper."
-                );
-                let mut constructor_args = Vec::new();
-                if let Some(oomir::DataType::Class { fields, .. }) = data_types.get(class_name) {
-                    if let Some((_field_name, field_ty)) = fields.first().cloned() {
-                        let value_ty = oomir_operand.get_type().unwrap_or(oomir_source_type);
-                        let needs_cast = field_ty != value_ty
-                            && field_ty.to_jvm_descriptor() != value_ty.to_jvm_descriptor();
-                        let primitive_sentinel_for_reference =
-                            value_ty.is_jvm_primitive_like() && field_ty.is_jvm_reference_type();
-
-                        let value_operand = if needs_cast && primitive_sentinel_for_reference {
-                            oomir::Operand::Constant(oomir::Constant::Null(field_ty.clone()))
-                        } else if needs_cast {
-                            let cast_value_name = format!("{}_value", temp_cast_var);
-                            instructions.push(oomir::Instruction::Cast {
-                                op: oomir_operand,
-                                ty: field_ty.clone(),
-                                dest: cast_value_name.clone(),
-                            });
-                            oomir::Operand::Variable {
-                                name: cast_value_name,
-                                ty: field_ty.clone(),
-                            }
-                        } else {
-                            oomir_operand
-                        };
-
-                        constructor_args.push((value_operand, field_ty));
+            if matches!(
+                cast_kind,
+                CastKind::PointerCoercion(PointerCoercion::ReifyFnPointer(_), _)
+            ) {
+                if let TyKind::FnDef(def_id, substs) = source_mir_ty.kind() {
+                    let func_instance = Instance::resolve_for_fn_ptr(
+                        tcx,
+                        TypingEnv::post_analysis(tcx, mir.source.def_id()),
+                        *def_id,
+                        substs,
+                    )
+                    .unwrap();
+                    let fn_name =
+                        super::super::naming::mono_fn_name_from_instance(tcx, func_instance)
+                            .method_name;
+                    let signature =
+                        fn_ptr_signature_from_ty(*target_mir_ty, tcx, data_types, instance);
+                    let interface_name = ensure_fn_ptr_interface(&signature, data_types);
+                    let callable_target = func_instance
+                        .def_id()
+                        .is_local()
+                        .then_some(fn_name.as_str());
+                    if callable_target.is_none() {
+                        breadcrumbs::log!(
+                            breadcrumbs::LogLevel::Warn,
+                            "mir-lowering",
+                            format!(
+                                "Warning: Reified non-local function pointer '{}' will use an UnsupportedOperationException stub if invoked.",
+                                fn_name
+                            )
+                        );
                     }
+                    let adapter_class = ensure_fn_pointer_adapter_class(
+                        data_types,
+                        callable_target,
+                        &signature,
+                        &interface_name,
+                    );
+                    breadcrumbs::log!(
+                        breadcrumbs::LogLevel::Info,
+                        "mir-lowering",
+                        format!(
+                            "Info: Reifying FnDef to FnPtr: '{}' -> '{}' as '{}'",
+                            source_mir_ty, fn_name, adapter_class
+                        )
+                    );
+                    instructions.push(oomir::Instruction::ConstructObject {
+                        dest: temp_cast_var.clone(),
+                        class_name: adapter_class,
+                        args: Vec::new(),
+                    });
+                    result_operand = oomir::Operand::Variable {
+                        name: temp_cast_var,
+                        ty: oomir::Type::Interface(interface_name),
+                    };
+                } else {
+                    breadcrumbs::log!(
+                        breadcrumbs::LogLevel::Warn,
+                        "mir-lowering",
+                        format!(
+                            "Warning: ReifyFnPointer cast with non-FnDef source type: {:?}",
+                            source_mir_ty
+                        )
+                    );
+                    result_operand =
+                        oomir::Operand::Constant(oomir::Constant::Null(oomir_target_type));
                 }
-                instructions.push(oomir::Instruction::ConstructObject {
-                    dest: temp_cast_var.clone(),
-                    class_name: class_name.clone(),
-                    args: constructor_args,
-                });
-            } else if oomir_target_type == oomir_source_type {
-                breadcrumbs::log!(
-                    breadcrumbs::LogLevel::Info,
-                    "mir-lowering",
-                    "Info: Handling Rvalue::Cast (Same OOMIR Types) -> Temp Move."
-                );
-                instructions.push(oomir::Instruction::Move {
-                    dest: temp_cast_var.clone(),
-                    src: oomir_operand,
-                });
             } else {
-                breadcrumbs::log!(
-                    breadcrumbs::LogLevel::Info,
-                    "mir-lowering",
-                    "Info: Handling Rvalue::Cast (Different OOMIR Types) -> Temp Cast."
-                );
-                instructions.push(oomir::Instruction::Cast {
-                    op: oomir_operand,
-                    ty: oomir_target_type.clone(),
-                    dest: temp_cast_var.clone(),
-                });
+                if matches!(source_mir_ty.kind(), TyKind::FnPtr(..))
+                    && matches!(target_mir_ty.kind(), TyKind::FnPtr(..))
+                {
+                    let source_signature =
+                        fn_ptr_signature_from_ty(source_mir_ty, tcx, data_types, instance);
+                    let target_signature =
+                        fn_ptr_signature_from_ty(*target_mir_ty, tcx, data_types, instance);
+                    let target_interface = ensure_fn_ptr_interface(&target_signature, data_types);
+
+                    if source_signature.to_jvm_descriptor_with_explicit_params()
+                        == target_signature.to_jvm_descriptor_with_explicit_params()
+                    {
+                        let oomir_operand = convert_operand(
+                            operand,
+                            tcx,
+                            instance,
+                            mir,
+                            data_types,
+                            &mut instructions,
+                        );
+                        instructions.push(oomir::Instruction::Move {
+                            dest: temp_cast_var.clone(),
+                            src: oomir_operand,
+                        });
+                    } else {
+                        breadcrumbs::log!(
+                            breadcrumbs::LogLevel::Warn,
+                            "mir-lowering",
+                            format!(
+                                "Warning: Function pointer cast from '{}' to '{}' changes the JVM descriptor; generating an UnsupportedOperationException stub.",
+                                source_signature.to_jvm_descriptor_with_explicit_params(),
+                                target_signature.to_jvm_descriptor_with_explicit_params()
+                            )
+                        );
+                        let adapter_class = ensure_fn_pointer_adapter_class(
+                            data_types,
+                            None,
+                            &target_signature,
+                            &target_interface,
+                        );
+                        instructions.push(oomir::Instruction::ConstructObject {
+                            dest: temp_cast_var.clone(),
+                            class_name: adapter_class,
+                            args: Vec::new(),
+                        });
+                    }
+
+                    result_operand = oomir::Operand::Variable {
+                        name: temp_cast_var,
+                        ty: oomir::Type::Interface(target_interface),
+                    };
+                } else {
+                    let oomir_source_type =
+                        ty_to_oomir_type(source_mir_ty, tcx, data_types, instance);
+                    let oomir_operand =
+                        convert_operand(operand, tcx, instance, mir, data_types, &mut instructions);
+
+                    if let oomir::Type::Class(class_name) = &oomir_target_type
+                        && class_name.starts_with("NonNull_")
+                    {
+                        breadcrumbs::log!(
+                            breadcrumbs::LogLevel::Info,
+                            "mir-lowering",
+                            "Info: Handling Rvalue::Cast to NonNull wrapper."
+                        );
+                        let mut constructor_args = Vec::new();
+                        if let Some(oomir::DataType::Class { fields, .. }) =
+                            data_types.get(class_name)
+                        {
+                            if let Some((_field_name, field_ty)) = fields.first().cloned() {
+                                let value_ty =
+                                    oomir_operand.get_type().unwrap_or(oomir_source_type);
+                                let needs_cast = field_ty != value_ty
+                                    && field_ty.to_jvm_descriptor() != value_ty.to_jvm_descriptor();
+                                let primitive_sentinel_for_reference = value_ty
+                                    .is_jvm_primitive_like()
+                                    && field_ty.is_jvm_reference_type();
+
+                                let value_operand =
+                                    if needs_cast && primitive_sentinel_for_reference {
+                                        oomir::Operand::Constant(oomir::Constant::Null(
+                                            field_ty.clone(),
+                                        ))
+                                    } else if needs_cast {
+                                        let cast_value_name = format!("{}_value", temp_cast_var);
+                                        instructions.push(oomir::Instruction::Cast {
+                                            op: oomir_operand,
+                                            ty: field_ty.clone(),
+                                            dest: cast_value_name.clone(),
+                                        });
+                                        oomir::Operand::Variable {
+                                            name: cast_value_name,
+                                            ty: field_ty.clone(),
+                                        }
+                                    } else {
+                                        oomir_operand
+                                    };
+
+                                constructor_args.push((value_operand, field_ty));
+                            }
+                        }
+                        instructions.push(oomir::Instruction::ConstructObject {
+                            dest: temp_cast_var.clone(),
+                            class_name: class_name.clone(),
+                            args: constructor_args,
+                        });
+                    } else if oomir_target_type == oomir_source_type {
+                        breadcrumbs::log!(
+                            breadcrumbs::LogLevel::Info,
+                            "mir-lowering",
+                            "Info: Handling Rvalue::Cast (Same OOMIR Types) -> Temp Move."
+                        );
+                        instructions.push(oomir::Instruction::Move {
+                            dest: temp_cast_var.clone(),
+                            src: oomir_operand,
+                        });
+                    } else {
+                        breadcrumbs::log!(
+                            breadcrumbs::LogLevel::Info,
+                            "mir-lowering",
+                            "Info: Handling Rvalue::Cast (Different OOMIR Types) -> Temp Cast."
+                        );
+                        instructions.push(oomir::Instruction::Cast {
+                            op: oomir_operand,
+                            ty: oomir_target_type.clone(),
+                            dest: temp_cast_var.clone(),
+                        });
+                    }
+                    result_operand = oomir::Operand::Variable {
+                        name: temp_cast_var,
+                        ty: oomir_target_type,
+                    };
+                }
             }
-            result_operand = oomir::Operand::Variable {
-                name: temp_cast_var,
-                ty: oomir_target_type,
-            };
         }
 
         Rvalue::BinaryOp(bin_op, box (op1, op2)) => {

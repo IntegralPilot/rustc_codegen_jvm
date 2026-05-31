@@ -608,12 +608,24 @@ pub fn convert_basic_block<'tcx>(
                         });
                     }
                 } else {
-                    // Fallback for function pointers
-                    let legacy_name = make_jvm_safe(format!("{:?}", func).as_str());
-                    instructions.push(oomir::Instruction::Call {
-                        dest: dest_var_name, // Note: Function pointers might also need Void check eventually
-                        function: legacy_name,
+                    let func_oomir_operand =
+                        convert_operand(&func, tcx, instance, mir, data_types, &mut instructions);
+
+                    let oomir_sig =
+                        super::types::fn_ptr_signature_from_ty(func_ty, tcx, data_types, instance);
+                    super::types::ensure_fn_ptr_interface(&oomir_sig, data_types);
+
+                    let effective_dest = if matches!(oomir_sig.ret.as_ref(), oomir::Type::Void) {
+                        None
+                    } else {
+                        dest_var_name.clone()
+                    };
+
+                    instructions.push(oomir::Instruction::CallIndirect {
+                        dest: effective_dest,
+                        function_ptr: Box::new(func_oomir_operand),
                         args: oomir_operands.clone(),
+                        signature: oomir_sig,
                     });
                 }
 

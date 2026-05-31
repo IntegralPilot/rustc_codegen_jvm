@@ -573,8 +573,7 @@ fn handle_constant_enum<'tcx>(
                         .map(|(idx, discr)| (idx, discr.val))
                         .collect();
 
-                    for v_idx_int in niche_variants.start().index()..=niche_variants.end().index() {
-                        let v_idx = VariantIdx::from_usize(v_idx_int);
+                    for v_idx in niche_variants.clone() {
                         if v_idx == *untagged_variant {
                             continue;
                         }

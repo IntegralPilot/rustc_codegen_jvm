@@ -2351,6 +2351,42 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     self.jvm_instructions.push(JI::Athrow);
                 }
             }
+            OI::CallIndirect {
+                dest,
+                function_ptr,
+                args,
+                signature,
+            } => {
+                let interface_name = signature.fn_ptr_interface_name();
+                let class_index = self.constant_pool.add_class(&interface_name)?;
+                let descriptor = signature.to_jvm_descriptor_with_explicit_params();
+                let method_ref = self.constant_pool.add_interface_method_ref(
+                    class_index,
+                    "call",
+                    &descriptor,
+                )?;
+
+                self.load_operand(function_ptr)?;
+                for arg in args.iter() {
+                    self.load_call_argument(arg)?;
+                }
+
+                let count = self.invokeinterface_count(args)?;
+                self.jvm_instructions
+                    .push(JI::Invokeinterface(method_ref, count));
+
+                if let Some(dest_var) = dest {
+                    if *signature.ret != oomir::Type::Void {
+                        self.store_result(dest_var, &signature.ret)?;
+                    }
+                } else if *signature.ret != oomir::Type::Void {
+                    match get_type_size(&signature.ret) {
+                        1 => self.jvm_instructions.push(JI::Pop),
+                        2 => self.jvm_instructions.push(JI::Pop2),
+                        _ => {}
+                    }
+                }
+            }
             OI::Move { dest, src } => {
                 // Determine the type of the VALUE being moved (from the source operand)
                 let value_type = match src {
@@ -2839,8 +2875,9 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 }
 
                 // 3. Emit 'invokeinterface' instruction
+                let count = self.invokeinterface_count(args)?;
                 self.jvm_instructions
-                    .push(JI::Invokeinterface(method_ref_index, args.len() as u8 + 1)); // Stack: [result]
+                    .push(JI::Invokeinterface(method_ref_index, count)); // Stack: [result]
 
                 // 4. Handle the return value
                 if let Some(dest_var) = dest {
@@ -2983,5 +3020,21 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             }
         }
         Ok(())
+    }
+
+    fn call_argument_slot_size(operand: &oomir::Operand) -> u16 {
+        let ty = get_operand_type(operand);
+        match ty {
+            oomir::Type::Reference(inner) if inner.is_jvm_primitive() => get_type_size(&inner),
+            _ => get_type_size(&ty),
+        }
+    }
+
+    fn invokeinterface_count(&self, args: &[oomir::Operand]) -> Result<u8, jvm::Error> {
+        let slots = 1 + args.iter().map(Self::call_argument_slot_size).sum::<u16>();
+        u8::try_from(slots).map_err(|_| jvm::Error::VerificationError {
+            context: format!("Function {}", self.oomir_func.name),
+            message: format!("invokeinterface argument slot count {slots} exceeds u8 range"),
+        })
     }
 }
