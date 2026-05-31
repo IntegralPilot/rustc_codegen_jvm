@@ -29,22 +29,23 @@ pub use closures::generate_closure_function_name;
 /// This function extracts a function's signature (currently minimal) and builds
 /// a control flow graph of basic blocks.
 ///
-/// If `fn_name_override` is provided, it will be used as the function name instead of
-/// querying rustc for the item name. This is necessary for closures, which don't have
-/// proper item names in rustc's internal representation.
+/// If `fn_name_override` is provided, it will be used instead of querying rustc for
+/// the item name. This is necessary for closures, which don't have proper item names
+/// in rustc's internal representation.
 pub fn mir_to_oomir<'tcx>(
     tcx: TyCtxt<'tcx>,
     instance: Instance<'tcx>,
     mir: &mut Body<'tcx>,
-    fn_name_override: Option<String>,
+    fn_name_override: Option<naming::FnNameData>,
     is_static: bool,
 ) -> (oomir::Function, HashMap<String, oomir::DataType>) {
     use rustc_middle::ty::TyKind;
 
     // Get a function name from the instance or use the provided override.
     // Prefer monomorphized naming to disambiguate generic instantiations.
-    let fn_name = fn_name_override
-        .unwrap_or_else(|| naming::mono_fn_name_from_instance(tcx, instance).method_name);
+    let fn_name_data =
+        fn_name_override.unwrap_or_else(|| naming::mono_fn_name_from_instance(tcx, instance));
+    let fn_name = fn_name_data.method_name.clone();
 
     // Extract function signature
     // Closures require special handling - we must use as_closure().sig() instead of fn_sig()
@@ -218,6 +219,7 @@ pub fn mir_to_oomir<'tcx>(
     (
         oomir::Function {
             name: fn_name,
+            owner_class: fn_name_data.class_to_call_on,
             signature,
             body: codeblock,
         },

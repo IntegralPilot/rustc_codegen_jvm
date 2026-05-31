@@ -561,8 +561,11 @@ pub fn convert_basic_block<'tcx>(
                             }
 
                             if !generated {
+                                let fn_name_data =
+                                    super::naming::mono_fn_name_from_instance(tcx, func_instance);
                                 instructions.push(oomir::Instruction::Call {
-                                    function: method_name,
+                                    class_name: fn_name_data.class_to_call_on,
+                                    function: fn_name_data.method_name,
                                     args: oomir_operands.clone(),
                                     dest: effective_dest, // use effective_dest
                                 });
@@ -571,11 +574,15 @@ pub fn convert_basic_block<'tcx>(
                     } else {
                         // --- Free Function ---
                         let is_closure_call = matches!(instance_ty.kind(), TyKind::Closure(..));
-                        let function = if is_closure_call {
-                            super::generate_closure_function_name(tcx, func_instance.def_id())
+                        let (class_name, function) = if is_closure_call {
+                            (
+                                None,
+                                super::generate_closure_function_name(tcx, func_instance.def_id()),
+                            )
                         } else {
-                            super::naming::mono_fn_name_from_instance(tcx, func_instance)
-                                .method_name
+                            let fn_name_data =
+                                super::naming::mono_fn_name_from_instance(tcx, func_instance);
+                            (fn_name_data.class_to_call_on, fn_name_data.method_name)
                         };
                         let call_args = if is_closure_call && !oomir_operands.is_empty() {
                             let closure_has_captures = match oomir_operands[0].get_type() {
@@ -602,6 +609,7 @@ pub fn convert_basic_block<'tcx>(
                         method_signature.is_static = true;
 
                         instructions.push(oomir::Instruction::Call {
+                            class_name,
                             function,
                             args: call_args,
                             dest: effective_dest, // use effective_dest

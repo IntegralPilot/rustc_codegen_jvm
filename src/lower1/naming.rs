@@ -2,11 +2,7 @@
 
 use super::{place::make_jvm_safe, types::ty_to_oomir_type};
 use rustc_hir::def_id::DefId;
-use rustc_middle::{
-    mir::Operand as MirOperand,
-    ty::{GenericArgsRef, Instance, Ty, TyCtxt, TyKind, TypeVisitableExt},
-};
-use sha2::Digest;
+use rustc_middle::ty::{Instance, TyCtxt, TypeVisitableExt};
 use std::collections::HashMap;
 
 const MAX_MONO_FN_NAME_LEN: usize = 128;
@@ -15,6 +11,15 @@ const MAX_MONO_FN_NAME_LEN: usize = 128;
 pub struct FnNameData {
     pub class_to_call_on: Option<String>,
     pub method_name: String,
+}
+
+impl FnNameData {
+    pub fn key(&self, fallback_class: &str) -> String {
+        crate::oomir::Module::function_key_for_owner(
+            self.class_to_call_on.as_deref().unwrap_or(fallback_class),
+            &self.method_name,
+        )
+    }
 }
 
 /// Generate a JVM-safe function name for a (possibly monomorphized) function instance.
@@ -26,95 +31,7 @@ pub fn mono_fn_name_from_instance<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'t
     let full_path = tcx.def_path_str(instance.def_id());
 
     // Determine class (module path) from the full path (everything before the last "::")
-    let class;
-    if let Some(pos) = full_path.rfind("::") {
-        let mod_path = &full_path[..pos];
-        // replace :: with /
-        let mod_path_slash = mod_path.replace("::", "/");
-
-        // sanitize any `impl ...` segments to keep only the trait name (e.g.:
-        // "impl PartialEq<&B> for &A>" -> "PartialEq")
-        // Also handle "Type as Trait" segments (e.g. "SimpleAdder as Calculator" -> "Calculator")
-        let sanitize_impl_segment = |seg: &str| -> String {
-            let mut s = seg.trim();
-            if s.starts_with('<') && s.ends_with('>') && s.len() > 2 {
-                s = &s[1..s.len() - 1];
-                s = s.trim();
-            }
-            if s.starts_with("impl") {
-                // drop the "impl" prefix and leading whitespace
-                s = &s["impl".len()..];
-                s = s.trim_start();
-
-                // if there are leading generic params like "<T>", skip them
-                if s.starts_with('<') {
-                    let mut depth = 0usize;
-                    let mut end_idx = None;
-                    for (i, ch) in s.char_indices() {
-                        if ch == '<' {
-                            depth += 1;
-                        } else if ch == '>' {
-                            if depth == 0 {
-                                continue;
-                            }
-                            depth -= 1;
-                            if depth == 0 {
-                                end_idx = Some(i);
-                                break;
-                            }
-                        }
-                    }
-                    if let Some(i) = end_idx {
-                        s = &s[i + 1..];
-                        s = s.trim_start();
-                    } else {
-                        // malformed; fall back to original segment (but trimmed)
-                        return seg.trim().to_string();
-                    }
-                }
-
-                // now we expect something like "TraitName<...> for Foo" or "TraitName"
-                // drop the " for ..." portion if present
-                if let Some(pos) = s.find(" for ") {
-                    s = &s[..pos];
-                }
-                // drop trait generics if present, e.g. "PartialEq<&B>" -> "PartialEq"
-                if let Some(pos) = s.find('<') {
-                    s = &s[..pos];
-                }
-
-                return s.trim().to_string();
-            }
-
-            // Handle "Type as Trait" pattern (without impl prefix)
-            if let Some(pos) = s.find(" as ") {
-                let trait_part = &s[pos + 4..];
-                // drop trait generics if present
-                if let Some(gpos) = trait_part.find('<') {
-                    return trait_part[..gpos].trim().to_string();
-                }
-                return trait_part.trim().to_string();
-            }
-
-            seg.to_string()
-        };
-
-        let sanitized_segments: Vec<String> = mod_path_slash
-            .split('/')
-            .map(|seg| sanitize_impl_segment(seg))
-            .collect();
-
-        let sanitized_path = sanitized_segments.join("/");
-
-        // if the first word is "core" replace it with org/rustlang/core
-        class = if sanitized_path.starts_with("core/") {
-            Some(format!("org/rustlang/{}", sanitized_path))
-        } else {
-            Some(sanitized_path)
-        };
-    } else {
-        class = None;
-    }
+    let class = owner_class_from_path(tcx, instance.def_id(), &full_path);
 
     // Use only the last path segment as the method base (so "core::panicking::panic" -> "panic")
     let method_segment = if let Some(pos) = full_path.rfind("::") {
@@ -124,7 +41,6 @@ pub fn mono_fn_name_from_instance<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'t
     };
 
     let safe_base = make_jvm_safe(method_segment);
-
     // We need a local map for the type conversion, similar to the original function
     let mut data_types = HashMap::new();
 
@@ -189,4 +105,106 @@ pub fn mono_fn_name_from_instance<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'t
         class_to_call_on: class,
         method_name: format!("{}__{}", safe_base, hash),
     }
+}
+
+fn owner_class_from_path<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: DefId,
+    full_path: &str,
+) -> Option<String> {
+    let crate_name = make_jvm_safe(&tcx.crate_name(def_id.krate).to_string());
+    let def_path = tcx.def_path(def_id);
+    let mut segments: Vec<String> = def_path
+        .data
+        .iter()
+        .filter_map(|component| component.data.get_opt_name())
+        .map(|name| sanitize_class_segment(name.as_str()))
+        .collect();
+
+    let method_segment = full_path
+        .rfind("::")
+        .map_or(full_path, |pos| &full_path[pos + 2..]);
+    let method_name = make_jvm_safe(method_segment);
+    if segments
+        .last()
+        .is_some_and(|segment| segment == &method_name)
+    {
+        segments.pop();
+    }
+
+    match crate_name.as_str() {
+        "core" | "alloc" | "std" => {
+            let runtime_root = format!("org/rustlang/{crate_name}");
+            if segments.is_empty() {
+                Some(runtime_root)
+            } else {
+                Some(format!("{runtime_root}/{}", segments.join("/")))
+            }
+        }
+        _ if segments.is_empty() => Some(crate_name),
+        _ if def_id.is_local() => Some(segments.join("/")),
+        _ => Some(format!("{crate_name}/{}", segments.join("/"))),
+    }
+}
+
+fn sanitize_class_segment(seg: &str) -> String {
+    let mut s = seg.trim();
+    if s.starts_with('<') && s.ends_with('>') && s.len() > 2 {
+        s = &s[1..s.len() - 1];
+        s = s.trim();
+    }
+    if s.starts_with("impl") {
+        // drop the "impl" prefix and leading whitespace
+        s = &s["impl".len()..];
+        s = s.trim_start();
+
+        // if there are leading generic params like "<T>", skip them
+        if s.starts_with('<') {
+            let mut depth = 0usize;
+            let mut end_idx = None;
+            for (i, ch) in s.char_indices() {
+                if ch == '<' {
+                    depth += 1;
+                } else if ch == '>' {
+                    if depth == 0 {
+                        continue;
+                    }
+                    depth -= 1;
+                    if depth == 0 {
+                        end_idx = Some(i);
+                        break;
+                    }
+                }
+            }
+            if let Some(i) = end_idx {
+                s = &s[i + 1..];
+                s = s.trim_start();
+            } else {
+                return make_jvm_safe(seg.trim());
+            }
+        }
+
+        // now we expect something like "TraitName<...> for Foo" or "TraitName"
+        // drop the " for ..." portion if present
+        if let Some(pos) = s.find(" for ") {
+            s = &s[..pos];
+        }
+        // drop trait generics if present, e.g. "PartialEq<&B>" -> "PartialEq"
+        if let Some(pos) = s.find('<') {
+            s = &s[..pos];
+        }
+
+        return make_jvm_safe(s.trim());
+    }
+
+    // Handle "Type as Trait" pattern (without impl prefix)
+    if let Some(pos) = s.find(" as ") {
+        let trait_part = &s[pos + 4..];
+        if let Some(gpos) = trait_part.find('<') {
+            return make_jvm_safe(trait_part[..gpos].trim());
+        }
+        return make_jvm_safe(trait_part.trim());
+    }
+
+    make_jvm_safe(seg)
 }

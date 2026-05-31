@@ -429,9 +429,17 @@ fn create_jar(
             .and_then(|caps| caps.name("name").map(|m| format!("{}.class", m.as_str())))
             .unwrap_or_else(|| file_name.to_string());
 
-        let jar_entry_name = base_name;
-
         let data = fs::read(path)?;
+        let jar_entry_name = ClassFile::from_bytes(&mut Cursor::new(data.clone()))
+            .ok()
+            .and_then(|class_file| {
+                class_file
+                    .class_name()
+                    .ok()
+                    .map(|class_name| format!("{class_name}.class"))
+            })
+            .unwrap_or(base_name);
+
         app_classes.push(ClassInfo {
             jar_entry_name,
             data,

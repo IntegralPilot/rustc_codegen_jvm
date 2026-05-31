@@ -67,7 +67,7 @@ fn lower_closure_to_oomir<'tcx>(
     let closure_name = lower1::generate_closure_function_name(tcx, closure_def_id);
 
     // Check if we've already lowered this closure
-    if oomir_module.functions.contains_key(&closure_name) {
+    if oomir_module.get_function(None, &closure_name).is_some() {
         breadcrumbs::log!(
             breadcrumbs::LogLevel::Info,
             "closure-lowering",
@@ -109,8 +109,16 @@ fn lower_closure_to_oomir<'tcx>(
 
     // Lower the closure MIR to OOMIR, providing the closure name as an override
     // since closures don't have proper item names in rustc
-    let (oomir_function, data_types) =
-        lower1::mir_to_oomir(tcx, instance, &mut mir, Some(closure_name.clone()), true);
+    let (oomir_function, data_types) = lower1::mir_to_oomir(
+        tcx,
+        instance,
+        &mut mir,
+        Some(lower1::naming::FnNameData {
+            class_to_call_on: Some(oomir_module.name.clone()),
+            method_name: closure_name.clone(),
+        }),
+        true,
+    );
 
     breadcrumbs::log!(
         breadcrumbs::LogLevel::Info,
@@ -119,7 +127,7 @@ fn lower_closure_to_oomir<'tcx>(
     );
 
     // Add the closure function to the module
-    oomir_module.functions.insert(closure_name, oomir_function);
+    oomir_module.insert_function(oomir_function);
     oomir_module.merge_data_types(&data_types);
 }
 
@@ -301,6 +309,7 @@ fn install_fmt_arguments_shim(oomir_module: &mut oomir::Module) {
         };
         oomir::DataTypeMethod::Function(oomir::Function {
             name: "from_str".to_string(),
+            owner_class: None,
             signature: oomir::Signature {
                 params: vec![("s".to_string(), Type::String)],
                 ret: Box::new(Type::Class(class_name.clone())),
@@ -385,6 +394,7 @@ fn install_fmt_arguments_shim(oomir_module: &mut oomir::Module) {
         };
         oomir::DataTypeMethod::Function(oomir::Function {
             name: "new".to_string(),
+            owner_class: None,
             signature: oomir::Signature {
                 params: vec![
                     ("template".to_string(), Type::Array(Box::new(Type::I16))),
@@ -481,6 +491,7 @@ fn install_fmt_arguments_shim(oomir_module: &mut oomir::Module) {
         };
         oomir::DataTypeMethod::Function(oomir::Function {
             name: "toString".to_string(),
+            owner_class: None,
             signature: oomir::Signature {
                 params: vec![("self".to_string(), Type::Class(class_name.clone()))],
                 ret: Box::new(Type::String),
@@ -550,6 +561,7 @@ fn install_fmt_argument_shim(oomir_module: &mut oomir::Module) {
         };
         oomir::DataTypeMethod::Function(oomir::Function {
             name: "new_display".to_string(),
+            owner_class: None,
             signature: oomir::Signature {
                 params: vec![("value".to_string(), Type::I32)],
                 ret: Box::new(Type::Class(class_name.clone())),
@@ -586,6 +598,7 @@ fn install_fmt_argument_shim(oomir_module: &mut oomir::Module) {
         };
         oomir::DataTypeMethod::Function(oomir::Function {
             name: "toString".to_string(),
+            owner_class: None,
             signature: oomir::Signature {
                 params: vec![("self".to_string(), Type::Class(class_name.clone()))],
                 ret: Box::new(Type::String),
@@ -627,8 +640,11 @@ impl CodegenBackend for MyBackend {
         let mut closures_to_lower: std::collections::HashSet<rustc_hir::def_id::DefId> =
             std::collections::HashSet::new();
 
-        // Track monomorphized function instances to lower and avoid duplicates by name
-        let mut fn_instances_to_lower: Vec<(rustc_middle::ty::Instance<'_>, String)> = Vec::new();
+        // Track monomorphized function instances to lower and avoid duplicates by owner+name
+        let mut fn_instances_to_lower: Vec<(
+            rustc_middle::ty::Instance<'_>,
+            lower1::naming::FnNameData,
+        )> = Vec::new();
         let mut seen_fn_names: std::collections::HashSet<String> = std::collections::HashSet::new();
         use rustc_middle::ty::TypingEnv;
 
@@ -739,9 +755,8 @@ impl CodegenBackend for MyBackend {
                                         let name = lower1::naming::mono_fn_name_from_instance(
                                             tcx, instance,
                                         );
-                                        if seen_fn_names.insert(name.method_name.clone()) {
-                                            fn_instances_to_lower
-                                                .push((instance, name.method_name.clone()));
+                                        if seen_fn_names.insert(name.key(&crate_name)) {
+                                            fn_instances_to_lower.push((instance, name));
                                         }
                                     } else if should_lower_non_local(tcx, *fn_def_id) {
                                         let instance = rustc_middle::ty::Instance::expect_resolve(
@@ -767,9 +782,8 @@ impl CodegenBackend for MyBackend {
                                         let name = lower1::naming::mono_fn_name_from_instance(
                                             tcx, instance,
                                         );
-                                        if seen_fn_names.insert(name.method_name.clone()) {
-                                            fn_instances_to_lower
-                                                .push((instance, name.method_name.clone()));
+                                        if seen_fn_names.insert(name.key(&crate_name)) {
+                                            fn_instances_to_lower.push((instance, name));
                                         }
                                     } else {
                                         breadcrumbs::log!(
@@ -801,9 +815,7 @@ impl CodegenBackend for MyBackend {
 
                 let oomir_function = oomir_result.0;
 
-                oomir_module
-                    .functions
-                    .insert(oomir_function.name.clone(), oomir_function);
+                oomir_module.insert_function(oomir_function);
 
                 oomir_module.merge_data_types(&oomir_result.1);
             } else if let rustc_hir::ItemKind::Impl(impl_a) = item.kind {
@@ -973,9 +985,8 @@ impl CodegenBackend for MyBackend {
                                             let name = lower1::naming::mono_fn_name_from_instance(
                                                 tcx, instance,
                                             );
-                                            if seen_fn_names.insert(name.method_name.clone()) {
-                                                fn_instances_to_lower
-                                                    .push((instance, name.method_name));
+                                            if seen_fn_names.insert(name.key(&crate_name)) {
+                                                fn_instances_to_lower.push((instance, name));
                                             }
                                         } else if should_lower_non_local(tcx, *fn_def_id) {
                                             let instance =
@@ -1002,9 +1013,8 @@ impl CodegenBackend for MyBackend {
                                             let name = lower1::naming::mono_fn_name_from_instance(
                                                 tcx, instance,
                                             );
-                                            if seen_fn_names.insert(name.method_name.clone()) {
-                                                fn_instances_to_lower
-                                                    .push((instance, name.method_name));
+                                            if seen_fn_names.insert(name.key(&crate_name)) {
+                                                fn_instances_to_lower.push((instance, name));
                                             }
                                         } else {
                                             breadcrumbs::log!(
@@ -1307,7 +1317,10 @@ impl CodegenBackend for MyBackend {
             breadcrumbs::log!(
                 breadcrumbs::LogLevel::Info,
                 "mir-lowering",
-                format!("--- Lowering monomorphized function instance: {} ---", name)
+                format!(
+                    "--- Lowering monomorphized function instance: {} ---",
+                    name.method_name
+                )
             );
             let (mut oomir_function, data_types) =
                 lower1::mir_to_oomir(tcx, instance, &mut mir, Some(name.clone()), true);
@@ -1342,6 +1355,7 @@ impl CodegenBackend for MyBackend {
                             // It is a user class!
                             // 1. Rename function to simple name (e.g. "new" instead of "new__hash")
                             oomir_function.name = tcx.item_name(instance.def_id()).to_string();
+                            oomir_function.owner_class = None;
 
                             // 2. Check if this is an instance method.
                             if assoc_item.is_method() {
@@ -1372,7 +1386,7 @@ impl CodegenBackend for MyBackend {
                                     "backend",
                                     format!(
                                         "Warning: Class {} not found in module for method {}, falling back to free function",
-                                        class_name, name
+                                        class_name, name.method_name
                                     )
                                 );
                             }
@@ -1382,7 +1396,7 @@ impl CodegenBackend for MyBackend {
             }
 
             if !placed_in_class {
-                oomir_module.functions.insert(name, oomir_function);
+                oomir_module.insert_function(oomir_function);
             }
         }
 
@@ -1512,13 +1526,23 @@ impl CodegenBackend for MyBackend {
 
             // Iterate over each (file_name, bytecode) pair in the map.
             for (name, bytecode) in bytecode_map.into_iter() {
-                let file_path = outputs.temp_path_ext_for_cgu("class", &name);
+                let cgu_name = name.replace('/', "_");
+                let file_path = outputs.temp_path_ext_for_cgu("class", &cgu_name);
 
                 // extract the directory from the file path
                 let dir = file_path.parent().unwrap();
 
                 // make the actual file path by adding {name}.class to the directory
                 let file_path = dir.join(format!("{}.class", name));
+                if let Some(parent) = file_path.parent() {
+                    std::fs::create_dir_all(parent).unwrap_or_else(|e| {
+                        panic!(
+                            "Could not create class output directory {}: {}",
+                            parent.display(),
+                            e
+                        )
+                    });
+                }
 
                 // Write the bytecode to the file
                 let mut file = std::fs::File::create(&file_path).unwrap_or_else(|e| {
@@ -1580,7 +1604,7 @@ impl CodegenBackend for MyBackend {
 
 struct RustcCodegenJvmLogListener;
 
-const LISTENING_CHANNELS: &[&str] = &["non_local", "mir-lowering"];
+const LISTENING_CHANNELS: &[&str] = &[];
 
 impl breadcrumbs::LogListener for RustcCodegenJvmLogListener {
     fn on_log(&mut self, log: breadcrumbs::Log) {

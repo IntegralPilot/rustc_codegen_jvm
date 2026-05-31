@@ -24,6 +24,37 @@ pub struct Module {
 }
 
 impl Module {
+    pub fn function_key(&self, owner_class: Option<&str>, function_name: &str) -> String {
+        Self::function_key_for_owner(owner_class.unwrap_or(&self.name), function_name)
+    }
+
+    pub fn function_key_for_owner(owner_class: &str, function_name: &str) -> String {
+        format!("{owner_class}::{function_name}")
+    }
+
+    pub fn insert_function(&mut self, function: Function) {
+        let key = self.function_key(function.owner_class.as_deref(), &function.name);
+        self.functions.insert(key, function);
+    }
+
+    pub fn get_function(
+        &self,
+        owner_class: Option<&str>,
+        function_name: &str,
+    ) -> Option<&Function> {
+        let key = self.function_key(owner_class, function_name);
+        self.functions.get(&key).or_else(|| {
+            owner_class
+                .is_none()
+                .then(|| self.functions.get(function_name))
+                .flatten()
+        })
+    }
+
+    pub fn owner_class_for_function<'a>(&'a self, function: &'a Function) -> &'a str {
+        function.owner_class.as_deref().unwrap_or(&self.name)
+    }
+
     // Helper function to merge data types into the module
     // Ensure no dups (if there are, give the older one precedence)
     pub fn merge_data_types(&mut self, other: &HashMap<String, DataType>) {
@@ -192,6 +223,7 @@ impl DataType {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Function {
     pub name: String,
+    pub owner_class: Option<String>,
     pub signature: Signature,
     pub body: CodeBlock,
 }
@@ -402,9 +434,10 @@ pub enum Instruction {
         operand: Option<Operand>, // Optional return value
     },
     Call {
-        dest: Option<String>, // Optional destination variable for the return value
-        function: String,     // Name of the function to call
-        args: Vec<Operand>,   // Arguments to the function
+        dest: Option<String>,       // Optional destination variable for the return value
+        class_name: Option<String>, // JVM owner class for module/free functions
+        function: String,           // Name of the function to call
+        args: Vec<Operand>,         // Arguments to the function
     },
     CallIndirect {
         dest: Option<String>,       // Optional destination variable for the return value

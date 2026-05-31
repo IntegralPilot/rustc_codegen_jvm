@@ -860,6 +860,7 @@ pub fn process_block_instructions(
             Instruction::Call {
                 dest,
                 args,
+                class_name,
                 function,
                 ..
             } => {
@@ -924,6 +925,7 @@ pub fn process_block_instructions(
                 // Keep the call instruction, but with potentially updated arguments
                 optimised_instruction = Instruction::Call {
                     dest: dest.clone(),
+                    class_name: class_name.clone(),
                     function: function.clone(), // Use the captured function name
                     args: new_args,
                 };

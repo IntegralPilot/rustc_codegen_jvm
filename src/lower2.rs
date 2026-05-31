@@ -15,7 +15,7 @@ use ristretto_classfile::{
     attributes::{Attribute, MaxStack},
 };
 use rustc_middle::ty::TyCtxt;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 mod consts;
 mod helpers;
@@ -35,22 +35,27 @@ pub fn oomir_to_jvm_bytecode(
     // Map to store the generated class files (Class Name -> Bytes)
     let mut generated_classes: HashMap<String, Vec<u8>> = HashMap::new();
 
-    // --- 1. Generate the Main Module Class (containing functions) ---
-    {
-        // Scope block for the main class generation
+    // --- 1. Generate module classes (containing free functions grouped by owner module) ---
+    let mut functions_by_class: BTreeMap<String, Vec<&oomir::Function>> = BTreeMap::new();
+    for function in module.functions.values() {
+        functions_by_class
+            .entry(module.owner_class_for_function(function).to_string())
+            .or_default()
+            .push(function);
+    }
+
+    for (class_name_jvm, functions) in functions_by_class {
         let mut main_cp = ConstantPool::default();
-        // Convert module name to JVM internal format (replace '.' with '/')
-        let main_class_name_jvm = module.name.replace('.', "/");
         let super_class_name_jvm = "java/lang/Object"; // Standard superclass
 
         let super_class_index = main_cp.add_class(super_class_name_jvm)?;
-        let this_class_index = main_cp.add_class(&main_class_name_jvm)?;
+        let this_class_index = main_cp.add_class(&class_name_jvm)?;
         let code_attribute_name_index = main_cp.add_utf8("Code")?;
 
         let mut methods: Vec<jvm::Method> = Vec::new();
         let mut has_constructor = false;
 
-        for function in module.functions.values() {
+        for function in functions {
             // Don't create a default constructor if the OOMIR provided one
             if function.name == "<init>" {
                 has_constructor = true;
@@ -117,7 +122,7 @@ pub fn oomir_to_jvm_bytecode(
         }
 
         // Add a default constructor if none was provided in OOMIR
-        if !has_constructor && !module.functions.contains_key("<init>") {
+        if !has_constructor {
             methods.push(create_default_constructor(&mut main_cp, super_class_index)?);
         }
 
@@ -136,8 +141,11 @@ pub fn oomir_to_jvm_bytecode(
         // Add SourceFile attribute
         let source_file_name = format!(
             "{}.rs",
-            module.name.split('.').last().unwrap_or(&module.name)
-        ); // Simple name
+            class_name_jvm
+                .split('/')
+                .next_back()
+                .unwrap_or(&class_name_jvm)
+        );
         let source_file_utf8_index = class_file.constant_pool.add_utf8(&source_file_name)?;
         let source_file_attr_name_index = class_file.constant_pool.add_utf8("SourceFile")?;
         class_file.attributes.push(Attribute::SourceFile {
@@ -148,12 +156,12 @@ pub fn oomir_to_jvm_bytecode(
         // Serialize the main class file
         let mut byte_vector = Vec::new();
         class_file.to_bytes(&mut byte_vector)?;
-        generated_classes.insert(main_class_name_jvm.clone(), byte_vector);
+        generated_classes.insert(class_name_jvm.clone(), byte_vector);
 
         breadcrumbs::log!(
             breadcrumbs::LogLevel::Info,
             "bytecode-gen",
-            format!("Generated main class: {}", main_class_name_jvm)
+            format!("Generated module class: {}", class_name_jvm)
         );
     }
 

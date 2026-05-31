@@ -289,6 +289,7 @@ pub fn emit_checked_arithmetic_intrinsic(
 
     Function {
         name: fn_name.clone(),
+        owner_class: None,
         signature: Signature {
             params: vec![(a, ty.clone()), (b, ty.clone())],
             ret: Box::new(Type::Class(result_struct_name)),

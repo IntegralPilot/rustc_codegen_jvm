@@ -85,14 +85,21 @@ fn adapt_value_for_field(
 
 fn ensure_fn_pointer_adapter_class(
     data_types: &mut HashMap<String, oomir::DataType>,
-    target_function: Option<&str>,
+    target_function: Option<&super::super::naming::FnNameData>,
     signature: &oomir::Signature,
     interface_name: &str,
 ) -> String {
     let descriptor = signature.to_jvm_descriptor_with_explicit_params();
-    let target_name = target_function.unwrap_or("unsupported");
+    let target_name = target_function
+        .map(|target| {
+            target.class_to_call_on.as_deref().map_or_else(
+                || target.method_name.clone(),
+                |class| format!("{class}::{}", target.method_name),
+            )
+        })
+        .unwrap_or_else(|| "unsupported".to_string());
     let hash = short_hash(&format!("{target_name}:{descriptor}"), 10);
-    let base_name: String = make_jvm_safe(target_name).chars().take(80).collect();
+    let base_name: String = make_jvm_safe(&target_name).chars().take(80).collect();
     let class_name = format!("FnPtrImpl_{}_{}", base_name, hash);
 
     let mut method_params = Vec::with_capacity(signature.params.len() + 1);
@@ -117,7 +124,8 @@ fn ensure_fn_pointer_adapter_class(
 
         let mut instructions = vec![oomir::Instruction::Call {
             dest: call_dest.clone(),
-            function: target_function.to_string(),
+            class_name: target_function.class_to_call_on.clone(),
+            function: target_function.method_name.clone(),
             args: call_args,
         }];
 
@@ -137,6 +145,7 @@ fn ensure_fn_pointer_adapter_class(
 
     let call_method = oomir::DataTypeMethod::Function(oomir::Function {
         name: "call".to_string(),
+        owner_class: None,
         signature: oomir::Signature {
             params: method_params,
             ret: signature.ret.clone(),
@@ -532,22 +541,18 @@ pub fn convert_rvalue_to_operand<'a>(
                     )
                     .unwrap();
                     let fn_name =
-                        super::super::naming::mono_fn_name_from_instance(tcx, func_instance)
-                            .method_name;
+                        super::super::naming::mono_fn_name_from_instance(tcx, func_instance);
                     let signature =
                         fn_ptr_signature_from_ty(*target_mir_ty, tcx, data_types, instance);
                     let interface_name = ensure_fn_ptr_interface(&signature, data_types);
-                    let callable_target = func_instance
-                        .def_id()
-                        .is_local()
-                        .then_some(fn_name.as_str());
+                    let callable_target = func_instance.def_id().is_local().then_some(&fn_name);
                     if callable_target.is_none() {
                         breadcrumbs::log!(
                             breadcrumbs::LogLevel::Warn,
                             "mir-lowering",
                             format!(
                                 "Warning: Reified non-local function pointer '{}' will use an UnsupportedOperationException stub if invoked.",
-                                fn_name
+                                fn_name.method_name
                             )
                         );
                     }
@@ -562,7 +567,7 @@ pub fn convert_rvalue_to_operand<'a>(
                         "mir-lowering",
                         format!(
                             "Info: Reifying FnDef to FnPtr: '{}' -> '{}' as '{}'",
-                            source_mir_ty, fn_name, adapter_class
+                            source_mir_ty, fn_name.method_name, adapter_class
                         )
                     );
                     instructions.push(oomir::Instruction::ConstructObject {
