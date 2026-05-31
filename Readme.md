@@ -54,8 +54,8 @@ All examples live in `tests/binary` and are compiled to JVM bytecode & run/teste
 - Implementations for ADTs, including using and returning `self`, `&self`, `&mut self`
 - Traits, including dynamic dispatch (`&dyn Trait`)
 - Closures, including capturing closures
-- Function pointers
-- **Integration tests** for all features, in debug and release modes
+- Function pointers, in almost any context (within ADTs, as variables, as parameters and return values of functions, as generics, etc.)
+- **Integration tests** for all these features and more, in debug and release modes
 
 🚧 **Next Milestone:** Full support for the Rust `core` crate.
 
