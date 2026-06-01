@@ -1,12 +1,15 @@
 use super::{
     operand::convert_operand,
-    types::{get_field_name_from_index, ty_to_oomir_type},
+    types::{
+        get_field_name_from_index, ty_to_oomir_type, union_getter_method_name,
+        union_setter_method_name,
+    },
 };
 use crate::oomir::{self, DataTypeMethod, Instruction, Operand};
 use regex::Regex;
 use rustc_middle::{
     mir::{Body, Operand as MirOperand, Place, ProjectionElem},
-    ty::{Instance, TyCtxt, TyKind},
+    ty::{AdtDef, GenericArgsRef, Instance, Ty, TyCtxt, TyKind},
 };
 use std::{collections::HashMap, sync::OnceLock};
 
@@ -98,6 +101,43 @@ pub fn make_jvm_safe(input: &str) -> String {
     final_result
 }
 
+fn union_parts_from_ty<'tcx>(ty: Ty<'tcx>) -> Option<(AdtDef<'tcx>, GenericArgsRef<'tcx>)> {
+    match ty.kind() {
+        TyKind::Adt(adt_def, substs) if adt_def.is_union() => Some((*adt_def, substs)),
+        TyKind::Ref(_, inner_ty, _) => match inner_ty.kind() {
+            TyKind::Adt(adt_def, substs) if adt_def.is_union() => Some((*adt_def, substs)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn projection_prefix_place<'tcx>(
+    place: &Place<'tcx>,
+    proj_index: usize,
+    tcx: TyCtxt<'tcx>,
+) -> Place<'tcx> {
+    Place {
+        local: place.local,
+        projection: tcx.mk_place_elems(&place.projection[..proj_index]),
+    }
+}
+
+fn union_field_name<'tcx>(adt_def: AdtDef<'tcx>, field_index: usize, tcx: TyCtxt<'tcx>) -> String {
+    adt_def
+        .variant(0usize.into())
+        .fields
+        .get(rustc_abi::FieldIdx::from_usize(field_index))
+        .unwrap_or_else(|| {
+            panic!(
+                "Union field index {} out of bounds for {:?}",
+                field_index, adt_def
+            )
+        })
+        .ident(tcx)
+        .to_string()
+}
+
 /// Generates the necessary OOMIR instructions to retrieve the value corresponding
 /// to a given Place that may have a nested projection chain.
 ///
@@ -126,6 +166,51 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
         let type_before_proj = current_type.clone();
         match proj {
             ProjectionElem::Field(field_index, field_ty) => {
+                let base_place_for_field = projection_prefix_place(place, proj_index, tcx);
+                let base_rust_ty = base_place_for_field.ty(&mir.local_decls, tcx).ty;
+                if let Some((adt_def, _substs)) = union_parts_from_ty(base_rust_ty) {
+                    let owner_class_name =
+                        match ty_to_oomir_type(base_rust_ty, tcx, data_types, instance) {
+                            oomir::Type::Class(name) => name,
+                            oomir::Type::Reference(inner)
+                                if matches!(inner.as_ref(), oomir::Type::Class(_)) =>
+                            {
+                                if let oomir::Type::Class(name) = inner.as_ref() {
+                                    name.clone()
+                                } else {
+                                    unreachable!()
+                                }
+                            }
+                            other => {
+                                panic!("Union field access on non-class OOMIR type: {:?}", other)
+                            }
+                        };
+                    let field_name = union_field_name(adt_def, field_index.index(), tcx);
+                    let next_var = format!("{}_{}", current_var, field_index.index());
+                    let obj_type = current_type.clone();
+                    current_type = ty_to_oomir_type(field_ty, tcx, data_types, instance);
+                    instructions.push(oomir::Instruction::InvokeVirtual {
+                        dest: Some(next_var.clone()),
+                        class_name: owner_class_name.clone(),
+                        method_name: union_getter_method_name(&field_name),
+                        method_ty: oomir::Signature {
+                            params: vec![(
+                                "self".to_string(),
+                                oomir::Type::Class(owner_class_name),
+                            )],
+                            ret: Box::new(current_type.clone()),
+                            is_static: false,
+                        },
+                        args: vec![],
+                        operand: Operand::Variable {
+                            name: current_var.clone(),
+                            ty: obj_type,
+                        },
+                    });
+                    current_var = next_var;
+                    continue;
+                }
+
                 // Get the owner class name and field name.
                 let owner_class_name = match &current_type {
                     oomir::Type::Class(name) => name.clone(),
@@ -560,6 +645,48 @@ pub fn emit_instructions_to_set_value<'tcx>(
         // 3. Generate the final store instruction based on the *last* projection.
         match last_projection {
             ProjectionElem::Field(field_index, field_mir_ty) => {
+                let base_rust_ty = base_place.ty(&mir.local_decls, tcx).ty;
+                if let Some((adt_def, _substs)) = union_parts_from_ty(base_rust_ty) {
+                    let owner_class_name =
+                        match ty_to_oomir_type(base_rust_ty, tcx, data_types, instance) {
+                            oomir::Type::Class(name) => name,
+                            oomir::Type::Reference(inner)
+                                if matches!(inner.as_ref(), oomir::Type::Class(_)) =>
+                            {
+                                if let oomir::Type::Class(name) = inner.as_ref() {
+                                    name.clone()
+                                } else {
+                                    unreachable!()
+                                }
+                            }
+                            other => panic!(
+                                "Union field assignment on non-class OOMIR type: {:?}",
+                                other
+                            ),
+                        };
+                    let field_name = union_field_name(adt_def, field_index.index(), tcx);
+                    let field_ty = ty_to_oomir_type(*field_mir_ty, tcx, data_types, instance);
+                    instructions.push(Instruction::InvokeVirtual {
+                        dest: None,
+                        class_name: owner_class_name.clone(),
+                        method_name: union_setter_method_name(&field_name),
+                        method_ty: oomir::Signature {
+                            params: vec![
+                                ("self".to_string(), oomir::Type::Class(owner_class_name)),
+                                ("value".to_string(), field_ty),
+                            ],
+                            ret: Box::new(oomir::Type::Void),
+                            is_static: false,
+                        },
+                        args: vec![source_operand],
+                        operand: Operand::Variable {
+                            name: base_var_name,
+                            ty: base_oomir_type,
+                        },
+                    });
+                    return instructions;
+                }
+
                 // Target is a field: base_var_name.field = source_operand
                 let owner_class_name = match &base_oomir_type {
                     oomir::Type::Class(name) => name.clone(),

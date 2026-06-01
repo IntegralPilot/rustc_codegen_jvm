@@ -33,13 +33,12 @@ All examples live in `tests/binary` and are compiled to JVM bytecode & run/teste
 - **[Large prime](tests/binary/primes/src/main.rs)** generator  
 - Use of nested data structures: enums, structs, tuples, arrays, slices (**[enums](tests/binary/enums/src/main.rs)**, **[structs](tests/binary/structs/src/main.rs)** - both tests use arrays and tuples)  
 * **[Implementation blocks](tests/binary/impl/src/main.rs)** and **[traits](tests/binary/traits/src/main.rs)** (including dynamic dispatch!)
+* Some `unsafe` code, such as **[unions](tests/binary/unions/src/main.rs)** 
 - …and more!
 
 ---
 
 ## ✨ Features
-
-- **Minimal `no_std` & `no_core`** programs via `jvm-unknown-unknown`  
 - Optimisations including constant folding and propogation, dead code elimination, and more to generate efficient JVM bytecode
 - Basic `core` support on host target for JVM output  
 - Arithmetic (integers + floats, incl. checked ops)  
@@ -55,6 +54,7 @@ All examples live in `tests/binary` and are compiled to JVM bytecode & run/teste
 - Traits, including dynamic dispatch (`&dyn Trait`)
 - Closures, including capturing closures
 - Function pointers, in almost any context (within ADTs, as variables, as parameters and return values of functions, as generics, etc.)
+- Unions (only for: `bool`, `i8`/`u8`, `i16`/`u16`, `i32`/`u32`, `f32`, `f64` and structs that contain combinations of these types)
 - **Integration tests** for all these features and more, in debug and release modes
 
 🚧 **Next Milestone:** Full support for the Rust `core` crate.

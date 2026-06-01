@@ -16,8 +16,8 @@ use super::{
         },
         place::{emit_instructions_to_get_on_own, get_place_type, make_jvm_safe, place_to_string},
         types::{
-            ensure_fn_ptr_interface, fn_ptr_signature_from_ty, generate_adt_jvm_class_name,
-            short_hash, ty_to_oomir_type,
+            ensure_fn_ptr_interface, ensure_union_data_type, fn_ptr_signature_from_ty,
+            generate_adt_jvm_class_name, short_hash, ty_to_oomir_type, union_from_method_name,
         },
     },
     checked_ops::emit_checked_arithmetic_oomir_instructions,
@@ -1156,7 +1156,13 @@ pub fn convert_rvalue_to_operand<'a>(
                         args: constructor_args,
                     });
                 }
-                rustc_middle::mir::AggregateKind::Adt(def_id, variant_idx, substs, _, _) => {
+                rustc_middle::mir::AggregateKind::Adt(
+                    def_id,
+                    variant_idx,
+                    substs,
+                    _,
+                    active_field_idx,
+                ) => {
                     let adt_def = tcx.adt_def(*def_id);
                     if adt_def.is_struct() {
                         let variant = adt_def.variant(*variant_idx);
@@ -1507,17 +1513,43 @@ pub fn convert_rvalue_to_operand<'a>(
                             args: constructor_args,
                         });
                     } else {
-                        // Union
-                        breadcrumbs::log!(
-                            breadcrumbs::LogLevel::Warn,
-                            "mir-lowering",
-                            format!("Warning: Unhandled ADT Aggregate Kind -> Temp Placeholder")
+                        let union_class_name =
+                            ensure_union_data_type(&adt_def, substs, tcx, data_types, instance);
+                        let active_field_idx = active_field_idx.unwrap_or(FieldIdx::from_usize(0));
+                        let variant = adt_def.variant(*variant_idx);
+                        let field_def = &variant.fields[active_field_idx];
+                        let field_name = field_def.ident(tcx).to_string();
+                        let field_mir_ty = field_def.ty(tcx, substs).skip_norm_wip();
+                        let field_oomir_ty =
+                            ty_to_oomir_type(field_mir_ty, tcx, data_types, instance);
+                        let value_operand = convert_operand(
+                            &operands[FieldIdx::from_usize(0)],
+                            tcx,
+                            instance,
+                            mir,
+                            data_types,
+                            &mut instructions,
                         );
-                        // make a placeholder (Class("java/lang/Object"))
-                        instructions.push(oomir::Instruction::ConstructObject {
-                            dest: temp_aggregate_var.clone(),
-                            class_name: "java/lang/Object".to_string(),
-                            args: Vec::new(),
+
+                        breadcrumbs::log!(
+                            breadcrumbs::LogLevel::Info,
+                            "mir-lowering",
+                            format!(
+                                "Info: Handling Union Aggregate field '{}' -> Temp Var '{}' (Class: {})",
+                                field_name, temp_aggregate_var, union_class_name
+                            )
+                        );
+
+                        instructions.push(oomir::Instruction::InvokeStatic {
+                            dest: Some(temp_aggregate_var.clone()),
+                            class_name: union_class_name.clone(),
+                            method_name: union_from_method_name(&field_name),
+                            method_ty: oomir::Signature {
+                                params: vec![("value".to_string(), field_oomir_ty)],
+                                ret: Box::new(oomir::Type::Class(union_class_name)),
+                                is_static: true,
+                            },
+                            args: vec![value_operand],
                         });
                     }
                 }

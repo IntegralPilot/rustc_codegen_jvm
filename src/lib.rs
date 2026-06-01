@@ -1169,6 +1169,13 @@ impl CodegenBackend for MyBackend {
                     }
                 }
                 if let Some(of_trait) = of_trait {
+                    oomir_module
+                        .data_types
+                        .entry(of_trait.clone())
+                        .or_insert_with(|| oomir::DataType::Interface {
+                            methods: HashMap::new(),
+                        });
+
                     if let Some(data) = oomir_module.data_types.get(&ident).cloned() {
                         match data {
                             oomir::DataType::Class {
