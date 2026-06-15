@@ -1,5 +1,5 @@
 plugins {
-    kotlin("jvm") version "2.2.21"
+    java
     application
 }
 
@@ -10,10 +10,13 @@ repositories {
     mavenCentral()
 }
 
-dependencies {
-    implementation(kotlin("stdlib"))
+application {
+    // The shim jar is consumed as a library, not run; this only satisfies the application
+    // plugin's start-script generation (which preserves the build/distributions/.../lib/ layout
+    // that build.py reads). The class is never executed.
+    mainClass.set("org.rustlang.core.Core")
 }
 
-kotlin {
-    jvmToolchain(21)
+tasks.withType<JavaCompile> {
+    options.release.set(8)
 }
