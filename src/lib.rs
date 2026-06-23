@@ -30,7 +30,7 @@ use rustc_codegen_ssa::{
 };
 use std::collections::{HashMap, HashSet};
 
-use rustc_data_structures::fx::FxIndexMap;
+use rustc_data_structures::unord::UnordMap;
 use rustc_hir::{QPath, TyKind as HirTyKind};
 use rustc_metadata::EncodedMetadata;
 use rustc_middle::dep_graph::{WorkProduct, WorkProductId};
@@ -1516,7 +1516,7 @@ impl CodegenBackend for MyBackend {
         _sess: &Session,
         outputs: &OutputFilenames,
         _crate_info: &CrateInfo,
-    ) -> (CompiledModules, FxIndexMap<WorkProductId, WorkProduct>) {
+    ) -> (CompiledModules, UnordMap<WorkProductId, WorkProduct>) {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             // Update the downcast to expect a HashMap now.
             // panic!("{:#?}", ongoing_codegen.downcast::<std::collections::HashMap<String, Vec<u8>>>());
@@ -1582,7 +1582,7 @@ impl CodegenBackend for MyBackend {
                 allocator_module: None,
             };
             let _ = crate_info;
-            (compiled_modules, FxIndexMap::default())
+            (compiled_modules, UnordMap::default())
         }))
         .expect("Could not join_codegen")
     }
