@@ -355,8 +355,7 @@ fn handle_constant_struct<'tcx>(
         fields_map.insert(field_name, field_const);
     }
 
-    let rust_path = tcx.def_path_str(adt_def.did());
-    let class_name = make_jvm_safe(&rust_path).replace("::", "/");
+    let class_name = generate_adt_jvm_class_name(&adt_def, substs, tcx, oomir_data_types, instance);
 
     Ok(oomir::Constant::Instance {
         class_name,

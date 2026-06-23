@@ -929,60 +929,8 @@ pub fn ty_to_oomir_type<'tcx>(
             if full_path_str == "String" || full_path_str == "std::string::String" {
                 oomir::Type::String
             } else {
-                let safe_name = make_jvm_safe(&full_path_str);
-                let base_jvm = safe_name.replace("::", "/").replace('.', "/");
-
-                // Build readable generic tokens from substitutions (if any)
-                let mut generic_tokens: Vec<String> = Vec::new();
-                for arg in substs.iter() {
-                    if let Some(arg_ty) = arg.as_type() {
-                        let oomir_ty = ty_to_oomir_type(arg_ty, tcx, data_types, instance_context);
-                        let token = readable_oomir_type_name(&oomir_ty);
-                        generic_tokens.push(sanitize_name_token(&token));
-                    } else {
-                        // placeholder for non-type generic args (lifetimes/consts)
-                        generic_tokens.push("_".to_string());
-                    }
-                }
-
-                // Attach generics to the last path segment for readability
-                let (prefix, last_segment) = match base_jvm.rsplit_once('/') {
-                    Some((p, l)) => (p.to_string(), l.to_string()),
-                    None => ("".to_string(), base_jvm.clone()),
-                };
-
-                let mut last_with_gens = last_segment.clone();
-                if !generic_tokens.is_empty() {
-                    last_with_gens = format!("{}_{}", last_segment, generic_tokens.join("_"));
-                }
-
-                let mut jvm_name_full = if prefix.is_empty() {
-                    last_with_gens.clone()
-                } else {
-                    format!("{}/{}", prefix, last_with_gens)
-                };
-
-                // If the name is too long, fall back to hashed form
-                if jvm_name_full.len() > MAX_TUPLE_NAME_LEN {
-                    let mut name_parts = String::new();
-                    name_parts.push_str(&base_jvm);
-                    name_parts.push_str("_");
-                    for arg in substs.iter() {
-                        if let Some(arg_ty) = arg.as_type() {
-                            let oomir_ty =
-                                ty_to_oomir_type(arg_ty, tcx, data_types, instance_context);
-                            name_parts.push_str(&oomir_ty.to_jvm_descriptor());
-                            name_parts.push_str("_");
-                        }
-                    }
-                    let hash = short_hash(&name_parts, 10);
-                    let hashed_last = format!("{}_{}", last_segment, hash);
-                    jvm_name_full = if prefix.is_empty() {
-                        hashed_last
-                    } else {
-                        format!("{}/{}", prefix, hashed_last)
-                    };
-                }
+                let jvm_name_full =
+                    generate_adt_jvm_class_name(adt_def, substs, tcx, data_types, instance_context);
 
                 if adt_def.is_struct() {
                     let variant = adt_def.variant(0usize.into());
@@ -1386,6 +1334,28 @@ pub fn sanitize_name_token(s: &str) -> String {
         .collect()
 }
 
+fn adt_base_jvm_name<'tcx>(adt_def: &AdtDef<'tcx>, tcx: TyCtxt<'tcx>) -> String {
+    let def_id = adt_def.did();
+    if !def_id.is_local() {
+        return make_jvm_safe(&tcx.def_path_str(def_id));
+    }
+
+    let segments: Vec<String> = tcx
+        .def_path(def_id)
+        .data
+        .iter()
+        .filter_map(|component| component.data.get_opt_name())
+        .map(|name| make_jvm_safe(name.as_str()))
+        .filter(|segment| !segment.is_empty())
+        .collect();
+
+    if segments.is_empty() {
+        make_jvm_safe(&tcx.def_path_str(def_id))
+    } else {
+        segments.join("/")
+    }
+}
+
 /// Generate a JVM-safe class name for an ADT (struct/enum) including readable generic
 /// substitution tokens. Falls back to a hashed last segment when the full name is too long.
 pub fn generate_adt_jvm_class_name<'tcx>(
@@ -1395,9 +1365,7 @@ pub fn generate_adt_jvm_class_name<'tcx>(
     data_types: &mut HashMap<String, oomir::DataType>,
     instance_context: rustc_middle::ty::Instance<'tcx>,
 ) -> String {
-    let full_path_str = tcx.def_path_str(adt_def.did());
-    let safe_name = make_jvm_safe(&full_path_str);
-    let base_jvm = safe_name.replace("::", "/").replace('.', "/");
+    let base_jvm = adt_base_jvm_name(adt_def, tcx);
 
     // Build readable generic tokens from substitutions (if any)
     let mut generic_tokens: Vec<String> = Vec::new();

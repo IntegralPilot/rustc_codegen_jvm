@@ -839,7 +839,7 @@ impl CodegenBackend for MyBackend {
                     );
                     continue; // Skip to the next item in the crate
                 }
-                let ident = match impl_a.self_ty.kind {
+                let legacy_ident = match impl_a.self_ty.kind {
                     HirTyKind::Path(qpath) => match qpath {
                         QPath::Resolved(_, p) => {
                             format!("{}", p.segments[0].ident)
@@ -865,7 +865,36 @@ impl CodegenBackend for MyBackend {
                         "unknown_type_kind".into()
                     }
                 };
-                let ident = lower1::place::make_jvm_safe(&ident);
+                let legacy_ident = lower1::place::make_jvm_safe(&legacy_ident);
+                let ident = {
+                    let impl_instance = rustc_middle::ty::Instance::new_raw(
+                        impl_def_id,
+                        rustc_middle::ty::GenericArgs::identity_for_item(tcx, impl_def_id),
+                    );
+                    let impl_self_ty = tcx
+                        .type_of(impl_def_id)
+                        .instantiate(
+                            tcx,
+                            rustc_middle::ty::GenericArgs::identity_for_item(tcx, impl_def_id),
+                        )
+                        .skip_norm_wip();
+                    let mut impl_data_types = HashMap::new();
+                    let impl_self_oomir_ty = lower1::types::ty_to_oomir_type(
+                        impl_self_ty,
+                        tcx,
+                        &mut impl_data_types,
+                        impl_instance,
+                    );
+                    oomir_module.merge_data_types(&impl_data_types);
+                    match impl_self_oomir_ty {
+                        Type::Class(name) | Type::Interface(name) => name,
+                        Type::MutableReference(inner) => match *inner {
+                            Type::Class(name) | Type::Interface(name) => name,
+                            _ => legacy_ident,
+                        },
+                        _ => legacy_ident,
+                    }
+                };
                 let of_trait = match impl_a.of_trait {
                     Some(trait_impl_header) => Some(lower1::place::make_jvm_safe(
                         trait_impl_header
