@@ -23,7 +23,7 @@ type ShimMap = BTreeMap<String, ShimInfo>;
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() != 3 {
-        eprintln!("Usage: {} <path/to/kotlin-library.jar> <path/to/output.json>", args[0]);
+        eprintln!("Usage: {} <path/to/library.jar> <path/to/output.json>", args[0]);
         exit(1);
     }
 

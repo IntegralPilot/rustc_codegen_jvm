@@ -6,6 +6,9 @@ import sys
 import argparse
 import shutil
 
+SHIM_JAR = os.path.join("library", "build", "libs", "library-0.1.0.jar")
+
+
 # --- Helper Functions ---
 
 def run_command(cmd: list, cwd=None):
@@ -195,18 +198,13 @@ def investigate_test(test_name: str, release_mode: bool):
     
     # 7. Run with Java and capture output
     print("|-- 🤖 Running with Java and capturing logs...")
-    # This classpath is copied from the original script. It assumes the script is run from the project root.
-    runtime_libs = "library/build/distributions/library-0.1.0/lib/library-0.1.0.jar:library/build/distributions/library-0.1.0/lib/kotlin-stdlib-2.1.20.jar"
     
     if use_raw_classfiles and deps_dir is not None:
-        # Use deps directory in classpath instead of JAR
-        # Use -noverify because stackmap frames aren't generated yet
-        classpath = f"{runtime_libs}:{deps_dir}"
+        classpath = os.pathsep.join([SHIM_JAR, deps_dir])
         print(f"|---- Using deps directory in classpath: {deps_dir}")
         java_cmd = ["java", "-noverify", "-cp", classpath, test_name]
     else:
-        # Use JAR file
-        classpath = f"{runtime_libs}:{jar_path}"
+        classpath = jar_path
         java_cmd = ["java", "-cp", classpath, test_name]
     
     proc = run_command(java_cmd)

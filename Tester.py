@@ -6,12 +6,8 @@ import argparse
 import glob
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# A constant for the base classpath needed by both test types
-# NOTE: We may need to update the kotlin version in the future
-RUNTIME_CLASSPATH_BASE = os.pathsep.join([
-    "library/build/distributions/library-0.1.0/lib/library-0.1.0.jar",
-    "library/build/distributions/library-0.1.0/lib/kotlin-stdlib-2.2.21.jar",
-])
+SHIM_JAR = os.path.join("library", "build", "libs", "library-0.1.0.jar")
+
 
 def read_from_file(path: str) -> str:
     with open(path, "r") as f:
@@ -59,8 +55,7 @@ def build_rust_code(test_dir: str, release_mode: bool, logs: list) -> tuple[bool
                 # Check if the main class file exists
                 main_class = os.path.join(deps_dir, f"{test_name}.class")
                 if os.path.exists(main_class):
-                    # Build classpath: runtime libraries + deps directory
-                    java_cp = f"{RUNTIME_CLASSPATH_BASE}{os.pathsep}{deps_dir}"
+                    java_cp = f"{SHIM_JAR}{os.pathsep}{deps_dir}"
                     verify_proc = run_command(
                         ["java", "-noverify", "-cp", java_cp, test_name]
                     )
@@ -205,7 +200,7 @@ def process_binary_test(test_dir: str, release_mode: bool, logs: list) -> bool:
         return False
 
     logs.append("|--- 🤖 Running with Java...")
-    java_cp = f"{RUNTIME_CLASSPATH_BASE}{os.pathsep}{jar_path}"
+    java_cp = jar_path
     proc = run_command(["java", "-cp", java_cp, test_name]) 
     
     if not check_results(proc, test_dir, release_mode, logs):
@@ -246,11 +241,9 @@ def process_integration_test(test_dir: str, release_mode: bool, logs: list) -> b
         logs.append("|---- ❌ No .java files found in test directory.")
         return False
     
-    base_cp_components = [os.path.relpath(p, test_dir) for p in RUNTIME_CLASSPATH_BASE.split(os.pathsep)]
     relative_jar_path = os.path.relpath(jar_path, test_dir)
     
-    javac_cp_list = ['.'] + base_cp_components + [relative_jar_path]
-    javac_cp = os.pathsep.join(javac_cp_list)
+    javac_cp = os.pathsep.join(['.', relative_jar_path])
 
     javac_cmd = ["javac", "-cp", javac_cp] + java_files
     proc = run_command(javac_cmd, cwd=test_dir)

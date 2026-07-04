@@ -382,13 +382,13 @@ fn check_class_data_for_main(
 
 // --- create_jar ---
 fn create_jar(
-    input_class_files: &[String], // Separate .class files
-    input_jar_files: &[String],   // Separate .jar files (treated as libraries)
+    input_class_files: &[String],
+    input_jar_files: &[String],
     final_output_jar_path: &str,
     main_class_name: Option<&str>,
     r8_jar_path: Option<&Path>,
     proguard_config_path: Option<&Path>,
-    java_lib_path: Option<&Path>, // Base Java runtime lib path
+    java_lib_path: Option<&Path>,
     release_mode: bool,
 ) -> io::Result<()> {
     // Regex for stripping cargo hashes from .class filenames
@@ -446,7 +446,7 @@ fn create_jar(
         });
     }
 
-    // Convert input JAR file strings to PathBufs for R8
+    // Input JARs are program inputs when R8 is enabled so the runtime shim is bundled.
     let library_jar_paths: Vec<PathBuf> = input_jar_files.iter().map(PathBuf::from).collect();
 
     // Check if we have any application code to process
@@ -736,55 +736,48 @@ fn create_manifest_content(main_class_name: Option<&str>) -> String {
     manifest
 }
 
-// --- run_r8_optimizer (Modified) ---
-/// Executes the R8 optimizer using `java -cp r8.jar com.android.tools.r8.R8 ...`.
 fn run_r8_optimizer(
-    r8_jar_path: &Path,            // Path to r8.jar
-    proguard_config_path: &Path,   // Path to R8/ProGuard config file
-    java_runtime_lib_path: &Path,  // Path to base Java runtime library (e.g., rt.jar or jmods)
-    program_input_jar_path: &Path, // The intermediate JAR with app classes
-    library_jar_paths: &[PathBuf], // List of other input JARs (dependencies)
-    output_jar_path: &Path,        // Where R8 should write the optimized JAR
-    release_mode: bool,            // Release mode flag
+    r8_jar_path: &Path,
+    proguard_config_path: &Path,
+    java_runtime_lib_path: &Path,
+    program_input_jar_path: &Path,
+    library_jar_paths: &[PathBuf],
+    output_jar_path: &Path,
+    release_mode: bool,
 ) -> io::Result<()> {
     println!("--- Running R8 ---");
     println!("  R8 JAR: {}", r8_jar_path.display());
     println!("  Config: {}", proguard_config_path.display());
     println!("  Java Runtime Lib: {}", java_runtime_lib_path.display());
     println!("  Program Input: {}", program_input_jar_path.display());
-    println!("  Library Inputs:");
+    println!("  Extra Program Inputs:");
     for lib_path in library_jar_paths {
         println!("    - {}", lib_path.display());
     }
     println!("  Output: {}", output_jar_path.display());
 
-    // --- Construct the command: java -cp <r8.jar> com.android.tools.r8.R8 [args...] ---
     let r8_main_class = "com.android.tools.r8.R8";
 
     let mut cmd = Command::new("java");
-    cmd.arg("-cp") // Use classpath option
-        .arg(r8_jar_path) // Provide path to r8.jar
-        .arg(r8_main_class) // Specify the main class to run
-        // --- R8 specific arguments ---
-        .arg("--output") // Specify output path
+    cmd.arg("-cp")
+        .arg(r8_jar_path)
+        .arg(r8_main_class)
+        .arg("--output")
         .arg(output_jar_path)
-        .arg("--pg-conf") // Specify ProGuard/R8 config file
+        .arg("--pg-conf")
         .arg(proguard_config_path)
-        // Add the base Java runtime library
         .arg("--lib")
         .arg(java_runtime_lib_path)
         .arg("--classfile");
 
-    // Add all the *other* input JARs as libraries
     for lib_path in library_jar_paths {
-        cmd.arg("--classpath").arg(lib_path);
+        cmd.arg(lib_path);
     }
 
     if release_mode {
-        cmd.arg("--release"); // Add release mode flag if specified
+        cmd.arg("--release");
     }
 
-    // Add the program input JAR (containing app classes) last
     cmd.arg(program_input_jar_path);
 
     println!("Executing command: {:?}", cmd);

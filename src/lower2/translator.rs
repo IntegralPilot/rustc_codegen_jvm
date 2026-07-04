@@ -2190,13 +2190,13 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                             // --- Continue with Shim Call Invocation ---
 
                             // Add MethodRef for the actual shim function
-                            let kotlin_shim_class =
+                            let shim_class =
                                 if function_name == "panic" || function_name == "panic_fmt" {
                                     "org/rustlang/core/panicking"
                                 } else {
                                     "org/rustlang/core/Core"
                                 };
-                            let class_index = self.constant_pool.add_class(kotlin_shim_class)?;
+                            let class_index = self.constant_pool.add_class(shim_class)?;
                             let method_ref_index = self.constant_pool.add_method_ref(
                                 class_index,
                                 function_name, // Use the original function name key

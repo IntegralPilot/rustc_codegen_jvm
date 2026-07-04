@@ -1,6 +1,5 @@
 plugins {
-    kotlin("jvm") version "2.2.21"
-    application
+    java
 }
 
 group = "org.rustlang"
@@ -10,10 +9,7 @@ repositories {
     mavenCentral()
 }
 
-dependencies {
-    implementation(kotlin("stdlib"))
-}
-
-kotlin {
-    jvmToolchain(21)
+tasks.withType<JavaCompile>().configureEach {
+    options.release.set(8)
+    options.compilerArgs.add("-Xlint:-options")
 }

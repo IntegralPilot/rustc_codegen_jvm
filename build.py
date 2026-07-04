@@ -7,7 +7,6 @@ import shutil
 import argparse
 import platform
 import urllib.request
-import zipfile
 from pathlib import Path
 from typing import List
 
@@ -37,14 +36,15 @@ class Config:
 
     # Source File Lists (used for dependency tracking)
     # Using glob patterns for automatic discovery
-    KOTLIN_SOURCES = list(LIBRARY_DIR.glob("src/**/*.kt"))
+    LIBRARY_SOURCES = list(LIBRARY_DIR.glob("src/**/*.java")) + [
+        LIBRARY_DIR / "build.gradle.kts"
+    ]
     SHIM_GEN_RUST_SOURCES = list(SHIM_METADATA_GEN_DIR.glob("src/**/*.rs"))
     BACKEND_RUST_SOURCES = list(ROOT_DIR.glob("src/**/*.rs"))
     LINKER_RUST_SOURCES = list(JAVA_LINKER_DIR.glob("src/**/*.rs"))
 
     # Key Target Files
-    LIBRARY_ZIP = LIBRARY_DIR / f"build/distributions/library-{LIBRARY_VERSION}.zip"
-    LIBRARY_JAR = LIBRARY_DIR / f"build/distributions/library-{LIBRARY_VERSION}/lib/library-{LIBRARY_VERSION}.jar"
+    LIBRARY_JAR = LIBRARY_DIR / f"build/libs/library-{LIBRARY_VERSION}.jar"
     R8_JAR = VENDOR_DIR / "r8.jar"
     CORE_JSON = SHIM_METADATA_GEN_DIR / "core.json"
     CONFIG_TOML = ROOT_DIR / "config.toml"
@@ -144,24 +144,22 @@ def install_rust_components():
     run_command(["rustup", "component", "add", "rustc-dev", "llvm-tools"])
 
 def build_library():
-    """Builds the Kotlin standard library shim and unzips it."""
-    # The true target is the final JAR, not the zip.
-    if not is_stale(Config.LIBRARY_JAR, Config.KOTLIN_SOURCES):
-        print(f"{Colors.GREEN}✅ Kotlin library shim is up to date.{Colors.RESET}")
+    """Builds the Java standard library shim."""
+    if not is_stale(Config.LIBRARY_JAR, Config.LIBRARY_SOURCES):
+        print(f"{Colors.GREEN}✅ Java library shim is up to date.{Colors.RESET}")
         return
 
-    print(f"{Colors.CYAN}📚 Building Kotlin library shim...{Colors.RESET}")
+    print(f"{Colors.CYAN}📚 Building Java library shim...{Colors.RESET}")
     
-    # Run Gradle build
     gradle_args = ["--no-daemon", "build"] if Config.IS_CI else ["build"]
     gradle_cmd = ["./gradlew"] + gradle_args if platform.system() != "Windows" else ["gradlew.bat"] + gradle_args
     run_command(gradle_cmd, cwd=Config.LIBRARY_DIR)
-    
-    # Unzip the distribution (cross-platform)
-    print(f"   Unzipping {Config.LIBRARY_ZIP}...")
-    with zipfile.ZipFile(Config.LIBRARY_ZIP, 'r') as zip_ref:
-        zip_ref.extractall(Config.LIBRARY_ZIP.parent)
-    print(f"{Colors.GREEN}   Kotlin library shim built successfully.{Colors.RESET}")
+
+    if not Config.LIBRARY_JAR.exists():
+        print(f"{Colors.RED}❌ Expected library JAR was not created: {Config.LIBRARY_JAR}{Colors.RESET}")
+        sys.exit(1)
+
+    print(f"{Colors.GREEN}   Java library shim built successfully.{Colors.RESET}")
 
 def generate_shim_metadata():
     """Generates core.json from the library shim JAR."""

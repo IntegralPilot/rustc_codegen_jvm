@@ -1,3 +1,5 @@
+-keep class org.rustlang.** { *; }
+
 -keep public class *
 -keep class * {
     <fields>;

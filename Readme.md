@@ -74,9 +74,9 @@ These examples are located in `tests/binary`, compiled to JVM bytecode, and veri
 4. **OOMIR → JVM Classfile**  
    Translates OOMIR to `.class` files using `ristretto_classfile` (defined in `src/lower2.rs`).  
 5. **R8 Pass**  
-   Invokes `r8` to add stack map frames (required for JVM 8+) and apply further Optimisation passes.
+   Invokes `r8` to add stack map frames (required for JVM 8+), embed the runtime shim, and apply further Optimisation passes.
 6. **Link & Package**  
-   Uses `java-linker` to bundle `.class` files into a runnable `.jar` with an appropriate `META-INF/MANIFEST.MF`.
+   Uses `java-linker` to bundle `.class` files into a self-contained runnable `.jar` with an appropriate `META-INF/MANIFEST.MF`.
 
 ---
 
@@ -107,7 +107,7 @@ python build.py all
 ```
 
 This script builds the necessary components in the correct dependency order:
-- The Kotlin library shim (`library/`)
+- The Java library shim (`library/`)
 - The shim metadata file (`core.json`)
 - The `java-linker` executable
 - The `rustc_codegen_jvm` backend library
@@ -179,7 +179,7 @@ Test results will output to the console. Temporary test artifacts are written to
 │   └── oomir.rs              # OOMIR data definitions
 ├── java-linker/              # Bundles compiled .class files into .jar archives
 ├── tests/binary/             # Integration tests and source examples
-├── library/                  # Kotlin shim implementation for the Rust core library
+├── library/                  # Java shim implementation for the Rust core library
 ├── shim-metadata-gen/        # Tool to generate core.json metadata
 ├── proguard/                 # Proguard / R8 configuration rules
 ├── build.py                  # Orchestrator build script
