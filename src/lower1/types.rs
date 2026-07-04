@@ -886,12 +886,12 @@ pub fn ty_to_oomir_type<'tcx>(
     let has_params = instance_context.args.has_param();
 
     let resolved_ty = if has_params {
-        rustc_middle::ty::EarlyBinder::bind(ty)
+        rustc_middle::ty::EarlyBinder::bind(tcx, ty)
             .instantiate(tcx, instance_context.args)
             .skip_norm_wip()
     } else {
         let instantiated =
-            rustc_middle::ty::EarlyBinder::bind(ty).instantiate(tcx, instance_context.args);
+            rustc_middle::ty::EarlyBinder::bind(tcx, ty).instantiate(tcx, instance_context.args);
         match tcx.try_normalize_erasing_regions(TypingEnv::fully_monomorphized(), instantiated) {
             Ok(normalized) => normalized,
             Err(_) => instantiated.skip_norm_wip(),
@@ -929,8 +929,13 @@ pub fn ty_to_oomir_type<'tcx>(
             if full_path_str == "String" || full_path_str == "std::string::String" {
                 oomir::Type::String
             } else {
-                let jvm_name_full =
-                    generate_adt_jvm_class_name(adt_def, substs, tcx, data_types, instance_context);
+                let jvm_name_full = generate_adt_jvm_class_name(
+                    &adt_def,
+                    substs,
+                    tcx,
+                    data_types,
+                    instance_context,
+                );
 
                 if adt_def.is_struct() {
                     let variant = adt_def.variant(0usize.into());
@@ -984,7 +989,7 @@ pub fn ty_to_oomir_type<'tcx>(
                         );
                     }
                 } else if adt_def.is_union() {
-                    ensure_union_data_type(adt_def, substs, tcx, data_types, instance_context);
+                    ensure_union_data_type(&adt_def, substs, tcx, data_types, instance_context);
                 }
                 oomir::Type::Class(jvm_name_full)
             }
@@ -1267,7 +1272,7 @@ pub fn ty_to_oomir_type<'tcx>(
             }
             oomir::Type::Class(safe_name)
         }
-        rustc_middle::ty::TyKind::Alias(_alias_ty) => {
+        rustc_middle::ty::TyKind::Alias(_, _alias_ty) => {
             // This handles associated types and projections (like Self::Output)
             // that couldn't be normalized because we are in a generic context.
             // We map them to java/lang/Object, effectively erasing them.

@@ -581,7 +581,7 @@ pub fn get_place_type<'tcx>(
 ) -> oomir::Type {
     let place_ty = place.ty(&mir.local_decls, tcx);
     // Instantiate the type with the instance's generic arguments to get concrete types
-    let instantiated_ty = rustc_middle::ty::EarlyBinder::bind(place_ty.ty)
+    let instantiated_ty = rustc_middle::ty::EarlyBinder::bind(tcx, place_ty.ty)
         .instantiate(tcx, instance.args)
         .skip_norm_wip();
     ty_to_oomir_type(instantiated_ty, tcx, data_types, instance)
