@@ -4,7 +4,7 @@ use super::{
     FunctionTranslator,
     consts::{get_int_const_instr, load_constant},
     helpers::{get_load_instruction, get_type_size, oomir_function_stack_floor},
-    stackmaps,
+    optimise2, stackmaps,
 };
 use crate::oomir::{self, AdtHelperKind, DataTypeMethod, Signature, Type};
 
@@ -23,6 +23,10 @@ fn code_attribute_with_stack_maps(
     initial_locals: Vec<stackmaps::FrameValue>,
     context: &str,
 ) -> jvm::Result<Attribute> {
+    let fixed_prefix_slots = initial_locals.len() as u16;
+    let optimised = optimise2::optimise(code, max_locals, fixed_prefix_slots)?;
+    let code = optimised.instructions;
+    let max_locals = optimised.max_locals;
     let name_index = cp.add_utf8("Code")?;
     let attributes = stackmaps::build_stack_map_attributes(
         &code,

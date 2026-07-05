@@ -20,6 +20,7 @@ use std::collections::{BTreeMap, HashMap};
 mod consts;
 mod helpers;
 mod jvm_gen;
+mod optimise2;
 mod shim;
 mod stackmaps;
 mod translator;

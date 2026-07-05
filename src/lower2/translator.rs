@@ -4,6 +4,7 @@ use super::{
         get_cast_instructions, get_load_instruction, get_operand_type, get_store_instruction,
         get_type_size, parse_jvm_descriptor_params,
     },
+    optimise2,
     shim::get_shim_metadata,
     stackmaps,
 };
@@ -429,15 +430,34 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 *instruction = Instruction::Nop;
             }
         }
+
+        let local_hints = stackmaps::local_hints_for_oomir_locals(
+            &self.local_var_map,
+            &self.local_var_types,
+            self.max_locals_used,
+        );
+        let fixed_prefix_slots = self.initial_locals.len() as u16;
+        let optimised = optimise2::optimise(
+            std::mem::take(&mut self.jvm_instructions),
+            self.max_locals_used,
+            fixed_prefix_slots,
+        )
+        .map_err(|error| jvm::Error::VerificationError {
+            context: format!("Function {}", self.oomir_func.name),
+            message: format!("Failed to run optimise2: {error:?}"),
+        })?;
+        self.jvm_instructions = optimised.instructions;
+        self.max_locals_used = optimised.max_locals;
+
         self.widen_branches()
             .map_err(|error| jvm::Error::VerificationError {
                 context: format!("Function {}", self.oomir_func.name),
                 message: format!("Failed to widen branches: {error:?}"),
             })?;
 
-        let local_hints = stackmaps::local_hints_for_oomir_locals(
-            &self.local_var_map,
-            &self.local_var_types,
+        let local_hints = optimise2::remap_frame_values(
+            &local_hints,
+            &optimised.local_slot_map,
             self.max_locals_used,
         );
         let stack_map_attributes = stackmaps::build_stack_map_attributes(

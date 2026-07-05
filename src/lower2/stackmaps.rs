@@ -141,12 +141,6 @@ impl FrameState {
         self.locals[index] = value;
         if width == 2 {
             self.locals[index + 1] = FrameValue::Top;
-        } else if self
-            .locals
-            .get(index + 1)
-            .is_some_and(FrameValue::is_category2)
-        {
-            self.locals[index + 1] = FrameValue::Top;
         }
     }
 
