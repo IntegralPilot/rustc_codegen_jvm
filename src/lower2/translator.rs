@@ -1,4 +1,5 @@
 use super::{
+    constant_pool::InternedConstantPool,
     consts::{get_int_const_instr, load_constant},
     helpers::{
         get_cast_instructions, get_load_instruction, get_operand_type, get_store_instruction,
@@ -11,7 +12,7 @@ use super::{
 use crate::oomir::{self, Type};
 
 use ristretto_classfile::attributes::{ArrayType, Instruction};
-use ristretto_classfile::{self as jvm, ConstantPool};
+use ristretto_classfile::{self as jvm};
 use std::collections::{HashMap, VecDeque};
 use std::convert::TryInto;
 use std::io::Cursor;
@@ -22,7 +23,7 @@ use super::{BIG_DECIMAL_CLASS, BIG_INTEGER_CLASS};
 pub struct FunctionTranslator<'a, 'cp> {
     module: &'a oomir::Module,
     oomir_func: &'a oomir::Function,
-    constant_pool: &'cp mut ConstantPool,
+    constant_pool: &'cp mut InternedConstantPool,
 
     local_var_map: HashMap<String, u16>, // OOMIR var name -> JVM local index
     local_var_types: HashMap<String, oomir::Type>, // OOMIR var name -> OOMIR Type
@@ -41,7 +42,7 @@ pub struct FunctionTranslator<'a, 'cp> {
 impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
     pub fn new(
         oomir_func: &'a oomir::Function,
-        constant_pool: &'cp mut ConstantPool,
+        constant_pool: &'cp mut InternedConstantPool,
         module: &'a oomir::Module,
         is_static: bool,
         owner_class_name: Option<&str>,

@@ -2,6 +2,7 @@
 
 use super::{
     FunctionTranslator,
+    constant_pool::{InternedConstantPool, verify_no_duplicate_constants},
     consts::{get_int_const_instr, load_constant},
     helpers::{get_load_instruction, get_type_size, oomir_function_stack_floor},
     optimise2, stackmaps,
@@ -9,14 +10,14 @@ use super::{
 use crate::oomir::{self, AdtHelperKind, DataTypeMethod, Signature, Type};
 
 use ristretto_classfile::{
-    self as jvm, BaseType, ClassAccessFlags, ClassFile, ConstantPool, FieldAccessFlags,
-    MethodAccessFlags, Version,
+    self as jvm, BaseType, ClassAccessFlags, ClassFile, FieldAccessFlags, MethodAccessFlags,
+    Version,
     attributes::{Attribute, InnerClass, Instruction, MaxStack, NestedClassAccessFlags},
 };
 use std::collections::{HashMap, HashSet};
 
 fn code_attribute_with_stack_maps(
-    cp: &mut ConstantPool,
+    cp: &mut InternedConstantPool,
     max_stack: u16,
     max_locals: u16,
     code: Vec<Instruction>,
@@ -47,7 +48,7 @@ fn code_attribute_with_stack_maps(
 }
 
 fn code_attribute_for_descriptor(
-    cp: &mut ConstantPool,
+    cp: &mut InternedConstantPool,
     max_stack: u16,
     max_locals: u16,
     code: Vec<Instruction>,
@@ -68,7 +69,7 @@ fn code_attribute_for_descriptor(
 /// Creates a default constructor `<init>()V` that just calls `super()`.
 pub(super) fn create_default_constructor(
     // pub(super) or pub(crate)
-    cp: &mut ConstantPool,
+    cp: &mut InternedConstantPool,
     super_class_index: u16,
 ) -> jvm::Result<jvm::Method> {
     let init_name_index = cp.add_utf8("<init>")?;
@@ -106,7 +107,7 @@ pub(super) fn create_default_constructor(
 }
 
 fn create_field_constructor(
-    cp: &mut ConstantPool,
+    cp: &mut InternedConstantPool,
     this_class_index: u16,
     super_class_index: u16,
     fields: &[(String, Type)],
@@ -193,7 +194,7 @@ fn return_instruction_for_type(ty: &Type) -> Instruction {
 }
 
 fn create_static_instance_bridge(
-    cp: &mut ConstantPool,
+    cp: &mut InternedConstantPool,
     class_name_jvm: &str,
     method_name: &str,
     function: &oomir::Function,
@@ -332,7 +333,7 @@ fn append_boolean_false_check(instructions: &mut Vec<Instruction>, false_fixups:
 
 fn append_field_equality_check(
     module: &oomir::Module,
-    cp: &mut ConstantPool,
+    cp: &mut InternedConstantPool,
     instructions: &mut Vec<Instruction>,
     false_fixups: &mut Vec<usize>,
     variant_class_idx: u16,
@@ -419,7 +420,7 @@ pub(super) fn create_data_type_classfile_for_class(
     subclasses: Vec<String>,
     nest_host: Option<String>,
 ) -> jvm::Result<Vec<u8>> {
-    let mut cp = ConstantPool::default();
+    let mut cp = InternedConstantPool::default();
 
     let this_class_index = cp.add_class(class_name_jvm)?;
 
@@ -467,26 +468,8 @@ pub(super) fn create_data_type_classfile_for_class(
     } else {
         create_field_constructor(&mut cp, this_class_index, super_class_index, &fields)?
     };
-    let jvm_methods = vec![constructor];
-
-    // --- Assemble ClassFile ---
-    let mut class_file = ClassFile {
-        version: Version::Java8 { minor: 0 },
-        constant_pool: cp,
-        access_flags: ClassAccessFlags::PUBLIC
-            | ClassAccessFlags::SUPER
-            | if is_abstract {
-                ClassAccessFlags::ABSTRACT
-            } else {
-                ClassAccessFlags::FINAL
-            },
-        this_class: this_class_index,
-        super_class: super_class_index,
-        interfaces: interface_indices,
-        fields: jvm_fields,
-        methods: jvm_methods,
-        attributes: Vec::new(),
-    };
+    let mut jvm_methods = vec![constructor];
+    let mut class_attributes = Vec::new();
 
     // Check for jvm_methods
     for (method_name, method) in methods.iter() {
@@ -495,16 +478,15 @@ pub(super) fn create_data_type_classfile_for_class(
                 let method_desc = format!("(){}", return_type.to_jvm_descriptor());
 
                 // Add the method to the class file
-                let name_index = class_file.constant_pool.add_utf8(&method_name)?;
-                let descriptor_index: u16 = class_file.constant_pool.add_utf8(method_desc)?;
+                let name_index = cp.add_utf8(&method_name)?;
+                let descriptor_index: u16 = cp.add_utf8(method_desc)?;
 
                 let mut attributes = vec![];
                 let mut is_abstract = false;
 
                 match return_const {
                     Some(rc) => attributes.push(create_code_from_method_name_and_constant_return(
-                        &rc,
-                        &mut class_file.constant_pool,
+                        &rc, &mut cp,
                     )?),
                     None => {
                         is_abstract = true;
@@ -523,7 +505,7 @@ pub(super) fn create_data_type_classfile_for_class(
                     attributes,
                 };
 
-                class_file.methods.push(jvm_method);
+                jvm_methods.push(jvm_method);
             }
             DataTypeMethod::Function(function) => {
                 let instrumented_fn_name = format!("{class_name_jvm}::{method_name}");
@@ -538,7 +520,7 @@ pub(super) fn create_data_type_classfile_for_class(
                 };
                 let translator = FunctionTranslator::new(
                     function,
-                    &mut class_file.constant_pool,
+                    &mut cp,
                     module,
                     function.signature.is_static,
                     owner_class,
@@ -552,7 +534,7 @@ pub(super) fn create_data_type_classfile_for_class(
                         })?;
 
                 let stack_floor = oomir_function_stack_floor(function);
-                let max_stack_val = match jvm_code.max_stack(&class_file.constant_pool) {
+                let max_stack_val = match jvm_code.max_stack(&cp) {
                     Ok(max_stack) => max_stack.saturating_mul(2).max(stack_floor),
                     Err(error) => {
                         breadcrumbs::log!(
@@ -568,7 +550,7 @@ pub(super) fn create_data_type_classfile_for_class(
                 };
 
                 let code_attribute = Attribute::Code {
-                    name_index: class_file.constant_pool.add_utf8("Code")?,
+                    name_index: cp.add_utf8("Code")?,
                     max_stack: max_stack_val,
                     max_locals: max_locals_val,
                     code: jvm_code,
@@ -592,23 +574,20 @@ pub(super) fn create_data_type_classfile_for_class(
                     &function.signature.params[..]
                 };
                 for (name, _) in params_to_iterate {
-                    let name_index = class_file.constant_pool.add_utf8(name)?;
+                    let name_index = cp.add_utf8(name)?;
                     parameters_for_attribute.push(jvm::attributes::MethodParameter {
                         name_index,
                         access_flags: MethodAccessFlags::empty(), // No special flags
                     });
                 }
-                let method_parameters_attribute_name_index =
-                    class_file.constant_pool.add_utf8("MethodParameters")?;
+                let method_parameters_attribute_name_index = cp.add_utf8("MethodParameters")?;
                 let method_parameters_attribute = Attribute::MethodParameters {
                     name_index: method_parameters_attribute_name_index,
                     parameters: parameters_for_attribute,
                 };
 
-                let name_index = class_file.constant_pool.add_utf8(method_name)?;
-                let descriptor_index = class_file
-                    .constant_pool
-                    .add_utf8(&function.signature.to_string())?;
+                let name_index = cp.add_utf8(method_name)?;
+                let descriptor_index = cp.add_utf8(&function.signature.to_string())?;
 
                 let mut attributes_vec = vec![code_attribute];
                 // Skip MethodParameters for constructors and getVariantIdx
@@ -627,10 +606,10 @@ pub(super) fn create_data_type_classfile_for_class(
                     attributes: attributes_vec,
                 };
 
-                class_file.methods.push(jvm_method);
+                jvm_methods.push(jvm_method);
                 if !function.signature.is_static && !function.signature.params.is_empty() {
-                    class_file.methods.push(create_static_instance_bridge(
-                        &mut class_file.constant_pool,
+                    jvm_methods.push(create_static_instance_bridge(
+                        &mut cp,
                         class_name_jvm,
                         method_name,
                         function,
@@ -642,16 +621,13 @@ pub(super) fn create_data_type_classfile_for_class(
                     AdtHelperKind::IsVariant { variant_idx } => {
                         // Signature: ()Z - returns boolean
                         let method_desc = "()Z";
-                        let name_index = class_file.constant_pool.add_utf8(method_name)?;
-                        let descriptor_index = class_file.constant_pool.add_utf8(method_desc)?;
+                        let name_index = cp.add_utf8(method_name)?;
+                        let descriptor_index = cp.add_utf8(method_desc)?;
 
                         // Get the getVariantIdx method reference on THIS class
-                        let this_class_idx = class_file.this_class;
-                        let get_variant_idx_ref = class_file.constant_pool.add_method_ref(
-                            this_class_idx,
-                            "getVariantIdx",
-                            "()I",
-                        )?;
+                        let this_class_idx = this_class_index;
+                        let get_variant_idx_ref =
+                            cp.add_method_ref(this_class_idx, "getVariantIdx", "()I")?;
 
                         let idx = *variant_idx as u16;
                         // Offsets are instruction indices, not byte offsets:
@@ -688,7 +664,7 @@ pub(super) fn create_data_type_classfile_for_class(
                         let max_locals = 1u16;
 
                         let code_attribute = code_attribute_for_descriptor(
-                            &mut class_file.constant_pool,
+                            &mut cp,
                             max_stack,
                             max_locals,
                             instructions,
@@ -708,16 +684,13 @@ pub(super) fn create_data_type_classfile_for_class(
                     AdtHelperKind::PartialEqEnum { variants } => {
                         // Signature: (LObject;)Z - takes another enum instance, returns boolean
                         let method_desc = format!("(L{};)Z", class_name_jvm);
-                        let name_index = class_file.constant_pool.add_utf8(method_name)?;
-                        let descriptor_index = class_file.constant_pool.add_utf8(&method_desc)?;
+                        let name_index = cp.add_utf8(method_name)?;
+                        let descriptor_index = cp.add_utf8(&method_desc)?;
 
                         // Get the getVariantIdx method reference on THIS class
-                        let this_class_idx = class_file.this_class;
-                        let get_variant_idx_ref = class_file.constant_pool.add_method_ref(
-                            this_class_idx,
-                            "getVariantIdx",
-                            "()I",
-                        )?;
+                        let this_class_idx = this_class_index;
+                        let get_variant_idx_ref =
+                            cp.add_method_ref(this_class_idx, "getVariantIdx", "()I")?;
 
                         let mut instructions = vec![
                             Instruction::Aload_0,
@@ -740,20 +713,16 @@ pub(super) fn create_data_type_classfile_for_class(
 
                             instructions.push(Instruction::Aload_0);
                             instructions.push(Instruction::Invokevirtual(get_variant_idx_ref));
-                            instructions.push(get_int_const_instr(
-                                &mut class_file.constant_pool,
-                                variant_idx as i32,
-                            ));
+                            instructions.push(get_int_const_instr(&mut cp, variant_idx as i32));
                             let next_variant_fixup = instructions.len();
                             instructions.push(Instruction::If_icmpne(0));
 
-                            let variant_class_idx =
-                                class_file.constant_pool.add_class(&variant_class_name)?;
+                            let variant_class_idx = cp.add_class(&variant_class_name)?;
 
                             for (field_idx, field_ty) in fields.iter().enumerate() {
                                 append_field_equality_check(
                                     module,
-                                    &mut class_file.constant_pool,
+                                    &mut cp,
                                     &mut instructions,
                                     &mut false_fixups,
                                     variant_class_idx,
@@ -788,7 +757,7 @@ pub(super) fn create_data_type_classfile_for_class(
                         let max_locals = 2u16;
 
                         let code_attribute = code_attribute_for_descriptor(
-                            &mut class_file.constant_pool,
+                            &mut cp,
                             max_stack,
                             max_locals,
                             instructions,
@@ -807,17 +776,17 @@ pub(super) fn create_data_type_classfile_for_class(
                     }
                     AdtHelperKind::PartialEqClass { fields } => {
                         let method_desc = format!("(L{};)Z", class_name_jvm);
-                        let name_index = class_file.constant_pool.add_utf8(method_name)?;
-                        let descriptor_index = class_file.constant_pool.add_utf8(&method_desc)?;
+                        let name_index = cp.add_utf8(method_name)?;
+                        let descriptor_index = cp.add_utf8(&method_desc)?;
 
-                        let this_class_idx = class_file.this_class;
+                        let this_class_idx = this_class_index;
                         let mut instructions = Vec::new();
                         let mut false_fixups = Vec::new();
 
                         for (field_name, field_ty) in fields {
                             append_field_equality_check(
                                 module,
-                                &mut class_file.constant_pool,
+                                &mut cp,
                                 &mut instructions,
                                 &mut false_fixups,
                                 this_class_idx,
@@ -840,7 +809,7 @@ pub(super) fn create_data_type_classfile_for_class(
                         }
 
                         let code_attribute = code_attribute_for_descriptor(
-                            &mut class_file.constant_pool,
+                            &mut cp,
                             4,
                             2,
                             instructions,
@@ -858,7 +827,7 @@ pub(super) fn create_data_type_classfile_for_class(
                         }
                     }
                 };
-                class_file.methods.push(jvm_method);
+                jvm_methods.push(jvm_method);
             }
         }
     }
@@ -869,10 +838,10 @@ pub(super) fn create_data_type_classfile_for_class(
 
         for subclass_name in &subclasses {
             // Ensure subclass class_info is in the constant pool
-            let class_info_index = class_file.constant_pool.add_class(subclass_name)?;
+            let class_info_index = cp.add_class(subclass_name)?;
 
             // The outer class is this class
-            let outer_class_info_index = class_file.this_class;
+            let outer_class_info_index = this_class_index;
 
             // Derive simple name: part after last '$'. If there's no '$', treat as unnamed (0).
             let simple_name_part = subclass_name.rsplit('$').next().unwrap_or(subclass_name);
@@ -884,7 +853,7 @@ pub(super) fn create_data_type_classfile_for_class(
                 // No '$' present -> not an inner/member class; leave name_index = 0
                 0
             } else {
-                class_file.constant_pool.add_utf8(simple_name_part)?
+                cp.add_utf8(simple_name_part)?
             };
 
             // Default to PUBLIC | STATIC for generated nested classes. This can be adjusted
@@ -902,11 +871,10 @@ pub(super) fn create_data_type_classfile_for_class(
         // If this class has a nest host, add it as well
         // make it like [us]=class Host$[us] of class Host
         if let Some(nest_host_name) = nest_host {
-            let class_info_index = class_file.constant_pool.add_class(class_name_jvm)?;
-            let outer_class_info_index = class_file.constant_pool.add_class(&nest_host_name)?;
-            let name_index = class_file
-                .constant_pool
-                .add_utf8(class_name_jvm.rsplit('$').next().unwrap_or(class_name_jvm))?;
+            let class_info_index = cp.add_class(class_name_jvm)?;
+            let outer_class_info_index = cp.add_class(&nest_host_name)?;
+            let name_index =
+                cp.add_utf8(class_name_jvm.rsplit('$').next().unwrap_or(class_name_jvm))?;
             let access_flags = NestedClassAccessFlags::PUBLIC | NestedClassAccessFlags::STATIC;
             inner_classes_vec.push(InnerClass {
                 class_info_index,
@@ -916,8 +884,8 @@ pub(super) fn create_data_type_classfile_for_class(
             });
         }
 
-        let inner_classes_attr_name_index = class_file.constant_pool.add_utf8("InnerClasses")?;
-        class_file.attributes.push(Attribute::InnerClasses {
+        let inner_classes_attr_name_index = cp.add_utf8("InnerClasses")?;
+        class_attributes.push(Attribute::InnerClasses {
             name_index: inner_classes_attr_name_index,
             classes: inner_classes_vec,
         });
@@ -926,12 +894,31 @@ pub(super) fn create_data_type_classfile_for_class(
     // --- Add SourceFile Attribute ---
     let simple_name = class_name_jvm.split('/').last().unwrap_or(class_name_jvm);
     let source_file_name = format!("{}.rs", simple_name);
-    let source_file_utf8_index = class_file.constant_pool.add_utf8(&source_file_name)?;
-    let source_file_attr_name_index = class_file.constant_pool.add_utf8("SourceFile")?;
-    class_file.attributes.push(Attribute::SourceFile {
+    let source_file_utf8_index = cp.add_utf8(&source_file_name)?;
+    let source_file_attr_name_index = cp.add_utf8("SourceFile")?;
+    class_attributes.push(Attribute::SourceFile {
         name_index: source_file_attr_name_index,
         source_file_index: source_file_utf8_index,
     });
+
+    let class_file = ClassFile {
+        version: Version::Java8 { minor: 0 },
+        constant_pool: cp.into_inner(),
+        access_flags: ClassAccessFlags::PUBLIC
+            | ClassAccessFlags::SUPER
+            | if is_abstract {
+                ClassAccessFlags::ABSTRACT
+            } else {
+                ClassAccessFlags::FINAL
+            },
+        this_class: this_class_index,
+        super_class: super_class_index,
+        interfaces: interface_indices,
+        fields: jvm_fields,
+        methods: jvm_methods,
+        attributes: class_attributes,
+    };
+    verify_no_duplicate_constants(&class_file)?;
 
     // --- Serialize ---
     let mut byte_vector = Vec::new();
@@ -950,7 +937,7 @@ pub(super) fn create_data_type_classfile_for_interface(
     interface_name_jvm: &str, // Renamed for clarity
     methods: &HashMap<String, Signature>,
 ) -> jvm::Result<Vec<u8>> {
-    let mut cp = ConstantPool::default();
+    let mut cp = InternedConstantPool::default();
 
     let this_class_index = cp.add_class(interface_name_jvm)?;
 
@@ -994,21 +981,7 @@ pub(super) fn create_data_type_classfile_for_interface(
         );
     }
 
-    // --- Assemble ClassFile ---
-    let mut class_file = ClassFile {
-        version: Version::Java8 { minor: 0 }, // Or higher if using default/static methods
-        constant_pool: cp,
-        access_flags: ClassAccessFlags::PUBLIC
-            | ClassAccessFlags::INTERFACE
-            | ClassAccessFlags::ABSTRACT,
-        // Note: ACC_SUPER is generally not set for interfaces, though JVM might tolerate it.
-        this_class: this_class_index,
-        super_class: super_class_index, // Must be java/lang/Object
-        interfaces: Vec::new(),         // Interfaces implemented by *this* interface (if any)
-        fields: Vec::new(), // Interfaces can have static final fields, but not requested here
-        methods: jvm_methods, // Only the abstract methods defined above
-        attributes: Vec::new(), // SourceFile added below
-    };
+    let mut class_attributes = Vec::new();
 
     // --- Add SourceFile Attribute ---
     let simple_name = interface_name_jvm
@@ -1016,12 +989,27 @@ pub(super) fn create_data_type_classfile_for_interface(
         .last()
         .unwrap_or(interface_name_jvm);
     let source_file_name = format!("{}.rs", simple_name); // Or .java
-    let source_file_utf8_index = class_file.constant_pool.add_utf8(&source_file_name)?;
-    let source_file_attr_name_index = class_file.constant_pool.add_utf8("SourceFile")?;
-    class_file.attributes.push(Attribute::SourceFile {
+    let source_file_utf8_index = cp.add_utf8(&source_file_name)?;
+    let source_file_attr_name_index = cp.add_utf8("SourceFile")?;
+    class_attributes.push(Attribute::SourceFile {
         name_index: source_file_attr_name_index,
         source_file_index: source_file_utf8_index,
     });
+
+    let class_file = ClassFile {
+        version: Version::Java8 { minor: 0 },
+        constant_pool: cp.into_inner(),
+        access_flags: ClassAccessFlags::PUBLIC
+            | ClassAccessFlags::INTERFACE
+            | ClassAccessFlags::ABSTRACT,
+        this_class: this_class_index,
+        super_class: super_class_index,
+        interfaces: Vec::new(),
+        fields: Vec::new(),
+        methods: jvm_methods,
+        attributes: class_attributes,
+    };
+    verify_no_duplicate_constants(&class_file)?;
 
     // --- Serialize ---
     let mut byte_vector = Vec::new();
@@ -1038,7 +1026,7 @@ pub(super) fn create_data_type_classfile_for_interface(
 /// Creates a code attribute for a method that returns a constant value.
 fn create_code_from_method_name_and_constant_return(
     return_const: &oomir::Constant,
-    cp: &mut ConstantPool,
+    cp: &mut InternedConstantPool,
 ) -> jvm::Result<Attribute> {
     let code_attr_name_index = cp.add_utf8("Code")?;
     let return_ty = Type::from_constant(return_const);

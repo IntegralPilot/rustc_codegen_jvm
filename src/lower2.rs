@@ -10,13 +10,15 @@ use jvm_gen::{
 };
 use translator::FunctionTranslator;
 
+use constant_pool::{InternedConstantPool, verify_no_duplicate_constants};
 use ristretto_classfile::{
-    self as jvm, ClassAccessFlags, ClassFile, ConstantPool, MethodAccessFlags, Version,
+    self as jvm, ClassAccessFlags, ClassFile, MethodAccessFlags, Version,
     attributes::{Attribute, MaxStack},
 };
 use rustc_middle::ty::TyCtxt;
 use std::collections::{BTreeMap, HashMap};
 
+mod constant_pool;
 mod consts;
 mod helpers;
 mod jvm_gen;
@@ -47,7 +49,7 @@ pub fn oomir_to_jvm_bytecode(
     }
 
     for (class_name_jvm, functions) in functions_by_class {
-        let mut main_cp = ConstantPool::default();
+        let mut main_cp = InternedConstantPool::default();
         let super_class_name_jvm = "java/lang/Object"; // Standard superclass
 
         let super_class_index = main_cp.add_class(super_class_name_jvm)?;
@@ -150,18 +152,6 @@ pub fn oomir_to_jvm_bytecode(
             methods.push(create_default_constructor(&mut main_cp, super_class_index)?);
         }
 
-        let mut class_file = ClassFile {
-            version: Version::Java8 { minor: 0 },
-            constant_pool: main_cp, // Move the main constant pool here
-            access_flags: ClassAccessFlags::PUBLIC | ClassAccessFlags::SUPER,
-            this_class: this_class_index,
-            super_class: super_class_index,
-            interfaces: Vec::new(),
-            fields: Vec::new(), // Main class might not have fields unless they are static globals
-            methods,
-            attributes: Vec::new(),
-        };
-
         // Add SourceFile attribute
         let source_file_name = format!(
             "{}.rs",
@@ -170,12 +160,25 @@ pub fn oomir_to_jvm_bytecode(
                 .next_back()
                 .unwrap_or(&class_name_jvm)
         );
-        let source_file_utf8_index = class_file.constant_pool.add_utf8(&source_file_name)?;
-        let source_file_attr_name_index = class_file.constant_pool.add_utf8("SourceFile")?;
-        class_file.attributes.push(Attribute::SourceFile {
+        let source_file_utf8_index = main_cp.add_utf8(&source_file_name)?;
+        let source_file_attr_name_index = main_cp.add_utf8("SourceFile")?;
+        let attributes = vec![Attribute::SourceFile {
             name_index: source_file_attr_name_index,
             source_file_index: source_file_utf8_index,
-        });
+        }];
+
+        let class_file = ClassFile {
+            version: Version::Java8 { minor: 0 },
+            constant_pool: main_cp.into_inner(),
+            access_flags: ClassAccessFlags::PUBLIC | ClassAccessFlags::SUPER,
+            this_class: this_class_index,
+            super_class: super_class_index,
+            interfaces: Vec::new(),
+            fields: Vec::new(),
+            methods,
+            attributes,
+        };
+        verify_no_duplicate_constants(&class_file)?;
 
         // Serialize the main class file
         let mut byte_vector = Vec::new();

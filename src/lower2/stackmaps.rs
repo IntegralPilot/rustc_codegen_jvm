@@ -1,3 +1,4 @@
+use super::constant_pool::InternedConstantPool;
 use crate::oomir::{self, Type};
 use ristretto_classfile::{
     self as jvm, BaseType, Constant, ConstantPool, FieldType,
@@ -230,7 +231,7 @@ pub(super) fn build_stack_map_attributes(
     initial_locals: &[FrameValue],
     local_hints: &[FrameValue],
     max_locals: u16,
-    constant_pool: &mut ConstantPool,
+    constant_pool: &mut InternedConstantPool,
     context: &str,
 ) -> jvm::Result<Vec<Attribute>> {
     let target_offsets = branch_targets(instructions);
@@ -1448,7 +1449,7 @@ fn set_slot_value(locals: &mut Vec<FrameValue>, local_index: u16, value: FrameVa
 
 fn locals_for_stack_map(
     locals: &[FrameValue],
-    constant_pool: &mut ConstantPool,
+    constant_pool: &mut InternedConstantPool,
     verification_class_cache: &mut HashMap<String, u16>,
 ) -> jvm::Result<Vec<VerificationType>> {
     let mut end = locals.len();
@@ -1472,7 +1473,7 @@ fn locals_for_stack_map(
 
 fn stack_for_stack_map(
     stack: &[FrameValue],
-    constant_pool: &mut ConstantPool,
+    constant_pool: &mut InternedConstantPool,
     verification_class_cache: &mut HashMap<String, u16>,
 ) -> jvm::Result<Vec<VerificationType>> {
     stack
@@ -1483,7 +1484,7 @@ fn stack_for_stack_map(
 
 fn to_verification_type(
     value: &FrameValue,
-    constant_pool: &mut ConstantPool,
+    constant_pool: &mut InternedConstantPool,
     verification_class_cache: &mut HashMap<String, u16>,
 ) -> jvm::Result<VerificationType> {
     Ok(match value {

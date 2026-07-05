@@ -1,12 +1,12 @@
-use super::helpers::are_types_jvm_compatible;
+use super::{constant_pool::InternedConstantPool, helpers::are_types_jvm_compatible};
 use crate::oomir::{self, Type};
 use ristretto_classfile::{
-    self as jvm, ConstantPool,
+    self as jvm,
     attributes::{ArrayType, Instruction},
 };
 
 // Helper to get the appropriate integer constant loading instruction
-pub fn get_int_const_instr(cp: &mut ConstantPool, val: i32) -> Instruction {
+pub fn get_int_const_instr(cp: &mut InternedConstantPool, val: i32) -> Instruction {
     match val {
         // Direct iconst mapping
         -1 => Instruction::Iconst_m1,
@@ -38,8 +38,7 @@ pub fn get_int_const_instr(cp: &mut ConstantPool, val: i32) -> Instruction {
 }
 
 // Helper to get the appropriate long constant loading instruction
-pub fn get_long_const_instr(cp: &mut ConstantPool, val: i64) -> Instruction {
-    // <-- Add `cp: &mut ConstantPool`
+pub fn get_long_const_instr(cp: &mut InternedConstantPool, val: i64) -> Instruction {
     match val {
         0 => Instruction::Lconst_0,
         1 => Instruction::Lconst_1,
@@ -55,7 +54,7 @@ pub fn get_long_const_instr(cp: &mut ConstantPool, val: i64) -> Instruction {
 }
 
 // Helper to get the appropriate float constant loading instruction
-pub fn get_float_const_instr(cp: &mut ConstantPool, val: f32) -> Instruction {
+pub fn get_float_const_instr(cp: &mut InternedConstantPool, val: f32) -> Instruction {
     if val == 0.0 {
         Instruction::Fconst_0
     } else if val == 1.0 {
@@ -73,7 +72,7 @@ pub fn get_float_const_instr(cp: &mut ConstantPool, val: f32) -> Instruction {
 }
 
 // Helper to get the appropriate double constant loading instruction
-pub fn get_double_const_instr(cp: &mut ConstantPool, val: f64) -> Instruction {
+pub fn get_double_const_instr(cp: &mut InternedConstantPool, val: f64) -> Instruction {
     // Using bit representation for exact zero comparison is more robust
     if val.to_bits() == 0.0f64.to_bits() {
         // Handles +0.0 and -0.0
@@ -93,7 +92,7 @@ pub fn get_double_const_instr(cp: &mut ConstantPool, val: f64) -> Instruction {
 /// Appends JVM instructions for loading a constant onto the stack.
 pub fn load_constant(
     instructions: &mut Vec<Instruction>,
-    cp: &mut ConstantPool,
+    cp: &mut InternedConstantPool,
     constant: &oomir::Constant,
 ) -> Result<(), jvm::Error> {
     use jvm::attributes::Instruction as JI;

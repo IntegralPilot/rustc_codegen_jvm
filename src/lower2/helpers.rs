@@ -1,7 +1,7 @@
-use super::oomir;
+use super::{constant_pool::InternedConstantPool, oomir};
 
 use oomir::Type;
-use ristretto_classfile::{self as jvm, ConstantPool, attributes::Instruction};
+use ristretto_classfile::{self as jvm, attributes::Instruction};
 
 use super::{BIG_DECIMAL_CLASS, BIG_INTEGER_CLASS};
 
@@ -188,7 +188,7 @@ pub fn get_store_instruction(ty: &Type, index: u16) -> Result<Instruction, jvm::
 pub fn get_cast_instructions(
     src: &Type,
     dest: &Type,
-    cp: &mut ConstantPool,
+    cp: &mut InternedConstantPool,
 ) -> Result<Vec<Instruction>, jvm::Error> {
     use Instruction as JI;
 
@@ -481,7 +481,10 @@ fn primitive_to_primitive(src: &Type, dest: &Type) -> Result<Vec<Instruction>, j
 }
 
 /// primitive → BigInteger via BigInteger.valueOf(long)
-fn prim_to_bigint(src: &Type, cp: &mut ConstantPool) -> Result<Vec<Instruction>, jvm::Error> {
+fn prim_to_bigint(
+    src: &Type,
+    cp: &mut InternedConstantPool,
+) -> Result<Vec<Instruction>, jvm::Error> {
     use Instruction as JI;
     let bi_idx = cp.add_class(BIG_INTEGER_CLASS)?;
     let mref = cp.add_method_ref(bi_idx, "valueOf", "(J)Ljava/math/BigInteger;")?;
@@ -497,7 +500,10 @@ fn prim_to_bigint(src: &Type, cp: &mut ConstantPool) -> Result<Vec<Instruction>,
 }
 
 /// primitive → BigDecimal via BigDecimal.valueOf(long|double)
-fn prim_to_bigdec(src: &Type, cp: &mut ConstantPool) -> Result<Vec<Instruction>, jvm::Error> {
+fn prim_to_bigdec(
+    src: &Type,
+    cp: &mut InternedConstantPool,
+) -> Result<Vec<Instruction>, jvm::Error> {
     use Instruction as JI;
     let bd_idx = cp.add_class(BIG_DECIMAL_CLASS)?;
     let (cast, sig) = match src {
@@ -515,7 +521,10 @@ fn prim_to_bigdec(src: &Type, cp: &mut ConstantPool) -> Result<Vec<Instruction>,
 }
 
 /// BigInteger → primitive via intValue/longValue/doubleValue(...)
-fn bigint_to_prim(dest: &Type, cp: &mut ConstantPool) -> Result<Vec<Instruction>, jvm::Error> {
+fn bigint_to_prim(
+    dest: &Type,
+    cp: &mut InternedConstantPool,
+) -> Result<Vec<Instruction>, jvm::Error> {
     use Instruction as JI;
     let bi_idx = cp.add_class(BIG_INTEGER_CLASS)?;
     let mut ins = Vec::new();
@@ -551,7 +560,10 @@ fn bigint_to_prim(dest: &Type, cp: &mut ConstantPool) -> Result<Vec<Instruction>
 }
 
 /// BigDecimal → primitive via intValue/longValue/floatValue/doubleValue(...)
-fn bigdec_to_prim(dest: &Type, cp: &mut ConstantPool) -> Result<Vec<Instruction>, jvm::Error> {
+fn bigdec_to_prim(
+    dest: &Type,
+    cp: &mut InternedConstantPool,
+) -> Result<Vec<Instruction>, jvm::Error> {
     use Instruction as JI;
     let bd_idx = cp.add_class(BIG_DECIMAL_CLASS)?;
     let mut ins = Vec::new();
