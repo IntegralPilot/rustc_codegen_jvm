@@ -1,10 +1,12 @@
 use crate::{lower1::operand::extract_number_from_operand, oomir::*};
 use std::collections::{HashMap, HashSet, VecDeque};
 
+mod copyprop;
 mod dataflow;
 mod reachability;
 mod reorganisation;
 
+use copyprop::propagate_copies_and_eliminate_dead_moves;
 use dataflow::{analyze_constant_propagation, process_block_instructions};
 use reachability::{find_reachable_blocks, get_instruction_successors};
 use reorganisation::{
@@ -312,10 +314,11 @@ pub fn optimise_function(
     // 3. Transform & Perform Dead Code Elimination
     transform_function(&mut function, &cfg, &analysis_result, data_types);
 
-    // 4. Eliminate duplicate basic blocks (re-pass-through after transformation)
-    eliminate_duplicate_basic_blocks(&mut function);
+    // 4. Clean up simple copies introduced by lowering and constant/algebraic rewrites.
+    propagate_copies_and_eliminate_dead_moves(&mut function);
 
-    // TODO: Further optimization passes? (Copy propagation, dead store elimination, etc.)
+    // 5. Eliminate duplicate basic blocks (re-pass-through after transformation)
+    eliminate_duplicate_basic_blocks(&mut function);
 
     breadcrumbs::log!(
         breadcrumbs::LogLevel::Info,

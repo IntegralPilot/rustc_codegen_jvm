@@ -122,28 +122,5 @@ pub fn emit_checked_arithmetic_oomir_instructions(
         },
         args: vec![op1.clone(), op2.clone()],
     });
-    // Extract result and overflow from the pair (assume tuple struct with .0 and .1)
-    // Assume the intrinsic returns a struct with fields "result" and "overflow"
-    // Use GetField to extract them
-    generated_instructions.push(Instruction::GetField {
-        dest: tmp_result.clone(),
-        object: Operand::Variable {
-            name: tmp_pair.clone(),
-            ty: Type::Class(tuple_type_name.clone()),
-        },
-        field_name: "field0".to_string(),
-        field_ty: op_ty.clone(),
-        owner_class: tuple_type_name.clone(),
-    });
-    generated_instructions.push(Instruction::GetField {
-        dest: tmp_overflow.clone(),
-        object: Operand::Variable {
-            name: tmp_pair.clone(),
-            ty: Type::Class(tuple_type_name.clone()),
-        },
-        field_name: "field1".to_string(),
-        field_ty: Type::Boolean,
-        owner_class: tuple_type_name.clone(),
-    });
     (generated_instructions, tmp_pair, tmp_result, tmp_overflow)
 }

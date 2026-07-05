@@ -52,6 +52,9 @@ pub(super) fn optimise(
     let local_slot_map = allocate_local_slots(&instructions, max_locals, fixed_prefix_slots);
     let (instructions, _) = rewrite_locals(instructions, &local_slot_map);
     let instructions = rewrite_store_load_pairs(instructions);
+    let instructions = fold_boolean_zero_comparisons(instructions)?;
+    let instructions = fold_stack_boolean_zero_comparisons(instructions)?;
+    let instructions = remove_dead_duplicate_stores(instructions)?;
     let instructions = remove_redundant_instructions(instructions)?;
     let max_locals = compute_max_locals(&instructions);
     let max_locals = max_locals.max(fixed_prefix_slots);
@@ -227,6 +230,241 @@ fn only_expected_incoming(incoming: &[BTreeSet<usize>], pattern_start: usize) ->
     true
 }
 
+fn fold_boolean_zero_comparisons(
+    mut instructions: Vec<Instruction>,
+) -> jvm::Result<Vec<Instruction>> {
+    if instructions.len() < 6 {
+        return Ok(instructions);
+    }
+
+    let liveness = analyze_local_liveness(&instructions);
+    let incoming = incoming_branch_sources(&instructions);
+    let mut keep = vec![true; instructions.len()];
+    let mut index = 0;
+
+    while index + 5 < instructions.len() {
+        if !keep[index] {
+            index += 1;
+            continue;
+        }
+
+        let Some(true_value_target) = conditional_branch_target(&instructions[index]) else {
+            index += 1;
+            continue;
+        };
+        if usize::from(true_value_target) != index + 3
+            || !matches!(instructions[index + 1], Instruction::Iconst_0)
+            || !matches!(instructions[index + 3], Instruction::Iconst_1)
+        {
+            index += 1;
+            continue;
+        }
+
+        let Instruction::Goto(join_target) = instructions[index + 2] else {
+            index += 1;
+            continue;
+        };
+        if usize::from(join_target) != index + 4 {
+            index += 1;
+            continue;
+        }
+
+        let mut cursor = index + 4;
+        let mut stored_locals = BTreeSet::new();
+        while cursor + 1 < instructions.len()
+            && matches!(instructions[cursor], Instruction::Dup)
+            && let Some((LocalKind::Int, local)) = local_store(&instructions[cursor + 1])
+        {
+            stored_locals.insert(local.index);
+            cursor += 2;
+        }
+
+        if cursor + 1 >= instructions.len()
+            || !matches!(instructions[cursor], Instruction::Iconst_0)
+        {
+            index += 1;
+            continue;
+        }
+
+        let Some((branch_when_true, final_target)) =
+            bool_zero_compare_target(&instructions[cursor + 1])
+        else {
+            index += 1;
+            continue;
+        };
+        let branch_index = cursor + 1;
+        if (index + 1..=branch_index).contains(&usize::from(final_target))
+            || stored_locals
+                .iter()
+                .any(|local| liveness.live_out[branch_index].contains(local))
+            || !only_expected_incoming_for_zero_compare(&incoming, index, branch_index)
+        {
+            index += 1;
+            continue;
+        }
+
+        let replacement = if branch_when_true {
+            set_conditional_branch_target(&instructions[index], final_target)
+        } else {
+            invert_conditional_branch(&instructions[index], final_target)
+        }
+        .ok_or_else(|| jvm::Error::VerificationError {
+            context: "optimise2".to_string(),
+            message: format!("Expected conditional branch at instruction {index}"),
+        })?;
+
+        instructions[index] = replacement;
+        for keep_removed in keep.iter_mut().take(branch_index + 1).skip(index + 1) {
+            *keep_removed = false;
+        }
+        index = branch_index + 1;
+    }
+
+    compact_instructions(instructions, &keep)
+}
+
+fn only_expected_incoming_for_zero_compare(
+    incoming: &[BTreeSet<usize>],
+    pattern_start: usize,
+    pattern_end: usize,
+) -> bool {
+    for target in pattern_start + 1..=pattern_end {
+        let expected_source = if target == pattern_start + 3 {
+            Some(pattern_start)
+        } else if target == pattern_start + 4 {
+            Some(pattern_start + 2)
+        } else {
+            None
+        };
+        let Some(actual_sources) = incoming.get(target) else {
+            return false;
+        };
+        match expected_source {
+            Some(source) if actual_sources.len() == 1 && actual_sources.contains(&source) => {}
+            None if actual_sources.is_empty() => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn fold_stack_boolean_zero_comparisons(
+    mut instructions: Vec<Instruction>,
+) -> jvm::Result<Vec<Instruction>> {
+    if instructions.len() < 4 {
+        return Ok(instructions);
+    }
+
+    let liveness = analyze_local_liveness(&instructions);
+    let incoming = incoming_branch_sources(&instructions);
+    let mut keep = vec![true; instructions.len()];
+    let mut index = 0;
+
+    while index + 3 < instructions.len() {
+        if !keep[index] {
+            index += 1;
+            continue;
+        }
+
+        let mut cursor = index;
+        let mut stores = Vec::new();
+        while cursor + 1 < instructions.len()
+            && matches!(instructions[cursor], Instruction::Dup)
+            && let Some((LocalKind::Int, local)) = local_store(&instructions[cursor + 1])
+        {
+            stores.push((cursor, cursor + 1, local.index));
+            cursor += 2;
+        }
+
+        if stores.is_empty()
+            || cursor + 1 >= instructions.len()
+            || !matches!(instructions[cursor], Instruction::Iconst_0)
+        {
+            index += 1;
+            continue;
+        }
+
+        let Some((branch_when_true, final_target)) =
+            bool_zero_compare_target(&instructions[cursor + 1])
+        else {
+            index += 1;
+            continue;
+        };
+        let branch_index = cursor + 1;
+        if (index..=branch_index).contains(&usize::from(final_target))
+            || !range_has_no_incoming(&incoming, index, branch_index)
+        {
+            index += 1;
+            continue;
+        }
+
+        let mut kept_live_stores = BTreeSet::new();
+        for (dup_index, store_index, local) in stores.into_iter().rev() {
+            if liveness.live_out[branch_index].contains(&local) && kept_live_stores.insert(local) {
+                continue;
+            }
+            keep[dup_index] = false;
+            keep[store_index] = false;
+        }
+
+        keep[cursor] = false;
+        instructions[branch_index] = if branch_when_true {
+            Instruction::Ifne(final_target)
+        } else {
+            Instruction::Ifeq(final_target)
+        };
+        index = branch_index + 1;
+    }
+
+    compact_instructions(instructions, &keep)
+}
+
+fn range_has_no_incoming(incoming: &[BTreeSet<usize>], start: usize, end: usize) -> bool {
+    (start..=end).all(|target| {
+        incoming
+            .get(target)
+            .is_some_and(|sources| sources.is_empty())
+    })
+}
+
+fn remove_dead_duplicate_stores(instructions: Vec<Instruction>) -> jvm::Result<Vec<Instruction>> {
+    if instructions.len() < 2 {
+        return Ok(instructions);
+    }
+
+    let liveness = analyze_local_liveness(&instructions);
+    let protected = protected_instruction_indices(&instructions);
+    let mut keep = vec![true; instructions.len()];
+    let mut index = 0;
+
+    while index + 1 < instructions.len() {
+        if protected.contains(&index) || protected.contains(&(index + 1)) {
+            index += 1;
+            continue;
+        }
+
+        let Some((store_kind, stored)) = local_store(&instructions[index + 1]) else {
+            index += 1;
+            continue;
+        };
+        let duplicate_matches_store = match &instructions[index] {
+            Instruction::Dup => local_width(store_kind) == 1,
+            Instruction::Dup2 => local_width(store_kind) == 2,
+            _ => false,
+        };
+        if !duplicate_matches_store || liveness.live_out[index + 1].contains(&stored.index) {
+            index += 1;
+            continue;
+        }
+
+        keep[index] = false;
+        keep[index + 1] = false;
+        index += 2;
+    }
+
+    compact_instructions(instructions, &keep)
+}
+
 fn remove_redundant_instructions(instructions: Vec<Instruction>) -> jvm::Result<Vec<Instruction>> {
     if instructions.is_empty() {
         return Ok(instructions);
@@ -289,9 +527,6 @@ fn rewrite_store_load_pairs(mut instructions: Vec<Instruction>) -> Vec<Instructi
         let Some((store_kind, stored)) = local_store(&instructions[index]) else {
             continue;
         };
-        if local_width(store_kind) != 1 {
-            continue;
-        }
         let Some((load_kind, loaded)) = local_load(&instructions[index + 1]) else {
             continue;
         };
@@ -299,7 +534,11 @@ fn rewrite_store_load_pairs(mut instructions: Vec<Instruction>) -> Vec<Instructi
             continue;
         }
 
-        instructions[index] = Instruction::Dup;
+        instructions[index] = if local_width(store_kind) == 2 {
+            Instruction::Dup2
+        } else {
+            Instruction::Dup
+        };
         instructions[index + 1] = make_store(store_kind, stored.index);
     }
 
@@ -1018,6 +1257,14 @@ fn bool_branch_target(instruction: &Instruction) -> Option<(bool, u16)> {
     match instruction {
         Instruction::Ifne(target) => Some((true, *target)),
         Instruction::Ifeq(target) => Some((false, *target)),
+        _ => None,
+    }
+}
+
+fn bool_zero_compare_target(instruction: &Instruction) -> Option<(bool, u16)> {
+    match instruction {
+        Instruction::If_icmpne(target) => Some((true, *target)),
+        Instruction::If_icmpeq(target) => Some((false, *target)),
         _ => None,
     }
 }

@@ -615,7 +615,20 @@ fn transfer_instruction(
             state.stack.push(value2);
             state.stack.push(value1);
         }
-        I::Dup_x2 | I::Dup2 | I::Dup2_x1 | I::Dup2_x2 => {
+        I::Dup2 => {
+            let value1 = state.pop(context, instruction_index)?;
+            if value1.is_category2() {
+                state.stack.push(value1.clone());
+                state.stack.push(value1);
+            } else {
+                let value2 = state.pop_category1(context, instruction_index)?;
+                state.stack.push(value2.clone());
+                state.stack.push(value1.clone());
+                state.stack.push(value2);
+                state.stack.push(value1);
+            }
+        }
+        I::Dup_x2 | I::Dup2_x1 | I::Dup2_x2 => {
             return Err(jvm::Error::VerificationError {
                 context: context.to_string(),
                 message: format!(
