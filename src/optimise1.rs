@@ -251,6 +251,13 @@ pub fn optimise_function(
     mut function: Function,
     data_types: &HashMap<String, DataType>,
 ) -> Function {
+    let instrumented_fn_name = function
+        .owner_class
+        .as_deref()
+        .map(|owner| format!("{owner}::{}", function.name))
+        .unwrap_or_else(|| function.name.clone());
+    let _timer = crate::instrumentation::Timer::function("optimise1", None, &instrumented_fn_name);
+
     if function.body.basic_blocks.is_empty() {
         breadcrumbs::log!(
             breadcrumbs::LogLevel::Info,

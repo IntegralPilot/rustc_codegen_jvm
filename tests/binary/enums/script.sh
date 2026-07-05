@@ -5,13 +5,6 @@ echo "minimize-fmt-cargo"
 
 # --- Configuration ---
 # Choose a unique string that ONLY appears when your specific linker error occurs.
-# Good candidates from your previous output:
-#   "Error: java.lang.ArrayIndexOutOfBoundsException"
-#   "--- R8 FAILED ---"
-#   "Error creating JAR file: R8 optimization failed"
-# Let's use the most specific one related to the R8 crash:
-#EXPECTED_ERROR_SUBSTRING="ArrayIndexOutOfBoundsException"
-# Or use:
 EXPECTED_ERROR_SUBSTRING="linking with"
 
 # --- Execution ---

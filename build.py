@@ -6,7 +6,6 @@ import subprocess
 import shutil
 import argparse
 import platform
-import urllib.request
 from pathlib import Path
 from typing import List
 
@@ -28,30 +27,23 @@ class Config:
     JAVA_LINKER_DIR = ROOT_DIR / "java-linker"
     LIBRARY_DIR = ROOT_DIR / "library"
     SHIM_METADATA_GEN_DIR = ROOT_DIR / "shim-metadata-gen"
-    VENDOR_DIR = ROOT_DIR / "vendor"
 
     # Versions (centralized management)
     LIBRARY_VERSION = "0.1.0"
-    R8_VERSION = "8.11.18"
 
     # Source File Lists (used for dependency tracking)
     # Using glob patterns for automatic discovery
-    LIBRARY_SOURCES = list(LIBRARY_DIR.glob("src/**/*.java")) + [
-        LIBRARY_DIR / "build.gradle.kts"
-    ]
+    LIBRARY_SOURCES = sorted(LIBRARY_DIR.glob("src/**/*.java"))
     SHIM_GEN_RUST_SOURCES = list(SHIM_METADATA_GEN_DIR.glob("src/**/*.rs"))
     BACKEND_RUST_SOURCES = list(ROOT_DIR.glob("src/**/*.rs"))
     LINKER_RUST_SOURCES = list(JAVA_LINKER_DIR.glob("src/**/*.rs"))
 
     # Key Target Files
     LIBRARY_JAR = LIBRARY_DIR / f"build/libs/library-{LIBRARY_VERSION}.jar"
-    R8_JAR = VENDOR_DIR / "r8.jar"
+    LIBRARY_CLASSES_DIR = LIBRARY_DIR / "build/classes"
     CORE_JSON = SHIM_METADATA_GEN_DIR / "core.json"
     CONFIG_TOML = ROOT_DIR / "config.toml"
     JVM_TARGET_JSON = ROOT_DIR / "jvm-unknown-unknown.json"
-
-    # URLs
-    R8_URL = f"https://maven.google.com/com/android/tools/r8/{R8_VERSION}/r8-{R8_VERSION}.jar"
 
     # Platform-specific details
     if platform.system() == "Windows":
@@ -71,13 +63,14 @@ def run_command(cmd: List[str], cwd: Path = None, check: bool = True):
     cwd_str = f" (in {cwd})" if cwd else ""
     print(f"{Colors.YELLOW}▶️  Running: {' '.join(cmd)}{cwd_str}{Colors.RESET}")
     try:
-        subprocess.run(
+        proc = subprocess.run(
             cmd, 
             cwd=cwd, 
             check=check,
             stdout=sys.stdout, # Stream output directly
             stderr=sys.stderr
         )
+        return proc
     except FileNotFoundError as e:
         print(f"{Colors.RED}❌ Error: Command '{cmd[0]}' not found. Is it in your PATH?{Colors.RESET}")
         print(f"   Details: {e}")
@@ -100,10 +93,6 @@ def is_stale(target: Path, sources: List[Path]) -> bool:
             return True
     return False
 
-def ensure_dir(path: Path):
-    """Ensures a directory exists, creating it if necessary."""
-    path.mkdir(parents=True, exist_ok=True)
-    
 # --- Build Tasks (Replaces Makefile Targets) ---
 
 def clean():
@@ -117,17 +106,12 @@ def clean():
     run_command(["cargo", "clean"], cwd=Config.JAVA_LINKER_DIR)
     run_command(["cargo", "clean"], cwd=Config.SHIM_METADATA_GEN_DIR)
 
-    # Gradle clean
-    gradle_cmd = ["./gradlew", "clean"] if platform.system() != "Windows" else ["gradlew.bat", "clean"]
-    run_command(gradle_cmd, cwd=Config.LIBRARY_DIR)
-
     # Remove specific files and directories
     for path in [
-        Config.VENDOR_DIR, 
         Config.CONFIG_TOML, 
         Config.JVM_TARGET_JSON,
         Config.CORE_JSON,
-        Config.LIBRARY_DIR / "build" # Also remove gradle's build dir
+        Config.LIBRARY_DIR / "build"
     ]:
         try:
             if path.is_dir():
@@ -149,11 +133,34 @@ def build_library():
         print(f"{Colors.GREEN}✅ Java library shim is up to date.{Colors.RESET}")
         return
 
+    if not Config.LIBRARY_SOURCES:
+        print(f"{Colors.RED}❌ No Java sources found under {Config.LIBRARY_DIR / 'src'}{Colors.RESET}")
+        sys.exit(1)
+
     print(f"{Colors.CYAN}📚 Building Java library shim...{Colors.RESET}")
-    
-    gradle_args = ["--no-daemon", "build"] if Config.IS_CI else ["build"]
-    gradle_cmd = ["./gradlew"] + gradle_args if platform.system() != "Windows" else ["gradlew.bat"] + gradle_args
-    run_command(gradle_cmd, cwd=Config.LIBRARY_DIR)
+
+    if Config.LIBRARY_CLASSES_DIR.exists():
+        shutil.rmtree(Config.LIBRARY_CLASSES_DIR)
+    Config.LIBRARY_CLASSES_DIR.mkdir(parents=True, exist_ok=True)
+    Config.LIBRARY_JAR.parent.mkdir(parents=True, exist_ok=True)
+
+    source_paths = [str(path) for path in Config.LIBRARY_SOURCES]
+    javac_base = ["javac", "-Xlint:-options", "-d", str(Config.LIBRARY_CLASSES_DIR)]
+    proc = run_command(["javac", "--release", "8"] + javac_base[1:] + source_paths, check=False)
+    if proc.returncode != 0:
+        print(
+            f"{Colors.YELLOW}⚠️  javac --release 8 failed; retrying with -source 8 -target 8.{Colors.RESET}"
+        )
+        run_command(["javac", "-source", "8", "-target", "8"] + javac_base[1:] + source_paths)
+
+    run_command([
+        "jar",
+        "cf",
+        str(Config.LIBRARY_JAR),
+        "-C",
+        str(Config.LIBRARY_CLASSES_DIR),
+        ".",
+    ])
 
     if not Config.LIBRARY_JAR.exists():
         print(f"{Colors.RED}❌ Expected library JAR was not created: {Config.LIBRARY_JAR}{Colors.RESET}")
@@ -235,24 +242,6 @@ def generate_config_files():
         print(f"   Generated {target_path.name}")
     print(f"{Colors.GREEN}   Configuration files generated.{Colors.RESET}")
     
-def vendor_r8():
-    """Downloads the R8 compiler if it doesn't exist."""
-    if Config.R8_JAR.exists():
-        print(f"{Colors.GREEN}✅ R8 is already vendored.{Colors.RESET}")
-        return
-    
-    print(f"{Colors.CYAN}📦 Vendoring R8 from {Config.R8_URL}...{Colors.RESET}")
-    ensure_dir(Config.VENDOR_DIR)
-    try:
-        urllib.request.urlretrieve(Config.R8_URL, Config.R8_JAR)
-    except Exception as e:
-        print(f"{Colors.RED}❌ Failed to download R8: {e}{Colors.RESET}")
-        # Clean up partial download if it exists
-        if Config.R8_JAR.exists():
-            Config.R8_JAR.unlink()
-        sys.exit(1)
-    print(f"{Colors.GREEN}   R8 vendored successfully.{Colors.RESET}")
-    
 def all_tasks():
     """Runs all necessary build tasks in the correct order."""
     if not Config.IS_CI:
@@ -265,7 +254,6 @@ def all_tasks():
     generate_shim_metadata()
     build_rust_backend()
     build_java_linker()
-    vendor_r8()
 
     print(f"\n{Colors.GREEN}✨ Build complete! ✨{Colors.RESET}")
 
@@ -288,7 +276,6 @@ TARGETS = {
     "java-linker": (build_java_linker, "Build the Java Linker subproject."),
     "library": (build_library, "Build the standard library shim."),
     "gen-files": (generate_config_files, "Generate necessary files from templates."),
-    "vendor-r8": (vendor_r8, "Download the R8 compiler."),
     "help": (help_message, "Show this help message."),
 }
 

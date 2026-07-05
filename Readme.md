@@ -1,204 +1,240 @@
 # rustc_codegen_jvm
 
-[![License: MIT/Apache-2.0](https://img.shields.io/badge/license-MIT%20%7C%20Apache--2.0-blue.svg)](https://opensource.org/licenses/MIT)  
+**A custom Rust compiler backend that compiles Rust directly to Java Virtual Machine (JVM) bytecode.**
+
+[![License: MIT/Apache-2.0](https://img.shields.io/badge/license-MIT%20%7C%20Apache--2.0-blue.svg)](https://opensource.org/licenses/MIT)
 [![CI](https://github.com/IntegralPilot/rustc_codegen_jvm/actions/workflows/ci.yml/badge.svg)](https://github.com/IntegralPilot/rustc_codegen_jvm/actions)
+[![Rust: Nightly](https://img.shields.io/badge/Rust-Nightly-orange.svg)](https://rustup.rs/)
 
-A custom Rust compiler backend that emits Java Virtual Machine bytecode.  
-Compile Rust code into a runnable `.jar` compatible with JVM 8+.
+Compile your Rust code into a self-contained, runnable `.jar` compatible with JVM 8+. By transparently mapping Rust constructs onto Java classes and interfaces, this backend bridges the safety and ergonomics of Rust with the reach of the JVM.
 
----
+### Why use this?
+
+- **Fast iteration**
+  - Fresh compilation for most small test crates takes **under 1 second**, making the backend practical for rapid experimentation compared to native compilation. Due to the rich hot reload and debugging ecosystem of the JVM, my vision is that this project can in future make rapidly iterating on Rust code (which is a known drawback of Rust) fast and enjoyable.
+- **Interop without the boilerplate**
+  - Rust enums, generics, function pointers, unions and other supported constructs map directly onto JVM classes and interfaces (see [Interop Model](#interop-model)). Because of this, `rustc_codegen_jvm` can achieve a level of ergonomic interop with Java that comparable native solutions can't. For example, a Java class can implement a Rust trait and be passed directly into Rust code as a `&dyn Trait` object and no bindings layer is required.
+- **Run anywhere a JVM runs**
+   - Because the output is standard bytecode rather than a native binary, your Rust code can target environments where native FFI is difficult or unavailable, including **sandboxed environments like Minecraft mod loaders** and **Android** (if you convert to DEX files).
+- **Sandboxed by construction**
+   - Native code loaded via JNI can crash the entire JVM on a bad memory access. Rust compiled to JVM bytecode is checked by the JVM's own bytecode verifier, so those failures stay within the managed runtime. Future visions for the project include it being able to help you leverage the JVM's safety to debug undefined behaviour, like [Miri](https://github.com/rust-lang/miri/) but faster because of the JVM's JIT.
+ 
+It should be noted that this project is still in early development, but is supporting more of the Rust language as time goes on! The eventual goal is a potential upstreaming with main `rustc`.
+
+I am so grateful for any stars and support!
 
 ## Table of Contents
-
 1. [Demos](#demos)
 2. [Features](#features)
 3. [How It Works](#how-it-works)
-4. [Prerequisites](#prerequisites)
-5. [Installation & Build](#installation--build)
-6. [Usage](#usage)
-7. [Running Tests](#running-tests)
-8. [Project Structure](#project-structure)
-9. [Contributing](#contributing)
-10. [License](#license) 
-
----
+4. [Interop Model](#interop-model)
+5. [Target Platforms](#target-platforms)
+6. [Prerequisites](#prerequisites)
+7. [Installation & Build](#installation--build)
+8. [Usage](#usage)
+9. [Running Tests](#running-tests)
+10. [Project Structure](#project-structure)
+11. [Contributing](#contributing)
+12. [License](#license)
 
 ## Demos
 
-These examples are located in `tests/binary`, compiled to JVM bytecode, and verified on CI during integration testing. Examples include:
+These examples live in `tests/binary`, are compiled to JVM bytecode, and are verified on every CI run as part of the integration test suite. Most small examples cold-compile and run in **under 1 second** - verify it yourself with `Instrument.py`.
 
-- **[RSA](tests/binary/rsa/src/main.rs)** encryption/decryption  
-- **[Binary search](tests/binary/binsearch/src/main.rs)** algorithm  
-- **[Fibonacci](tests/binary/fibonacci/src/main.rs)** sequence generator  
-- **[Collatz conjecture](tests/binary/collatz/src/main.rs)** verifier  
-- **[Large prime](tests/binary/primes/src/main.rs)** generator  
-- **[Enums](tests/binary/enums/src/main.rs)** and **[Structs](tests/binary/structs/src/main.rs)** (nested data structures: structs, tuples, arrays, and slices)  
-- **[Implementation blocks](tests/binary/impl/src/main.rs)** and **[Traits](tests/binary/traits/src/main.rs)** (including dynamic dispatch)
-- **[Unions](tests/binary/unions/src/main.rs)** (demonstrating certain `unsafe` operations)
-
----
+| Example | Demonstrates |
+|---|---|
+| **[RSA](tests/binary/rsa/src/main.rs)** | Encryption / decryption |
+| **[Binary search](tests/binary/binsearch/src/main.rs)** | Classic search algorithm |
+| **[Fibonacci](tests/binary/fibonacci/src/main.rs)** | Recursive sequence generation |
+| **[Collatz conjecture](tests/binary/collatz/src/main.rs)** | Iterative mathematical verification |
+| **[Large prime generator](tests/binary/primes/src/main.rs)** | Numeric computation at scale |
+| **[Enums](tests/binary/enums/src/main.rs)** / **[Structs](tests/binary/structs/src/main.rs)** | Nested data structures - tuples, arrays, slices |
+| **[Impl blocks](tests/binary/impl/src/main.rs)** / **[Traits](tests/binary/traits/src/main.rs)** | Trait implementations, including dynamic dispatch |
+| **[Function pointers](tests/binary/fn_pointers/src/main.rs)** | Function pointers as values, fields, parameters, returns, and generic members |
+| **[Unions](tests/binary/unions/src/main.rs)** | `unsafe` union handling, running on the JVM |
 
 ## Features
 
-- **Optimisations**: Constant folding, constant propagation, and dead code elimination to generate clean JVM bytecode.
-- **Standard Library Support**: Basic `core` support on host target for JVM output.
-- **Arithmetic**: Support for integers, floats, and checked operations.
-- **Operations**: Comparisons, bitwise, and logical operations.
-- **Control Flow**: Support for `if`/`else`, `match`, `for`, `while`, and `loop`.
-- **Type Handling**: Type casting (`as`) and primitive types.
-- **Functions**: Function calls, recursion, and function pointers in multiple contexts (within ADTs, as variables, parameters, return values, or generics).
-- **Data Structures**: Arrays, slices, structs, tuples, and enums (C-like and Rust-style).
-- **Memory Management**: Mutable borrowing, references, and dereferencing.
-- **Object-Oriented Constructs**: Implementations for ADTs, including `self`, `&self`, and `&mut self`.
-- **Traits & Closures**: Dynamic dispatch (`&dyn Trait`) and closure capturing.
-- **Unions**: Supported for basic types (`bool`, `i8`/`u8`, `i16`/`u16`, `i32`/`u32`, `f32`, `f64`) and structs containing combinations of these types.
-- **Output**: Executable `.jar` generation for binary crates.
-- **Testing**: Comprehensive integration tests covering these features in both debug and release modes.
+### Compiler optimisations
+- **Constant folding & propagation**
+  - Evaluates constant expressions and known values at compile time.
+- **Dead code elimination**
+  - Strips unreachable paths for clean, efficient bytecode.
+- **Algebraic simplification**
+  - Reduces expressions using algebraic identities.
 
-*Current Milestone:* Full support for the Rust `core` crate.
+### Rust Language Support
+- **Control flow**
+  - `if`/`else`, `match`, `for`, `while`, and `loop`.
+- **Data structures**
+  - arrays, slices, structs, tuples, and enums (both C-like and Rust-style).
+- **Functions & closures**
+  - calls, recursion, function pointers (as values, parameters, return types, and in generics), and closure capture.
+- **OOP constructs**
+  - `impl` blocks for ADTs, including `self`, `&self`, and `&mut self`.
+- **Traits**
+  - dynamic dispatch via `&dyn Trait`.
+- **Memory management**
+  - mutable borrowing, references, and dereferencing.
+- **Unions**
+  - supported for primitive types (`bool`, `i8`–`f64`) and structs composed of them.
+- **Output**
+  - executable, self-contained `.jar` generation for binary crates.
+- **Testing**
+  - integration coverage across debug and release modes for all of the above.
 
----
+**Current milestone:** full support for the Rust `core` crate.
 
 ## How It Works
 
-1. **Rustc Frontend → MIR**  
-   The standard `rustc` compiler parses your code into Mid-level IR (MIR).
-2. **MIR → OOMIR**  
-   A custom "Object-Oriented MIR" layer simplifies MIR into OOP-style constructs (defined in `src/lower1.rs`).  
-3. **OOMIR Optimiser**  
-   Optimises OOMIR (defined in `src/optimise1.rs`) using:
-   - **Constant Folding**: Evaluates constant expressions at compile time.  
-   - **Constant Propagation**: Replaces variables with their constant values.  
-   - **Dead Code Elimination**: Removes unused execution paths.  
-   - **Algebraic Simplification**: Simplifies expressions using algebraic identities.
-4. **OOMIR → JVM Classfile**  
-   Translates OOMIR to `.class` files using `ristretto_classfile` (defined in `src/lower2.rs`).  
-5. **R8 Pass**  
-   Invokes `r8` to add stack map frames (required for JVM 8+), embed the runtime shim, and apply further Optimisation passes.
-6. **Link & Package**  
-   Uses `java-linker` to bundle `.class` files into a self-contained runnable `.jar` with an appropriate `META-INF/MANIFEST.MF`.
+```mermaid
+graph TD
+    A[Rust Source Code] -->|rustc frontend| B(MIR)
+    B -->|lower1| C(OOMIR)
+    C -->|optimise1| D(Optimised OOMIR)
+    D -->|lower2| E[JVM .class files]
+    E -->|java-linker| F[Executable .jar]
 
----
+    style A fill:#f9d0c4,stroke:#333,stroke-width:2px
+    style C fill:#d4e6f1,stroke:#333,stroke-width:2px
+    style F fill:#d5f5e3,stroke:#333,stroke-width:2px
+```
+
+1. **`rustc` frontend** parses and type-checks your code, lowering it to Mid-level IR (MIR).
+2. **lower1** generates a custom "Object-Oriented MIR" (OOMIR) by reshaping MIR into constructs closer to the JVM's object model.
+3. **optimise1** applies constant folding, constant propagation, dead code elimination, and algebraic simplification.
+4. **lower2** translates OOMIR into `.class` files via `ristretto_classfile`, including stack map frame generation.
+5. **java-linker** bundles the `.class` files with a small runtime shim into a self-contained, runnable `.jar` with an appropriate `META-INF/MANIFEST.MF`.
+
+## Interop Model
+
+Rust types map onto the JVM's class model directly, which is what makes interop feel native from both sides:
+
+| Rust construct | JVM representation |
+|---|---|
+| `struct` | A standard JVM class, with fields and methods generated 1:1 |
+| `enum` | An abstract parent class with an abstract `getVariantIdx`, and one concrete subclass per variant |
+| `union` | A JVM class over the union's shared memory layout |
+| `trait` | A Java interface - any type implementing the trait implements the interface |
+| `fn(A, B) -> R` | A generated single-method Java interface for that signature, with adapter classes for Rust function definitions |
+| `impl` methods (`self`, `&self`, `&mut self`) | Instance methods on the generated class |
+| `&dyn Trait` | The generated Java interface type, usable as a normal Java argument or return type |
+
+For supported constructs, there is no manual marshalling and no bindings layer to maintain, unlike JNI or Project Panama.
+
+The generated classfiles also carry extra metadata so that IDEs like IntelliJ IDEA offer autocomplete, tooltips, and refactoring support for Rust-defined types directly from Java.
+
+## Target Platforms
+
+Because output is standard JVM bytecode rather than a native binary, `rustc_codegen_jvm` targets environments where native compilation isn't practical or allowed:
+
+- **Any JVM 8+**, including older or constrained runtimes without modern FFI features.
+- **Android**, by routing the `.class` output through an external DEX conversion pipeline.
+- **Sandboxed or embedded JVM environments**, such as Minecraft mod loaders, where loading native libraries is restricted or undesirable.
 
 ## Prerequisites
 
-- **Rust Nightly** (`rustup default nightly`)  
-- **Gradle 8.5+** (`gradle` must be in system PATH)
-- **JDK 8+** (`java` must be in system PATH, with `JAVA_HOME` set)
-- **Python 3** (`python3` must be in system PATH)
-
----
+- **Rust Nightly** - `rustup default nightly`
+- **JDK 8+** - `java`, `javac`, and `jar` must be on `PATH`
+- **Python 3** - `python3` must be on `PATH`
 
 ## Installation & Build
 
-Clone the repository and build all components using the main build script:
+Clone the repository and build all components with the provided build script:
 
 ```bash
-# Clone the repository
 git clone https://github.com/IntegralPilot/rustc_codegen_jvm.git
 cd rustc_codegen_jvm
 
-# Build all components using Python
 # On Linux or macOS:
 ./build.py all
-
 # On Windows:
 python build.py all
 ```
 
-This script builds the necessary components in the correct dependency order:
+This builds the following, in dependency order:
+
 - The Java library shim (`library/`)
 - The shim metadata file (`core.json`)
 - The `java-linker` executable
 - The `rustc_codegen_jvm` backend library
 - Configuration files (`config.toml`, `jvm-unknown-unknown.json`)
-- Vendored dependencies (such as R8)
 
-Subsequent runs of `build.py` check file timestamps and will only rebuild modified components.
-
----
+`build.py` checks file timestamps on subsequent runs, so only modified components are rebuilt.
 
 ## Usage
 
-1. **Configure Your Project**  
-   In your target Rust project directory, create or update `.cargo/config.toml` by copying the generated template located in the root of this repository.
+1. **Configure your project**
+   In your target Rust project, create or update `.cargo/config.toml` using the template provided in the root of this repository. Your `Cargo.toml` must also enable per-profile compilation flags:
 
-   Ensure your `Cargo.toml` contains the following feature flag to support separate compilation configurations:
    ```toml
    cargo-features = ["profile-rustflags"]
    ```
 
-2. **Build with Cargo**  
+2. **Build with Cargo**
+
    ```bash
    cargo build           # Debug build
    cargo build --release # Optimised build
    ```
 
-3. **Run the JAR File**  
-   ```bash
-   java -jar target/debug/deps/your_crate*.jar   # Run debug build
-   java -jar target/release/deps/your_crate*.jar # Run release build
-   ```
+3. **Run the generated JAR**
 
----
+   ```bash
+   java -jar target/debug/deps/your_crate*.jar   # Debug build
+   java -jar target/release/deps/your_crate*.jar # Release build
+   ```
 
 ## Running Tests
 
-First, ensure the toolchain is built:
+Ensure the toolchain is built first:
 
 ```bash
 # On Linux/macOS:
 ./build.py all
-
 # On Windows:
 python build.py all
 ```
 
-Run the test suite with the test runner:
+Then run the test suite:
 
 ```bash
-# Run tests in debug mode
-python Tester.py
-
-# Run tests in release mode
-python Tester.py --release
+python Tester.py             # Debug mode
+python Tester.py --release   # Release mode
 ```
 
-Test results will output to the console. Temporary test artifacts are written to `.generated/` for debugging.
+Results are printed to the console, and temporary test artifacts are written to `.generated/` for inspection. The runner defaults to your local CPU core count; override it with `-j` / `--jobs`.
 
----
-
-## Project Structure
+## Project structure
 
 ```
 .
 ├── src/                      # rustc_codegen_jvm compiler backend
 │   ├── lib.rs
-│   ├── lower1.rs             # MIR → OOMIR conversion
-│   ├── lower2.rs             # OOMIR → JVM bytecode translation
+│   ├── lower1/               # MIR -> OOMIR conversion
+│   ├── optimise1/            # OOMIR optimiser
+│   ├── lower2/               # OOMIR -> JVM bytecode translation
 │   └── oomir.rs              # OOMIR data definitions
 ├── java-linker/              # Bundles compiled .class files into .jar archives
-├── tests/binary/             # Integration tests and source examples
+├── tests/binary/             # Integration tests and example source crates
 ├── library/                  # Java shim implementation for the Rust core library
 ├── shim-metadata-gen/        # Tool to generate core.json metadata
-├── proguard/                 # Proguard / R8 configuration rules
 ├── build.py                  # Orchestrator build script
-├── config.toml.template      # Configuration template for cargo projects
+├── config.toml.template      # Cargo configuration template
 ├── jvm-unknown-unknown.json.template
 ├── Tester.py                 # Automated test runner
 └── LICENSE, LICENSE-Apache
 ```
 
----
-
 ## Contributing
 
-Contributions, issues, and pull requests are welcome.
+Issues and pull requests are welcome and would be greatly appreciated!
 
----
+If you'd like to get involved but aren't sure where to start, open a thread on the [Discussions](https://github.com/IntegralPilot/rustc_codegen_jvm/discussions) page - I am happy to help scope out a task list. For larger changes, opening an issue first to discuss the approach is appreciated.
 
 ## License
 
-This project is dual-licensed under the **MIT License** and the **Apache License, Version 2.0** at your option:
-- <https://opensource.org/licenses/MIT>
-- <https://www.apache.org/licenses/LICENSE-2.0>
+This project is dual-licensed under your choice of:
+
+- **MIT License** - <https://opensource.org/licenses/MIT>
+- **Apache License, Version 2.0** - <https://www.apache.org/licenses/LICENSE-2.0>

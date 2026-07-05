@@ -21,6 +21,7 @@ mod consts;
 mod helpers;
 mod jvm_gen;
 mod shim;
+mod stackmaps;
 mod translator;
 
 pub const BIG_INTEGER_CLASS: &str = "java/math/BigInteger";
@@ -56,6 +57,10 @@ pub fn oomir_to_jvm_bytecode(
         let mut has_constructor = false;
 
         for function in functions {
+            let instrumented_fn_name = format!("{class_name_jvm}::{}", function.name);
+            let _timer =
+                crate::instrumentation::Timer::function("lower2", None, &instrumented_fn_name);
+
             // Don't create a default constructor if the OOMIR provided one
             if function.name == "<init>" {
                 has_constructor = true;
@@ -73,11 +78,29 @@ pub fn oomir_to_jvm_bytecode(
                 true,
                 None, // No owner class for free functions
             );
-            let (jvm_code, max_locals_val) = translator.translate()?;
+            let (jvm_code, max_locals_val, code_attributes) =
+                translator
+                    .translate()
+                    .map_err(|error| jvm::Error::VerificationError {
+                        context: format!("Function {class_name_jvm}::{}", function.name),
+                        message: format!("Failed to translate function: {error:?}"),
+                    })?;
 
-            let max_stack_val = jvm_code
-                .max_stack(&main_cp)?
-                .max(oomir_function_stack_floor(function));
+            let stack_floor = oomir_function_stack_floor(function);
+            let max_stack_val = match jvm_code.max_stack(&main_cp) {
+                Ok(max_stack) => max_stack.saturating_mul(2).max(stack_floor),
+                Err(error) => {
+                    breadcrumbs::log!(
+                        breadcrumbs::LogLevel::Warn,
+                        "bytecode-gen",
+                        format!(
+                            "Falling back to conservative max_stack for {}::{} after max_stack failed: {:?}",
+                            class_name_jvm, function.name, error
+                        )
+                    );
+                    stack_floor.max(1024)
+                }
+            };
 
             let code_attribute = Attribute::Code {
                 name_index: code_attribute_name_index,
@@ -85,7 +108,7 @@ pub fn oomir_to_jvm_bytecode(
                 max_locals: max_locals_val,
                 code: jvm_code,
                 exception_table: Vec::new(),
-                attributes: Vec::new(),
+                attributes: code_attributes,
             };
 
             // Create MethodParameters attribute to preserve parameter names
@@ -155,7 +178,12 @@ pub fn oomir_to_jvm_bytecode(
 
         // Serialize the main class file
         let mut byte_vector = Vec::new();
-        class_file.to_bytes(&mut byte_vector)?;
+        class_file
+            .to_bytes(&mut byte_vector)
+            .map_err(|error| jvm::Error::VerificationError {
+                context: format!("Class {class_name_jvm}"),
+                message: format!("Failed to serialize class file: {error:?}"),
+            })?;
         generated_classes.insert(class_name_jvm.clone(), byte_vector);
 
         breadcrumbs::log!(

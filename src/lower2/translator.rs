@@ -5,6 +5,7 @@ use super::{
         get_type_size, parse_jvm_descriptor_params,
     },
     shim::get_shim_metadata,
+    stackmaps,
 };
 use crate::oomir::{self, Type};
 
@@ -12,6 +13,7 @@ use ristretto_classfile::attributes::{ArrayType, Instruction};
 use ristretto_classfile::{self as jvm, ConstantPool};
 use std::collections::{HashMap, VecDeque};
 use std::convert::TryInto;
+use std::io::Cursor;
 
 use super::{BIG_DECIMAL_CLASS, BIG_INTEGER_CLASS};
 
@@ -29,6 +31,7 @@ pub struct FunctionTranslator<'a, 'cp> {
     // Store (instruction_index_to_patch, target_label) for fixups
     branch_fixups: Vec<(usize, String)>,
     current_oomir_block_label: String, // For error reporting maybe
+    initial_locals: Vec<stackmaps::FrameValue>,
 
     // For max_locals calculation - track highest index used + size
     max_locals_used: u16,
@@ -53,6 +56,11 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             label_to_instr_index: HashMap::new(),
             branch_fixups: Vec::new(),
             current_oomir_block_label: String::new(),
+            initial_locals: stackmaps::initial_locals_for_oomir_function(
+                oomir_func,
+                is_static,
+                owner_class_name,
+            ),
             max_locals_used: 0,
         };
 
@@ -273,7 +281,16 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
     }
 
     /// Translates the entire function body.
-    pub fn translate(mut self) -> Result<(Vec<jvm::attributes::Instruction>, u16), jvm::Error> {
+    pub fn translate(
+        mut self,
+    ) -> Result<
+        (
+            Vec<jvm::attributes::Instruction>,
+            u16,
+            Vec<jvm::attributes::Attribute>,
+        ),
+        jvm::Error,
+    > {
         // Use a worklist algorithm for potentially better handling of arbitrary CFGs
         let mut worklist: VecDeque<String> = VecDeque::new();
         let mut visited: HashMap<String, bool> = HashMap::new();
@@ -362,7 +379,8 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         }
 
         // --- Branch Fixup Pass ---
-        for (instr_index, target_label) in self.branch_fixups {
+        let branch_fixups = std::mem::take(&mut self.branch_fixups);
+        for (instr_index, target_label) in branch_fixups {
             let target_instr_index =
                 *self
                     .label_to_instr_index
@@ -405,7 +423,150 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             }
         }
 
-        Ok((self.jvm_instructions, self.max_locals_used))
+        for (instr_index, instruction) in self.jvm_instructions.iter_mut().enumerate() {
+            if matches!(instruction, Instruction::Goto(target) if usize::from(*target) == instr_index + 1)
+            {
+                *instruction = Instruction::Nop;
+            }
+        }
+        self.widen_branches()
+            .map_err(|error| jvm::Error::VerificationError {
+                context: format!("Function {}", self.oomir_func.name),
+                message: format!("Failed to widen branches: {error:?}"),
+            })?;
+
+        let local_hints = stackmaps::local_hints_for_oomir_locals(
+            &self.local_var_map,
+            &self.local_var_types,
+            self.max_locals_used,
+        );
+        let stack_map_attributes = stackmaps::build_stack_map_attributes(
+            &self.jvm_instructions,
+            &self.initial_locals,
+            &local_hints,
+            self.max_locals_used,
+            self.constant_pool,
+            &format!("Function {}", self.oomir_func.name),
+        )
+        .map_err(|error| jvm::Error::VerificationError {
+            context: format!("Function {}", self.oomir_func.name),
+            message: format!("Failed to build StackMapTable: {error:?}"),
+        })?;
+
+        Ok((
+            self.jvm_instructions,
+            self.max_locals_used,
+            stack_map_attributes,
+        ))
+    }
+
+    fn widen_branches(&mut self) -> Result<(), jvm::Error> {
+        loop {
+            let byte_offsets = instruction_byte_offsets(&self.jvm_instructions)?;
+            let mut changed = false;
+
+            for index in 0..self.jvm_instructions.len() {
+                if let Some(original_target) =
+                    conditional_branch_target(&self.jvm_instructions[index])
+                {
+                    if branch_offset_fits_i16(&byte_offsets, index, usize::from(original_target)) {
+                        continue;
+                    }
+
+                    let insert_at = index + 1;
+                    self.retarget_after_insert(insert_at)?;
+                    let adjusted_target = if usize::from(original_target) >= insert_at {
+                        original_target.checked_add(1).ok_or_else(|| {
+                            jvm::Error::VerificationError {
+                                context: format!("Function {}", self.oomir_func.name),
+                                message: "Conditional branch target overflow during widening"
+                                    .to_string(),
+                            }
+                        })?
+                    } else {
+                        original_target
+                    };
+                    let skip_wide_goto =
+                        u16::try_from(index + 2).map_err(|_| jvm::Error::VerificationError {
+                            context: format!("Function {}", self.oomir_func.name),
+                            message: "Conditional branch skip target overflow during widening"
+                                .to_string(),
+                        })?;
+
+                    self.jvm_instructions[index] =
+                        invert_conditional_branch(&self.jvm_instructions[index], skip_wide_goto)
+                            .ok_or_else(|| jvm::Error::VerificationError {
+                                context: format!("Function {}", self.oomir_func.name),
+                                message: "Expected conditional branch during widening".to_string(),
+                            })?;
+                    self.jvm_instructions
+                        .insert(insert_at, Instruction::Goto_w(i32::from(adjusted_target)));
+                    changed = true;
+                    break;
+                }
+
+                if let Instruction::Goto(target) = self.jvm_instructions[index]
+                    && !branch_offset_fits_i16(&byte_offsets, index, usize::from(target))
+                {
+                    self.jvm_instructions[index] = Instruction::Goto_w(i32::from(target));
+                    changed = true;
+                    break;
+                }
+            }
+
+            if !changed {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn retarget_after_insert(&mut self, insert_at: usize) -> Result<(), jvm::Error> {
+        let context = format!("Function {}", self.oomir_func.name);
+        for instruction in &mut self.jvm_instructions {
+            match instruction {
+                Instruction::Ifeq(target)
+                | Instruction::Ifne(target)
+                | Instruction::Iflt(target)
+                | Instruction::Ifge(target)
+                | Instruction::Ifgt(target)
+                | Instruction::Ifle(target)
+                | Instruction::If_icmpeq(target)
+                | Instruction::If_icmpne(target)
+                | Instruction::If_icmplt(target)
+                | Instruction::If_icmpge(target)
+                | Instruction::If_icmpgt(target)
+                | Instruction::If_icmple(target)
+                | Instruction::If_acmpeq(target)
+                | Instruction::If_acmpne(target)
+                | Instruction::Goto(target)
+                | Instruction::Ifnull(target)
+                | Instruction::Ifnonnull(target) => {
+                    bump_u16_branch_target(target, insert_at, &context)?;
+                }
+                Instruction::Goto_w(target) => {
+                    if *target >= insert_at as i32 {
+                        *target += 1;
+                    }
+                }
+                Instruction::Tableswitch {
+                    default, offsets, ..
+                } => {
+                    bump_i32_branch_target(default, insert_at);
+                    for target in offsets {
+                        bump_i32_branch_target(target, insert_at);
+                    }
+                }
+                Instruction::Lookupswitch { default, pairs } => {
+                    bump_i32_branch_target(default, insert_at);
+                    for target in pairs.values_mut() {
+                        bump_i32_branch_target(target, insert_at);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     /// Parses a variable name like "_1" into its numeric index, if applicable.
@@ -3045,5 +3206,132 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             context: format!("Function {}", self.oomir_func.name),
             message: format!("invokeinterface argument slot count {slots} exceeds u8 range"),
         })
+    }
+}
+
+fn conditional_branch_target(instruction: &Instruction) -> Option<u16> {
+    match instruction {
+        Instruction::Ifeq(target)
+        | Instruction::Ifne(target)
+        | Instruction::Iflt(target)
+        | Instruction::Ifge(target)
+        | Instruction::Ifgt(target)
+        | Instruction::Ifle(target)
+        | Instruction::If_icmpeq(target)
+        | Instruction::If_icmpne(target)
+        | Instruction::If_icmplt(target)
+        | Instruction::If_icmpge(target)
+        | Instruction::If_icmpgt(target)
+        | Instruction::If_icmple(target)
+        | Instruction::If_acmpeq(target)
+        | Instruction::If_acmpne(target)
+        | Instruction::Ifnull(target)
+        | Instruction::Ifnonnull(target) => Some(*target),
+        _ => None,
+    }
+}
+
+fn instruction_byte_offsets(instructions: &[Instruction]) -> Result<Vec<usize>, jvm::Error> {
+    let mut offsets = Vec::with_capacity(instructions.len() + 1);
+    let mut byte_offset = 0usize;
+    for instruction in instructions {
+        offsets.push(byte_offset);
+        byte_offset += instruction_size_at(instruction, byte_offset)?;
+    }
+    offsets.push(byte_offset);
+    Ok(offsets)
+}
+
+fn instruction_size_at(instruction: &Instruction, byte_offset: usize) -> Result<usize, jvm::Error> {
+    match instruction {
+        Instruction::Ifeq(_)
+        | Instruction::Ifne(_)
+        | Instruction::Iflt(_)
+        | Instruction::Ifge(_)
+        | Instruction::Ifgt(_)
+        | Instruction::Ifle(_)
+        | Instruction::If_icmpeq(_)
+        | Instruction::If_icmpne(_)
+        | Instruction::If_icmplt(_)
+        | Instruction::If_icmpge(_)
+        | Instruction::If_icmpgt(_)
+        | Instruction::If_icmple(_)
+        | Instruction::If_acmpeq(_)
+        | Instruction::If_acmpne(_)
+        | Instruction::Goto(_)
+        | Instruction::Jsr(_)
+        | Instruction::Ifnull(_)
+        | Instruction::Ifnonnull(_) => Ok(3),
+        Instruction::Goto_w(_) | Instruction::Jsr_w(_) => Ok(5),
+        Instruction::Tableswitch { offsets, .. } => {
+            let position_after_opcode = byte_offset + 1;
+            let padding = (4 - (position_after_opcode % 4)) % 4;
+            Ok(1 + padding + 12 + offsets.len() * 4)
+        }
+        Instruction::Lookupswitch { pairs, .. } => {
+            let position_after_opcode = byte_offset + 1;
+            let padding = (4 - (position_after_opcode % 4)) % 4;
+            Ok(1 + padding + 8 + pairs.len() * 8)
+        }
+        _ => {
+            let mut bytes = Cursor::new(Vec::new());
+            instruction.to_bytes(&mut bytes)?;
+            Ok(bytes.get_ref().len())
+        }
+    }
+}
+
+fn branch_offset_fits_i16(byte_offsets: &[usize], index: usize, target: usize) -> bool {
+    let Some(origin) = byte_offsets.get(index) else {
+        return false;
+    };
+    let Some(destination) = byte_offsets.get(target) else {
+        return false;
+    };
+    let offset = *destination as isize - *origin as isize;
+    i16::try_from(offset).is_ok()
+}
+
+fn invert_conditional_branch(instruction: &Instruction, target: u16) -> Option<Instruction> {
+    Some(match instruction {
+        Instruction::Ifeq(_) => Instruction::Ifne(target),
+        Instruction::Ifne(_) => Instruction::Ifeq(target),
+        Instruction::Iflt(_) => Instruction::Ifge(target),
+        Instruction::Ifge(_) => Instruction::Iflt(target),
+        Instruction::Ifgt(_) => Instruction::Ifle(target),
+        Instruction::Ifle(_) => Instruction::Ifgt(target),
+        Instruction::If_icmpeq(_) => Instruction::If_icmpne(target),
+        Instruction::If_icmpne(_) => Instruction::If_icmpeq(target),
+        Instruction::If_icmplt(_) => Instruction::If_icmpge(target),
+        Instruction::If_icmpge(_) => Instruction::If_icmplt(target),
+        Instruction::If_icmpgt(_) => Instruction::If_icmple(target),
+        Instruction::If_icmple(_) => Instruction::If_icmpgt(target),
+        Instruction::If_acmpeq(_) => Instruction::If_acmpne(target),
+        Instruction::If_acmpne(_) => Instruction::If_acmpeq(target),
+        Instruction::Ifnull(_) => Instruction::Ifnonnull(target),
+        Instruction::Ifnonnull(_) => Instruction::Ifnull(target),
+        _ => return None,
+    })
+}
+
+fn bump_u16_branch_target(
+    target: &mut u16,
+    insert_at: usize,
+    context: &str,
+) -> Result<(), jvm::Error> {
+    if usize::from(*target) >= insert_at {
+        *target = target
+            .checked_add(1)
+            .ok_or_else(|| jvm::Error::VerificationError {
+                context: context.to_string(),
+                message: "Branch target overflow while widening branches".to_string(),
+            })?;
+    }
+    Ok(())
+}
+
+fn bump_i32_branch_target(target: &mut i32, insert_at: usize) {
+    if *target >= insert_at as i32 {
+        *target += 1;
     }
 }

@@ -46,6 +46,12 @@ pub fn mir_to_oomir<'tcx>(
     let fn_name_data =
         fn_name_override.unwrap_or_else(|| naming::mono_fn_name_from_instance(tcx, instance));
     let fn_name = fn_name_data.method_name.clone();
+    let instrumented_fn_name = fn_name_data
+        .class_to_call_on
+        .as_deref()
+        .map(|owner| format!("{owner}::{fn_name}"))
+        .unwrap_or_else(|| fn_name.clone());
+    let _timer = crate::instrumentation::Timer::function("lower1", None, &instrumented_fn_name);
 
     // Extract function signature
     // Closures require special handling - we must use as_closure().sig() instead of fn_sig()

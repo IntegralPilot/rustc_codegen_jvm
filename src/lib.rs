@@ -40,6 +40,7 @@ use std::{any::Any, io::Write, path::Path};
 
 use misc::ToIdent;
 
+mod instrumentation;
 mod lower1;
 mod lower2;
 mod misc;
@@ -647,6 +648,7 @@ impl CodegenBackend for MyBackend {
         )> = Vec::new();
         let mut seen_fn_names: std::collections::HashSet<String> = std::collections::HashSet::new();
         use rustc_middle::ty::TypingEnv;
+        let lower1_timer = instrumentation::Timer::phase("lower1", Some(&crate_name));
 
         // Iterate through all items in the crate and find functions
         let module_items = tcx.hir_crate_items(());
@@ -1485,6 +1487,7 @@ impl CodegenBackend for MyBackend {
                 .data_types
                 .insert("RustcCodegenJVMIntrinsics".to_string(), intrinsic_class);
         }
+        drop(lower1_timer);
 
         breadcrumbs::log!(
             breadcrumbs::LogLevel::Info,
@@ -1495,7 +1498,9 @@ impl CodegenBackend for MyBackend {
             )
         );
 
+        let optimise1_timer = instrumentation::Timer::phase("optimise1", Some(&crate_name));
         let oomir_module = optimise1::optimise_module(oomir_module);
+        drop(optimise1_timer);
 
         breadcrumbs::log!(
             breadcrumbs::LogLevel::Info,
@@ -1520,7 +1525,9 @@ impl CodegenBackend for MyBackend {
                 crate_name
             )
         );
+        let lower2_timer = instrumentation::Timer::phase("lower2", Some(&crate_name));
         let bytecode = lower2::oomir_to_jvm_bytecode(&oomir_module, tcx).unwrap();
+        drop(lower2_timer);
         //let bytecode = vec![0; 1024];
         breadcrumbs::log!(
             breadcrumbs::LogLevel::Info,

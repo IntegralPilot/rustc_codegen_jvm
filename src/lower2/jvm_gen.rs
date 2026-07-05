@@ -4,6 +4,7 @@ use super::{
     FunctionTranslator,
     consts::{get_int_const_instr, load_constant},
     helpers::{get_load_instruction, get_type_size, oomir_function_stack_floor},
+    stackmaps,
 };
 use crate::oomir::{self, AdtHelperKind, DataTypeMethod, Signature, Type};
 
@@ -12,7 +13,53 @@ use ristretto_classfile::{
     MethodAccessFlags, Version,
     attributes::{Attribute, InnerClass, Instruction, MaxStack, NestedClassAccessFlags},
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+fn code_attribute_with_stack_maps(
+    cp: &mut ConstantPool,
+    max_stack: u16,
+    max_locals: u16,
+    code: Vec<Instruction>,
+    initial_locals: Vec<stackmaps::FrameValue>,
+    context: &str,
+) -> jvm::Result<Attribute> {
+    let name_index = cp.add_utf8("Code")?;
+    let attributes = stackmaps::build_stack_map_attributes(
+        &code,
+        &initial_locals,
+        &[],
+        max_locals,
+        cp,
+        context,
+    )?;
+    Ok(Attribute::Code {
+        name_index,
+        max_stack,
+        max_locals,
+        code,
+        exception_table: Vec::new(),
+        attributes,
+    })
+}
+
+fn code_attribute_for_descriptor(
+    cp: &mut ConstantPool,
+    max_stack: u16,
+    max_locals: u16,
+    code: Vec<Instruction>,
+    descriptor: &str,
+    is_static: bool,
+    this_class_name: Option<&str>,
+    method_name: &str,
+) -> jvm::Result<Attribute> {
+    let initial_locals = stackmaps::initial_locals_for_descriptor(
+        descriptor,
+        is_static,
+        this_class_name,
+        method_name == "<init>",
+    )?;
+    code_attribute_with_stack_maps(cp, max_stack, max_locals, code, initial_locals, method_name)
+}
 
 /// Creates a default constructor `<init>()V` that just calls `super()`.
 pub(super) fn create_default_constructor(
@@ -20,7 +67,6 @@ pub(super) fn create_default_constructor(
     cp: &mut ConstantPool,
     super_class_index: u16,
 ) -> jvm::Result<jvm::Method> {
-    let code_attr_name_index = cp.add_utf8("Code")?;
     let init_name_index = cp.add_utf8("<init>")?;
     let init_desc_index = cp.add_utf8("()V")?;
 
@@ -36,14 +82,16 @@ pub(super) fn create_default_constructor(
     let max_stack = 1;
     let max_locals = 1;
 
-    let code_attribute = Attribute::Code {
-        name_index: code_attr_name_index,
+    let code_attribute = code_attribute_for_descriptor(
+        cp,
         max_stack,
         max_locals,
-        code: instructions,
-        exception_table: Vec::new(),
-        attributes: Vec::new(),
-    };
+        instructions,
+        "()V",
+        false,
+        None,
+        "<init>",
+    )?;
 
     Ok(jvm::Method {
         access_flags: MethodAccessFlags::PUBLIC,
@@ -59,7 +107,6 @@ fn create_field_constructor(
     super_class_index: u16,
     fields: &[(String, Type)],
 ) -> jvm::Result<jvm::Method> {
-    let code_attr_name_index = cp.add_utf8("Code")?;
     let init_name_index = cp.add_utf8("<init>")?;
     let descriptor = format!(
         "({})V",
@@ -107,14 +154,16 @@ fn create_field_constructor(
         name_index: init_name_index,
         descriptor_index: init_desc_index,
         attributes: vec![
-            Attribute::Code {
-                name_index: code_attr_name_index,
-                max_stack: max_field_stack,
-                max_locals: next_local,
-                code: instructions,
-                exception_table: Vec::new(),
-                attributes: Vec::new(),
-            },
+            code_attribute_for_descriptor(
+                cp,
+                max_field_stack,
+                next_local,
+                instructions,
+                &descriptor,
+                false,
+                None,
+                "<init>",
+            )?,
             Attribute::MethodParameters {
                 name_index: method_parameters_attribute_name_index,
                 parameters,
@@ -149,7 +198,6 @@ fn create_static_instance_bridge(
         !function.signature.is_static && !function.signature.params.is_empty(),
         "static receiver bridges require the first signature parameter to be self"
     );
-    let code_attr_name_index = cp.add_utf8("Code")?;
     let name_index = cp.add_utf8(method_name)?;
 
     // OOMIR instance method signatures retain self as params[0], while the real
@@ -205,14 +253,16 @@ fn create_static_instance_bridge(
         name_index,
         descriptor_index,
         attributes: vec![
-            Attribute::Code {
-                name_index: code_attr_name_index,
-                max_stack: max_stack.max(return_stack),
-                max_locals: next_local,
-                code: instructions,
-                exception_table: Vec::new(),
-                attributes: Vec::new(),
-            },
+            code_attribute_for_descriptor(
+                cp,
+                max_stack.max(return_stack),
+                next_local,
+                instructions,
+                &bridge_descriptor,
+                true,
+                None,
+                method_name,
+            )?,
             Attribute::MethodParameters {
                 name_index: method_parameters_attribute_name_index,
                 parameters,
@@ -372,8 +422,12 @@ pub(super) fn create_data_type_classfile_for_class(
     let super_class_index = cp.add_class(super_class_name_jvm)?;
 
     // --- Process Implemented Interfaces ---
+    let mut seen_interfaces = HashSet::new();
     let mut interface_indices: Vec<u16> = Vec::with_capacity(implements_interfaces.len());
     for interface_name in &implements_interfaces {
+        if !seen_interfaces.insert(interface_name.as_str()) {
+            continue;
+        }
         // Add the interface name to the constant pool as a Class reference
         let interface_index = cp.add_class(interface_name)?;
         interface_indices.push(interface_index);
@@ -468,6 +522,10 @@ pub(super) fn create_data_type_classfile_for_class(
                 class_file.methods.push(jvm_method);
             }
             DataTypeMethod::Function(function) => {
+                let instrumented_fn_name = format!("{class_name_jvm}::{method_name}");
+                let _timer =
+                    crate::instrumentation::Timer::function("lower2", None, &instrumented_fn_name);
+
                 // Translate the function body using its own constant pool reference
                 let owner_class = if !function.signature.is_static {
                     Some(class_name_jvm)
@@ -481,11 +539,29 @@ pub(super) fn create_data_type_classfile_for_class(
                     function.signature.is_static,
                     owner_class,
                 );
-                let (jvm_code, max_locals_val) = translator.translate()?;
+                let (jvm_code, max_locals_val, code_attributes) =
+                    translator
+                        .translate()
+                        .map_err(|error| jvm::Error::VerificationError {
+                            context: format!("Function {class_name_jvm}::{method_name}"),
+                            message: format!("Failed to translate function: {error:?}"),
+                        })?;
 
-                let max_stack_val = jvm_code
-                    .max_stack(&class_file.constant_pool)?
-                    .max(oomir_function_stack_floor(function));
+                let stack_floor = oomir_function_stack_floor(function);
+                let max_stack_val = match jvm_code.max_stack(&class_file.constant_pool) {
+                    Ok(max_stack) => max_stack.saturating_mul(2).max(stack_floor),
+                    Err(error) => {
+                        breadcrumbs::log!(
+                            breadcrumbs::LogLevel::Warn,
+                            "bytecode-gen",
+                            format!(
+                                "Falling back to conservative max_stack for {}::{} after max_stack failed: {:?}",
+                                class_name_jvm, method_name, error
+                            )
+                        );
+                        stack_floor.max(1024)
+                    }
+                };
 
                 let code_attribute = Attribute::Code {
                     name_index: class_file.constant_pool.add_utf8("Code")?,
@@ -493,7 +569,7 @@ pub(super) fn create_data_type_classfile_for_class(
                     max_locals: max_locals_val,
                     code: jvm_code,
                     exception_table: Vec::new(),
-                    attributes: Vec::new(),
+                    attributes: code_attributes,
                 };
 
                 // Create MethodParameters attribute to preserve parameter names
@@ -607,14 +683,16 @@ pub(super) fn create_data_type_classfile_for_class(
                         let max_stack = 2u16;
                         let max_locals = 1u16;
 
-                        let code_attribute = Attribute::Code {
-                            name_index: class_file.constant_pool.add_utf8("Code")?,
+                        let code_attribute = code_attribute_for_descriptor(
+                            &mut class_file.constant_pool,
                             max_stack,
                             max_locals,
-                            code: instructions,
-                            exception_table: Vec::new(),
-                            attributes: Vec::new(),
-                        };
+                            instructions,
+                            method_desc,
+                            false,
+                            Some(class_name_jvm),
+                            method_name,
+                        )?;
 
                         jvm::Method {
                             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::FINAL,
@@ -705,14 +783,16 @@ pub(super) fn create_data_type_classfile_for_class(
                         let max_stack = 4u16;
                         let max_locals = 2u16;
 
-                        let code_attribute = Attribute::Code {
-                            name_index: class_file.constant_pool.add_utf8("Code")?,
+                        let code_attribute = code_attribute_for_descriptor(
+                            &mut class_file.constant_pool,
                             max_stack,
                             max_locals,
-                            code: instructions,
-                            exception_table: Vec::new(),
-                            attributes: Vec::new(),
-                        };
+                            instructions,
+                            &method_desc,
+                            false,
+                            Some(class_name_jvm),
+                            method_name,
+                        )?;
 
                         jvm::Method {
                             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::FINAL,
@@ -744,22 +824,27 @@ pub(super) fn create_data_type_classfile_for_class(
 
                         instructions.push(Instruction::Iconst_1);
                         instructions.push(Instruction::Ireturn);
-                        let false_target = instructions.len() as u16;
-                        instructions.push(Instruction::Iconst_0);
-                        instructions.push(Instruction::Ireturn);
 
-                        for fixup in false_fixups {
-                            patch_branch_target(&mut instructions, fixup, false_target);
+                        if !false_fixups.is_empty() {
+                            let false_target = instructions.len() as u16;
+                            instructions.push(Instruction::Iconst_0);
+                            instructions.push(Instruction::Ireturn);
+
+                            for fixup in false_fixups {
+                                patch_branch_target(&mut instructions, fixup, false_target);
+                            }
                         }
 
-                        let code_attribute = Attribute::Code {
-                            name_index: class_file.constant_pool.add_utf8("Code")?,
-                            max_stack: 4,
-                            max_locals: 2,
-                            code: instructions,
-                            exception_table: Vec::new(),
-                            attributes: Vec::new(),
-                        };
+                        let code_attribute = code_attribute_for_descriptor(
+                            &mut class_file.constant_pool,
+                            4,
+                            2,
+                            instructions,
+                            &method_desc,
+                            false,
+                            Some(class_name_jvm),
+                            method_name,
+                        )?;
 
                         jvm::Method {
                             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::FINAL,
@@ -846,7 +931,12 @@ pub(super) fn create_data_type_classfile_for_class(
 
     // --- Serialize ---
     let mut byte_vector = Vec::new();
-    class_file.to_bytes(&mut byte_vector)?;
+    class_file
+        .to_bytes(&mut byte_vector)
+        .map_err(|error| jvm::Error::VerificationError {
+            context: format!("Class {class_name_jvm}"),
+            message: format!("Failed to serialize class file: {error:?}"),
+        })?;
 
     Ok(byte_vector)
 }
@@ -931,7 +1021,12 @@ pub(super) fn create_data_type_classfile_for_interface(
 
     // --- Serialize ---
     let mut byte_vector = Vec::new();
-    class_file.to_bytes(&mut byte_vector)?;
+    class_file
+        .to_bytes(&mut byte_vector)
+        .map_err(|error| jvm::Error::VerificationError {
+            context: format!("Interface {interface_name_jvm}"),
+            message: format!("Failed to serialize class file: {error:?}"),
+        })?;
 
     Ok(byte_vector)
 }
@@ -970,7 +1065,7 @@ fn create_code_from_method_name_and_constant_return(
 
     instructions.push(return_instr);
 
-    let max_stack = 1;
+    let max_stack = get_type_size(&return_ty).max(1);
     let max_locals = 1;
 
     let code_attribute = Attribute::Code {

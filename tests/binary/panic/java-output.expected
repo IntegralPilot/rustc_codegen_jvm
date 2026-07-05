@@ -1,1 +1,1 @@
-STDOUT:STDERR:Exception in thread "main" java.lang.RuntimeException: Rust panic: This is a formatted panic message: 42	at org.rustlang.core.panicking.panic_fmt(SourceFile:11)	at panic.main(SourceFile)
+STDOUT:STDERR:Exception in thread "main" java.lang.RuntimeException: Rust panic: This is a formatted panic message: 42	at org.rustlang.core.panicking.panic_fmt(panicking.java:11)	at panic.main(panic.rs)

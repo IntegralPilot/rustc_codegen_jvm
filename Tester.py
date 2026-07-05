@@ -6,7 +6,19 @@ import argparse
 import glob
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-SHIM_JAR = os.path.join("library", "build", "libs", "library-0.1.0.jar")
+
+def resolve_jobs(requested_jobs: int | None) -> int:
+    if requested_jobs is None:
+        return os.cpu_count() or 1
+    if requested_jobs < 1:
+        raise ValueError("--jobs must be at least 1")
+    return requested_jobs
+
+
+def parallelism_description(jobs: int, requested_jobs: int | None) -> str:
+    if requested_jobs is None:
+        return f"{jobs} concurrent workers (auto; CPU core count; override with -j/--jobs)"
+    return f"{jobs} concurrent workers"
 
 
 def read_from_file(path: str) -> str:
@@ -42,49 +54,6 @@ def build_rust_code(test_dir: str, release_mode: bool, logs: list) -> tuple[bool
         output = f"STDOUT:\n{proc.stdout}\n\nSTDERR:\n{proc.stderr}"
         write_to_file(fail_path, output)
         logs.append(f"|---- ❌ cargo build exited with code {proc.returncode}")
-        
-        # Check if this is an R8 linking error (indicates invalid JVM bytecode)
-        error_output = proc.stdout + proc.stderr
-        if "R8" in error_output:
-            logs.append("|---- 🔍 Detected R8 error - attempting to run with -noverify for better diagnostics...")
-            test_name = os.path.basename(test_dir)
-            
-            # Try to run the main class with -noverify to get actual JVM error
-            deps_dir = os.path.join(test_dir, "target", target_dir, "deps")
-            if os.path.exists(deps_dir):
-                # Check if the main class file exists
-                main_class = os.path.join(deps_dir, f"{test_name}.class")
-                if os.path.exists(main_class):
-                    java_cp = f"{SHIM_JAR}{os.pathsep}{deps_dir}"
-                    verify_proc = run_command(
-                        ["java", "-noverify", "-cp", java_cp, test_name]
-                    )
-                    
-                    # Always write output if we got any
-                    verify_output = f"\n\n--- JVM OUTPUT WITH -noverify ---\n"
-                    verify_output += f"Command: java -noverify -cp {java_cp} {test_name}\n"
-                    verify_output += f"STDOUT:\n{verify_proc.stdout}\n\nSTDERR:\n{verify_proc.stderr}\n"
-                    verify_output += f"Return code: {verify_proc.returncode}\n"
-                    
-                    # Append to the fail file
-                    full_output = output + verify_output
-                    write_to_file(fail_path, full_output)
-                    logs.append("|---- 📝 JVM diagnostics written to cargo-build-fail.generated")
-                    
-                    # Show relevant error info
-                    if verify_proc.stderr:
-                        # Filter out the deprecation warning about -noverify
-                        error_lines = [line for line in verify_proc.stderr.split('\n') 
-                                     if '-noverify' not in line and '-Xverify:none' not in line and line.strip()]
-                        if error_lines:
-                            logs.append(f"|---- JVM error: {error_lines[0][:200]}")
-                    elif verify_proc.returncode != 0:
-                        logs.append(f"|---- JVM exited with code {verify_proc.returncode}")
-                else:
-                    logs.append(f"|---- ⚠️ Main class file not found: {main_class}")
-            else:
-                logs.append(f"|---- ⚠️ Deps directory not found: {deps_dir}")
-        
         return False, ""
 
     return True, target_dir
@@ -283,17 +252,21 @@ def main():
     parser.add_argument(
         "-j", "--jobs", 
         type=int, 
-        default=os.cpu_count(), 
-        help="Number of concurrent test executions (defaults to system CPU count)"
+        default=None,
+        help="Number of concurrent test executions (default: auto)"
     )
     args = parser.parse_args()
+    try:
+        jobs = resolve_jobs(args.jobs)
+    except ValueError as e:
+        parser.error(str(e))
 
     print("🧪 Tester for Rustc's JVM Codegen Backend started!")
     overall_success = True
 
     if args.release:
         print("|- ⚒️ Running in release mode")
-    print(f"|- 🧵 Using {args.jobs} concurrent workers")
+    print(f"|- 🧵 Using {parallelism_description(jobs, args.jobs)}")
     print(" ")
 
     # --- Gather and filter tests ---
@@ -328,7 +301,7 @@ def main():
     print(f"|- 📦 Running {len(tasks)} test(s) in parallel...")
     print(" ")
 
-    with ThreadPoolExecutor(max_workers=args.jobs) as executor:
+    with ThreadPoolExecutor(max_workers=jobs) as executor:
         futures = {
             executor.submit(run_single_test, test_dir, t_type, args.release): (test_dir, t_type)
             for test_dir, t_type in tasks

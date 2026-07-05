@@ -202,7 +202,7 @@ def investigate_test(test_name: str, release_mode: bool):
     if use_raw_classfiles and deps_dir is not None:
         classpath = os.pathsep.join([SHIM_JAR, deps_dir])
         print(f"|---- Using deps directory in classpath: {deps_dir}")
-        java_cmd = ["java", "-noverify", "-cp", classpath, test_name]
+        java_cmd = ["java", "-cp", classpath, test_name]
     else:
         classpath = jar_path
         java_cmd = ["java", "-cp", classpath, test_name]
