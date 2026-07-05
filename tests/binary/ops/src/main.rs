@@ -64,7 +64,22 @@ macro_rules! test_ops {
     };
 }
 
+#[inline(never)]
+fn sparse_switch(value: i32) -> i32 {
+    match value {
+        -1000 => 10,
+        0 => 20,
+        1000 => 30,
+        _ => 40,
+    }
+}
+
 fn main() {
+    assert!(sparse_switch(-1000) == 10, "sparse switch negative case");
+    assert!(sparse_switch(0) == 20, "sparse switch zero case");
+    assert!(sparse_switch(1000) == 30, "sparse switch positive case");
+    assert!(sparse_switch(7) == 40, "sparse switch default case");
+
     // u8 comparisons
     test_comparisons!(u8, 5u8, 5u8, 10u8, 2u8, 0u8, 0u8);
 

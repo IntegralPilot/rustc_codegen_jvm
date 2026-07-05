@@ -49,12 +49,20 @@ pub(super) fn optimise(
     // peepholes and local-slot reuse before StackMapTable generation.
     let instructions = fold_boolean_branch_materialization(instructions)?;
     let instructions = remove_redundant_instructions(instructions)?;
+    let instructions = thread_jump_targets(instructions)?;
+    let instructions = fold_branch_over_goto(instructions)?;
+    let instructions = remove_unreachable_instructions(instructions)?;
     let local_slot_map = allocate_local_slots(&instructions, max_locals, fixed_prefix_slots);
     let (instructions, _) = rewrite_locals(instructions, &local_slot_map);
     let instructions = rewrite_store_load_pairs(instructions);
+    let instructions = fold_iinc_patterns(instructions)?;
+    let instructions = fold_null_branch_comparisons(instructions)?;
     let instructions = fold_boolean_zero_comparisons(instructions)?;
     let instructions = fold_stack_boolean_zero_comparisons(instructions)?;
     let instructions = remove_dead_duplicate_stores(instructions)?;
+    let instructions = thread_jump_targets(instructions)?;
+    let instructions = fold_branch_over_goto(instructions)?;
+    let instructions = remove_unreachable_instructions(instructions)?;
     let instructions = remove_redundant_instructions(instructions)?;
     let max_locals = compute_max_locals(&instructions);
     let max_locals = max_locals.max(fixed_prefix_slots);
@@ -199,7 +207,7 @@ fn fold_boolean_branch_materialization(
 fn incoming_branch_sources(instructions: &[Instruction]) -> Vec<BTreeSet<usize>> {
     let mut incoming = vec![BTreeSet::new(); instructions.len()];
     for (source, instruction) in instructions.iter().enumerate() {
-        for target in branch_targets(instruction) {
+        for target in branch_targets(source, instruction) {
             if target >= 0
                 && let Some(target_incoming) = incoming.get_mut(target as usize)
             {
@@ -513,6 +521,177 @@ fn remove_redundant_instructions(instructions: Vec<Instruction>) -> jvm::Result<
     compact_instructions(instructions, &keep)
 }
 
+fn remove_unreachable_instructions(
+    instructions: Vec<Instruction>,
+) -> jvm::Result<Vec<Instruction>> {
+    if instructions.is_empty() {
+        return Ok(instructions);
+    }
+
+    let mut reachable = vec![false; instructions.len()];
+    let mut stack = vec![0usize];
+    while let Some(index) = stack.pop() {
+        if index >= instructions.len() || reachable[index] {
+            continue;
+        }
+
+        reachable[index] = true;
+        for successor in instruction_successors(index, &instructions[index], instructions.len()) {
+            if successor < instructions.len() && !reachable[successor] {
+                stack.push(successor);
+            }
+        }
+    }
+
+    if reachable.iter().all(|reachable| *reachable) {
+        return Ok(instructions);
+    }
+
+    compact_instructions(instructions, &reachable)
+}
+
+fn thread_jump_targets(mut instructions: Vec<Instruction>) -> jvm::Result<Vec<Instruction>> {
+    for index in 0..instructions.len() {
+        let replacement = match instructions[index].clone() {
+            Instruction::Ifeq(target) => {
+                Instruction::Ifeq(thread_u16_target(&instructions, target)?)
+            }
+            Instruction::Ifne(target) => {
+                Instruction::Ifne(thread_u16_target(&instructions, target)?)
+            }
+            Instruction::Iflt(target) => {
+                Instruction::Iflt(thread_u16_target(&instructions, target)?)
+            }
+            Instruction::Ifge(target) => {
+                Instruction::Ifge(thread_u16_target(&instructions, target)?)
+            }
+            Instruction::Ifgt(target) => {
+                Instruction::Ifgt(thread_u16_target(&instructions, target)?)
+            }
+            Instruction::Ifle(target) => {
+                Instruction::Ifle(thread_u16_target(&instructions, target)?)
+            }
+            Instruction::If_icmpeq(target) => {
+                Instruction::If_icmpeq(thread_u16_target(&instructions, target)?)
+            }
+            Instruction::If_icmpne(target) => {
+                Instruction::If_icmpne(thread_u16_target(&instructions, target)?)
+            }
+            Instruction::If_icmplt(target) => {
+                Instruction::If_icmplt(thread_u16_target(&instructions, target)?)
+            }
+            Instruction::If_icmpge(target) => {
+                Instruction::If_icmpge(thread_u16_target(&instructions, target)?)
+            }
+            Instruction::If_icmpgt(target) => {
+                Instruction::If_icmpgt(thread_u16_target(&instructions, target)?)
+            }
+            Instruction::If_icmple(target) => {
+                Instruction::If_icmple(thread_u16_target(&instructions, target)?)
+            }
+            Instruction::If_acmpeq(target) => {
+                Instruction::If_acmpeq(thread_u16_target(&instructions, target)?)
+            }
+            Instruction::If_acmpne(target) => {
+                Instruction::If_acmpne(thread_u16_target(&instructions, target)?)
+            }
+            Instruction::Goto(target) => {
+                Instruction::Goto(thread_u16_target(&instructions, target)?)
+            }
+            Instruction::Ifnull(target) => {
+                Instruction::Ifnull(thread_u16_target(&instructions, target)?)
+            }
+            Instruction::Ifnonnull(target) => {
+                Instruction::Ifnonnull(thread_u16_target(&instructions, target)?)
+            }
+            Instruction::Goto_w(target) => {
+                Instruction::Goto_w(thread_i32_target(&instructions, target)?)
+            }
+            Instruction::Tableswitch {
+                default,
+                low,
+                high,
+                mut offsets,
+            } => {
+                let default = thread_switch_target(&instructions, index, default)?;
+                for target in &mut offsets {
+                    *target = thread_switch_target(&instructions, index, *target)?;
+                }
+                Instruction::Tableswitch {
+                    default,
+                    low,
+                    high,
+                    offsets,
+                }
+            }
+            Instruction::Lookupswitch { default, mut pairs } => {
+                let default = thread_switch_target(&instructions, index, default)?;
+                for target in pairs.values_mut() {
+                    *target = thread_switch_target(&instructions, index, *target)?;
+                }
+                Instruction::Lookupswitch { default, pairs }
+            }
+            other => other,
+        };
+        instructions[index] = replacement;
+    }
+
+    Ok(instructions)
+}
+
+fn fold_branch_over_goto(mut instructions: Vec<Instruction>) -> jvm::Result<Vec<Instruction>> {
+    if instructions.len() < 3 {
+        return Ok(instructions);
+    }
+
+    let incoming = incoming_branch_sources(&instructions);
+    let mut keep = vec![true; instructions.len()];
+    let mut index = 0;
+
+    while index + 2 < instructions.len() {
+        if !keep[index] || !keep[index + 1] {
+            index += 1;
+            continue;
+        }
+
+        let Some(branch_target) = conditional_branch_target(&instructions[index]) else {
+            index += 1;
+            continue;
+        };
+        if usize::from(branch_target) != index + 2
+            || !incoming
+                .get(index + 1)
+                .is_some_and(|sources| sources.is_empty())
+        {
+            index += 1;
+            continue;
+        }
+
+        let Some(goto_target) = goto_target(&instructions[index + 1]) else {
+            index += 1;
+            continue;
+        };
+        if goto_target == index + 2 {
+            index += 1;
+            continue;
+        }
+        let Ok(goto_target) = u16::try_from(goto_target) else {
+            index += 1;
+            continue;
+        };
+
+        let Some(replacement) = invert_conditional_branch(&instructions[index], goto_target) else {
+            index += 1;
+            continue;
+        };
+        instructions[index] = replacement;
+        keep[index + 1] = false;
+        index += 2;
+    }
+
+    compact_instructions(instructions, &keep)
+}
+
 fn rewrite_store_load_pairs(mut instructions: Vec<Instruction>) -> Vec<Instruction> {
     if instructions.len() < 2 {
         return instructions;
@@ -545,6 +724,88 @@ fn rewrite_store_load_pairs(mut instructions: Vec<Instruction>) -> Vec<Instructi
     instructions
 }
 
+fn fold_iinc_patterns(mut instructions: Vec<Instruction>) -> jvm::Result<Vec<Instruction>> {
+    if instructions.len() < 4 {
+        return Ok(instructions);
+    }
+
+    let protected = protected_instruction_indices(&instructions);
+    let mut keep = vec![true; instructions.len()];
+    let mut index = 0;
+
+    while index + 3 < instructions.len() {
+        if !keep[index..=index + 3].iter().all(|keep| *keep)
+            || protected.contains(&(index + 1))
+            || protected.contains(&(index + 2))
+            || protected.contains(&(index + 3))
+        {
+            index += 1;
+            continue;
+        }
+
+        let Some((local, amount)) = iinc_pattern(&instructions, index) else {
+            index += 1;
+            continue;
+        };
+
+        instructions[index] = if amount == 0 {
+            Instruction::Nop
+        } else {
+            make_iinc(local, amount)
+        };
+        keep[index + 1] = false;
+        keep[index + 2] = false;
+        keep[index + 3] = false;
+        index += 4;
+    }
+
+    compact_instructions(instructions, &keep)
+}
+
+fn fold_null_branch_comparisons(
+    mut instructions: Vec<Instruction>,
+) -> jvm::Result<Vec<Instruction>> {
+    if instructions.len() < 3 {
+        return Ok(instructions);
+    }
+
+    let protected = protected_instruction_indices(&instructions);
+    let mut keep = vec![true; instructions.len()];
+    let mut index = 0;
+
+    while index + 2 < instructions.len() {
+        if !keep[index..=index + 2].iter().all(|keep| *keep) || protected.contains(&(index + 1)) {
+            index += 1;
+            continue;
+        }
+
+        let is_reference_load = matches!(
+            local_load(&instructions[index]),
+            Some((LocalKind::Reference, _))
+        );
+        if !is_reference_load || !matches!(instructions[index + 1], Instruction::Aconst_null) {
+            index += 1;
+            continue;
+        }
+
+        let replacement = match instructions[index + 2] {
+            Instruction::If_acmpeq(target) => Some(Instruction::Ifnull(target)),
+            Instruction::If_acmpne(target) => Some(Instruction::Ifnonnull(target)),
+            _ => None,
+        };
+        let Some(replacement) = replacement else {
+            index += 1;
+            continue;
+        };
+
+        instructions[index + 2] = replacement;
+        keep[index + 1] = false;
+        index += 3;
+    }
+
+    compact_instructions(instructions, &keep)
+}
+
 fn compute_max_locals(instructions: &[Instruction]) -> u16 {
     instructions
         .iter()
@@ -560,8 +821,8 @@ fn compute_max_locals(instructions: &[Instruction]) -> u16 {
 
 fn protected_instruction_indices(instructions: &[Instruction]) -> BTreeSet<usize> {
     let mut protected = BTreeSet::from([0usize]);
-    for instruction in instructions {
-        for target in branch_targets(instruction) {
+    for (index, instruction) in instructions.iter().enumerate() {
+        for target in branch_targets(index, instruction) {
             if target >= 0 {
                 protected.insert(target as usize);
             }
@@ -588,13 +849,24 @@ fn compact_instructions(
         if !keep[old_index] {
             continue;
         }
-        compacted.push(retarget_branches(instruction, &old_to_new)?);
+        let new_index = old_to_new[old_index].ok_or_else(|| jvm::Error::VerificationError {
+            context: "optimise2".to_string(),
+            message: format!("Kept instruction {old_index} has no compacted index"),
+        })?;
+        compacted.push(retarget_branches(
+            instruction,
+            old_index,
+            new_index,
+            &old_to_new,
+        )?);
     }
     Ok(compacted)
 }
 
 fn retarget_branches(
     instruction: Instruction,
+    old_index: usize,
+    new_index: usize,
     old_to_new: &[Option<usize>],
 ) -> jvm::Result<Instruction> {
     use Instruction as I;
@@ -624,6 +896,27 @@ fn retarget_branches(
                 message: format!("Removed or invalid branch target {target}"),
             })
     };
+    let map_switch_i32 = |target: i32| -> jvm::Result<i32> {
+        let absolute_target = old_index as i64 + i64::from(target);
+        if absolute_target < 0 {
+            return Err(jvm::Error::VerificationError {
+                context: "optimise2".to_string(),
+                message: format!("Invalid switch target {target} from instruction {old_index}"),
+            });
+        }
+        let absolute_target = absolute_target as usize;
+        let mapped = old_to_new
+            .get(absolute_target)
+            .and_then(|mapped| *mapped)
+            .ok_or_else(|| jvm::Error::VerificationError {
+                context: "optimise2".to_string(),
+                message: format!("Removed or invalid switch target {absolute_target}"),
+            })?;
+        i32::try_from(mapped as i64 - new_index as i64).map_err(|_| jvm::Error::VerificationError {
+            context: "optimise2".to_string(),
+            message: format!("Switch target delta overflow for target {absolute_target}"),
+        })
+    };
 
     Ok(match instruction {
         I::Ifeq(target) => I::Ifeq(map_u16(target)?),
@@ -652,9 +945,9 @@ fn retarget_branches(
             high,
             mut offsets,
         } => {
-            let default = map_i32(default)?;
+            let default = map_switch_i32(default)?;
             for target in &mut offsets {
-                *target = map_i32(*target)?;
+                *target = map_switch_i32(*target)?;
             }
             I::Tableswitch {
                 default,
@@ -664,9 +957,9 @@ fn retarget_branches(
             }
         }
         I::Lookupswitch { default, mut pairs } => {
-            let default = map_i32(default)?;
+            let default = map_switch_i32(default)?;
             for target in pairs.values_mut() {
-                *target = map_i32(*target)?;
+                *target = map_switch_i32(*target)?;
             }
             I::Lookupswitch { default, pairs }
         }
@@ -1107,6 +1400,121 @@ fn make_ret(index: u16) -> Instruction {
     }
 }
 
+fn iinc_pattern(instructions: &[Instruction], index: usize) -> Option<(u16, i16)> {
+    let Some((LocalKind::Int, stored)) = local_store(&instructions[index + 3]) else {
+        return None;
+    };
+
+    let (loaded, amount) = match instructions[index + 2] {
+        Instruction::Iadd => {
+            if let Some((LocalKind::Int, loaded)) = local_load(&instructions[index]) {
+                (loaded, int_constant(&instructions[index + 1])?)
+            } else if let Some((LocalKind::Int, loaded)) = local_load(&instructions[index + 1]) {
+                (loaded, int_constant(&instructions[index])?)
+            } else {
+                return None;
+            }
+        }
+        Instruction::Isub => {
+            let Some((LocalKind::Int, loaded)) = local_load(&instructions[index]) else {
+                return None;
+            };
+            let amount = int_constant(&instructions[index + 1])?.checked_neg()?;
+            (loaded, amount)
+        }
+        _ => return None,
+    };
+    if loaded.index != stored.index {
+        return None;
+    }
+
+    i16::try_from(amount)
+        .ok()
+        .map(|amount| (loaded.index, amount))
+}
+
+fn int_constant(instruction: &Instruction) -> Option<i32> {
+    Some(match instruction {
+        Instruction::Iconst_m1 => -1,
+        Instruction::Iconst_0 => 0,
+        Instruction::Iconst_1 => 1,
+        Instruction::Iconst_2 => 2,
+        Instruction::Iconst_3 => 3,
+        Instruction::Iconst_4 => 4,
+        Instruction::Iconst_5 => 5,
+        Instruction::Bipush(value) => i32::from(*value),
+        Instruction::Sipush(value) => i32::from(*value),
+        _ => return None,
+    })
+}
+
+fn goto_target(instruction: &Instruction) -> Option<usize> {
+    match instruction {
+        Instruction::Goto(target) => Some(usize::from(*target)),
+        Instruction::Goto_w(target) if *target >= 0 => Some(*target as usize),
+        _ => None,
+    }
+}
+
+fn thread_u16_target(instructions: &[Instruction], target: u16) -> jvm::Result<u16> {
+    let target = resolve_goto_chain(instructions, usize::from(target));
+    u16::try_from(target).map_err(|_| jvm::Error::VerificationError {
+        context: "optimise2".to_string(),
+        message: format!("Threaded branch target {target} exceeds u16 range"),
+    })
+}
+
+fn thread_i32_target(instructions: &[Instruction], target: i32) -> jvm::Result<i32> {
+    if target < 0 {
+        return Ok(target);
+    }
+
+    let target = resolve_goto_chain(instructions, target as usize);
+    i32::try_from(target).map_err(|_| jvm::Error::VerificationError {
+        context: "optimise2".to_string(),
+        message: format!("Threaded wide branch target {target} exceeds i32 range"),
+    })
+}
+
+fn thread_switch_target(
+    instructions: &[Instruction],
+    source_index: usize,
+    target: i32,
+) -> jvm::Result<i32> {
+    let absolute_target = source_index as i64 + i64::from(target);
+    if absolute_target < 0 {
+        return Err(jvm::Error::VerificationError {
+            context: "optimise2".to_string(),
+            message: format!("Invalid switch target {target} from instruction {source_index}"),
+        });
+    }
+
+    let threaded = resolve_goto_chain(instructions, absolute_target as usize);
+    i32::try_from(threaded as i64 - source_index as i64).map_err(|_| {
+        jvm::Error::VerificationError {
+            context: "optimise2".to_string(),
+            message: format!("Threaded switch target {threaded} exceeds i32 delta range"),
+        }
+    })
+}
+
+fn resolve_goto_chain(instructions: &[Instruction], target: usize) -> usize {
+    let mut current = target;
+    let mut seen = BTreeSet::new();
+
+    while seen.insert(current) {
+        let Some(next) = instructions.get(current).and_then(goto_target) else {
+            break;
+        };
+        if next == current {
+            break;
+        }
+        current = next;
+    }
+
+    current
+}
+
 fn local_reads(instruction: &Instruction) -> Vec<LocalRef> {
     let mut reads = Vec::new();
     if let Some((_, local)) = local_load(instruction) {
@@ -1377,24 +1785,28 @@ fn instruction_successors(
             default, offsets, ..
         } => {
             let mut successors = Vec::with_capacity(offsets.len() + 1);
-            if *default >= 0 {
-                successors.push(*default as usize);
+            let default = index as i32 + *default;
+            if default >= 0 {
+                successors.push(default as usize);
             }
             for target in offsets {
-                if *target >= 0 {
-                    successors.push(*target as usize);
+                let target = index as i32 + *target;
+                if target >= 0 {
+                    successors.push(target as usize);
                 }
             }
             successors
         }
         I::Lookupswitch { default, pairs } => {
             let mut successors = Vec::with_capacity(pairs.len() + 1);
-            if *default >= 0 {
-                successors.push(*default as usize);
+            let default = index as i32 + *default;
+            if default >= 0 {
+                successors.push(default as usize);
             }
             for target in pairs.values() {
-                if *target >= 0 {
-                    successors.push(*target as usize);
+                let target = index as i32 + *target;
+                if target >= 0 {
+                    successors.push(target as usize);
                 }
             }
             successors
@@ -1406,7 +1818,7 @@ fn instruction_successors(
     }
 }
 
-fn branch_targets(instruction: &Instruction) -> Vec<i32> {
+fn branch_targets(index: usize, instruction: &Instruction) -> Vec<i32> {
     use Instruction as I;
 
     match instruction {
@@ -1433,14 +1845,14 @@ fn branch_targets(instruction: &Instruction) -> Vec<i32> {
             default, offsets, ..
         } => {
             let mut targets = Vec::with_capacity(offsets.len() + 1);
-            targets.push(*default);
-            targets.extend(offsets.iter().copied());
+            targets.push(index as i32 + *default);
+            targets.extend(offsets.iter().map(|target| index as i32 + *target));
             targets
         }
         I::Lookupswitch { default, pairs } => {
             let mut targets = Vec::with_capacity(pairs.len() + 1);
-            targets.push(*default);
-            targets.extend(pairs.values().copied());
+            targets.push(index as i32 + *default);
+            targets.extend(pairs.values().map(|target| index as i32 + *target));
             targets
         }
         _ => Vec::new(),

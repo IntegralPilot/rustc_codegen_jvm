@@ -13,7 +13,7 @@ use crate::oomir::{self, Type};
 
 use ristretto_classfile::attributes::{ArrayType, Instruction};
 use ristretto_classfile::{self as jvm};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::TryInto;
 use std::io::Cursor;
 
@@ -32,11 +32,24 @@ pub struct FunctionTranslator<'a, 'cp> {
     label_to_instr_index: HashMap<String, u16>, // OOMIR label -> JVM instruction index
     // Store (instruction_index_to_patch, target_label) for fixups
     branch_fixups: Vec<(usize, String)>,
+    switch_fixups: Vec<SwitchFixup>,
     current_oomir_block_label: String, // For error reporting maybe
+    current_fallthrough_block_label: Option<String>,
     initial_locals: Vec<stackmaps::FrameValue>,
 
     // For max_locals calculation - track highest index used + size
     max_locals_used: u16,
+}
+
+struct SwitchFixup {
+    instruction_index: usize,
+    default_label: String,
+    kind: SwitchFixupKind,
+}
+
+enum SwitchFixupKind {
+    Table { target_labels: Vec<String> },
+    Lookup { target_labels: Vec<(i32, String)> },
 }
 
 impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
@@ -57,7 +70,9 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             jvm_instructions: Vec::new(),
             label_to_instr_index: HashMap::new(),
             branch_fixups: Vec::new(),
+            switch_fixups: Vec::new(),
             current_oomir_block_label: String::new(),
+            current_fallthrough_block_label: None,
             initial_locals: stackmaps::initial_locals_for_oomir_function(
                 oomir_func,
                 is_static,
@@ -151,6 +166,268 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         }
 
         translator
+    }
+
+    fn emit_integer_switch(
+        &mut self,
+        discr: &oomir::Operand,
+        discr_type: &Type,
+        targets: &[(oomir::Constant, String)],
+        otherwise: &str,
+    ) -> Result<bool, jvm::Error> {
+        if !is_jvm_switch_type(discr_type) || targets.len() < 3 {
+            return Ok(false);
+        }
+
+        let context = format!("Function {}", self.oomir_func.name);
+        let mut cases = BTreeMap::new();
+        for (constant_key, target_label) in targets {
+            let key = jvm_switch_key(discr_type, constant_key, &context)?;
+            if let Some(existing_target) = cases.insert(key, target_label.clone())
+                && existing_target != *target_label
+            {
+                return Err(jvm::Error::VerificationError {
+                    context,
+                    message: format!(
+                        "Switch has duplicate key {key} with targets {existing_target} and {target_label}"
+                    ),
+                });
+            }
+        }
+
+        if cases.len() < 3 {
+            return Ok(false);
+        }
+
+        let low = *cases.keys().next().expect("switch cases are non-empty");
+        let high = *cases
+            .keys()
+            .next_back()
+            .expect("switch cases are non-empty");
+        let span = i64::from(high) - i64::from(low) + 1;
+        let Ok(span) = usize::try_from(span) else {
+            return Ok(false);
+        };
+        let table_payload_bytes = 12usize.saturating_add(span.saturating_mul(4));
+        let lookup_payload_bytes = 8usize.saturating_add(cases.len().saturating_mul(8));
+        let use_table = table_payload_bytes <= lookup_payload_bytes;
+
+        self.load_operand(discr)?;
+        let instruction_index = self.jvm_instructions.len();
+        if use_table {
+            let default_label = otherwise.to_string();
+            let target_labels = (low..=high)
+                .map(|key| {
+                    cases
+                        .get(&key)
+                        .cloned()
+                        .unwrap_or_else(|| default_label.clone())
+                })
+                .collect::<Vec<_>>();
+            self.jvm_instructions.push(Instruction::Tableswitch {
+                default: 0,
+                low,
+                high,
+                offsets: vec![0; span],
+            });
+            self.switch_fixups.push(SwitchFixup {
+                instruction_index,
+                default_label,
+                kind: SwitchFixupKind::Table { target_labels },
+            });
+        } else {
+            let target_labels = cases.into_iter().collect::<Vec<_>>();
+            self.jvm_instructions.push(Instruction::Lookupswitch {
+                default: 0,
+                pairs: target_labels.iter().map(|(key, _)| (*key, 0)).collect(),
+            });
+            self.switch_fixups.push(SwitchFixup {
+                instruction_index,
+                default_label: otherwise.to_string(),
+                kind: SwitchFixupKind::Lookup { target_labels },
+            });
+        }
+
+        Ok(true)
+    }
+
+    fn emit_iinc_add(
+        &mut self,
+        dest: &str,
+        op1: &oomir::Operand,
+        op2: &oomir::Operand,
+    ) -> Result<bool, jvm::Error> {
+        if self.emit_iinc_update(dest, op1, op2, 1)? {
+            return Ok(true);
+        }
+        self.emit_iinc_update(dest, op2, op1, 1)
+    }
+
+    fn emit_iinc_sub(
+        &mut self,
+        dest: &str,
+        op1: &oomir::Operand,
+        op2: &oomir::Operand,
+    ) -> Result<bool, jvm::Error> {
+        self.emit_iinc_update(dest, op1, op2, -1)
+    }
+
+    fn emit_iinc_update(
+        &mut self,
+        dest: &str,
+        local_operand: &oomir::Operand,
+        amount_operand: &oomir::Operand,
+        amount_sign: i32,
+    ) -> Result<bool, jvm::Error> {
+        let oomir::Operand::Variable { name, ty } = local_operand else {
+            return Ok(false);
+        };
+        if name != dest || *ty != Type::I32 {
+            return Ok(false);
+        }
+
+        let Some(amount) = iinc_amount(amount_operand, amount_sign) else {
+            return Ok(false);
+        };
+        let Some(local_index) = self.local_var_map.get(dest).copied() else {
+            return Ok(false);
+        };
+
+        if amount != 0 {
+            self.jvm_instructions
+                .push(make_iinc_instruction(local_index, amount));
+        }
+        self.max_locals_used = self.max_locals_used.max(local_index + 1);
+        self.local_var_types.insert(dest.to_string(), Type::I32);
+        Ok(true)
+    }
+
+    fn apply_switch_fixup(&mut self, fixup: SwitchFixup) -> Result<(), jvm::Error> {
+        let default_target =
+            self.label_instruction_delta_i32(fixup.instruction_index, &fixup.default_label)?;
+        match fixup.kind {
+            SwitchFixupKind::Table { target_labels } => {
+                let patched_offsets = target_labels
+                    .iter()
+                    .map(|target_label| {
+                        self.label_instruction_delta_i32(fixup.instruction_index, target_label)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                match self.jvm_instructions.get_mut(fixup.instruction_index) {
+                    Some(Instruction::Tableswitch {
+                        default, offsets, ..
+                    }) if offsets.len() == patched_offsets.len() => {
+                        *default = default_target;
+                        *offsets = patched_offsets;
+                    }
+                    Some(_) => {
+                        return Err(jvm::Error::VerificationError {
+                            context: format!("Function {}", self.oomir_func.name),
+                            message: format!(
+                                "Switch fixup expected a tableswitch instruction at index {}",
+                                fixup.instruction_index
+                            ),
+                        });
+                    }
+                    None => {
+                        return Err(jvm::Error::VerificationError {
+                            context: format!("Function {}", self.oomir_func.name),
+                            message: format!(
+                                "Switch fixup index {} is out of bounds",
+                                fixup.instruction_index
+                            ),
+                        });
+                    }
+                }
+            }
+            SwitchFixupKind::Lookup { target_labels } => {
+                let patched_pairs = target_labels
+                    .into_iter()
+                    .map(|(key, target_label)| {
+                        self.label_instruction_delta_i32(fixup.instruction_index, &target_label)
+                            .map(|target| (key, target))
+                    })
+                    .collect::<Result<_, _>>()?;
+                match self.jvm_instructions.get_mut(fixup.instruction_index) {
+                    Some(Instruction::Lookupswitch { default, pairs }) => {
+                        *default = default_target;
+                        *pairs = patched_pairs;
+                    }
+                    Some(_) => {
+                        return Err(jvm::Error::VerificationError {
+                            context: format!("Function {}", self.oomir_func.name),
+                            message: format!(
+                                "Switch fixup expected a lookupswitch instruction at index {}",
+                                fixup.instruction_index
+                            ),
+                        });
+                    }
+                    None => {
+                        return Err(jvm::Error::VerificationError {
+                            context: format!("Function {}", self.oomir_func.name),
+                            message: format!(
+                                "Switch fixup index {} is out of bounds",
+                                fixup.instruction_index
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn label_instruction_delta_i32(
+        &self,
+        source_index: usize,
+        target_label: &str,
+    ) -> Result<i32, jvm::Error> {
+        let target_instr_index = *self.label_to_instr_index.get(target_label).ok_or_else(|| {
+            jvm::Error::VerificationError {
+                context: format!("Function {}", self.oomir_func.name),
+                message: format!("Switch target label not found: {target_label}"),
+            }
+        })?;
+        i32::try_from(i64::from(target_instr_index) - source_index as i64).map_err(|_| {
+            jvm::Error::VerificationError {
+                context: format!("Function {}", self.oomir_func.name),
+                message: format!(
+                    "Switch target delta from instruction {source_index} to label {target_label} overflowed"
+                ),
+            }
+        })
+    }
+
+    fn layout_block_order(&self) -> Result<Vec<String>, jvm::Error> {
+        let mut order = Vec::new();
+        let mut visited = HashSet::new();
+        let mut stack = vec![self.oomir_func.body.entry.clone()];
+
+        while let Some(block_label) = stack.pop() {
+            if !visited.insert(block_label.clone()) {
+                continue;
+            }
+
+            let block = self
+                .oomir_func
+                .body
+                .basic_blocks
+                .get(&block_label)
+                .ok_or_else(|| jvm::Error::VerificationError {
+                    context: format!("Function {}", self.oomir_func.name),
+                    message: format!("Basic block label not found: {block_label}"),
+                })?;
+
+            order.push(block_label);
+
+            for successor in layout_successors(block).into_iter().rev() {
+                if !visited.contains(&successor) {
+                    stack.push(successor);
+                }
+            }
+        }
+
+        Ok(order)
     }
 
     /// Assigns a local variable to a JVM slot, returning the index.
@@ -293,25 +570,23 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         ),
         jvm::Error,
     > {
-        // Use a worklist algorithm for potentially better handling of arbitrary CFGs
-        let mut worklist: VecDeque<String> = VecDeque::new();
-        let mut visited: HashMap<String, bool> = HashMap::new();
+        let block_order = self.layout_block_order()?;
 
-        worklist.push_back(self.oomir_func.body.entry.clone());
-        visited.insert(self.oomir_func.body.entry.clone(), true);
-
-        while let Some(block_label) = worklist.pop_front() {
+        for (block_order_index, block_label) in block_order.iter().enumerate() {
             let block = self
                 .oomir_func
                 .body
                 .basic_blocks
-                .get(&block_label)
+                .get(block_label)
                 .ok_or_else(|| jvm::Error::VerificationError {
                     context: format!("Function {}", self.oomir_func.name),
                     message: format!("Basic block label not found: {}", block_label),
                 })?;
 
             self.current_oomir_block_label = block_label.clone();
+            self.current_fallthrough_block_label = block_order
+                .get(block_order_index + 1)
+                .map(|label| label.to_string());
 
             // Record the start instruction index for this block label
             let start_instr_index = self.jvm_instructions.len().try_into().unwrap();
@@ -323,55 +598,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 self.translate_instruction(self.module, instr)?;
             }
 
-            // Add successor blocks to worklist if not visited
-            if let Some(last_instr) = block.instructions.last() {
-                match last_instr {
-                    oomir::Instruction::Jump { target } => {
-                        if visited.insert(target.clone(), true).is_none() {
-                            worklist.push_back(target.clone());
-                        }
-                    }
-                    oomir::Instruction::Branch {
-                        true_block,
-                        false_block,
-                        ..
-                    } => {
-                        if visited.insert(true_block.clone(), true).is_none() {
-                            worklist.push_back(true_block.clone());
-                        }
-                        if visited.insert(false_block.clone(), true).is_none() {
-                            worklist.push_back(false_block.clone());
-                        }
-                    }
-                    oomir::Instruction::Switch {
-                        targets, otherwise, ..
-                    } => {
-                        // Add all unique target labels from the switch cases
-                        for (_, target_label) in targets {
-                            if visited.insert(target_label.clone(), true).is_none() {
-                                worklist.push_back(target_label.clone());
-                            }
-                        }
-                        // Add the otherwise label
-                        if visited.insert(otherwise.clone(), true).is_none() {
-                            worklist.push_back(otherwise.clone());
-                        }
-                    }
-                    oomir::Instruction::Return { .. } => {
-                        // Terminal blocks have no successors to add
-                    }
-                    _ => {
-                        // Implicit fallthrough - This requires OOMIR blocks to be ordered or have explicit jumps.
-                        // Assuming explicit jumps for now. If fallthrough is possible, need block ordering info.
-                        // Find the next block label based on some ordering if necessary.
-                        // For simplicity here, we *require* terminal instructions (Jump, Branch, Return, Throw).
-                        // return Err(jvm::Error::VerificationError {
-                        //     context: format!("Function {}", self.oomir_func.name),
-                        //     message: format!("Basic block '{}' does not end with a terminal instruction", block_label),
-                        // });
-                    }
-                }
-            } else if self.oomir_func.body.basic_blocks.len() > 1 {
+            if block.instructions.is_empty() && self.oomir_func.body.basic_blocks.len() > 1 {
                 // Empty block needs explicit jump?
                 return Err(jvm::Error::VerificationError {
                     context: format!("Function {}", self.oomir_func.name),
@@ -379,6 +606,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 });
             }
         }
+        self.current_fallthrough_block_label = None;
 
         // --- Branch Fixup Pass ---
         let branch_fixups = std::mem::take(&mut self.branch_fixups);
@@ -423,6 +651,11 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     });
                 }
             }
+        }
+
+        let switch_fixups = std::mem::take(&mut self.switch_fixups);
+        for fixup in switch_fixups {
+            self.apply_switch_fixup(fixup)?;
         }
 
         for (instr_index, instruction) in self.jvm_instructions.iter_mut().enumerate() {
@@ -544,7 +777,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
 
     fn retarget_after_insert(&mut self, insert_at: usize) -> Result<(), jvm::Error> {
         let context = format!("Function {}", self.oomir_func.name);
-        for instruction in &mut self.jvm_instructions {
+        for (instruction_index, instruction) in self.jvm_instructions.iter_mut().enumerate() {
             match instruction {
                 Instruction::Ifeq(target)
                 | Instruction::Ifne(target)
@@ -573,15 +806,35 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 Instruction::Tableswitch {
                     default, offsets, ..
                 } => {
-                    bump_i32_branch_target(default, insert_at);
+                    bump_i32_relative_switch_target(
+                        default,
+                        instruction_index,
+                        insert_at,
+                        &context,
+                    )?;
                     for target in offsets {
-                        bump_i32_branch_target(target, insert_at);
+                        bump_i32_relative_switch_target(
+                            target,
+                            instruction_index,
+                            insert_at,
+                            &context,
+                        )?;
                     }
                 }
                 Instruction::Lookupswitch { default, pairs } => {
-                    bump_i32_branch_target(default, insert_at);
+                    bump_i32_relative_switch_target(
+                        default,
+                        instruction_index,
+                        insert_at,
+                        &context,
+                    )?;
                     for target in pairs.values_mut() {
-                        bump_i32_branch_target(target, insert_at);
+                        bump_i32_relative_switch_target(
+                            target,
+                            instruction_index,
+                            insert_at,
+                            &context,
+                        )?;
                     }
                 }
                 _ => {}
@@ -878,6 +1131,21 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         let (comparison_type, cast1_target, cast2_target) =
             self.determine_comparison_type(&op1_type, &op2_type)?;
 
+        if comparison_type.is_jvm_reference_type()
+            && matches!(comp_op, "eq" | "ne")
+            && (is_null_operand(op1) ^ is_null_operand(op2))
+        {
+            let value_operand = if is_null_operand(op1) { op2 } else { op1 };
+            self.load_operand(value_operand)?;
+            let branch_constructor: Box<dyn Fn(u16) -> Instruction> = match comp_op {
+                "eq" => Box::new(Instruction::Ifnull),
+                "ne" => Box::new(Instruction::Ifnonnull),
+                _ => unreachable!(),
+            };
+            self.materialize_boolean_from_branch(dest, branch_constructor)?;
+            return Ok(());
+        }
+
         // --- Load and Cast Operands ---
         self.load_operand(op1)?;
         if let Some(target_type) = cast1_target {
@@ -1030,7 +1298,16 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             }
         }
 
-        // --- Generate Branching Logic (unchanged from original) ---
+        self.materialize_boolean_from_branch(dest, branch_constructor)?;
+
+        Ok(())
+    }
+
+    fn materialize_boolean_from_branch<'branch>(
+        &mut self,
+        dest: &str,
+        branch_constructor: Box<dyn Fn(u16) -> Instruction + 'branch>,
+    ) -> Result<(), jvm::Error> {
         let instr_idx_if = self.jvm_instructions.len();
         let label_true = format!("_comparison_true_{}", instr_idx_if);
         let label_after = format!("_comparison_after_{}", instr_idx_if);
@@ -1076,6 +1353,10 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
 
         match instr {
             OI::Add { dest, op1, op2 } => {
+                if self.emit_iinc_add(dest, op1, op2)? {
+                    return Ok(());
+                }
+
                 let op1_type = get_operand_type(op1);
                 let op2_type = get_operand_type(op2); // Get type of op2 as well
 
@@ -1166,6 +1447,10 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 }
             }
             OI::Sub { dest, op1, op2 } => {
+                if self.emit_iinc_sub(dest, op1, op2)? {
+                    return Ok(());
+                }
+
                 let op1_type = get_operand_type(op1);
                 let op2_type = get_operand_type(op2);
 
@@ -1925,6 +2210,10 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
 
             // --- Control Flow ---
             OI::Jump { target } => {
+                if self.current_fallthrough_block_label.as_deref() == Some(target) {
+                    return Ok(());
+                }
+
                 let instr_index = self.jvm_instructions.len();
                 self.jvm_instructions.push(JI::Goto(0)); // Placeholder
                 self.branch_fixups.push((instr_index, target.clone()));
@@ -1937,17 +2226,33 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 // 1. Load the condition (must evaluate to int 0 or 1)
                 self.load_operand(condition)?;
 
-                // 2. Add conditional jump (if condition != 0, jump to true_block)
-                let instr_idx_ifne = self.jvm_instructions.len();
-                self.jvm_instructions.push(JI::Ifne(0)); // Placeholder (If Not Equal to zero)
-                self.branch_fixups
-                    .push((instr_idx_ifne, true_block.clone()));
+                match self.current_fallthrough_block_label.as_deref() {
+                    Some(fallthrough) if fallthrough == false_block => {
+                        let instr_idx_ifne = self.jvm_instructions.len();
+                        self.jvm_instructions.push(JI::Ifne(0));
+                        self.branch_fixups
+                            .push((instr_idx_ifne, true_block.clone()));
+                    }
+                    Some(fallthrough) if fallthrough == true_block => {
+                        let instr_idx_ifeq = self.jvm_instructions.len();
+                        self.jvm_instructions.push(JI::Ifeq(0));
+                        self.branch_fixups
+                            .push((instr_idx_ifeq, false_block.clone()));
+                    }
+                    _ => {
+                        // 2. Add conditional jump (if condition != 0, jump to true_block)
+                        let instr_idx_ifne = self.jvm_instructions.len();
+                        self.jvm_instructions.push(JI::Ifne(0));
+                        self.branch_fixups
+                            .push((instr_idx_ifne, true_block.clone()));
 
-                // 3. Add unconditional jump to false_block (this is the fallthrough if condition == 0)
-                let instr_idx_goto_false = self.jvm_instructions.len();
-                self.jvm_instructions.push(JI::Goto(0)); // Placeholder
-                self.branch_fixups
-                    .push((instr_idx_goto_false, false_block.clone()));
+                        // 3. Add unconditional jump to false_block.
+                        let instr_idx_goto_false = self.jvm_instructions.len();
+                        self.jvm_instructions.push(JI::Goto(0));
+                        self.branch_fixups
+                            .push((instr_idx_goto_false, false_block.clone()));
+                    }
+                }
             }
             OI::Switch {
                 discr,
@@ -1977,6 +2282,10 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                             discr_type
                         ),
                     });
+                }
+
+                if self.emit_integer_switch(discr, &discr_type, targets, otherwise)? {
+                    return Ok(());
                 }
 
                 // 1. Load the discriminant value onto the stack
@@ -3252,6 +3561,93 @@ fn conditional_branch_target(instruction: &Instruction) -> Option<u16> {
     }
 }
 
+fn layout_successors(block: &oomir::BasicBlock) -> Vec<String> {
+    let mut successors = Vec::new();
+    let mut seen = HashSet::new();
+    let mut push_unique = |target: &String| {
+        if seen.insert(target.clone()) {
+            successors.push(target.clone());
+        }
+    };
+
+    match block.instructions.last() {
+        Some(oomir::Instruction::Jump { target }) => push_unique(target),
+        Some(oomir::Instruction::Branch {
+            true_block,
+            false_block,
+            ..
+        }) => {
+            push_unique(false_block);
+            push_unique(true_block);
+        }
+        Some(oomir::Instruction::Switch {
+            targets, otherwise, ..
+        }) => {
+            push_unique(otherwise);
+            for (_, target) in targets {
+                push_unique(target);
+            }
+        }
+        _ => {}
+    }
+
+    successors
+}
+
+fn is_null_operand(operand: &oomir::Operand) -> bool {
+    matches!(operand, oomir::Operand::Constant(oomir::Constant::Null(_)))
+}
+
+fn iinc_amount(operand: &oomir::Operand, sign: i32) -> Option<i16> {
+    let oomir::Operand::Constant(constant) = operand else {
+        return None;
+    };
+    let amount = match constant {
+        oomir::Constant::I8(value) => i32::from(*value),
+        oomir::Constant::I16(value) => i32::from(*value),
+        oomir::Constant::I32(value) => *value,
+        _ => return None,
+    };
+    amount
+        .checked_mul(sign)
+        .and_then(|amount| i16::try_from(amount).ok())
+}
+
+fn make_iinc_instruction(index: u16, amount: i16) -> Instruction {
+    if index <= u16::from(u8::MAX) && amount >= i16::from(i8::MIN) && amount <= i16::from(i8::MAX) {
+        Instruction::Iinc(index as u8, amount as i8)
+    } else {
+        Instruction::Iinc_w(index, amount)
+    }
+}
+
+fn is_jvm_switch_type(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::I8 | Type::I16 | Type::I32 | Type::Boolean | Type::Char
+    )
+}
+
+fn jvm_switch_key(
+    discr_type: &Type,
+    constant_key: &oomir::Constant,
+    context: &str,
+) -> Result<i32, jvm::Error> {
+    match (discr_type, constant_key) {
+        (Type::I8, oomir::Constant::I8(value)) => Ok(i32::from(*value)),
+        (Type::I16, oomir::Constant::I16(value)) => Ok(i32::from(*value)),
+        (Type::I32, oomir::Constant::I32(value)) => Ok(*value),
+        (Type::Boolean, oomir::Constant::Boolean(value)) => Ok(i32::from(*value)),
+        (Type::Char, oomir::Constant::Char(value)) => Ok(*value as i32),
+        _ => Err(jvm::Error::VerificationError {
+            context: context.to_string(),
+            message: format!(
+                "Type mismatch in OOMIR Switch: Discriminant type is {discr_type:?}, but case key is {constant_key:?}"
+            ),
+        }),
+    }
+}
+
 fn instruction_byte_offsets(instructions: &[Instruction]) -> Result<Vec<usize>, jvm::Error> {
     let mut offsets = Vec::with_capacity(instructions.len() + 1);
     let mut byte_offset = 0usize;
@@ -3351,8 +3747,35 @@ fn bump_u16_branch_target(
     Ok(())
 }
 
-fn bump_i32_branch_target(target: &mut i32, insert_at: usize) {
-    if *target >= insert_at as i32 {
-        *target += 1;
+fn bump_i32_relative_switch_target(
+    target: &mut i32,
+    source_index: usize,
+    insert_at: usize,
+    context: &str,
+) -> Result<(), jvm::Error> {
+    let absolute_target = source_index as i64 + i64::from(*target);
+    if absolute_target < 0 {
+        return Err(jvm::Error::VerificationError {
+            context: context.to_string(),
+            message: format!(
+                "Invalid relative switch target {} from instruction {}",
+                *target, source_index
+            ),
+        });
     }
+
+    let adjusted_source = source_index as i64 + if source_index >= insert_at { 1 } else { 0 };
+    let adjusted_target = absolute_target
+        + if absolute_target >= insert_at as i64 {
+            1
+        } else {
+            0
+        };
+    *target = i32::try_from(adjusted_target - adjusted_source).map_err(|_| {
+        jvm::Error::VerificationError {
+            context: context.to_string(),
+            message: "Switch target overflow while widening branches".to_string(),
+        }
+    })?;
+    Ok(())
 }

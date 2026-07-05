@@ -814,18 +814,30 @@ fn transfer_instruction(
         } => {
             state.pop(context, instruction_index)?;
             let mut successors = Vec::with_capacity(offsets.len() + 1);
-            successors.push((*default as usize, state.clone()));
+            successors.push((
+                relative_switch_target(instruction_index, *default, context)?,
+                state.clone(),
+            ));
             for target in offsets {
-                successors.push((*target as usize, state.clone()));
+                successors.push((
+                    relative_switch_target(instruction_index, *target, context)?,
+                    state.clone(),
+                ));
             }
             return Ok(successors);
         }
         I::Lookupswitch { default, pairs } => {
             state.pop(context, instruction_index)?;
             let mut successors = Vec::with_capacity(pairs.len() + 1);
-            successors.push((*default as usize, state.clone()));
+            successors.push((
+                relative_switch_target(instruction_index, *default, context)?,
+                state.clone(),
+            ));
             for target in pairs.values() {
-                successors.push((*target as usize, state.clone()));
+                successors.push((
+                    relative_switch_target(instruction_index, *target, context)?,
+                    state.clone(),
+                ));
             }
             return Ok(successors);
         }
@@ -1260,24 +1272,24 @@ fn instruction_successors(
             default, offsets, ..
         } => {
             let mut successors = Vec::with_capacity(offsets.len() + 1);
-            if *default >= 0 {
-                successors.push(*default as usize);
+            if let Some(default) = relative_switch_target_opt(index, *default) {
+                successors.push(default);
             }
             for target in offsets {
-                if *target >= 0 {
-                    successors.push(*target as usize);
+                if let Some(target) = relative_switch_target_opt(index, *target) {
+                    successors.push(target);
                 }
             }
             successors
         }
         I::Lookupswitch { default, pairs } => {
             let mut successors = Vec::with_capacity(pairs.len() + 1);
-            if *default >= 0 {
-                successors.push(*default as usize);
+            if let Some(default) = relative_switch_target_opt(index, *default) {
+                successors.push(default);
             }
             for target in pairs.values() {
-                if *target >= 0 {
-                    successors.push(*target as usize);
+                if let Some(target) = relative_switch_target_opt(index, *target) {
+                    successors.push(target);
                 }
             }
             successors
@@ -1353,9 +1365,29 @@ fn local_defs(instruction: &Instruction) -> Vec<(u16, usize)> {
     }
 }
 
+fn relative_switch_target(
+    instruction_index: usize,
+    offset: i32,
+    context: &str,
+) -> jvm::Result<usize> {
+    relative_switch_target_opt(instruction_index, offset).ok_or_else(|| {
+        jvm::Error::VerificationError {
+            context: context.to_string(),
+            message: format!(
+                "Invalid switch target offset {offset} at instruction {instruction_index}"
+            ),
+        }
+    })
+}
+
+fn relative_switch_target_opt(instruction_index: usize, offset: i32) -> Option<usize> {
+    let target = instruction_index as i64 + i64::from(offset);
+    (target >= 0).then_some(target as usize)
+}
+
 fn branch_targets(instructions: &[Instruction]) -> BTreeSet<u16> {
     let mut targets = BTreeSet::new();
-    for instruction in instructions {
+    for (instruction_index, instruction) in instructions.iter().enumerate() {
         match instruction {
             Instruction::Ifeq(target)
             | Instruction::Ifne(target)
@@ -1384,22 +1416,22 @@ fn branch_targets(instructions: &[Instruction]) -> BTreeSet<u16> {
             Instruction::Tableswitch {
                 default, offsets, ..
             } => {
-                if *default >= 0 {
-                    targets.insert(*default as u16);
+                if let Some(default) = relative_switch_target_opt(instruction_index, *default) {
+                    targets.insert(default as u16);
                 }
                 for offset in offsets {
-                    if *offset >= 0 {
-                        targets.insert(*offset as u16);
+                    if let Some(target) = relative_switch_target_opt(instruction_index, *offset) {
+                        targets.insert(target as u16);
                     }
                 }
             }
             Instruction::Lookupswitch { default, pairs } => {
-                if *default >= 0 {
-                    targets.insert(*default as u16);
+                if let Some(default) = relative_switch_target_opt(instruction_index, *default) {
+                    targets.insert(default as u16);
                 }
                 for offset in pairs.values() {
-                    if *offset >= 0 {
-                        targets.insert(*offset as u16);
+                    if let Some(target) = relative_switch_target_opt(instruction_index, *offset) {
+                        targets.insert(target as u16);
                     }
                 }
             }
