@@ -6,22 +6,30 @@
 [![CI](https://github.com/IntegralPilot/rustc_codegen_jvm/actions/workflows/ci.yml/badge.svg)](https://github.com/IntegralPilot/rustc_codegen_jvm/actions)
 [![Rust: Nightly](https://img.shields.io/badge/Rust-Nightly-orange.svg)](https://rustup.rs/)
 
-Compile your Rust code into a self-contained, runnable `.jar` compatible with JVM 8+. By transparently mapping Rust constructs onto Java classes and interfaces, this backend bridges the safety and ergonomics of Rust with the reach of the JVM.
+Compile your Rust code into a self-contained, runnable `.jar` compatible with JVM 8+. This backend transparently compiles Rust constructs to Java classes and interfaces, enabling rich interop between JVM and Rust code at a level mostly unreachable by FFI solutions. 
 
-### Why use this?
+Looking ahead, it is envisioned that with further work this backend could benefit any Rust project, not just those requiring JVM integration. In future, by leveraging this backend and the JVM's robust debugging tools and hot-swapping capabilities, Rust developers could iterate quickly during local development to avoid the compile-time bottlenecks of the native toolchain, before compiling to a native binary for release.
 
-- **Fast iteration**
-  - Fresh compilation for most small test crates takes **under 1 second**, making the backend practical for rapid experimentation compared to native compilation. Due to the rich hot reload and debugging ecosystem of the JVM, my vision is that this project can in future make rapidly iterating on Rust code (which is a known drawback of Rust) fast and enjoyable.
-- **Interop without the boilerplate**
-  - Rust enums, generics, function pointers, unions and other supported constructs map directly onto JVM classes and interfaces (see [Interop Model](#interop-model)). Because of this, `rustc_codegen_jvm` can achieve a level of ergonomic interop with Java that comparable native solutions can't. For example, a Java class can implement a Rust trait and be passed directly into Rust code as a `&dyn Trait` object and no bindings layer is required.
-- **Run anywhere a JVM runs**
-   - Because the output is standard bytecode rather than a native binary, your Rust code can target environments where native FFI is difficult or unavailable, including **sandboxed environments like Minecraft mod loaders** and **Android** (if you convert to DEX files).
-- **Sandboxed by construction**
-   - Native code loaded via JNI can crash the entire JVM on a bad memory access. Rust compiled to JVM bytecode is checked by the JVM's own bytecode verifier, so those failures stay within the managed runtime. Future visions for the project include it being able to help you leverage the JVM's safety to debug undefined behaviour, like [Miri](https://github.com/rust-lang/miri/) but faster because of the JVM's JIT.
+It should be noted that this project is still in early development, but is supporting more of the Rust language as time goes on! The eventual goal is a potential upstreaming with main `rustc`, though that is definently a while away!
+
+**I am so grateful for any stars and support!**
+
+## Why use this?
+
+### Interop is deeper and more ergonomic than FFI or bridge solutions
+
+Rust enums, generics, function pointers, unions and other supported constructs map directly onto JVM classes and interfaces (see [Interop Model](#interop-model)). Because of this, `rustc_codegen_jvm` can achieve a level of ergonomic interop with Java that comparable native solutions can't easily. For example, you can make a Java class that implements a Rust trait and pass it as a `&dyn Trait` object to Rust functions, because traits just become normal Java interfaces, where this would be (to my knowledge) quite hard, with bridge and FFI solutions.
+
+### It's fast for debugging, a known problem with native Rust
+
+Fresh compilation for most small test crates takes **under 1 second**, making the backend practical for rapid experimentation compared to native compilation. Due to the rich hot reload and debugging ecosystem of the JVM, my vision is that this project can in future make rapidly iterating on Rust code (which is a known drawback of Rust) fast and enjoyable. Though there is still lots of work to be done on both making this compiler faster, and making it easy for Rust code to tap into that ecosystem!
+
+### Code runs anywhere a JVM runs
+
+Because the output is standard bytecode rather than a native binary, your Rust code can target environments where native FFI solutions like Panama are difficult or unavailable, including **sandboxed environments like Minecraft mod loaders** and **Android** (if you convert to DEX files).
+
+Future visions for the project include it being able to help you leverage the JVM's safety to debug undefined behaviour, like [Miri](https://github.com/rust-lang/miri/) but faster because of the JVM's JIT.
  
-It should be noted that this project is still in early development, but is supporting more of the Rust language as time goes on! The eventual goal is a potential upstreaming with main `rustc`.
-
-I am so grateful for any stars and support!
 
 ## Table of Contents
 1. [Demos](#demos)
@@ -56,32 +64,20 @@ These examples live in `tests/binary`, are compiled to JVM bytecode, and are ver
 ## Features
 
 ### Compiler optimisations
-- **Constant folding & propagation**
-  - Evaluates constant expressions and known values at compile time.
-- **Dead code elimination**
-  - Strips unreachable paths for clean, efficient bytecode.
-- **Algebraic simplification**
-  - Reduces expressions using algebraic identities.
+- **Constant folding & propagation** evaluating constant expressions and known values at compile time.
+- **Dead code elimination** stripping unreachable paths for clean & efficient bytecode.
+- **Algebraic simplification** reducing expressions using algebraic identities.
 
 ### Rust Language Support
-- **Control flow**
-  - `if`/`else`, `match`, `for`, `while`, and `loop`.
-- **Data structures**
-  - arrays, slices, structs, tuples, and enums (both C-like and Rust-style).
-- **Functions & closures**
-  - calls, recursion, function pointers (as values, parameters, return types, and in generics), and closure capture.
-- **OOP constructs**
-  - `impl` blocks for ADTs, including `self`, `&self`, and `&mut self`.
-- **Traits**
-  - dynamic dispatch via `&dyn Trait`.
-- **Memory management**
-  - mutable borrowing, references, and dereferencing.
-- **Unions**
-  - supported for primitive types (`bool`, `i8`–`f64`) and structs composed of them.
-- **Output**
-  - executable, self-contained `.jar` generation for binary crates.
-- **Testing**
-  - integration coverage across debug and release modes for all of the above.
+- **Control flow:** `if`/`else`, `match`, `for`, `while`, and `loop`.
+- **Data structures** including arrays, slices, structs, tuples, and enums (both C-like and Rust-style).
+- **Functions & closures:** calls, recursion, function pointers (as values, parameters, return types, and in generics), and closure capture.
+- **OOP constructs** such as `impl` blocks for ADTs, including `self`, `&self`, and `&mut self`.
+- **Traits** and dynamic dispatch via `&dyn Trait`.
+- **Memory management,** currently mutable borrowing, references, and dereferencing, with more complex stuff currently WIP!
+- **Unions** are supported for primitive types (`bool`, `i8`–`f64`) and structs composed of them.
+- **Outputs** executable, self-contained `.jar` generation for binary crates.
+- **Testing** with integration coverage across debug and release modes for all of the above.
 
 **Current milestone:** full support for the Rust `core` crate.
 
