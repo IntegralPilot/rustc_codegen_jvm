@@ -836,6 +836,9 @@ pub fn convert_basic_block<'tcx>(
                     rustc_middle::mir::AssertKind::NullPointerDereference => {
                         "NullPointerDereference".to_string()
                     }
+                    rustc_middle::mir::AssertKind::NullReferenceConstructed => {
+                        "NullReferenceConstructed".to_string()
+                    }
                     rustc_middle::mir::AssertKind::ResumedAfterDrop(_) => {
                         "ResumedAfterDrop".to_string()
                     }
