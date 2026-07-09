@@ -1,35 +1,273 @@
 use rustc_abi::{FieldIdx, FieldsShape, Size, TagEncoding, VariantIdx, Variants};
-use rustc_middle::mir::interpret::{AllocRange, GlobalAlloc, Provenance, Scalar};
+use rustc_middle::mir::interpret::{
+    AllocRange, Allocation, CtfeProvenance, GlobalAlloc, Pointer, Provenance, Scalar,
+};
 use rustc_middle::ty::layout::TyAndLayout;
-use rustc_middle::ty::{AdtDef, GenericArgsRef, Instance, Ty, TyCtxt, TyKind, TypingEnv};
+use rustc_middle::ty::{
+    AdtDef, FloatTy, GenericArgsRef, Instance, IntTy, PseudoCanonicalInput, ScalarInt, Ty, TyCtxt,
+    TyKind, TypingEnv, UintTy, util::IntTypeExt,
+};
 use std::collections::HashMap;
 
-use super::{
-    super::{
-        place::make_jvm_safe,
-        ty_to_oomir_type,
-        types::{generate_adt_jvm_class_name, generate_tuple_jvm_class_name},
-    },
-    scalar_int_to_oomir_constant,
+use super::super::{
+    place::make_jvm_safe,
+    ty_to_oomir_type,
+    types::{generate_adt_jvm_class_name, generate_tuple_jvm_class_name},
 };
+use super::float::f128_to_string;
 use crate::oomir::{self, DataTypeMethod};
 
-// Named "experimental" as it provides a new experimental (and not fully complete for every type) constant resolution engine to replace the overly hardcoded one in operand.rs
-// Slowly, operations are being switched over to this new engine.
-// Currently the engine is used for handling of ADTs and pointers to scalars.
+type ConstAllocation = Allocation<CtfeProvenance>;
+
+pub fn read_scalar_int_constant<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    scalar_int: ScalarInt,
+    ty: Ty<'tcx>,
+    oomir_data_types: &mut HashMap<String, oomir::DataType>,
+    instance: Instance<'tcx>,
+) -> Result<oomir::Constant, String> {
+    if let TyKind::Adt(adt_def, substs) = ty.kind() {
+        if adt_def.is_enum() {
+            let repr_type = adt_def.repr().discr_type();
+            let int_ty = repr_type.to_ty(tcx);
+            return Ok(scalar_int_to_oomir_constant(scalar_int, int_ty));
+        }
+
+        let adt_name = match ty_to_oomir_type(ty, tcx, oomir_data_types, instance) {
+            oomir::Type::Class(class_name) => class_name,
+            other => {
+                return Err(format!(
+                    "Expected class type for scalar ADT constant {:?}, got {:?}",
+                    ty, other
+                ));
+            }
+        };
+
+        let variant = adt_def
+            .variants()
+            .iter()
+            .next()
+            .ok_or_else(|| format!("Transparent ADT {:?} has no variants", ty))?;
+        let non_zst_fields = variant
+            .fields
+            .iter()
+            .filter(|field_def| {
+                !tcx.layout_of(PseudoCanonicalInput {
+                    typing_env: TypingEnv::post_analysis(tcx, field_def.did),
+                    value: field_def.ty(tcx, substs).skip_norm_wip(),
+                })
+                .map(|layout| layout.is_zst())
+                .unwrap_or(false)
+            })
+            .collect::<Vec<_>>();
+
+        if non_zst_fields.len() != 1 {
+            return Err(format!(
+                "Transparent ADT {:?} has {} non-ZST fields, expected exactly one",
+                ty,
+                non_zst_fields.len()
+            ));
+        }
+
+        let field_def = non_zst_fields[0];
+        let field_name = field_def.ident(tcx).name.to_string();
+        let field_ty = tcx
+            .normalize_erasing_regions(TypingEnv::fully_monomorphized(), field_def.ty(tcx, substs));
+        let inner_constant =
+            read_scalar_int_constant(tcx, scalar_int, field_ty, oomir_data_types, instance)?;
+        let mut fields = HashMap::new();
+        fields.insert(field_name, inner_constant.clone());
+        return Ok(oomir::Constant::Instance {
+            class_name: adt_name,
+            fields,
+            params: vec![inner_constant],
+        });
+    }
+
+    Ok(scalar_int_to_oomir_constant(scalar_int, ty))
+}
+
+pub fn read_pointer_constant<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    pointer: Pointer<CtfeProvenance>,
+    ty: Ty<'tcx>,
+    oomir_data_types: &mut HashMap<String, oomir::DataType>,
+    instance: Instance<'tcx>,
+) -> Result<oomir::Constant, String> {
+    match ty.kind() {
+        TyKind::Ref(_, inner_ty, _) | TyKind::RawPtr(inner_ty, _) => {
+            read_pointee_constant(tcx, pointer, *inner_ty, oomir_data_types, instance)
+        }
+        _ => read_pointee_constant(tcx, pointer, ty, oomir_data_types, instance),
+    }
+}
+
+fn read_pointer_from_memory<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    allocation: &ConstAllocation,
+    offset: Size,
+) -> Result<Pointer<CtfeProvenance>, String> {
+    let pointer_size = tcx.data_layout.pointer_size();
+    let ptr_range = AllocRange {
+        start: offset,
+        size: pointer_size,
+    };
+    match allocation
+        .read_scalar(&tcx.data_layout, ptr_range, true)
+        .map_err(|e| format!("Failed to read pointer scalar at {:?}: {:?}", offset, e))?
+    {
+        Scalar::Ptr(ptr, _) => Ok(ptr),
+        Scalar::Int(int) => Err(format!(
+            "Expected pointer scalar at {:?}, found integer {:?}",
+            offset, int
+        )),
+    }
+}
+
+fn read_pointee_constant<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    pointer: Pointer<CtfeProvenance>,
+    pointee_ty: Ty<'tcx>,
+    oomir_data_types: &mut HashMap<String, oomir::DataType>,
+    instance: Instance<'tcx>,
+) -> Result<oomir::Constant, String> {
+    let (provenance, offset) = pointer.into_raw_parts();
+    let alloc_id = provenance
+        .get_alloc_id()
+        .ok_or_else(|| format!("Pointer provenance {:?} has no allocation id", provenance))?;
+
+    match tcx.global_alloc(alloc_id) {
+        GlobalAlloc::Memory(const_alloc) => {
+            let allocation = const_alloc.inner();
+            if pointee_ty.is_str() {
+                read_string_from_allocation(allocation, offset, None)
+            } else {
+                read_constant_value_from_memory(
+                    tcx,
+                    allocation,
+                    offset,
+                    pointee_ty,
+                    oomir_data_types,
+                    instance,
+                )
+            }
+        }
+        GlobalAlloc::Function { instance } => {
+            let func_name = tcx.def_path_str(instance.def_id());
+            breadcrumbs::log!(
+                breadcrumbs::LogLevel::Info,
+                "const-eval",
+                format!("Info: Constant pointer to function: {}", func_name)
+            );
+            Ok(oomir::Constant::String(format!(
+                "FunctionPtr({})",
+                func_name
+            )))
+        }
+        GlobalAlloc::Static(def_id) => {
+            breadcrumbs::log!(
+                breadcrumbs::LogLevel::Info,
+                "const-eval",
+                format!("Info: Constant pointer to static: {:?}", def_id)
+            );
+            Ok(oomir::Constant::String(format!("StaticPtr({:?})", def_id)))
+        }
+        GlobalAlloc::VTable(..) => Err("Unsupported constant pointer to vtable".to_string()),
+        GlobalAlloc::TypeId { ty } => Err(format!("Unsupported constant pointer to TypeId {ty:?}")),
+    }
+}
+
+fn read_str_from_fat_pointer<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    allocation: &ConstAllocation,
+    offset: Size,
+) -> Result<oomir::Constant, String> {
+    let pointer_size = tcx.data_layout.pointer_size();
+    let data_ptr = read_pointer_from_memory(tcx, allocation, offset)?;
+    let len_range = AllocRange {
+        start: offset + pointer_size,
+        size: pointer_size,
+    };
+    let len_scalar = allocation
+        .read_scalar(&tcx.data_layout, len_range, false)
+        .map_err(|e| format!("Failed to read str length at {:?}: {:?}", offset, e))?;
+    let len = match len_scalar {
+        Scalar::Int(len) => len.to_target_usize(tcx) as usize,
+        Scalar::Ptr(..) => {
+            return Err(format!(
+                "Expected integer str length at {:?}, found pointer",
+                offset + pointer_size
+            ));
+        }
+    };
+
+    let (provenance, data_offset) = data_ptr.into_raw_parts();
+    let alloc_id = provenance.get_alloc_id().ok_or_else(|| {
+        format!(
+            "String data pointer provenance {:?} has no allocation id",
+            provenance
+        )
+    })?;
+    match tcx.global_alloc(alloc_id) {
+        GlobalAlloc::Memory(const_alloc) => {
+            read_string_from_allocation(const_alloc.inner(), data_offset, Some(len))
+        }
+        other => Err(format!(
+            "String data pointer referenced non-memory allocation {:?}",
+            other
+        )),
+    }
+}
+
+fn read_string_from_allocation(
+    allocation: &ConstAllocation,
+    offset: Size,
+    len: Option<usize>,
+) -> Result<oomir::Constant, String> {
+    let start = offset.bytes_usize();
+    let alloc_size = allocation.size().bytes_usize();
+    let end = match len {
+        Some(len) => start
+            .checked_add(len)
+            .ok_or_else(|| format!("String byte range starting at {} overflowed", start))?,
+        None => alloc_size,
+    };
+    if end > alloc_size {
+        return Err(format!(
+            "String byte range {}..{} is outside allocation size {}",
+            start, end, alloc_size
+        ));
+    }
+
+    let bytes = allocation.inspect_with_uninit_and_ptr_outside_interpreter(start..end);
+    match String::from_utf8(bytes.to_vec()) {
+        Ok(s) => {
+            breadcrumbs::log!(
+                breadcrumbs::LogLevel::Info,
+                "const-eval",
+                format!("Info: Successfully extracted string constant: \"{}\"", s)
+            );
+            Ok(oomir::Constant::String(s))
+        }
+        Err(e) => {
+            breadcrumbs::log!(
+                breadcrumbs::LogLevel::Warn,
+                "const-eval",
+                format!("Warning: String bytes were not valid UTF-8: {}", e)
+            );
+            Ok(oomir::Constant::String("Invalid UTF8".to_string()))
+        }
+    }
+}
 
 /// Reads a constant value of type `ty` from the `allocation` starting at `offset`.
-/// Eventually, this recursive function will replace the hardcoded/nested logic which is spagetti-like in operand.rs
-/// Currently, it is used only for ADTs as a trial period.
 pub fn read_constant_value_from_memory<'tcx>(
     tcx: TyCtxt<'tcx>,
-    allocation: &rustc_middle::mir::interpret::Allocation<
-        rustc_middle::mir::interpret::CtfeProvenance,
-    >,
+    allocation: &ConstAllocation,
     offset: Size,
     ty: Ty<'tcx>,
     oomir_data_types: &mut HashMap<String, oomir::DataType>,
-    instance: rustc_middle::ty::Instance<'tcx>,
+    instance: Instance<'tcx>,
 ) -> Result<oomir::Constant, String> {
     let pci = TypingEnv::fully_monomorphized().as_query_input(ty);
     let layout = tcx
@@ -66,114 +304,22 @@ pub fn read_constant_value_from_memory<'tcx>(
             let scalar_int = match scalar {
                 Scalar::Int(int) => int,
                 Scalar::Ptr(_, _) => {
-                    panic!("Expected scalar integer, found pointer");
+                    return Err(format!(
+                        "Expected scalar integer for type {:?}, found pointer",
+                        ty
+                    ));
                 }
             };
-            Ok(scalar_int_to_oomir_constant(scalar_int, &ty))
+            read_scalar_int_constant(tcx, scalar_int, ty, oomir_data_types, instance)
         }
 
-        TyKind::Ref(_, inner_ty, _) if inner_ty.is_str() => {
-            let size = allocation.size();
-            let range = 0..size.bytes_usize();
-
-            // Read the raw bytes, ignoring provenance and initialization checks
-            // Should be okay as we are "outisde the interpreter" as the name suggests
-            let bytes: &[u8] = allocation.inspect_with_uninit_and_ptr_outside_interpreter(range);
-            match String::from_utf8(bytes.to_vec()) {
-                Ok(s) => {
-                    breadcrumbs::log!(
-                        breadcrumbs::LogLevel::Info,
-                        "const-eval",
-                        format!(
-                            "Info: Successfully extracted string constant from allocation: \"{}\"",
-                            s
-                        )
-                    );
-                    Ok(oomir::Constant::String(s))
-                }
-                Err(e) => {
-                    breadcrumbs::log!(
-                        breadcrumbs::LogLevel::Warn,
-                        "const-eval",
-                        format!(
-                            "Warning: Bytes from allocation for &str were not valid UTF-8: {}",
-                            e
-                        )
-                    );
-                    // TODO: make OOMIR support raw bytes?
-                    Ok(oomir::Constant::String("Invalid UTF8".to_string()))
-                }
-            }
-        }
         // --- Pointer/Reference Types (requires recursive dereference) ---
         TyKind::Ref(_, inner_ty, _) | TyKind::RawPtr(inner_ty, _) => {
-            // Read the pointer scalar itself from the current allocation
-            let ptr_range = AllocRange {
-                start: offset,
-                size: tcx.data_layout.pointer_size(),
-            };
-            let scalar = allocation
-                .read_scalar(&tcx.data_layout, ptr_range, false)
-                .map_err(|e| {
-                    breadcrumbs::log!(
-                        breadcrumbs::LogLevel::Error,
-                        "const-eval",
-                        format!("Error reading pointer scalar: {:?}", e)
-                    );
-                    "Failed to read pointer scalar".to_string()
-                })?;
-
-            match scalar {
-                Scalar::Ptr(ptr, _) => {
-                    let (inner_alloc_id, inner_offset) = ptr.into_raw_parts();
-                    match tcx.global_alloc(inner_alloc_id.get_alloc_id().unwrap()) {
-                        // Assuming AllocId implements Copy
-                        GlobalAlloc::Memory(inner_const_alloc) => {
-                            // Recursively read the value the pointer points to
-                            read_constant_value_from_memory(
-                                tcx,
-                                inner_const_alloc.inner(),
-                                inner_offset,
-                                *inner_ty,
-                                oomir_data_types,
-                                instance,
-                            )
-                        }
-                        GlobalAlloc::Function { instance } => {
-                            // Represent the function pointer, e.g., by its path
-                            let func_name = tcx.def_path_str(instance.def_id());
-                            breadcrumbs::log!(
-                                breadcrumbs::LogLevel::Info,
-                                "const-eval",
-                                format!("Info: Constant pointer to function: {}", func_name)
-                            );
-                            // You might need a specific oomir::Constant variant for this
-                            Ok(oomir::Constant::String(format!(
-                                "FunctionPtr({})",
-                                func_name
-                            ))) // Placeholder
-                        }
-                        GlobalAlloc::Static(def_id) => {
-                            breadcrumbs::log!(
-                                breadcrumbs::LogLevel::Info,
-                                "const-eval",
-                                format!("Info: Constant pointer to static: {:?}", def_id)
-                            );
-                            // Need to look up the static's allocation - this might involve tcx.eval_static_initializer
-                            // For now, return placeholder
-                            Ok(oomir::Constant::String(format!("StaticPtr({:?})", def_id))) // Placeholder
-                            // TODO: Properly evaluate or look up the static's allocation and recurse
-                            // let static_alloc_id = tcx.eval_static_initializer(def_id)?; // Requires ErrorReporting + InterpCx? Complex.
-                            // Simplification: Assume static maps to a known allocation ID if possible, otherwise error/placeholder.
-                            // Err(ConstReadError::UnsupportedType("Pointer to Static".to_string()))
-                        }
-                        GlobalAlloc::VTable(..) => Err("Unsupported type: VTable".to_string()),
-                        GlobalAlloc::TypeId { ty: _ } => {
-                            Err("Unsupported type: TypeId".to_string())
-                        }
-                    }
-                }
-                Scalar::Int(scalar) => Ok(scalar_int_to_oomir_constant(scalar, &ty)),
+            if inner_ty.is_str() {
+                read_str_from_fat_pointer(tcx, allocation, offset)
+            } else {
+                let ptr = read_pointer_from_memory(tcx, allocation, offset)?;
+                read_pointee_constant(tcx, ptr, *inner_ty, oomir_data_types, instance)
             }
         }
 
@@ -197,28 +343,11 @@ pub fn read_constant_value_from_memory<'tcx>(
             let elem_layout = tcx
                 .layout_of(elem_pci)
                 .map_err(|_| "Couldn't get element layout.".to_string())?;
-            let mut elements = Vec::with_capacity(len as usize);
-
-            for i in 0..len {
-                // Calculate offset of element `i` within the array allocation
-                let elem_offset =
-                    offset + elem_layout.size.checked_mul(i, &tcx.data_layout).unwrap();
-                // Recursively read the element's constant value
-                let elem_const = read_constant_value_from_memory(
-                    tcx,
-                    allocation,
-                    elem_offset,
-                    *elem_ty,
-                    oomir_data_types,
-                    instance,
-                )?;
-                elements.push(elem_const);
-            }
             // Determine OOMIR element type (assuming ty_to_oomir_type exists)
             let oomir_elem_type = ty_to_oomir_type(*elem_ty, tcx, oomir_data_types, instance);
 
             // find values in the array
-            let mut values = Vec::new();
+            let mut values = Vec::with_capacity(len as usize);
             for i in 0..len {
                 let elem_offset =
                     offset + elem_layout.size.checked_mul(i, &tcx.data_layout).unwrap();
@@ -819,4 +948,83 @@ fn handle_constant_enum<'tcx>(
         fields: fields_map,
         params,
     })
+}
+
+/// Converts a Rust MIR Scalar::Int into the appropriate OOMIR constant.
+pub fn scalar_int_to_oomir_constant(scalar_int: ScalarInt, ty: Ty<'_>) -> oomir::Constant {
+    match ty.kind() {
+        TyKind::Int(int_ty) => match int_ty {
+            IntTy::I8 => oomir::Constant::I8(scalar_int.to_i8() as i8),
+            IntTy::I16 => oomir::Constant::I16(scalar_int.to_i16() as i16),
+            IntTy::I32 => oomir::Constant::I32(scalar_int.to_i32() as i32),
+            IntTy::Isize => oomir::Constant::I32(scalar_int.to_i64() as i32),
+            IntTy::I64 => oomir::Constant::I64(scalar_int.to_i64()),
+            IntTy::I128 => {
+                let param = oomir::Constant::String(scalar_int.to_i128().to_string());
+                oomir::Constant::Instance {
+                    class_name: "java/math/BigInteger".into(),
+                    fields: HashMap::new(),
+                    params: vec![param],
+                }
+            }
+        },
+        TyKind::Uint(uint_ty) => match uint_ty {
+            UintTy::U8 => oomir::Constant::I16(scalar_int.to_u8() as i16),
+            UintTy::U16 => oomir::Constant::I32(scalar_int.to_u16() as i32),
+            UintTy::U32 => oomir::Constant::I64(scalar_int.to_u32() as i64),
+            UintTy::Usize => oomir::Constant::I32(scalar_int.to_u64() as i32),
+            UintTy::U64 => {
+                let param = oomir::Constant::String(scalar_int.to_u64().to_string());
+                oomir::Constant::Instance {
+                    class_name: "java/math/BigInteger".into(),
+                    fields: HashMap::new(),
+                    params: vec![param],
+                }
+            }
+            UintTy::U128 => {
+                let param = oomir::Constant::String(scalar_int.to_u128().to_string());
+                oomir::Constant::Instance {
+                    class_name: "java/math/BigInteger".into(),
+                    fields: HashMap::new(),
+                    params: vec![param],
+                }
+            }
+        },
+        TyKind::Bool => oomir::Constant::Boolean(scalar_int.try_to_bool().unwrap_or(false)),
+        TyKind::Char => oomir::Constant::Char(char::from_u32(scalar_int.to_u32()).unwrap_or('\0')),
+        TyKind::Float(float_ty) => match float_ty {
+            FloatTy::F16 => {
+                let f16_val = half::f16::from_bits(scalar_int.to_u16());
+                oomir::Constant::F32(f16_val.to_f32())
+            }
+            FloatTy::F32 => oomir::Constant::F32(f32::from_bits(scalar_int.to_u32())),
+            FloatTy::F64 => oomir::Constant::F64(f64::from_bits(scalar_int.to_u64())),
+            FloatTy::F128 => {
+                let val = f128::from_bits(scalar_int.to_u128());
+                if val.is_nan() || val.is_infinite() {
+                    breadcrumbs::log!(
+                        breadcrumbs::LogLevel::Warn,
+                        "const-eval",
+                        "Warning: Attempt to store NaN/inf as BigDecimal/F128. BigDecimal does not support it. Using 0 as placeholder."
+                    );
+                    oomir::Constant::Instance {
+                        class_name: "java/math/BigDecimal".into(),
+                        fields: HashMap::new(),
+                        params: vec![oomir::Constant::String("0".to_string())],
+                    }
+                } else {
+                    oomir::Constant::Instance {
+                        class_name: "java/math/BigDecimal".into(),
+                        fields: HashMap::new(),
+                        params: vec![oomir::Constant::String(f128_to_string(val))],
+                    }
+                }
+            }
+        },
+        TyKind::Str => oomir::Constant::String(scalar_int.to_u64().to_string()),
+        TyKind::Ref(_, inner_ty, _) => {
+            scalar_int_to_oomir_constant(scalar_int.to_u64().into(), *inner_ty)
+        }
+        _ => panic!("Unsupported type for ScalarInt conversion: {:?}", ty),
+    }
 }
