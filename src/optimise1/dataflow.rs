@@ -862,6 +862,7 @@ pub fn process_block_instructions(
                 args,
                 class_name,
                 function,
+                signature,
                 ..
             } => {
                 // Added 'function' for logging
@@ -927,6 +928,7 @@ pub fn process_block_instructions(
                     dest: dest.clone(),
                     class_name: class_name.clone(),
                     function: function.clone(), // Use the captured function name
+                    signature: signature.clone(),
                     args: new_args,
                 };
                 keep_original_instruction = true; // Always keep the call itself

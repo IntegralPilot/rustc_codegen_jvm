@@ -1,7 +1,7 @@
 use rustc_hir::def_id::{CrateNum, DefId};
 use rustc_middle::ty::{Instance, TyCtxt};
 
-const RUNTIME_CRATES: &[&str] = &["core", "alloc", "std"];
+const RUNTIME_CRATES: &[&str] = &["core"];
 
 pub fn member_name(raw: &str) -> String {
     jvm_identifier(raw)

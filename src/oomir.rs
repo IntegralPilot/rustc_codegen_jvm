@@ -5,7 +5,6 @@ use crate::lower2::BIG_DECIMAL_CLASS;
 
 use super::lower2::BIG_INTEGER_CLASS;
 use breadcrumbs::LogLevel;
-use core::panic;
 use ristretto_classfile::attributes::Instruction as JVMInstruction;
 use sha2::Digest;
 use std::{
@@ -53,108 +52,6 @@ impl Module {
 
     pub fn owner_class_for_function<'a>(&'a self, function: &'a Function) -> &'a str {
         function.owner_class.as_deref().unwrap_or(&self.name)
-    }
-
-    // Helper function to merge data types into the module
-    // Ensure no dups (if there are, give the older one precedence)
-    pub fn merge_data_types(&mut self, other: &HashMap<String, DataType>) {
-        for (name, data_type) in other {
-            if !self.data_types.contains_key(name) {
-                self.data_types.insert(name.clone(), data_type.clone());
-            } else {
-                // try and merge them
-                let cur_data_type = self.data_types.get(name).unwrap().clone();
-                let other_data_type = other.get(name).unwrap();
-                match &cur_data_type {
-                    DataType::Class {
-                        is_abstract,
-                        super_class,
-                        fields,
-                        methods,
-                        interfaces,
-                    } => match other_data_type {
-                        DataType::Class {
-                            is_abstract: o_is_abstract,
-                            super_class: o_super_class,
-                            fields: o_fields,
-                            methods: o_methods,
-                            interfaces: o_interfaces,
-                        } => {
-                            let mut new_is_abstract = false;
-                            if *is_abstract || *o_is_abstract {
-                                new_is_abstract = true;
-                            }
-                            let new_super_class = match super_class {
-                                Some(x) => {
-                                    if x == "java/lang/Object" && o_super_class.is_some() {
-                                        o_super_class
-                                    } else if o_super_class.is_none() {
-                                        super_class
-                                    } else if o_super_class != super_class {
-                                        if o_super_class.clone().unwrap() == "java/lang/Object" {
-                                            super_class
-                                        } else {
-                                            panic!(
-                                                "Incompadible DataTypes (super) for {}: {:?} and {:?}",
-                                                name, cur_data_type, other_data_type
-                                            )
-                                        }
-                                    } else {
-                                        super_class
-                                    }
-                                }
-                                None => o_super_class,
-                            };
-                            let mut new_fields = fields.clone();
-                            new_fields.extend(o_fields.iter().cloned());
-                            let mut new_methods = methods.clone();
-                            new_methods
-                                .extend(o_methods.iter().map(|(k, v)| (k.clone(), v.clone())));
-                            let mut new_interfaces = interfaces.clone();
-                            new_interfaces.extend(o_interfaces.iter().cloned());
-
-                            self.data_types.insert(
-                                name.clone(),
-                                DataType::Class {
-                                    is_abstract: new_is_abstract,
-                                    super_class: new_super_class.clone(),
-                                    fields: new_fields,
-                                    methods: new_methods,
-                                    interfaces: new_interfaces,
-                                },
-                            );
-                        }
-                        _ => {
-                            panic!(
-                                "Incompadible DataTypes (type) for {}: {:?} and {:?}",
-                                name, cur_data_type, other_data_type
-                            )
-                        }
-                    },
-                    DataType::Interface { methods } => match other_data_type {
-                        DataType::Interface { methods: o_methods } => {
-                            let mut new_methods = methods.clone();
-                            new_methods
-                                .extend(o_methods.iter().map(|(k, v)| (k.clone(), v.clone())));
-
-                            self.data_types.remove(name);
-                            self.data_types.insert(
-                                name.clone(),
-                                DataType::Interface {
-                                    methods: new_methods,
-                                },
-                            );
-                        }
-                        _ => {
-                            panic!(
-                                "Incompadible DataTypes (type) for {}: {:?} and {:?}",
-                                name, cur_data_type, other_data_type
-                            )
-                        }
-                    },
-                }
-            }
-        }
     }
 }
 
@@ -437,6 +334,7 @@ pub enum Instruction {
         dest: Option<String>,       // Optional destination variable for the return value
         class_name: Option<String>, // JVM owner class for module/free functions
         function: String,           // Name of the function to call
+        signature: Signature,       // Full JVM-callable signature
         args: Vec<Operand>,         // Arguments to the function
     },
     CallIndirect {

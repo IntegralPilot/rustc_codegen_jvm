@@ -2737,6 +2737,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 dest,
                 class_name,
                 function: function_name,
+                signature,
                 args,
             } => {
                 let mut handled_as_shim = false;
@@ -2775,26 +2776,22 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     }
                 } // End Shim Lookup
 
-                // --- Intra-Module Call (Fallback) ---
+                // --- Intra-Module or linked external call (Fallback) ---
                 if !handled_as_shim {
-                    // This logic remains the same, using function_name for lookup
-                    let target_func =
-                        module
-                            .get_function(class_name.as_deref(), function_name)
-                            .ok_or_else(|| {
-                        jvm::Error::VerificationError {
+                    let target_func = module.get_function(class_name.as_deref(), function_name);
+                    let owner_class = target_func
+                        .map(|target_func| module.owner_class_for_function(target_func).to_string())
+                        .or_else(|| class_name.clone())
+                        .ok_or_else(|| jvm::Error::VerificationError {
                             context: format!("Function {}", self.oomir_func.name),
                             message: format!(
-                                "Cannot find function '{}{}' within OOMIR module or as a known shim.",
-                                class_name
-                                    .as_ref()
-                                    .map(|class_name| format!("{class_name}::"))
-                                    .unwrap_or_default(),
+                                "Cannot find local function '{}' and no owner class was supplied for a linked external call.",
                                 function_name
                             ),
-                        }
-                    })?;
-                    let target_sig = &target_func.signature;
+                        })?;
+                    let target_sig = target_func
+                        .map(|target_func| &target_func.signature)
+                        .unwrap_or(signature);
 
                     // 1. Load arguments
                     if args.len() != target_sig.params.len() {
@@ -2813,7 +2810,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     }
 
                     // 2. Add MethodRef
-                    let owner_class = module.owner_class_for_function(target_func);
                     let class_index = self.constant_pool.add_class(owner_class)?;
                     let method_ref_index = self.constant_pool.add_method_ref(
                         class_index,

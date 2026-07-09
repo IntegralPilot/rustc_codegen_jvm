@@ -1,6 +1,7 @@
 use super::jvm_names;
 use crate::oomir::{self, DataType, DataTypeMethod};
 
+use rustc_hir::def_id::DefId;
 use rustc_middle::ty::{
     AdtDef,
     ExistentialPredicate,
@@ -137,6 +138,10 @@ fn int_constant_for_type(value: i64, ty: &oomir::Type) -> oomir::Constant {
     } else {
         oomir::Constant::I32(value as i32)
     }
+}
+
+pub fn should_define_named_data_type<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> bool {
+    def_id.is_local() || tcx.crate_name(def_id.krate).as_str() == "core"
 }
 
 fn operand_var(name: impl Into<String>, ty: oomir::Type) -> oomir::Operand {
@@ -943,38 +948,59 @@ pub fn ty_to_oomir_type<'tcx>(
                     instance_context,
                 );
 
+                if !should_define_named_data_type(tcx, adt_def.did()) {
+                    return oomir::Type::Class(jvm_name_full);
+                }
+
                 if adt_def.is_struct() {
                     let variant = adt_def.variant(0usize.into());
-                    let oomir_fields = variant
-                        .fields
-                        .iter()
-                        .map(|field_def| {
-                            let field_name = field_def.ident(tcx).to_string();
-                            let field_mir_ty = field_def.ty(tcx, substs).skip_norm_wip();
-                            let field_oomir_type =
-                                ty_to_oomir_type(field_mir_ty, tcx, data_types, instance_context);
-                            (field_name, field_oomir_type)
-                        })
-                        .collect::<Vec<_>>();
-                    let mut methods = HashMap::new();
-                    methods.insert(
-                        "eq".to_string(),
-                        DataTypeMethod::AdtHelperMethod {
-                            kind: oomir::AdtHelperKind::PartialEqClass {
-                                fields: oomir_fields.clone(),
+                    if !data_types.contains_key(&jvm_name_full) {
+                        let oomir_fields = variant
+                            .fields
+                            .iter()
+                            .map(|field_def| {
+                                let field_name = field_def.ident(tcx).to_string();
+                                let field_mir_ty = field_def.ty(tcx, substs).skip_norm_wip();
+                                let field_oomir_type = ty_to_oomir_type(
+                                    field_mir_ty,
+                                    tcx,
+                                    data_types,
+                                    instance_context,
+                                );
+                                (field_name, field_oomir_type)
+                            })
+                            .collect::<Vec<_>>();
+                        let mut methods = HashMap::new();
+                        methods.insert(
+                            "eq".to_string(),
+                            DataTypeMethod::AdtHelperMethod {
+                                kind: oomir::AdtHelperKind::PartialEqClass {
+                                    fields: oomir_fields.clone(),
+                                },
                             },
-                        },
-                    );
-                    data_types.insert(
-                        jvm_name_full.clone(),
-                        oomir::DataType::Class {
-                            fields: oomir_fields,
-                            is_abstract: false,
-                            methods,
-                            super_class: None,
-                            interfaces: vec![],
-                        },
-                    );
+                        );
+                        data_types.insert(
+                            jvm_name_full.clone(),
+                            oomir::DataType::Class {
+                                fields: oomir_fields,
+                                is_abstract: false,
+                                methods,
+                                super_class: None,
+                                interfaces: vec![],
+                            },
+                        );
+                    } else if let Some(oomir::DataType::Class {
+                        fields, methods, ..
+                    }) = data_types.get_mut(&jvm_name_full)
+                    {
+                        methods.entry("eq".to_string()).or_insert_with(|| {
+                            DataTypeMethod::AdtHelperMethod {
+                                kind: oomir::AdtHelperKind::PartialEqClass {
+                                    fields: fields.clone(),
+                                },
+                            }
+                        });
+                    }
                 } else if adt_def.is_enum() {
                     // the enum in general
                     if !data_types.contains_key(&jvm_name_full) {
@@ -1171,21 +1197,25 @@ pub fn ty_to_oomir_type<'tcx>(
                 match binder.skip_binder() {
                     ExistentialPredicate::Trait(trait_ref) => {
                         let safe_name = jvm_names::class_for_def_id(tcx, trait_ref.def_id);
-                        data_types.entry(safe_name.clone()).or_insert_with(|| {
-                            oomir::DataType::Interface {
-                                methods: HashMap::new(),
-                            }
-                        });
+                        if should_define_named_data_type(tcx, trait_ref.def_id) {
+                            data_types.entry(safe_name.clone()).or_insert_with(|| {
+                                oomir::DataType::Interface {
+                                    methods: HashMap::new(),
+                                }
+                            });
+                        }
                         resolved_types.push(oomir::Type::Interface(safe_name));
                     }
                     ExistentialPredicate::AutoTrait(def_id) => {
                         // Auto traits like Send/Sync — treat as interfaces as well.
                         let safe_name = jvm_names::class_for_def_id(tcx, def_id);
-                        data_types.entry(safe_name.clone()).or_insert_with(|| {
-                            oomir::DataType::Interface {
-                                methods: HashMap::new(),
-                            }
-                        });
+                        if should_define_named_data_type(tcx, def_id) {
+                            data_types.entry(safe_name.clone()).or_insert_with(|| {
+                                oomir::DataType::Interface {
+                                    methods: HashMap::new(),
+                                }
+                            });
+                        }
                         resolved_types.push(oomir::Type::Interface(safe_name));
                     }
                     ExistentialPredicate::Projection(_) => {
@@ -1222,7 +1252,7 @@ pub fn ty_to_oomir_type<'tcx>(
             let safe_name = jvm_names::closure_class_for_def_id(tcx, *def_id);
 
             // Define the closure class struct if not already present
-            if !data_types.contains_key(&safe_name) {
+            if should_define_named_data_type(tcx, *def_id) && !data_types.contains_key(&safe_name) {
                 let closure_args = args.as_closure();
                 let upvar_tys = closure_args.upvar_tys();
 
@@ -1261,7 +1291,7 @@ pub fn ty_to_oomir_type<'tcx>(
             // produce unique JVM class names.
             let safe_name = jvm_names::class_for_def_id(tcx, *def_id);
 
-            if !data_types.contains_key(&safe_name) {
+            if should_define_named_data_type(tcx, *def_id) && !data_types.contains_key(&safe_name) {
                 data_types.insert(
                     safe_name.clone(),
                     oomir::DataType::Class {

@@ -1,8 +1,8 @@
 use super::{
     operand::convert_operand,
     types::{
-        get_field_name_from_index, ty_to_oomir_type, union_getter_method_name,
-        union_setter_method_name,
+        get_field_name_from_index, should_define_named_data_type, ty_to_oomir_type,
+        union_getter_method_name, union_setter_method_name,
     },
 };
 use crate::oomir::{self, DataTypeMethod, Instruction, Operand};
@@ -138,6 +138,36 @@ fn union_field_name<'tcx>(adt_def: AdtDef<'tcx>, field_index: usize, tcx: TyCtxt
         .to_string()
 }
 
+fn field_name_from_rust_ty<'tcx>(
+    ty: Ty<'tcx>,
+    field_index: usize,
+    tcx: TyCtxt<'tcx>,
+) -> Option<String> {
+    match ty.kind() {
+        TyKind::Ref(_, inner_ty, _) => field_name_from_rust_ty(*inner_ty, field_index, tcx),
+        TyKind::Tuple(_) => Some(format!("field{}", field_index)),
+        TyKind::Adt(adt_def, _) if adt_def.is_struct() => adt_def
+            .variant(0usize.into())
+            .fields
+            .get(rustc_abi::FieldIdx::from_usize(field_index))
+            .map(|field| field.ident(tcx).to_string()),
+        TyKind::Adt(adt_def, _) if adt_def.is_enum() => Some(format!("field{}", field_index)),
+        _ => None,
+    }
+}
+
+fn field_name_for_projection<'tcx>(
+    owner_class_name: &str,
+    field_index: usize,
+    base_rust_ty: Ty<'tcx>,
+    tcx: TyCtxt<'tcx>,
+    data_types: &HashMap<String, oomir::DataType>,
+) -> Result<String, String> {
+    get_field_name_from_index(owner_class_name, field_index, data_types).or_else(|original_error| {
+        field_name_from_rust_ty(base_rust_ty, field_index, tcx).ok_or(original_error)
+    })
+}
+
 /// Generates the necessary OOMIR instructions to retrieve the value corresponding
 /// to a given Place that may have a nested projection chain.
 ///
@@ -229,9 +259,11 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
                     ),
                 };
 
-                let field_name = match get_field_name_from_index(
+                let field_name = match field_name_for_projection(
                     &owner_class_name,
                     field_index.index(),
+                    base_rust_ty,
+                    tcx,
                     data_types,
                 ) {
                     Ok(name) => name,
@@ -489,7 +521,9 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
                 current_type = oomir::Type::Class(variant_class_name.clone());
 
                 // Verify this class exists in data_types
-                if !data_types.contains_key(&variant_class_name) {
+                if should_define_named_data_type(tcx, adt_def.did())
+                    && !data_types.contains_key(&variant_class_name)
+                {
                     breadcrumbs::log!(
                         breadcrumbs::LogLevel::Info,
                         "place-lowering",
@@ -705,9 +739,11 @@ pub fn emit_instructions_to_set_value<'tcx>(
                     ),
                 };
 
-                let field_name = match get_field_name_from_index(
+                let field_name = match field_name_for_projection(
                     &owner_class_name,
                     field_index.index(),
+                    base_rust_ty,
+                    tcx,
                     data_types,
                 ) {
                     Ok(name) => name,

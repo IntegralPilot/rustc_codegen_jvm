@@ -302,7 +302,7 @@ pub fn convert_basic_block<'tcx>(
                     };
 
                     let oomir_output_type =
-                        super::types::ty_to_oomir_type(fn_output, tcx, data_types, instance);
+                        super::types::ty_to_oomir_type(fn_output, tcx, data_types, func_instance);
 
                     let effective_dest = if matches!(oomir_output_type, oomir::Type::Void) {
                         None
@@ -312,7 +312,9 @@ pub fn convert_basic_block<'tcx>(
 
                     let oomir_input_types: Vec<oomir::Type> = fn_inputs
                         .iter()
-                        .map(|ty| super::types::ty_to_oomir_type(*ty, tcx, data_types, instance))
+                        .map(|ty| {
+                            super::types::ty_to_oomir_type(*ty, tcx, data_types, func_instance)
+                        })
                         .collect();
 
                     let oomir_params: Vec<(String, oomir::Type)> = oomir_input_types
@@ -442,10 +444,25 @@ pub fn convert_basic_block<'tcx>(
                                                 ))
                                             });
 
+                                        let class_name = class_name_opt.unwrap();
+                                        let mut virtual_method_signature = method_signature;
+                                        if method_name == "eq" {
+                                            if let Some((_name, self_ty)) =
+                                                virtual_method_signature.params.get_mut(0)
+                                            {
+                                                *self_ty = oomir::Type::Class(class_name.clone());
+                                            }
+                                            if let Some((_name, other_ty)) =
+                                                virtual_method_signature.params.get_mut(1)
+                                            {
+                                                *other_ty = oomir::Type::Class(class_name.clone());
+                                            }
+                                        }
+
                                         instructions.push(oomir::Instruction::InvokeVirtual {
-                                            class_name: class_name_opt.unwrap(),
+                                            class_name,
                                             method_name,
-                                            method_ty: method_signature,
+                                            method_ty: virtual_method_signature,
                                             args: method_args,
                                             dest: effective_dest,
                                             operand: receiver_operand,
@@ -475,7 +492,10 @@ pub fn convert_basic_block<'tcx>(
                             let mut generated = false;
                             if let Some(self_ty) = self_ty_opt {
                                 let class_type = super::types::ty_to_oomir_type(
-                                    self_ty, tcx, data_types, instance,
+                                    self_ty,
+                                    tcx,
+                                    data_types,
+                                    func_instance,
                                 );
 
                                 if let Some(class_name) = class_type.get_class_name() {
@@ -496,6 +516,7 @@ pub fn convert_basic_block<'tcx>(
                                 instructions.push(oomir::Instruction::Call {
                                     class_name: fn_name_data.class_to_call_on,
                                     function: fn_name_data.method_name,
+                                    signature: method_signature.clone(),
                                     args: oomir_operands.clone(),
                                     dest: effective_dest, // use effective_dest
                                 });
@@ -535,6 +556,7 @@ pub fn convert_basic_block<'tcx>(
                         instructions.push(oomir::Instruction::Call {
                             class_name,
                             function,
+                            signature: method_signature,
                             args: call_args,
                             dest: effective_dest, // use effective_dest
                         });

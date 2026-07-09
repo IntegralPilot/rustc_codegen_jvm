@@ -18,7 +18,8 @@ use super::{
         place::{emit_instructions_to_get_on_own, get_place_type, place_to_string},
         types::{
             ensure_fn_ptr_interface, ensure_union_data_type, fn_ptr_signature_from_ty,
-            generate_adt_jvm_class_name, short_hash, ty_to_oomir_type, union_from_method_name,
+            generate_adt_jvm_class_name, short_hash, should_define_named_data_type,
+            ty_to_oomir_type, union_from_method_name,
         },
     },
     checked_ops::{
@@ -138,6 +139,7 @@ fn ensure_fn_pointer_adapter_class<'tcx>(
             dest: call_dest.clone(),
             class_name: target_function.class_to_call_on.clone(),
             function: target_function.method_name.clone(),
+            signature: signature.clone(),
             args: call_args,
         }];
 
@@ -1176,6 +1178,7 @@ pub fn convert_rvalue_to_operand<'a>(
                     active_field_idx,
                 ) => {
                     let adt_def = tcx.adt_def(*def_id);
+                    let should_define_data_type = should_define_named_data_type(tcx, *def_id);
                     if adt_def.is_struct() {
                         let variant = adt_def.variant(*variant_idx);
                         let jvm_class_name = generate_adt_jvm_class_name(
@@ -1204,7 +1207,7 @@ pub fn convert_rvalue_to_operand<'a>(
                                 )
                             })
                             .collect();
-                        if !data_types.contains_key(&jvm_class_name) {
+                        if should_define_data_type && !data_types.contains_key(&jvm_class_name) {
                             let mut methods = HashMap::new();
                             methods.insert(
                                 "eq".to_string(),
@@ -1224,9 +1227,10 @@ pub fn convert_rvalue_to_operand<'a>(
                                     interfaces: vec![],
                                 },
                             );
-                        } else if let Some(oomir::DataType::Class {
-                            fields, methods, ..
-                        }) = data_types.get_mut(&jvm_class_name)
+                        } else if should_define_data_type
+                            && let Some(oomir::DataType::Class {
+                                fields, methods, ..
+                            }) = data_types.get_mut(&jvm_class_name)
                         {
                             methods.entry("eq".to_string()).or_insert_with(|| {
                                 DataTypeMethod::AdtHelperMethod {
@@ -1330,7 +1334,7 @@ pub fn convert_rvalue_to_operand<'a>(
                         */
 
                         // the enum in general - always ensure helper methods are present
-                        {
+                        if should_define_data_type {
                             let variants_info: Vec<_> = adt_def
                                 .variants()
                                 .iter()
@@ -1463,7 +1467,8 @@ pub fn convert_rvalue_to_operand<'a>(
                         }
 
                         // this variant
-                        if !data_types.contains_key(&variant_class_name) {
+                        if should_define_data_type && !data_types.contains_key(&variant_class_name)
+                        {
                             let mut fields = vec![];
                             for (i, field) in variant_def.fields.iter().enumerate() {
                                 let field_name = format!("field{}", i);
@@ -1525,8 +1530,11 @@ pub fn convert_rvalue_to_operand<'a>(
                             args: constructor_args,
                         });
                     } else {
-                        let union_class_name =
-                            ensure_union_data_type(&adt_def, substs, tcx, data_types, instance);
+                        let union_class_name = if should_define_data_type {
+                            ensure_union_data_type(&adt_def, substs, tcx, data_types, instance)
+                        } else {
+                            generate_adt_jvm_class_name(&adt_def, substs, tcx, data_types, instance)
+                        };
                         let active_field_idx = active_field_idx.unwrap_or(FieldIdx::from_usize(0));
                         let variant = adt_def.variant(*variant_idx);
                         let field_def = &variant.fields[active_field_idx];

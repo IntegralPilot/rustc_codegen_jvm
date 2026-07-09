@@ -110,7 +110,7 @@ fn lower_closure_to_oomir<'tcx>(
 
     // Lower the closure MIR to OOMIR, providing the closure name as an override
     // since closures don't have proper item names in rustc
-    let (oomir_function, data_types) = lower1::mir_to_oomir(
+    let oomir_function = lower1::mir_to_oomir(
         tcx,
         instance,
         &mut mir,
@@ -119,6 +119,7 @@ fn lower_closure_to_oomir<'tcx>(
             method_name: closure_name.clone(),
         }),
         true,
+        &mut oomir_module.data_types,
     );
 
     breadcrumbs::log!(
@@ -129,7 +130,6 @@ fn lower_closure_to_oomir<'tcx>(
 
     // Add the closure function to the module
     oomir_module.insert_function(oomir_function);
-    oomir_module.merge_data_types(&data_types);
 }
 
 impl CodegenBackend for MyBackend {
@@ -327,18 +327,21 @@ impl CodegenBackend for MyBackend {
                     "mir-lowering",
                     format!("--- Starting MIR to OOMIR Lowering for function: {i} ---")
                 );
-                let oomir_result = lower1::mir_to_oomir(tcx, instance, &mut mir, None, true);
+                let oomir_function = lower1::mir_to_oomir(
+                    tcx,
+                    instance,
+                    &mut mir,
+                    None,
+                    true,
+                    &mut oomir_module.data_types,
+                );
                 breadcrumbs::log!(
                     breadcrumbs::LogLevel::Info,
                     "mir-lowering",
                     format!("--- Finished MIR to OOMIR Lowering for function: {i} ---")
                 );
 
-                let oomir_function = oomir_result.0;
-
                 oomir_module.insert_function(oomir_function);
-
-                oomir_module.merge_data_types(&oomir_result.1);
             } else if let rustc_hir::ItemKind::Impl(impl_a) = item.kind {
                 // Get the DefId of the impl block itself. The `item_id` from the
                 // outer loop refers to the `impl` item.
@@ -399,14 +402,12 @@ impl CodegenBackend for MyBackend {
                             rustc_middle::ty::GenericArgs::identity_for_item(tcx, impl_def_id),
                         )
                         .skip_norm_wip();
-                    let mut impl_data_types = HashMap::new();
                     let impl_self_oomir_ty = lower1::types::ty_to_oomir_type(
                         impl_self_ty,
                         tcx,
-                        &mut impl_data_types,
+                        &mut oomir_module.data_types,
                         impl_instance,
                     );
-                    oomir_module.merge_data_types(&impl_data_types);
                     match impl_self_oomir_ty {
                         Type::Class(name) | Type::Interface(name) => name,
                         Type::MutableReference(inner) => match *inner {
@@ -595,15 +596,20 @@ impl CodegenBackend for MyBackend {
                         "mir-lowering",
                         format!("--- Starting MIR to OOMIR Lowering for function: {i2} ---")
                     );
-                    let oomir_result: (oomir::Function, HashMap<String, oomir::DataType>) =
-                        lower1::mir_to_oomir(tcx, instance, &mut mir, None, true);
+                    let mut oomir_function = lower1::mir_to_oomir(
+                        tcx,
+                        instance,
+                        &mut mir,
+                        None,
+                        true,
+                        &mut oomir_module.data_types,
+                    );
                     breadcrumbs::log!(
                         breadcrumbs::LogLevel::Info,
                         "mir-lowering",
                         format!("--- Finished MIR to OOMIR Lowering for function: {i2} ---")
                     );
 
-                    let mut oomir_function = oomir_result.0;
                     oomir_function.name = i.to_string();
 
                     // For trait implementations, replace trait type references with concrete type
@@ -668,8 +674,6 @@ impl CodegenBackend for MyBackend {
                         format!("Function args: {:?}", args)
                     );
 
-                    oomir_module.merge_data_types(&oomir_result.1);
-
                     // find the data type we are implementing the trait for
                     let dt = oomir_module.data_types.get(&ident).cloned();
                     match dt {
@@ -707,7 +711,8 @@ impl CodegenBackend for MyBackend {
                             );
                         }
                         None => {
-                            // create a new one with reasonable defaults that will be overriden by merge_data_types once it's eventually resolved
+                            // Create a placeholder class; field/type discovery can fill it later through
+                            // the shared data-type table.
                             let mut new_methods = HashMap::new();
                             new_methods.insert(
                                 i.to_string(),
@@ -789,8 +794,6 @@ impl CodegenBackend for MyBackend {
                     let params_ty = mir_sig.inputs();
                     let return_ty = mir_sig.output();
 
-                    let data_types = &mut HashMap::new(); // Consider if this should be shared across loop iterations or functions
-
                     let instance = rustc_middle::ty::Instance::new_raw(
                         def_id,
                         rustc_middle::ty::GenericArgs::identity_for_item(tcx, def_id),
@@ -818,8 +821,12 @@ impl CodegenBackend for MyBackend {
                             } else {
                                 // For trait methods, we don't have MIR, so use generic names
                                 let param_name = format!("arg{}", i);
-                                let oomir_type =
-                                    lower1::types::ty_to_oomir_type(*ty, tcx, data_types, instance);
+                                let oomir_type = lower1::types::ty_to_oomir_type(
+                                    *ty,
+                                    tcx,
+                                    &mut oomir_module.data_types,
+                                    instance,
+                                );
                                 Some((param_name, oomir_type))
                             }
                         })
@@ -827,7 +834,7 @@ impl CodegenBackend for MyBackend {
                     let return_oomir_ty: oomir::Type = lower1::types::ty_to_oomir_type(
                         return_ty.skip_binder(),
                         tcx,
-                        data_types,
+                        &mut oomir_module.data_types,
                         instance,
                     );
 
@@ -887,10 +894,14 @@ impl CodegenBackend for MyBackend {
                     name.method_name
                 )
             );
-            let (mut oomir_function, data_types) =
-                lower1::mir_to_oomir(tcx, instance, &mut mir, Some(name.clone()), true);
-
-            oomir_module.merge_data_types(&data_types);
+            let mut oomir_function = lower1::mir_to_oomir(
+                tcx,
+                instance,
+                &mut mir,
+                Some(name.clone()),
+                true,
+                &mut oomir_module.data_types,
+            );
 
             // Idiomatic placement:
             // If this is a method of a generic struct, place it inside the OOMIR Class for that struct.
@@ -908,9 +919,12 @@ impl CodegenBackend for MyBackend {
                         .skip_norm_wip();
 
                     // Determine the OOMIR type of the container
-                    let mut temp_dt = HashMap::new();
-                    let self_oomir_ty =
-                        lower1::types::ty_to_oomir_type(container_ty, tcx, &mut temp_dt, instance);
+                    let self_oomir_ty = lower1::types::ty_to_oomir_type(
+                        container_ty,
+                        tcx,
+                        &mut oomir_module.data_types,
+                        instance,
+                    );
 
                     if let oomir::Type::Class(class_name) = self_oomir_ty {
                         // Check if this is a user-defined class (not java/ or stdlib shim)

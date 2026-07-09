@@ -178,6 +178,9 @@ def process_binary_test(test_dir: str, release_mode: bool, logs: list) -> bool:
     logs.append("|--- ✅ Binary test passed!")
     return True
 
+def process_multicrate_test(test_dir: str, release_mode: bool, logs: list) -> bool:
+    return process_binary_test(test_dir, release_mode, logs)
+
 def process_integration_test(test_dir: str, release_mode: bool, logs: list) -> bool:
     test_name = os.path.basename(test_dir)
     normalized = normalize_name(test_name)
@@ -240,6 +243,8 @@ def run_single_test(test_dir: str, test_type: str, release_mode: bool) -> tuple[
     logs = []
     if test_type == "binary":
         success = process_binary_test(test_dir, release_mode, logs)
+    elif test_type == "multicrate":
+        success = process_multicrate_test(test_dir, release_mode, logs)
     else:
         success = process_integration_test(test_dir, release_mode, logs)
     return success, test_dir, logs
@@ -285,11 +290,14 @@ def main():
         return all_tests
 
     binary_tests = sorted(discover_tests(os.path.join("tests", "binary")))
+    multicrate_tests = sorted(discover_tests(os.path.join("tests", "multicrate")))
     integration_tests = sorted(discover_tests(os.path.join("tests", "integration")))
     
     tasks = []
     for test_dir in binary_tests:
         tasks.append((test_dir, "binary"))
+    for test_dir in multicrate_tests:
+        tasks.append((test_dir, "multicrate"))
     for test_dir in integration_tests:
         tasks.append((test_dir, "integration"))
 

@@ -101,6 +101,7 @@ fn main() -> Result<(), i32> {
 
     let mut input_class_files: Vec<String> = Vec::new();
     let mut input_jar_files: Vec<String> = Vec::new(); // Separate JARs
+    let mut input_rlib_files: Vec<String> = Vec::new();
     let mut output_file: Option<String> = None;
 
     // --- Argument Parsing ---
@@ -131,6 +132,9 @@ fn main() -> Result<(), i32> {
             } else if arg.ends_with(".jar") {
                 input_jar_files.push(arg.clone());
                 i += 1;
+            } else if arg.ends_with(".rlib") {
+                input_rlib_files.push(arg.clone());
+                i += 1;
             } else {
                 // If it's not a flag and not a recognized input type, warn or error
                 eprintln!("Warning: Ignoring unrecognized argument: {}", arg);
@@ -147,6 +151,7 @@ fn main() -> Result<(), i32> {
         .iter()
         .cloned()
         .chain(input_jar_files.iter().cloned())
+        .chain(input_rlib_files.iter().cloned())
         .collect();
 
     if all_input_paths.is_empty() {
@@ -181,6 +186,7 @@ fn main() -> Result<(), i32> {
     create_jar(
         &input_class_files,
         &input_jar_files, // Pass JARs separately
+        &input_rlib_files,
         &output_file_path,
         main_class_name.as_deref(),
     )
@@ -307,6 +313,33 @@ fn find_main_classes_with_ristretto(input_files: &[String]) -> io::Result<Vec<St
                     );
                 }
             }
+        } else if file_path_str.ends_with(".rlib") {
+            match collect_rlib_classes(path) {
+                Ok(classes) => {
+                    for class_info in classes {
+                        match check_class_data_for_main(
+                            &class_info.data,
+                            main_method_name,
+                            main_method_descriptor,
+                        ) {
+                            Ok(Some(class_name)) => main_classes.push(class_name),
+                            Ok(None) => {}
+                            Err(e) => {
+                                eprintln!(
+                                    "Warning (main scan): Could not parse class entry '{}' within rlib '{}': {}. Skipping entry.",
+                                    class_info.jar_entry_name, file_path_str, e
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Warning (main scan): Could not read rlib '{}': {}. Skipping.",
+                        file_path_str, e
+                    );
+                }
+            }
         }
     }
     Ok(main_classes)
@@ -371,6 +404,7 @@ fn check_class_data_for_main(
 fn create_jar(
     input_class_files: &[String],
     input_jar_files: &[String],
+    input_rlib_files: &[String],
     final_output_jar_path: &str,
     main_class_name: Option<&str>,
 ) -> io::Result<()> {
@@ -412,21 +446,26 @@ fn create_jar(
             .and_then(|caps| caps.name("name").map(|m| format!("{}.class", m.as_str())))
             .unwrap_or_else(|| file_name.to_string());
 
-        let data = fs::read(path)?;
-        let jar_entry_name = ClassFile::from_bytes(&mut Cursor::new(data.clone()))
-            .ok()
-            .and_then(|class_file| {
-                class_file
-                    .class_name()
-                    .ok()
-                    .map(|class_name| format!("{class_name}.class"))
-            })
-            .unwrap_or(base_name);
+        app_classes.push(class_info_from_class_data(fs::read(path)?, base_name));
+    }
 
-        app_classes.push(ClassInfo {
-            jar_entry_name,
-            data,
-        });
+    for path_str in input_rlib_files {
+        let path = Path::new(path_str);
+        if !path.exists() {
+            eprintln!(
+                "Warning (create_jar): Input rlib path does not exist: {}. Skipping.",
+                path_str
+            );
+            continue;
+        }
+        if !path.is_file() {
+            eprintln!(
+                "Warning (create_jar): Input rlib path is not a file: {}. Skipping.",
+                path_str
+            );
+            continue;
+        }
+        app_classes.extend(collect_rlib_classes(path)?);
     }
 
     // Input JARs are bundled into the final artifact alongside generated classes.
@@ -453,7 +492,11 @@ fn create_jar(
             .compression_method(CompressionMethod::DEFLATE)
             .unix_permissions(0o644);
 
+        let mut seen_class_entries = HashSet::new();
         for class_info in &app_classes {
+            if !seen_class_entries.insert(class_info.jar_entry_name.as_str()) {
+                continue;
+            }
             zip_writer.start_file(&class_info.jar_entry_name, options)?;
             zip_writer.write_all(&class_info.data)?;
         }
@@ -536,6 +579,178 @@ fn create_jar(
     Ok(())
 }
 
+fn class_info_from_class_data(mut data: Vec<u8>, fallback_name: String) -> ClassInfo {
+    let mut cursor = Cursor::new(data.clone());
+    let class_file = ClassFile::from_bytes(&mut cursor).ok();
+    if class_file.is_some() {
+        data.truncate(cursor.position() as usize);
+    }
+
+    let jar_entry_name = class_file
+        .and_then(|class_file| {
+            class_file
+                .class_name()
+                .ok()
+                .map(|class_name| format!("{class_name}.class"))
+        })
+        .unwrap_or(fallback_name);
+
+    ClassInfo {
+        jar_entry_name,
+        data,
+    }
+}
+
+fn try_class_info_from_class_data(mut data: Vec<u8>, fallback_name: String) -> Option<ClassInfo> {
+    let mut cursor = Cursor::new(data.clone());
+    let class_file = ClassFile::from_bytes(&mut cursor).ok()?;
+    data.truncate(cursor.position() as usize);
+    let jar_entry_name = class_file
+        .class_name()
+        .ok()
+        .map(|class_name| format!("{class_name}.class"))
+        .unwrap_or(fallback_name);
+
+    Some(ClassInfo {
+        jar_entry_name,
+        data,
+    })
+}
+
+fn gnu_long_name(table: &[u8], offset_text: &str, path: &Path) -> io::Result<String> {
+    let offset = offset_text.trim().parse::<usize>().map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "invalid GNU ar long-name offset '{}' in {}: {}",
+                offset_text,
+                path.display(),
+                e
+            ),
+        )
+    })?;
+
+    if offset >= table.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "GNU ar long-name offset {} is outside table in {}",
+                offset,
+                path.display()
+            ),
+        ));
+    }
+
+    let tail = &table[offset..];
+    let end = tail
+        .windows(2)
+        .position(|window| window == b"/\n")
+        .unwrap_or(tail.len());
+    Ok(String::from_utf8_lossy(&tail[..end]).to_string())
+}
+
+fn collect_rlib_classes(path: &Path) -> io::Result<Vec<ClassInfo>> {
+    let archive = fs::read(path)?;
+    if !archive.starts_with(b"!<arch>\n") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} is not an ar archive", path.display()),
+        ));
+    }
+
+    let mut classes = Vec::new();
+    let mut offset = 8usize;
+    let mut gnu_long_names = Vec::new();
+    while offset + 60 <= archive.len() {
+        let header = &archive[offset..offset + 60];
+        let raw_name = String::from_utf8_lossy(&header[0..16]).trim().to_string();
+        let size_text = String::from_utf8_lossy(&header[48..58]).trim().to_string();
+        let size = size_text.parse::<usize>().map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "invalid ar member size '{}' in {}: {}",
+                    size_text,
+                    path.display(),
+                    e
+                ),
+            )
+        })?;
+
+        if &header[58..60] != b"`\n" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid ar member header in {}", path.display()),
+            ));
+        }
+
+        let mut data_start = offset + 60;
+        let mut data_len = size;
+        let member_name = if raw_name == "/" {
+            "__gnu_symbol_table__".to_string()
+        } else if raw_name == "//" {
+            "__gnu_long_names__".to_string()
+        } else if let Some(name_offset_text) = raw_name.strip_prefix('/') {
+            gnu_long_name(&gnu_long_names, name_offset_text, path)?
+        } else if let Some(name_len_text) = raw_name.strip_prefix("#1/") {
+            let name_len = name_len_text.trim().parse::<usize>().map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "invalid BSD ar name length '{}' in {}: {}",
+                        name_len_text,
+                        path.display(),
+                        e
+                    ),
+                )
+            })?;
+            if data_start + name_len > archive.len() || name_len > data_len {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid BSD ar name in {}", path.display()),
+                ));
+            }
+            let name = String::from_utf8_lossy(&archive[data_start..data_start + name_len])
+                .trim_end_matches('\0')
+                .to_string();
+            data_start += name_len;
+            data_len -= name_len;
+            name
+        } else {
+            raw_name.trim_end_matches('/').to_string()
+        };
+
+        if data_start + data_len > archive.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "ar member '{}' extends past end of {}",
+                    member_name,
+                    path.display()
+                ),
+            ));
+        }
+
+        let data = &archive[data_start..data_start + data_len];
+        if member_name == "__gnu_long_names__" {
+            gnu_long_names = data.to_vec();
+        } else if member_name.ends_with(".class") || data.starts_with(b"\xca\xfe\xba\xbe") {
+            if let Some(class_info) =
+                try_class_info_from_class_data(data.to_vec(), member_name.clone())
+            {
+                classes.push(class_info);
+            }
+        }
+
+        offset += 60 + size;
+        if offset % 2 == 1 {
+            offset += 1;
+        }
+    }
+
+    Ok(classes)
+}
+
 fn merge_input_jars(
     app_jar_path: Option<&Path>,
     library_jar_paths: &[PathBuf],
@@ -545,12 +760,14 @@ fn merge_input_jars(
     let mut zip_writer = ZipWriter::new(output_file);
     let mut seen_entries = HashSet::new();
 
-    if let Some(app_jar) = app_jar_path {
-        copy_jar_entries(app_jar, &mut zip_writer, &mut seen_entries)?;
-    }
-
     for library_jar_path in library_jar_paths {
         copy_jar_entries(library_jar_path, &mut zip_writer, &mut seen_entries)?;
+    }
+
+    // Runtime shim classes are authoritative for Java-owned core APIs such as
+    // fmt::Arguments. Generated app classes with the same names are skipped.
+    if let Some(app_jar) = app_jar_path {
+        copy_jar_entries(app_jar, &mut zip_writer, &mut seen_entries)?;
     }
 
     zip_writer.finish()?;

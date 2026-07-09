@@ -39,7 +39,8 @@ pub fn mir_to_oomir<'tcx>(
     mir: &mut Body<'tcx>,
     fn_name_override: Option<naming::FnNameData>,
     is_static: bool,
-) -> (oomir::Function, HashMap<String, oomir::DataType>) {
+    data_types: &mut HashMap<String, oomir::DataType>,
+) -> oomir::Function {
     use rustc_middle::ty::TyKind;
 
     // Get a function name from the instance or use the provided override.
@@ -79,7 +80,6 @@ pub fn mir_to_oomir<'tcx>(
         }
     };
 
-    let data_types = &mut HashMap::new();
     let closure_has_captures = matches!(
         instance_ty.kind(),
         TyKind::Closure(_, args) if !args.as_closure().upvar_tys().is_empty()
@@ -223,13 +223,10 @@ pub fn mir_to_oomir<'tcx>(
     };
 
     // Return the OOMIR representation of the function.
-    (
-        oomir::Function {
-            name: fn_name,
-            owner_class: fn_name_data.class_to_call_on,
-            signature,
-            body: codeblock,
-        },
-        data_types.clone(),
-    )
+    oomir::Function {
+        name: fn_name,
+        owner_class: fn_name_data.class_to_call_on,
+        signature,
+        body: codeblock,
+    }
 }

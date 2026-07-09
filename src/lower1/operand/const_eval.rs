@@ -12,7 +12,9 @@ use std::collections::HashMap;
 use super::super::{
     place::make_jvm_safe,
     ty_to_oomir_type,
-    types::{generate_adt_jvm_class_name, generate_tuple_jvm_class_name},
+    types::{
+        generate_adt_jvm_class_name, generate_tuple_jvm_class_name, should_define_named_data_type,
+    },
 };
 use super::float::f128_to_string;
 use crate::oomir::{self, DataTypeMethod};
@@ -889,8 +891,10 @@ fn handle_constant_enum<'tcx>(
         make_jvm_safe(&variant_def.ident(tcx).to_string()) // Use ident for correct name
     );
 
+    let should_define_data_type = should_define_named_data_type(tcx, adt_def.did());
+
     // the enum in general
-    if !oomir_data_types.contains_key(&base_enum_name) {
+    if should_define_data_type && !oomir_data_types.contains_key(&base_enum_name) {
         let mut methods = HashMap::new();
         methods.insert(
             "getVariantIdx".to_string(),
@@ -909,7 +913,7 @@ fn handle_constant_enum<'tcx>(
     }
 
     // this variant
-    if !oomir_data_types.contains_key(&variant_class_name) {
+    if should_define_data_type && !oomir_data_types.contains_key(&variant_class_name) {
         let mut fields = vec![];
         for (i, field) in variant_def.fields.iter().enumerate() {
             let field_name = format!("field{}", i);
