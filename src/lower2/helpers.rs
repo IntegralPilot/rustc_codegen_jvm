@@ -230,7 +230,7 @@ pub fn get_cast_instructions(
                     return Ok(vec![JI::Invokestatic(mref)]);
                 }
             }
-            if cn.starts_with("NonNull_") {
+            if oomir::is_non_null_class_name(cn) {
                 let class_idx = cp.add_class(cn)?;
                 let init = cp.add_method_ref(class_idx, "<init>", "()V")?;
                 let mut instrs = Vec::new();
@@ -308,7 +308,7 @@ pub fn get_cast_instructions(
         }
 
         if let Type::Class(cn) = dest {
-            if cn.starts_with("NonNull_") {
+            if oomir::is_non_null_class_name(cn) {
                 let class_idx = cp.add_class(cn)?;
                 let init = cp.add_method_ref(class_idx, "<init>", "()V")?;
                 return Ok(vec![

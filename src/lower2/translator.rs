@@ -6,7 +6,7 @@ use super::{
         get_type_size, parse_jvm_descriptor_params,
     },
     optimise2,
-    shim::get_shim_metadata,
+    shim::{ShimInfo, get_shim_metadata},
     stackmaps,
 };
 use crate::oomir::{self, Type};
@@ -891,7 +891,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         let actual_ty = get_operand_type(operand);
         if actual_ty != *expected_ty
             && let oomir::Type::Class(class_name) = expected_ty
-            && class_name.starts_with("NonNull_")
+            && oomir::is_non_null_class_name(class_name)
             && !matches!(operand, oomir::Operand::Constant(oomir::Constant::Null(_)))
         {
             return self.construct_non_null_wrapper_from_operand(operand, &actual_ty, class_name);
@@ -934,6 +934,157 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         let index: u16 = self.get_or_assign_local(dest_var, ty);
         let store_instr = get_store_instruction(ty, index)?;
         self.jvm_instructions.push(store_instr);
+        Ok(())
+    }
+
+    fn emit_shim_call(
+        &mut self,
+        shim_key: &str,
+        shim_info: &ShimInfo,
+        args: &[oomir::Operand],
+        dest: &Option<String>,
+        expected_return_type: Option<&oomir::Type>,
+        is_diverging_call: bool,
+    ) -> Result<(), jvm::Error> {
+        let expected_jvm_param_types =
+            parse_jvm_descriptor_params(&shim_info.descriptor).map_err(|e| {
+                jvm::Error::VerificationError {
+                    context: format!("Function {}", self.oomir_func.name),
+                    message: format!("Error parsing shim descriptor: {}", e),
+                }
+            })?;
+
+        if args.len() != expected_jvm_param_types.len() {
+            return Err(jvm::Error::VerificationError {
+                context: format!("Function {}", self.oomir_func.name),
+                message: format!(
+                    "Shim argument count mismatch for '{}': descriptor '{}' expects {}, found {}",
+                    shim_key,
+                    shim_info.descriptor,
+                    expected_jvm_param_types.len(),
+                    args.len()
+                ),
+            });
+        }
+
+        for (arg_operand, expected_jvm_type) in args.iter().zip(expected_jvm_param_types.iter()) {
+            let provided_oomir_type = get_operand_type(arg_operand);
+            self.load_call_argument(arg_operand)?;
+            self.adapt_loaded_shim_argument(&provided_oomir_type, expected_jvm_type)?;
+        }
+
+        let class_index = self
+            .constant_pool
+            .add_class(shim_info.java_class(shim_key))?;
+        let method_ref_index = self.constant_pool.add_method_ref(
+            class_index,
+            shim_info.java_method(shim_key),
+            &shim_info.descriptor,
+        )?;
+
+        if shim_info.is_static {
+            self.jvm_instructions
+                .push(Instruction::Invokestatic(method_ref_index));
+        } else {
+            return Err(jvm::Error::VerificationError {
+                context: format!("Function {}", self.oomir_func.name),
+                message: format!("Non-static shim function '{}' not supported", shim_key),
+            });
+        }
+
+        if is_diverging_call {
+            return Ok(());
+        }
+
+        let shim_return_type = oomir::Type::from_jvm_descriptor_return_type(&shim_info.descriptor);
+        if shim_return_type == oomir::Type::Void {
+            if dest.is_some() {
+                breadcrumbs::log!(
+                    breadcrumbs::LogLevel::Info,
+                    "bytecode-gen",
+                    format!(
+                        "Info: Ignoring store for void return from shim '{}'",
+                        shim_key
+                    )
+                );
+            }
+            return Ok(());
+        }
+
+        let store_type = expected_return_type.unwrap_or(&shim_return_type);
+        self.cast_loaded_shim_return_if_needed(&shim_return_type, store_type)?;
+
+        if let Some(dest_var) = dest {
+            self.store_result(dest_var, store_type)?;
+        } else {
+            match get_type_size(store_type) {
+                1 => self.jvm_instructions.push(Instruction::Pop),
+                2 => self.jvm_instructions.push(Instruction::Pop2),
+                _ => {}
+            }
+        }
+
+        Ok(())
+    }
+
+    fn adapt_loaded_shim_argument(
+        &mut self,
+        provided_oomir_type: &oomir::Type,
+        expected_jvm_type: &str,
+    ) -> Result<(), jvm::Error> {
+        if expected_jvm_type == "Ljava/lang/Object;" && provided_oomir_type.is_jvm_primitive() {
+            if let Some((wrapper_class, box_method, box_desc)) =
+                provided_oomir_type.get_boxing_info()
+            {
+                let class_index = self.constant_pool.add_class(wrapper_class)?;
+                let method_ref_index =
+                    self.constant_pool
+                        .add_method_ref(class_index, box_method, box_desc)?;
+                self.jvm_instructions
+                    .push(Instruction::Invokestatic(method_ref_index));
+                return Ok(());
+            }
+
+            return Err(jvm::Error::VerificationError {
+                context: format!("Function {}", self.oomir_func.name),
+                message: format!(
+                    "No boxing information found for type {:?}",
+                    provided_oomir_type
+                ),
+            });
+        }
+
+        if expected_jvm_type.starts_with('L') && !expected_jvm_type.ends_with(';') {
+            return Err(jvm::Error::VerificationError {
+                context: format!("Function {}", self.oomir_func.name),
+                message: format!(
+                    "Invalid JVM descriptor for expected type: {}",
+                    expected_jvm_type
+                ),
+            });
+        }
+
+        Ok(())
+    }
+
+    fn cast_loaded_shim_return_if_needed(
+        &mut self,
+        actual_type: &oomir::Type,
+        expected_type: &oomir::Type,
+    ) -> Result<(), jvm::Error> {
+        if actual_type == expected_type
+            || actual_type.to_jvm_descriptor() == expected_type.to_jvm_descriptor()
+            || *expected_type == oomir::Type::Void
+        {
+            return Ok(());
+        }
+
+        let Some(class_name) = expected_type.get_class_name() else {
+            return Ok(());
+        };
+        let class_index = self.constant_pool.add_class(class_name)?;
+        self.jvm_instructions
+            .push(Instruction::Checkcast(class_index));
         Ok(())
     }
 
@@ -2594,166 +2745,21 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 // --- Shim Lookup using JSON metadata ---
                 match get_shim_metadata() {
                     Ok(shim_map) => {
-                        // Use the function_name (make_jvm_safe output) as the key
+                        // Use the lowered function name as the key.
                         if let Some(shim_info) = shim_map.get(function_name) {
                             handled_as_shim = true;
-
-                            let shim_descriptor = Some(shim_info.descriptor.clone()); // Store descriptor
-
-                            // --- Argument Loading with Boxing ---
-                            let expected_jvm_param_types = parse_jvm_descriptor_params(
-                                &shim_info.descriptor,
-                            )
-                            .map_err(|e| jvm::Error::VerificationError {
-                                context: format!("Function {}", self.oomir_func.name),
-                                message: format!("Error parsing shim descriptor: {}", e),
-                            })?;
-
-                            if args.len() != expected_jvm_param_types.len() {
-                                return Err(jvm::Error::VerificationError {
-                                    context: format!("Function {}", self.oomir_func.name),
-                                    message: format!(
-                                        "Shim argument count mismatch for '{}': descriptor '{}' expects {}, found {}",
-                                        function_name,
-                                        shim_info.descriptor,
-                                        expected_jvm_param_types.len(),
-                                        args.len()
-                                    ),
-                                });
-                            }
-
-                            for (arg_operand, expected_jvm_type) in
-                                args.iter().zip(expected_jvm_param_types.iter())
-                            {
-                                // 1. Get the OOMIR type of the argument being passed
-                                let provided_oomir_type = get_operand_type(arg_operand);
-
-                                // 2. Load the raw value onto the stack first
-                                self.load_call_argument(arg_operand)?; // Assumes this loads the primitive value correctly
-
-                                // 3. Check if boxing is needed: Expects Object, Got Primitive
-                                //    (Only boxing to java.lang.Object for now)
-                                if expected_jvm_type == "Ljava/lang/Object;"
-                                    && provided_oomir_type.is_jvm_primitive()
-                                {
-                                    // 4. Get boxing information
-                                    if let Some((wrapper_class, box_method, box_desc)) =
-                                        provided_oomir_type.get_boxing_info()
-                                    {
-                                        // 5. Add MethodRef for the boxing method (e.g., Integer.valueOf)
-                                        let class_index =
-                                            self.constant_pool.add_class(wrapper_class)?;
-                                        let method_ref_index = self.constant_pool.add_method_ref(
-                                            class_index,
-                                            box_method,
-                                            box_desc,
-                                        )?;
-                                        // 6. Add the invokestatic instruction for boxing
-                                        self.jvm_instructions
-                                            .push(JI::Invokestatic(method_ref_index));
-                                    } else {
-                                        // This indicates an internal error - we identified a primitive
-                                        // but don't know how to box it.
-                                        return Err(jvm::Error::VerificationError {
-                                            context: format!("Function {}", self.oomir_func.name),
-                                            message: format!(
-                                                "No boxing information found for type {:?}",
-                                                provided_oomir_type
-                                            ),
-                                        });
-                                    }
-                                } else if expected_jvm_type.starts_with('L')
-                                    && !expected_jvm_type.ends_with(';')
-                                {
-                                    // Basic sanity check for descriptor parsing
-                                    return Err(jvm::Error::VerificationError {
-                                        context: format!("Function {}", self.oomir_func.name),
-                                        message: format!(
-                                            "Invalid JVM descriptor for expected type: {}",
-                                            expected_jvm_type
-                                        ),
-                                    });
-                                }
-                                // Else: No boxing needed. The type is either already an object,
-                                // or the expected type is not Object (e.g., primitive expected, primitive provided).
-                            } // End loop over args
-
-                            // --- Continue with Shim Call Invocation ---
-
-                            // Add MethodRef for the actual shim function
-                            let shim_class =
-                                if function_name == "panic" || function_name == "panic_fmt" {
-                                    "org/rustlang/core/panicking"
-                                } else {
-                                    "org/rustlang/core/Core"
-                                };
-                            let class_index = self.constant_pool.add_class(shim_class)?;
-                            let method_ref_index = self.constant_pool.add_method_ref(
-                                class_index,
-                                function_name, // Use the original function name key
-                                &shim_info.descriptor, // Use the stored descriptor
-                            )?;
-
-                            // Add invoke instruction
-                            if shim_info.is_static {
-                                self.jvm_instructions
-                                    .push(JI::Invokestatic(method_ref_index));
-                            } else {
-                                // Handle non-static if needed, or keep error
-                                return Err(jvm::Error::VerificationError {
-                                    context: format!("Function {}", self.oomir_func.name),
-                                    message: format!(
-                                        "Non-static shim function '{}' not supported",
-                                        function_name
-                                    ),
-                                });
-                            }
-
-                            // Check for diverging (can use shim_info if available)
-                            if function_name == "panic"
+                            is_diverging_call = function_name == "panic"
                                 || function_name == "panic_fmt"
                                 || function_name == "core_panicking_panic"
-                                || function_name == "core_assert_failed"
-                            // Or check shim_info.diverges
-                            {
-                                is_diverging_call = true;
-                            }
-
-                            // Store result or pop (using the stored descriptor)
-                            let shim_descriptor = shim_descriptor
-                                .as_ref()
-                                .expect("no descriptor found for shim?");
-                            if !is_diverging_call && !shim_descriptor.ends_with(")V") {
-                                // Parse the OOMIR type corresponding to the shim's return value
-                                let shim_return_oomir_type =
-                                    oomir::Type::from_jvm_descriptor_return_type(shim_descriptor);
-
-                                if let Some(dest_var) = dest {
-                                    // Now, store the result (which is correctly typed on the stack)
-                                    // Use the OOMIR type derived from the descriptor for storage logic
-                                    self.store_result(dest_var, &shim_return_oomir_type)?;
-                                } else {
-                                    // No destination variable, just pop the result based on its size
-                                    // Use the OOMIR type derived from the descriptor
-                                    match get_type_size(&shim_return_oomir_type) {
-                                        1 => self.jvm_instructions.push(JI::Pop),
-                                        2 => self.jvm_instructions.push(JI::Pop2),
-                                        _ => { /* Void return already handled, ignore size 0 */ }
-                                    }
-                                }
-                            } else if dest.is_some()
-                                && !is_diverging_call
-                                && shim_info.descriptor.ends_with(")V")
-                            {
-                                breadcrumbs::log!(
-                                    breadcrumbs::LogLevel::Info,
-                                    "bytecode-gen",
-                                    format!(
-                                        "Info: Ignoring store for void return from shim '{}'",
-                                        function_name
-                                    )
-                                );
-                            }
+                                || function_name == "core_assert_failed";
+                            self.emit_shim_call(
+                                function_name,
+                                shim_info,
+                                args,
+                                dest,
+                                None,
+                                is_diverging_call,
+                            )?;
                         } // End if shim_info found by name
                     } // End Ok(shim_map)
                     Err(e) => {
@@ -2857,7 +2863,10 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 args,
                 signature,
             } => {
-                let interface_name = signature.fn_ptr_interface_name();
+                let interface_name = match function_ptr.get_type() {
+                    Some(oomir::Type::Interface(name)) => name,
+                    _ => signature.fn_ptr_interface_name(),
+                };
                 let class_index = self.constant_pool.add_class(&interface_name)?;
                 let descriptor = signature.to_jvm_descriptor_with_explicit_params();
                 let method_ref = self.constant_pool.add_interface_method_ref(
@@ -3461,6 +3470,21 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 method_ty,
                 args,
             } => {
+                if let Ok(shim_map) = get_shim_metadata() {
+                    let shim_key = format!("{class_name}::{method_name}");
+                    if let Some(shim_info) = shim_map.get(&shim_key) {
+                        self.emit_shim_call(
+                            &shim_key,
+                            shim_info,
+                            args,
+                            dest,
+                            Some(method_ty.ret.as_ref()),
+                            false,
+                        )?;
+                        return Ok(());
+                    }
+                }
+
                 // 1. Add Method reference to constant pool
                 let class_index = self.constant_pool.add_class(class_name)?;
                 let method_ref_index = self.constant_pool.add_method_ref(

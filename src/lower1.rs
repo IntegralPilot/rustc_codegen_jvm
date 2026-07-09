@@ -18,6 +18,7 @@ use types::ty_to_oomir_type;
 
 mod closures;
 pub mod control_flow;
+pub mod jvm_names;
 pub mod naming;
 pub mod operand;
 pub mod place;

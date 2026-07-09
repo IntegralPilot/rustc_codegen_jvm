@@ -2,11 +2,19 @@
 // This module emits reusable OOMIR checked arithmetic functions for integer types.
 use crate::oomir::{CodeBlock, DataType, DataTypeMethod, Function, Signature};
 use crate::oomir::{Constant, Instruction, Operand, Type};
+use sha2::Digest;
 use std::collections::HashMap;
 
 /// Generate the intrinsic function name for a checked operation
-pub fn get_intrinsic_function_name(operation: &str, ty_suffix: &str) -> String {
-    format!("__oomir_checked_{}_{}", operation, ty_suffix)
+pub fn get_intrinsic_function_name(
+    operation: &str,
+    ty_suffix: &str,
+    result_struct_name: &str,
+) -> String {
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(result_struct_name.as_bytes());
+    let hash = format!("{:x}", hasher.finalize());
+    format!("__oomir_checked_{}_{}_{}", operation, ty_suffix, &hash[..8])
 }
 
 /// Emits a checked arithmetic intrinsic function for the given integer type
@@ -15,8 +23,9 @@ pub fn emit_checked_arithmetic_intrinsic(
     operation: &str, // "add", "sub", "mul"
     ty: &Type,
     ty_suffix: &str, // "i32", "i64", etc.
+    result_struct_name: &str,
 ) -> Function {
-    let fn_name = get_intrinsic_function_name(operation, ty_suffix);
+    let fn_name = get_intrinsic_function_name(operation, ty_suffix, result_struct_name);
 
     // Use MIR naming convention for parameters
     let a = "_1".to_string();
@@ -24,9 +33,6 @@ pub fn emit_checked_arithmetic_intrinsic(
     let result = "result".to_string();
     let overflow = "overflow".to_string();
     let tmp_struct = "tmp_struct".to_string();
-
-    // Use the standard tuple type naming that matches MIR
-    let result_struct_name = format!("Tuple_{}_bool", ty_suffix);
 
     let mut instrs = Vec::new();
 
@@ -262,7 +268,7 @@ pub fn emit_checked_arithmetic_intrinsic(
     // Construct tuple object (Tuple_i32_bool, etc.)
     instrs.push(Instruction::ConstructObject {
         dest: tmp_struct.clone(),
-        class_name: result_struct_name.clone(),
+        class_name: result_struct_name.to_string(),
         args: vec![
             (
                 Operand::Variable {
@@ -283,7 +289,7 @@ pub fn emit_checked_arithmetic_intrinsic(
     instrs.push(Instruction::Return {
         operand: Some(Operand::Variable {
             name: tmp_struct.clone(),
-            ty: Type::Class(result_struct_name.clone()),
+            ty: Type::Class(result_struct_name.to_string()),
         }),
     });
 
@@ -292,7 +298,7 @@ pub fn emit_checked_arithmetic_intrinsic(
         owner_class: None,
         signature: Signature {
             params: vec![(a, ty.clone()), (b, ty.clone())],
-            ret: Box::new(Type::Class(result_struct_name)),
+            ret: Box::new(Type::Class(result_struct_name.to_string())),
             is_static: true,
         },
         body: CodeBlock {
@@ -314,11 +320,11 @@ pub fn emit_checked_arithmetic_intrinsic(
 
 /// Emit all needed checked arithmetic intrinsics
 /// Returns the intrinsic class
-pub fn emit_all_needed_intrinsics(needed_intrinsics: &[(String, String)]) -> DataType {
+pub fn emit_all_needed_intrinsics(needed_intrinsics: &[(String, String, String)]) -> DataType {
     // Create RustcCodegenJVMIntrinsics class with static methods
     let mut intrinsic_methods = HashMap::new();
 
-    for (operation, ty_suffix) in needed_intrinsics {
+    for (operation, ty_suffix, result_struct_name) in needed_intrinsics {
         let ty = match ty_suffix.as_str() {
             "i8" => Type::I8,
             "i16" => Type::I16,
@@ -327,7 +333,8 @@ pub fn emit_all_needed_intrinsics(needed_intrinsics: &[(String, String)]) -> Dat
             _ => panic!("Unsupported type suffix: {}", ty_suffix),
         };
 
-        let function = emit_checked_arithmetic_intrinsic(operation, &ty, ty_suffix);
+        let function =
+            emit_checked_arithmetic_intrinsic(operation, &ty, ty_suffix, result_struct_name);
         intrinsic_methods.insert(function.name.clone(), DataTypeMethod::Function(function));
     }
 

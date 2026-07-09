@@ -28,7 +28,7 @@ use rustc_codegen_ssa::back::archive::{ArArchiveBuilder, ArchiveBuilder, Archive
 use rustc_codegen_ssa::{
     CompiledModule, CompiledModules, CrateInfo, ModuleKind, traits::CodegenBackend,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use rustc_data_structures::unord::UnordMap;
 use rustc_hir::{QPath, TyKind as HirTyKind};
@@ -132,487 +132,6 @@ fn lower_closure_to_oomir<'tcx>(
     oomir_module.merge_data_types(&data_types);
 }
 
-fn placeholder_operand_for_constructor_field(ty: &Type) -> Operand {
-    let constant = match ty {
-        Type::Boolean => oomir::Constant::Boolean(false),
-        Type::Char => oomir::Constant::Char('\0'),
-        Type::I8 => oomir::Constant::I8(0),
-        Type::I16 => oomir::Constant::I16(0),
-        Type::I32 => oomir::Constant::I32(0),
-        Type::I64 => oomir::Constant::I64(0),
-        Type::F32 => oomir::Constant::F32(0.0),
-        Type::F64 => oomir::Constant::F64(0.0),
-        Type::String
-        | Type::Class(_)
-        | Type::Interface(_)
-        | Type::Array(_)
-        | Type::MutableReference(_)
-        | Type::Reference(_) => oomir::Constant::Null(ty.clone()),
-        Type::Void => panic!("unexpected Void field type in constructor placeholder"),
-    };
-    Operand::Constant(constant)
-}
-
-fn constructor_args_from_fields(
-    fields: &[(String, Type)],
-    values: &[(&str, Operand)],
-) -> Vec<(Operand, Type)> {
-    fields
-        .iter()
-        .map(|(field_name, field_ty)| {
-            let operand = values
-                .iter()
-                .find_map(|(name, operand)| (*name == field_name).then(|| operand.clone()))
-                .unwrap_or_else(|| {
-                    breadcrumbs::log!(
-                        breadcrumbs::LogLevel::Info,
-                        "shim",
-                        format!(
-                            "Info: Using constructor placeholder for missing shim field '{}' ({:?})",
-                            field_name, field_ty
-                        )
-                    );
-                    placeholder_operand_for_constructor_field(field_ty)
-                });
-            (operand, field_ty.clone())
-        })
-        .collect()
-}
-
-fn pad_construct_object_args_in_function(
-    function: &mut oomir::Function,
-    class_fields: &HashMap<String, Vec<(String, Type)>>,
-) {
-    for block in function.body.basic_blocks.values_mut() {
-        for instruction in &mut block.instructions {
-            let oomir::Instruction::ConstructObject {
-                class_name, args, ..
-            } = instruction
-            else {
-                continue;
-            };
-
-            let Some(fields) = class_fields.get(class_name) else {
-                continue;
-            };
-
-            if args.len() >= fields.len() {
-                continue;
-            }
-
-            for (field_name, field_ty) in fields.iter().skip(args.len()) {
-                breadcrumbs::log!(
-                    breadcrumbs::LogLevel::Info,
-                    "shim",
-                    format!(
-                        "Info: Padding constructor for '{}' with placeholder field '{}' ({:?})",
-                        class_name, field_name, field_ty
-                    )
-                );
-                args.push((
-                    placeholder_operand_for_constructor_field(field_ty),
-                    field_ty.clone(),
-                ));
-            }
-        }
-    }
-}
-
-fn pad_construct_object_args_for_field_constructors(oomir_module: &mut oomir::Module) {
-    let class_fields: HashMap<String, Vec<(String, Type)>> = oomir_module
-        .data_types
-        .iter()
-        .filter_map(|(class_name, data_type)| match data_type {
-            oomir::DataType::Class { fields, .. } => {
-                let mut fields = fields.clone();
-                let mut seen_fields = HashSet::new();
-                fields.retain(|(name, _)| seen_fields.insert(name.clone()));
-                Some((class_name.clone(), fields))
-            }
-            oomir::DataType::Interface { .. } => None,
-        })
-        .collect();
-
-    for function in oomir_module.functions.values_mut() {
-        pad_construct_object_args_in_function(function, &class_fields);
-    }
-
-    for data_type in oomir_module.data_types.values_mut() {
-        let oomir::DataType::Class { methods, .. } = data_type else {
-            continue;
-        };
-
-        for method in methods.values_mut() {
-            if let oomir::DataTypeMethod::Function(function) = method {
-                pad_construct_object_args_in_function(function, &class_fields);
-            }
-        }
-    }
-}
-
-fn install_fmt_arguments_shim(oomir_module: &mut oomir::Module) {
-    let class_name = "Arguments__".to_string();
-    let Some(oomir::DataType::Class {
-        fields, methods, ..
-    }) = oomir_module.data_types.get_mut(&class_name)
-    else {
-        return;
-    };
-
-    if !fields.iter().any(|(name, _)| name == "message") {
-        fields.push(("message".to_string(), Type::String));
-    }
-    let template_ty = fields
-        .iter()
-        .find(|(name, _)| name == "template")
-        .map(|(_, ty)| ty.clone())
-        .unwrap_or_else(|| {
-            let ty = Type::Class("java/lang/Object".to_string());
-            fields.push(("template".to_string(), ty.clone()));
-            ty
-        });
-    let args_ty = fields
-        .iter()
-        .find(|(name, _)| name == "args")
-        .map(|(_, ty)| ty.clone())
-        .unwrap_or_else(|| {
-            let ty = Type::Class("java/lang/Object".to_string());
-            fields.push(("args".to_string(), ty.clone()));
-            ty
-        });
-
-    let from_str_fields = fields.clone();
-    methods.entry("from_str".to_string()).or_insert_with(|| {
-        let block = oomir::BasicBlock {
-            label: "bb0".to_string(),
-            instructions: vec![
-                oomir::Instruction::ConstructObject {
-                    dest: "_args".to_string(),
-                    class_name: class_name.clone(),
-                    args: constructor_args_from_fields(
-                        &from_str_fields,
-                        &[(
-                            "message",
-                            Operand::Variable {
-                                name: "_1".to_string(),
-                                ty: Type::String,
-                            },
-                        )],
-                    ),
-                },
-                oomir::Instruction::Return {
-                    operand: Some(Operand::Variable {
-                        name: "_args".to_string(),
-                        ty: Type::Class(class_name.clone()),
-                    }),
-                },
-            ],
-        };
-        oomir::DataTypeMethod::Function(oomir::Function {
-            name: "from_str".to_string(),
-            owner_class: None,
-            signature: oomir::Signature {
-                params: vec![("s".to_string(), Type::String)],
-                ret: Box::new(Type::Class(class_name.clone())),
-                is_static: true,
-            },
-            body: oomir::CodeBlock {
-                entry: "bb0".to_string(),
-                basic_blocks: HashMap::from([("bb0".to_string(), block)]),
-            },
-        })
-    });
-
-    let new_fields = fields.clone();
-    methods.entry("new".to_string()).or_insert_with(|| {
-        let argument_class = "core_fmt_rt_Argument__".to_string();
-        let block = oomir::BasicBlock {
-            label: "bb0".to_string(),
-            instructions: vec![
-                oomir::Instruction::InvokeStatic {
-                    dest: Some("_message".to_string()),
-                    class_name: "org/rustlang/core/Core".to_string(),
-                    method_name: "formatArgs".to_string(),
-                    method_ty: oomir::Signature {
-                        params: vec![
-                            ("template".to_string(), Type::Array(Box::new(Type::I16))),
-                            (
-                                "args".to_string(),
-                                Type::Array(Box::new(Type::Class("java/lang/Object".to_string()))),
-                            ),
-                        ],
-                        ret: Box::new(Type::String),
-                        is_static: true,
-                    },
-                    args: vec![
-                        Operand::Variable {
-                            name: "_1".to_string(),
-                            ty: Type::Array(Box::new(Type::I16)),
-                        },
-                        Operand::Variable {
-                            name: "_2".to_string(),
-                            ty: Type::Array(Box::new(Type::Class(argument_class.clone()))),
-                        },
-                    ],
-                },
-                oomir::Instruction::ConstructObject {
-                    dest: "_args".to_string(),
-                    class_name: class_name.clone(),
-                    args: constructor_args_from_fields(
-                        &new_fields,
-                        &[
-                            (
-                                "message",
-                                Operand::Variable {
-                                    name: "_message".to_string(),
-                                    ty: Type::String,
-                                },
-                            ),
-                            (
-                                "template",
-                                Operand::Variable {
-                                    name: "_1".to_string(),
-                                    ty: Type::Array(Box::new(Type::I16)),
-                                },
-                            ),
-                            (
-                                "args",
-                                Operand::Variable {
-                                    name: "_2".to_string(),
-                                    ty: Type::Array(Box::new(Type::Class(argument_class.clone()))),
-                                },
-                            ),
-                        ],
-                    ),
-                },
-                oomir::Instruction::Return {
-                    operand: Some(Operand::Variable {
-                        name: "_args".to_string(),
-                        ty: Type::Class(class_name.clone()),
-                    }),
-                },
-            ],
-        };
-        oomir::DataTypeMethod::Function(oomir::Function {
-            name: "new".to_string(),
-            owner_class: None,
-            signature: oomir::Signature {
-                params: vec![
-                    ("template".to_string(), Type::Array(Box::new(Type::I16))),
-                    (
-                        "args".to_string(),
-                        Type::Array(Box::new(Type::Class(argument_class))),
-                    ),
-                ],
-                ret: Box::new(Type::Class(class_name.clone())),
-                is_static: true,
-            },
-            body: oomir::CodeBlock {
-                entry: "bb0".to_string(),
-                basic_blocks: HashMap::from([("bb0".to_string(), block)]),
-            },
-        })
-    });
-
-    methods.entry("toString".to_string()).or_insert_with(|| {
-        let block = oomir::BasicBlock {
-            label: "bb0".to_string(),
-            instructions: vec![
-                oomir::Instruction::GetField {
-                    dest: "_message".to_string(),
-                    object: Operand::Variable {
-                        name: "_1".to_string(),
-                        ty: Type::Class(class_name.clone()),
-                    },
-                    field_name: "message".to_string(),
-                    field_ty: Type::String,
-                    owner_class: class_name.clone(),
-                },
-                oomir::Instruction::GetField {
-                    dest: "_template".to_string(),
-                    object: Operand::Variable {
-                        name: "_1".to_string(),
-                        ty: Type::Class(class_name.clone()),
-                    },
-                    field_name: "template".to_string(),
-                    field_ty: template_ty.clone(),
-                    owner_class: class_name.clone(),
-                },
-                oomir::Instruction::GetField {
-                    dest: "_args_field".to_string(),
-                    object: Operand::Variable {
-                        name: "_1".to_string(),
-                        ty: Type::Class(class_name.clone()),
-                    },
-                    field_name: "args".to_string(),
-                    field_ty: args_ty.clone(),
-                    owner_class: class_name.clone(),
-                },
-                oomir::Instruction::InvokeStatic {
-                    dest: Some("_formatted".to_string()),
-                    class_name: "org/rustlang/core/Core".to_string(),
-                    method_name: "formatArguments".to_string(),
-                    method_ty: oomir::Signature {
-                        params: vec![
-                            ("message".to_string(), Type::String),
-                            (
-                                "template".to_string(),
-                                Type::Class("java/lang/Object".to_string()),
-                            ),
-                            (
-                                "args".to_string(),
-                                Type::Class("java/lang/Object".to_string()),
-                            ),
-                        ],
-                        ret: Box::new(Type::String),
-                        is_static: true,
-                    },
-                    args: vec![
-                        Operand::Variable {
-                            name: "_message".to_string(),
-                            ty: Type::String,
-                        },
-                        Operand::Variable {
-                            name: "_template".to_string(),
-                            ty: template_ty.clone(),
-                        },
-                        Operand::Variable {
-                            name: "_args_field".to_string(),
-                            ty: args_ty.clone(),
-                        },
-                    ],
-                },
-                oomir::Instruction::Return {
-                    operand: Some(Operand::Variable {
-                        name: "_formatted".to_string(),
-                        ty: Type::String,
-                    }),
-                },
-            ],
-        };
-        oomir::DataTypeMethod::Function(oomir::Function {
-            name: "toString".to_string(),
-            owner_class: None,
-            signature: oomir::Signature {
-                params: vec![("self".to_string(), Type::Class(class_name.clone()))],
-                ret: Box::new(Type::String),
-                is_static: false,
-            },
-            body: oomir::CodeBlock {
-                entry: "bb0".to_string(),
-                basic_blocks: HashMap::from([("bb0".to_string(), block)]),
-            },
-        })
-    });
-}
-
-fn install_fmt_argument_shim(oomir_module: &mut oomir::Module) {
-    let class_name = "core_fmt_rt_Argument__".to_string();
-    let Some(oomir::DataType::Class {
-        fields, methods, ..
-    }) = oomir_module.data_types.get_mut(&class_name)
-    else {
-        return;
-    };
-
-    if !fields.iter().any(|(name, _)| name == "value") {
-        fields.push(("value".to_string(), Type::String));
-    }
-
-    let argument_fields = fields.clone();
-    methods.entry("new_display".to_string()).or_insert_with(|| {
-        let block = oomir::BasicBlock {
-            label: "bb0".to_string(),
-            instructions: vec![
-                oomir::Instruction::InvokeStatic {
-                    dest: Some("_value".to_string()),
-                    class_name: "java/lang/String".to_string(),
-                    method_name: "valueOf".to_string(),
-                    method_ty: oomir::Signature {
-                        params: vec![("value".to_string(), Type::I32)],
-                        ret: Box::new(Type::String),
-                        is_static: true,
-                    },
-                    args: vec![Operand::Variable {
-                        name: "_1".to_string(),
-                        ty: Type::I32,
-                    }],
-                },
-                oomir::Instruction::ConstructObject {
-                    dest: "_arg".to_string(),
-                    class_name: class_name.clone(),
-                    args: constructor_args_from_fields(
-                        &argument_fields,
-                        &[(
-                            "value",
-                            Operand::Variable {
-                                name: "_value".to_string(),
-                                ty: Type::String,
-                            },
-                        )],
-                    ),
-                },
-                oomir::Instruction::Return {
-                    operand: Some(Operand::Variable {
-                        name: "_arg".to_string(),
-                        ty: Type::Class(class_name.clone()),
-                    }),
-                },
-            ],
-        };
-        oomir::DataTypeMethod::Function(oomir::Function {
-            name: "new_display".to_string(),
-            owner_class: None,
-            signature: oomir::Signature {
-                params: vec![("value".to_string(), Type::I32)],
-                ret: Box::new(Type::Class(class_name.clone())),
-                is_static: true,
-            },
-            body: oomir::CodeBlock {
-                entry: "bb0".to_string(),
-                basic_blocks: HashMap::from([("bb0".to_string(), block)]),
-            },
-        })
-    });
-
-    methods.entry("toString".to_string()).or_insert_with(|| {
-        let block = oomir::BasicBlock {
-            label: "bb0".to_string(),
-            instructions: vec![
-                oomir::Instruction::GetField {
-                    dest: "_value".to_string(),
-                    object: Operand::Variable {
-                        name: "_1".to_string(),
-                        ty: Type::Class(class_name.clone()),
-                    },
-                    field_name: "value".to_string(),
-                    field_ty: Type::String,
-                    owner_class: class_name.clone(),
-                },
-                oomir::Instruction::Return {
-                    operand: Some(Operand::Variable {
-                        name: "_value".to_string(),
-                        ty: Type::String,
-                    }),
-                },
-            ],
-        };
-        oomir::DataTypeMethod::Function(oomir::Function {
-            name: "toString".to_string(),
-            owner_class: None,
-            signature: oomir::Signature {
-                params: vec![("self".to_string(), Type::Class(class_name.clone()))],
-                ret: Box::new(Type::String),
-                is_static: false,
-            },
-            body: oomir::CodeBlock {
-                entry: "bb0".to_string(),
-                basic_blocks: HashMap::from([("bb0".to_string(), block)]),
-            },
-        })
-    });
-}
-
 impl CodegenBackend for MyBackend {
     fn name(&self) -> &'static str {
         "rustc_codegen_jvm"
@@ -627,12 +146,12 @@ impl CodegenBackend for MyBackend {
     }
 
     fn codegen_crate<'a>(&self, tcx: TyCtxt<'_>) -> Box<dyn Any> {
-        let crate_name = tcx
-            .crate_name(rustc_hir::def_id::CRATE_DEF_ID.to_def_id().krate)
-            .to_string();
+        let rust_crate = rustc_hir::def_id::CRATE_DEF_ID.to_def_id().krate;
+        let crate_name = tcx.crate_name(rust_crate).to_string();
+        let crate_module_class = lower1::jvm_names::crate_module_class(tcx, rust_crate);
 
         let mut oomir_module = oomir::Module {
-            name: crate_name.clone(),
+            name: crate_module_class.clone(),
             functions: std::collections::HashMap::new(),
             data_types: std::collections::HashMap::new(),
         };
@@ -757,7 +276,7 @@ impl CodegenBackend for MyBackend {
                                         let name = lower1::naming::mono_fn_name_from_instance(
                                             tcx, instance,
                                         );
-                                        if seen_fn_names.insert(name.key(&crate_name)) {
+                                        if seen_fn_names.insert(name.key(&crate_module_class)) {
                                             fn_instances_to_lower.push((instance, name));
                                         }
                                     } else if should_lower_non_local(tcx, *fn_def_id) {
@@ -784,7 +303,7 @@ impl CodegenBackend for MyBackend {
                                         let name = lower1::naming::mono_fn_name_from_instance(
                                             tcx, instance,
                                         );
-                                        if seen_fn_names.insert(name.key(&crate_name)) {
+                                        if seen_fn_names.insert(name.key(&crate_module_class)) {
                                             fn_instances_to_lower.push((instance, name));
                                         }
                                     } else {
@@ -867,7 +386,7 @@ impl CodegenBackend for MyBackend {
                         "unknown_type_kind".into()
                     }
                 };
-                let legacy_ident = lower1::place::make_jvm_safe(&legacy_ident);
+                let legacy_ident = lower1::jvm_names::member_name(&legacy_ident);
                 let ident = {
                     let impl_instance = rustc_middle::ty::Instance::new_raw(
                         impl_def_id,
@@ -898,16 +417,24 @@ impl CodegenBackend for MyBackend {
                     }
                 };
                 let of_trait = match impl_a.of_trait {
-                    Some(trait_impl_header) => Some(lower1::place::make_jvm_safe(
-                        trait_impl_header
-                            .trait_ref
-                            .path
-                            .segments
-                            .last()
-                            .unwrap()
-                            .ident
-                            .as_str(),
-                    )),
+                    Some(trait_impl_header) => trait_impl_header
+                        .trait_ref
+                        .path
+                        .res
+                        .opt_def_id()
+                        .map(|def_id| lower1::jvm_names::class_for_def_id(tcx, def_id))
+                        .or_else(|| {
+                            Some(lower1::jvm_names::member_name(
+                                trait_impl_header
+                                    .trait_ref
+                                    .path
+                                    .segments
+                                    .last()
+                                    .unwrap()
+                                    .ident
+                                    .as_str(),
+                            ))
+                        }),
                     None => None,
                 };
                 for item in impl_a.items {
@@ -1016,7 +543,7 @@ impl CodegenBackend for MyBackend {
                                             let name = lower1::naming::mono_fn_name_from_instance(
                                                 tcx, instance,
                                             );
-                                            if seen_fn_names.insert(name.key(&crate_name)) {
+                                            if seen_fn_names.insert(name.key(&crate_module_class)) {
                                                 fn_instances_to_lower.push((instance, name));
                                             }
                                         } else if should_lower_non_local(tcx, *fn_def_id) {
@@ -1044,7 +571,7 @@ impl CodegenBackend for MyBackend {
                                             let name = lower1::naming::mono_fn_name_from_instance(
                                                 tcx, instance,
                                             );
-                                            if seen_fn_names.insert(name.key(&crate_name)) {
+                                            if seen_fn_names.insert(name.key(&crate_module_class)) {
                                                 fn_instances_to_lower.push((instance, name));
                                             }
                                         } else {
@@ -1249,7 +776,7 @@ impl CodegenBackend for MyBackend {
                 ..
             } = item.kind
             {
-                let ident = lower1::place::make_jvm_safe(ident.as_str());
+                let ident = lower1::jvm_names::class_for_def_id(tcx, item.owner_id.to_def_id());
                 let mut fn_data = HashMap::new();
                 for item in item_refs {
                     let name = item.to_ident(tcx).as_str().to_string();
@@ -1451,10 +978,6 @@ impl CodegenBackend for MyBackend {
         for closure_def_id in closures_to_lower {
             lower_closure_to_oomir(tcx, closure_def_id, &mut oomir_module);
         }
-
-        install_fmt_argument_shim(&mut oomir_module);
-        install_fmt_arguments_shim(&mut oomir_module);
-        pad_construct_object_args_for_field_constructors(&mut oomir_module);
 
         breadcrumbs::log!(
             breadcrumbs::LogLevel::Info,

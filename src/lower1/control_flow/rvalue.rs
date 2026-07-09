@@ -10,17 +10,20 @@ use std::collections::HashMap;
 
 use super::{
     super::{
+        jvm_names,
         operand::{
             convert_operand, extract_number_from_operand, get_placeholder_operand,
             handle_const_value,
         },
-        place::{emit_instructions_to_get_on_own, get_place_type, make_jvm_safe, place_to_string},
+        place::{emit_instructions_to_get_on_own, get_place_type, place_to_string},
         types::{
             ensure_fn_ptr_interface, ensure_union_data_type, fn_ptr_signature_from_ty,
             generate_adt_jvm_class_name, short_hash, ty_to_oomir_type, union_from_method_name,
         },
     },
-    checked_ops::emit_checked_arithmetic_oomir_instructions,
+    checked_ops::{
+        checked_arithmetic_tuple_local_name, emit_checked_arithmetic_oomir_instructions,
+    },
     oomir::{self, DataTypeMethod},
 };
 
@@ -31,7 +34,7 @@ static TEMP_VAR_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 fn generate_temp_var_name(base_name: &str) -> String {
     let count = TEMP_VAR_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{}_tmp{}", make_jvm_safe(base_name), count)
+    format!("{}_tmp{}", jvm_names::member_name(base_name), count)
 }
 
 fn adapt_value_for_field(
@@ -83,11 +86,13 @@ fn adapt_value_for_field(
     value_operand
 }
 
-fn ensure_fn_pointer_adapter_class(
+fn ensure_fn_pointer_adapter_class<'tcx>(
     data_types: &mut HashMap<String, oomir::DataType>,
     target_function: Option<&super::super::naming::FnNameData>,
     signature: &oomir::Signature,
     interface_name: &str,
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
 ) -> String {
     let descriptor = signature.to_jvm_descriptor_with_explicit_params();
     let target_name = target_function
@@ -99,8 +104,15 @@ fn ensure_fn_pointer_adapter_class(
         })
         .unwrap_or_else(|| "unsupported".to_string());
     let hash = short_hash(&format!("{target_name}:{descriptor}"), 10);
-    let base_name: String = make_jvm_safe(&target_name).chars().take(80).collect();
-    let class_name = format!("FnPtrImpl_{}_{}", base_name, hash);
+    let base_name: String = jvm_names::path_segment(&target_name)
+        .chars()
+        .take(80)
+        .collect();
+    let class_name = jvm_names::synthetic_class_for_instance(
+        tcx,
+        instance,
+        format!("FnPtrImpl_{base_name}_{hash}"),
+    );
 
     let mut method_params = Vec::with_capacity(signature.params.len() + 1);
     method_params.push(("self".to_string(), oomir::Type::Class(class_name.clone())));
@@ -445,14 +457,16 @@ pub fn convert_rvalue_to_operand<'a>(
                     );
 
                     let source_mir_ty = source_place.ty(&mir.local_decls, tcx).ty;
-                    if matches!(source_mir_ty.kind(), TyKind::Closure(..)) {
+                    if let TyKind::Closure(_, closure_args) = source_mir_ty.kind() {
                         let closure_oomir_type =
                             ty_to_oomir_type(source_mir_ty, tcx, data_types, instance);
                         if let oomir::Type::Class(class_name) = closure_oomir_type.clone() {
-                            let has_captures = matches!(
-                                data_types.get(&class_name),
-                                Some(oomir::DataType::Class { fields, .. }) if !fields.is_empty()
-                            );
+                            let has_captures = closure_args
+                                .as_closure()
+                                .upvar_tys()
+                                .iter()
+                                .next()
+                                .is_some();
                             if has_captures {
                                 let (temp_var_name, get_instructions, temp_var_type) =
                                     emit_instructions_to_get_on_own(
@@ -544,7 +558,8 @@ pub fn convert_rvalue_to_operand<'a>(
                         super::super::naming::mono_fn_name_from_instance(tcx, func_instance);
                     let signature =
                         fn_ptr_signature_from_ty(*target_mir_ty, tcx, data_types, instance);
-                    let interface_name = ensure_fn_ptr_interface(&signature, data_types);
+                    let interface_name =
+                        ensure_fn_ptr_interface(&signature, data_types, tcx, instance);
                     let callable_target = func_instance.def_id().is_local().then_some(&fn_name);
                     if callable_target.is_none() {
                         breadcrumbs::log!(
@@ -561,6 +576,8 @@ pub fn convert_rvalue_to_operand<'a>(
                         callable_target,
                         &signature,
                         &interface_name,
+                        tcx,
+                        instance,
                     );
                     breadcrumbs::log!(
                         breadcrumbs::LogLevel::Info,
@@ -599,7 +616,8 @@ pub fn convert_rvalue_to_operand<'a>(
                         fn_ptr_signature_from_ty(source_mir_ty, tcx, data_types, instance);
                     let target_signature =
                         fn_ptr_signature_from_ty(*target_mir_ty, tcx, data_types, instance);
-                    let target_interface = ensure_fn_ptr_interface(&target_signature, data_types);
+                    let target_interface =
+                        ensure_fn_ptr_interface(&target_signature, data_types, tcx, instance);
 
                     if source_signature.to_jvm_descriptor_with_explicit_params()
                         == target_signature.to_jvm_descriptor_with_explicit_params()
@@ -631,6 +649,8 @@ pub fn convert_rvalue_to_operand<'a>(
                             None,
                             &target_signature,
                             &target_interface,
+                            tcx,
+                            instance,
                         );
                         instructions.push(oomir::Instruction::ConstructObject {
                             dest: temp_cast_var.clone(),
@@ -650,7 +670,7 @@ pub fn convert_rvalue_to_operand<'a>(
                         convert_operand(operand, tcx, instance, mir, data_types, &mut instructions);
 
                     if let oomir::Type::Class(class_name) = &oomir_target_type
-                        && class_name.starts_with("NonNull_")
+                        && oomir::is_non_null_class_name(class_name)
                     {
                         breadcrumbs::log!(
                             breadcrumbs::LogLevel::Info,
@@ -840,6 +860,12 @@ pub fn convert_rvalue_to_operand<'a>(
                         BinOp::MulWithOverflow => "mul",
                         _ => unreachable!(),
                     };
+                    let tuple_local_name = checked_arithmetic_tuple_local_name(&op_oomir_ty)
+                        .unwrap_or_else(|| {
+                            panic!("Unsupported type for checked arithmetic: {:?}", op_oomir_ty)
+                        });
+                    let tuple_type_name =
+                        jvm_names::synthetic_class_for_instance(tcx, instance, tuple_local_name);
                     let (checked_instructions, tmp_pair_var, _tmp_result_var, _tmp_overflow_var) =
                         emit_checked_arithmetic_oomir_instructions(
                             &base_temp_name, // Use base temp name for context
@@ -848,24 +874,9 @@ pub fn convert_rvalue_to_operand<'a>(
                             &op_oomir_ty,
                             operation_string,
                             instructions.len(),
+                            &tuple_type_name,
                         );
                     instructions.extend(checked_instructions);
-                    // The checked intrinsic returns a tuple object (Tuple_i32_bool, etc.) in tmp_pair
-                    // Determine the tuple type name based on the operation type
-                    // Note: Must match the names generated by types.rs:readable_oomir_type_name
-                    let tuple_type_name = match &op_oomir_ty {
-                        oomir::Type::I8 => "Tuple_i8_bool".to_string(),
-                        oomir::Type::I16 => "Tuple_i16_bool".to_string(),
-                        oomir::Type::I32 => "Tuple_i32_bool".to_string(),
-                        oomir::Type::I64 => "Tuple_i64_bool".to_string(),
-                        oomir::Type::Class(c) if c == crate::lower2::BIG_INTEGER_CLASS => {
-                            "Tuple_BigInteger_bool".to_string()
-                        }
-                        oomir::Type::Class(c) if c == crate::lower2::BIG_DECIMAL_CLASS => {
-                            "Tuple_BigDecimal_bool".to_string()
-                        }
-                        _ => panic!("Unsupported type for checked arithmetic: {:?}", op_oomir_ty),
-                    };
                     // Return the object as the operand
                     result_operand = oomir::Operand::Variable {
                         name: tmp_pair_var,
@@ -1128,9 +1139,10 @@ pub fn convert_rvalue_to_operand<'a>(
                     for (i, mir_operand) in operands.iter().enumerate() {
                         let (_field_name, field_ty) =
                             closure_fields.get(i).cloned().unwrap_or_else(|| {
+                                let operand_mir_ty = mir_operand.ty(&mir.local_decls, tcx);
                                 (
                                     format!("arg{}", i),
-                                    oomir::Type::Class("java/lang/Object".to_string()),
+                                    ty_to_oomir_type(operand_mir_ty, tcx, data_types, instance),
                                 )
                             });
                         let value_operand = convert_operand(
@@ -1260,7 +1272,7 @@ pub fn convert_rvalue_to_operand<'a>(
                         let variant_class_name = format!(
                             "{}${}",
                             base_enum_name,
-                            make_jvm_safe(&variant_def.name.to_string())
+                            jvm_names::member_name(&variant_def.name.to_string())
                         );
 
                         breadcrumbs::log!(
@@ -1323,7 +1335,7 @@ pub fn convert_rvalue_to_operand<'a>(
                                 .variants()
                                 .iter()
                                 .map(|v| {
-                                    let v_name = make_jvm_safe(&v.name.to_string());
+                                    let v_name = jvm_names::member_name(&v.name.to_string());
                                     let v_fields: Vec<oomir::Type> = v
                                         .fields
                                         .iter()

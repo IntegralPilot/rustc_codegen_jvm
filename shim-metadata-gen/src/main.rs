@@ -5,9 +5,7 @@ use std::io::{Cursor, Read, Write};
 use std::path::PathBuf;
 use std::process::exit;
 
-use ristretto_classfile::{
-    ClassFile, MethodAccessFlags,
-};
+use ristretto_classfile::{ClassFile, MethodAccessFlags};
 use serde::Serialize;
 use zip::ZipArchive;
 
@@ -15,6 +13,10 @@ use zip::ZipArchive;
 struct ShimInfo {
     descriptor: String,
     is_static: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    class_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    method_name: Option<String>,
 }
 
 // Use BTreeMap to keep the shims sorted by function (key) name
@@ -23,7 +25,10 @@ type ShimMap = BTreeMap<String, ShimInfo>;
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() != 3 {
-        eprintln!("Usage: {} <path/to/library.jar> <path/to/output.json>", args[0]);
+        eprintln!(
+            "Usage: {} <path/to/library.jar> <path/to/output.json>",
+            args[0]
+        );
         exit(1);
     }
 
@@ -35,7 +40,10 @@ fn main() {
 
     match generate_metadata(&jar_path, &output_path) {
         Ok(count) => {
-            println!("Successfully generated metadata for {} shim methods.", count);
+            println!(
+                "Successfully generated metadata for {} shim methods.",
+                count
+            );
         }
         Err(e) => {
             eprintln!("Error: {}", e);
@@ -56,9 +64,12 @@ fn generate_metadata(jar_path: &PathBuf, output_path: &PathBuf) -> Result<usize,
         .map_err(|e| format!("Failed to read JAR archive {:?}: {}", jar_path, e))?;
 
     // 2. Find and Read the target .class file
-    let mut class_file_entry = archive
-        .by_name(&target_class_path)
-        .map_err(|e| format!("Class '{}' not found in JAR {:?}: {}", target_class_path, jar_path, e))?;
+    let mut class_file_entry = archive.by_name(&target_class_path).map_err(|e| {
+        format!(
+            "Class '{}' not found in JAR {:?}: {}",
+            target_class_path, jar_path, e
+        )
+    })?;
 
     let mut class_data = Vec::new();
     class_file_entry
@@ -79,7 +90,12 @@ fn generate_metadata(jar_path: &PathBuf, output_path: &PathBuf) -> Result<usize,
     for method in &parsed_class.methods {
         let method_name = cp
             .try_get_utf8(method.name_index)
-            .map_err(|e| format!("Failed to get method name at index {}: {:?}", method.name_index, e))?
+            .map_err(|e| {
+                format!(
+                    "Failed to get method name at index {}: {:?}",
+                    method.name_index, e
+                )
+            })?
             .to_string();
 
         // Skip constructors and static initializers
@@ -113,12 +129,30 @@ fn generate_metadata(jar_path: &PathBuf, output_path: &PathBuf) -> Result<usize,
                 ShimInfo {
                     descriptor,
                     is_static: true, // We already filtered for static
+                    class_name: None,
+                    method_name: None,
                 },
             );
         } else {
-             println!("  Skipping non-public-static method: '{}'", method_name);
+            println!("  Skipping non-public-static method: '{}'", method_name);
         }
     }
+
+    insert_alias(
+        &mut shim_map,
+        "org/rustlang/core/fmt/rt/Argument__::new_display",
+        "new_display",
+    )?;
+    insert_alias(
+        &mut shim_map,
+        "org/rustlang/core/fmt/Arguments__::new",
+        "new_arguments",
+    )?;
+    insert_alias(
+        &mut shim_map,
+        "org/rustlang/core/fmt/Arguments__::from_str",
+        "arguments_from_str",
+    )?;
 
     // 5. Serialize the map to JSON (keys will be in sorted order because of BTreeMap)
     let json_output = serde_json::to_string_pretty(&shim_map)
@@ -133,4 +167,24 @@ fn generate_metadata(jar_path: &PathBuf, output_path: &PathBuf) -> Result<usize,
         .map_err(|e| format!("Failed to write JSON to {:?}: {}", output_path, e))?;
 
     Ok(shim_map.len())
+}
+
+fn insert_alias(shim_map: &mut ShimMap, alias: &str, target_method: &str) -> Result<(), String> {
+    let Some(target) = shim_map.get(target_method).cloned() else {
+        return Err(format!(
+            "Cannot add shim alias '{}' because target method '{}' was not found",
+            alias, target_method
+        ));
+    };
+
+    shim_map.insert(
+        alias.to_string(),
+        ShimInfo {
+            descriptor: target.descriptor,
+            is_static: target.is_static,
+            class_name: Some("org/rustlang/core/Core".to_string()),
+            method_name: Some(target_method.to_string()),
+        },
+    );
+    Ok(())
 }

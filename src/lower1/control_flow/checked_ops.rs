@@ -1,5 +1,17 @@
-use super::checked_intrinsic_registry;
+use super::{checked_intrinsic_registry, checked_intrinsics};
 use crate::oomir::{Constant, Instruction, Operand, Type};
+
+pub fn checked_arithmetic_tuple_local_name(op_ty: &Type) -> Option<&'static str> {
+    match op_ty {
+        Type::I8 => Some("Tuple_i8_bool"),
+        Type::I16 => Some("Tuple_i16_bool"),
+        Type::I32 => Some("Tuple_i32_bool"),
+        Type::I64 => Some("Tuple_i64_bool"),
+        Type::Class(c) if c == crate::lower2::BIG_INTEGER_CLASS => Some("Tuple_BigInteger_bool"),
+        Type::Class(c) if c == crate::lower2::BIG_DECIMAL_CLASS => Some("Tuple_BigDecimal_bool"),
+        _ => None,
+    }
+}
 
 pub fn emit_checked_arithmetic_oomir_instructions(
     dest_base_name: &str,
@@ -8,6 +20,7 @@ pub fn emit_checked_arithmetic_oomir_instructions(
     op_ty: &Type,
     operation: &str,         // "add", "sub", "mul"
     unique_id_offset: usize, // Used to ensure unique labels/temps
+    result_tuple_class: &str,
 ) -> (Vec<Instruction>, String, String, String) {
     // Instead of inlining, emit a call to a reusable checked arithmetic intrinsic function.
     // The intrinsic function should be emitted once per type/operation elsewhere (e.g., at module init).
@@ -47,18 +60,9 @@ pub fn emit_checked_arithmetic_oomir_instructions(
             src: Operand::Constant(Constant::Boolean(false)),
         });
 
-        // Construct a tuple for consistency with the primitive integer case
-        // Determine the tuple type based on the BigInteger/BigDecimal type
-        // Note: Use the readable name form that matches types.rs:readable_oomir_type_name
-        let class_name = match op_ty {
-            Type::Class(c) if c == crate::lower2::BIG_INTEGER_CLASS => "Tuple_BigInteger_bool",
-            Type::Class(c) if c == crate::lower2::BIG_DECIMAL_CLASS => "Tuple_BigDecimal_bool",
-            _ => unreachable!(),
-        };
-
         generated_instructions.push(Instruction::ConstructObject {
             dest: tmp_pair.clone(),
-            class_name: class_name.to_string(),
+            class_name: result_tuple_class.to_string(),
             args: vec![
                 (
                     Operand::Variable {
@@ -81,43 +85,33 @@ pub fn emit_checked_arithmetic_oomir_instructions(
     }
 
     // --- For primitive integer types, emit a call to the checked arithmetic intrinsic ---
-    // The function name is e.g. "__oomir_checked_add_i32"
-    let (fn_name, ty_suffix) = match (operation, op_ty) {
-        ("add", Type::I32) => ("__oomir_checked_add_i32", "i32"),
-        ("add", Type::I64) => ("__oomir_checked_add_i64", "i64"),
-        ("add", Type::I16) => ("__oomir_checked_add_i16", "i16"),
-        ("add", Type::I8) => ("__oomir_checked_add_i8", "i8"),
-        ("sub", Type::I32) => ("__oomir_checked_sub_i32", "i32"),
-        ("sub", Type::I64) => ("__oomir_checked_sub_i64", "i64"),
-        ("sub", Type::I16) => ("__oomir_checked_sub_i16", "i16"),
-        ("sub", Type::I8) => ("__oomir_checked_sub_i8", "i8"),
-        ("mul", Type::I32) => ("__oomir_checked_mul_i32", "i32"),
-        ("mul", Type::I64) => ("__oomir_checked_mul_i64", "i64"),
-        ("mul", Type::I16) => ("__oomir_checked_mul_i16", "i16"),
-        ("mul", Type::I8) => ("__oomir_checked_mul_i8", "i8"),
+    let ty_suffix = match op_ty {
+        Type::I32 => "i32",
+        Type::I64 => "i64",
+        Type::I16 => "i16",
+        Type::I8 => "i8",
         _ => panic!(
             "Unsupported checked arithmetic operation/type: {} {:?}",
             operation, op_ty
         ),
     };
+    let fn_name =
+        checked_intrinsics::get_intrinsic_function_name(operation, ty_suffix, result_tuple_class);
 
     // Register that this intrinsic is needed
-    checked_intrinsic_registry::register_intrinsic(operation, ty_suffix);
-
-    // Determine the result tuple type (e.g. Tuple_i32_bool)
-    let tuple_type_name = format!("Tuple_{}_bool", ty_suffix);
+    checked_intrinsic_registry::register_intrinsic(operation, ty_suffix, result_tuple_class);
 
     // Emit a call to the intrinsic static method: pair = RustcCodegenJVMIntrinsics.fn_name(a, b)
     generated_instructions.push(Instruction::InvokeStatic {
         dest: Some(tmp_pair.clone()),
         class_name: "RustcCodegenJVMIntrinsics".to_string(),
-        method_name: fn_name.to_string(),
+        method_name: fn_name,
         method_ty: crate::oomir::Signature {
             params: vec![
                 ("a".to_string(), op_ty.clone()),
                 ("b".to_string(), op_ty.clone()),
             ],
-            ret: Box::new(Type::Class(tuple_type_name.clone())),
+            ret: Box::new(Type::Class(result_tuple_class.to_string())),
             is_static: true,
         },
         args: vec![op1.clone(), op2.clone()],

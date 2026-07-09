@@ -170,7 +170,7 @@ def process_binary_test(test_dir: str, release_mode: bool, logs: list) -> bool:
 
     logs.append("|--- 🤖 Running with Java...")
     java_cp = jar_path
-    proc = run_command(["java", "-cp", java_cp, test_name]) 
+    proc = run_command(["java", "-cp", java_cp, f"{test_name}.{test_name}"])
     
     if not check_results(proc, test_dir, release_mode, logs):
         return False

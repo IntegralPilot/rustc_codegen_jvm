@@ -1,4 +1,8 @@
 {
+  "arguments_from_str": {
+    "descriptor": "(Ljava/lang/String;)Ljava/lang/Object;",
+    "is_static": true
+  },
   "compare_bytes": {
     "descriptor": "([S[SI)I",
     "is_static": true
@@ -11,6 +15,10 @@
     "descriptor": "([S[Ljava/lang/Object;)Ljava/lang/String;",
     "is_static": true
   },
+  "formatArgumentObject": {
+    "descriptor": "(Ljava/lang/Object;)Ljava/lang/String;",
+    "is_static": true
+  },
   "formatArguments": {
     "descriptor": "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/String;",
     "is_static": true
@@ -18,6 +26,32 @@
   "fromShortArray": {
     "descriptor": "([S)Ljava/lang/String;",
     "is_static": true
+  },
+  "new_arguments": {
+    "descriptor": "([S[Ljava/lang/Object;)Ljava/lang/Object;",
+    "is_static": true
+  },
+  "new_display": {
+    "descriptor": "(Ljava/lang/Object;)Ljava/lang/Object;",
+    "is_static": true
+  },
+  "org/rustlang/core/fmt/Arguments__::from_str": {
+    "descriptor": "(Ljava/lang/String;)Ljava/lang/Object;",
+    "is_static": true,
+    "class_name": "org/rustlang/core/Core",
+    "method_name": "arguments_from_str"
+  },
+  "org/rustlang/core/fmt/Arguments__::new": {
+    "descriptor": "([S[Ljava/lang/Object;)Ljava/lang/Object;",
+    "is_static": true,
+    "class_name": "org/rustlang/core/Core",
+    "method_name": "new_arguments"
+  },
+  "org/rustlang/core/fmt/rt/Argument__::new_display": {
+    "descriptor": "(Ljava/lang/Object;)Ljava/lang/Object;",
+    "is_static": true,
+    "class_name": "org/rustlang/core/Core",
+    "method_name": "new_display"
   },
   "panic": {
     "descriptor": "(Ljava/lang/String;)V",

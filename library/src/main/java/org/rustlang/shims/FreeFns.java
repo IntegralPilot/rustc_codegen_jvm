@@ -1,5 +1,7 @@
 package org.rustlang.shims;
 
+import org.rustlang.core.Core;
+
 import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
 import java.util.ArrayList;
@@ -12,7 +14,7 @@ public final class FreeFns {
     private FreeFns() {}
 
     public static void panic_fmt(Object args) {
-        throw new RuntimeException("Rust panic: " + args);
+        throw new RuntimeException("Rust panic: " + Core.formatArgumentObject(args));
     }
 
     public static boolean eq_String_String(String a, String b) {

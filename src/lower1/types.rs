@@ -1,4 +1,4 @@
-use super::place::make_jvm_safe;
+use super::jvm_names;
 use crate::oomir::{self, DataType, DataTypeMethod};
 
 use rustc_middle::ty::{
@@ -20,15 +20,15 @@ use std::collections::HashMap;
 pub const UNION_BYTES_FIELD: &str = "__bytes";
 
 pub fn union_from_method_name(field_name: &str) -> String {
-    format!("from_{}", make_jvm_safe(field_name))
+    format!("from_{}", jvm_names::member_name(field_name))
 }
 
 pub fn union_getter_method_name(field_name: &str) -> String {
-    format!("get_{}", make_jvm_safe(field_name))
+    format!("get_{}", jvm_names::member_name(field_name))
 }
 
 pub fn union_setter_method_name(field_name: &str) -> String {
-    format!("set_{}", make_jvm_safe(field_name))
+    format!("set_{}", jvm_names::member_name(field_name))
 }
 
 /// OOMIR doesn't have a Never type (because the JVM doesn't), so we map it to Void.
@@ -64,11 +64,17 @@ pub fn fn_ptr_signature_from_ty<'tcx>(
     }
 }
 
-pub fn ensure_fn_ptr_interface(
+pub fn ensure_fn_ptr_interface<'tcx>(
     signature: &oomir::Signature,
     data_types: &mut HashMap<String, oomir::DataType>,
+    tcx: TyCtxt<'tcx>,
+    instance_context: rustc_middle::ty::Instance<'tcx>,
 ) -> String {
-    let interface_name = signature.fn_ptr_interface_name();
+    let interface_name = jvm_names::synthetic_class_for_instance(
+        tcx,
+        instance_context,
+        signature.fn_ptr_interface_name(),
+    );
     let method_signature = signature.fn_ptr_interface_method_signature();
 
     match data_types.get_mut(&interface_name) {
@@ -1164,8 +1170,7 @@ pub fn ty_to_oomir_type<'tcx>(
             for binder in bound_preds.iter() {
                 match binder.skip_binder() {
                     ExistentialPredicate::Trait(trait_ref) => {
-                        let trait_name = tcx.def_path_str(trait_ref.def_id);
-                        let safe_name = make_jvm_safe(&trait_name);
+                        let safe_name = jvm_names::class_for_def_id(tcx, trait_ref.def_id);
                         data_types.entry(safe_name.clone()).or_insert_with(|| {
                             oomir::DataType::Interface {
                                 methods: HashMap::new(),
@@ -1175,8 +1180,7 @@ pub fn ty_to_oomir_type<'tcx>(
                     }
                     ExistentialPredicate::AutoTrait(def_id) => {
                         // Auto traits like Send/Sync — treat as interfaces as well.
-                        let trait_name = tcx.def_path_str(def_id);
-                        let safe_name = make_jvm_safe(&trait_name);
+                        let safe_name = jvm_names::class_for_def_id(tcx, def_id);
                         data_types.entry(safe_name.clone()).or_insert_with(|| {
                             oomir::DataType::Interface {
                                 methods: HashMap::new(),
@@ -1212,11 +1216,10 @@ pub fn ty_to_oomir_type<'tcx>(
                 .unwrap_or(oomir::Type::Class("java/lang/Object".to_string()))
         }
         rustc_middle::ty::TyKind::Param(param_ty) => {
-            oomir::Type::Class(make_jvm_safe(param_ty.name.as_str()))
+            oomir::Type::Class(jvm_names::member_name(param_ty.name.as_str()))
         }
         rustc_middle::ty::TyKind::Closure(def_id, args) => {
-            let full_path_str = tcx.def_path_str(*def_id);
-            let safe_name = make_jvm_safe(&full_path_str);
+            let safe_name = jvm_names::closure_class_for_def_id(tcx, *def_id);
 
             // Define the closure class struct if not already present
             if !data_types.contains_key(&safe_name) {
@@ -1248,15 +1251,15 @@ pub fn ty_to_oomir_type<'tcx>(
         rustc_middle::ty::TyKind::FnPtr(_, _) => {
             let signature =
                 fn_ptr_signature_from_ty(resolved_ty, tcx, data_types, instance_context);
-            let interface_name = ensure_fn_ptr_interface(&signature, data_types);
+            let interface_name =
+                ensure_fn_ptr_interface(&signature, data_types, tcx, instance_context);
             oomir::Type::Interface(interface_name)
         }
         rustc_middle::ty::TyKind::FnDef(def_id, _args) => {
             // Named functions are Zero-Sized Types (ZSTs).
             // We generate a singleton class so generics like Map<Iter, MyFunc>
             // produce unique JVM class names.
-            let full_path_str = tcx.def_path_str(*def_id);
-            let safe_name = make_jvm_safe(&full_path_str);
+            let safe_name = jvm_names::class_for_def_id(tcx, *def_id);
 
             if !data_types.contains_key(&safe_name) {
                 data_types.insert(
@@ -1340,25 +1343,7 @@ pub fn sanitize_name_token(s: &str) -> String {
 }
 
 fn adt_base_jvm_name<'tcx>(adt_def: &AdtDef<'tcx>, tcx: TyCtxt<'tcx>) -> String {
-    let def_id = adt_def.did();
-    if !def_id.is_local() {
-        return make_jvm_safe(&tcx.def_path_str(def_id));
-    }
-
-    let segments: Vec<String> = tcx
-        .def_path(def_id)
-        .data
-        .iter()
-        .filter_map(|component| component.data.get_opt_name())
-        .map(|name| make_jvm_safe(name.as_str()))
-        .filter(|segment| !segment.is_empty())
-        .collect();
-
-    if segments.is_empty() {
-        make_jvm_safe(&tcx.def_path_str(def_id))
-    } else {
-        segments.join("/")
-    }
+    jvm_names::class_for_def_id(tcx, adt_def.did())
 }
 
 /// Generate a JVM-safe class name for an ADT (struct/enum) including readable generic
@@ -1442,7 +1427,11 @@ pub fn generate_tuple_jvm_class_name<'tcx>(
         tokens.push(sanitize_name_token(&token));
     }
 
-    let readable_name = format!("Tuple_{}", tokens.join("_"));
+    let readable_name = jvm_names::synthetic_class_for_instance(
+        tcx,
+        instance_context,
+        format!("Tuple_{}", tokens.join("_")),
+    );
 
     // If the readable name is within bounds, use it. Otherwise fall back to a hash
     if readable_name.len() <= MAX_TUPLE_NAME_LEN {
@@ -1458,7 +1447,7 @@ pub fn generate_tuple_jvm_class_name<'tcx>(
         }
         // with a length of 10, the chance of a collision is tiny
         let hash = short_hash(&name_parts, 10);
-        format!("Tuple_{}", hash)
+        jvm_names::synthetic_class_for_instance(tcx, instance_context, format!("Tuple_{}", hash))
     }
 }
 

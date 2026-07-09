@@ -8,6 +8,6 @@ public final class panicking {
     }
 
     public static void panic_fmt(Object args) {
-        throw new RuntimeException("Rust panic: " + args);
+        throw new RuntimeException("Rust panic: " + Core.formatArgumentObject(args));
     }
 }

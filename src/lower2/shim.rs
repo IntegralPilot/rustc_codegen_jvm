@@ -10,6 +10,26 @@ pub(super) struct ShimInfo {
     // pub(super) or pub(crate)
     pub(super) descriptor: String,
     pub(super) is_static: bool,
+    #[serde(default)]
+    pub(super) class_name: Option<String>,
+    #[serde(default)]
+    pub(super) method_name: Option<String>,
+}
+
+impl ShimInfo {
+    pub(super) fn java_class<'a>(&'a self, key: &str) -> &'a str {
+        self.class_name.as_deref().unwrap_or_else(|| {
+            if key == "panic" || key == "panic_fmt" {
+                "org/rustlang/core/panicking"
+            } else {
+                "org/rustlang/core/Core"
+            }
+        })
+    }
+
+    pub(super) fn java_method<'a>(&'a self, key: &'a str) -> &'a str {
+        self.method_name.as_deref().unwrap_or(key)
+    }
 }
 
 // Key: Simplified function name (output of make_jvm_safe)

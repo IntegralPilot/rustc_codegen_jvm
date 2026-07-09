@@ -1,9 +1,7 @@
 use super::{
+    jvm_names,
     operand::convert_operand,
-    place::{
-        emit_instructions_to_get_on_own, emit_instructions_to_set_value, make_jvm_safe,
-        place_to_string,
-    },
+    place::{emit_instructions_to_get_on_own, emit_instructions_to_set_value, place_to_string},
     types::mir_int_to_oomir_const,
 };
 use crate::oomir;
@@ -24,43 +22,6 @@ mod rvalue;
 
 pub use checked_intrinsic_registry::take_needed_intrinsics;
 
-fn tracked_string_for_mir_operand(
-    operand: &MirOperand<'_>,
-    local_string_values: &HashMap<Local, String>,
-) -> Option<String> {
-    match operand {
-        MirOperand::Copy(place) | MirOperand::Move(place) if place.projection.is_empty() => {
-            local_string_values.get(&place.local).cloned()
-        }
-        _ => None,
-    }
-}
-
-fn infer_string_value(
-    rvalue: &rustc_middle::mir::Rvalue<'_>,
-    source_operand: &oomir::Operand,
-    local_string_values: &HashMap<Local, String>,
-) -> Option<String> {
-    if let oomir::Operand::Constant(oomir::Constant::String(value)) = source_operand {
-        return Some(value.clone());
-    }
-
-    match rvalue {
-        rustc_middle::mir::Rvalue::Use(operand, _)
-        | rustc_middle::mir::Rvalue::Cast(_, operand, _) => {
-            tracked_string_for_mir_operand(operand, local_string_values)
-        }
-        rustc_middle::mir::Rvalue::RawPtr(_, place)
-        | rustc_middle::mir::Rvalue::Ref(_, _, place) => {
-            local_string_values.get(&place.local).cloned()
-        }
-        rustc_middle::mir::Rvalue::Aggregate(_, operands) => operands
-            .iter()
-            .find_map(|operand| tracked_string_for_mir_operand(operand, local_string_values)),
-        _ => None,
-    }
-}
-
 /// Convert a single MIR basic block into an OOMIR basic block.
 pub fn convert_basic_block<'tcx>(
     bb: BasicBlock,
@@ -77,7 +38,6 @@ pub fn convert_basic_block<'tcx>(
     let mut instructions = Vec::new();
     let mut mutable_borrow_arrays: HashMap<Local, (Place<'tcx>, String, oomir::Type)> =
         HashMap::new();
-    let mut local_string_values: HashMap<Local, String> = HashMap::new();
 
     // Convert each MIR statement in the block.
     for stmt in &bb_data.statements {
@@ -97,28 +57,6 @@ pub fn convert_basic_block<'tcx>(
 
                 // Add instructions needed to calculate the Rvalue
                 instructions.extend(rvalue_instructions);
-
-                let tracked_string_value =
-                    infer_string_value(rvalue, &source_operand, &local_string_values);
-
-                if let rustc_middle::mir::Rvalue::Aggregate(_, operands) = rvalue
-                    && let oomir::Operand::Variable {
-                        name: args_object,
-                        ty: oomir::Type::Class(class_name),
-                    } = &source_operand
-                    && class_name == "Arguments__"
-                    && let Some(message) = operands.iter().find_map(|operand| {
-                        tracked_string_for_mir_operand(operand, &local_string_values)
-                    })
-                {
-                    instructions.push(oomir::Instruction::SetField {
-                        object: args_object.clone(),
-                        field_name: "message".to_string(),
-                        value: oomir::Operand::Constant(oomir::Constant::String(message)),
-                        field_ty: oomir::Type::String,
-                        owner_class: class_name.clone(),
-                    });
-                }
 
                 if let rustc_middle::mir::Rvalue::Ref(
                     _,
@@ -210,14 +148,6 @@ pub fn convert_basic_block<'tcx>(
 
                 // Add the final assignment instructions (Move, SetField, ArrayStore)
                 instructions.extend(assignment_instructions);
-
-                if place.projection.is_empty() {
-                    if let Some(value) = tracked_string_value {
-                        local_string_values.insert(place.local, value);
-                    } else {
-                        local_string_values.remove(&place.local);
-                    }
-                }
             }
             StatementKind::StorageLive(_) | StatementKind::StorageDead(_) => {
                 // no-op, currently
@@ -417,10 +347,8 @@ pub fn convert_basic_block<'tcx>(
                                 receiver_mir_ty.kind()
                             {
                                 let principal = preds.principal().unwrap().skip_binder();
-                                let trait_name = tcx.def_path_str(principal.def_id);
-
                                 instructions.push(oomir::Instruction::InvokeInterface {
-                                    class_name: make_jvm_safe(&trait_name),
+                                    class_name: jvm_names::class_for_def_id(tcx, principal.def_id),
                                     method_name,
                                     method_ty: method_signature,
                                     args: method_args,
@@ -448,8 +376,7 @@ pub fn convert_basic_block<'tcx>(
                                         Some(interface_name.clone())
                                     } else if is_trait_method {
                                         // Get the trait name and convert to interface name
-                                        let trait_name = tcx.def_path_str(container_id);
-                                        Some(make_jvm_safe(&trait_name))
+                                        Some(jvm_names::class_for_def_id(tcx, container_id))
                                     } else {
                                         None
                                     };
@@ -508,7 +435,10 @@ pub fn convert_basic_block<'tcx>(
                                             .or_else(|| {
                                                 Some(format!(
                                                     "org/rustlang/primitives/{}",
-                                                    make_jvm_safe(&format!("{:?}", class_type))
+                                                    jvm_names::path_segment(&format!(
+                                                        "{:?}",
+                                                        class_type
+                                                    ))
                                                 ))
                                             });
 
@@ -585,17 +515,11 @@ pub fn convert_basic_block<'tcx>(
                             (fn_name_data.class_to_call_on, fn_name_data.method_name)
                         };
                         let call_args = if is_closure_call && !oomir_operands.is_empty() {
-                            let closure_has_captures = match oomir_operands[0].get_type() {
-                                Some(ty) => ty
-                                    .get_class_name()
-                                    .and_then(|class_name| data_types.get(class_name))
-                                    .is_some_and(|data_type| {
-                                        matches!(
-                                            data_type,
-                                            oomir::DataType::Class { fields, .. } if !fields.is_empty()
-                                        )
-                                    }),
-                                None => false,
+                            let closure_has_captures = match instance_ty.kind() {
+                                TyKind::Closure(_, args) => {
+                                    args.as_closure().upvar_tys().iter().next().is_some()
+                                }
+                                _ => false,
                             };
 
                             if closure_has_captures {
@@ -621,7 +545,7 @@ pub fn convert_basic_block<'tcx>(
 
                     let oomir_sig =
                         super::types::fn_ptr_signature_from_ty(func_ty, tcx, data_types, instance);
-                    super::types::ensure_fn_ptr_interface(&oomir_sig, data_types);
+                    super::types::ensure_fn_ptr_interface(&oomir_sig, data_types, tcx, instance);
 
                     let effective_dest = if matches!(oomir_sig.ret.as_ref(), oomir::Type::Void) {
                         None

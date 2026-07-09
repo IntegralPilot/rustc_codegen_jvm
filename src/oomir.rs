@@ -815,6 +815,13 @@ pub enum Type {
     Interface(String),    // dyn TraitName
 }
 
+pub fn is_non_null_class_name(class_name: &str) -> bool {
+    class_name
+        .rsplit('/')
+        .next()
+        .is_some_and(|leaf| leaf.starts_with("NonNull_"))
+}
+
 impl Type {
     /// Returns the JVM type descriptor string (e.g., "I", "Ljava/lang/String;", "[I").
     pub fn to_jvm_descriptor(&self) -> String {
@@ -1090,7 +1097,9 @@ impl Type {
         match self {
             Type::Class(name) | Type::Interface(name) => Some(name),
             Type::String => Some("org/rustlang/primitives/RustString"),
-            Type::Array(inner) | Type::MutableReference(inner) => inner.get_class_name(),
+            Type::Array(inner) | Type::MutableReference(inner) | Type::Reference(inner) => {
+                inner.get_class_name()
+            }
             _ => None,
         }
     }
