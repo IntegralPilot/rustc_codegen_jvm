@@ -50,9 +50,3 @@ pub fn wrap_maybe(value: MaybeNumber) -> NestedEquality {
 pub fn wrap_boxed(value: NumberBox) -> NestedEquality {
     NestedEquality::Boxed(value)
 }
-
-pub fn main() {
-    assert!(get_light_action(TrafficLight::Red) == "Stop");
-    assert!(get_light_action(TrafficLight::Yellow) == "Caution");
-    assert!(get_light_action(TrafficLight::Green) == "Go");
-}

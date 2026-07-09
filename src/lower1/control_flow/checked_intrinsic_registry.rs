@@ -27,13 +27,3 @@ pub fn take_needed_intrinsics() -> Vec<(String, String, String)> {
     registry.clear();
     intrinsics
 }
-
-/// Check if an intrinsic has been registered
-pub fn is_registered(operation: &str, ty: &str, result_tuple_class: &str) -> bool {
-    let registry = NEEDED_INTRINSICS.lock().unwrap();
-    registry.contains(&(
-        operation.to_string(),
-        ty.to_string(),
-        result_tuple_class.to_string(),
-    ))
-}

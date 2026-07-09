@@ -1,7 +1,7 @@
 //! Naming helpers for functions and monomorphized instances
 
 use super::{jvm_names, types::ty_to_oomir_type};
-use rustc_middle::ty::{Instance, TyCtxt, TypeVisitableExt};
+use rustc_middle::ty::{GenericParamDefKind, Instance, TyCtxt, TypeVisitableExt};
 use std::collections::HashMap;
 
 const MAX_MONO_FN_NAME_LEN: usize = 128;
@@ -18,6 +18,27 @@ impl FnNameData {
             self.class_to_call_on.as_deref().unwrap_or(fallback_class),
             &self.method_name,
         )
+    }
+}
+
+pub fn associated_method_name_from_instance<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
+) -> String {
+    if !instance.def_id().is_local() {
+        return jvm_names::method_for_function(tcx, instance.def_id());
+    }
+
+    let has_own_type_or_const_generics = tcx
+        .generics_of(instance.def_id())
+        .own_params
+        .iter()
+        .any(|param| !matches!(param.kind, GenericParamDefKind::Lifetime));
+
+    if has_own_type_or_const_generics {
+        mono_fn_name_from_instance(tcx, instance).method_name
+    } else {
+        jvm_names::method_for_function(tcx, instance.def_id())
     }
 }
 

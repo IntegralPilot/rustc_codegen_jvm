@@ -1343,13 +1343,15 @@ pub fn convert_rvalue_to_operand<'a>(
                                     let v_fields: Vec<oomir::Type> = v
                                         .fields
                                         .iter()
-                                        .map(|f| {
-                                            ty_to_oomir_type(
+                                        .filter_map(|f| {
+                                            let field_ty = ty_to_oomir_type(
                                                 f.ty(tcx, substs).skip_norm_wip(),
                                                 tcx,
                                                 data_types,
                                                 instance,
-                                            )
+                                            );
+                                            (!matches!(field_ty, oomir::Type::Void))
+                                                .then_some(field_ty)
                                         })
                                         .collect();
                                     (v_name, v_fields)
@@ -1470,15 +1472,17 @@ pub fn convert_rvalue_to_operand<'a>(
                         if should_define_data_type && !data_types.contains_key(&variant_class_name)
                         {
                             let mut fields = vec![];
-                            for (i, field) in variant_def.fields.iter().enumerate() {
-                                let field_name = format!("field{}", i);
+                            for field in variant_def.fields.iter() {
                                 let field_type = ty_to_oomir_type(
                                     field.ty(tcx, substs).skip_norm_wip(),
                                     tcx,
                                     data_types,
                                     instance,
                                 );
-                                fields.push((field_name, field_type));
+                                if !matches!(field_type, oomir::Type::Void) {
+                                    let field_name = format!("field{}", fields.len());
+                                    fields.push((field_name, field_type));
+                                }
                             }
 
                             let mut methods = HashMap::new();
@@ -1507,6 +1511,9 @@ pub fn convert_rvalue_to_operand<'a>(
                             let field_mir_ty = field.ty(tcx, substs).skip_norm_wip();
                             let field_oomir_type =
                                 ty_to_oomir_type(field_mir_ty, tcx, data_types, instance);
+                            if matches!(field_oomir_type, oomir::Type::Void) {
+                                continue;
+                            }
                             let value_operand = convert_operand(
                                 &operands[FieldIdx::from_usize(i)],
                                 tcx,

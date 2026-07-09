@@ -810,6 +810,10 @@ fn handle_constant_enum<'tcx>(
     for (i, field_def) in variant_def.fields.iter().enumerate() {
         let field_idx = FieldIdx::from_usize(i);
         let field_ty = field_def.ty(tcx, substs).skip_norm_wip();
+        let field_oomir_ty = ty_to_oomir_type(field_ty, tcx, oomir_data_types, instance);
+        if matches!(field_oomir_ty, oomir::Type::Void) {
+            continue;
+        }
 
         // Calculate the offset of the field *within the variant's data area*.
         // `variant_fields_shape.offset()` gives the offset relative to the start of *this variant's fields*.
@@ -854,7 +858,7 @@ fn handle_constant_enum<'tcx>(
         // Calculate absolute offset relative to the start of the *whole allocation* `offset`.
         let absolute_field_offset = offset + field_offset_in_variant_shape;
 
-        let field_name = format!("field{}", i); // Using index as field name for enum variant
+        let field_name = format!("field{}", fields_map.len());
 
         breadcrumbs::log!(
             breadcrumbs::LogLevel::Info,
@@ -915,15 +919,17 @@ fn handle_constant_enum<'tcx>(
     // this variant
     if should_define_data_type && !oomir_data_types.contains_key(&variant_class_name) {
         let mut fields = vec![];
-        for (i, field) in variant_def.fields.iter().enumerate() {
-            let field_name = format!("field{}", i);
+        for field in variant_def.fields.iter() {
             let field_type = ty_to_oomir_type(
                 field.ty(tcx, substs).skip_norm_wip(),
                 tcx,
                 oomir_data_types,
                 instance,
             );
-            fields.push((field_name, field_type));
+            if !matches!(field_type, oomir::Type::Void) {
+                let field_name = format!("field{}", fields.len());
+                fields.push((field_name, field_type));
+            }
         }
 
         let mut methods = HashMap::new();

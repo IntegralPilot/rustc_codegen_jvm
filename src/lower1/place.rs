@@ -533,15 +533,17 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
                         )
                     );
                     let mut fields = vec![];
-                    for (i, field) in variant_def.fields.iter().enumerate() {
-                        let field_name = format!("field{}", i);
+                    for field in variant_def.fields.iter() {
                         let field_type = ty_to_oomir_type(
                             field.ty(tcx, substs).skip_norm_wip(),
                             tcx,
                             data_types,
                             instance,
                         );
-                        fields.push((field_name, field_type));
+                        if !matches!(field_type, oomir::Type::Void) {
+                            let field_name = format!("field{}", fields.len());
+                            fields.push((field_name, field_type));
+                        }
                     }
 
                     let mut methods = HashMap::new();

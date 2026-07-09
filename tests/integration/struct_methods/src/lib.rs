@@ -60,5 +60,3 @@ pub fn accept_empty_marker(_marker: EmptyMarker) {
 pub fn default_profile() -> OrderedConstant {
     DEFAULT_PROFILE
 }
-
-pub fn main() {}

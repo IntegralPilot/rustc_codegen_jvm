@@ -6,7 +6,6 @@ import argparse
 import glob
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-
 def resolve_jobs(requested_jobs: int | None) -> int:
     if requested_jobs is None:
         return os.cpu_count() or 1
@@ -66,19 +65,20 @@ def find_and_prepare_jar(test_dir: str, test_name: str, target_dir: str, logs: l
     if not os.path.exists(use_target_json):
         deps_dir = os.path.join(test_dir, "target", target_dir, "deps")
         jar_file = None
+        jar_prefixes = (test_name, f"lib{test_name}")
         try:
-            for file in os.listdir(deps_dir):
-                if file.startswith(test_name) and file.endswith(".jar"):
+            for file in sorted(os.listdir(deps_dir)):
+                if file.endswith(".jar") and file.startswith(jar_prefixes):
                     jar_file = file
                     break
         except FileNotFoundError:
             logs.append(f"|---- ❌ Dependency directory not found: {deps_dir}")
             return False, ""
-            
+
         if jar_file is None:
             logs.append(f"|---- ❌ No jar file found for '{test_name}' in target/{target_dir}/deps")
             return False, ""
-        
+
         # Move jar to a predictable location
         dest_dir = os.path.join(test_dir, "target", "jvm-unknown-unknown", target_dir)
         os.makedirs(dest_dir, exist_ok=True)

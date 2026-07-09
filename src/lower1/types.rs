@@ -32,12 +32,6 @@ pub fn union_setter_method_name(field_name: &str) -> String {
     format!("set_{}", jvm_names::member_name(field_name))
 }
 
-/// OOMIR doesn't have a Never type (because the JVM doesn't), so we map it to Void.
-/// So when we need to know if a MIR type is Never, we can use this helper.
-pub fn ty_is_never<'tcx>(ty: Ty<'tcx>) -> bool {
-    matches!(ty.kind(), TyKind::Never)
-}
-
 pub fn fn_ptr_signature_from_ty<'tcx>(
     ty: Ty<'tcx>,
     tcx: TyCtxt<'tcx>,
@@ -142,6 +136,144 @@ fn int_constant_for_type(value: i64, ty: &oomir::Type) -> oomir::Constant {
 
 pub fn should_define_named_data_type<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> bool {
     def_id.is_local() || tcx.crate_name(def_id.krate).as_str() == "core"
+}
+
+fn add_enum_helper_methods(
+    methods: &mut HashMap<String, DataTypeMethod>,
+    variants_info: Vec<(String, Vec<oomir::Type>)>,
+) {
+    methods
+        .entry("getVariantIdx".to_string())
+        .or_insert(DataTypeMethod::SimpleConstantReturn(oomir::Type::I32, None));
+    methods
+        .entry("eq".to_string())
+        .or_insert(DataTypeMethod::AdtHelperMethod {
+            kind: oomir::AdtHelperKind::PartialEqEnum {
+                variants: variants_info.clone(),
+            },
+        });
+
+    if variants_info.len() == 2 {
+        let mut none_variant_idx = 1u32;
+        let mut some_variant_idx = 0u32;
+        for (idx, (name, _)) in variants_info.iter().enumerate() {
+            if name == "None" {
+                none_variant_idx = idx as u32;
+            } else if name == "Some" {
+                some_variant_idx = idx as u32;
+            }
+        }
+
+        methods
+            .entry("is_none".to_string())
+            .or_insert(DataTypeMethod::AdtHelperMethod {
+                kind: oomir::AdtHelperKind::IsVariant {
+                    variant_idx: none_variant_idx,
+                },
+            });
+        methods
+            .entry("is_some".to_string())
+            .or_insert(DataTypeMethod::AdtHelperMethod {
+                kind: oomir::AdtHelperKind::IsVariant {
+                    variant_idx: some_variant_idx,
+                },
+            });
+    }
+}
+
+fn ensure_enum_data_types<'tcx>(
+    adt_def: &AdtDef<'tcx>,
+    substs: GenericArgsRef<'tcx>,
+    base_enum_name: &str,
+    tcx: TyCtxt<'tcx>,
+    data_types: &mut HashMap<String, oomir::DataType>,
+    instance_context: rustc_middle::ty::Instance<'tcx>,
+) {
+    let variants_info: Vec<_> = adt_def
+        .variants()
+        .iter()
+        .map(|variant| {
+            let variant_name = jvm_names::member_name(&variant.name.to_string());
+            let fields = variant
+                .fields
+                .iter()
+                .filter_map(|field| {
+                    let field_ty = ty_to_oomir_type(
+                        field.ty(tcx, substs).skip_norm_wip(),
+                        tcx,
+                        data_types,
+                        instance_context,
+                    );
+                    (!matches!(field_ty, oomir::Type::Void)).then_some(field_ty)
+                })
+                .collect();
+            (variant_name, fields)
+        })
+        .collect();
+
+    if !data_types.contains_key(base_enum_name) {
+        let mut methods = HashMap::new();
+        add_enum_helper_methods(&mut methods, variants_info.clone());
+        data_types.insert(
+            base_enum_name.to_string(),
+            oomir::DataType::Class {
+                fields: vec![],
+                is_abstract: true,
+                methods,
+                super_class: None,
+                interfaces: vec![],
+            },
+        );
+    } else if let Some(oomir::DataType::Class { methods, .. }) = data_types.get_mut(base_enum_name)
+    {
+        add_enum_helper_methods(methods, variants_info.clone());
+    }
+
+    for (variant_idx, variant) in adt_def.variants().iter().enumerate() {
+        let variant_class_name = format!(
+            "{}${}",
+            base_enum_name,
+            jvm_names::member_name(&variant.name.to_string())
+        );
+        if data_types.contains_key(&variant_class_name) {
+            continue;
+        }
+
+        let fields = variant
+            .fields
+            .iter()
+            .filter_map(|field| {
+                let field_ty = ty_to_oomir_type(
+                    field.ty(tcx, substs).skip_norm_wip(),
+                    tcx,
+                    data_types,
+                    instance_context,
+                );
+                (!matches!(field_ty, oomir::Type::Void)).then_some(field_ty)
+            })
+            .enumerate()
+            .map(|(field_idx, field_ty)| (format!("field{}", field_idx), field_ty))
+            .collect();
+        let mut methods = HashMap::new();
+        methods.insert(
+            "getVariantIdx".to_string(),
+            DataTypeMethod::SimpleConstantReturn(
+                oomir::Type::I32,
+                Some(oomir::Constant::I32(variant_idx as i32)),
+            ),
+        );
+
+        data_types.insert(
+            variant_class_name,
+            oomir::DataType::Class {
+                fields,
+                is_abstract: false,
+                methods,
+                super_class: Some(base_enum_name.to_string()),
+                interfaces: vec![],
+            },
+        );
+    }
 }
 
 fn operand_var(name: impl Into<String>, ty: oomir::Type) -> oomir::Operand {
@@ -1002,24 +1134,14 @@ pub fn ty_to_oomir_type<'tcx>(
                         });
                     }
                 } else if adt_def.is_enum() {
-                    // the enum in general
-                    if !data_types.contains_key(&jvm_name_full) {
-                        let mut methods = HashMap::new();
-                        methods.insert(
-                            "getVariantIdx".to_string(),
-                            DataTypeMethod::SimpleConstantReturn(oomir::Type::I32, None),
-                        );
-                        data_types.insert(
-                            jvm_name_full.clone(),
-                            oomir::DataType::Class {
-                                fields: vec![], // No fields in the abstract class
-                                is_abstract: true,
-                                methods,
-                                super_class: None,
-                                interfaces: vec![],
-                            },
-                        );
-                    }
+                    ensure_enum_data_types(
+                        &adt_def,
+                        substs,
+                        &jvm_name_full,
+                        tcx,
+                        data_types,
+                        instance_context,
+                    );
                 } else if adt_def.is_union() {
                     ensure_union_data_type(&adt_def, substs, tcx, data_types, instance_context);
                 }
@@ -1226,14 +1348,6 @@ pub fn ty_to_oomir_type<'tcx>(
                                 "Warning: Unhandled dynamic projection predicate {:?}",
                                 binder
                             )
-                        );
-                        resolved_types.push(oomir::Type::Class("java/lang/Object".to_string()));
-                    }
-                    _ => {
-                        breadcrumbs::log!(
-                            breadcrumbs::LogLevel::Warn,
-                            "type-mapping",
-                            format!("Warning: Unhandled dynamic type {:?}", binder)
                         );
                         resolved_types.push(oomir::Type::Class("java/lang/Object".to_string()));
                     }
