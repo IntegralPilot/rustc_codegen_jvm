@@ -17,9 +17,10 @@ use super::{
         },
         place::{emit_instructions_to_get_on_own, get_place_type, place_to_string},
         types::{
-            ensure_fn_ptr_interface, ensure_union_data_type, fn_ptr_signature_from_ty,
-            generate_adt_jvm_class_name, short_hash, should_define_named_data_type,
-            ty_to_oomir_type, union_from_method_name,
+            ENUM_UNION_DISCRIMINANT_METHOD, adapt_simple_enum_operand, ensure_fn_ptr_interface,
+            ensure_union_data_type, fn_ptr_signature_from_ty, generate_adt_jvm_class_name,
+            short_hash, should_define_named_data_type, simple_enum_union_size, ty_to_oomir_type,
+            union_from_method_name,
         },
     },
     checked_ops::{
@@ -53,6 +54,16 @@ fn adapt_value_for_field(
         && !value_ty.is_jvm_reference_type()
     {
         let temp_name = generate_temp_var_name(temp_base_name);
+        let enum_value = adapt_simple_enum_operand(
+            value_operand.clone(),
+            field_ty,
+            &temp_name,
+            data_types,
+            instructions,
+        );
+        if enum_value.get_type().as_ref() == Some(field_ty) {
+            return enum_value;
+        }
         if class_name == "java/lang/Object" {
             instructions.push(oomir::Instruction::Cast {
                 op: value_operand,
@@ -288,6 +299,13 @@ pub fn convert_rvalue_to_operand<'a>(
                     tcx,
                     instance,
                     mir,
+                    data_types,
+                    &mut instructions,
+                );
+                let oomir_elem_op = adapt_value_for_field(
+                    oomir_elem_op,
+                    &oomir_elem_type,
+                    &temp_array_var,
                     data_types,
                     &mut instructions,
                 );
@@ -1110,6 +1128,13 @@ pub fn convert_rvalue_to_operand<'a>(
                             data_types,
                             &mut instructions,
                         );
+                        let value_operand = adapt_value_for_field(
+                            value_operand,
+                            &oomir_element_type,
+                            &format!("{}_{}", temp_aggregate_var, i),
+                            data_types,
+                            &mut instructions,
+                        );
                         let index_operand =
                             oomir::Operand::Constant(oomir::Constant::I32(i as i32));
                         instructions.push(oomir::Instruction::ArrayStore {
@@ -1195,16 +1220,15 @@ pub fn convert_rvalue_to_operand<'a>(
                         let oomir_fields: Vec<(String, oomir::Type)> = variant
                             .fields
                             .iter()
-                            .map(|f| {
-                                (
-                                    f.ident(tcx).to_string(),
-                                    ty_to_oomir_type(
-                                        f.ty(tcx, substs).skip_norm_wip(),
-                                        tcx,
-                                        data_types,
-                                        instance,
-                                    ),
-                                )
+                            .filter_map(|f| {
+                                let field_ty = ty_to_oomir_type(
+                                    f.ty(tcx, substs).skip_norm_wip(),
+                                    tcx,
+                                    data_types,
+                                    instance,
+                                );
+                                (!matches!(field_ty, oomir::Type::Void))
+                                    .then(|| (f.ident(tcx).to_string(), field_ty))
                             })
                             .collect();
                         if should_define_data_type && !data_types.contains_key(&jvm_class_name) {
@@ -1246,6 +1270,9 @@ pub fn convert_rvalue_to_operand<'a>(
                             let field_mir_ty = field_def.ty(tcx, substs).skip_norm_wip();
                             let field_oomir_type =
                                 ty_to_oomir_type(field_mir_ty, tcx, data_types, instance);
+                            if matches!(field_oomir_type, oomir::Type::Void) {
+                                continue;
+                            }
                             let value_operand = convert_operand(
                                 mir_operand,
                                 tcx,
@@ -1549,14 +1576,24 @@ pub fn convert_rvalue_to_operand<'a>(
                         let field_mir_ty = field_def.ty(tcx, substs).skip_norm_wip();
                         let field_oomir_ty =
                             ty_to_oomir_type(field_mir_ty, tcx, data_types, instance);
-                        let value_operand = convert_operand(
-                            &operands[FieldIdx::from_usize(0)],
-                            tcx,
-                            instance,
-                            mir,
-                            data_types,
-                            &mut instructions,
-                        );
+                        let is_unit = matches!(field_oomir_ty, oomir::Type::Void);
+                        let value_operand = (!is_unit).then(|| {
+                            let value = convert_operand(
+                                &operands[FieldIdx::from_usize(0)],
+                                tcx,
+                                instance,
+                                mir,
+                                data_types,
+                                &mut instructions,
+                            );
+                            adapt_value_for_field(
+                                value,
+                                &field_oomir_ty,
+                                &temp_aggregate_var,
+                                data_types,
+                                &mut instructions,
+                            )
+                        });
 
                         breadcrumbs::log!(
                             breadcrumbs::LogLevel::Info,
@@ -1572,11 +1609,15 @@ pub fn convert_rvalue_to_operand<'a>(
                             class_name: union_class_name.clone(),
                             method_name: union_from_method_name(&field_name),
                             method_ty: oomir::Signature {
-                                params: vec![("value".to_string(), field_oomir_ty)],
+                                params: if is_unit {
+                                    vec![]
+                                } else {
+                                    vec![("value".to_string(), field_oomir_ty)]
+                                },
                                 ret: Box::new(oomir::Type::Class(union_class_name)),
                                 is_static: true,
                             },
-                            args: vec![value_operand],
+                            args: value_operand.into_iter().collect(),
                         });
                     }
                 }
@@ -1687,8 +1728,23 @@ pub fn convert_rvalue_to_operand<'a>(
                 ),
             };
 
-            let method_name = "getVariantIdx".to_string();
-            let method_return_type = oomir::Type::I32;
+            let place_mir_ty = place.ty(&mir.local_decls, tcx).ty;
+            let use_numeric_discriminant = match place_mir_ty.kind() {
+                TyKind::Adt(adt_def, _) if adt_def.is_enum() => {
+                    simple_enum_union_size(adt_def, tcx).is_ok()
+                }
+                _ => false,
+            };
+            let method_name = if use_numeric_discriminant {
+                ENUM_UNION_DISCRIMINANT_METHOD.to_string()
+            } else {
+                "getVariantIdx".to_string()
+            };
+            let method_return_type = if use_numeric_discriminant {
+                oomir::Type::I64
+            } else {
+                oomir::Type::I32
+            };
 
             let method_ty = oomir::Signature {
                 params: vec![],
@@ -1709,11 +1765,36 @@ pub fn convert_rvalue_to_operand<'a>(
                 },
             });
 
-            // 4. The result is the temporary variable holding the discriminant value
-            result_operand = oomir::Operand::Variable {
-                name: temp_discriminant_var,
-                ty: method_return_type, // Should be I32
-            };
+            // 4. Convert a numeric enum discriminant to the MIR destination's
+            // integer type. Other enum shapes retain the variant-index path.
+            if use_numeric_discriminant {
+                let result_ty = get_place_type(original_dest_place, mir, tcx, instance, data_types);
+                if result_ty == method_return_type {
+                    result_operand = oomir::Operand::Variable {
+                        name: temp_discriminant_var,
+                        ty: method_return_type,
+                    };
+                } else {
+                    let cast_dest = generate_temp_var_name(&base_temp_name);
+                    instructions.push(oomir::Instruction::Cast {
+                        op: oomir::Operand::Variable {
+                            name: temp_discriminant_var,
+                            ty: method_return_type,
+                        },
+                        ty: result_ty.clone(),
+                        dest: cast_dest.clone(),
+                    });
+                    result_operand = oomir::Operand::Variable {
+                        name: cast_dest,
+                        ty: result_ty,
+                    };
+                }
+            } else {
+                result_operand = oomir::Operand::Variable {
+                    name: temp_discriminant_var,
+                    ty: method_return_type,
+                };
+            }
         }
         Rvalue::CopyForDeref(place) => {
             // Need to get the value from the source place first

@@ -9,8 +9,8 @@ public final class RustString {
         return Objects.equals(a, b);
     }
 
-    public static boolean starts_with(String value, char prefix) {
-        return value.startsWith(String.valueOf(prefix));
+    public static boolean starts_with(String value, int prefix) {
+        return value.startsWith(new String(Character.toChars(prefix)));
     }
 
     public static int len(String value) {

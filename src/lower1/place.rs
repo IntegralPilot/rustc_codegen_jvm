@@ -1,8 +1,8 @@
 use super::{
     operand::convert_operand,
     types::{
-        get_field_name_from_index, should_define_named_data_type, ty_to_oomir_type,
-        union_getter_method_name, union_setter_method_name,
+        adapt_simple_enum_operand, get_field_name_from_index, should_define_named_data_type,
+        ty_to_oomir_type, union_getter_method_name, union_setter_method_name,
     },
 };
 use crate::oomir::{self, DataTypeMethod, Instruction, Operand};
@@ -219,8 +219,9 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
                     let next_var = format!("{}_{}", current_var, field_index.index());
                     let obj_type = current_type.clone();
                     current_type = ty_to_oomir_type(field_ty, tcx, data_types, instance);
+                    let is_unit = matches!(current_type, oomir::Type::Void);
                     instructions.push(oomir::Instruction::InvokeVirtual {
-                        dest: Some(next_var.clone()),
+                        dest: (!is_unit).then_some(next_var.clone()),
                         class_name: owner_class_name.clone(),
                         method_name: union_getter_method_name(&field_name),
                         method_ty: oomir::Signature {
@@ -702,19 +703,34 @@ pub fn emit_instructions_to_set_value<'tcx>(
                         };
                     let field_name = union_field_name(adt_def, field_index.index(), tcx);
                     let field_ty = ty_to_oomir_type(*field_mir_ty, tcx, data_types, instance);
+                    let is_unit = matches!(field_ty, oomir::Type::Void);
+                    let source_operand = adapt_simple_enum_operand(
+                        source_operand,
+                        &field_ty,
+                        &format!("{}_{}_union", base_var_name, field_name),
+                        data_types,
+                        &mut instructions,
+                    );
                     instructions.push(Instruction::InvokeVirtual {
                         dest: None,
                         class_name: owner_class_name.clone(),
                         method_name: union_setter_method_name(&field_name),
                         method_ty: oomir::Signature {
-                            params: vec![
-                                ("self".to_string(), oomir::Type::Class(owner_class_name)),
-                                ("value".to_string(), field_ty),
-                            ],
+                            params: vec![(
+                                "self".to_string(),
+                                oomir::Type::Class(owner_class_name),
+                            )]
+                            .into_iter()
+                            .chain((!is_unit).then_some(("value".to_string(), field_ty)))
+                            .collect(),
                             ret: Box::new(oomir::Type::Void),
                             is_static: false,
                         },
-                        args: vec![source_operand],
+                        args: if is_unit {
+                            vec![]
+                        } else {
+                            vec![source_operand]
+                        },
                         operand: Operand::Variable {
                             name: base_var_name,
                             ty: base_oomir_type,

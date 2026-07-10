@@ -19,6 +19,8 @@ use sha2::Digest;
 use std::collections::HashMap;
 
 pub const UNION_BYTES_FIELD: &str = "__bytes";
+pub(super) const ENUM_UNION_DISCRIMINANT_METHOD: &str = "__unionDiscriminant";
+const ENUM_FROM_UNION_DISCRIMINANT_METHOD: &str = "__fromUnionDiscriminant";
 
 pub fn union_from_method_name(field_name: &str) -> String {
     format!("from_{}", jvm_names::member_name(field_name))
@@ -118,6 +120,66 @@ fn layout_size_bytes<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Result<usize, Str
     Ok(layout.size.bytes_usize())
 }
 
+pub(super) fn simple_enum_union_size<'tcx>(
+    adt_def: &AdtDef<'tcx>,
+    tcx: TyCtxt<'tcx>,
+) -> Result<usize, String> {
+    if !adt_def.is_enum() || adt_def.variants().is_empty() {
+        return Err("only non-empty enums are supported in unions".to_string());
+    }
+    if adt_def
+        .variants()
+        .iter()
+        .any(|variant| !variant.fields.is_empty())
+    {
+        return Err("only fieldless enums are supported in unions".to_string());
+    }
+
+    let discriminant_ty = adt_def
+        .discriminants(tcx)
+        .next()
+        .ok_or_else(|| "enum has no discriminants".to_string())?
+        .1
+        .ty;
+    match discriminant_ty.kind() {
+        TyKind::Int(IntTy::I128) | TyKind::Uint(UintTy::U64 | UintTy::U128) => {
+            return Err(format!(
+                "unsupported enum discriminant type {:?}",
+                discriminant_ty
+            ));
+        }
+        TyKind::Int(_) | TyKind::Uint(_) => {}
+        _ => {
+            return Err(format!(
+                "enum discriminant type is not a supported integer: {:?}",
+                discriminant_ty
+            ));
+        }
+    }
+
+    let enum_ty = tcx
+        .type_of(adt_def.did())
+        .instantiate_identity()
+        .skip_norm_wip();
+    let size = layout_size_bytes(tcx, enum_ty)?;
+    if !matches!(size, 1 | 2 | 4 | 8) {
+        return Err(format!(
+            "unsupported enum discriminant layout size: {} bytes",
+            size
+        ));
+    }
+    Ok(size)
+}
+
+fn masked_enum_discriminant(value: u128, size: usize) -> i64 {
+    if size == 8 {
+        value as i64
+    } else {
+        let mask = (1u128 << (size * 8)) - 1;
+        (value & mask) as i64
+    }
+}
+
 fn scalar_bits_type(rust_size: usize, oomir_ty: &oomir::Type) -> oomir::Type {
     if matches!(oomir_ty, oomir::Type::I64 | oomir::Type::F64) || rust_size > 4 {
         oomir::Type::I64
@@ -181,6 +243,98 @@ fn add_enum_helper_methods(
     }
 }
 
+fn enum_from_union_discriminant_function<'tcx>(
+    adt_def: &AdtDef<'tcx>,
+    union_size: usize,
+    base_enum_name: &str,
+    tcx: TyCtxt<'tcx>,
+) -> oomir::Function {
+    let mut basic_blocks = HashMap::new();
+    let mut targets = Vec::new();
+
+    for (variant_idx, discriminant) in adt_def.discriminants(tcx) {
+        let variant = adt_def.variant(variant_idx);
+        let variant_class_name = format!(
+            "{}${}",
+            base_enum_name,
+            jvm_names::member_name(&variant.name.to_string())
+        );
+        let block_name = format!("variant_{}", variant_idx.as_u32());
+        let result_name = format!("_variant_{}", variant_idx.as_u32());
+        let masked_discriminant = masked_enum_discriminant(discriminant.val, union_size);
+        targets.push((
+            oomir::Constant::I64(masked_discriminant),
+            block_name.clone(),
+        ));
+        let shift = 64 - union_size * 8;
+        let signed_discriminant = (masked_discriminant << shift) >> shift;
+        if signed_discriminant != masked_discriminant {
+            targets.push((
+                oomir::Constant::I64(signed_discriminant),
+                block_name.clone(),
+            ));
+        }
+        basic_blocks.insert(
+            block_name.clone(),
+            oomir::BasicBlock {
+                label: block_name,
+                instructions: vec![
+                    oomir::Instruction::ConstructObject {
+                        dest: result_name.clone(),
+                        class_name: variant_class_name.clone(),
+                        args: vec![],
+                    },
+                    oomir::Instruction::Return {
+                        operand: Some(operand_var(
+                            result_name,
+                            oomir::Type::Class(variant_class_name),
+                        )),
+                    },
+                ],
+            },
+        );
+    }
+
+    basic_blocks.insert(
+        "entry".to_string(),
+        oomir::BasicBlock {
+            label: "entry".to_string(),
+            instructions: vec![oomir::Instruction::Switch {
+                discr: operand_var("_1", oomir::Type::I64),
+                targets,
+                otherwise: "invalid".to_string(),
+            }],
+        },
+    );
+    basic_blocks.insert(
+        "invalid".to_string(),
+        oomir::BasicBlock {
+            label: "invalid".to_string(),
+            instructions: vec![oomir::Instruction::ThrowNewWithMessage {
+                exception_class: "java/lang/IllegalArgumentException".to_string(),
+                message: format!(
+                    "invalid discriminant while reading enum {} from union storage",
+                    base_enum_name
+                ),
+            }],
+        },
+    );
+
+    oomir::Function {
+        name: ENUM_FROM_UNION_DISCRIMINANT_METHOD.to_string(),
+        owner_class: None,
+        signature: oomir::Signature {
+            params: vec![("discriminant".to_string(), oomir::Type::I64)],
+            ret: Box::new(oomir::Type::Class(base_enum_name.to_string())),
+            is_static: true,
+        },
+        body: oomir::CodeBlock {
+            entry: "entry".to_string(),
+            basic_blocks,
+        },
+    }
+}
+
 fn ensure_enum_data_types<'tcx>(
     adt_def: &AdtDef<'tcx>,
     substs: GenericArgsRef<'tcx>,
@@ -189,6 +343,9 @@ fn ensure_enum_data_types<'tcx>(
     data_types: &mut HashMap<String, oomir::DataType>,
     instance_context: rustc_middle::ty::Instance<'tcx>,
 ) {
+    let union_size = simple_enum_union_size(adt_def, tcx).ok();
+    let union_factory = union_size
+        .map(|size| enum_from_union_discriminant_function(adt_def, size, base_enum_name, tcx));
     let variants_info: Vec<_> = adt_def
         .variants()
         .iter()
@@ -214,6 +371,16 @@ fn ensure_enum_data_types<'tcx>(
     if !data_types.contains_key(base_enum_name) {
         let mut methods = HashMap::new();
         add_enum_helper_methods(&mut methods, variants_info.clone());
+        if let Some(factory) = union_factory.clone() {
+            methods.insert(
+                ENUM_UNION_DISCRIMINANT_METHOD.to_string(),
+                DataTypeMethod::SimpleConstantReturn(oomir::Type::I64, None),
+            );
+            methods.insert(
+                ENUM_FROM_UNION_DISCRIMINANT_METHOD.to_string(),
+                DataTypeMethod::Function(factory),
+            );
+        }
         data_types.insert(
             base_enum_name.to_string(),
             oomir::DataType::Class {
@@ -227,15 +394,35 @@ fn ensure_enum_data_types<'tcx>(
     } else if let Some(oomir::DataType::Class { methods, .. }) = data_types.get_mut(base_enum_name)
     {
         add_enum_helper_methods(methods, variants_info.clone());
+        if let Some(factory) = union_factory {
+            methods
+                .entry(ENUM_UNION_DISCRIMINANT_METHOD.to_string())
+                .or_insert(DataTypeMethod::SimpleConstantReturn(oomir::Type::I64, None));
+            methods
+                .entry(ENUM_FROM_UNION_DISCRIMINANT_METHOD.to_string())
+                .or_insert(DataTypeMethod::Function(factory));
+        }
     }
 
+    let discriminants: HashMap<_, _> = adt_def.discriminants(tcx).collect();
     for (variant_idx, variant) in adt_def.variants().iter().enumerate() {
         let variant_class_name = format!(
             "{}${}",
             base_enum_name,
             jvm_names::member_name(&variant.name.to_string())
         );
-        if data_types.contains_key(&variant_class_name) {
+        if let Some(oomir::DataType::Class { methods, .. }) =
+            data_types.get_mut(&variant_class_name)
+        {
+            if union_size.is_some() {
+                let discriminant = discriminants[&variant_idx.into()];
+                methods
+                    .entry(ENUM_UNION_DISCRIMINANT_METHOD.to_string())
+                    .or_insert(DataTypeMethod::SimpleConstantReturn(
+                        oomir::Type::I64,
+                        Some(oomir::Constant::I64(discriminant.val as i64)),
+                    ));
+            }
             continue;
         }
 
@@ -262,6 +449,16 @@ fn ensure_enum_data_types<'tcx>(
                 Some(oomir::Constant::I32(variant_idx as i32)),
             ),
         );
+        if union_size.is_some() {
+            let discriminant = discriminants[&variant_idx.into()];
+            methods.insert(
+                ENUM_UNION_DISCRIMINANT_METHOD.to_string(),
+                DataTypeMethod::SimpleConstantReturn(
+                    oomir::Type::I64,
+                    Some(oomir::Constant::I64(discriminant.val as i64)),
+                ),
+            );
+        }
 
         data_types.insert(
             variant_class_name,
@@ -283,10 +480,57 @@ fn operand_var(name: impl Into<String>, ty: oomir::Type) -> oomir::Operand {
     }
 }
 
+pub(super) fn adapt_simple_enum_operand(
+    source: oomir::Operand,
+    target_ty: &oomir::Type,
+    temp_prefix: &str,
+    data_types: &HashMap<String, oomir::DataType>,
+    instructions: &mut Vec<oomir::Instruction>,
+) -> oomir::Operand {
+    let oomir::Type::Class(enum_class) = target_ty else {
+        return source;
+    };
+    if source
+        .get_type()
+        .is_some_and(|source_ty| source_ty.is_jvm_reference_type())
+    {
+        return source;
+    }
+    let has_factory = matches!(
+        data_types.get(enum_class),
+        Some(oomir::DataType::Class { methods, .. })
+            if methods.contains_key(ENUM_FROM_UNION_DISCRIMINANT_METHOD)
+    );
+    if !has_factory {
+        return source;
+    }
+
+    let bits_dest = format!("{}_enum_discriminant", temp_prefix);
+    instructions.push(oomir::Instruction::Cast {
+        op: source,
+        ty: oomir::Type::I64,
+        dest: bits_dest.clone(),
+    });
+    let enum_dest = format!("{}_enum_value", temp_prefix);
+    instructions.push(oomir::Instruction::InvokeStatic {
+        dest: Some(enum_dest.clone()),
+        class_name: enum_class.clone(),
+        method_name: ENUM_FROM_UNION_DISCRIMINANT_METHOD.to_string(),
+        method_ty: oomir::Signature {
+            params: vec![("discriminant".to_string(), oomir::Type::I64)],
+            ret: Box::new(target_ty.clone()),
+            is_static: true,
+        },
+        args: vec![operand_var(bits_dest, oomir::Type::I64)],
+    });
+    operand_var(enum_dest, target_ty.clone())
+}
+
 fn is_direct_union_scalar<'tcx>(ty: Ty<'tcx>) -> bool {
     matches!(
         ty.kind(),
         TyKind::Bool
+            | TyKind::Char
             | TyKind::Int(_)
             | TyKind::Uint(_)
             | TyKind::Float(FloatTy::F32 | FloatTy::F64)
@@ -348,7 +592,7 @@ fn scalar_bit_operand_for_union<'tcx>(
         TyKind::Int(IntTy::I128) | TyKind::Uint(UintTy::U64 | UintTy::U128) => {
             Err(format!("unsupported wide integer union field: {:?}", ty))
         }
-        TyKind::Bool | TyKind::Int(_) | TyKind::Uint(_) => {
+        TyKind::Bool | TyKind::Char | TyKind::Int(_) | TyKind::Uint(_) => {
             let bits_ty = scalar_bits_type(rust_size, &oomir_ty);
             if source.get_type().as_ref() == Some(&bits_ty) {
                 Ok((source, bits_ty, rust_size))
@@ -366,27 +610,15 @@ fn scalar_bit_operand_for_union<'tcx>(
     }
 }
 
-fn emit_scalar_to_union_bytes<'tcx>(
-    ty: Ty<'tcx>,
-    source: oomir::Operand,
+fn emit_bits_to_union_bytes(
+    bits_operand: oomir::Operand,
+    bits_ty: oomir::Type,
+    rust_size: usize,
     bytes_var: &str,
     base_offset: usize,
-    tcx: TyCtxt<'tcx>,
-    data_types: &mut HashMap<String, oomir::DataType>,
-    instance_context: rustc_middle::ty::Instance<'tcx>,
     instructions: &mut Vec<oomir::Instruction>,
     temp_counter: &mut usize,
 ) -> Result<(), String> {
-    let (bits_operand, bits_ty, rust_size) = scalar_bit_operand_for_union(
-        ty,
-        source,
-        tcx,
-        data_types,
-        instance_context,
-        instructions,
-        temp_counter,
-    )?;
-
     for byte_idx in 0..rust_size {
         let shifted = if byte_idx == 0 {
             bits_operand.clone()
@@ -424,6 +656,37 @@ fn emit_scalar_to_union_bytes<'tcx>(
     Ok(())
 }
 
+fn emit_scalar_to_union_bytes<'tcx>(
+    ty: Ty<'tcx>,
+    source: oomir::Operand,
+    bytes_var: &str,
+    base_offset: usize,
+    tcx: TyCtxt<'tcx>,
+    data_types: &mut HashMap<String, oomir::DataType>,
+    instance_context: rustc_middle::ty::Instance<'tcx>,
+    instructions: &mut Vec<oomir::Instruction>,
+    temp_counter: &mut usize,
+) -> Result<(), String> {
+    let (bits_operand, bits_ty, rust_size) = scalar_bit_operand_for_union(
+        ty,
+        source,
+        tcx,
+        data_types,
+        instance_context,
+        instructions,
+        temp_counter,
+    )?;
+    emit_bits_to_union_bytes(
+        bits_operand,
+        bits_ty,
+        rust_size,
+        bytes_var,
+        base_offset,
+        instructions,
+        temp_counter,
+    )
+}
+
 fn emit_ty_to_union_bytes<'tcx>(
     ty: Ty<'tcx>,
     source: oomir::Operand,
@@ -450,6 +713,69 @@ fn emit_ty_to_union_bytes<'tcx>(
     }
 
     match ty.kind() {
+        TyKind::Tuple(elements) if elements.is_empty() => Ok(()),
+        TyKind::Array(element_ty, length) => {
+            let length = length
+                .try_to_target_usize(tcx)
+                .ok_or_else(|| format!("array length is not concrete for {:?}", ty))?
+                as usize;
+            let element_size = layout_size_bytes(tcx, *element_ty)?;
+            if element_size == 0 {
+                return Err(format!(
+                    "zero-sized array elements are unsupported in union field {:?}",
+                    ty
+                ));
+            }
+            let element_oomir_ty = ty_to_oomir_type(*element_ty, tcx, data_types, instance_context);
+
+            for index in 0..length {
+                let element_dest = next_union_temp("union_array_element", temp_counter);
+                instructions.push(oomir::Instruction::ArrayGet {
+                    dest: element_dest.clone(),
+                    array: source.clone(),
+                    index: oomir::Operand::Constant(oomir::Constant::I32(index as i32)),
+                });
+                emit_ty_to_union_bytes(
+                    *element_ty,
+                    operand_var(element_dest, element_oomir_ty.clone()),
+                    bytes_var,
+                    base_offset + index * element_size,
+                    tcx,
+                    data_types,
+                    instance_context,
+                    instructions,
+                    temp_counter,
+                )?;
+            }
+            Ok(())
+        }
+        TyKind::Adt(adt_def, substs) if adt_def.is_enum() => {
+            let enum_size = simple_enum_union_size(adt_def, tcx)?;
+            let enum_class =
+                generate_adt_jvm_class_name(adt_def, substs, tcx, data_types, instance_context);
+            let discriminant_dest = next_union_temp("union_enum_discriminant", temp_counter);
+            instructions.push(oomir::Instruction::InvokeVirtual {
+                dest: Some(discriminant_dest.clone()),
+                class_name: enum_class.clone(),
+                method_name: ENUM_UNION_DISCRIMINANT_METHOD.to_string(),
+                method_ty: oomir::Signature {
+                    params: vec![("self".to_string(), oomir::Type::Class(enum_class))],
+                    ret: Box::new(oomir::Type::I64),
+                    is_static: false,
+                },
+                args: vec![],
+                operand: source,
+            });
+            emit_bits_to_union_bytes(
+                operand_var(discriminant_dest, oomir::Type::I64),
+                oomir::Type::I64,
+                enum_size,
+                bytes_var,
+                base_offset,
+                instructions,
+                temp_counter,
+            )
+        }
         TyKind::Adt(adt_def, substs) if adt_def.is_struct() => {
             let class_name =
                 generate_adt_jvm_class_name(adt_def, substs, tcx, data_types, instance_context);
@@ -493,37 +819,20 @@ fn emit_ty_to_union_bytes<'tcx>(
             Ok(())
         }
         _ => Err(format!(
-            "unsupported union field type {:?}; only primitive numbers and structs of them are implemented",
+            "unsupported union field type {:?}; only primitive numbers, fieldless enums, fixed-size arrays, and structs of them are implemented",
             ty
         )),
     }
 }
 
-fn emit_scalar_from_union_bytes<'tcx>(
-    ty: Ty<'tcx>,
+fn emit_bits_from_union_bytes(
+    bits_ty: oomir::Type,
+    rust_size: usize,
     bytes_var: &str,
     base_offset: usize,
-    tcx: TyCtxt<'tcx>,
-    data_types: &mut HashMap<String, oomir::DataType>,
-    instance_context: rustc_middle::ty::Instance<'tcx>,
     instructions: &mut Vec<oomir::Instruction>,
     temp_counter: &mut usize,
-) -> Result<oomir::Operand, String> {
-    let rust_size = layout_size_bytes(tcx, ty)?;
-    let oomir_ty = ty_to_oomir_type(ty, tcx, data_types, instance_context);
-    let bits_ty = match ty.kind() {
-        TyKind::Float(FloatTy::F32) => oomir::Type::I32,
-        TyKind::Float(FloatTy::F64) => oomir::Type::I64,
-        TyKind::Float(_) => {
-            return Err(format!("unsupported float width in union field: {:?}", ty));
-        }
-        TyKind::Int(IntTy::I128) | TyKind::Uint(UintTy::U64 | UintTy::U128) => {
-            return Err(format!("unsupported wide integer union field: {:?}", ty));
-        }
-        TyKind::Bool | TyKind::Int(_) | TyKind::Uint(_) => scalar_bits_type(rust_size, &oomir_ty),
-        _ => return Err(format!("unsupported scalar union field: {:?}", ty)),
-    };
-
+) -> oomir::Operand {
     let mut accum: Option<oomir::Operand> = None;
     for byte_idx in 0..rust_size {
         let raw_dest = next_union_temp("union_raw_byte", temp_counter);
@@ -572,13 +881,49 @@ fn emit_scalar_from_union_bytes<'tcx>(
         });
     }
 
-    let bits_operand = accum.unwrap_or_else(|| {
+    accum.unwrap_or_else(|| {
         oomir::Operand::Constant(if matches!(bits_ty, oomir::Type::I64) {
             oomir::Constant::I64(0)
         } else {
             oomir::Constant::I32(0)
         })
-    });
+    })
+}
+
+fn emit_scalar_from_union_bytes<'tcx>(
+    ty: Ty<'tcx>,
+    bytes_var: &str,
+    base_offset: usize,
+    tcx: TyCtxt<'tcx>,
+    data_types: &mut HashMap<String, oomir::DataType>,
+    instance_context: rustc_middle::ty::Instance<'tcx>,
+    instructions: &mut Vec<oomir::Instruction>,
+    temp_counter: &mut usize,
+) -> Result<oomir::Operand, String> {
+    let rust_size = layout_size_bytes(tcx, ty)?;
+    let oomir_ty = ty_to_oomir_type(ty, tcx, data_types, instance_context);
+    let bits_ty = match ty.kind() {
+        TyKind::Float(FloatTy::F32) => oomir::Type::I32,
+        TyKind::Float(FloatTy::F64) => oomir::Type::I64,
+        TyKind::Float(_) => {
+            return Err(format!("unsupported float width in union field: {:?}", ty));
+        }
+        TyKind::Int(IntTy::I128) | TyKind::Uint(UintTy::U64 | UintTy::U128) => {
+            return Err(format!("unsupported wide integer union field: {:?}", ty));
+        }
+        TyKind::Bool | TyKind::Char | TyKind::Int(_) | TyKind::Uint(_) => {
+            scalar_bits_type(rust_size, &oomir_ty)
+        }
+        _ => return Err(format!("unsupported scalar union field: {:?}", ty)),
+    };
+    let bits_operand = emit_bits_from_union_bytes(
+        bits_ty.clone(),
+        rust_size,
+        bytes_var,
+        base_offset,
+        instructions,
+        temp_counter,
+    );
 
     match ty.kind() {
         TyKind::Float(FloatTy::F32) => {
@@ -648,6 +993,72 @@ fn emit_ty_from_union_bytes<'tcx>(
     }
 
     match ty.kind() {
+        TyKind::Array(element_ty, length) => {
+            let length = length
+                .try_to_target_usize(tcx)
+                .ok_or_else(|| format!("array length is not concrete for {:?}", ty))?
+                as usize;
+            let element_size = layout_size_bytes(tcx, *element_ty)?;
+            if element_size == 0 {
+                return Err(format!(
+                    "zero-sized array elements are unsupported in union field {:?}",
+                    ty
+                ));
+            }
+            let element_oomir_ty = ty_to_oomir_type(*element_ty, tcx, data_types, instance_context);
+            let array_ty = oomir::Type::Array(Box::new(element_oomir_ty.clone()));
+            let array_dest = next_union_temp("union_array_value", temp_counter);
+            instructions.push(oomir::Instruction::NewArray {
+                dest: array_dest.clone(),
+                element_type: element_oomir_ty,
+                size: oomir::Operand::Constant(oomir::Constant::I32(length as i32)),
+            });
+
+            for index in 0..length {
+                let element_value = emit_ty_from_union_bytes(
+                    *element_ty,
+                    bytes_var,
+                    base_offset + index * element_size,
+                    tcx,
+                    data_types,
+                    instance_context,
+                    instructions,
+                    temp_counter,
+                )?;
+                instructions.push(oomir::Instruction::ArrayStore {
+                    array: array_dest.clone(),
+                    index: oomir::Operand::Constant(oomir::Constant::I32(index as i32)),
+                    value: element_value,
+                });
+            }
+            Ok(operand_var(array_dest, array_ty))
+        }
+        TyKind::Adt(adt_def, substs) if adt_def.is_enum() => {
+            let enum_size = simple_enum_union_size(adt_def, tcx)?;
+            let enum_class =
+                generate_adt_jvm_class_name(adt_def, substs, tcx, data_types, instance_context);
+            let discriminant = emit_bits_from_union_bytes(
+                oomir::Type::I64,
+                enum_size,
+                bytes_var,
+                base_offset,
+                instructions,
+                temp_counter,
+            );
+            let enum_dest = next_union_temp("union_enum_value", temp_counter);
+            instructions.push(oomir::Instruction::InvokeStatic {
+                dest: Some(enum_dest.clone()),
+                class_name: enum_class.clone(),
+                method_name: ENUM_FROM_UNION_DISCRIMINANT_METHOD.to_string(),
+                method_ty: oomir::Signature {
+                    params: vec![("discriminant".to_string(), oomir::Type::I64)],
+                    ret: Box::new(oomir::Type::Class(enum_class.clone())),
+                    is_static: true,
+                },
+                args: vec![discriminant],
+            });
+            Ok(operand_var(enum_dest, oomir::Type::Class(enum_class)))
+        }
         TyKind::Adt(adt_def, substs) if adt_def.is_struct() => {
             let class_name =
                 generate_adt_jvm_class_name(adt_def, substs, tcx, data_types, instance_context);
@@ -660,6 +1071,9 @@ fn emit_ty_from_union_bytes<'tcx>(
             for (idx, field_def) in variant.fields.iter().enumerate() {
                 let field_ty = field_def.ty(tcx, substs).skip_norm_wip();
                 let field_oomir_ty = ty_to_oomir_type(field_ty, tcx, data_types, instance_context);
+                if matches!(field_oomir_ty, oomir::Type::Void) {
+                    continue;
+                }
                 let field_offset = layout.fields.offset(idx).bytes_usize();
                 let field_value = emit_ty_from_union_bytes(
                     field_ty,
@@ -683,7 +1097,7 @@ fn emit_ty_from_union_bytes<'tcx>(
             Ok(operand_var(dest, oomir::Type::Class(class_name)))
         }
         _ => Err(format!(
-            "unsupported union field type {:?}; only primitive numbers and structs of them are implemented",
+            "unsupported union field type {:?}; only primitive numbers, fieldless enums, fixed-size arrays, and structs of them are implemented",
             ty
         )),
     }
@@ -728,6 +1142,7 @@ fn union_from_function<'tcx>(
     data_types: &mut HashMap<String, oomir::DataType>,
     instance_context: rustc_middle::ty::Instance<'tcx>,
 ) -> oomir::Function {
+    let is_unit = matches!(field_oomir_ty, oomir::Type::Void);
     let mut instructions = vec![oomir::Instruction::NewArray {
         dest: "_bytes".to_string(),
         element_type: oomir::Type::I8,
@@ -776,7 +1191,11 @@ fn union_from_function<'tcx>(
         name: union_from_method_name(field_name),
         owner_class: None,
         signature: oomir::Signature {
-            params: vec![("value".to_string(), field_oomir_ty)],
+            params: if is_unit {
+                vec![]
+            } else {
+                vec![("value".to_string(), field_oomir_ty)]
+            },
             ret: Box::new(oomir::Type::Class(union_class.to_string())),
             is_static: true,
         },
@@ -793,6 +1212,22 @@ fn union_getter_function<'tcx>(
     data_types: &mut HashMap<String, oomir::DataType>,
     instance_context: rustc_middle::ty::Instance<'tcx>,
 ) -> oomir::Function {
+    if matches!(field_oomir_ty, oomir::Type::Void) {
+        return oomir::Function {
+            name: union_getter_method_name(field_name),
+            owner_class: None,
+            signature: oomir::Signature {
+                params: vec![(
+                    "self".to_string(),
+                    oomir::Type::Class(union_class.to_string()),
+                )],
+                ret: Box::new(oomir::Type::Void),
+                is_static: false,
+            },
+            body: simple_body(vec![oomir::Instruction::Return { operand: None }]),
+        };
+    }
+
     let mut instructions = vec![oomir::Instruction::GetField {
         dest: "_bytes".to_string(),
         object: operand_var("_1", oomir::Type::Class(union_class.to_string())),
@@ -854,6 +1289,7 @@ fn union_setter_function<'tcx>(
     data_types: &mut HashMap<String, oomir::DataType>,
     instance_context: rustc_middle::ty::Instance<'tcx>,
 ) -> oomir::Function {
+    let is_unit = matches!(field_oomir_ty, oomir::Type::Void);
     let mut instructions = vec![oomir::Instruction::GetField {
         dest: "_bytes".to_string(),
         object: operand_var("_1", oomir::Type::Class(union_class.to_string())),
@@ -894,13 +1330,13 @@ fn union_setter_function<'tcx>(
         name: union_setter_method_name(field_name),
         owner_class: None,
         signature: oomir::Signature {
-            params: vec![
-                (
-                    "self".to_string(),
-                    oomir::Type::Class(union_class.to_string()),
-                ),
-                ("value".to_string(), field_oomir_ty),
-            ],
+            params: vec![(
+                "self".to_string(),
+                oomir::Type::Class(union_class.to_string()),
+            )]
+            .into_iter()
+            .chain((!is_unit).then_some(("value".to_string(), field_oomir_ty)))
+            .collect(),
             ret: Box::new(oomir::Type::Void),
             is_static: false,
         },
@@ -1042,7 +1478,10 @@ pub fn ty_to_oomir_type<'tcx>(
     };
     match resolved_ty.kind() {
         rustc_middle::ty::TyKind::Bool => oomir::Type::Boolean,
-        rustc_middle::ty::TyKind::Char => oomir::Type::Char,
+        // Rust `char` is a 32-bit Unicode scalar value, unlike the JVM's
+        // 16-bit UTF-16 `char` primitive. Keep it as an int so supplementary
+        // characters are not truncated.
+        rustc_middle::ty::TyKind::Char => oomir::Type::I32,
         rustc_middle::ty::TyKind::Int(int_ty) => match int_ty {
             IntTy::I8 => oomir::Type::I8,
             IntTy::I16 => oomir::Type::I16,
@@ -1090,7 +1529,7 @@ pub fn ty_to_oomir_type<'tcx>(
                         let oomir_fields = variant
                             .fields
                             .iter()
-                            .map(|field_def| {
+                            .filter_map(|field_def| {
                                 let field_name = field_def.ident(tcx).to_string();
                                 let field_mir_ty = field_def.ty(tcx, substs).skip_norm_wip();
                                 let field_oomir_type = ty_to_oomir_type(
@@ -1099,7 +1538,8 @@ pub fn ty_to_oomir_type<'tcx>(
                                     data_types,
                                     instance_context,
                                 );
-                                (field_name, field_oomir_type)
+                                (!matches!(field_oomir_type, oomir::Type::Void))
+                                    .then_some((field_name, field_oomir_type))
                             })
                             .collect::<Vec<_>>();
                         let mut methods = HashMap::new();
@@ -1629,10 +2069,7 @@ pub fn mir_int_to_oomir_const<'tcx>(
             },
         },
         TyKind::Bool => oomir::Constant::Boolean(value != 0), // 0 is false, non-zero is true
-        TyKind::Char => {
-            // u128 -> u32 -> char
-            oomir::Constant::Char(char::from_u32(value as u32).unwrap_or('\0')) // Handle potential invalid char
-        }
+        TyKind::Char => oomir::Constant::I32(value as i32),
         _ => {
             // This case should ideally not happen if MIR is well-typed
             breadcrumbs::log!(

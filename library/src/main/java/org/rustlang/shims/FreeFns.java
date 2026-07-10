@@ -21,8 +21,8 @@ public final class FreeFns {
         return Objects.equals(a, b);
     }
 
-    public static boolean starts_with_char(String value, char prefix) {
-        return value.startsWith(String.valueOf(prefix));
+    public static boolean starts_with_char(String value, int prefix) {
+        return value.startsWith(new String(Character.toChars(prefix)));
     }
 
     public static boolean eq_Object_Object(Object a, Object b) {

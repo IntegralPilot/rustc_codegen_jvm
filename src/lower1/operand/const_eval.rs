@@ -962,15 +962,23 @@ fn handle_constant_enum<'tcx>(
 
 /// Converts a Rust MIR Scalar::Int into the appropriate OOMIR constant.
 pub fn scalar_int_to_oomir_constant(scalar_int: ScalarInt, ty: Ty<'_>) -> oomir::Constant {
+    let bits = scalar_int.to_bits(scalar_int.size());
+    let bit_width = scalar_int.size().bits() as u32;
+    let signed = if bit_width == 128 {
+        bits as i128
+    } else {
+        ((bits << (128 - bit_width)) as i128) >> (128 - bit_width)
+    };
+
     match ty.kind() {
         TyKind::Int(int_ty) => match int_ty {
-            IntTy::I8 => oomir::Constant::I8(scalar_int.to_i8() as i8),
-            IntTy::I16 => oomir::Constant::I16(scalar_int.to_i16() as i16),
-            IntTy::I32 => oomir::Constant::I32(scalar_int.to_i32() as i32),
-            IntTy::Isize => oomir::Constant::I32(scalar_int.to_i64() as i32),
-            IntTy::I64 => oomir::Constant::I64(scalar_int.to_i64()),
+            IntTy::I8 => oomir::Constant::I8(signed as i8),
+            IntTy::I16 => oomir::Constant::I16(signed as i16),
+            IntTy::I32 => oomir::Constant::I32(signed as i32),
+            IntTy::Isize => oomir::Constant::I32(signed as i32),
+            IntTy::I64 => oomir::Constant::I64(signed as i64),
             IntTy::I128 => {
-                let param = oomir::Constant::String(scalar_int.to_i128().to_string());
+                let param = oomir::Constant::String(signed.to_string());
                 oomir::Constant::Instance {
                     class_name: "java/math/BigInteger".into(),
                     fields: HashMap::new(),
@@ -979,12 +987,12 @@ pub fn scalar_int_to_oomir_constant(scalar_int: ScalarInt, ty: Ty<'_>) -> oomir:
             }
         },
         TyKind::Uint(uint_ty) => match uint_ty {
-            UintTy::U8 => oomir::Constant::I16(scalar_int.to_u8() as i16),
-            UintTy::U16 => oomir::Constant::I32(scalar_int.to_u16() as i32),
-            UintTy::U32 => oomir::Constant::I64(scalar_int.to_u32() as i64),
-            UintTy::Usize => oomir::Constant::I32(scalar_int.to_u64() as i32),
+            UintTy::U8 => oomir::Constant::I16(bits as u8 as i16),
+            UintTy::U16 => oomir::Constant::I32(bits as u16 as i32),
+            UintTy::U32 => oomir::Constant::I64(bits as u32 as i64),
+            UintTy::Usize => oomir::Constant::I32(bits as i32),
             UintTy::U64 => {
-                let param = oomir::Constant::String(scalar_int.to_u64().to_string());
+                let param = oomir::Constant::String((bits as u64).to_string());
                 oomir::Constant::Instance {
                     class_name: "java/math/BigInteger".into(),
                     fields: HashMap::new(),
@@ -992,7 +1000,7 @@ pub fn scalar_int_to_oomir_constant(scalar_int: ScalarInt, ty: Ty<'_>) -> oomir:
                 }
             }
             UintTy::U128 => {
-                let param = oomir::Constant::String(scalar_int.to_u128().to_string());
+                let param = oomir::Constant::String(bits.to_string());
                 oomir::Constant::Instance {
                     class_name: "java/math/BigInteger".into(),
                     fields: HashMap::new(),
@@ -1001,7 +1009,7 @@ pub fn scalar_int_to_oomir_constant(scalar_int: ScalarInt, ty: Ty<'_>) -> oomir:
             }
         },
         TyKind::Bool => oomir::Constant::Boolean(scalar_int.try_to_bool().unwrap_or(false)),
-        TyKind::Char => oomir::Constant::Char(char::from_u32(scalar_int.to_u32()).unwrap_or('\0')),
+        TyKind::Char => oomir::Constant::I32(scalar_int.to_u32() as i32),
         TyKind::Float(float_ty) => match float_ty {
             FloatTy::F16 => {
                 let f16_val = half::f16::from_bits(scalar_int.to_u16());
