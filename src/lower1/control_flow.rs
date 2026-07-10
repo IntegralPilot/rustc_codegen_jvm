@@ -362,11 +362,7 @@ pub fn convert_basic_block<'tcx>(
                                 });
                             } else {
                                 // Check if this method is declared in a trait (interface)
-                                let container_id = item.container_id(tcx);
-                                let is_trait_method = matches!(
-                                    tcx.def_kind(container_id),
-                                    rustc_hir::def::DefKind::Trait
-                                );
+                                let trait_container = item.trait_container(tcx);
 
                                 // Check if the receiver operand is an interface type (after any casts)
                                 let receiver_oomir_ty = receiver_operand.get_type();
@@ -379,9 +375,9 @@ pub fn convert_basic_block<'tcx>(
                                         receiver_oomir_ty
                                     {
                                         Some(interface_name.clone())
-                                    } else if is_trait_method {
+                                    } else if let Some(trait_def_id) = trait_container {
                                         // Get the trait name and convert to interface name
-                                        Some(jvm_names::class_for_def_id(tcx, container_id))
+                                        Some(jvm_names::class_for_def_id(tcx, trait_def_id))
                                     } else {
                                         None
                                     };
@@ -481,13 +477,9 @@ pub fn convert_basic_block<'tcx>(
                             );
                             method_signature.is_static = true;
 
-                            let container_id = item.container_id(tcx);
-                            let self_ty_opt = if matches!(
-                                tcx.def_kind(container_id),
-                                rustc_hir::def::DefKind::Impl { .. }
-                            ) {
+                            let self_ty_opt = if let Some(impl_def_id) = item.impl_container(tcx) {
                                 Some(
-                                    tcx.type_of(container_id)
+                                    tcx.type_of(impl_def_id)
                                         .instantiate(tcx, func_instance.args)
                                         .skip_norm_wip(),
                                 )

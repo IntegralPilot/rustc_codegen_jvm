@@ -1,5 +1,5 @@
-use rustc_hir::def_id::{CrateNum, DefId};
 use rustc_middle::ty::{Instance, TyCtxt};
+use rustc_span::def_id::{CrateNum, DefId};
 
 const RUNTIME_CRATES: &[&str] = &["core"];
 

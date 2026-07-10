@@ -7,7 +7,7 @@
 #![allow(clippy::cast_possible_truncation)]
 #![allow(clippy::cast_sign_loss)]
 
-//! Rustc Codegen JVM (Upgraded Version)
+//! Rustc Codegen JVM
 //!
 //! Compiler backend for rustc that generates JVM bytecode, using a two-stage lowering process:
 //! MIR -> OOMIR -> JVM Bytecode.
@@ -28,28 +28,26 @@ use rustc_codegen_ssa::back::archive::{ArArchiveBuilder, ArchiveBuilder, Archive
 use rustc_codegen_ssa::{
     CompiledModule, CompiledModules, CrateInfo, ModuleKind, traits::CodegenBackend,
 };
+use rustc_hir::def::DefKind;
 use std::collections::{HashMap, HashSet};
 
 use rustc_data_structures::unord::UnordMap;
-use rustc_hir::{QPath, TyKind as HirTyKind, def_id::LocalDefId};
 use rustc_metadata::EncodedMetadata;
 use rustc_middle::{
     dep_graph::{WorkProduct, WorkProductId},
     mono::MonoItem,
-    ty::{Instance, InstanceKind, TyCtxt, TyKind},
+    ty::{GenericArgs, Instance, InstanceKind, TyCtxt, TyKind},
 };
 use rustc_session::{
     Session,
     config::{CrateType, OutputFilenames},
 };
+use rustc_span::def_id::{DefId, LOCAL_CRATE};
 use std::{any::Any, io::Write, path::Path, process::Command};
-
-use misc::ToIdent;
 
 mod instrumentation;
 mod lower1;
 mod lower2;
-mod misc;
 mod oomir;
 mod optimise1;
 
@@ -158,11 +156,8 @@ fn place_or_insert_mono_function<'tcx>(
     oomir_module: &mut oomir::Module,
 ) {
     if let Some(assoc_item) = tcx.opt_associated_item(instance.def_id()) {
-        let container_id = assoc_item.container_id(tcx);
-        let is_trait_container =
-            matches!(tcx.def_kind(container_id), rustc_hir::def::DefKind::Trait);
-
-        if !is_trait_container {
+        if assoc_item.trait_container(tcx).is_none() {
+            let container_id = assoc_item.container_id(tcx);
             let container_ty = tcx
                 .type_of(container_id)
                 .instantiate(tcx, instance.args)
@@ -184,23 +179,36 @@ fn place_or_insert_mono_function<'tcx>(
                         oomir_function.signature.is_static = false;
                     }
 
-                    if matches!(
-                        tcx.def_kind(container_id),
-                        rustc_hir::def::DefKind::Impl { of_trait: true }
-                    ) {
-                        let trait_ref = tcx
-                            .impl_trait_ref(container_id)
-                            .instantiate(tcx, instance.args)
-                            .skip_norm_wip();
-                        let trait_name = lower1::jvm_names::class_for_def_id(tcx, trait_ref.def_id);
-                        oomir_function
-                            .signature
-                            .replace_class_in_signature(&trait_name, &class_name);
-                    }
+                    let implemented_trait = assoc_item
+                        .impl_container(tcx)
+                        .and_then(|impl_def_id| tcx.impl_opt_trait_ref(impl_def_id))
+                        .map(|trait_ref| {
+                            let trait_ref =
+                                trait_ref.instantiate(tcx, instance.args).skip_norm_wip();
+                            let trait_name =
+                                lower1::jvm_names::class_for_def_id(tcx, trait_ref.def_id);
+                            ensure_trait_interface(
+                                tcx,
+                                trait_ref.def_id,
+                                &mut oomir_module.data_types,
+                            );
+                            oomir_function
+                                .signature
+                                .replace_class_in_signature(&trait_name, &class_name);
+                            trait_name
+                        });
 
-                    if let Some(oomir::DataType::Class { methods, .. }) =
-                        oomir_module.data_types.get_mut(&class_name)
+                    if let Some(oomir::DataType::Class {
+                        methods,
+                        interfaces,
+                        ..
+                    }) = oomir_module.data_types.get_mut(&class_name)
                     {
+                        if let Some(trait_name) = implemented_trait {
+                            if !interfaces.contains(&trait_name) {
+                                interfaces.push(trait_name);
+                            }
+                        }
                         methods.insert(
                             oomir_function.name.clone(),
                             oomir::DataTypeMethod::Function(oomir_function),
@@ -329,18 +337,163 @@ fn lower_mono_items<'tcx>(tcx: TyCtxt<'tcx>, oomir_module: &mut oomir::Module) {
     }
 }
 
+fn ensure_trait_interface<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    trait_def_id: DefId,
+    data_types: &mut HashMap<String, oomir::DataType>,
+) {
+    let interface_name = lower1::jvm_names::class_for_def_id(tcx, trait_def_id);
+    let methods = trait_interface_methods(tcx, trait_def_id, &interface_name, data_types);
+
+    match data_types.get_mut(&interface_name) {
+        Some(oomir::DataType::Interface {
+            methods: existing_methods,
+        }) => {
+            existing_methods.extend(methods);
+        }
+        Some(oomir::DataType::Class { .. }) => {
+            breadcrumbs::log!(
+                breadcrumbs::LogLevel::Warn,
+                "mono-lowering",
+                format!(
+                    "Trait interface '{}' already exists as a class; leaving it unchanged",
+                    interface_name
+                )
+            );
+        }
+        None => {
+            data_types.insert(interface_name, oomir::DataType::Interface { methods });
+        }
+    }
+}
+
+fn trait_interface_methods<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    trait_def_id: DefId,
+    interface_name: &str,
+    data_types: &mut HashMap<String, oomir::DataType>,
+) -> HashMap<String, oomir::Signature> {
+    let mut methods = HashMap::new();
+
+    for assoc_item in tcx.associated_items(trait_def_id).in_definition_order() {
+        let def_id = assoc_item.def_id;
+        if !assoc_item.is_fn() {
+            continue;
+        }
+
+        let mir_sig = tcx.type_of(def_id).skip_binder().fn_sig(tcx);
+        let params_ty = mir_sig.inputs();
+        let return_ty = mir_sig.output();
+        let instance = Instance::new_raw(
+            def_id,
+            rustc_middle::ty::GenericArgs::identity_for_item(tcx, def_id),
+        );
+
+        let params_inputs = params_ty.skip_binder();
+        let params_oomir: Vec<(String, oomir::Type)> = params_inputs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, ty)| {
+                let is_self_param = matches!(
+                    ty.peel_refs().kind(),
+                    rustc_middle::ty::TyKind::Param(param) if param.name.as_str() == "Self"
+                );
+
+                if is_self_param {
+                    None
+                } else {
+                    let param_name = format!("arg{}", i);
+                    let oomir_type =
+                        lower1::types::ty_to_oomir_type(*ty, tcx, data_types, instance);
+                    Some((param_name, oomir_type))
+                }
+            })
+            .collect();
+        let return_oomir_ty =
+            lower1::types::ty_to_oomir_type(return_ty.skip_binder(), tcx, data_types, instance);
+
+        let is_instance_method = params_inputs.len() > params_oomir.len();
+        let mut signature = oomir::Signature {
+            params: params_oomir,
+            ret: Box::new(return_oomir_ty),
+            is_static: !is_instance_method,
+        };
+        let (params_changed, _) = signature.replace_class_in_signature("Self", interface_name);
+
+        if params_changed {
+            signature.is_static = false;
+        }
+
+        methods.insert(assoc_item.name().as_str().to_string(), signature);
+    }
+
+    methods
+}
+
 fn crate_emits_library_artifact(tcx: TyCtxt<'_>) -> bool {
     tcx.crate_types()
         .iter()
         .any(|crate_type| !matches!(crate_type, CrateType::Executable))
 }
 
-fn is_lowerable_reachable_body(tcx: TyCtxt<'_>, def_id: LocalDefId) -> bool {
-    matches!(
-        tcx.def_kind(def_id),
-        rustc_hir::def::DefKind::Fn | rustc_hir::def::DefKind::AssocFn
-    ) && !tcx.generics_of(def_id).requires_monomorphization(tcx)
-        && tcx.is_mir_available(def_id.to_def_id())
+fn is_lowerable_java_public_function(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
+    if !matches!(tcx.def_kind(def_id), DefKind::Fn | DefKind::AssocFn) {
+        return false;
+    }
+
+    if let Some(assoc_item) = tcx.opt_associated_item(def_id)
+        && assoc_item.trait_container(tcx).is_some()
+    {
+        return false;
+    }
+
+    def_id.is_local()
+        && !tcx.generics_of(def_id).requires_monomorphization(tcx)
+        && tcx.is_mir_available(def_id)
+}
+
+enum JavaPublicSurface {
+    Exported,
+    Reachable,
+}
+
+fn java_public_surface_def_ids(tcx: TyCtxt<'_>, surface: JavaPublicSurface) -> Vec<DefId> {
+    let effective_visibilities = tcx.effective_visibilities(());
+    let mut def_ids: Vec<_> = effective_visibilities
+        .iter()
+        .filter_map(|(&local_def_id, _)| {
+            let is_public_enough = match surface {
+                JavaPublicSurface::Exported => effective_visibilities.is_exported(local_def_id),
+                JavaPublicSurface::Reachable => effective_visibilities.is_reachable(local_def_id),
+            };
+            is_public_enough.then_some(local_def_id.to_def_id())
+        })
+        .collect();
+
+    def_ids.sort_by_cached_key(|def_id| tcx.def_path_str(*def_id));
+    def_ids
+}
+
+fn materialize_java_public_data_type<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: DefId,
+    oomir_module: &mut oomir::Module,
+) {
+    match tcx.def_kind(def_id) {
+        DefKind::Struct | DefKind::Enum | DefKind::Union => {
+            let item_ty = tcx.type_of(def_id).instantiate_identity().skip_norm_wip();
+            let instance_context =
+                Instance::new_raw(def_id, GenericArgs::identity_for_item(tcx, def_id));
+            lower1::types::ty_to_oomir_type(
+                item_ty,
+                tcx,
+                &mut oomir_module.data_types,
+                instance_context,
+            );
+        }
+        DefKind::Trait => ensure_trait_interface(tcx, def_id, &mut oomir_module.data_types),
+        _ => {}
+    }
 }
 
 fn lower_public_library_exports<'tcx>(tcx: TyCtxt<'tcx>, oomir_module: &mut oomir::Module) {
@@ -348,16 +501,18 @@ fn lower_public_library_exports<'tcx>(tcx: TyCtxt<'tcx>, oomir_module: &mut oomi
         return;
     }
 
-    let reachable_defs: Vec<_> = tcx.with_stable_hashing_context(|mut hcx| {
-        tcx.reachable_set(())
-            .items()
-            .copied()
-            .filter(|&def_id| is_lowerable_reachable_body(tcx, def_id))
-            .collect_sorted(&mut hcx, true)
-    });
+    let function_defs = java_public_surface_def_ids(tcx, JavaPublicSurface::Exported);
 
-    for def_id in reachable_defs {
-        lower_mono_function(tcx, Instance::mono(tcx, def_id.to_def_id()), oomir_module);
+    for def_id in function_defs {
+        if is_lowerable_java_public_function(tcx, def_id) {
+            lower_mono_function(tcx, Instance::mono(tcx, def_id), oomir_module);
+        }
+    }
+
+    let data_type_defs = java_public_surface_def_ids(tcx, JavaPublicSurface::Reachable);
+
+    for def_id in data_type_defs {
+        materialize_java_public_data_type(tcx, def_id, oomir_module);
     }
 }
 
@@ -375,7 +530,7 @@ impl CodegenBackend for MyBackend {
     }
 
     fn codegen_crate<'a>(&self, tcx: TyCtxt<'_>) -> Box<dyn Any> {
-        let rust_crate = rustc_hir::def_id::CRATE_DEF_ID.to_def_id().krate;
+        let rust_crate = LOCAL_CRATE;
         let crate_name = tcx.crate_name(rust_crate).to_string();
         let crate_module_class = lower1::jvm_names::crate_module_class(tcx, rust_crate);
 
@@ -386,206 +541,6 @@ impl CodegenBackend for MyBackend {
         };
 
         let lower1_timer = instrumentation::Timer::phase("lower1", Some(&crate_name));
-
-        // HIR still declares source-level JVM shapes. Function reachability and
-        // monomorphized body lowering are handled by rustc's mono-item collector below.
-        let module_items = tcx.hir_crate_items(());
-
-        for item_id in module_items.free_items() {
-            let item = tcx.hir_item(item_id);
-            if let rustc_hir::ItemKind::Impl(impl_a) = item.kind {
-                let impl_def_id = item_id.owner_id.to_def_id();
-                let impl_generics = tcx.generics_of(impl_def_id);
-
-                if !impl_generics.own_params.is_empty() {
-                    breadcrumbs::log!(
-                        breadcrumbs::LogLevel::Info,
-                        "backend",
-                        format!(
-                            "Skipping source-level declaration pass for generic impl block (DefId: {:?}); concrete methods are handled by mono items",
-                            impl_def_id
-                        )
-                    );
-                    continue;
-                }
-
-                let legacy_ident = match impl_a.self_ty.kind {
-                    HirTyKind::Path(qpath) => match qpath {
-                        QPath::Resolved(_, p) => format!("{}", p.segments[0].ident),
-                        QPath::TypeRelative(_, ps) => format!("{}", ps.ident),
-                    },
-                    _ => {
-                        breadcrumbs::log!(
-                            breadcrumbs::LogLevel::Warn,
-                            "backend",
-                            format!("{:?} has unknown kind", impl_a.self_ty)
-                        );
-                        "unknown_type_kind".into()
-                    }
-                };
-                let legacy_ident = lower1::jvm_names::member_name(&legacy_ident);
-                let ident = {
-                    let impl_instance = Instance::new_raw(
-                        impl_def_id,
-                        rustc_middle::ty::GenericArgs::identity_for_item(tcx, impl_def_id),
-                    );
-                    let impl_self_ty = tcx
-                        .type_of(impl_def_id)
-                        .instantiate(
-                            tcx,
-                            rustc_middle::ty::GenericArgs::identity_for_item(tcx, impl_def_id),
-                        )
-                        .skip_norm_wip();
-                    let impl_self_oomir_ty = lower1::types::ty_to_oomir_type(
-                        impl_self_ty,
-                        tcx,
-                        &mut oomir_module.data_types,
-                        impl_instance,
-                    );
-                    match impl_self_oomir_ty {
-                        Type::Class(name) | Type::Interface(name) => name,
-                        Type::MutableReference(inner) => match *inner {
-                            Type::Class(name) | Type::Interface(name) => name,
-                            _ => legacy_ident,
-                        },
-                        _ => legacy_ident,
-                    }
-                };
-
-                let Some(of_trait) = impl_a.of_trait.and_then(|trait_impl_header| {
-                    trait_impl_header
-                        .trait_ref
-                        .path
-                        .res
-                        .opt_def_id()
-                        .map(|def_id| lower1::jvm_names::class_for_def_id(tcx, def_id))
-                        .or_else(|| {
-                            Some(lower1::jvm_names::member_name(
-                                trait_impl_header
-                                    .trait_ref
-                                    .path
-                                    .segments
-                                    .last()
-                                    .unwrap()
-                                    .ident
-                                    .as_str(),
-                            ))
-                        })
-                }) else {
-                    continue;
-                };
-
-                oomir_module
-                    .data_types
-                    .entry(of_trait.clone())
-                    .or_insert_with(|| oomir::DataType::Interface {
-                        methods: HashMap::new(),
-                    });
-
-                match oomir_module.data_types.get_mut(&ident) {
-                    Some(oomir::DataType::Class { interfaces, .. }) => {
-                        if !interfaces.contains(&of_trait) {
-                            interfaces.push(of_trait);
-                        }
-                    }
-                    Some(oomir::DataType::Interface { .. }) => {
-                        breadcrumbs::log!(
-                            breadcrumbs::LogLevel::Warn,
-                            "backend",
-                            format!(
-                                "Skipping trait implementation declaration for Interface type '{}'.",
-                                ident
-                            )
-                        );
-                    }
-                    None => {
-                        oomir_module.data_types.insert(
-                            ident,
-                            oomir::DataType::Class {
-                                methods: HashMap::new(),
-                                is_abstract: false,
-                                super_class: Some("java/lang/Object".to_string()),
-                                fields: vec![],
-                                interfaces: vec![of_trait],
-                            },
-                        );
-                    }
-                }
-            } else if let rustc_hir::ItemKind::Trait {
-                ident: _,
-                items: item_refs,
-                ..
-            } = item.kind
-            {
-                let ident = lower1::jvm_names::class_for_def_id(tcx, item.owner_id.to_def_id());
-                let mut fn_data = HashMap::new();
-                for item in item_refs {
-                    let name = item.to_ident(tcx).as_str().to_string();
-                    let def_id = item.owner_id.to_def_id();
-                    if tcx.def_kind(def_id) != rustc_hir::def::DefKind::AssocFn {
-                        continue;
-                    }
-                    let mir_sig = tcx.type_of(def_id).skip_binder().fn_sig(tcx);
-
-                    let params_ty = mir_sig.inputs();
-                    let return_ty = mir_sig.output();
-
-                    let instance = Instance::new_raw(
-                        def_id,
-                        rustc_middle::ty::GenericArgs::identity_for_item(tcx, def_id),
-                    );
-
-                    let params_inputs = params_ty.skip_binder();
-                    let params_oomir: Vec<(String, oomir::Type)> = params_inputs
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(i, ty)| {
-                            let is_self_param = matches!(
-                                ty.peel_refs().kind(),
-                                rustc_middle::ty::TyKind::Param(param) if param.name.as_str() == "Self"
-                            );
-
-                            if is_self_param {
-                                None
-                            } else {
-                                let param_name = format!("arg{}", i);
-                                let oomir_type = lower1::types::ty_to_oomir_type(
-                                    *ty,
-                                    tcx,
-                                    &mut oomir_module.data_types,
-                                    instance,
-                                );
-                                Some((param_name, oomir_type))
-                            }
-                        })
-                        .collect();
-                    let return_oomir_ty = lower1::types::ty_to_oomir_type(
-                        return_ty.skip_binder(),
-                        tcx,
-                        &mut oomir_module.data_types,
-                        instance,
-                    );
-
-                    let is_instance_method = params_inputs.len() > params_oomir.len();
-                    let mut signature = oomir::Signature {
-                        params: params_oomir,
-                        ret: Box::new(return_oomir_ty),
-                        is_static: !is_instance_method,
-                    };
-                    let (params_changed, _) = signature.replace_class_in_signature("Self", &ident);
-
-                    if params_changed {
-                        signature.is_static = false;
-                    }
-
-                    fn_data.insert(name, signature);
-                }
-
-                oomir_module
-                    .data_types
-                    .insert(ident, oomir::DataType::Interface { methods: fn_data });
-            }
-        }
 
         lower_public_library_exports(tcx, &mut oomir_module);
         lower_mono_items(tcx, &mut oomir_module);

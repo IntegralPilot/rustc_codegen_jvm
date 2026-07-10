@@ -1,8 +1,8 @@
 //! Closure naming helpers for MIR lowering.
 
 use super::jvm_names;
-use rustc_hir::def_id::DefId;
 use rustc_middle::ty::TyCtxt;
+use rustc_span::def_id::DefId;
 
 /// Generate a consistent JVM-safe name for a closure function
 ///

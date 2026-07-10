@@ -1,7 +1,6 @@
 use super::jvm_names;
 use crate::oomir::{self, DataType, DataTypeMethod};
 
-use rustc_hir::def_id::DefId;
 use rustc_middle::ty::{
     AdtDef,
     ExistentialPredicate,
@@ -15,6 +14,7 @@ use rustc_middle::ty::{
     TypingEnv,
     UintTy,
 };
+use rustc_span::def_id::DefId;
 use sha2::Digest;
 use std::collections::HashMap;
 
