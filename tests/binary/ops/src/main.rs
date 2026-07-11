@@ -28,19 +28,6 @@ macro_rules! test_comparisons_float {
     };
 }
 
-macro_rules! test_comparisons_float_no_nan {
-    ($type:ty, $a:expr, $b:expr, $c:expr, $d:expr, $zero:expr, $nzero:expr) => {
-        assert!($a == $b, concat!(stringify!($type), ": a == b"));
-        assert!($a != $c, concat!(stringify!($type), ": a != c"));
-        assert!($a < $c, concat!(stringify!($type), ": a < c"));
-        assert!($a <= $b, concat!(stringify!($type), ": a <= b"));
-        assert!($c > $a, concat!(stringify!($type), ": c > a"));
-        assert!($a >= $b, concat!(stringify!($type), ": a >= b"));
-        assert!($d < $a, concat!(stringify!($type), ": d < a"));
-        assert!($zero == $nzero, concat!(stringify!($type), ": 0.0 == -0.0"));
-    };
-}
-
 macro_rules! test_binary_ops {
     ($type:ty, $a:expr, $b:expr, $zero:expr, $and:expr, $or:expr, $xor:expr) => {
         assert!(($a & $b) == $and, concat!(stringify!($type), ": a & b"));
@@ -72,6 +59,17 @@ fn sparse_switch(value: i32) -> i32 {
         1000 => 30,
         _ => 40,
     }
+}
+
+#[inline(never)]
+fn opaque_f128(value: f128) -> f128 {
+    value
+}
+
+macro_rules! assert_f128_bits {
+    ($value:expr, $expected:expr, $message:literal $(,)?) => {
+        assert!($value.to_bits() == $expected, $message);
+    };
 }
 
 fn main() {
@@ -117,7 +115,16 @@ fn main() {
     test_comparisons!(i128, 5_000_000_000_000_000_000_000i128, 5_000_000_000_000_000_000_000i128, 10_000_000_000_000_000_000_000i128, -2i128, 0i128, 0i128);
 
     // f128 comparisons
-    test_comparisons_float_no_nan!(f128, 5.0f128, 5.0f128, 10.5f128, -2.1f128, 0.0f128, -0.0f128);
+    test_comparisons_float!(
+        f128,
+        opaque_f128(5.0f128),
+        opaque_f128(5.0f128),
+        opaque_f128(10.5f128),
+        opaque_f128(-2.1f128),
+        opaque_f128(0.0f128),
+        opaque_f128(-0.0f128),
+        opaque_f128(f128::NAN)
+    );
     
     // u8 binary operations
     test_binary_ops!(
@@ -289,12 +296,75 @@ fn main() {
     // f128 operations
     test_ops!(
         f128, 
-        10.0f128, 
-        2.0f128, 
-        0.0f128, 
+        opaque_f128(10.0f128),
+        opaque_f128(2.0f128),
+        opaque_f128(0.0f128),
         12.0f128, 
         8.0f128, 
         20.0f128, 
         5.0f128
     );
+
+    const F128_SIGN: u128 = 1u128 << 127;
+    const F128_ONE: u128 = 0x3fff_0000_0000_0000_0000_0000_0000_0000;
+    const F128_INFINITY: u128 = 0x7fff_0000_0000_0000_0000_0000_0000_0000;
+    const F128_MAX: u128 = 0x7ffe_ffff_ffff_ffff_ffff_ffff_ffff_ffff;
+    const F128_NAN_PAYLOAD: u128 = 0x7fff_8000_0000_0000_0000_0000_0000_1234;
+
+    // Every category of binary128 value must survive a JVM round trip bit-for-bit.
+    assert_f128_bits!(opaque_f128(f128::from_bits(0)), 0, "f128 positive zero bits");
+    assert_f128_bits!(
+        opaque_f128(f128::from_bits(F128_SIGN)),
+        F128_SIGN,
+        "f128 negative zero bits",
+    );
+    assert_f128_bits!(
+        opaque_f128(f128::from_bits(1)),
+        1,
+        "f128 smallest subnormal bits",
+    );
+    assert_f128_bits!(
+        opaque_f128(f128::from_bits(F128_INFINITY)),
+        F128_INFINITY,
+        "f128 infinity bits",
+    );
+    assert_f128_bits!(
+        opaque_f128(f128::from_bits(F128_NAN_PAYLOAD)),
+        F128_NAN_PAYLOAD,
+        "f128 NaN payload bits",
+    );
+
+    let one = opaque_f128(f128::from_bits(F128_ONE));
+    let epsilon = opaque_f128(f128::EPSILON);
+    assert_f128_bits!(one + epsilon, F128_ONE + 1, "f128 retains full precision");
+    assert_f128_bits!(
+        opaque_f128(f128::from_bits(1)) + opaque_f128(f128::from_bits(1)),
+        2,
+        "f128 subnormal addition",
+    );
+    assert_f128_bits!(
+        opaque_f128(f128::from_bits(F128_MAX)) + opaque_f128(f128::from_bits(F128_MAX)),
+        F128_INFINITY,
+        "f128 overflow to infinity",
+    );
+    assert_f128_bits!(
+        opaque_f128(1.0f128) / opaque_f128(10.0f128),
+        0x3ffb_9999_9999_9999_9999_9999_9999_999a,
+        "f128 division rounds to nearest even",
+    );
+    assert!(
+        opaque_f128(6.0f128) / opaque_f128(-2.0f128) == -3.0f128,
+        "f128 division sign",
+    );
+    assert!(
+        opaque_f128(5.5f128) % opaque_f128(2.0f128) == 1.5f128,
+        "f128 remainder",
+    );
+
+    let positive_nan = opaque_f128(f128::from_bits(F128_NAN_PAYLOAD));
+    assert_f128_bits!(-positive_nan, F128_NAN_PAYLOAD ^ F128_SIGN, "f128 negation bits");
+    let invalid = opaque_f128(f128::INFINITY) + opaque_f128(f128::NEG_INFINITY);
+    assert!(invalid != invalid, "f128 infinity plus negative infinity is NaN");
+    let zero_over_zero = opaque_f128(0.0f128) / opaque_f128(0.0f128);
+    assert!(zero_over_zero != zero_over_zero, "f128 zero divided by zero is NaN");
 }

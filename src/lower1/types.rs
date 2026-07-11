@@ -1491,6 +1491,33 @@ fn emit_ty_to_union_bytes<'tcx>(
             instructions,
             temp_counter,
         ),
+        TyKind::Float(FloatTy::F128) => {
+            for (method_name, offset) in [("lowBits", 0), ("highBits", 8)] {
+                let bits_dest = next_union_temp("union_f128_bits", temp_counter);
+                instructions.push(oomir::Instruction::InvokeVirtual {
+                    dest: Some(bits_dest.clone()),
+                    class_name: crate::lower2::F128_CLASS.to_string(),
+                    method_name: method_name.to_string(),
+                    method_ty: oomir::Signature {
+                        params: Vec::new(),
+                        ret: Box::new(oomir::Type::I64),
+                        is_static: false,
+                    },
+                    args: Vec::new(),
+                    operand: source.clone(),
+                });
+                emit_bits_to_union_bytes(
+                    operand_var(bits_dest, oomir::Type::I64),
+                    oomir::Type::I64,
+                    8,
+                    storage,
+                    base_offset + offset,
+                    instructions,
+                    temp_counter,
+                )?;
+            }
+            Ok(())
+        }
         TyKind::Tuple(elements) if elements.is_empty() => Ok(()),
         TyKind::Array(element_ty, length) => {
             let length = length
@@ -1801,6 +1828,34 @@ fn emit_ty_from_union_bytes<'tcx>(
             instructions,
             temp_counter,
         ),
+        TyKind::Float(FloatTy::F128) => {
+            let low = emit_bits_from_union_bytes(
+                oomir::Type::I64,
+                8,
+                storage,
+                base_offset,
+                instructions,
+                temp_counter,
+            );
+            let high = emit_bits_from_union_bytes(
+                oomir::Type::I64,
+                8,
+                storage,
+                base_offset + 8,
+                instructions,
+                temp_counter,
+            );
+            let dest = next_union_temp("union_f128_value", temp_counter);
+            instructions.push(oomir::Instruction::ConstructObject {
+                dest: dest.clone(),
+                class_name: crate::lower2::F128_CLASS.to_string(),
+                args: vec![(high, oomir::Type::I64), (low, oomir::Type::I64)],
+            });
+            Ok(operand_var(
+                dest,
+                oomir::Type::Class(crate::lower2::F128_CLASS.to_string()),
+            ))
+        }
         TyKind::Array(element_ty, length) => {
             let length = length
                 .try_to_target_usize(tcx)
@@ -2386,7 +2441,7 @@ pub fn ty_to_oomir_type<'tcx>(
             FloatTy::F32 => oomir::Type::F32,
             FloatTy::F64 => oomir::Type::F64,
             FloatTy::F16 => oomir::Type::F32,
-            FloatTy::F128 => oomir::Type::Class("java/math/BigDecimal".to_string()),
+            FloatTy::F128 => oomir::Type::Class(crate::lower2::F128_CLASS.to_string()),
         },
         rustc_middle::ty::TyKind::Adt(adt_def, substs) => {
             // Get the full path string for the ADT

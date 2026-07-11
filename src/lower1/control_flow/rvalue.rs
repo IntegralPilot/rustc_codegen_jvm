@@ -727,7 +727,42 @@ pub fn convert_rvalue_to_operand<'a>(
                     let oomir_operand =
                         convert_operand(operand, tcx, instance, mir, data_types, &mut instructions);
 
-                    if matches!(
+                    if matches!(cast_kind, CastKind::Transmute)
+                        && oomir_source_type
+                            == oomir::Type::Class(crate::lower2::F128_CLASS.to_string())
+                        && oomir_target_type
+                            == oomir::Type::Class(crate::lower2::BIG_INTEGER_CLASS.to_string())
+                    {
+                        instructions.push(oomir::Instruction::InvokeVirtual {
+                            dest: Some(temp_cast_var.clone()),
+                            class_name: crate::lower2::F128_CLASS.to_string(),
+                            method_name: "toBits".to_string(),
+                            method_ty: oomir::Signature {
+                                params: Vec::new(),
+                                ret: Box::new(oomir_target_type.clone()),
+                                is_static: false,
+                            },
+                            args: Vec::new(),
+                            operand: oomir_operand,
+                        });
+                    } else if matches!(cast_kind, CastKind::Transmute)
+                        && oomir_source_type
+                            == oomir::Type::Class(crate::lower2::BIG_INTEGER_CLASS.to_string())
+                        && oomir_target_type
+                            == oomir::Type::Class(crate::lower2::F128_CLASS.to_string())
+                    {
+                        instructions.push(oomir::Instruction::InvokeStatic {
+                            dest: Some(temp_cast_var.clone()),
+                            class_name: crate::lower2::F128_CLASS.to_string(),
+                            method_name: "fromBits".to_string(),
+                            method_ty: oomir::Signature {
+                                params: vec![("bits".to_string(), oomir_source_type.clone())],
+                                ret: Box::new(oomir_target_type.clone()),
+                                is_static: true,
+                            },
+                            args: vec![oomir_operand],
+                        });
+                    } else if matches!(
                         (&oomir_source_type, &oomir_target_type),
                         (oomir::Type::Str, oomir::Type::Slice(element_type))
                             if matches!(element_type.as_ref(), oomir::Type::I16)

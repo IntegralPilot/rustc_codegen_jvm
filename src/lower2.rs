@@ -31,6 +31,7 @@ mod translator;
 
 pub const BIG_INTEGER_CLASS: &str = "java/math/BigInteger";
 pub const BIG_DECIMAL_CLASS: &str = "java/math/BigDecimal";
+pub const F128_CLASS: &str = "org/rustlang/runtime/F128";
 
 fn factory_return_instruction(ty: &oomir::Type) -> Instruction {
     match ty {

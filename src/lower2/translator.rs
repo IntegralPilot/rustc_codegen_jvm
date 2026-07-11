@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::TryInto;
 use std::io::Cursor;
 
-use super::{BIG_DECIMAL_CLASS, BIG_INTEGER_CLASS};
+use super::{BIG_DECIMAL_CLASS, BIG_INTEGER_CLASS, F128_CLASS};
 
 /// Represents the state during the translation of a single function's body.
 pub struct FunctionTranslator<'a, 'cp> {
@@ -1312,6 +1312,25 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         Ok(())
     }
 
+    fn translate_f128_binary_op(
+        &mut self,
+        dest: &str,
+        op1: &oomir::Operand,
+        op2: &oomir::Operand,
+        method_name: &str,
+    ) -> Result<(), jvm::Error> {
+        self.load_operand(op1)?;
+        self.load_operand(op2)?;
+        let class = self.constant_pool.add_class(F128_CLASS)?;
+        let descriptor = format!("(L{F128_CLASS};)L{F128_CLASS};");
+        let method = self
+            .constant_pool
+            .add_method_ref(class, method_name, descriptor)?;
+        self.jvm_instructions
+            .push(Instruction::Invokevirtual(method));
+        self.store_result(dest, &Type::Class(F128_CLASS.to_string()))
+    }
+
     /// Determines the common comparison type based on numeric promotion rules,
     /// including BigInteger and BigDecimal. Also returns necessary cast targets.
     fn determine_comparison_type(
@@ -1535,6 +1554,20 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             return Ok(());
         }
 
+        if comparison_type == Type::Class(F128_CLASS.to_string()) {
+            self.load_operand(op1)?;
+            self.load_operand(op2)?;
+            let class = self.constant_pool.add_class(F128_CLASS)?;
+            let descriptor = format!("(L{F128_CLASS};)Z");
+            let method = self
+                .constant_pool
+                .add_method_ref(class, comp_op, descriptor)?;
+            self.jvm_instructions
+                .push(Instruction::Invokevirtual(method));
+            self.store_result(dest, &Type::Boolean)?;
+            return Ok(());
+        }
+
         self.load_operand(op1)?;
         if let Some(target_type) = cast1_target {
             // Use the enhanced casting helper which needs the constant pool
@@ -1749,7 +1782,11 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
 
                 // Promote based on types (Simplified: assumes BigInt/BigDec promote others)
                 // A more robust system would use determine_comparison_type logic
-                let op_type = if op1_type == Type::Class(BIG_DECIMAL_CLASS.to_string())
+                let op_type = if op1_type == Type::Class(F128_CLASS.to_string())
+                    || op2_type == Type::Class(F128_CLASS.to_string())
+                {
+                    Type::Class(F128_CLASS.to_string())
+                } else if op1_type == Type::Class(BIG_DECIMAL_CLASS.to_string())
                     || op2_type == Type::Class(BIG_DECIMAL_CLASS.to_string())
                 {
                     Type::Class(BIG_DECIMAL_CLASS.to_string())
@@ -1770,6 +1807,9 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     Type::I64 => self.translate_binary_op(dest, op1, op2, JI::Ladd)?,
                     Type::F32 => self.translate_binary_op(dest, op1, op2, JI::Fadd)?,
                     Type::F64 => self.translate_binary_op(dest, op1, op2, JI::Dadd)?,
+                    Type::Class(ref c) if c == F128_CLASS => {
+                        self.translate_f128_binary_op(dest, op1, op2, "add")?
+                    }
                     Type::Class(ref c) if c == BIG_INTEGER_CLASS => {
                         // BigInteger ADD operation: add(BigInteger)
                         let class_idx = self.constant_pool.add_class(BIG_INTEGER_CLASS)?;
@@ -1842,7 +1882,11 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 let op2_type = get_operand_type(op2);
 
                 // Determine result type (similar promotion logic as Add)
-                let op_type = if op1_type == Type::Class(BIG_DECIMAL_CLASS.to_string())
+                let op_type = if op1_type == Type::Class(F128_CLASS.to_string())
+                    || op2_type == Type::Class(F128_CLASS.to_string())
+                {
+                    Type::Class(F128_CLASS.to_string())
+                } else if op1_type == Type::Class(BIG_DECIMAL_CLASS.to_string())
                     || op2_type == Type::Class(BIG_DECIMAL_CLASS.to_string())
                 {
                     Type::Class(BIG_DECIMAL_CLASS.to_string())
@@ -1861,6 +1905,9 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     Type::I64 => self.translate_binary_op(dest, op1, op2, JI::Lsub)?,
                     Type::F32 => self.translate_binary_op(dest, op1, op2, JI::Fsub)?,
                     Type::F64 => self.translate_binary_op(dest, op1, op2, JI::Dsub)?,
+                    Type::Class(ref c) if c == F128_CLASS => {
+                        self.translate_f128_binary_op(dest, op1, op2, "subtract")?
+                    }
                     Type::Class(ref c) if c == BIG_INTEGER_CLASS => {
                         // BigInteger SUBTRACT operation: subtract(BigInteger)
                         let class_idx = self.constant_pool.add_class(BIG_INTEGER_CLASS)?;
@@ -1927,7 +1974,11 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             OI::Mul { dest, op1, op2 } => {
                 let op1_type = get_operand_type(op1);
                 let op2_type = get_operand_type(op2);
-                let op_type = if op1_type == Type::Class(BIG_DECIMAL_CLASS.to_string())
+                let op_type = if op1_type == Type::Class(F128_CLASS.to_string())
+                    || op2_type == Type::Class(F128_CLASS.to_string())
+                {
+                    Type::Class(F128_CLASS.to_string())
+                } else if op1_type == Type::Class(BIG_DECIMAL_CLASS.to_string())
                     || op2_type == Type::Class(BIG_DECIMAL_CLASS.to_string())
                 {
                     Type::Class(BIG_DECIMAL_CLASS.to_string())
@@ -1946,6 +1997,9 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     Type::I64 => self.translate_binary_op(dest, op1, op2, JI::Lmul)?,
                     Type::F32 => self.translate_binary_op(dest, op1, op2, JI::Fmul)?,
                     Type::F64 => self.translate_binary_op(dest, op1, op2, JI::Dmul)?,
+                    Type::Class(ref c) if c == F128_CLASS => {
+                        self.translate_f128_binary_op(dest, op1, op2, "multiply")?
+                    }
                     Type::Class(ref c) if c == BIG_INTEGER_CLASS => {
                         // BigInteger MULTIPLY operation: multiply(BigInteger)
                         let class_idx = self.constant_pool.add_class(BIG_INTEGER_CLASS)?;
@@ -2009,7 +2063,11 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             OI::Div { dest, op1, op2 } => {
                 let op1_type = get_operand_type(op1);
                 let op2_type = get_operand_type(op2);
-                let op_type = if op1_type == Type::Class(BIG_DECIMAL_CLASS.to_string())
+                let op_type = if op1_type == Type::Class(F128_CLASS.to_string())
+                    || op2_type == Type::Class(F128_CLASS.to_string())
+                {
+                    Type::Class(F128_CLASS.to_string())
+                } else if op1_type == Type::Class(BIG_DECIMAL_CLASS.to_string())
                     || op2_type == Type::Class(BIG_DECIMAL_CLASS.to_string())
                 {
                     Type::Class(BIG_DECIMAL_CLASS.to_string())
@@ -2029,6 +2087,9 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     Type::I64 => self.translate_binary_op(dest, op1, op2, JI::Ldiv)?,
                     Type::F32 => self.translate_binary_op(dest, op1, op2, JI::Fdiv)?, // Handles +/- Infinity, NaN
                     Type::F64 => self.translate_binary_op(dest, op1, op2, JI::Ddiv)?, // Handles +/- Infinity, NaN
+                    Type::Class(ref c) if c == F128_CLASS => {
+                        self.translate_f128_binary_op(dest, op1, op2, "divide")?
+                    }
                     Type::Class(ref c) if c == BIG_INTEGER_CLASS => {
                         // BigInteger DIVIDE operation: divide(BigInteger)
                         // Throws ArithmeticException if divisor is zero.
@@ -2114,7 +2175,11 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             OI::Rem { dest, op1, op2 } => {
                 let op1_type = get_operand_type(op1);
                 let op2_type = get_operand_type(op2);
-                let op_type = if op1_type == Type::Class(BIG_DECIMAL_CLASS.to_string())
+                let op_type = if op1_type == Type::Class(F128_CLASS.to_string())
+                    || op2_type == Type::Class(F128_CLASS.to_string())
+                {
+                    Type::Class(F128_CLASS.to_string())
+                } else if op1_type == Type::Class(BIG_DECIMAL_CLASS.to_string())
                     || op2_type == Type::Class(BIG_DECIMAL_CLASS.to_string())
                 {
                     Type::Class(BIG_DECIMAL_CLASS.to_string())
@@ -2134,6 +2199,9 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     Type::I64 => self.translate_binary_op(dest, op1, op2, JI::Lrem)?,
                     Type::F32 => self.translate_binary_op(dest, op1, op2, JI::Frem)?, // Handles NaN
                     Type::F64 => self.translate_binary_op(dest, op1, op2, JI::Drem)?, // Handles NaN
+                    Type::Class(ref c) if c == F128_CLASS => {
+                        self.translate_f128_binary_op(dest, op1, op2, "remainder")?
+                    }
                     Type::Class(ref c) if c == BIG_INTEGER_CLASS => {
                         // BigInteger REMAINDER operation: remainder(BigInteger)
                         // Throws ArithmeticException if divisor is zero.
@@ -2564,6 +2632,16 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     oomir::Type::F64 => {
                         self.load_operand(src)?;
                         self.jvm_instructions.push(JI::Dneg);
+                        self.store_result(dest, &src_type)?;
+                    }
+                    oomir::Type::Class(ref c) if c == F128_CLASS => {
+                        let class = self.constant_pool.add_class(F128_CLASS)?;
+                        let descriptor = format!("()L{F128_CLASS};");
+                        let method = self
+                            .constant_pool
+                            .add_method_ref(class, "negate", descriptor)?;
+                        self.load_operand(src)?;
+                        self.jvm_instructions.push(JI::Invokevirtual(method));
                         self.store_result(dest, &src_type)?;
                     }
                     oomir::Type::Class(ref c) if c == BIG_INTEGER_CLASS => {

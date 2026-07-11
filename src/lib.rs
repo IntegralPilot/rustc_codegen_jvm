@@ -2,7 +2,6 @@
 #![feature(box_patterns)]
 #![feature(rustc_private)]
 #![feature(f16)]
-#![feature(f128)]
 #![warn(clippy::pedantic)]
 #![allow(clippy::cast_possible_truncation)]
 #![allow(clippy::cast_sign_loss)]

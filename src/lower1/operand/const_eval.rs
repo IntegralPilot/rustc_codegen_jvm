@@ -17,7 +17,6 @@ use super::super::{
         generate_tuple_jvm_class_name, should_define_named_data_type,
     },
 };
-use super::float::f128_to_string;
 use crate::oomir::{self, DataTypeMethod};
 
 type ConstAllocation = Allocation<CtfeProvenance>;
@@ -1225,24 +1224,14 @@ pub fn scalar_int_to_oomir_constant(scalar_int: ScalarInt, ty: Ty<'_>) -> oomir:
             FloatTy::F32 => oomir::Constant::F32(f32::from_bits(scalar_int.to_u32())),
             FloatTy::F64 => oomir::Constant::F64(f64::from_bits(scalar_int.to_u64())),
             FloatTy::F128 => {
-                let val = f128::from_bits(scalar_int.to_u128());
-                if val.is_nan() || val.is_infinite() {
-                    breadcrumbs::log!(
-                        breadcrumbs::LogLevel::Warn,
-                        "const-eval",
-                        "Warning: Attempt to store NaN/inf as BigDecimal/F128. BigDecimal does not support it. Using 0 as placeholder."
-                    );
-                    oomir::Constant::Instance {
-                        class_name: "java/math/BigDecimal".into(),
-                        fields: HashMap::new(),
-                        params: vec![oomir::Constant::String("0".to_string())],
-                    }
-                } else {
-                    oomir::Constant::Instance {
-                        class_name: "java/math/BigDecimal".into(),
-                        fields: HashMap::new(),
-                        params: vec![oomir::Constant::String(f128_to_string(val))],
-                    }
+                let bits = scalar_int.to_u128();
+                oomir::Constant::Instance {
+                    class_name: crate::lower2::F128_CLASS.into(),
+                    fields: HashMap::new(),
+                    params: vec![
+                        oomir::Constant::I64((bits >> 64) as i64),
+                        oomir::Constant::I64(bits as i64),
+                    ],
                 }
             }
         },
