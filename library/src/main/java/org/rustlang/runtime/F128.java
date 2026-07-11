@@ -37,6 +37,10 @@ public final class F128 {
         return toBits();
     }
 
+    public static BigInteger to_bits(F128 value) {
+        return value.toBits();
+    }
+
     public static F128 fromBits(BigInteger bits) {
         BigInteger raw = bits.and(MASK_128);
         return new F128(raw.shiftRight(64).longValue(), raw.longValue());

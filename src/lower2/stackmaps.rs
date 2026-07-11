@@ -412,8 +412,11 @@ fn solve_frame_states(
         .map_err(|error| jvm::Error::VerificationError {
             context: context.to_string(),
             message: format!(
-                "Stack-map transfer failed at instruction {index} ({:?}) with input stack {:?}: {error:?}",
-                instructions[index], input_state.stack
+                "Stack-map transfer failed at instruction {index} ({}) with input stack {:?} and locals {:?}: {error:?}\nInstruction window:\n{}",
+                describe_instruction(&instructions[index], constant_pool),
+                input_state.stack,
+                input_state.locals,
+                instruction_window(instructions, index, constant_pool),
             ),
         })?;
 
@@ -439,6 +442,44 @@ fn solve_frame_states(
     }
 
     Ok(states)
+}
+
+fn describe_instruction(instruction: &Instruction, constant_pool: &ConstantPool) -> String {
+    let method = match instruction {
+        Instruction::Invokevirtual(index)
+        | Instruction::Invokestatic(index)
+        | Instruction::Invokespecial(index) => method_ref_info(constant_pool, *index, false).ok(),
+        Instruction::Invokeinterface(index, _) => method_ref_info(constant_pool, *index, true).ok(),
+        _ => None,
+    };
+    method.map_or_else(
+        || format!("{instruction:?}"),
+        |method| {
+            format!(
+                "{instruction:?} => {}.{}{}",
+                method.class_name, method.method_name, method.descriptor
+            )
+        },
+    )
+}
+
+fn instruction_window(
+    instructions: &[Instruction],
+    center: usize,
+    constant_pool: &ConstantPool,
+) -> String {
+    let start = center.saturating_sub(8);
+    let end = (center + 4).min(instructions.len().saturating_sub(1));
+    (start..=end)
+        .map(|index| {
+            let marker = if index == center { ">" } else { " " };
+            format!(
+                "{marker} {index}: {}",
+                describe_instruction(&instructions[index], constant_pool)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn transfer_instruction(

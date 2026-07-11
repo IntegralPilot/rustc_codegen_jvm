@@ -12,6 +12,28 @@ trait Calculator {
     fn id(&self) -> u8;
 }
 
+trait CarrierValue {
+    fn carrier_value(self) -> i32;
+}
+
+impl CarrierValue for i32 {
+    fn carrier_value(self) -> i32 {
+        self + 1
+    }
+}
+
+impl CarrierValue for [i32; 3] {
+    fn carrier_value(self) -> i32 {
+        self[0] + self[1] + self[2]
+    }
+}
+
+impl CarrierValue for &str {
+    fn carrier_value(self) -> i32 {
+        self.len() as i32
+    }
+}
+
 // --- First Implementation ---
 struct SimpleAdder {
     current_total: i32,
@@ -88,6 +110,10 @@ fn check_properties(calc: &dyn Calculator) -> (i32, u8) {
 
 
 fn main() {
+    assert!(41i32.carrier_value() == 42);
+    assert!([2, 3, 5].carrier_value() == 10);
+    assert!("carrier".carrier_value() == 7);
+
     let mut adder = SimpleAdder { current_total: 10 };
 
     // Direct calls

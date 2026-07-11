@@ -22,6 +22,37 @@ pub(crate) mod rvalue;
 
 pub use checked_intrinsic_registry::take_needed_intrinsics;
 
+fn requires_compiled_static_dispatch(ty: &oomir::Type) -> bool {
+    if let oomir::Type::MutableReference(inner) | oomir::Type::Reference(inner) = ty {
+        return requires_compiled_static_dispatch(inner);
+    }
+    ty.is_jvm_primitive_like()
+        || matches!(
+            ty,
+            oomir::Type::Class(class_name)
+                if class_name == crate::lower2::BIG_INTEGER_CLASS
+                    || class_name == crate::lower2::F128_CLASS
+        )
+        || matches!(
+            ty,
+            oomir::Type::Array(_) | oomir::Type::Slice(_) | oomir::Type::Str | oomir::Type::String
+        )
+}
+
+fn supports_direct_equality(ty: &oomir::Type) -> bool {
+    if let oomir::Type::MutableReference(inner) | oomir::Type::Reference(inner) = ty {
+        return supports_direct_equality(inner);
+    }
+    ty.is_jvm_primitive_like()
+        || matches!(
+            ty,
+            oomir::Type::Class(class_name)
+                if class_name == crate::lower2::BIG_INTEGER_CLASS
+                    || class_name == crate::lower2::F128_CLASS
+        )
+        || matches!(ty, oomir::Type::Str | oomir::Type::String)
+}
+
 /// Convert a single MIR basic block into an OOMIR basic block.
 pub fn convert_basic_block<'tcx>(
     bb: BasicBlock,
@@ -368,7 +399,7 @@ pub fn convert_basic_block<'tcx>(
                                 // 2. The method is declared in a trait (which maps to an interface)
                                 let use_interface =
                                     if let Some(oomir::Type::Interface(interface_name)) =
-                                        receiver_oomir_ty
+                                        &receiver_oomir_ty
                                     {
                                         Some(interface_name.clone())
                                     } else if let Some(trait_def_id) = trait_container {
@@ -377,17 +408,63 @@ pub fn convert_basic_block<'tcx>(
                                     } else {
                                         None
                                     };
+                                let dispatch_receiver_ty = super::types::ty_to_oomir_type(
+                                    receiver_mir_ty,
+                                    tcx,
+                                    data_types,
+                                    instance,
+                                );
+                                let declared_method_name = item.name().as_str().to_string();
+                                let direct_equality =
+                                    matches!(declared_method_name.as_str(), "eq" | "ne")
+                                        && supports_direct_equality(&dispatch_receiver_ty)
+                                        && oomir_operands.len() == 2;
 
-                                if let Some(interface_name) = use_interface {
-                                    // The method is from an interface - use InvokeInterface
-                                    instructions.push(oomir::Instruction::InvokeInterface {
-                                        class_name: interface_name,
-                                        method_name,
-                                        method_ty: method_signature,
-                                        args: method_args,
-                                        dest: effective_dest,
-                                        operand: receiver_operand,
-                                    });
+                                if direct_equality {
+                                    if let Some(dest) = effective_dest {
+                                        let instruction = if declared_method_name == "eq" {
+                                            oomir::Instruction::Eq {
+                                                dest,
+                                                op1: oomir_operands[0].clone(),
+                                                op2: oomir_operands[1].clone(),
+                                            }
+                                        } else {
+                                            oomir::Instruction::Ne {
+                                                dest,
+                                                op1: oomir_operands[0].clone(),
+                                                op2: oomir_operands[1].clone(),
+                                            }
+                                        };
+                                        instructions.push(instruction);
+                                    }
+                                } else if let Some(interface_name) = use_interface {
+                                    if requires_compiled_static_dispatch(&dispatch_receiver_ty) {
+                                        let target = super::naming::mono_fn_name_from_instance(
+                                            tcx,
+                                            func_instance,
+                                        );
+                                        let mut static_signature = method_signature;
+                                        static_signature.is_static = true;
+                                        instructions.push(oomir::Instruction::InvokeStatic {
+                                            class_name: target
+                                                .class_to_call_on
+                                                .expect("monomorphized functions have JVM owners"),
+                                            method_name: target.method_name,
+                                            method_ty: static_signature,
+                                            args: oomir_operands.clone(),
+                                            dest: effective_dest,
+                                        });
+                                    } else {
+                                        // The method is from an interface - use InvokeInterface
+                                        instructions.push(oomir::Instruction::InvokeInterface {
+                                            class_name: interface_name,
+                                            method_name,
+                                            method_ty: method_signature,
+                                            args: method_args,
+                                            dest: effective_dest,
+                                            operand: receiver_operand,
+                                        });
+                                    }
                                 } else {
                                     // The receiver is a concrete class - use InvokeVirtual
                                     let class_type = super::types::ty_to_oomir_type(
@@ -396,7 +473,7 @@ pub fn convert_basic_block<'tcx>(
                                         data_types,
                                         instance,
                                     );
-                                    let primitive_static_target = match &class_type {
+                                    let runtime_static_target = match &class_type {
                                         oomir::Type::Str if method_name == "as_bytes" => Some((
                                             oomir::UTF8_VIEW_CLASS.to_string(),
                                             "asSlice".to_string(),
@@ -445,6 +522,15 @@ pub fn convert_basic_block<'tcx>(
                                             "org/rustlang/primitives/F64".to_string(),
                                             method_name.clone(),
                                         )),
+                                        oomir::Type::Class(class_name)
+                                            if class_name == crate::lower2::F128_CLASS
+                                                && item.name().as_str() == "to_bits" =>
+                                        {
+                                            Some((
+                                                crate::lower2::F128_CLASS.to_string(),
+                                                "to_bits".to_string(),
+                                            ))
+                                        }
                                         oomir::Type::Array(inner) | oomir::Type::Slice(inner)
                                             if matches!(inner.as_ref(), oomir::Type::I16)
                                                 && method_name == "starts_with" =>
@@ -456,10 +542,22 @@ pub fn convert_basic_block<'tcx>(
                                         }
                                         _ => None,
                                     };
+                                    let static_target = runtime_static_target.or_else(|| {
+                                        requires_compiled_static_dispatch(&class_type).then(|| {
+                                            let target = super::naming::mono_fn_name_from_instance(
+                                                tcx,
+                                                func_instance,
+                                            );
+                                            (
+                                                target.class_to_call_on.expect(
+                                                    "monomorphized functions have JVM owners",
+                                                ),
+                                                target.method_name,
+                                            )
+                                        })
+                                    });
 
-                                    if let Some((class_name, static_method_name)) =
-                                        primitive_static_target
-                                    {
+                                    if let Some((class_name, static_method_name)) = static_target {
                                         let mut static_signature = method_signature;
                                         static_signature.is_static = true;
                                         instructions.push(oomir::Instruction::InvokeStatic {
