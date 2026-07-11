@@ -403,6 +403,14 @@ pub fn read_constant_value_from_memory<'tcx>(
     );
 
     match ty.kind() {
+        TyKind::Pat(base_ty, _) => read_constant_value_from_memory(
+            tcx,
+            allocation,
+            offset,
+            *base_ty,
+            oomir_data_types,
+            instance,
+        ),
         TyKind::Bool | TyKind::Char | TyKind::Int(_) | TyKind::Uint(_) | TyKind::Float(_) => {
             let range = AllocRange {
                 start: offset,
@@ -768,72 +776,20 @@ fn handle_constant_enum<'tcx>(
                         format!("Debug: Read Niche value bits: {:#x}", read_value_bits)
                     );
 
-                    let mut found_match = false;
-                    let mut matched_idx = *untagged_variant;
-
-                    let discriminants: HashMap<VariantIdx, u128> = adt_def
-                        .discriminants(tcx)
-                        .map(|(idx, discr)| (idx, discr.val))
-                        .collect();
-
-                    for v_idx in niche_variants.clone() {
-                        if v_idx == *untagged_variant {
-                            continue;
-                        }
-
-                        let d = match discriminants.get(&v_idx) {
-                            Some(discr) => discr,
-                            None => {
-                                breadcrumbs::log!(
-                                    breadcrumbs::LogLevel::Warn,
-                                    "const-eval",
-                                    format!(
-                                        "Warning: No discriminant found for variant {:?}",
-                                        v_idx
-                                    )
-                                );
-                                continue;
-                            }
-                        };
-                        let niche_offset = d.wrapping_sub(*niche_start);
-                        let expected_niche_val_u128 = niche_offset.wrapping_add(*niche_start);
-                        let mask = (1u128 << tag_size.bits()) - 1;
-                        let expected_niche_bits = expected_niche_val_u128 & mask;
-
-                        breadcrumbs::log!(
-                            breadcrumbs::LogLevel::Info,
-                            "const-eval",
-                            format!(
-                                "Debug: Checking Niche for {:?} (Discr: {:#x}). Expected Niche Bits: {:#x}",
-                                v_idx, d, expected_niche_bits
-                            )
-                        );
-
-                        if read_value_bits == expected_niche_bits {
-                            breadcrumbs::log!(
-                                breadcrumbs::LogLevel::Info,
-                                "const-eval",
-                                format!("Debug: Match found for niche variant {:?}", v_idx)
-                            );
-                            if found_match && matched_idx != v_idx {
-                                return Err(format!("Ambiguous match found for enum variant"));
-                            }
-                            matched_idx = v_idx;
-                            found_match = true;
-                        }
-                    }
-
-                    if found_match {
-                        active_variant_idx = matched_idx;
+                    let tag_bits = tag_size.bits();
+                    let tag_mask = if tag_bits == 128 {
+                        u128::MAX
                     } else {
-                        breadcrumbs::log!(
-                            breadcrumbs::LogLevel::Info,
-                            "const-eval",
-                            format!(
-                                "Debug: No niche match found for bits {:#x}, assuming untagged variant {:?}",
-                                read_value_bits, untagged_variant
-                            )
+                        (1u128 << tag_bits) - 1
+                    };
+                    let relative = read_value_bits.wrapping_sub(*niche_start) & tag_mask;
+                    let first = niche_variants.start.as_u32();
+                    let relative_max = niche_variants.last.as_u32() - first;
+                    if relative <= u128::from(relative_max) {
+                        active_variant_idx = VariantIdx::from_u32(
+                            first + u32::try_from(relative).expect("bounded by relative_max"),
                         );
+                    } else {
                         active_variant_idx = *untagged_variant;
                     }
                 }

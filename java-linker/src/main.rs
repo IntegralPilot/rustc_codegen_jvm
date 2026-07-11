@@ -94,7 +94,7 @@ fn record_instrumentation_duration(stage: &'static str, duration: Duration) {
 fn main() -> Result<(), i32> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 3 {
-        eprintln!("Usage: java-linker <input_files...> -o <output_jar_file> [--release]");
+        eprintln!("Usage: java-linker <input_files...> -o <output_jar_file>");
         return Err(1);
     }
     let _linker_timer = InstrumentationTimer::new("java-linker");
@@ -120,10 +120,6 @@ fn main() -> Result<(), i32> {
                 eprintln!("Error: -o flag requires an output file path");
                 return Err(1);
             }
-        } else if arg == "--release" {
-            // Accepted for compatibility with release profile link-args. The
-            // linker no longer has a separate release-mode optimization path.
-            i += 1;
         } else if !arg.starts_with('-') {
             // Collect potential input files, differentiating classes and JARs
             if arg.ends_with(".class") {

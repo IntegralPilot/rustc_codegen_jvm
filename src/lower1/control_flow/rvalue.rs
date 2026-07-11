@@ -4,17 +4,14 @@ use rustc_middle::{
         BinOp, Body, BorrowKind as MirBorrowKind, CastKind, Operand as MirOperand, Place, Rvalue,
         UnOp,
     },
-    ty::{ConstKind, Instance, TyCtxt, TyKind, TypingEnv, adjustment::PointerCoercion},
+    ty::{EarlyBinder, Instance, TyCtxt, TyKind, TypingEnv, adjustment::PointerCoercion},
 };
 use std::collections::HashMap;
 
 use super::{
     super::{
         jvm_names,
-        operand::{
-            convert_operand, extract_number_from_operand, get_placeholder_operand,
-            handle_const_value,
-        },
+        operand::{convert_operand, get_placeholder_operand},
         place::{emit_instructions_to_get_on_own, get_place_type, place_to_string},
         types::{
             ENUM_UNION_DISCRIMINANT_METHOD, adapt_simple_enum_operand, ensure_fn_ptr_interface,
@@ -306,21 +303,13 @@ pub fn convert_rvalue_to_operand<'a>(
                     data_types,
                     &mut instructions,
                 );
-                let array_size = match len_const.kind() {
-                    ConstKind::Value(val) => {
-                        /* ... extract size ... */
-                        extract_number_from_operand(handle_const_value(
-                            None,
-                            tcx.valtree_to_const_val(val),
-                            &val.ty,
-                            tcx,
-                            data_types,
-                            instance,
-                        ))
-                        .unwrap_or(0)
-                    } // Simplified extraction
-                    _ => panic!("Expected constant value for array size"),
-                };
+                let array_size = EarlyBinder::bind(tcx, *len_const)
+                    .instantiate(tcx, instance.args)
+                    .skip_norm_wip()
+                    .try_to_target_usize(tcx)
+                    .unwrap_or_else(|| {
+                        panic!("Could not resolve array repeat length {:?}", len_const)
+                    });
                 let size_operand =
                     oomir::Operand::Constant(oomir::Constant::I32(array_size as i32));
 
@@ -555,7 +544,9 @@ pub fn convert_rvalue_to_operand<'a>(
         Rvalue::Cast(cast_kind, operand, target_mir_ty) => {
             let temp_cast_var = generate_temp_var_name(&base_temp_name);
             let oomir_target_type = ty_to_oomir_type(*target_mir_ty, tcx, data_types, instance);
-            let source_mir_ty = operand.ty(&mir.local_decls, tcx);
+            let source_mir_ty = EarlyBinder::bind(tcx, operand.ty(&mir.local_decls, tcx))
+                .instantiate(tcx, instance.args)
+                .skip_norm_wip();
 
             if matches!(
                 cast_kind,
@@ -852,6 +843,60 @@ pub fn convert_rvalue_to_operand<'a>(
                     op1: oomir_op1,
                     op2: oomir_op2,
                 }),
+                BinOp::Cmp => {
+                    let less = format!("{}_less", temp_binop_var);
+                    let greater = format!("{}_greater", temp_binop_var);
+                    instructions.push(oomir::Instruction::Lt {
+                        dest: less.clone(),
+                        op1: oomir_op1.clone(),
+                        op2: oomir_op2.clone(),
+                    });
+                    instructions.push(oomir::Instruction::Gt {
+                        dest: greater.clone(),
+                        op1: oomir_op1,
+                        op2: oomir_op2,
+                    });
+                    let less_int = format!("{}_less_int", temp_binop_var);
+                    let greater_int = format!("{}_greater_int", temp_binop_var);
+                    instructions.push(oomir::Instruction::Cast {
+                        op: oomir::Operand::Variable {
+                            name: less,
+                            ty: oomir::Type::Boolean,
+                        },
+                        ty: oomir::Type::I32,
+                        dest: less_int.clone(),
+                    });
+                    instructions.push(oomir::Instruction::Cast {
+                        op: oomir::Operand::Variable {
+                            name: greater,
+                            ty: oomir::Type::Boolean,
+                        },
+                        ty: oomir::Type::I32,
+                        dest: greater_int.clone(),
+                    });
+                    instructions.push(oomir::Instruction::Sub {
+                        dest: temp_binop_var.clone(),
+                        op1: oomir::Operand::Variable {
+                            name: greater_int,
+                            ty: oomir::Type::I32,
+                        },
+                        op2: oomir::Operand::Variable {
+                            name: less_int,
+                            ty: oomir::Type::I32,
+                        },
+                    });
+                    result_operand = adapt_simple_enum_operand(
+                        oomir::Operand::Variable {
+                            name: temp_binop_var,
+                            ty: oomir::Type::I32,
+                        },
+                        &oomir_result_type,
+                        &base_temp_name,
+                        data_types,
+                        &mut instructions,
+                    );
+                    return (instructions, result_operand);
+                }
                 // Checked ops need special handling as they produce a tuple
                 BinOp::AddWithOverflow | BinOp::SubWithOverflow | BinOp::MulWithOverflow => {
                     // This case needs to return the *tuple* variable, and the instructions
@@ -1570,14 +1615,25 @@ pub fn convert_rvalue_to_operand<'a>(
                         });
                     }
                 }
-                _ => {
-                    /* Unknown aggregate */
+                rustc_middle::mir::AggregateKind::RawPtr(pointee_ty, mutability) => {
                     breadcrumbs::log!(
                         breadcrumbs::LogLevel::Warn,
                         "mir-lowering",
-                        format!("Warning: Unhandled Aggregate Kind -> Temp Placeholder")
+                        format!(
+                            "Warning: Raw pointer aggregate ({:?}, {:?}) is unsupported -> Temp Placeholder",
+                            pointee_ty, mutability
+                        )
                     );
-                    // No instructions needed for placeholder, result set below
+                }
+                _ => {
+                    breadcrumbs::log!(
+                        breadcrumbs::LogLevel::Warn,
+                        "mir-lowering",
+                        format!(
+                            "Warning: Unhandled non-pointer Aggregate Kind {:?} -> Temp Placeholder",
+                            kind
+                        )
+                    );
                 }
             }
 

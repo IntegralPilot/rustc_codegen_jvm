@@ -11,7 +11,7 @@ use rustc_middle::{
         BasicBlock, BasicBlockData, Body, Local, NonDivergingIntrinsic, Operand as MirOperand,
         Place, StatementKind, TerminatorKind,
     },
-    ty::{Instance, TyCtxt, TyKind, TypingEnv},
+    ty::{EarlyBinder, Instance, TyCtxt, TyKind, TypingEnv},
 };
 use std::collections::HashMap;
 
@@ -152,7 +152,7 @@ pub fn convert_basic_block<'tcx>(
             StatementKind::StorageLive(_) | StatementKind::StorageDead(_) => {
                 // no-op, currently
             }
-            StatementKind::Nop => {
+            StatementKind::Nop | StatementKind::ConstEvalCounter => {
                 // Literally a no-op
             }
             StatementKind::Intrinsic(box NonDivergingIntrinsic::Assume(operand)) => {
@@ -268,21 +268,18 @@ pub fn convert_basic_block<'tcx>(
                     .is_empty()
                     .then(|| format!("_{}", destination.local.index()));
 
-                let func_ty = func.ty(mir, tcx);
+                let typing_env = TypingEnv::post_analysis(tcx, mir.source.def_id());
+                let func_ty = EarlyBinder::bind(tcx, func.ty(mir, tcx))
+                    .instantiate(tcx, instance.args)
+                    .skip_norm_wip();
                 if let rustc_middle::ty::TyKind::FnDef(def_id, substs) = func_ty.kind() {
                     // Resolve the instance
                     let func_instance = rustc_middle::ty::Instance::resolve_for_fn_ptr(
-                        tcx,
-                        TypingEnv::post_analysis(tcx, mir.source.def_id()),
-                        *def_id,
-                        substs,
+                        tcx, typing_env, *def_id, substs,
                     )
                     .unwrap();
 
-                    let instance_ty = tcx
-                        .type_of(func_instance.def_id())
-                        .instantiate(tcx, func_instance.args)
-                        .skip_norm_wip();
+                    let instance_ty = func_instance.ty(tcx, typing_env);
                     let (fn_inputs, fn_output) = match instance_ty.kind() {
                         TyKind::Closure(_, args) => {
                             let sig = args.as_closure().sig();
@@ -298,7 +295,7 @@ pub fn convert_basic_block<'tcx>(
                     };
 
                     let oomir_output_type =
-                        super::types::ty_to_oomir_type(fn_output, tcx, data_types, func_instance);
+                        super::types::ty_to_oomir_type(fn_output, tcx, data_types, instance);
 
                     let effective_dest = if matches!(oomir_output_type, oomir::Type::Void) {
                         None
@@ -308,9 +305,7 @@ pub fn convert_basic_block<'tcx>(
 
                     let oomir_input_types: Vec<oomir::Type> = fn_inputs
                         .iter()
-                        .map(|ty| {
-                            super::types::ty_to_oomir_type(*ty, tcx, data_types, func_instance)
-                        })
+                        .map(|ty| super::types::ty_to_oomir_type(*ty, tcx, data_types, instance))
                         .collect();
 
                     let oomir_params: Vec<(String, oomir::Type)> = oomir_input_types

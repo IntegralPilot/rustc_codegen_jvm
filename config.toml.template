@@ -6,11 +6,5 @@ rustflags = [
 ]
 
 # Throwing a JVM exception will unwind and give a stack trace, no need for rust to handle unwinding.
-[profile.debug]
+[profile]
 panic = "abort"
-
-[profile.release]
-panic = "abort"
-rustflags = [
-  "-C", "link-args=--release"
-]

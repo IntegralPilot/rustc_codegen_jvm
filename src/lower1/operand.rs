@@ -7,7 +7,7 @@ use rustc_middle::{
         Body, Const, ConstOperand, ConstValue, Operand as MirOperand, Place,
         interpret::{ErrorHandled, Scalar},
     },
-    ty::{ConstKind, Instance, Ty, TyCtxt, TypeVisitableExt, TypingEnv},
+    ty::{ConstKind, EarlyBinder, Instance, Ty, TyCtxt, TypeVisitableExt, TypingEnv},
 };
 use std::collections::HashMap;
 
@@ -30,7 +30,9 @@ pub fn convert_operand<'tcx>(
                     handle_const_value(Some(constant), const_val, &ty, tcx, data_types, instance)
                 }
                 Const::Ty(const_ty, ty_const) => {
-                    // ty_const is NOT a type, naming is b/c it's a ty::Const (as opposed to mir::Const)
+                    let ty_const = EarlyBinder::bind(tcx, ty_const)
+                        .instantiate(tcx, instance.args)
+                        .skip_norm_wip();
                     let kind = ty_const.kind();
                     match kind {
                         ConstKind::Value(val) => {
