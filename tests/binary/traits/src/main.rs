@@ -34,6 +34,20 @@ impl CarrierValue for &str {
     }
 }
 
+trait PrimitiveTraitObject {
+    fn doubled(&self) -> i32;
+}
+
+impl PrimitiveTraitObject for i32 {
+    fn doubled(&self) -> i32 {
+        *self * 2
+    }
+}
+
+fn use_primitive_trait_object(value: &dyn PrimitiveTraitObject) -> i32 {
+    value.doubled()
+}
+
 // --- First Implementation ---
 struct SimpleAdder {
     current_total: i32,
@@ -113,6 +127,11 @@ fn main() {
     assert!(41i32.carrier_value() == 42);
     assert!([2, 3, 5].carrier_value() == 10);
     assert!("carrier".carrier_value() == 7);
+
+    let primitive = 21i32;
+    let primitive_object: &dyn PrimitiveTraitObject = &primitive;
+    assert!(primitive_object.doubled() == 42);
+    assert!(use_primitive_trait_object(&primitive) == 42);
 
     let mut adder = SimpleAdder { current_total: 10 };
 

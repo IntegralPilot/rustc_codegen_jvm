@@ -19,6 +19,7 @@ mod checked_intrinsic_registry;
 pub mod checked_intrinsics;
 mod checked_ops;
 pub(crate) mod rvalue;
+mod trait_objects;
 
 pub use checked_intrinsic_registry::take_needed_intrinsics;
 

@@ -26,6 +26,7 @@ use super::{
         checked_arithmetic_tuple_local_name, emit_checked_arithmetic_oomir_instructions,
     },
     oomir::{self, DataTypeMethod},
+    trait_objects::{carrier_needs_trait_object_adapter, ensure_trait_object_adapter_class},
 };
 
 use std::sync::atomic::{AtomicUsize, Ordering}; // For unique temp names
@@ -939,7 +940,47 @@ pub fn convert_rvalue_to_operand<'a>(
                     let oomir_operand =
                         convert_operand(operand, tcx, instance, mir, data_types, &mut instructions);
 
-                    if matches!(cast_kind, CastKind::Transmute)
+                    let trait_object_adapter = if matches!(
+                        cast_kind,
+                        CastKind::PointerCoercion(PointerCoercion::Unsize, _)
+                    ) && carrier_needs_trait_object_adapter(
+                        &oomir_source_type,
+                        data_types,
+                    ) && let oomir::Type::Interface(interface_name) =
+                        &oomir_target_type
+                    {
+                        match ensure_trait_object_adapter_class(
+                            source_mir_ty,
+                            *target_mir_ty,
+                            &oomir_source_type,
+                            interface_name,
+                            data_types,
+                            tcx,
+                            instance,
+                        ) {
+                            Ok(class_name) => Some(class_name),
+                            Err(error) => {
+                                breadcrumbs::log!(
+                                    breadcrumbs::LogLevel::Warn,
+                                    "mir-lowering",
+                                    format!(
+                                        "Could not build trait-object carrier adapter for {source_mir_ty:?} -> {target_mir_ty:?}: {error}"
+                                    )
+                                );
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+
+                    if let Some(adapter_class) = trait_object_adapter {
+                        instructions.push(oomir::Instruction::ConstructObject {
+                            dest: temp_cast_var.clone(),
+                            class_name: adapter_class,
+                            args: vec![(oomir_operand, oomir_source_type.clone())],
+                        });
+                    } else if matches!(cast_kind, CastKind::Transmute)
                         && oomir_source_type
                             == oomir::Type::Class(crate::lower2::F128_CLASS.to_string())
                         && oomir_target_type
