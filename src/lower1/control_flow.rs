@@ -514,7 +514,7 @@ pub fn convert_basic_block<'tcx>(
                         let (class_name, function) = if is_closure_call {
                             (
                                 None,
-                                super::generate_closure_function_name(tcx, func_instance.def_id()),
+                                super::generate_closure_function_name(tcx, func_instance),
                             )
                         } else {
                             let fn_name_data =

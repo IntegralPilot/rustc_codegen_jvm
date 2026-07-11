@@ -10,8 +10,8 @@
 use crate::oomir;
 use control_flow::convert_basic_block;
 use rustc_middle::{
-    mir::Body,
-    ty::{Instance, TyCtxt},
+    mir::{Body, Local},
+    ty::{EarlyBinder, Instance, TyCtxt},
 };
 use std::collections::HashMap;
 use types::ty_to_oomir_type;
@@ -111,7 +111,10 @@ pub fn mir_to_oomir<'tcx>(
         .collect();
 
     if closure_has_captures {
-        let closure_env_ty = ty_to_oomir_type(instance_ty, tcx, data_types, instance);
+        let closure_env_mir_ty = EarlyBinder::bind(tcx, mir.local_decls[Local::from_usize(1)].ty)
+            .instantiate(tcx, instance.args)
+            .skip_norm_wip();
+        let closure_env_ty = ty_to_oomir_type(closure_env_mir_ty, tcx, data_types, instance);
         params_oomir.insert(0, ("closure_env".to_string(), closure_env_ty));
     }
 

@@ -27,6 +27,7 @@ pub struct FunctionTranslator<'a, 'cp> {
 
     local_var_map: HashMap<String, u16>, // OOMIR var name -> JVM local index
     local_var_types: HashMap<String, oomir::Type>, // OOMIR var name -> OOMIR Type
+    typed_local_var_map: HashMap<(String, oomir::Type), u16>,
     next_local_index: u16,
     jvm_instructions: Vec<jvm::attributes::Instruction>,
     label_to_instr_index: HashMap<String, u16>, // OOMIR label -> JVM instruction index
@@ -66,6 +67,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             constant_pool,
             local_var_map: HashMap::new(),
             local_var_types: HashMap::new(),
+            typed_local_var_map: HashMap::new(),
             next_local_index: if is_static { 0 } else { 1 },
             jvm_instructions: Vec::new(),
             label_to_instr_index: HashMap::new(),
@@ -95,6 +97,9 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 translator
                     .local_var_types
                     .insert("_1".to_string(), Type::Class(class_name.to_string()));
+                translator
+                    .typed_local_var_map
+                    .insert(("_1".to_string(), Type::Class(class_name.to_string())), 0);
                 translator.max_locals_used = translator.max_locals_used.max(1);
 
                 breadcrumbs::log!(
@@ -163,6 +168,9 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     )
                 );
             }
+            translator
+                .typed_local_var_map
+                .insert((param_oomir_name, param_ty.clone()), assigned_index);
         }
 
         translator
@@ -289,7 +297,11 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         let Some(amount) = iinc_amount(amount_operand, amount_sign) else {
             return Ok(false);
         };
-        let Some(local_index) = self.local_var_map.get(dest).copied() else {
+        let Some(local_index) = self
+            .typed_local_var_map
+            .get(&(dest.to_string(), Type::I32))
+            .copied()
+        else {
             return Ok(false);
         };
 
@@ -430,124 +442,68 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         Ok(order)
     }
 
-    /// Assigns a local variable to a JVM slot, returning the index.
-    // Ensure assign_local ONLY inserts if vacant, it shouldn't be called directly
-    // when we intend to overwrite like in the type mismatch case above.
-    // The logic above directly modifies the map and next_local_index when overwriting.
     fn assign_local(&mut self, var_name: &str, ty: &oomir::Type) -> u16 {
-        if let std::collections::hash_map::Entry::Vacant(e) =
-            self.local_var_map.entry(var_name.to_string())
-        {
-            let index = self.next_local_index;
-            e.insert(index);
-            // Only insert type if it's also vacant (should always be if index is vacant)
-            if self
-                .local_var_types
-                .insert(var_name.to_string(), ty.clone())
-                .is_some()
-            {
-                breadcrumbs::log!(
-                    breadcrumbs::LogLevel::Warn,
-                    "bytecode-gen",
-                    format!(
-                        "Internal Warning: Type map already had entry for supposedly new local '{}'",
-                        var_name
-                    )
-                );
-            }
-
-            let size = get_type_size(ty);
-            self.next_local_index += size;
-            self.max_locals_used = self.max_locals_used.max(index + size);
-            index
-        } else {
-            // This case should ideally not be hit if get_or_assign_local handles re-assignments.
-            // If it IS hit, it means assign_local was called when the variable already exists.
-            // This might happen with parameters if called carelessly after initial setup.
-            let existing_index = self.local_var_map[var_name];
-            breadcrumbs::log!(
-                breadcrumbs::LogLevel::Warn,
-                "bytecode-gen",
-                format!(
-                    "Warning: assign_local called for existing variable '{}' (index {}). Reusing index.",
-                    var_name, existing_index
-                )
-            );
-            // Should we verify type consistency here too? Probably.
-            if let Some(existing_ty) = self.local_var_types.get(var_name) {
-                if existing_ty != ty {
-                    breadcrumbs::log!(
-                        breadcrumbs::LogLevel::Warn,
-                        "bytecode-gen",
-                        format!(
-                            "   -> CRITICAL WARNING: assign_local type mismatch for '{}'! Existing: {:?}, New: {:?}. Keeping existing index but this indicates a flaw!",
-                            var_name, existing_ty, ty
-                        )
-                    );
-                }
-            }
-            existing_index // Return existing index, but flag this as problematic
+        let key = (var_name.to_string(), ty.clone());
+        if let Some(index) = self.typed_local_var_map.get(&key).copied() {
+            self.local_var_map.insert(var_name.to_string(), index);
+            self.local_var_types
+                .insert(var_name.to_string(), ty.clone());
+            return index;
         }
+
+        let index = self.next_local_index;
+        let size = get_type_size(ty);
+        self.next_local_index += size;
+        self.max_locals_used = self.max_locals_used.max(index + size);
+        self.typed_local_var_map.insert(key, index);
+        self.local_var_map.insert(var_name.to_string(), index);
+        self.local_var_types
+            .insert(var_name.to_string(), ty.clone());
+        index
     }
 
     /// Gets the slot index for a variable, assigning if new.
     fn get_or_assign_local(&mut self, var_name: &str, ty_hint: &oomir::Type) -> u16 {
-        if let Some(existing_index) = self.local_var_map.get(var_name).copied() {
-            // Check if the existing type matches the hint. If not, update it.
-            if let Some(existing_ty) = self.local_var_types.get(var_name) {
-                if existing_ty != ty_hint {
-                    breadcrumbs::log!(
-                        breadcrumbs::LogLevel::Warn,
-                        "bytecode-gen",
-                        format!(
-                            "Warning: Reusing local '{}' (index {}) with new type {:?} (previous: {:?}). Updating type.",
-                            var_name, existing_index, ty_hint, existing_ty
-                        )
-                    );
-                    // Update the type in the map
-                    self.local_var_types
-                        .insert(var_name.to_string(), ty_hint.clone());
-                    // Re-check if max_locals_used needs update due to size change
-                    let size = get_type_size(ty_hint);
-                    self.max_locals_used = self.max_locals_used.max(existing_index + size);
-                } else {
-                    breadcrumbs::log!(
-                        breadcrumbs::LogLevel::Info,
-                        "bytecode-gen",
-                        format!(
-                            "Debug: Reusing local '{}' (index {}) with same type hint {:?}.",
-                            var_name, existing_index, ty_hint
-                        )
-                    );
-                }
-            } else {
-                // This case is unlikely if index exists, but handle defensively
-                breadcrumbs::log!(
-                    breadcrumbs::LogLevel::Warn,
-                    "bytecode-gen",
-                    format!(
-                        "Warning: Local '{}' has index {} but no type in map. Assigning type {:?}.",
-                        var_name, existing_index, ty_hint
-                    )
-                );
-                self.local_var_types
-                    .insert(var_name.to_string(), ty_hint.clone());
-                let size = get_type_size(ty_hint);
-                self.max_locals_used = self.max_locals_used.max(existing_index + size);
-            }
-            existing_index
+        if let Some(index) = self
+            .typed_local_var_map
+            .get(&(var_name.to_string(), ty_hint.clone()))
+            .copied()
+        {
+            self.local_var_map.insert(var_name.to_string(), index);
+            self.local_var_types
+                .insert(var_name.to_string(), ty_hint.clone());
+            index
+        } else if let (Some(index), Some(current_ty)) = (
+            self.local_var_map.get(var_name).copied(),
+            self.local_var_types.get(var_name).cloned(),
+        ) && Self::can_share_jvm_local(&current_ty, ty_hint)
+        {
+            self.typed_local_var_map
+                .insert((var_name.to_string(), ty_hint.clone()), index);
+            self.local_var_types
+                .insert(var_name.to_string(), ty_hint.clone());
+            index
         } else {
-            // Variable is genuinely new. Use assign_local to get a fresh slot.
-            breadcrumbs::log!(
-                breadcrumbs::LogLevel::Info,
-                "bytecode-gen",
-                format!(
-                    "Debug: Assigning new local '{}' (type {:?})",
-                    var_name, ty_hint
-                )
-            );
-            self.assign_local(var_name, ty_hint) // assign_local handles map insertion etc.
+            self.assign_local(var_name, ty_hint)
         }
+    }
+
+    fn can_share_jvm_local(existing: &oomir::Type, new: &oomir::Type) -> bool {
+        existing == new
+            || (existing.is_jvm_reference_type() && new.is_jvm_reference_type())
+            || (matches!(
+                existing,
+                Type::I8 | Type::I16 | Type::I32 | Type::Boolean | Type::Char
+            ) && matches!(
+                new,
+                Type::I8 | Type::I16 | Type::I32 | Type::Boolean | Type::Char
+            ))
+    }
+
+    fn get_typed_local_index(&self, var_name: &str, ty: &oomir::Type) -> Option<u16> {
+        self.typed_local_var_map
+            .get(&(var_name.to_string(), ty.clone()))
+            .copied()
     }
     fn get_local_index(&self, var_name: &str) -> Result<u16, jvm::Error> {
         self.local_var_map
@@ -665,8 +621,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         }
 
         let local_hints = stackmaps::local_hints_for_oomir_locals(
-            &self.local_var_map,
-            &self.local_var_types,
+            &self.typed_local_var_map,
             self.max_locals_used,
         );
         let fixed_prefix_slots = self.initial_locals.len() as u16;
@@ -893,7 +848,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         var_name: &str,
         ty: &oomir::Type,
     ) -> Result<bool, jvm::Error> {
-        if self.local_var_map.contains_key(var_name) {
+        if self.get_typed_local_index(var_name, ty).is_some() {
             return Ok(false);
         }
         let Some(class_name) = self.zero_sized_class_name(ty) else {
@@ -917,18 +872,21 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             }
             oomir::Operand::Variable { name: var_name, ty } => {
                 self.materialize_zero_sized_local(var_name, ty)?;
-                // For instance methods, _1 is mapped to slot 0 as the raw 'this' pointer
-                // Use the actual JVM type from local_var_types if available (for _1 in instance methods)
-                // Otherwise use the OOMIR operand type
-                let mut actual_ty = self
-                    .local_var_types
-                    .get(var_name)
-                    .cloned()
-                    .unwrap_or_else(|| ty.clone());
-                if !actual_ty.has_jvm_value() && ty.has_jvm_value() {
-                    actual_ty = ty.clone();
-                }
-                let index = self.get_or_assign_local(var_name, &actual_ty);
+                let (index, actual_ty) =
+                    if let Some(index) = self.get_typed_local_index(var_name, ty) {
+                        (index, ty.clone())
+                    } else {
+                        let mut actual_ty = self
+                            .local_var_types
+                            .get(var_name)
+                            .cloned()
+                            .unwrap_or_else(|| ty.clone());
+                        if !actual_ty.has_jvm_value() && ty.has_jvm_value() {
+                            actual_ty = ty.clone();
+                        }
+                        let index = self.get_or_assign_local(var_name, &actual_ty);
+                        (index, actual_ty)
+                    };
                 let load_instr = get_load_instruction(&actual_ty, index)?;
                 self.jvm_instructions.push(load_instr);
             }
@@ -1004,12 +962,28 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         if !ty.has_jvm_value() {
             self.local_var_types
                 .insert(dest_var.to_string(), ty.clone());
+            self.typed_local_var_map
+                .insert((dest_var.to_string(), ty.clone()), self.next_local_index);
             return Ok(());
         }
         // Assign or update the local variable slot with the provided type
         let index: u16 = self.get_or_assign_local(dest_var, ty);
         let store_instr = get_store_instruction(ty, index)?;
         self.jvm_instructions.push(store_instr);
+        Ok(())
+    }
+
+    fn store_result_in_distinct_slot(
+        &mut self,
+        dest_var: &str,
+        ty: &oomir::Type,
+    ) -> Result<(), jvm::Error> {
+        if !ty.has_jvm_value() {
+            return self.store_result(dest_var, ty);
+        }
+        let index = self.assign_local(dest_var, ty);
+        self.jvm_instructions
+            .push(get_store_instruction(ty, index)?);
         Ok(())
     }
 
@@ -3330,7 +3304,14 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 owner_class, // Class where the field is *defined*
             } => {
                 // 1. Get the type of the object variable itself (should be a Class type)
-                let object_actual_type = self.get_local_type(object)?.clone();
+                let owner_ty = oomir::Type::Class(owner_class.clone());
+                let (object_var_index, object_actual_type) = self
+                    .get_typed_local_index(object, &owner_ty)
+                    .map(|index| (index, owner_ty))
+                    .unwrap_or((
+                        self.get_local_index(object)?,
+                        self.get_local_type(object)?.clone(),
+                    ));
 
                 // We don't strictly *need* object_actual_type for the load instruction itself
                 // if get_load_instruction correctly handles all reference types with Aload,
@@ -3356,7 +3337,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
 
                 // 3. Load the object reference onto the stack
                 // Use object_actual_type (which must be a reference type) to get aload
-                let object_var_index = self.get_local_index(object)?;
                 let load_object_instr =
                     get_load_instruction(&object_actual_type, object_var_index)?;
                 self.jvm_instructions.push(load_object_instr.clone()); // Stack: [object_ref]
@@ -3370,6 +3350,8 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
 
             OI::GetField { dest, field_ty, .. } if !field_ty.has_jvm_value() => {
                 self.local_var_types.insert(dest.clone(), field_ty.clone());
+                self.typed_local_var_map
+                    .insert((dest.clone(), field_ty.clone()), self.next_local_index);
             }
             OI::GetField {
                 dest,
@@ -3408,7 +3390,11 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
 
                 // 5. Store the retrieved field value into the destination variable
                 //    The type for storage is the field's type (field_ty)
-                self.store_result(dest, field_ty)?; // Stack: []
+                if object.get_name() == Some(dest.as_str()) {
+                    self.store_result_in_distinct_slot(dest, field_ty)?;
+                } else {
+                    self.store_result(dest, field_ty)?;
+                }
             }
             OI::Cast { op, ty, dest } => {
                 self.load_operand_as(op, ty)?;
@@ -3609,14 +3595,15 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         match operand {
             oomir::Operand::Variable { name: var_name, ty } => {
                 self.materialize_zero_sized_local(var_name, ty)?;
-                let index =
-                    self.get_local_index(var_name)
-                        .map_err(|_| jvm::Error::VerificationError {
-                            context: format!("Function {}", self.oomir_func.name),
-                            message: format!(
-                                "Undefined call argument local variable: {var_name} ({ty:?})"
-                            ),
-                        })?;
+                let index = self
+                    .get_typed_local_index(var_name, ty)
+                    .or_else(|| self.local_var_map.get(var_name).copied())
+                    .ok_or_else(|| jvm::Error::VerificationError {
+                        context: format!("Function {}", self.oomir_func.name),
+                        message: format!(
+                            "Undefined call argument local variable: {var_name} ({ty:?})"
+                        ),
+                    })?;
                 let load_type = match ty {
                     // If the argument is declared as Ref<Primitive>, load the primitive directly
                     oomir::Type::Reference(box inner_ty) if inner_ty.is_jvm_primitive() => {

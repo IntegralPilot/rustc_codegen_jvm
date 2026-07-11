@@ -1,4 +1,4 @@
-use rustc_middle::ty::{Instance, TyCtxt};
+use rustc_middle::ty::{GenericArgsRef, Instance, TyCtxt};
 use rustc_span::def_id::{CrateNum, DefId};
 
 const RUNTIME_CRATES: &[&str] = &["core"];
@@ -40,12 +40,14 @@ pub fn class_for_def_id<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> String {
     segments.join("/")
 }
 
-pub fn closure_class_for_def_id<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> String {
-    format!(
-        "{}/{}",
-        crate_root(tcx, def_id.krate),
-        path_segment(&tcx.def_path_str(def_id))
-    )
+pub fn closure_class_for_args<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: DefId,
+    args: GenericArgsRef<'tcx>,
+) -> String {
+    let base = path_segment(&tcx.def_path_str(def_id));
+    let hash = super::types::short_hash(&format!("{def_id:?}:{args:?}"), 10);
+    format!("{}/{}_{}", crate_root(tcx, def_id.krate), base, hash)
 }
 
 pub fn owner_class_for_function<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> String {

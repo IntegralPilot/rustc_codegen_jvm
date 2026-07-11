@@ -217,15 +217,11 @@ pub(super) fn initial_locals_for_descriptor(
 }
 
 pub(super) fn local_hints_for_oomir_locals(
-    local_var_map: &HashMap<String, u16>,
-    local_var_types: &HashMap<String, oomir::Type>,
+    local_var_map: &HashMap<(String, oomir::Type), u16>,
     max_locals: u16,
 ) -> Vec<FrameValue> {
     let mut hints = vec![FrameValue::Top; max_locals as usize];
-    for (name, local_index) in local_var_map {
-        let Some(ty) = local_var_types.get(name) else {
-            continue;
-        };
+    for ((_, ty), local_index) in local_var_map {
         set_slot_value(&mut hints, *local_index, frame_value_from_oomir_type(ty));
     }
     hints

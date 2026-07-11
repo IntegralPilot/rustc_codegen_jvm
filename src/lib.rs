@@ -141,7 +141,7 @@ fn mono_item_name<'tcx>(
     if matches!(instance_ty.kind(), TyKind::Closure(..)) {
         return lower1::naming::FnNameData {
             class_to_call_on: Some(oomir_module.name.clone()),
-            method_name: lower1::generate_closure_function_name(tcx, instance.def_id()),
+            method_name: lower1::generate_closure_function_name(tcx, instance),
         };
     }
 

@@ -1838,7 +1838,7 @@ pub fn ty_to_oomir_type<'tcx>(
             oomir::Type::Class(jvm_names::member_name(param_ty.name.as_str()))
         }
         rustc_middle::ty::TyKind::Closure(def_id, args) => {
-            let safe_name = jvm_names::closure_class_for_def_id(tcx, *def_id);
+            let safe_name = jvm_names::closure_class_for_args(tcx, *def_id, args);
 
             // Define the closure class struct if not already present
             if should_define_named_data_type(tcx, *def_id) && !data_types.contains_key(&safe_name) {
