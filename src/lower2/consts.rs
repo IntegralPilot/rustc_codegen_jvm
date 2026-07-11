@@ -295,7 +295,10 @@ pub fn load_constant(
                     ),
                 });
             }
-            let constructor_params = params.iter().collect::<Vec<_>>();
+            let constructor_params = params
+                .iter()
+                .filter(|param| Type::from_constant(param).has_jvm_value())
+                .collect::<Vec<_>>();
 
             // 2. Determine constructor signature descriptor.
             let constructor_descriptor = format!(

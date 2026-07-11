@@ -736,6 +736,7 @@ fn create_field_constructor(
         "({})V",
         fields
             .iter()
+            .filter(|(_, ty)| ty.has_jvm_value())
             .map(|(_, ty)| ty.to_jvm_descriptor())
             .collect::<String>()
     );
@@ -764,7 +765,7 @@ fn create_field_constructor(
     instructions.push(Instruction::Return);
 
     let mut parameters = Vec::new();
-    for (field_name, _) in fields {
+    for (field_name, _) in fields.iter().filter(|(_, ty)| ty.has_jvm_value()) {
         let name_index = cp.add_utf8(field_name)?;
         parameters.push(jvm::attributes::MethodParameter {
             name_index,

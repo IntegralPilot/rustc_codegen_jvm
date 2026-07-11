@@ -3249,7 +3249,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     }
                 };
 
-                // check if any instructions are needed to cast the value to the element type
                 let value_type = get_operand_type(value);
                 breadcrumbs::log!(
                     breadcrumbs::LogLevel::Info,
@@ -3259,13 +3258,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                         value_type, element_type
                     )
                 );
-                if value_type != *element_type {
-                    let instrs =
-                        get_cast_instructions(&value_type, &element_type, &mut self.constant_pool)
-                            .unwrap();
-                    self.jvm_instructions.extend(instrs);
-                }
-
                 // 2. Load array reference
                 // Use the full array type when loading the variable
                 let array_operand = oomir::Operand::Variable {
@@ -3278,7 +3270,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 self.load_operand(index)?; // Stack: [arrayref, index_int]
 
                 // 4. Load value onto the stack
-                self.load_operand(value)?; // Stack: [arrayref, index_int, value]
+                self.load_operand_as(value, &element_type)?; // Stack: [arrayref, index_int, value]
 
                 // 5. Get and add the appropriate array store instruction
                 let store_instr =

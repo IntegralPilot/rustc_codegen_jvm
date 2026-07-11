@@ -75,7 +75,7 @@ These examples live in `tests/binary`, are compiled to JVM bytecode, and are ver
 - **OOP constructs** such as `impl` blocks for ADTs, including `self`, `&self`, and `&mut self`.
 - **Traits** and dynamic dispatch via `&dyn Trait`.
 - **Memory management,** currently mutable borrowing, references, and dereferencing, with more complex stuff currently WIP!
-- **Unions** are supported for primitive types (`bool`, `i8`–`f64`, `()`, `char`), structs composed of them, fieldless enums and fixed-sized arrays containing any of these.
+- **Unions** support primitive values, references, tuples, structs, fixed-size arrays, and fieldless or data-carrying enums, including recursively nested combinations of these types.
 - **Outputs** executable, self-contained `.jar` generation for binary crates.
 - **Testing** with integration coverage across debug and release modes for all of the above.
 

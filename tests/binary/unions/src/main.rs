@@ -94,6 +94,82 @@ union EnumArrayBytes10 {
     bytes: [u8; 10],
 }
 
+type NestedTuple = (u8, (), u32, (u16, u8));
+
+union TupleStorage {
+    value: NestedTuple,
+    bytes: [u8; core::mem::size_of::<NestedTuple>()],
+}
+
+#[derive(Copy, Clone)]
+#[repr(C, u8)]
+enum DataEnum {
+    Empty = 1,
+    Pair(u16, u8) = 3,
+    Named { word: u32, marker: u8 } = 7,
+    Nested((u16, (), u8), [u8; 3]) = 9,
+}
+
+union DataEnumStorage {
+    value: DataEnum,
+    bytes: [u8; core::mem::size_of::<DataEnum>()],
+}
+
+union DataEnumArrayStorage {
+    values: [DataEnum; 3],
+    bytes: [u8; core::mem::size_of::<[DataEnum; 3]>()],
+}
+
+#[derive(Copy, Clone)]
+enum NicheEnum {
+    Missing,
+    Present(bool),
+}
+
+union NicheEnumStorage {
+    value: NicheEnum,
+    byte: u8,
+}
+
+#[derive(Copy, Clone)]
+enum SingleVariantEnum {
+    Only(u16, (u8, u8)),
+}
+
+union SingleVariantStorage {
+    value: SingleVariantEnum,
+    bytes: [u8; core::mem::size_of::<SingleVariantEnum>()],
+}
+
+union ReferenceStorage<'a> {
+    slice: &'a [u8],
+    text: &'a str,
+}
+
+#[derive(Copy, Clone)]
+#[repr(C)]
+struct ReferencePayload<'a> {
+    marker: u8,
+    text: &'a str,
+}
+
+union NestedReferenceStorage<'a> {
+    value: ReferencePayload<'a>,
+}
+
+#[derive(Copy, Clone)]
+#[repr(C)]
+struct CompositePayload {
+    prefix: u16,
+    payload: (u8, DataEnum),
+    suffix: [u8; 2],
+}
+
+union CompositeStorage {
+    value: CompositePayload,
+    bytes: [u8; core::mem::size_of::<CompositePayload>()],
+}
+
 fn main() {
     let bytes = Bytes {
         group1: TwoGroupsOfOneByte { a: 0x01, b: 0x02 },
@@ -267,5 +343,171 @@ fn main() {
         assert!(matches!(from_bytes.values[1], EscapeCharacter::Quote));
         assert!(matches!(from_bytes.values[2], EscapeCharacter::UpperA));
         assert!(matches!(from_bytes.values[3], EscapeCharacter::Backslash));
+
+        // Tuple fields use the same recursive layout model as named structs.
+        // This includes nested tuples, padding, and zero-sized elements.
+        let mut tuple = TupleStorage {
+            value: (0x12, (), 0x8877_6655, (0x4433, 0xaa)),
+        };
+        let tuple_value = tuple.value;
+        assert!(tuple_value.0 == 0x12);
+        tuple_value.1;
+        assert!(tuple_value.2 == 0x8877_6655);
+        assert!((tuple_value.3).0 == 0x4433);
+        assert!((tuple_value.3).1 == 0xaa);
+
+        tuple.value = (0xfe, (), 0x1020_3040, (0x5060, 0x70));
+        assert!(tuple.value.0 == 0xfe);
+        assert!(tuple.value.2 == 0x1020_3040);
+        assert!((tuple.value.3).0 == 0x5060);
+        assert!((tuple.value.3).1 == 0x70);
+
+        // Data-carrying enum codecs preserve the real Rust tag and payload
+        // offsets, rather than imposing a JVM-specific enum layout.
+        let empty_variant = DataEnumStorage {
+            value: DataEnum::Empty,
+        };
+        assert!(empty_variant.bytes[0] == 1);
+        assert!(matches!(empty_variant.value, DataEnum::Empty));
+
+        let pair_variant = DataEnumStorage {
+            value: DataEnum::Pair(0x4321, 0x65),
+        };
+        assert!(pair_variant.bytes[0] == 3);
+        match pair_variant.value {
+            DataEnum::Pair(first, second) => {
+                assert!(first == 0x4321);
+                assert!(second == 0x65);
+            }
+            _ => panic!(),
+        }
+
+        let mut changing_variant = DataEnumStorage {
+            value: DataEnum::Named {
+                word: 0x8877_6655,
+                marker: 0x44,
+            },
+        };
+        assert!(changing_variant.bytes[0] == 7);
+        match changing_variant.value {
+            DataEnum::Named { word, marker } => {
+                assert!(word == 0x8877_6655);
+                assert!(marker == 0x44);
+            }
+            _ => panic!(),
+        }
+
+        changing_variant.value = DataEnum::Nested((0xabcd, (), 0xef), [1, 2, 3]);
+        assert!(changing_variant.bytes[0] == 9);
+        match changing_variant.value {
+            DataEnum::Nested(tuple, bytes) => {
+                assert!(tuple.0 == 0xabcd);
+                tuple.1;
+                assert!(tuple.2 == 0xef);
+                assert!(bytes[0] == 1);
+                assert!(bytes[1] == 2);
+                assert!(bytes[2] == 3);
+            }
+            _ => panic!(),
+        }
+
+        // Exercise enum codecs at non-zero offsets and repeatedly within an
+        // array. Each element may have a different active variant.
+        let enum_array = DataEnumArrayStorage {
+            values: [
+                DataEnum::Empty,
+                DataEnum::Pair(0x1234, 0x56),
+                DataEnum::Named {
+                    word: 0x1020_3040,
+                    marker: 0x50,
+                },
+            ],
+        };
+        assert!(matches!(enum_array.values[0], DataEnum::Empty));
+        match enum_array.values[1] {
+            DataEnum::Pair(first, second) => {
+                assert!(first == 0x1234);
+                assert!(second == 0x56);
+            }
+            _ => panic!(),
+        }
+        match enum_array.values[2] {
+            DataEnum::Named { word, marker } => {
+                assert!(word == 0x1020_3040);
+                assert!(marker == 0x50);
+            }
+            _ => panic!(),
+        }
+
+        // Cover Rust's niche encoding as well as a tagless single-variant
+        // enum. Both still use the same recursive payload codec.
+        let missing = NicheEnumStorage {
+            value: NicheEnum::Missing,
+        };
+        assert!(missing.byte == 2);
+        assert!(matches!(missing.value, NicheEnum::Missing));
+
+        let present = NicheEnumStorage {
+            value: NicheEnum::Present(true),
+        };
+        assert!(present.byte == 1);
+        match present.value {
+            NicheEnum::Present(value) => assert!(value),
+            _ => panic!(),
+        }
+
+        let single = SingleVariantStorage {
+            value: SingleVariantEnum::Only(0x1234, (0x56, 0x78)),
+        };
+        match single.value {
+            SingleVariantEnum::Only(word, pair) => {
+                assert!(word == 0x1234);
+                assert!(pair.0 == 0x56);
+                assert!(pair.1 == 0x78);
+            }
+        }
+
+        // JVM references occupy offset-addressed object slots alongside the
+        // native byte storage. They work directly and inside aggregates.
+        let source = [10_u8, 20, 30, 40];
+        let mut reference = ReferenceStorage {
+            slice: &source,
+        };
+        assert!(reference.slice.len() == 4);
+        assert!(reference.slice[0] == 10);
+        assert!(reference.slice[3] == 40);
+        reference.text = "union reference";
+        assert!(reference.text == "union reference");
+        assert!(reference.slice.len() == 15);
+
+        let nested_reference = NestedReferenceStorage {
+            value: ReferencePayload {
+                marker: 0xa5,
+                text: "nested reference",
+            },
+        };
+        assert!(nested_reference.value.marker == 0xa5);
+        assert!(nested_reference.value.text == "nested reference");
+
+        // Finally compose struct, tuple, enum, and array layouts recursively.
+        let composite = CompositeStorage {
+            value: CompositePayload {
+                prefix: 0x1122,
+                payload: (0x33, DataEnum::Pair(0x4455, 0x66)),
+                suffix: [0x77, 0x88],
+            },
+        };
+        let composite_value = composite.value;
+        assert!(composite_value.prefix == 0x1122);
+        assert!((composite_value.payload).0 == 0x33);
+        match (composite_value.payload).1 {
+            DataEnum::Pair(first, second) => {
+                assert!(first == 0x4455);
+                assert!(second == 0x66);
+            }
+            _ => panic!(),
+        }
+        assert!(composite_value.suffix[0] == 0x77);
+        assert!(composite_value.suffix[1] == 0x88);
     }
 }

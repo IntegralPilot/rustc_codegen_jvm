@@ -17,9 +17,9 @@ use super::{
         },
         types::{
             ENUM_UNION_DISCRIMINANT_METHOD, adapt_simple_enum_operand, ensure_fn_ptr_interface,
-            ensure_union_data_type, fn_ptr_signature_from_ty, generate_adt_jvm_class_name,
-            short_hash, should_define_named_data_type, simple_enum_union_size, ty_to_oomir_type,
-            union_from_method_name,
+            ensure_union_data_type, enum_union_discriminant_supported, fn_ptr_signature_from_ty,
+            generate_adt_jvm_class_name, short_hash, should_define_named_data_type,
+            ty_to_oomir_type, union_from_method_name,
         },
     },
     checked_ops::{
@@ -1921,7 +1921,7 @@ pub fn convert_rvalue_to_operand<'a>(
             let place_mir_ty = place.ty(&mir.local_decls, tcx).ty;
             let use_numeric_discriminant = match place_mir_ty.kind() {
                 TyKind::Adt(adt_def, _) if adt_def.is_enum() => {
-                    simple_enum_union_size(adt_def, tcx).is_ok()
+                    enum_union_discriminant_supported(adt_def, tcx)
                 }
                 _ => false,
             };
