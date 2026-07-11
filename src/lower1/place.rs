@@ -223,6 +223,23 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
     let mut current_var = place_to_string(&current_place, tcx);
     let mut current_type = get_place_type(&current_place, mir, tcx, instance, data_types);
     let mut instructions = vec![];
+    let base_rust_ty = current_place.ty(&mir.local_decls, tcx).ty;
+    if let Some(value) = super::value_repr::materialize_implicit_zst(
+        base_rust_ty,
+        &format!("{}_implicit", current_var),
+        tcx,
+        instance,
+        data_types,
+        &mut instructions,
+    ) {
+        current_var = value
+            .get_name()
+            .expect("materialized value must use a temporary")
+            .to_string();
+        current_type = value
+            .get_type()
+            .expect("materialized value must have a JVM type");
+    }
 
     // Iterate over each projection element in the order they appear.
     for (proj_index, proj) in place.projection.iter().enumerate() {
@@ -700,6 +717,16 @@ pub fn emit_instructions_to_set_value<'tcx>(
     data_types: &mut HashMap<String, oomir::DataType>,
 ) -> Vec<Instruction> {
     let mut instructions = Vec::new();
+    let target_rust_ty = dest_place.ty(&mir.local_decls, tcx).ty;
+    let source_operand = super::value_repr::adapt_operand_to_rust_type(
+        source_operand,
+        target_rust_ty,
+        &format!("{}_assignment", place_to_string(dest_place, tcx)),
+        tcx,
+        instance,
+        data_types,
+        &mut instructions,
+    );
 
     if dest_place.projection.is_empty() {
         // e.g., _1 = source_operand

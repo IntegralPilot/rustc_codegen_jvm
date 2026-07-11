@@ -24,6 +24,7 @@ pub mod operand;
 pub mod place;
 pub mod statics;
 pub mod types;
+mod value_repr;
 
 pub use closures::generate_closure_function_name;
 

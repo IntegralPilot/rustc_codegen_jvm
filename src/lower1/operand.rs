@@ -125,23 +125,14 @@ pub fn convert_operand<'tcx>(
             }
         }
         MirOperand::Copy(place) | MirOperand::Move(place) => {
-            if place.projection.is_empty() {
-                let var_name = place_to_string(place, tcx);
-                let oomir_type = get_place_type(place, mir, tcx, instance, data_types);
-                oomir::Operand::Variable {
-                    name: var_name,
-                    ty: oomir_type,
-                }
-            } else {
-                let (final_var_name, get_instructions, final_type) =
-                    emit_instructions_to_get_on_own(place, tcx, instance, mir, data_types);
+            let (final_var_name, get_instructions, final_type) =
+                emit_instructions_to_get_on_own(place, tcx, instance, mir, data_types);
 
-                instructions.extend(get_instructions);
+            instructions.extend(get_instructions);
 
-                oomir::Operand::Variable {
-                    name: final_var_name,
-                    ty: final_type,
-                }
+            oomir::Operand::Variable {
+                name: final_var_name,
+                ty: final_type,
             }
         }
         MirOperand::RuntimeChecks(checks) => {

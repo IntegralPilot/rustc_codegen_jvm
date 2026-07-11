@@ -203,15 +203,29 @@ pub fn convert_basic_block<'tcx>(
                 place,
                 variant_index,
             } => {
-                breadcrumbs::log!(
-                    breadcrumbs::LogLevel::Warn,
-                    "mir-lowering",
-                    format!(
-                        "Warning: StatementKind::SetDiscriminant NYI. Place: {:?}, Index: {:?}",
-                        place, variant_index
-                    )
-                );
-                // TODO: Need logic similar to emit_instructions_to_set_value but for discriminants
+                let enum_ty = place.ty(&mir.local_decls, tcx).ty;
+                if let Some(value) = super::value_repr::construct_fieldless_enum_variant(
+                    enum_ty,
+                    *variant_index,
+                    &format!("{}_variant", super::place::place_to_string(place, tcx)),
+                    tcx,
+                    instance,
+                    data_types,
+                    &mut instructions,
+                ) {
+                    instructions.extend(emit_instructions_to_set_value(
+                        place, value, tcx, instance, mir, data_types,
+                    ));
+                } else {
+                    breadcrumbs::log!(
+                        breadcrumbs::LogLevel::Warn,
+                        "mir-lowering",
+                        format!(
+                            "Warning: SetDiscriminant for data-carrying or non-enum place is unsupported. Place: {:?}, Index: {:?}",
+                            place, variant_index
+                        )
+                    );
+                }
             }
             // Handle other StatementKind variants if necessary
             _ => {
@@ -286,7 +300,7 @@ pub fn convert_basic_block<'tcx>(
                 ..
             } => {
                 let mut pre_call_instructions = Vec::new();
-                let oomir_operands: Vec<oomir::Operand> = args
+                let mut oomir_operands: Vec<oomir::Operand> = args
                     .iter()
                     .map(|arg| {
                         convert_operand(
@@ -300,6 +314,18 @@ pub fn convert_basic_block<'tcx>(
                     })
                     .collect();
                 instructions.extend(pre_call_instructions);
+                for (index, arg) in args.iter().enumerate() {
+                    let source = oomir_operands[index].clone();
+                    oomir_operands[index] = super::value_repr::adapt_operand_to_rust_type(
+                        source,
+                        arg.node.ty(mir, tcx),
+                        &format!("{}_call_operand_{}", label, index),
+                        tcx,
+                        instance,
+                        data_types,
+                        &mut instructions,
+                    );
+                }
 
                 let dest_var_name = destination
                     .projection
@@ -331,6 +357,21 @@ pub fn convert_basic_block<'tcx>(
                             (sig.inputs().to_vec(), sig.output())
                         }
                     };
+
+                    for (index, target_ty) in fn_inputs.iter().enumerate() {
+                        let Some(source) = oomir_operands.get(index).cloned() else {
+                            break;
+                        };
+                        oomir_operands[index] = super::value_repr::adapt_operand_to_rust_type(
+                            source,
+                            *target_ty,
+                            &format!("{}_call_arg_{}", label, index),
+                            tcx,
+                            instance,
+                            data_types,
+                            &mut instructions,
+                        );
+                    }
 
                     let oomir_output_type =
                         super::types::ty_to_oomir_type(fn_output, tcx, data_types, instance);
@@ -697,6 +738,21 @@ pub fn convert_basic_block<'tcx>(
                         });
                     }
                 } else {
+                    let indirect_sig = func_ty.fn_sig(tcx).skip_binder();
+                    for (index, target_ty) in indirect_sig.inputs().iter().enumerate() {
+                        let Some(source) = oomir_operands.get(index).cloned() else {
+                            break;
+                        };
+                        oomir_operands[index] = super::value_repr::adapt_operand_to_rust_type(
+                            source,
+                            *target_ty,
+                            &format!("{}_indirect_arg_{}", label, index),
+                            tcx,
+                            instance,
+                            data_types,
+                            &mut instructions,
+                        );
+                    }
                     let func_oomir_operand =
                         convert_operand(&func, tcx, instance, mir, data_types, &mut instructions);
 

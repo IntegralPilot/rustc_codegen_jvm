@@ -40,13 +40,25 @@ fn generate_temp_var_name(base_name: &str) -> String {
     format!("{}_tmp{}", jvm_names::member_name(base_name), count)
 }
 
-fn adapt_value_for_field(
+fn adapt_value_for_field<'tcx>(
     value_operand: oomir::Operand,
+    field_rust_ty: rustc_middle::ty::Ty<'tcx>,
     field_ty: &oomir::Type,
     temp_base_name: &str,
-    data_types: &HashMap<String, oomir::DataType>,
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
+    data_types: &mut HashMap<String, oomir::DataType>,
     instructions: &mut Vec<oomir::Instruction>,
 ) -> oomir::Operand {
+    let value_operand = super::super::value_repr::adapt_operand_to_rust_type(
+        value_operand,
+        field_rust_ty,
+        temp_base_name,
+        tcx,
+        instance,
+        data_types,
+        instructions,
+    );
     let Some(value_ty) = value_operand.get_type() else {
         return value_operand;
     };
@@ -504,8 +516,11 @@ pub fn convert_rvalue_to_operand<'a>(
                 );
                 let oomir_elem_op = adapt_value_for_field(
                     oomir_elem_op,
+                    *elem_ty,
                     &oomir_elem_type,
                     &temp_array_var,
+                    tcx,
+                    instance,
                     data_types,
                     &mut instructions,
                 );
@@ -1674,8 +1689,11 @@ pub fn convert_rvalue_to_operand<'a>(
                         );
                         let value_operand = adapt_value_for_field(
                             value_operand,
+                            element_mir_ty,
                             &element_oomir_type,
                             &temp_aggregate_var,
+                            tcx,
+                            instance,
                             data_types,
                             &mut instructions,
                         );
@@ -1718,8 +1736,11 @@ pub fn convert_rvalue_to_operand<'a>(
                         );
                         let value_operand = adapt_value_for_field(
                             value_operand,
+                            *mir_element_ty,
                             &oomir_element_type,
                             &format!("{}_{}", temp_aggregate_var, i),
+                            tcx,
+                            instance,
                             data_types,
                             &mut instructions,
                         );
@@ -1770,8 +1791,11 @@ pub fn convert_rvalue_to_operand<'a>(
                         );
                         let value_operand = adapt_value_for_field(
                             value_operand,
+                            mir_operand.ty(&mir.local_decls, tcx),
                             &field_ty,
                             &temp_aggregate_var,
+                            tcx,
+                            instance,
                             data_types,
                             &mut instructions,
                         );
@@ -1872,8 +1896,11 @@ pub fn convert_rvalue_to_operand<'a>(
                             );
                             let value_operand = adapt_value_for_field(
                                 value_operand,
+                                field_mir_ty,
                                 &field_oomir_type,
                                 &temp_aggregate_var,
+                                tcx,
+                                instance,
                                 data_types,
                                 &mut instructions,
                             );
@@ -2093,8 +2120,11 @@ pub fn convert_rvalue_to_operand<'a>(
                             );
                             let value_operand = adapt_value_for_field(
                                 value_operand,
+                                field_mir_ty,
                                 &field_oomir_type,
                                 &temp_aggregate_var,
+                                tcx,
+                                instance,
                                 data_types,
                                 &mut instructions,
                             );
@@ -2130,8 +2160,11 @@ pub fn convert_rvalue_to_operand<'a>(
                             );
                             adapt_value_for_field(
                                 value,
+                                field_mir_ty,
                                 &field_oomir_ty,
                                 &temp_aggregate_var,
+                                tcx,
+                                instance,
                                 data_types,
                                 &mut instructions,
                             )
