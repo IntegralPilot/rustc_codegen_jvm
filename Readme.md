@@ -76,6 +76,7 @@ These examples live in `tests/binary`, are compiled to JVM bytecode, and are ver
 - **Traits** and dynamic dispatch via `&dyn Trait`.
 - **Memory management,** currently mutable borrowing, references, and dereferencing, with more complex stuff currently WIP!
 - **Unions** support primitive values, references, tuples, structs, fixed-size arrays, and fieldless or data-carrying enums, including recursively nested combinations of these types.
+- **Transmute** between everything supported by unions (uses the same inner machinery)
 - **Outputs** executable, self-contained `.jar` generation for binary crates.
 - **Testing** with integration coverage across debug and release modes for all of the above.
 

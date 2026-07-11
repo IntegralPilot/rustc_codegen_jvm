@@ -3901,9 +3901,20 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     &method_ty.to_string(),
                 )?;
 
-                // 2. Load arguments onto the stack
-                for arg in args {
-                    self.load_call_argument(arg)?; // Use helper to handle references properly
+                if args.len() != method_ty.params.len() {
+                    return Err(jvm::Error::VerificationError {
+                        context: format!("Function {}", self.oomir_func.name),
+                        message: format!(
+                            "Argument count mismatch for static method '{}.{}': expected {}, found {}",
+                            class_name,
+                            method_name,
+                            method_ty.params.len(),
+                            args.len()
+                        ),
+                    });
+                }
+                for (arg, (_, expected_ty)) in args.iter().zip(method_ty.params.iter()) {
+                    self.load_call_argument_as(arg, expected_ty)?;
                 }
 
                 // 3. Emit 'invokestatic' instruction

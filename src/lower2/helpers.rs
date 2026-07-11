@@ -68,6 +68,37 @@ pub fn oomir_function_stack_floor(function: &oomir::Function) -> u16 {
     for block in function.body.basic_blocks.values() {
         for instruction in &block.instructions {
             match instruction {
+                oomir::Instruction::Add { op1, op2, .. }
+                | oomir::Instruction::Sub { op1, op2, .. }
+                | oomir::Instruction::Mul { op1, op2, .. }
+                | oomir::Instruction::Div { op1, op2, .. }
+                | oomir::Instruction::Rem { op1, op2, .. }
+                | oomir::Instruction::Eq { op1, op2, .. }
+                | oomir::Instruction::Ne { op1, op2, .. }
+                | oomir::Instruction::Lt { op1, op2, .. }
+                | oomir::Instruction::Le { op1, op2, .. }
+                | oomir::Instruction::Gt { op1, op2, .. }
+                | oomir::Instruction::Ge { op1, op2, .. }
+                | oomir::Instruction::BitAnd { op1, op2, .. }
+                | oomir::Instruction::BitOr { op1, op2, .. }
+                | oomir::Instruction::BitXor { op1, op2, .. }
+                | oomir::Instruction::Shl { op1, op2, .. }
+                | oomir::Instruction::Shr { op1, op2, .. } => {
+                    floor = floor.max(operand_sequence_stack_floor([op1, op2], 0));
+                }
+                oomir::Instruction::Not { src, .. }
+                | oomir::Instruction::Neg { src, .. }
+                | oomir::Instruction::Move { src, .. } => {
+                    floor = floor.max(operand_load_stack_floor(src));
+                }
+                oomir::Instruction::Branch { condition, .. } => {
+                    floor = floor.max(operand_load_stack_floor(condition));
+                }
+                oomir::Instruction::Return {
+                    operand: Some(operand),
+                } => {
+                    floor = floor.max(operand_load_stack_floor(operand));
+                }
                 oomir::Instruction::ConstructObject { args, .. } => {
                     floor = floor.max(operand_sequence_stack_floor(
                         args.iter().map(|(operand, _)| operand),
@@ -89,8 +120,28 @@ pub fn oomir_function_stack_floor(function: &oomir::Function) -> u16 {
                     floor = floor.max(operand_load_stack_floor(operand));
                     floor = floor.max(operand_sequence_stack_floor(args, 1));
                 }
-                oomir::Instruction::Move { src, .. } => {
-                    floor = floor.max(operand_load_stack_floor(src));
+                oomir::Instruction::ThrowNewWithMessage { .. } => {
+                    floor = floor.max(3);
+                }
+                oomir::Instruction::Switch { discr, .. } => {
+                    floor = floor.max(operand_load_stack_floor(discr));
+                }
+                oomir::Instruction::NewArray { size, .. } => {
+                    floor = floor.max(operand_load_stack_floor(size));
+                }
+                oomir::Instruction::ArrayStore { index, value, .. } => {
+                    floor = floor.max(operand_sequence_stack_floor([index, value], 1));
+                }
+                oomir::Instruction::ArrayGet { array, index, .. } => {
+                    floor = floor.max(operand_sequence_stack_floor([array, index], 0));
+                }
+                oomir::Instruction::Length { array, .. }
+                | oomir::Instruction::GetField { object: array, .. }
+                | oomir::Instruction::Cast { op: array, .. } => {
+                    floor = floor.max(operand_load_stack_floor(array));
+                }
+                oomir::Instruction::SetField { value, .. } => {
+                    floor = floor.max(1 + operand_load_stack_floor(value));
                 }
                 _ => {}
             }

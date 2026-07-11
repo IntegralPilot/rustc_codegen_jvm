@@ -1453,6 +1453,53 @@ fn emit_object_from_union_storage(
     operand_var(typed_dest, target_ty)
 }
 
+fn emit_union_storage_copy(
+    source: &JvmUnionStorage,
+    source_offset: usize,
+    target: &JvmUnionStorage,
+    target_offset: usize,
+    size: usize,
+    instructions: &mut Vec<oomir::Instruction>,
+    temp_counter: &mut usize,
+) {
+    for relative_offset in 0..size {
+        let byte_dest = next_union_temp("union_copied_byte", temp_counter);
+        let source_index =
+            source.byte_index(source_offset + relative_offset, instructions, temp_counter);
+        instructions.push(oomir::Instruction::ArrayGet {
+            dest: byte_dest.clone(),
+            array: operand_var(source.bytes_var.clone(), byte_array_type()),
+            index: source_index,
+        });
+        let target_index =
+            target.byte_index(target_offset + relative_offset, instructions, temp_counter);
+        instructions.push(oomir::Instruction::ArrayStore {
+            array: target.bytes_var.clone(),
+            index: target_index,
+            value: operand_var(byte_dest, oomir::Type::I8),
+        });
+
+        let object_dest = next_union_temp("union_copied_object", temp_counter);
+        let source_object_index =
+            source.byte_index(source_offset + relative_offset, instructions, temp_counter);
+        instructions.push(oomir::Instruction::ArrayGet {
+            dest: object_dest.clone(),
+            array: operand_var(source.objects_var.clone(), object_array_type()),
+            index: source_object_index,
+        });
+        let target_object_index =
+            target.byte_index(target_offset + relative_offset, instructions, temp_counter);
+        instructions.push(oomir::Instruction::ArrayStore {
+            array: target.objects_var.clone(),
+            index: target_object_index,
+            value: operand_var(
+                object_dest,
+                oomir::Type::Class("java/lang/Object".to_string()),
+            ),
+        });
+    }
+}
+
 fn emit_ty_to_union_bytes<'tcx>(
     ty: Ty<'tcx>,
     source: oomir::Operand,
@@ -1581,6 +1628,39 @@ fn emit_ty_to_union_bytes<'tcx>(
                 ],
                 operand: source,
             });
+            Ok(())
+        }
+        TyKind::Adt(adt_def, _) if adt_def.is_union() => {
+            let union_size = layout_size_bytes(tcx, ty)?;
+            let union_oomir_ty = ty_to_oomir_type(ty, tcx, data_types, instance_context);
+            let oomir::Type::Class(union_class) = union_oomir_ty else {
+                return Err(format!("union {ty:?} did not map to a JVM class"));
+            };
+            let bytes_dest = next_union_temp("nested_union_bytes", temp_counter);
+            let objects_dest = next_union_temp("nested_union_objects", temp_counter);
+            instructions.push(oomir::Instruction::GetField {
+                dest: bytes_dest.clone(),
+                object: source.clone(),
+                field_name: UNION_BYTES_FIELD.to_string(),
+                field_ty: byte_array_type(),
+                owner_class: union_class.clone(),
+            });
+            instructions.push(oomir::Instruction::GetField {
+                dest: objects_dest.clone(),
+                object: source,
+                field_name: UNION_OBJECTS_FIELD.to_string(),
+                field_ty: object_array_type(),
+                owner_class: union_class,
+            });
+            emit_union_storage_copy(
+                &JvmUnionStorage::at_start(bytes_dest, objects_dest),
+                0,
+                storage,
+                base_offset,
+                union_size,
+                instructions,
+                temp_counter,
+            );
             Ok(())
         }
         TyKind::Tuple(elements) if !elements.is_empty() => {
@@ -1925,6 +2005,52 @@ fn emit_ty_from_union_bytes<'tcx>(
             });
             Ok(operand_var(enum_dest, enum_oomir_ty))
         }
+        TyKind::Adt(adt_def, _) if adt_def.is_union() => {
+            let union_size = layout_size_bytes(tcx, ty)?;
+            let union_oomir_ty = ty_to_oomir_type(ty, tcx, data_types, instance_context);
+            let oomir::Type::Class(union_class) = &union_oomir_ty else {
+                return Err(format!("union {ty:?} did not map to a JVM class"));
+            };
+            let bytes_dest = next_union_temp("nested_union_bytes", temp_counter);
+            let objects_dest = next_union_temp("nested_union_objects", temp_counter);
+            instructions.push(oomir::Instruction::NewArray {
+                dest: bytes_dest.clone(),
+                element_type: oomir::Type::I8,
+                size: oomir::Operand::Constant(oomir::Constant::I32(union_size as i32)),
+            });
+            instructions.push(oomir::Instruction::NewArray {
+                dest: objects_dest.clone(),
+                element_type: oomir::Type::Class("java/lang/Object".to_string()),
+                size: oomir::Operand::Constant(oomir::Constant::I32(union_size.max(1) as i32)),
+            });
+            let nested_storage =
+                JvmUnionStorage::at_start(bytes_dest.clone(), objects_dest.clone());
+            emit_union_storage_copy(
+                storage,
+                base_offset,
+                &nested_storage,
+                0,
+                union_size,
+                instructions,
+                temp_counter,
+            );
+            let union_dest = next_union_temp("nested_union_value", temp_counter);
+            instructions.push(oomir::Instruction::ConstructObject {
+                dest: union_dest.clone(),
+                class_name: union_class.clone(),
+                args: vec![
+                    (
+                        operand_var(bytes_dest, byte_array_type()),
+                        byte_array_type(),
+                    ),
+                    (
+                        operand_var(objects_dest, object_array_type()),
+                        object_array_type(),
+                    ),
+                ],
+            });
+            Ok(operand_var(union_dest, union_oomir_ty))
+        }
         TyKind::Tuple(elements) if elements.is_empty() => {
             Ok(oomir::Operand::Constant(oomir::Constant::Unit))
         }
@@ -1987,6 +2113,190 @@ fn emit_ty_from_union_bytes<'tcx>(
             }
         }
     }
+}
+
+fn exact_bytes_supported<'tcx>(
+    ty: Ty<'tcx>,
+    tcx: TyCtxt<'tcx>,
+    instance_context: rustc_middle::ty::Instance<'tcx>,
+) -> Result<(), String> {
+    let ty = resolve_union_ty(tcx, ty, instance_context)?;
+    match ty.kind() {
+        TyKind::Bool
+        | TyKind::Char
+        | TyKind::Int(IntTy::I8 | IntTy::I16 | IntTy::I32 | IntTy::I64 | IntTy::Isize)
+        | TyKind::Uint(UintTy::U8 | UintTy::U16 | UintTy::U32 | UintTy::Usize)
+        | TyKind::Float(FloatTy::F32 | FloatTy::F64 | FloatTy::F128) => Ok(()),
+        TyKind::Pat(inner, _) => exact_bytes_supported(*inner, tcx, instance_context),
+        TyKind::Tuple(elements) => elements
+            .iter()
+            .try_for_each(|element| exact_bytes_supported(element, tcx, instance_context)),
+        TyKind::Array(element, length) => {
+            length
+                .try_to_target_usize(tcx)
+                .ok_or_else(|| format!("array length is not concrete for {ty:?}"))?;
+            if layout_size_bytes(tcx, *element)? == 0 {
+                return Err(format!(
+                    "zero-sized array elements are not yet supported in exact-layout storage: {ty:?}"
+                ));
+            }
+            exact_bytes_supported(*element, tcx, instance_context)
+        }
+        TyKind::Adt(adt_def, substs)
+            if adt_def.is_struct() || adt_def.is_enum() || adt_def.is_union() =>
+        {
+            adt_def
+                .variants()
+                .iter()
+                .flat_map(|variant| variant.fields.iter())
+                .try_for_each(|field| {
+                    exact_bytes_supported(
+                        field.ty(tcx, substs).skip_norm_wip(),
+                        tcx,
+                        instance_context,
+                    )
+                })
+        }
+        _ => Err(format!(
+            "type {ty:?} is not fully byte-addressable; references, raw pointers, and JVM object carriers need an explicit bit representation"
+        )),
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct ExactTransmuteHelper {
+    pub class_name: String,
+    pub method_name: String,
+    pub signature: oomir::Signature,
+}
+
+pub(super) fn ensure_exact_transmute_helper<'tcx>(
+    source_ty: Ty<'tcx>,
+    target_ty: Ty<'tcx>,
+    tcx: TyCtxt<'tcx>,
+    data_types: &mut HashMap<String, oomir::DataType>,
+    instance_context: rustc_middle::ty::Instance<'tcx>,
+) -> Result<ExactTransmuteHelper, String> {
+    let source_ty = resolve_union_ty(tcx, source_ty, instance_context)?;
+    let target_ty = resolve_union_ty(tcx, target_ty, instance_context)?;
+    let source_size = layout_size_bytes(tcx, source_ty)?;
+    let target_size = layout_size_bytes(tcx, target_ty)?;
+    if source_size != target_size {
+        return Err(format!(
+            "transmute layout sizes differ: {source_ty:?} is {source_size} bytes, {target_ty:?} is {target_size} bytes"
+        ));
+    }
+    exact_bytes_supported(source_ty, tcx, instance_context)?;
+    exact_bytes_supported(target_ty, tcx, instance_context)?;
+
+    let source_oomir_ty = ty_to_oomir_type(source_ty, tcx, data_types, instance_context);
+    let target_oomir_ty = ty_to_oomir_type(target_ty, tcx, data_types, instance_context);
+    let method_name = "transmute".to_string();
+    let signature = oomir::Signature {
+        params: source_oomir_ty
+            .has_jvm_value()
+            .then(|| vec![("value".to_string(), source_oomir_ty.clone())])
+            .unwrap_or_default(),
+        ret: Box::new(target_oomir_ty.clone()),
+        is_static: true,
+    };
+    let identity = format!(
+        "{source_ty:?}:{}->{target_ty:?}:{}",
+        source_oomir_ty.to_jvm_descriptor(),
+        target_oomir_ty.to_jvm_descriptor()
+    );
+    let class_name = jvm_names::synthetic_class_for_instance(
+        tcx,
+        instance_context,
+        format!("ExactTransmute_{}", short_hash(&identity, 12)),
+    );
+    let helper = ExactTransmuteHelper {
+        class_name: class_name.clone(),
+        method_name: method_name.clone(),
+        signature: signature.clone(),
+    };
+    if matches!(
+        data_types.get(&class_name),
+        Some(oomir::DataType::Class { methods, .. }) if methods.contains_key(&method_name)
+    ) {
+        return Ok(helper);
+    }
+
+    let bytes_name = "_exact_bytes".to_string();
+    let objects_name = "_exact_objects".to_string();
+    let mut instructions = vec![
+        oomir::Instruction::NewArray {
+            dest: bytes_name.clone(),
+            element_type: oomir::Type::I8,
+            size: oomir::Operand::Constant(oomir::Constant::I32(source_size as i32)),
+        },
+        oomir::Instruction::NewArray {
+            dest: objects_name.clone(),
+            element_type: oomir::Type::Class("java/lang/Object".to_string()),
+            size: oomir::Operand::Constant(oomir::Constant::I32(source_size.max(1) as i32)),
+        },
+    ];
+    let storage = JvmUnionStorage::at_start(bytes_name, objects_name);
+    let source = if source_oomir_ty.has_jvm_value() {
+        operand_var("_1", source_oomir_ty)
+    } else {
+        oomir::Operand::Constant(oomir::Constant::Unit)
+    };
+    let mut temp_counter = 0;
+    emit_ty_to_union_bytes(
+        source_ty,
+        source,
+        &storage,
+        0,
+        tcx,
+        data_types,
+        instance_context,
+        &mut instructions,
+        &mut temp_counter,
+    )?;
+    let result = emit_ty_from_union_bytes(
+        target_ty,
+        &storage,
+        0,
+        tcx,
+        data_types,
+        instance_context,
+        &mut instructions,
+        &mut temp_counter,
+    )?;
+    instructions.push(oomir::Instruction::Return {
+        operand: target_oomir_ty.has_jvm_value().then_some(result),
+    });
+
+    let function = oomir::Function {
+        name: method_name.clone(),
+        owner_class: None,
+        signature,
+        body: simple_body(instructions),
+    };
+    match data_types.get_mut(&class_name) {
+        Some(oomir::DataType::Class { methods, .. }) => {
+            methods.insert(method_name, DataTypeMethod::Function(function));
+        }
+        Some(oomir::DataType::Interface { .. }) => {
+            return Err(format!(
+                "exact transmute helper name {class_name} is already an interface"
+            ));
+        }
+        None => {
+            data_types.insert(
+                class_name,
+                oomir::DataType::Class {
+                    fields: Vec::new(),
+                    is_abstract: false,
+                    methods: HashMap::from([(method_name, DataTypeMethod::Function(function))]),
+                    super_class: Some("java/lang/Object".to_string()),
+                    interfaces: Vec::new(),
+                },
+            );
+        }
+    }
+    Ok(helper)
 }
 
 fn unsupported_union_body(message: String) -> oomir::CodeBlock {

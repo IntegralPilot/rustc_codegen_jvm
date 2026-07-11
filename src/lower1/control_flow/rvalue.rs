@@ -16,8 +16,9 @@ use super::{
             emit_instructions_to_get_on_own, emit_slice_view, get_place_type, place_to_string,
         },
         types::{
-            ENUM_UNION_DISCRIMINANT_METHOD, adapt_simple_enum_operand, ensure_fn_ptr_interface,
-            ensure_union_data_type, enum_union_discriminant_supported, fn_ptr_signature_from_ty,
+            ENUM_UNION_DISCRIMINANT_METHOD, adapt_simple_enum_operand,
+            ensure_exact_transmute_helper, ensure_fn_ptr_interface, ensure_union_data_type,
+            enum_union_discriminant_supported, fn_ptr_signature_from_ty,
             generate_adt_jvm_class_name, short_hash, should_define_named_data_type,
             ty_to_oomir_type, union_from_method_name,
         },
@@ -974,11 +975,47 @@ pub fn convert_rvalue_to_operand<'a>(
                         None
                     };
 
+                    let exact_transmute_helper = matches!(cast_kind, CastKind::Transmute)
+                        .then(|| {
+                            ensure_exact_transmute_helper(
+                                source_mir_ty,
+                                *target_mir_ty,
+                                tcx,
+                                data_types,
+                                instance,
+                            )
+                        })
+                        .transpose()
+                        .unwrap_or_else(|error| {
+                            breadcrumbs::log!(
+                                breadcrumbs::LogLevel::Info,
+                                "mir-lowering",
+                                format!(
+                                    "Exact-layout transmute codec is unavailable for {source_mir_ty:?} -> {target_mir_ty:?}: {error}"
+                                )
+                            );
+                            None
+                        });
+
                     if let Some(adapter_class) = trait_object_adapter {
                         instructions.push(oomir::Instruction::ConstructObject {
                             dest: temp_cast_var.clone(),
                             class_name: adapter_class,
                             args: vec![(oomir_operand, oomir_source_type.clone())],
+                        });
+                    } else if let Some(helper) = exact_transmute_helper {
+                        instructions.push(oomir::Instruction::InvokeStatic {
+                            dest: oomir_target_type
+                                .has_jvm_value()
+                                .then(|| temp_cast_var.clone()),
+                            class_name: helper.class_name,
+                            method_name: helper.method_name,
+                            method_ty: helper.signature,
+                            args: oomir_source_type
+                                .has_jvm_value()
+                                .then_some(oomir_operand)
+                                .into_iter()
+                                .collect(),
                         });
                     } else if matches!(cast_kind, CastKind::Transmute)
                         && oomir_source_type
@@ -1253,9 +1290,13 @@ pub fn convert_rvalue_to_operand<'a>(
                             dest: temp_cast_var.clone(),
                         });
                     }
-                    result_operand = oomir::Operand::Variable {
-                        name: temp_cast_var,
-                        ty: oomir_target_type,
+                    result_operand = if oomir_target_type.has_jvm_value() {
+                        oomir::Operand::Variable {
+                            name: temp_cast_var,
+                            ty: oomir_target_type,
+                        }
+                    } else {
+                        oomir::Operand::Constant(oomir::Constant::Unit)
                     };
                 }
             }
