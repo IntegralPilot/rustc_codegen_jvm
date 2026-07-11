@@ -92,7 +92,7 @@ fn read_slice_backed_value<'tcx>(
                 )?);
             }
 
-            Ok(oomir::Constant::Array(Box::new(element_type), elements))
+            Ok(oomir::Constant::Slice(Box::new(element_type), elements))
         }
         TyKind::Adt(adt_def, args) if adt_def.is_struct() && adt_def.repr().transparent() => {
             let variant = adt_def.variant(VariantIdx::from_usize(0));
@@ -235,11 +235,49 @@ pub fn read_pointer_constant<'tcx>(
     instance: Instance<'tcx>,
 ) -> Result<oomir::Constant, String> {
     match ty.kind() {
+        TyKind::Ref(_, inner_ty, _) if inner_ty.is_array() => {
+            let value = read_pointee_constant(tcx, pointer, *inner_ty, oomir_data_types, instance)?;
+            array_reference_to_slice(tcx, *inner_ty, value, oomir_data_types, instance)
+        }
         TyKind::Ref(_, inner_ty, _) | TyKind::RawPtr(inner_ty, _) => {
             read_pointee_constant(tcx, pointer, *inner_ty, oomir_data_types, instance)
         }
         _ => read_pointee_constant(tcx, pointer, ty, oomir_data_types, instance),
     }
+}
+
+fn array_reference_to_slice<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    array_ty: Ty<'tcx>,
+    value: oomir::Constant,
+    oomir_data_types: &mut HashMap<String, oomir::DataType>,
+    instance: Instance<'tcx>,
+) -> Result<oomir::Constant, String> {
+    let TyKind::Array(element_ty, _) = array_ty.kind() else {
+        return Err(format!("Expected array type, found {array_ty:?}"));
+    };
+    let value = match value {
+        oomir::Constant::Array(element_type, elements) => {
+            return Ok(oomir::Constant::Slice(element_type, elements));
+        }
+        other => other,
+    };
+    let layout = tcx
+        .layout_of(TypingEnv::fully_monomorphized().as_query_input(array_ty))
+        .map_err(|error| format!("Could not get array layout for {array_ty:?}: {error:?}"))?;
+    let FieldsShape::Array { count, .. } = layout.fields else {
+        return Err(format!("Array type {array_ty:?} had layout {layout:?}"));
+    };
+    Ok(oomir::Constant::SliceRef {
+        backing: Box::new(value),
+        element_type: Box::new(ty_to_oomir_type(
+            *element_ty,
+            tcx,
+            oomir_data_types,
+            instance,
+        )),
+        length: count,
+    })
 }
 
 fn read_pointer_from_memory<'tcx>(
@@ -446,7 +484,7 @@ fn read_string_from_allocation(
                 "const-eval",
                 format!("Info: Successfully extracted string constant: \"{}\"", s)
             );
-            Ok(oomir::Constant::String(s))
+            Ok(oomir::Constant::Str(s))
         }
         Err(e) => {
             breadcrumbs::log!(
@@ -454,7 +492,7 @@ fn read_string_from_allocation(
                 "const-eval",
                 format!("Warning: String bytes were not valid UTF-8: {}", e)
             );
-            Ok(oomir::Constant::String("Invalid UTF8".to_string()))
+            Ok(oomir::Constant::Str("Invalid UTF8".to_string()))
         }
     }
 }
@@ -533,15 +571,19 @@ pub fn read_constant_value_from_memory<'tcx>(
                         instance,
                     )?
                 };
-                if mutability.is_mut() {
-                    let value_type = ty_to_oomir_type(*inner_ty, tcx, oomir_data_types, instance);
-                    Ok(oomir::Constant::Array(Box::new(value_type), vec![value]))
-                } else {
-                    Ok(value)
-                }
+                Ok(value)
             } else {
                 let ptr = read_pointer_from_memory(tcx, allocation, offset)?;
                 let value = read_pointee_constant(tcx, ptr, *inner_ty, oomir_data_types, instance)?;
+                if inner_ty.is_array() {
+                    return array_reference_to_slice(
+                        tcx,
+                        *inner_ty,
+                        value,
+                        oomir_data_types,
+                        instance,
+                    );
+                }
                 if mutability.is_mut() {
                     let pointee_type = ty_to_oomir_type(*inner_ty, tcx, oomir_data_types, instance);
                     Ok(oomir::Constant::Array(Box::new(pointee_type), vec![value]))
@@ -1204,7 +1246,7 @@ pub fn scalar_int_to_oomir_constant(scalar_int: ScalarInt, ty: Ty<'_>) -> oomir:
                 }
             }
         },
-        TyKind::Str => oomir::Constant::String(scalar_int.to_u64().to_string()),
+        TyKind::Str => oomir::Constant::Str(scalar_int.to_u64().to_string()),
         TyKind::Ref(_, inner_ty, _) => {
             scalar_int_to_oomir_constant(scalar_int.to_u64().into(), *inner_ty)
         }

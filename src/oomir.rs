@@ -14,6 +14,9 @@ use std::{
 
 pub mod interpret;
 
+pub const SLICE_VIEW_CLASS: &str = "org/rustlang/runtime/SliceView";
+pub const UTF8_VIEW_CLASS: &str = "org/rustlang/runtime/Utf8View";
+
 // OOMIR definitions
 #[derive(Debug, Clone)]
 pub struct Module {
@@ -501,10 +504,17 @@ pub enum Constant {
     F64(f64),
     Boolean(bool),
     Char(char),
+    Str(String),
     String(String),
     Class(String),
     // 0 = the type of elements, 1 = the elements as a vec of constants
     Array(Box<Type>, Vec<Constant>),
+    Slice(Box<Type>, Vec<Constant>),
+    SliceRef {
+        backing: Box<Constant>,
+        element_type: Box<Type>,
+        length: u64,
+    },
     Instance {
         /// The fully qualified JVM class name (e.g., "MyStruct", "MyEnum$VariantA").
         class_name: String,
@@ -525,7 +535,11 @@ impl Constant {
     /// so folding never discards a required static load hidden inside one.
     pub fn is_propagatable(&self) -> bool {
         match self {
-            Constant::StaticRef { .. } | Constant::FactoryCall { .. } => false,
+            Constant::StaticRef { .. }
+            | Constant::FactoryCall { .. }
+            | Constant::Str(..)
+            | Constant::Slice(..)
+            | Constant::SliceRef { .. } => false,
             Constant::Array(_, elements) => elements.iter().all(Constant::is_propagatable),
             Constant::Instance { fields, params, .. } => {
                 fields.values().all(Constant::is_propagatable)
@@ -578,11 +592,25 @@ impl std::hash::Hash for Constant {
             Constant::F64(f) => f.to_bits().hash(state),
             Constant::Boolean(b) => b.hash(state),
             Constant::Char(c) => c.hash(state),
+            Constant::Str(s) => s.hash(state),
             Constant::String(s) => s.hash(state),
             Constant::Class(s) => s.hash(state),
             Constant::Array(ty, elements) => {
                 ty.hash(state);
                 elements.hash(state);
+            }
+            Constant::Slice(ty, elements) => {
+                ty.hash(state);
+                elements.hash(state);
+            }
+            Constant::SliceRef {
+                backing,
+                element_type,
+                length,
+            } => {
+                backing.hash(state);
+                element_type.hash(state);
+                length.hash(state);
             }
             Constant::Instance {
                 class_name,
@@ -794,6 +822,8 @@ pub enum Type {
     MutableReference(Box<Type>), // Same as an Array
     Reference(Box<Type>), // Representing references, not currently constructed but might be useful in future for more complex things.
     Array(Box<Type>),     // Representing arrays
+    Slice(Box<Type>),     // A view over an array with an offset and length.
+    Str,                  // A borrowed UTF-8 byte view.
     String,               // String type
     Class(String),        // For structs, enums, and potentially Objects
     Interface(String),    // dyn TraitName
@@ -826,6 +856,7 @@ impl Type {
             // U64 is too large for a primitive; it's mapped to a BigInteger:
             Type::F32 => "F".to_string(),
             Type::F64 => "D".to_string(),
+            Type::Str => format!("L{};", UTF8_VIEW_CLASS),
             Type::String => "Ljava/lang/String;".to_string(),
             Type::Class(name) | Type::Interface(name) => format!("L{};", name.replace('.', "/")),
             Type::Reference(inner) => inner.to_jvm_descriptor(),
@@ -843,6 +874,7 @@ impl Type {
                     "[Ljava/lang/Object;".to_string()
                 }
             }
+            Type::Slice(_) => format!("L{};", SLICE_VIEW_CLASS),
         }
     }
 
@@ -886,11 +918,14 @@ impl Type {
     /// Returns None for primitive types.
     pub fn to_jvm_internal_name(&self) -> Option<String> {
         match self {
+            Type::Str => Some(UTF8_VIEW_CLASS.to_string()),
             Type::String => Some("java/lang/String".to_string()),
             Type::Class(name) => Some(name.replace('.', "/")),
             Type::Reference(inner) => inner.to_jvm_internal_name(), // delegate to inner type
-            // For arrays, the descriptor is the internal name.
-            Type::Array(_) => Some(self.to_jvm_descriptor()),
+            // For array-valued types, the descriptor is the component class name
+            // expected by `anewarray`. Mutable references use one-element arrays.
+            Type::Array(_) | Type::MutableReference(_) => Some(self.to_jvm_descriptor()),
+            Type::Slice(_) => Some(SLICE_VIEW_CLASS.to_string()),
             // Primitives don't have an internal name for anewarray.
             _ => None,
         }
@@ -927,12 +962,14 @@ impl Type {
             Type::F32 => Some(JVMInstruction::Fastore),
             Type::F64 => Some(JVMInstruction::Dastore),
             // Reference types:
-            Type::String
+            Type::Str
+            | Type::String
             | Type::Class(_)
             | Type::Interface(_)
             | Type::Array(_)
-            | Type::Reference(_) => Some(JVMInstruction::Aastore),
-            Type::MutableReference(box t) => t.get_jvm_array_store_instruction(),
+            | Type::Slice(_)
+            | Type::Reference(_)
+            | Type::MutableReference(_) => Some(JVMInstruction::Aastore),
             Type::Void => None,
             Type::Unit => None,
         }
@@ -953,9 +990,11 @@ impl Type {
             Type::F32 => Some(JVMInstruction::Faload),
             Type::F64 => Some(JVMInstruction::Daload),
             // Reference types:
-            Type::String
+            Type::Str
+            | Type::String
             | Type::Class(_)
             | Type::Array(_)
+            | Type::Slice(_)
             | Type::Reference(_)
             | Type::MutableReference(_)
             | Type::Interface(_) => Some(JVMInstruction::Aaload),
@@ -981,8 +1020,11 @@ impl Type {
             Constant::F32(_) => Type::F32,
             Constant::F64(_) => Type::F64,
             Constant::Array(inner_ty, _) => Type::Array(inner_ty.clone()),
+            Constant::Slice(inner_ty, _) => Type::Slice(inner_ty.clone()),
+            Constant::SliceRef { element_type, .. } => Type::Slice(element_type.clone()),
             Constant::Boolean(_) => Type::Boolean,
             Constant::Char(_) => Type::Char,
+            Constant::Str(_) => Type::Str,
             Constant::String(_) => Type::String,
             Constant::Class(name) => Type::Class(name.to_string()),
             Constant::Instance { class_name, .. } => Type::Class(class_name.to_string()),
@@ -1019,6 +1061,8 @@ impl Type {
             Type::Reference(_)
                 | Type::MutableReference(_)
                 | Type::Array(_)
+                | Type::Slice(_)
+                | Type::Str
                 | Type::String
                 | Type::Class(_)
                 | Type::Interface(_)
@@ -1062,6 +1106,8 @@ impl Type {
         match self {
             Type::Class(name) | Type::Interface(name) => Some(name.clone()),
             Type::Array(_) => Some(self.to_jvm_descriptor()), // Array descriptor works for checkcast/anewarray
+            Type::Slice(_) => Some(SLICE_VIEW_CLASS.to_string()),
+            Type::Str => Some(UTF8_VIEW_CLASS.to_string()),
             Type::String => Some("java/lang/String".to_string()),
             Type::Reference(inner) => inner.to_jvm_descriptor_or_internal_name(),
             Type::MutableReference(inner) => {
@@ -1082,9 +1128,10 @@ impl Type {
                 false
             }
             // Handle nested types recursively
-            Type::MutableReference(inner) | Type::Reference(inner) | Type::Array(inner) => {
-                inner.replace_class(old_name, new_name)
-            }
+            Type::MutableReference(inner)
+            | Type::Reference(inner)
+            | Type::Array(inner)
+            | Type::Slice(inner) => inner.replace_class(old_name, new_name),
             // Primitive types, Void, and String are unaffected
             Type::Void
             | Type::Unit
@@ -1096,6 +1143,7 @@ impl Type {
             | Type::I64
             | Type::F32
             | Type::F64
+            | Type::Str
             | Type::String => {
                 // No class names to replace here
                 false
@@ -1112,6 +1160,7 @@ impl Type {
         );
         match self {
             Type::Class(name) | Type::Interface(name) => Some(name),
+            Type::Str => Some(UTF8_VIEW_CLASS),
             Type::String => Some("org/rustlang/primitives/RustString"),
             Type::Array(inner) | Type::MutableReference(inner) | Type::Reference(inner) => {
                 inner.get_class_name()

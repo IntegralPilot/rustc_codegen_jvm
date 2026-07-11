@@ -24,6 +24,28 @@ fn shift_point(p: &mut Point) {
     p.x += 5; // Modify field again after inner borrow ended
 }
 
+fn check_arrays_of_mutable_references() {
+    let mut first = 1;
+    let mut second = 2;
+    {
+        let refs = [&mut first, &mut second];
+        *refs[0] += 10;
+        *refs[1] += 20;
+        assert!(*refs[0] == 11);
+        assert!(*refs[1] == 22);
+    }
+
+    let mut left = Point { x: 3, y: 4 };
+    let mut right = Point { x: 5, y: 6 };
+    {
+        let refs = [&mut left, &mut right];
+        refs[0].x += 30;
+        refs[1].y += 60;
+        assert!(refs[0].x == 33);
+        assert!(refs[1].y == 66);
+    }
+}
+
 
 fn main() {
     // 1. Initial setup
@@ -46,4 +68,6 @@ fn main() {
     // p.x = 11 + 5 = 16
     assert!(point.x == 16);
     assert!(point.y == -5);
+
+    check_arrays_of_mutable_references();
 }

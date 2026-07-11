@@ -12,7 +12,9 @@ use super::{
     super::{
         jvm_names,
         operand::{convert_operand, get_placeholder_operand},
-        place::{emit_instructions_to_get_on_own, get_place_type, place_to_string},
+        place::{
+            emit_instructions_to_get_on_own, emit_slice_view, get_place_type, place_to_string,
+        },
         types::{
             ENUM_UNION_DISCRIMINANT_METHOD, adapt_simple_enum_operand, ensure_fn_ptr_interface,
             ensure_union_data_type, fn_ptr_signature_from_ty, generate_adt_jvm_class_name,
@@ -408,6 +410,35 @@ pub fn convert_rvalue_to_operand<'a>(
                         );
                     instructions.extend(pointee_get_instructions); // Add instructions to get the value
 
+                    if matches!(pointee_oomir_type, oomir::Type::Array(_)) {
+                        let slice_name = generate_temp_var_name(&base_temp_name);
+                        let slice_type = emit_slice_view(
+                            oomir::Operand::Variable {
+                                name: pointee_value_var_name,
+                                ty: pointee_oomir_type.clone(),
+                            },
+                            &pointee_oomir_type,
+                            0,
+                            0,
+                            true,
+                            &slice_name,
+                            &mut instructions,
+                        );
+                        result_operand = oomir::Operand::Variable {
+                            name: slice_name,
+                            ty: slice_type,
+                        };
+                        return (instructions, result_operand);
+                    }
+
+                    if matches!(pointee_oomir_type, oomir::Type::Slice(_)) {
+                        result_operand = oomir::Operand::Variable {
+                            name: pointee_value_var_name,
+                            ty: pointee_oomir_type,
+                        };
+                        return (instructions, result_operand);
+                    }
+
                     // 2. Determine the OOMIR type for the array reference itself.
                     let array_ref_oomir_type =
                         oomir::Type::MutableReference(Box::new(pointee_oomir_type.clone()));
@@ -520,6 +551,27 @@ pub fn convert_rvalue_to_operand<'a>(
 
                         // 2. Add the instructions needed to get this value.
                         instructions.extend(pointee_get_instructions);
+
+                        if matches!(pointee_oomir_type, oomir::Type::Array(_)) {
+                            let slice_name = generate_temp_var_name(&base_temp_name);
+                            let slice_type = emit_slice_view(
+                                oomir::Operand::Variable {
+                                    name: pointee_value_var_name,
+                                    ty: pointee_oomir_type.clone(),
+                                },
+                                &pointee_oomir_type,
+                                0,
+                                0,
+                                true,
+                                &slice_name,
+                                &mut instructions,
+                            );
+                            result_operand = oomir::Operand::Variable {
+                                name: slice_name,
+                                ty: slice_type,
+                            };
+                            return (instructions, result_operand);
+                        }
 
                         // 3. The result *is* the operand representing the borrowed value itself.
                         //    No array wrapping is done.
@@ -675,7 +727,140 @@ pub fn convert_rvalue_to_operand<'a>(
                     let oomir_operand =
                         convert_operand(operand, tcx, instance, mir, data_types, &mut instructions);
 
-                    if let oomir::Type::Class(class_name) = &oomir_target_type
+                    if matches!(
+                        (&oomir_source_type, &oomir_target_type),
+                        (oomir::Type::Str, oomir::Type::Slice(element_type))
+                            if matches!(element_type.as_ref(), oomir::Type::I16)
+                    ) {
+                        instructions.push(oomir::Instruction::InvokeStatic {
+                            class_name: oomir::UTF8_VIEW_CLASS.to_string(),
+                            method_name: "asSlice".to_string(),
+                            method_ty: oomir::Signature {
+                                params: vec![("value".to_string(), oomir::Type::Str)],
+                                ret: Box::new(oomir_target_type.clone()),
+                                is_static: true,
+                            },
+                            args: vec![oomir_operand],
+                            dest: Some(temp_cast_var.clone()),
+                        });
+                    } else if matches!(
+                        (&oomir_source_type, &oomir_target_type),
+                        (oomir::Type::Slice(element_type), oomir::Type::Str)
+                            if matches!(element_type.as_ref(), oomir::Type::I16)
+                    ) {
+                        instructions.push(oomir::Instruction::InvokeStatic {
+                            class_name: oomir::UTF8_VIEW_CLASS.to_string(),
+                            method_name: "fromSlice".to_string(),
+                            method_ty: oomir::Signature {
+                                params: vec![("value".to_string(), oomir_source_type.clone())],
+                                ret: Box::new(oomir::Type::Str),
+                                is_static: true,
+                            },
+                            args: vec![oomir_operand],
+                            dest: Some(temp_cast_var.clone()),
+                        });
+                    } else if matches!(
+                        (&oomir_source_type, &oomir_target_type),
+                        (oomir::Type::Str, oomir::Type::String)
+                    ) {
+                        instructions.push(oomir::Instruction::InvokeStatic {
+                            class_name: oomir::UTF8_VIEW_CLASS.to_string(),
+                            method_name: "toJavaString".to_string(),
+                            method_ty: oomir::Signature {
+                                params: vec![("value".to_string(), oomir::Type::Str)],
+                                ret: Box::new(oomir::Type::String),
+                                is_static: true,
+                            },
+                            args: vec![oomir_operand],
+                            dest: Some(temp_cast_var.clone()),
+                        });
+                    } else if matches!(
+                        (&oomir_source_type, &oomir_target_type),
+                        (oomir::Type::String, oomir::Type::Str)
+                    ) {
+                        instructions.push(oomir::Instruction::InvokeStatic {
+                            class_name: oomir::UTF8_VIEW_CLASS.to_string(),
+                            method_name: "fromJavaString".to_string(),
+                            method_ty: oomir::Signature {
+                                params: vec![("value".to_string(), oomir::Type::String)],
+                                ret: Box::new(oomir::Type::Str),
+                                is_static: true,
+                            },
+                            args: vec![oomir_operand],
+                            dest: Some(temp_cast_var.clone()),
+                        });
+                    } else if matches!(
+                        (&oomir_source_type, &oomir_target_type),
+                        (oomir::Type::Slice(element_type), oomir::Type::String)
+                            if matches!(element_type.as_ref(), oomir::Type::I16)
+                    ) {
+                        instructions.push(oomir::Instruction::InvokeStatic {
+                            class_name: oomir::SLICE_VIEW_CLASS.to_string(),
+                            method_name: "toUtf8String".to_string(),
+                            method_ty: oomir::Signature {
+                                params: vec![("value".to_string(), oomir_source_type.clone())],
+                                ret: Box::new(oomir::Type::String),
+                                is_static: true,
+                            },
+                            args: vec![oomir_operand],
+                            dest: Some(temp_cast_var.clone()),
+                        });
+                    } else if matches!(
+                        (&oomir_source_type, &oomir_target_type),
+                        (oomir::Type::String, oomir::Type::Slice(element_type))
+                            if matches!(element_type.as_ref(), oomir::Type::I16)
+                    ) {
+                        instructions.push(oomir::Instruction::InvokeStatic {
+                            class_name: oomir::SLICE_VIEW_CLASS.to_string(),
+                            method_name: "fromString".to_string(),
+                            method_ty: oomir::Signature {
+                                params: vec![("value".to_string(), oomir::Type::String)],
+                                ret: Box::new(oomir_target_type.clone()),
+                                is_static: true,
+                            },
+                            args: vec![oomir_operand],
+                            dest: Some(temp_cast_var.clone()),
+                        });
+                    } else if matches!(oomir_target_type, oomir::Type::Slice(_))
+                        && (matches!(
+                            oomir_source_type,
+                            oomir::Type::Array(_) | oomir::Type::Slice(_)
+                        ) || matches!(
+                            &oomir_source_type,
+                            oomir::Type::MutableReference(inner)
+                                if matches!(inner.as_ref(), oomir::Type::Array(_))
+                        ))
+                    {
+                        let (slice_source, slice_source_type) = match &oomir_source_type {
+                            oomir::Type::MutableReference(inner)
+                                if matches!(inner.as_ref(), oomir::Type::Array(_)) =>
+                            {
+                                let unwrapped_name = format!("{}_array", temp_cast_var);
+                                instructions.push(oomir::Instruction::ArrayGet {
+                                    dest: unwrapped_name.clone(),
+                                    array: oomir_operand,
+                                    index: oomir::Operand::Constant(oomir::Constant::I32(0)),
+                                });
+                                (
+                                    oomir::Operand::Variable {
+                                        name: unwrapped_name,
+                                        ty: inner.as_ref().clone(),
+                                    },
+                                    inner.as_ref().clone(),
+                                )
+                            }
+                            _ => (oomir_operand, oomir_source_type.clone()),
+                        };
+                        emit_slice_view(
+                            slice_source,
+                            &slice_source_type,
+                            0,
+                            0,
+                            true,
+                            &temp_cast_var,
+                            &mut instructions,
+                        );
+                    } else if let oomir::Type::Class(class_name) = &oomir_target_type
                         && oomir::is_non_null_class_name(class_name)
                     {
                         breadcrumbs::log!(

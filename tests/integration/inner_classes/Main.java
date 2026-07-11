@@ -4,17 +4,20 @@ public class Main {
         inner_classes.TrafficLight yellow = new inner_classes.TrafficLight.Yellow();
         inner_classes.TrafficLight green = new inner_classes.TrafficLight.Green();
 
-        String redAction = inner_classes.inner_classes.get_light_action(red);
+        String redAction = org.rustlang.runtime.Utf8View.toJavaString(
+                inner_classes.inner_classes.get_light_action(red));
         if (!redAction.equals("Stop")) {
              throw new AssertionError("Test failed for Red: expected 'Stop' but got '" + redAction + "'");
         }
 
-        String yellowAction = inner_classes.inner_classes.get_light_action(yellow);
+        String yellowAction = org.rustlang.runtime.Utf8View.toJavaString(
+                inner_classes.inner_classes.get_light_action(yellow));
         if (!yellowAction.equals("Caution")) {
              throw new AssertionError("Test failed for Yellow: expected 'Caution' but got '" + yellowAction + "'");
         }
 
-        String greenAction = inner_classes.inner_classes.get_light_action(green);
+        String greenAction = org.rustlang.runtime.Utf8View.toJavaString(
+                inner_classes.inner_classes.get_light_action(green));
         if (!greenAction.equals("Go")) {
              throw new AssertionError("Test failed for Green: expected 'Go' but got '" + greenAction + "'");
         }

@@ -136,6 +136,18 @@ pub fn load_constant(
         OC::F64(v) => instructions_to_add.push(get_double_const_instr(cp, *v)),
         OC::Boolean(v) => instructions_to_add.push(if *v { JI::Iconst_1 } else { JI::Iconst_0 }),
         OC::Char(v) => instructions_to_add.push(get_int_const_instr(cp, *v as i32)),
+        OC::Str(s) => {
+            let index = cp.add_string(s)?;
+            instructions_to_add.push(if let Ok(idx8) = u8::try_from(index) {
+                JI::Ldc(idx8)
+            } else {
+                JI::Ldc_w(index)
+            });
+            let view_class = cp.add_class(oomir::UTF8_VIEW_CLASS)?;
+            let descriptor = format!("(Ljava/lang/String;)L{};", oomir::UTF8_VIEW_CLASS);
+            let from_java = cp.add_method_ref(view_class, "fromJavaString", descriptor)?;
+            instructions_to_add.push(JI::Invokestatic(from_java));
+        }
         OC::String(s) => {
             let index = cp.add_string(s)?;
             instructions_to_add.push(if let Ok(idx8) = u8::try_from(index) {
@@ -154,6 +166,34 @@ pub fn load_constant(
             } else {
                 JI::Ldc_w(index)
             });
+        }
+        OC::Slice(element_type, elements) => {
+            let class_index = cp.add_class(oomir::SLICE_VIEW_CLASS)?;
+            let constructor =
+                cp.add_method_ref(class_index, "<init>", "(Ljava/lang/Object;II)V")?;
+            instructions_to_add.push(JI::New(class_index));
+            instructions_to_add.push(JI::Dup);
+            load_constant(
+                &mut instructions_to_add,
+                cp,
+                &OC::Array(element_type.clone(), elements.clone()),
+            )?;
+            instructions_to_add.push(JI::Iconst_0);
+            instructions_to_add.push(get_int_const_instr(cp, elements.len() as i32));
+            instructions_to_add.push(JI::Invokespecial(constructor));
+        }
+        OC::SliceRef {
+            backing, length, ..
+        } => {
+            let class_index = cp.add_class(oomir::SLICE_VIEW_CLASS)?;
+            let constructor =
+                cp.add_method_ref(class_index, "<init>", "(Ljava/lang/Object;II)V")?;
+            instructions_to_add.push(JI::New(class_index));
+            instructions_to_add.push(JI::Dup);
+            load_constant(&mut instructions_to_add, cp, backing)?;
+            instructions_to_add.push(JI::Iconst_0);
+            instructions_to_add.push(get_int_const_instr(cp, *length as i32));
+            instructions_to_add.push(JI::Invokespecial(constructor));
         }
         OC::Array(elem_ty, elements) => {
             let array_len = elements.len();

@@ -12,7 +12,7 @@ use crate::oomir::{self, AdtHelperKind, DataTypeMethod, Signature, Type};
 use ristretto_classfile::{
     self as jvm, BaseType, ClassAccessFlags, ClassFile, FieldAccessFlags, MethodAccessFlags,
     Version,
-    attributes::{Attribute, InnerClass, Instruction, MaxStack, NestedClassAccessFlags},
+    attributes::{ArrayType, Attribute, InnerClass, Instruction, MaxStack, NestedClassAccessFlags},
 };
 use std::collections::{HashMap, HashSet};
 
@@ -106,6 +106,625 @@ pub(super) fn create_default_constructor(
     })
 }
 
+/// Builds the backend-owned runtime representation used for Rust slices.
+pub(super) fn create_slice_view_classfile() -> jvm::Result<Vec<u8>> {
+    let mut cp = InternedConstantPool::default();
+    let this_class = cp.add_class(oomir::SLICE_VIEW_CLASS)?;
+    let object_class = cp.add_class("java/lang/Object")?;
+
+    let array_field = cp.add_field_ref(this_class, "array", "Ljava/lang/Object;")?;
+    let offset_field = cp.add_field_ref(this_class, "offset", "I")?;
+    let length_field = cp.add_field_ref(this_class, "length", "I")?;
+    let object_init = cp.add_method_ref(object_class, "<init>", "()V")?;
+
+    let constructor_descriptor = "(Ljava/lang/Object;II)V";
+    let constructor = jvm::Method {
+        access_flags: MethodAccessFlags::PUBLIC,
+        name_index: cp.add_utf8("<init>")?,
+        descriptor_index: cp.add_utf8(constructor_descriptor)?,
+        attributes: vec![code_attribute_for_descriptor(
+            &mut cp,
+            2,
+            4,
+            vec![
+                Instruction::Aload_0,
+                Instruction::Invokespecial(object_init),
+                Instruction::Aload_0,
+                Instruction::Aload_1,
+                Instruction::Putfield(array_field),
+                Instruction::Aload_0,
+                Instruction::Iload_2,
+                Instruction::Putfield(offset_field),
+                Instruction::Aload_0,
+                Instruction::Iload_3,
+                Instruction::Putfield(length_field),
+                Instruction::Return,
+            ],
+            constructor_descriptor,
+            false,
+            Some(oomir::SLICE_VIEW_CLASS),
+            "<init>",
+        )?],
+    };
+
+    let get_class = cp.add_method_ref(object_class, "getClass", "()Ljava/lang/Class;")?;
+    let class_class = cp.add_class("java/lang/Class")?;
+    let get_component_type =
+        cp.add_method_ref(class_class, "getComponentType", "()Ljava/lang/Class;")?;
+    let reflect_array_class = cp.add_class("java/lang/reflect/Array")?;
+    let new_array = cp.add_method_ref(
+        reflect_array_class,
+        "newInstance",
+        "(Ljava/lang/Class;I)Ljava/lang/Object;",
+    )?;
+    let system_class = cp.add_class("java/lang/System")?;
+    let array_copy = cp.add_method_ref(
+        system_class,
+        "arraycopy",
+        "(Ljava/lang/Object;ILjava/lang/Object;II)V",
+    )?;
+    let to_array_descriptor = "()Ljava/lang/Object;";
+    let to_array = jvm::Method {
+        access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::FINAL,
+        name_index: cp.add_utf8("toArray")?,
+        descriptor_index: cp.add_utf8(to_array_descriptor)?,
+        attributes: vec![code_attribute_for_descriptor(
+            &mut cp,
+            5,
+            2,
+            vec![
+                Instruction::Aload_0,
+                Instruction::Getfield(array_field),
+                Instruction::Invokevirtual(get_class),
+                Instruction::Invokevirtual(get_component_type),
+                Instruction::Aload_0,
+                Instruction::Getfield(length_field),
+                Instruction::Invokestatic(new_array),
+                Instruction::Astore_1,
+                Instruction::Aload_0,
+                Instruction::Getfield(array_field),
+                Instruction::Aload_0,
+                Instruction::Getfield(offset_field),
+                Instruction::Aload_1,
+                Instruction::Iconst_0,
+                Instruction::Aload_0,
+                Instruction::Getfield(length_field),
+                Instruction::Invokestatic(array_copy),
+                Instruction::Aload_1,
+                Instruction::Areturn,
+            ],
+            to_array_descriptor,
+            false,
+            Some(oomir::SLICE_VIEW_CLASS),
+            "toArray",
+        )?],
+    };
+
+    let standard_charsets = cp.add_class("java/nio/charset/StandardCharsets")?;
+    let utf8 = cp.add_field_ref(standard_charsets, "UTF_8", "Ljava/nio/charset/Charset;")?;
+    let string_class = cp.add_class("java/lang/String")?;
+    let get_bytes =
+        cp.add_method_ref(string_class, "getBytes", "(Ljava/nio/charset/Charset;)[B")?;
+    let slice_constructor = cp.add_method_ref(this_class, "<init>", "(Ljava/lang/Object;II)V")?;
+    let from_string_descriptor = format!("(Ljava/lang/String;)L{};", oomir::SLICE_VIEW_CLASS);
+    let from_string = jvm::Method {
+        access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
+        name_index: cp.add_utf8("fromString")?,
+        descriptor_index: cp.add_utf8(&from_string_descriptor)?,
+        attributes: vec![code_attribute_for_descriptor(
+            &mut cp,
+            5,
+            4,
+            vec![
+                Instruction::Aload_0,
+                Instruction::Getstatic(utf8),
+                Instruction::Invokevirtual(get_bytes),
+                Instruction::Astore_1,
+                Instruction::Aload_1,
+                Instruction::Arraylength,
+                Instruction::Newarray(ArrayType::Short),
+                Instruction::Astore_2,
+                Instruction::Iconst_0,
+                Instruction::Istore_3,
+                Instruction::Iload_3,
+                Instruction::Aload_1,
+                Instruction::Arraylength,
+                Instruction::If_icmpge(25),
+                Instruction::Aload_2,
+                Instruction::Iload_3,
+                Instruction::Aload_1,
+                Instruction::Iload_3,
+                Instruction::Baload,
+                Instruction::Sipush(255),
+                Instruction::Iand,
+                Instruction::I2s,
+                Instruction::Sastore,
+                Instruction::Iinc(3, 1),
+                Instruction::Goto(10),
+                Instruction::New(this_class),
+                Instruction::Dup,
+                Instruction::Aload_2,
+                Instruction::Iconst_0,
+                Instruction::Aload_2,
+                Instruction::Arraylength,
+                Instruction::Invokespecial(slice_constructor),
+                Instruction::Areturn,
+            ],
+            &from_string_descriptor,
+            true,
+            Some(oomir::SLICE_VIEW_CLASS),
+            "fromString",
+        )?],
+    };
+
+    let short_array_class = cp.add_class("[S")?;
+    let string_from_bytes =
+        cp.add_method_ref(string_class, "<init>", "([BLjava/nio/charset/Charset;)V")?;
+    let to_utf8_string_descriptor = format!("(L{};)Ljava/lang/String;", oomir::SLICE_VIEW_CLASS);
+    let to_utf8_string = jvm::Method {
+        access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
+        name_index: cp.add_utf8("toUtf8String")?,
+        descriptor_index: cp.add_utf8(&to_utf8_string_descriptor)?,
+        attributes: vec![code_attribute_for_descriptor(
+            &mut cp,
+            5,
+            3,
+            vec![
+                Instruction::Aload_0,
+                Instruction::Getfield(length_field),
+                Instruction::Newarray(ArrayType::Byte),
+                Instruction::Astore_1,
+                Instruction::Iconst_0,
+                Instruction::Istore_2,
+                Instruction::Iload_2,
+                Instruction::Aload_0,
+                Instruction::Getfield(length_field),
+                Instruction::If_icmpge(24),
+                Instruction::Aload_1,
+                Instruction::Iload_2,
+                Instruction::Aload_0,
+                Instruction::Getfield(array_field),
+                Instruction::Checkcast(short_array_class),
+                Instruction::Aload_0,
+                Instruction::Getfield(offset_field),
+                Instruction::Iload_2,
+                Instruction::Iadd,
+                Instruction::Saload,
+                Instruction::I2b,
+                Instruction::Bastore,
+                Instruction::Iinc(2, 1),
+                Instruction::Goto(6),
+                Instruction::New(string_class),
+                Instruction::Dup,
+                Instruction::Aload_1,
+                Instruction::Getstatic(utf8),
+                Instruction::Invokespecial(string_from_bytes),
+                Instruction::Areturn,
+            ],
+            &to_utf8_string_descriptor,
+            true,
+            Some(oomir::SLICE_VIEW_CLASS),
+            "toUtf8String",
+        )?],
+    };
+
+    let character_class = cp.add_class("java/lang/Character")?;
+    let to_chars = cp.add_method_ref(character_class, "toChars", "(I)[C")?;
+    let string_value_of = cp.add_method_ref(string_class, "valueOf", "([C)Ljava/lang/String;")?;
+    let from_string_ref = cp.add_method_ref(this_class, "fromString", &from_string_descriptor)?;
+    let encode_utf8_descriptor = format!(
+        "(JL{};)L{};",
+        oomir::SLICE_VIEW_CLASS,
+        oomir::SLICE_VIEW_CLASS
+    );
+    let encode_utf8 = jvm::Method {
+        access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
+        name_index: cp.add_utf8("encodeUtf8")?,
+        descriptor_index: cp.add_utf8(&encode_utf8_descriptor)?,
+        attributes: vec![code_attribute_for_descriptor(
+            &mut cp,
+            5,
+            5,
+            vec![
+                Instruction::Lload_0,
+                Instruction::L2i,
+                Instruction::Invokestatic(to_chars),
+                Instruction::Invokestatic(string_value_of),
+                Instruction::Astore_3,
+                Instruction::Aload_3,
+                Instruction::Invokestatic(from_string_ref),
+                Instruction::Astore(4),
+                Instruction::Aload(4),
+                Instruction::Getfield(array_field),
+                Instruction::Aload(4),
+                Instruction::Getfield(offset_field),
+                Instruction::Aload_2,
+                Instruction::Getfield(array_field),
+                Instruction::Aload_2,
+                Instruction::Getfield(offset_field),
+                Instruction::Aload(4),
+                Instruction::Getfield(length_field),
+                Instruction::Invokestatic(array_copy),
+                Instruction::New(this_class),
+                Instruction::Dup,
+                Instruction::Aload_2,
+                Instruction::Getfield(array_field),
+                Instruction::Aload_2,
+                Instruction::Getfield(offset_field),
+                Instruction::Aload(4),
+                Instruction::Getfield(length_field),
+                Instruction::Invokespecial(slice_constructor),
+                Instruction::Areturn,
+            ],
+            &encode_utf8_descriptor,
+            true,
+            Some(oomir::SLICE_VIEW_CLASS),
+            "encodeUtf8",
+        )?],
+    };
+
+    let fields = vec![
+        jvm::Field {
+            access_flags: FieldAccessFlags::PUBLIC | FieldAccessFlags::FINAL,
+            name_index: cp.add_utf8("array")?,
+            descriptor_index: cp.add_utf8("Ljava/lang/Object;")?,
+            field_type: jvm::FieldType::Object("java/lang/Object".to_string()),
+            attributes: Vec::new(),
+        },
+        jvm::Field {
+            access_flags: FieldAccessFlags::PUBLIC | FieldAccessFlags::FINAL,
+            name_index: cp.add_utf8("offset")?,
+            descriptor_index: cp.add_utf8("I")?,
+            field_type: jvm::FieldType::Base(BaseType::Int),
+            attributes: Vec::new(),
+        },
+        jvm::Field {
+            access_flags: FieldAccessFlags::PUBLIC | FieldAccessFlags::FINAL,
+            name_index: cp.add_utf8("length")?,
+            descriptor_index: cp.add_utf8("I")?,
+            field_type: jvm::FieldType::Base(BaseType::Int),
+            attributes: Vec::new(),
+        },
+    ];
+
+    let class_file = ClassFile {
+        version: Version::Java8 { minor: 0 },
+        constant_pool: cp.into_inner(),
+        access_flags: ClassAccessFlags::PUBLIC | ClassAccessFlags::SUPER,
+        this_class,
+        super_class: object_class,
+        interfaces: Vec::new(),
+        fields,
+        methods: vec![
+            constructor,
+            to_array,
+            from_string,
+            to_utf8_string,
+            encode_utf8,
+        ],
+        attributes: Vec::new(),
+    };
+    verify_no_duplicate_constants(&class_file)?;
+
+    let mut bytes = Vec::new();
+    class_file.to_bytes(&mut bytes)?;
+    Ok(bytes)
+}
+
+/// Builds the UTF-8-valid specialization used for Rust `str` values.
+pub(super) fn create_utf8_view_classfile() -> jvm::Result<Vec<u8>> {
+    let mut cp = InternedConstantPool::default();
+    let this_class = cp.add_class(oomir::UTF8_VIEW_CLASS)?;
+    let slice_class = cp.add_class(oomir::SLICE_VIEW_CLASS)?;
+    let constructor_descriptor = "(Ljava/lang/Object;II)V";
+    let slice_constructor = cp.add_method_ref(slice_class, "<init>", constructor_descriptor)?;
+    let array_field = cp.add_field_ref(slice_class, "array", "Ljava/lang/Object;")?;
+    let offset_field = cp.add_field_ref(slice_class, "offset", "I")?;
+    let length_field = cp.add_field_ref(slice_class, "length", "I")?;
+    let utf8_constructor = cp.add_method_ref(this_class, "<init>", constructor_descriptor)?;
+
+    let constructor = jvm::Method {
+        access_flags: MethodAccessFlags::PUBLIC,
+        name_index: cp.add_utf8("<init>")?,
+        descriptor_index: cp.add_utf8(constructor_descriptor)?,
+        attributes: vec![code_attribute_for_descriptor(
+            &mut cp,
+            4,
+            4,
+            vec![
+                Instruction::Aload_0,
+                Instruction::Aload_1,
+                Instruction::Iload_2,
+                Instruction::Iload_3,
+                Instruction::Invokespecial(slice_constructor),
+                Instruction::Return,
+            ],
+            constructor_descriptor,
+            false,
+            Some(oomir::UTF8_VIEW_CLASS),
+            "<init>",
+        )?],
+    };
+
+    let slice_from_string_descriptor = format!("(Ljava/lang/String;)L{};", oomir::SLICE_VIEW_CLASS);
+    let slice_from_string =
+        cp.add_method_ref(slice_class, "fromString", &slice_from_string_descriptor)?;
+    let from_java_descriptor = format!("(Ljava/lang/String;)L{};", oomir::UTF8_VIEW_CLASS);
+    let from_java = jvm::Method {
+        access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
+        name_index: cp.add_utf8("fromJavaString")?,
+        descriptor_index: cp.add_utf8(&from_java_descriptor)?,
+        attributes: vec![code_attribute_for_descriptor(
+            &mut cp,
+            5,
+            2,
+            vec![
+                Instruction::Aload_0,
+                Instruction::Invokestatic(slice_from_string),
+                Instruction::Astore_1,
+                Instruction::New(this_class),
+                Instruction::Dup,
+                Instruction::Aload_1,
+                Instruction::Getfield(array_field),
+                Instruction::Aload_1,
+                Instruction::Getfield(offset_field),
+                Instruction::Aload_1,
+                Instruction::Getfield(length_field),
+                Instruction::Invokespecial(utf8_constructor),
+                Instruction::Areturn,
+            ],
+            &from_java_descriptor,
+            true,
+            Some(oomir::UTF8_VIEW_CLASS),
+            "fromJavaString",
+        )?],
+    };
+
+    let slice_to_string_descriptor = format!("(L{};)Ljava/lang/String;", oomir::SLICE_VIEW_CLASS);
+    let slice_to_string =
+        cp.add_method_ref(slice_class, "toUtf8String", &slice_to_string_descriptor)?;
+    let to_java_descriptor = format!("(L{};)Ljava/lang/String;", oomir::UTF8_VIEW_CLASS);
+    let to_java = jvm::Method {
+        access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
+        name_index: cp.add_utf8("toJavaString")?,
+        descriptor_index: cp.add_utf8(&to_java_descriptor)?,
+        attributes: vec![code_attribute_for_descriptor(
+            &mut cp,
+            1,
+            1,
+            vec![
+                Instruction::Aload_0,
+                Instruction::Invokestatic(slice_to_string),
+                Instruction::Areturn,
+            ],
+            &to_java_descriptor,
+            true,
+            Some(oomir::UTF8_VIEW_CLASS),
+            "toJavaString",
+        )?],
+    };
+
+    let as_slice_descriptor = format!(
+        "(L{};)L{};",
+        oomir::UTF8_VIEW_CLASS,
+        oomir::SLICE_VIEW_CLASS
+    );
+    let as_slice = jvm::Method {
+        access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
+        name_index: cp.add_utf8("asSlice")?,
+        descriptor_index: cp.add_utf8(&as_slice_descriptor)?,
+        attributes: vec![code_attribute_for_descriptor(
+            &mut cp,
+            1,
+            1,
+            vec![Instruction::Aload_0, Instruction::Areturn],
+            &as_slice_descriptor,
+            true,
+            Some(oomir::UTF8_VIEW_CLASS),
+            "asSlice",
+        )?],
+    };
+
+    let from_slice_descriptor = format!(
+        "(L{};)L{};",
+        oomir::SLICE_VIEW_CLASS,
+        oomir::UTF8_VIEW_CLASS
+    );
+    let from_slice = jvm::Method {
+        access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
+        name_index: cp.add_utf8("fromSlice")?,
+        descriptor_index: cp.add_utf8(&from_slice_descriptor)?,
+        attributes: vec![code_attribute_for_descriptor(
+            &mut cp,
+            5,
+            1,
+            vec![
+                Instruction::New(this_class),
+                Instruction::Dup,
+                Instruction::Aload_0,
+                Instruction::Getfield(array_field),
+                Instruction::Aload_0,
+                Instruction::Getfield(offset_field),
+                Instruction::Aload_0,
+                Instruction::Getfield(length_field),
+                Instruction::Invokespecial(utf8_constructor),
+                Instruction::Areturn,
+            ],
+            &from_slice_descriptor,
+            true,
+            Some(oomir::UTF8_VIEW_CLASS),
+            "fromSlice",
+        )?],
+    };
+
+    let len_descriptor = format!("(L{};)I", oomir::UTF8_VIEW_CLASS);
+    let len = jvm::Method {
+        access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
+        name_index: cp.add_utf8("len")?,
+        descriptor_index: cp.add_utf8(&len_descriptor)?,
+        attributes: vec![code_attribute_for_descriptor(
+            &mut cp,
+            1,
+            1,
+            vec![
+                Instruction::Aload_0,
+                Instruction::Getfield(length_field),
+                Instruction::Ireturn,
+            ],
+            &len_descriptor,
+            true,
+            Some(oomir::UTF8_VIEW_CLASS),
+            "len",
+        )?],
+    };
+
+    let short_array_class = cp.add_class("[S")?;
+    let starts_with_descriptor = format!(
+        "(L{};L{};)Z",
+        oomir::UTF8_VIEW_CLASS,
+        oomir::UTF8_VIEW_CLASS
+    );
+    let starts_with = jvm::Method {
+        access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
+        name_index: cp.add_utf8("startsWith")?,
+        descriptor_index: cp.add_utf8(&starts_with_descriptor)?,
+        attributes: vec![code_attribute_for_descriptor(
+            &mut cp,
+            4,
+            3,
+            vec![
+                Instruction::Aload_1,
+                Instruction::Getfield(length_field),
+                Instruction::Aload_0,
+                Instruction::Getfield(length_field),
+                Instruction::If_icmpgt(32),
+                Instruction::Iconst_0,
+                Instruction::Istore_2,
+                Instruction::Iload_2,
+                Instruction::Aload_1,
+                Instruction::Getfield(length_field),
+                Instruction::If_icmpge(30),
+                Instruction::Aload_0,
+                Instruction::Getfield(array_field),
+                Instruction::Checkcast(short_array_class),
+                Instruction::Aload_0,
+                Instruction::Getfield(offset_field),
+                Instruction::Iload_2,
+                Instruction::Iadd,
+                Instruction::Saload,
+                Instruction::Aload_1,
+                Instruction::Getfield(array_field),
+                Instruction::Checkcast(short_array_class),
+                Instruction::Aload_1,
+                Instruction::Getfield(offset_field),
+                Instruction::Iload_2,
+                Instruction::Iadd,
+                Instruction::Saload,
+                Instruction::If_icmpne(32),
+                Instruction::Iinc(2, 1),
+                Instruction::Goto(7),
+                Instruction::Iconst_1,
+                Instruction::Ireturn,
+                Instruction::Iconst_0,
+                Instruction::Ireturn,
+            ],
+            &starts_with_descriptor,
+            true,
+            Some(oomir::UTF8_VIEW_CLASS),
+            "startsWith",
+        )?],
+    };
+
+    let equals_descriptor = starts_with_descriptor.clone();
+    let starts_with_ref = cp.add_method_ref(this_class, "startsWith", &starts_with_descriptor)?;
+    let equals = jvm::Method {
+        access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
+        name_index: cp.add_utf8("equals")?,
+        descriptor_index: cp.add_utf8(&equals_descriptor)?,
+        attributes: vec![code_attribute_for_descriptor(
+            &mut cp,
+            2,
+            2,
+            vec![
+                Instruction::Aload_0,
+                Instruction::Getfield(length_field),
+                Instruction::Aload_1,
+                Instruction::Getfield(length_field),
+                Instruction::If_icmpne(9),
+                Instruction::Aload_0,
+                Instruction::Aload_1,
+                Instruction::Invokestatic(starts_with_ref),
+                Instruction::Ireturn,
+                Instruction::Iconst_0,
+                Instruction::Ireturn,
+            ],
+            &equals_descriptor,
+            true,
+            Some(oomir::UTF8_VIEW_CLASS),
+            "equals",
+        )?],
+    };
+
+    let to_java_ref = cp.add_method_ref(this_class, "toJavaString", &to_java_descriptor)?;
+    let character_class = cp.add_class("java/lang/Character")?;
+    let to_chars = cp.add_method_ref(character_class, "toChars", "(I)[C")?;
+    let string_class = cp.add_class("java/lang/String")?;
+    let string_value_of = cp.add_method_ref(string_class, "valueOf", "([C)Ljava/lang/String;")?;
+    let java_starts_with =
+        cp.add_method_ref(string_class, "startsWith", "(Ljava/lang/String;)Z")?;
+    let starts_with_char_descriptor = format!("(L{};I)Z", oomir::UTF8_VIEW_CLASS);
+    let starts_with_char = jvm::Method {
+        access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
+        name_index: cp.add_utf8("startsWithChar")?,
+        descriptor_index: cp.add_utf8(&starts_with_char_descriptor)?,
+        attributes: vec![code_attribute_for_descriptor(
+            &mut cp,
+            2,
+            2,
+            vec![
+                Instruction::Aload_0,
+                Instruction::Invokestatic(to_java_ref),
+                Instruction::Iload_1,
+                Instruction::Invokestatic(to_chars),
+                Instruction::Invokestatic(string_value_of),
+                Instruction::Invokevirtual(java_starts_with),
+                Instruction::Ireturn,
+            ],
+            &starts_with_char_descriptor,
+            true,
+            Some(oomir::UTF8_VIEW_CLASS),
+            "startsWithChar",
+        )?],
+    };
+
+    let class_file = ClassFile {
+        version: Version::Java8 { minor: 0 },
+        constant_pool: cp.into_inner(),
+        access_flags: ClassAccessFlags::PUBLIC | ClassAccessFlags::FINAL | ClassAccessFlags::SUPER,
+        this_class,
+        super_class: slice_class,
+        interfaces: Vec::new(),
+        fields: Vec::new(),
+        methods: vec![
+            constructor,
+            from_java,
+            to_java,
+            as_slice,
+            from_slice,
+            len,
+            starts_with,
+            equals,
+            starts_with_char,
+        ],
+        attributes: Vec::new(),
+    };
+    verify_no_duplicate_constants(&class_file)?;
+
+    let mut bytes = Vec::new();
+    class_file.to_bytes(&mut bytes)?;
+    Ok(bytes)
+}
+
 fn create_field_constructor(
     cp: &mut InternedConstantPool,
     this_class_index: u16,
@@ -187,6 +806,8 @@ fn return_instruction_for_type(ty: &Type) -> Instruction {
         Type::Reference(_)
         | Type::MutableReference(_)
         | Type::Array(_)
+        | Type::Slice(_)
+        | Type::Str
         | Type::String
         | Type::Class(_)
         | Type::Interface(_) => Instruction::Areturn,
@@ -296,6 +917,7 @@ pub(super) fn oomir_type_to_ristretto_field_type(
         oomir::Type::F64 => jvm::FieldType::Base(BaseType::Double),
         oomir::Type::Boolean => jvm::FieldType::Base(BaseType::Boolean),
         oomir::Type::Char => jvm::FieldType::Base(BaseType::Char),
+        oomir::Type::Str => jvm::FieldType::Object(oomir::UTF8_VIEW_CLASS.to_string()),
         oomir::Type::String => jvm::FieldType::Object("java/lang/String".to_string()),
         oomir::Type::Reference(ref2) => {
             let inner_ty = ref2.as_ref();
@@ -309,6 +931,7 @@ pub(super) fn oomir_type_to_ristretto_field_type(
             };
             jvm::FieldType::Array(Box::new(inner_field_type))
         }
+        oomir::Type::Slice(_) => jvm::FieldType::Object(oomir::SLICE_VIEW_CLASS.to_string()),
         oomir::Type::MutableReference(inner_ty) if !inner_ty.has_jvm_value() => {
             jvm::FieldType::Object("java/lang/Object".to_string())
         }
@@ -395,6 +1018,17 @@ fn append_field_equality_check(
             let equals_ref =
                 cp.add_method_ref(string_class_idx, "equals", "(Ljava/lang/Object;)Z")?;
             instructions.push(Instruction::Invokevirtual(equals_ref));
+            append_boolean_false_check(instructions, false_fixups);
+        }
+        Type::Str => {
+            let view_class = cp.add_class(oomir::UTF8_VIEW_CLASS)?;
+            let descriptor = format!(
+                "(L{};L{};)Z",
+                oomir::UTF8_VIEW_CLASS,
+                oomir::UTF8_VIEW_CLASS
+            );
+            let equals_ref = cp.add_method_ref(view_class, "equals", descriptor)?;
+            instructions.push(Instruction::Invokestatic(equals_ref));
             append_boolean_false_check(instructions, false_fixups);
         }
         Type::Class(class_name) if has_generated_eq(module, class_name) => {
@@ -1075,6 +1709,8 @@ fn create_code_from_method_name_and_constant_return(
         oomir::Type::Reference(_)
         | oomir::Type::MutableReference(_)
         | oomir::Type::Array(_)
+        | oomir::Type::Slice(_)
+        | oomir::Type::Str
         | oomir::Type::String
         | oomir::Type::Class(_)
         | oomir::Type::Interface(_) => Instruction::Areturn,

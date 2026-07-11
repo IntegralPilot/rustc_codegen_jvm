@@ -14,14 +14,85 @@ pub fn get_type_size(ty: &Type) -> u16 {
     }
 }
 
+fn constant_load_stack_floor(constant: &oomir::Constant) -> u16 {
+    use oomir::Constant;
+    match constant {
+        Constant::Unit => 0,
+        Constant::I64(_) | Constant::F64(_) => 2,
+        Constant::Array(_, elements) => elements
+            .iter()
+            .map(|element| 3 + constant_load_stack_floor(element))
+            .max()
+            .unwrap_or(1),
+        Constant::Slice(element_type, elements) => {
+            let backing = Constant::Array(element_type.clone(), elements.clone());
+            (2 + constant_load_stack_floor(&backing)).max(4)
+        }
+        Constant::SliceRef { backing, .. } => (2 + constant_load_stack_floor(backing)).max(4),
+        Constant::Instance { params, .. } => {
+            let mut stack = 2;
+            let mut peak = stack;
+            for param in params {
+                peak = peak.max(stack + constant_load_stack_floor(param));
+                stack += get_type_size(&Type::from_constant(param));
+            }
+            peak
+        }
+        Constant::StaticRef { ty, .. } | Constant::FactoryCall { ty, .. } => get_type_size(ty),
+        _ => 1,
+    }
+}
+
+fn operand_load_stack_floor(operand: &oomir::Operand) -> u16 {
+    match operand {
+        oomir::Operand::Constant(constant) => constant_load_stack_floor(constant),
+        oomir::Operand::Variable { ty, .. } => get_type_size(ty),
+    }
+}
+
+fn operand_sequence_stack_floor<'a>(
+    operands: impl IntoIterator<Item = &'a oomir::Operand>,
+    initial_stack: u16,
+) -> u16 {
+    let mut stack = initial_stack;
+    let mut peak = stack;
+    for operand in operands {
+        peak = peak.max(stack + operand_load_stack_floor(operand));
+        stack += operand.get_type().as_ref().map(get_type_size).unwrap_or(0);
+    }
+    peak
+}
+
 pub fn oomir_function_stack_floor(function: &oomir::Function) -> u16 {
     let mut floor = 0;
     for block in function.body.basic_blocks.values() {
         for instruction in &block.instructions {
-            if let oomir::Instruction::ConstructObject { args, .. } = instruction {
-                let constructor_stack =
-                    2 + args.iter().map(|(_, ty)| get_type_size(ty)).sum::<u16>();
-                floor = floor.max(constructor_stack);
+            match instruction {
+                oomir::Instruction::ConstructObject { args, .. } => {
+                    floor = floor.max(operand_sequence_stack_floor(
+                        args.iter().map(|(operand, _)| operand),
+                        2,
+                    ));
+                }
+                oomir::Instruction::Call { args, .. }
+                | oomir::Instruction::InvokeStatic { args, .. } => {
+                    floor = floor.max(operand_sequence_stack_floor(args, 0));
+                }
+                oomir::Instruction::CallIndirect {
+                    function_ptr, args, ..
+                } => {
+                    floor = floor.max(operand_load_stack_floor(function_ptr));
+                    floor = floor.max(operand_sequence_stack_floor(args, 1));
+                }
+                oomir::Instruction::InvokeInterface { operand, args, .. }
+                | oomir::Instruction::InvokeVirtual { operand, args, .. } => {
+                    floor = floor.max(operand_load_stack_floor(operand));
+                    floor = floor.max(operand_sequence_stack_floor(args, 1));
+                }
+                oomir::Instruction::Move { src, .. } => {
+                    floor = floor.max(operand_load_stack_floor(src));
+                }
+                _ => {}
             }
         }
     }
@@ -74,6 +145,8 @@ pub fn get_load_instruction(ty: &Type, index: u16) -> Result<Instruction, jvm::E
         Type::Reference(_)
         | Type::MutableReference(_)
         | Type::Array(_)
+        | Type::Slice(_)
+        | Type::Str
         | Type::String
         | Type::Class(_)
         | Type::Interface(_) => match index {
@@ -158,7 +231,8 @@ pub fn get_store_instruction(ty: &Type, index: u16) -> Result<Instruction, jvm::
                 Instruction::Dstore_w(index)
             }
         }
-        Reference(_) | MutableReference(_) | Array(_) | String | Class(_) | Interface(_) => {
+        Reference(_) | MutableReference(_) | Array(_) | Slice(_) | Str | String | Class(_)
+        | Interface(_) => {
             if index <= 3 {
                 match index {
                     0 => Instruction::Astore_0,

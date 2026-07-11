@@ -6,7 +6,8 @@ use crate::oomir::{self, DataType};
 use helpers::oomir_function_stack_floor;
 use jvm_gen::{
     create_data_type_classfile_for_class, create_data_type_classfile_for_interface,
-    create_default_constructor, oomir_type_to_ristretto_field_type,
+    create_default_constructor, create_slice_view_classfile, create_utf8_view_classfile,
+    oomir_type_to_ristretto_field_type,
 };
 use translator::FunctionTranslator;
 
@@ -41,9 +42,11 @@ fn factory_return_instruction(ty: &oomir::Type) -> Instruction {
         oomir::Type::I64 => Instruction::Lreturn,
         oomir::Type::F32 => Instruction::Freturn,
         oomir::Type::F64 => Instruction::Dreturn,
-        oomir::Type::String
+        oomir::Type::Str
+        | oomir::Type::String
         | oomir::Type::Class(_)
         | oomir::Type::Array(_)
+        | oomir::Type::Slice(_)
         | oomir::Type::Reference(_)
         | oomir::Type::MutableReference(_)
         | oomir::Type::Interface(_) => Instruction::Areturn,
@@ -68,6 +71,30 @@ fn create_constant_factory(
                 })
                 .collect::<jvm::Result<Vec<_>>>()?,
         ),
+        oomir::Constant::Slice(element_type, elements) => oomir::Constant::Slice(
+            element_type.clone(),
+            elements
+                .iter()
+                .map(|element| {
+                    create_constant_factory(cp, owner_class, element, methods, next_factory)
+                })
+                .collect::<jvm::Result<Vec<_>>>()?,
+        ),
+        oomir::Constant::SliceRef {
+            backing,
+            element_type,
+            length,
+        } => oomir::Constant::SliceRef {
+            backing: Box::new(create_constant_factory(
+                cp,
+                owner_class,
+                backing,
+                methods,
+                next_factory,
+            )?),
+            element_type: element_type.clone(),
+            length: *length,
+        },
         oomir::Constant::Instance {
             class_name,
             fields,
@@ -186,6 +213,14 @@ pub fn oomir_to_jvm_bytecode(
 ) -> jvm::Result<HashMap<String, Vec<u8>>> {
     // Map to store the generated class files (Class Name -> Bytes)
     let mut generated_classes: HashMap<String, Vec<u8>> = HashMap::new();
+    generated_classes.insert(
+        oomir::SLICE_VIEW_CLASS.to_string(),
+        create_slice_view_classfile()?,
+    );
+    generated_classes.insert(
+        oomir::UTF8_VIEW_CLASS.to_string(),
+        create_utf8_view_classfile()?,
+    );
 
     let mut functions_by_class: BTreeMap<String, Vec<&oomir::Function>> = BTreeMap::new();
     for function in module.functions.values() {

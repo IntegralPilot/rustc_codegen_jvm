@@ -81,37 +81,43 @@ pub fn convert_basic_block<'tcx>(
                                 ty: array_ty,
                             } = &source_operand
                             {
-                                // Extract element type from array type
-                                if let oomir::Type::MutableReference(element_ty) = array_ty {
-                                    breadcrumbs::log!(
-                                        breadcrumbs::LogLevel::Info,
-                                        "mir-lowering",
-                                        format!(
-                                            "Info: Tracking mutable borrow array for place {:?} stored in local {:?}. Original: {:?}, ArrayVar: {}, ElementTy: {:?}",
-                                            place,
+                                match array_ty {
+                                    oomir::Type::MutableReference(element_ty) => {
+                                        breadcrumbs::log!(
+                                            breadcrumbs::LogLevel::Info,
+                                            "mir-lowering",
+                                            format!(
+                                                "Info: Tracking mutable borrow array for place {:?} stored in local {:?}. Original: {:?}, ArrayVar: {}, ElementTy: {:?}",
+                                                place,
+                                                place.local,
+                                                borrowed_place,
+                                                array_var_name,
+                                                element_ty
+                                            )
+                                        );
+                                        mutable_borrow_arrays.insert(
                                             place.local,
-                                            borrowed_place,
-                                            array_var_name,
-                                            element_ty
-                                        )
-                                    );
-                                    mutable_borrow_arrays.insert(
-                                        place.local, // The local holding the array reference (e.g., _3)
-                                        (
-                                            borrowed_place.clone(), // The original place borrowed (e.g., _1)
-                                            array_var_name.clone(), // The OOMIR name of the array var (e.g., "3_tmp0")
-                                            *element_ty.clone(), // The type of the element in the array
-                                        ),
-                                    );
-                                } else {
-                                    breadcrumbs::log!(
-                                        breadcrumbs::LogLevel::Warn,
-                                        "mir-lowering",
-                                        format!(
-                                            "Warning: Expected type for mutable borrow ref, found {:?}",
-                                            array_ty
-                                        )
-                                    );
+                                            (
+                                                borrowed_place.clone(),
+                                                array_var_name.clone(),
+                                                *element_ty.clone(),
+                                            ),
+                                        );
+                                    }
+                                    oomir::Type::Slice(_) => {
+                                        // Slice views already alias their backing array, so writes
+                                        // are visible directly and need no copy-out bookkeeping.
+                                    }
+                                    _ => {
+                                        breadcrumbs::log!(
+                                            breadcrumbs::LogLevel::Warn,
+                                            "mir-lowering",
+                                            format!(
+                                                "Warning: Expected mutable-reference or slice representation, found {:?}",
+                                                array_ty
+                                            )
+                                        );
+                                    }
                                 }
                             } else {
                                 breadcrumbs::log!(
@@ -390,31 +396,75 @@ pub fn convert_basic_block<'tcx>(
                                         data_types,
                                         instance,
                                     );
-                                    let primitive_shim_class = match &class_type {
-                                        oomir::Type::String => {
-                                            Some("org/rustlang/primitives/RustString".to_string())
+                                    let primitive_static_target = match &class_type {
+                                        oomir::Type::Str if method_name == "as_bytes" => Some((
+                                            oomir::UTF8_VIEW_CLASS.to_string(),
+                                            "asSlice".to_string(),
+                                        )),
+                                        oomir::Type::Str
+                                            if method_name == "starts_with"
+                                                && oomir_operands.get(1).is_some_and(
+                                                    |operand| {
+                                                        matches!(
+                                                            operand.get_type(),
+                                                            Some(oomir::Type::I32)
+                                                        )
+                                                    },
+                                                ) =>
+                                        {
+                                            Some((
+                                                oomir::UTF8_VIEW_CLASS.to_string(),
+                                                "startsWithChar".to_string(),
+                                            ))
                                         }
-                                        oomir::Type::F32 => {
-                                            Some("org/rustlang/primitives/F32".to_string())
-                                        }
-                                        oomir::Type::F64 => {
-                                            Some("org/rustlang/primitives/F64".to_string())
-                                        }
-                                        oomir::Type::Array(inner)
+                                        oomir::Type::Str if method_name == "starts_with" => Some((
+                                            oomir::UTF8_VIEW_CLASS.to_string(),
+                                            "startsWith".to_string(),
+                                        )),
+                                        oomir::Type::Str if method_name == "eq" => Some((
+                                            oomir::UTF8_VIEW_CLASS.to_string(),
+                                            "equals".to_string(),
+                                        )),
+                                        oomir::Type::Str if method_name == "len" => Some((
+                                            oomir::UTF8_VIEW_CLASS.to_string(),
+                                            "len".to_string(),
+                                        )),
+                                        oomir::Type::String if method_name == "as_bytes" => Some((
+                                            oomir::SLICE_VIEW_CLASS.to_string(),
+                                            "fromString".to_string(),
+                                        )),
+                                        oomir::Type::String => Some((
+                                            "org/rustlang/primitives/RustString".to_string(),
+                                            method_name.clone(),
+                                        )),
+                                        oomir::Type::F32 => Some((
+                                            "org/rustlang/primitives/F32".to_string(),
+                                            method_name.clone(),
+                                        )),
+                                        oomir::Type::F64 => Some((
+                                            "org/rustlang/primitives/F64".to_string(),
+                                            method_name.clone(),
+                                        )),
+                                        oomir::Type::Array(inner) | oomir::Type::Slice(inner)
                                             if matches!(inner.as_ref(), oomir::Type::I16)
                                                 && method_name == "starts_with" =>
                                         {
-                                            Some("org/rustlang/core/Core".to_string())
+                                            Some((
+                                                "org/rustlang/core/Core".to_string(),
+                                                method_name.clone(),
+                                            ))
                                         }
                                         _ => None,
                                     };
 
-                                    if let Some(class_name) = primitive_shim_class {
+                                    if let Some((class_name, static_method_name)) =
+                                        primitive_static_target
+                                    {
                                         let mut static_signature = method_signature;
                                         static_signature.is_static = true;
                                         instructions.push(oomir::Instruction::InvokeStatic {
                                             class_name,
-                                            method_name,
+                                            method_name: static_method_name,
                                             method_ty: static_signature,
                                             args: oomir_operands.clone(),
                                             dest: effective_dest,

@@ -1633,7 +1633,7 @@ pub fn ty_to_oomir_type<'tcx>(
                 oomir::Type::Class(jvm_name_full)
             }
         }
-        rustc_middle::ty::TyKind::Str => oomir::Type::String,
+        rustc_middle::ty::TyKind::Str => oomir::Type::Str,
         rustc_middle::ty::TyKind::Pat(inner_ty, _) => {
             ty_to_oomir_type(*inner_ty, tcx, data_types, instance_context)
         }
@@ -1641,8 +1641,20 @@ pub fn ty_to_oomir_type<'tcx>(
             let pointee_oomir_type = ty_to_oomir_type(*inner_ty, tcx, data_types, instance_context);
             // For trait objects (&dyn Trait, &mut dyn Trait), represent as direct Interface
             // rather than using the array wrapper, since we call virtual methods on the object
-            if matches!(inner_ty.kind(), rustc_middle::ty::TyKind::Dynamic(_, _)) {
+            if matches!(
+                inner_ty.kind(),
+                rustc_middle::ty::TyKind::Dynamic(_, _)
+                    | rustc_middle::ty::TyKind::Slice(_)
+                    | rustc_middle::ty::TyKind::Str
+            ) {
                 pointee_oomir_type
+            } else if let rustc_middle::ty::TyKind::Array(element_ty, _) = inner_ty.kind() {
+                oomir::Type::Slice(Box::new(ty_to_oomir_type(
+                    *element_ty,
+                    tcx,
+                    data_types,
+                    instance_context,
+                )))
             } else if mutability.is_mut() {
                 oomir::Type::MutableReference(Box::new(pointee_oomir_type))
             } else {
@@ -1653,13 +1665,13 @@ pub fn ty_to_oomir_type<'tcx>(
             if ty.is_str() {
                 // A raw pointer to a string slice (*const str) is semantically a reference
                 // to string data. Its OOMIR representation should be consistent with &str.
-                oomir::Type::String
+                oomir::Type::Str
             } else if ty.is_slice() {
-                // A raw pointer to a slice (*const [T]) should be represented as an array of T.
+                // Preserve the pointer metadata as a slice view.
                 let component_ty = ty.sequence_element_type(tcx);
                 let oomir_component_type =
                     ty_to_oomir_type(component_ty, tcx, data_types, instance_context);
-                oomir::Type::Array(Box::new(oomir_component_type))
+                oomir::Type::Slice(Box::new(oomir_component_type))
             } else {
                 // For a pointer to a sized type (*const T), use the mutable reference
                 // "array hack" to represent it as a reference that can be written back to.
@@ -1675,7 +1687,7 @@ pub fn ty_to_oomir_type<'tcx>(
             // Special case for arrays of string references
             if let TyKind::Ref(_, inner_ty, _) = component_ty.kind() {
                 if inner_ty.is_str() {
-                    return oomir::Type::Array(Box::new(oomir::Type::String));
+                    return oomir::Type::Array(Box::new(oomir::Type::Str));
                 }
             }
             // Default array handling
@@ -1776,11 +1788,11 @@ pub fn ty_to_oomir_type<'tcx>(
             // Special case for slices of string references
             if let TyKind::Ref(_, inner_ty, _) = component_ty.kind() {
                 if inner_ty.is_str() {
-                    return oomir::Type::Array(Box::new(oomir::Type::String));
+                    return oomir::Type::Slice(Box::new(oomir::Type::Str));
                 }
             }
             // Default slice handling
-            oomir::Type::Array(Box::new(ty_to_oomir_type(
+            oomir::Type::Slice(Box::new(ty_to_oomir_type(
                 *component_ty,
                 tcx,
                 data_types,
@@ -1946,6 +1958,7 @@ pub fn readable_oomir_type_name(t: &oomir::Type) -> String {
         Type::I64 => "i64".to_string(),
         Type::F32 => "f32".to_string(),
         Type::F64 => "f64".to_string(),
+        Type::Str => "Str".to_string(),
         Type::String => "String".to_string(),
         Type::Void => "Void".to_string(),
         Type::Unit => "Unit".to_string(),
@@ -1954,6 +1967,7 @@ pub fn readable_oomir_type_name(t: &oomir::Type) -> String {
             name.rsplit('/').next().unwrap_or(name).to_string()
         }
         Type::Array(inner) => format!("{}Array", readable_oomir_type_name(inner)),
+        Type::Slice(inner) => format!("{}Slice", readable_oomir_type_name(inner)),
         Type::MutableReference(inner) => format!("Ref{}", readable_oomir_type_name(inner)),
         Type::Interface(name) => {
             // prefix interfaces with I to avoid conflicts with classes

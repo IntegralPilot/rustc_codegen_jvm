@@ -13,6 +13,127 @@ use rustc_middle::{
 };
 use std::collections::HashMap;
 
+pub fn emit_slice_view(
+    source: Operand,
+    source_type: &oomir::Type,
+    from: u64,
+    to: u64,
+    from_end: bool,
+    dest: &str,
+    instructions: &mut Vec<Instruction>,
+) -> oomir::Type {
+    let element_type = match source_type {
+        oomir::Type::Array(element) | oomir::Type::Slice(element) => element.as_ref().clone(),
+        other => panic!("Cannot create a slice view over {other:?}"),
+    };
+    let slice_type = oomir::Type::Slice(Box::new(element_type.clone()));
+    let length_name = format!("{dest}_source_length");
+    instructions.push(Instruction::Length {
+        dest: length_name.clone(),
+        array: source.clone(),
+    });
+
+    let (backing, base_offset) = if matches!(source_type, oomir::Type::Slice(_)) {
+        let backing_object_name = format!("{dest}_backing_object");
+        instructions.push(Instruction::GetField {
+            dest: backing_object_name.clone(),
+            object: source.clone(),
+            field_name: "array".to_string(),
+            field_ty: oomir::Type::Class("java/lang/Object".to_string()),
+            owner_class: oomir::SLICE_VIEW_CLASS.to_string(),
+        });
+        let backing_name = format!("{dest}_backing");
+        let backing_type = oomir::Type::Array(Box::new(element_type));
+        instructions.push(Instruction::Cast {
+            dest: backing_name.clone(),
+            op: Operand::Variable {
+                name: backing_object_name,
+                ty: oomir::Type::Class("java/lang/Object".to_string()),
+            },
+            ty: backing_type.clone(),
+        });
+        let offset_name = format!("{dest}_base_offset");
+        instructions.push(Instruction::GetField {
+            dest: offset_name.clone(),
+            object: source,
+            field_name: "offset".to_string(),
+            field_ty: oomir::Type::I32,
+            owner_class: oomir::SLICE_VIEW_CLASS.to_string(),
+        });
+        (
+            Operand::Variable {
+                name: backing_name,
+                ty: backing_type,
+            },
+            Operand::Variable {
+                name: offset_name,
+                ty: oomir::Type::I32,
+            },
+        )
+    } else {
+        (source, Operand::Constant(oomir::Constant::I32(0)))
+    };
+
+    let offset_name = format!("{dest}_offset");
+    instructions.push(Instruction::Add {
+        dest: offset_name.clone(),
+        op1: base_offset,
+        op2: Operand::Constant(oomir::Constant::I32(from as i32)),
+    });
+    let view_length = if from_end {
+        let after_start_name = format!("{dest}_after_start");
+        instructions.push(Instruction::Sub {
+            dest: after_start_name.clone(),
+            op1: Operand::Variable {
+                name: length_name,
+                ty: oomir::Type::I32,
+            },
+            op2: Operand::Constant(oomir::Constant::I32(from as i32)),
+        });
+        let view_length_name = format!("{dest}_length");
+        instructions.push(Instruction::Sub {
+            dest: view_length_name.clone(),
+            op1: Operand::Variable {
+                name: after_start_name,
+                ty: oomir::Type::I32,
+            },
+            op2: Operand::Constant(oomir::Constant::I32(to as i32)),
+        });
+        Operand::Variable {
+            name: view_length_name,
+            ty: oomir::Type::I32,
+        }
+    } else {
+        Operand::Constant(oomir::Constant::I32((to - from) as i32))
+    };
+
+    let object_name = format!("{dest}_object");
+    instructions.push(Instruction::ConstructObject {
+        dest: object_name.clone(),
+        class_name: oomir::SLICE_VIEW_CLASS.to_string(),
+        args: vec![
+            (backing, oomir::Type::Class("java/lang/Object".to_string())),
+            (
+                Operand::Variable {
+                    name: offset_name,
+                    ty: oomir::Type::I32,
+                },
+                oomir::Type::I32,
+            ),
+            (view_length, oomir::Type::I32),
+        ],
+    });
+    instructions.push(Instruction::Cast {
+        dest: dest.to_string(),
+        op: Operand::Variable {
+            name: object_name,
+            ty: oomir::Type::Class(oomir::SLICE_VIEW_CLASS.to_string()),
+        },
+        ty: slice_type.clone(),
+    });
+    slice_type
+}
+
 pub fn place_to_string<'tcx>(place: &Place<'tcx>, _tcx: TyCtxt<'tcx>) -> String {
     // Base variable name (e.g., "_1")
     format!("_{}", place.local.index()) // Start with base local "_N"
@@ -216,7 +337,7 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
                 let next_var = format!("{}_elem", current_var);
                 // Determine element type from the current type (which should be an array or reference-to-array).
                 current_type = match &current_type {
-                    oomir::Type::Array(inner) => inner.as_ref().clone(),
+                    oomir::Type::Array(inner) | oomir::Type::Slice(inner) => inner.as_ref().clone(),
                     oomir::Type::Reference(inner)
                         if matches!(inner.as_ref(), oomir::Type::Array(_)) =>
                     {
@@ -250,7 +371,7 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
                 let next_var = format!("{}_elem", current_var);
                 // Determine element type based on current_type being an array or reference-to-array.
                 current_type = match &current_type {
-                    oomir::Type::Array(inner) => inner.as_ref().clone(),
+                    oomir::Type::Array(inner) | oomir::Type::Slice(inner) => inner.as_ref().clone(),
                     oomir::Type::Reference(inner)
                         if matches!(inner.as_ref(), oomir::Type::Array(_)) =>
                     {
@@ -307,6 +428,22 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
                         },
                     });
                 }
+                current_var = next_var;
+            }
+            ProjectionElem::Subslice { from, to, from_end } => {
+                let next_var = format!("{}_slice_{}", current_var, proj_index);
+                current_type = emit_slice_view(
+                    Operand::Variable {
+                        name: current_var,
+                        ty: type_before_proj.clone(),
+                    },
+                    &type_before_proj,
+                    from,
+                    to,
+                    from_end,
+                    &next_var,
+                    &mut instructions,
+                );
                 current_var = next_var;
             }
             ProjectionElem::Deref => {
@@ -690,7 +827,7 @@ pub fn emit_instructions_to_set_value<'tcx>(
                 // Target is an array element: base_var_name[index] = source_operand
                 // Ensure the base is actually an array or ref-to-array
                 match &base_oomir_type {
-                    oomir::Type::Array(_) => {}
+                    oomir::Type::Array(_) | oomir::Type::Slice(_) => {}
                     oomir::Type::Reference(t) if matches!(t.as_ref(), oomir::Type::Array(_)) => {}
                     _ => panic!(
                         "ArrayStore target base '{}' (Place: {:?}) is not an array or reference-to-array type: {:?}",
@@ -724,7 +861,7 @@ pub fn emit_instructions_to_set_value<'tcx>(
                 // Target is array element with constant index: base_var_name[const_idx] = source_operand
                 // Ensure the base is actually an array or ref-to-array
                 match &base_oomir_type {
-                    oomir::Type::Array(_) => {}
+                    oomir::Type::Array(_) | oomir::Type::Slice(_) => {}
                     oomir::Type::Reference(t) if matches!(t.as_ref(), oomir::Type::Array(_)) => {}
                     _ => panic!(
                         "ArrayStore target base '{}' (Place: {:?}) is not an array or reference-to-array type: {:?}",

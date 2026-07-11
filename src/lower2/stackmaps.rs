@@ -404,11 +404,18 @@ fn solve_frame_states(
         let successors = transfer_instruction(
             index,
             &instructions[index],
-            input_state,
+            input_state.clone(),
             local_hints,
             constant_pool,
             context,
-        )?;
+        )
+        .map_err(|error| jvm::Error::VerificationError {
+            context: context.to_string(),
+            message: format!(
+                "Stack-map transfer failed at instruction {index} ({:?}) with input stack {:?}: {error:?}",
+                instructions[index], input_state.stack
+            ),
+        })?;
 
         for (target, successor_state) in successors {
             if target >= instructions.len() {
@@ -1482,9 +1489,11 @@ fn frame_value_from_oomir_type(ty: &Type) -> FrameValue {
         Type::I64 => FrameValue::Long,
         Type::F32 => FrameValue::Float,
         Type::F64 => FrameValue::Double,
+        Type::Str => FrameValue::Object(oomir::UTF8_VIEW_CLASS.to_string()),
         Type::String => FrameValue::Object("java/lang/String".to_string()),
         Type::Class(name) | Type::Interface(name) => FrameValue::Object(normalize_class_name(name)),
         Type::Array(_) | Type::MutableReference(_) => FrameValue::Object(ty.to_jvm_descriptor()),
+        Type::Slice(_) => FrameValue::Object(oomir::SLICE_VIEW_CLASS.to_string()),
         Type::Reference(inner) => {
             if inner.is_jvm_reference_type() {
                 frame_value_from_oomir_type(inner)
