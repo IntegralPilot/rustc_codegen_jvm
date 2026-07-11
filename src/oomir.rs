@@ -133,14 +133,20 @@ pub struct Signature {
 }
 
 impl Signature {
+    fn write_jvm_params(&self, result: &mut String, params: &[(String, Type)]) {
+        for (_param_name, param_type) in params {
+            if param_type.has_jvm_value() {
+                result.push_str(&param_type.to_jvm_descriptor());
+            }
+        }
+    }
+
     pub fn to_jvm_descriptor_with_explicit_params(&self) -> String {
         let mut result = String::new();
         result.push('(');
-        for (_param_name, param_type) in &self.params {
-            result.push_str(&param_type.to_jvm_descriptor());
-        }
+        self.write_jvm_params(&mut result, &self.params);
         result.push(')');
-        result.push_str(&self.ret.to_jvm_descriptor());
+        result.push_str(&self.ret.to_jvm_return_descriptor());
         result
     }
 
@@ -206,11 +212,9 @@ impl Signature {
         } else {
             &self.params[..]
         };
-        for (_param_name, param_type) in params_to_iterate {
-            result.push_str(&param_type.to_jvm_descriptor());
-        }
+        self.write_jvm_params(&mut result, params_to_iterate);
         result.push(')');
-        result.push_str(&self.ret.to_jvm_descriptor());
+        result.push_str(&self.ret.to_jvm_return_descriptor());
         result
     }
 }
@@ -451,6 +455,7 @@ impl Operand {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Constant {
+    Unit,
     /// A typed JVM null. The type is needed when null appears in a constructor
     /// argument list, because constructor descriptors are exact.
     Null(Type),
@@ -482,8 +487,9 @@ impl Eq for Constant {}
 impl std::hash::Hash for Constant {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         match self {
+            Constant::Unit => 0.hash(state),
             Constant::Null(ty) => {
-                0.hash(state);
+                1.hash(state);
                 ty.hash(state);
             }
             Constant::I8(i) => i.hash(state),
@@ -697,6 +703,8 @@ impl Constant {
 #[allow(dead_code)] /* Reference variant currently unused */
 pub enum Type {
     Void,
+    /// Rust's inhabited, zero-sized unit value. It has no JVM stack value or local slot.
+    Unit,
     Boolean,
     Char,
     I8,
@@ -725,6 +733,9 @@ impl Type {
     pub fn to_jvm_descriptor(&self) -> String {
         match self {
             Type::Void => "V".to_string(),
+            // Unit is only descriptor-compatible as a method return. Parameters and fields
+            // omit it before descriptors are built.
+            Type::Unit => "V".to_string(),
             Type::Boolean => "Z".to_string(),
             Type::Char => "C".to_string(),
             Type::I8 => "B".to_string(),
@@ -741,12 +752,32 @@ impl Type {
             Type::Class(name) | Type::Interface(name) => format!("L{};", name.replace('.', "/")),
             Type::Reference(inner) => inner.to_jvm_descriptor(),
             Type::MutableReference(inner) => {
-                format!("[{}", inner.to_jvm_descriptor())
+                if inner.has_jvm_value() {
+                    format!("[{}", inner.to_jvm_descriptor())
+                } else {
+                    "Ljava/lang/Object;".to_string()
+                }
             }
             Type::Array(element_type) => {
-                format!("[{}", element_type.to_jvm_descriptor())
+                if element_type.has_jvm_value() {
+                    format!("[{}", element_type.to_jvm_descriptor())
+                } else {
+                    "[Ljava/lang/Object;".to_string()
+                }
             }
         }
+    }
+
+    pub fn to_jvm_return_descriptor(&self) -> String {
+        if matches!(self, Type::Unit | Type::Void) {
+            "V".to_string()
+        } else {
+            self.to_jvm_descriptor()
+        }
+    }
+
+    pub fn has_jvm_value(&self) -> bool {
+        !matches!(self, Type::Unit | Type::Void)
     }
 
     pub fn from_jvm_descriptor(descriptor: &str) -> Self {
@@ -825,6 +856,7 @@ impl Type {
             | Type::Reference(_) => Some(JVMInstruction::Aastore),
             Type::MutableReference(box t) => t.get_jvm_array_store_instruction(),
             Type::Void => None,
+            Type::Unit => None,
         }
     }
 
@@ -850,12 +882,14 @@ impl Type {
             | Type::MutableReference(_)
             | Type::Interface(_) => Some(JVMInstruction::Aaload),
             Type::Void => None,
+            Type::Unit => None,
         }
     }
 
     /// Create a Type from a Constant.
     pub fn from_constant(constant: &Constant) -> Self {
         match constant {
+            Constant::Unit => Type::Unit,
             Constant::Null(ty) => ty.clone(),
             Constant::I8(_) => Type::I8,
             Constant::I16(_) => Type::I16,
@@ -970,6 +1004,7 @@ impl Type {
             }
             // Primitive types, Void, and String are unaffected
             Type::Void
+            | Type::Unit
             | Type::Boolean
             | Type::Char
             | Type::I8
@@ -1020,8 +1055,10 @@ impl fmt::Display for Signature {
             &self.params[..]
         };
         for (_param_name, param_ty) in params_to_iterate {
-            write!(f, "{}", param_ty.to_jvm_descriptor())?;
+            if param_ty.has_jvm_value() {
+                write!(f, "{}", param_ty.to_jvm_descriptor())?;
+            }
         }
-        write!(f, "){}", self.ret.to_jvm_descriptor())
+        write!(f, "){}", self.ret.to_jvm_return_descriptor())
     }
 }

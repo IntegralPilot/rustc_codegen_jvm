@@ -297,7 +297,7 @@ pub fn convert_basic_block<'tcx>(
                     let oomir_output_type =
                         super::types::ty_to_oomir_type(fn_output, tcx, data_types, instance);
 
-                    let effective_dest = if matches!(oomir_output_type, oomir::Type::Void) {
+                    let effective_dest = if !oomir_output_type.has_jvm_value() {
                         None
                     } else {
                         dest_var_name.clone()
@@ -555,7 +555,7 @@ pub fn convert_basic_block<'tcx>(
                         super::types::fn_ptr_signature_from_ty(func_ty, tcx, data_types, instance);
                     super::types::ensure_fn_ptr_interface(&oomir_sig, data_types, tcx, instance);
 
-                    let effective_dest = if matches!(oomir_sig.ret.as_ref(), oomir::Type::Void) {
+                    let effective_dest = if !oomir_sig.ret.has_jvm_value() {
                         None
                     } else {
                         dest_var_name.clone()

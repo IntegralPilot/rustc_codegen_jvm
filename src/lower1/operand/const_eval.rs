@@ -510,6 +510,9 @@ pub fn read_constant_value_from_memory<'tcx>(
         }
 
         TyKind::Tuple(field_tys) => {
+            if field_tys.is_empty() {
+                return Ok(oomir::Constant::Unit);
+            }
             let mut fields_map = HashMap::new();
             let mut params = Vec::new();
             match layout.fields {
@@ -830,7 +833,7 @@ fn handle_constant_enum<'tcx>(
         let field_idx = FieldIdx::from_usize(i);
         let field_ty = field_def.ty(tcx, substs).skip_norm_wip();
         let field_oomir_ty = ty_to_oomir_type(field_ty, tcx, oomir_data_types, instance);
-        if matches!(field_oomir_ty, oomir::Type::Void) {
+        if !field_oomir_ty.has_jvm_value() {
             continue;
         }
 
@@ -915,7 +918,7 @@ fn handle_constant_enum<'tcx>(
                 oomir_data_types,
                 instance,
             );
-            if !matches!(field_type, oomir::Type::Void) {
+            if field_type.has_jvm_value() {
                 let field_name = format!("field{}", fields.len());
                 fields.push((field_name, field_type));
             }

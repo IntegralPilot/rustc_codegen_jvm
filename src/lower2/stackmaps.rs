@@ -184,7 +184,9 @@ pub(super) fn initial_locals_for_oomir_function(
 
     let first_explicit_param = if is_static { 0 } else { 1 };
     for (_, param_ty) in function.signature.params.iter().skip(first_explicit_param) {
-        push_local_value(&mut locals, frame_value_from_oomir_type(param_ty));
+        if param_ty.has_jvm_value() {
+            push_local_value(&mut locals, frame_value_from_oomir_type(param_ty));
+        }
     }
     locals
 }
@@ -1479,7 +1481,7 @@ fn load_hint_for_instruction(instruction: &Instruction) -> FrameValue {
 
 fn frame_value_from_oomir_type(ty: &Type) -> FrameValue {
     match ty {
-        Type::Void => FrameValue::Top,
+        Type::Unit | Type::Void => FrameValue::Top,
         Type::Boolean | Type::Char | Type::I8 | Type::I16 | Type::I32 => FrameValue::Integer,
         Type::I64 => FrameValue::Long,
         Type::F32 => FrameValue::Float,

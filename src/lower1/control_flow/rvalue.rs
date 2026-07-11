@@ -128,7 +128,7 @@ fn ensure_fn_pointer_adapter_class<'tcx>(
     method_params.extend(signature.params.iter().cloned());
 
     let instructions = if let Some(target_function) = target_function {
-        let call_dest = if *signature.ret == oomir::Type::Void {
+        let call_dest = if !signature.ret.has_jvm_value() {
             None
         } else {
             Some("_ret".to_string())
@@ -1267,7 +1267,8 @@ pub fn convert_rvalue_to_operand<'a>(
                                     data_types,
                                     instance,
                                 );
-                                (!matches!(field_ty, oomir::Type::Void))
+                                field_ty
+                                    .has_jvm_value()
                                     .then(|| (f.ident(tcx).to_string(), field_ty))
                             })
                             .collect();
@@ -1310,7 +1311,7 @@ pub fn convert_rvalue_to_operand<'a>(
                             let field_mir_ty = field_def.ty(tcx, substs).skip_norm_wip();
                             let field_oomir_type =
                                 ty_to_oomir_type(field_mir_ty, tcx, data_types, instance);
-                            if matches!(field_oomir_type, oomir::Type::Void) {
+                            if !field_oomir_type.has_jvm_value() {
                                 continue;
                             }
                             let value_operand = convert_operand(
@@ -1371,8 +1372,7 @@ pub fn convert_rvalue_to_operand<'a>(
                                                 data_types,
                                                 instance,
                                             );
-                                            (!matches!(field_ty, oomir::Type::Void))
-                                                .then_some(field_ty)
+                                            field_ty.has_jvm_value().then_some(field_ty)
                                         })
                                         .collect();
                                     (v_name, v_fields)
@@ -1500,7 +1500,7 @@ pub fn convert_rvalue_to_operand<'a>(
                                     data_types,
                                     instance,
                                 );
-                                if !matches!(field_type, oomir::Type::Void) {
+                                if field_type.has_jvm_value() {
                                     let field_name = format!("field{}", fields.len());
                                     fields.push((field_name, field_type));
                                 }
@@ -1532,7 +1532,7 @@ pub fn convert_rvalue_to_operand<'a>(
                             let field_mir_ty = field.ty(tcx, substs).skip_norm_wip();
                             let field_oomir_type =
                                 ty_to_oomir_type(field_mir_ty, tcx, data_types, instance);
-                            if matches!(field_oomir_type, oomir::Type::Void) {
+                            if !field_oomir_type.has_jvm_value() {
                                 continue;
                             }
                             let value_operand = convert_operand(
@@ -1570,7 +1570,7 @@ pub fn convert_rvalue_to_operand<'a>(
                         let field_mir_ty = field_def.ty(tcx, substs).skip_norm_wip();
                         let field_oomir_ty =
                             ty_to_oomir_type(field_mir_ty, tcx, data_types, instance);
-                        let is_unit = matches!(field_oomir_ty, oomir::Type::Void);
+                        let is_unit = !field_oomir_ty.has_jvm_value();
                         let value_operand = (!is_unit).then(|| {
                             let value = convert_operand(
                                 &operands[FieldIdx::from_usize(0)],

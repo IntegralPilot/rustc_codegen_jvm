@@ -235,7 +235,15 @@ pub fn handle_const_value<'tcx>(
                 "const-eval",
                 format!("Info: Encountered ZeroSized constant for type {:?}", ty)
             );
-            oomir::Operand::Constant(oomir::Constant::I32(0))
+            let oomir_ty = super::types::ty_to_oomir_type(*ty, tcx, data_types, instance);
+            if oomir_ty == oomir::Type::Unit {
+                oomir::Operand::Constant(oomir::Constant::Unit)
+            } else {
+                // Other ZSTs can still have nominal identity (for example fieldless structs).
+                // Keep their existing placeholder representation until nominal ZST constants
+                // are represented directly.
+                oomir::Operand::Constant(oomir::Constant::I32(0))
+            }
         }
         ConstValue::Indirect { alloc_id, offset } => {
             breadcrumbs::log!(

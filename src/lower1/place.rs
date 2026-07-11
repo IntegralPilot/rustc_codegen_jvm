@@ -131,7 +131,7 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
                     let next_var = format!("{}_{}", current_var, field_index.index());
                     let obj_type = current_type.clone();
                     current_type = ty_to_oomir_type(field_ty, tcx, data_types, instance);
-                    let is_unit = matches!(current_type, oomir::Type::Void);
+                    let is_unit = !current_type.has_jvm_value();
                     instructions.push(oomir::Instruction::InvokeVirtual {
                         dest: (!is_unit).then_some(next_var.clone()),
                         class_name: owner_class_name.clone(),
@@ -452,7 +452,7 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
                             data_types,
                             instance,
                         );
-                        if !matches!(field_type, oomir::Type::Void) {
+                        if field_type.has_jvm_value() {
                             let field_name = format!("field{}", fields.len());
                             fields.push((field_name, field_type));
                         }
@@ -611,7 +611,7 @@ pub fn emit_instructions_to_set_value<'tcx>(
                         };
                     let field_name = union_field_name(adt_def, field_index.index(), tcx);
                     let field_ty = ty_to_oomir_type(*field_mir_ty, tcx, data_types, instance);
-                    let is_unit = matches!(field_ty, oomir::Type::Void);
+                    let is_unit = !field_ty.has_jvm_value();
                     let source_operand = adapt_simple_enum_operand(
                         source_operand,
                         &field_ty,

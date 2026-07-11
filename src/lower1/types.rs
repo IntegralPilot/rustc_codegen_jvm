@@ -391,7 +391,7 @@ fn ensure_enum_data_types<'tcx>(
                         data_types,
                         instance_context,
                     );
-                    (!matches!(field_ty, oomir::Type::Void)).then_some(field_ty)
+                    field_ty.has_jvm_value().then_some(field_ty)
                 })
                 .collect();
             (variant_name, fields)
@@ -444,7 +444,7 @@ fn ensure_enum_data_types<'tcx>(
                     data_types,
                     instance_context,
                 );
-                (!matches!(field_ty, oomir::Type::Void)).then_some(field_ty)
+                field_ty.has_jvm_value().then_some(field_ty)
             })
             .enumerate()
             .map(|(field_idx, field_ty)| (format!("field{}", field_idx), field_ty))
@@ -1079,7 +1079,7 @@ fn emit_ty_from_union_bytes<'tcx>(
             for (idx, field_def) in variant.fields.iter().enumerate() {
                 let field_ty = field_def.ty(tcx, substs).skip_norm_wip();
                 let field_oomir_ty = ty_to_oomir_type(field_ty, tcx, data_types, instance_context);
-                if matches!(field_oomir_ty, oomir::Type::Void) {
+                if !field_oomir_ty.has_jvm_value() {
                     continue;
                 }
                 let field_offset = layout.fields.offset(idx).bytes_usize();
@@ -1150,7 +1150,7 @@ fn union_from_function<'tcx>(
     data_types: &mut HashMap<String, oomir::DataType>,
     instance_context: rustc_middle::ty::Instance<'tcx>,
 ) -> oomir::Function {
-    let is_unit = matches!(field_oomir_ty, oomir::Type::Void);
+    let is_unit = !field_oomir_ty.has_jvm_value();
     let mut instructions = vec![oomir::Instruction::NewArray {
         dest: "_bytes".to_string(),
         element_type: oomir::Type::I8,
@@ -1220,7 +1220,7 @@ fn union_getter_function<'tcx>(
     data_types: &mut HashMap<String, oomir::DataType>,
     instance_context: rustc_middle::ty::Instance<'tcx>,
 ) -> oomir::Function {
-    if matches!(field_oomir_ty, oomir::Type::Void) {
+    if !field_oomir_ty.has_jvm_value() {
         return oomir::Function {
             name: union_getter_method_name(field_name),
             owner_class: None,
@@ -1297,7 +1297,7 @@ fn union_setter_function<'tcx>(
     data_types: &mut HashMap<String, oomir::DataType>,
     instance_context: rustc_middle::ty::Instance<'tcx>,
 ) -> oomir::Function {
-    let is_unit = matches!(field_oomir_ty, oomir::Type::Void);
+    let is_unit = !field_oomir_ty.has_jvm_value();
     let mut instructions = vec![oomir::Instruction::GetField {
         dest: "_bytes".to_string(),
         object: operand_var("_1", oomir::Type::Class(union_class.to_string())),
@@ -1573,7 +1573,8 @@ pub fn ty_to_oomir_type<'tcx>(
                                     data_types,
                                     instance_context,
                                 );
-                                (!matches!(field_oomir_type, oomir::Type::Void))
+                                field_oomir_type
+                                    .has_jvm_value()
                                     .then_some((field_name, field_oomir_type))
                             })
                             .collect::<Vec<_>>();
@@ -1676,9 +1677,9 @@ pub fn ty_to_oomir_type<'tcx>(
             )))
         }
         rustc_middle::ty::TyKind::Tuple(tuple_elements) => {
-            // Handle the unit type () -> Void
+            // Unit is an inhabited Rust value, but occupies no JVM stack or local slot.
             if tuple_elements.is_empty() {
-                return oomir::Type::Void;
+                return oomir::Type::Unit;
             }
 
             // Handle non-empty tuples -> generate a class
@@ -1937,6 +1938,7 @@ pub fn readable_oomir_type_name(t: &oomir::Type) -> String {
         Type::F64 => "f64".to_string(),
         Type::String => "String".to_string(),
         Type::Void => "Void".to_string(),
+        Type::Unit => "Unit".to_string(),
         Type::Class(name) => {
             // take last path segment for readability (e.g. java/lang/String -> String)
             name.rsplit('/').next().unwrap_or(name).to_string()

@@ -101,6 +101,7 @@ pub fn load_constant(
     let mut instructions_to_add = Vec::new();
 
     match constant {
+        OC::Unit => {}
         OC::I8(v) => instructions_to_add.push(get_int_const_instr(cp, *v as i32)),
         OC::I16(v) => instructions_to_add.push(get_int_const_instr(cp, *v as i32)),
         OC::I32(v) => instructions_to_add.push(get_int_const_instr(cp, *v)),

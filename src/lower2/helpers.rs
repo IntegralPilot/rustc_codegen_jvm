@@ -5,9 +5,10 @@ use ristretto_classfile::{self as jvm, attributes::Instruction};
 
 use super::{BIG_DECIMAL_CLASS, BIG_INTEGER_CLASS};
 
-/// Returns the number of JVM local variable slots a type occupies (1 or 2).
+/// Returns the number of JVM local variable slots a type occupies (0, 1, or 2).
 pub fn get_type_size(ty: &Type) -> u16 {
     match ty {
+        Type::Unit | Type::Void => 0,
         Type::I64 | Type::F64 => 2,
         _ => 1,
     }
@@ -84,7 +85,7 @@ pub fn get_load_instruction(ty: &Type, index: u16) -> Result<Instruction, jvm::E
             _ => Instruction::Aload_w(index),
         },
         // For void, return an error
-        Type::Void => {
+        Type::Unit | Type::Void => {
             return Err(jvm::Error::VerificationError {
                 context: "get_load_instruction".to_string(),
                 message: "Cannot load void type".to_string(),
@@ -172,7 +173,7 @@ pub fn get_store_instruction(ty: &Type, index: u16) -> Result<Instruction, jvm::
                 Instruction::Astore_w(index)
             }
         }
-        Void => {
+        Unit | Void => {
             return Err(jvm::Error::VerificationError {
                 context: "get_store_instructions".to_string(),
                 message: "Cannot store void type".to_string(),

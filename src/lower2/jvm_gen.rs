@@ -130,7 +130,7 @@ fn create_field_constructor(
     let mut next_local = 1;
     let mut max_field_stack = 1;
 
-    for (field_name, field_ty) in fields {
+    for (field_name, field_ty) in fields.iter().filter(|(_, ty)| ty.has_jvm_value()) {
         let field_ref =
             cp.add_field_ref(this_class_index, field_name, &field_ty.to_jvm_descriptor())?;
         instructions.push(Instruction::Aload_0);
@@ -183,7 +183,7 @@ fn return_instruction_for_type(ty: &Type) -> Instruction {
         Type::I64 => Instruction::Lreturn,
         Type::F32 => Instruction::Freturn,
         Type::F64 => Instruction::Dreturn,
-        Type::Void => Instruction::Return,
+        Type::Unit | Type::Void => Instruction::Return,
         Type::Reference(_)
         | Type::MutableReference(_)
         | Type::Array(_)
@@ -229,6 +229,9 @@ fn create_static_instance_bridge(
     let mut next_local = 0;
     let mut max_stack = 0;
     for (_, param_ty) in &bridge_signature.params {
+        if !param_ty.has_jvm_value() {
+            continue;
+        }
         instructions.push(get_load_instruction(param_ty, next_local)?);
         let size = get_type_size(param_ty);
         max_stack += size;
@@ -238,7 +241,10 @@ fn create_static_instance_bridge(
     instructions.push(return_instruction_for_type(bridge_signature.ret.as_ref()));
 
     let mut parameters = Vec::new();
-    for (param_name, _) in &bridge_signature.params {
+    for (param_name, param_ty) in &bridge_signature.params {
+        if !param_ty.has_jvm_value() {
+            continue;
+        }
         let name_index = cp.add_utf8(param_name)?;
         parameters.push(jvm::attributes::MethodParameter {
             name_index,
@@ -247,7 +253,7 @@ fn create_static_instance_bridge(
     }
     let method_parameters_attribute_name_index = cp.add_utf8("MethodParameters")?;
 
-    let return_stack = if *bridge_signature.ret == Type::Void {
+    let return_stack = if !bridge_signature.ret.has_jvm_value() {
         0
     } else {
         get_type_size(bridge_signature.ret.as_ref())
@@ -295,7 +301,18 @@ pub(super) fn oomir_type_to_ristretto_field_type(
             let inner_ty = ref2.as_ref();
             oomir_type_to_ristretto_field_type(inner_ty)
         }
-        oomir::Type::Array(inner_ty) | oomir::Type::MutableReference(inner_ty) => {
+        oomir::Type::Array(inner_ty) => {
+            let inner_field_type = if inner_ty.has_jvm_value() {
+                oomir_type_to_ristretto_field_type(inner_ty)
+            } else {
+                jvm::FieldType::Object("java/lang/Object".to_string())
+            };
+            jvm::FieldType::Array(Box::new(inner_field_type))
+        }
+        oomir::Type::MutableReference(inner_ty) if !inner_ty.has_jvm_value() => {
+            jvm::FieldType::Object("java/lang/Object".to_string())
+        }
+        oomir::Type::MutableReference(inner_ty) => {
             let inner_field_type = oomir_type_to_ristretto_field_type(inner_ty);
             jvm::FieldType::Array(Box::new(inner_field_type))
         }
@@ -304,6 +321,9 @@ pub(super) fn oomir_type_to_ristretto_field_type(
         }
         oomir::Type::Void => {
             panic!("Void type cannot be used as a field type");
+        }
+        oomir::Type::Unit => {
+            panic!("Unit has no JVM field representation");
         }
     }
 }
@@ -420,6 +440,10 @@ pub(super) fn create_data_type_classfile_for_class(
     subclasses: Vec<String>,
     nest_host: Option<String>,
 ) -> jvm::Result<Vec<u8>> {
+    let fields: Vec<_> = fields
+        .into_iter()
+        .filter(|(_, field_ty)| field_ty.has_jvm_value())
+        .collect();
     let mut cp = InternedConstantPool::default();
 
     let this_class_index = cp.add_class(class_name_jvm)?;
@@ -570,7 +594,10 @@ pub(super) fn create_data_type_classfile_for_class(
                 } else {
                     &function.signature.params[..]
                 };
-                for (name, _) in params_to_iterate {
+                for (name, param_ty) in params_to_iterate {
+                    if !param_ty.has_jvm_value() {
+                        continue;
+                    }
                     let name_index = cp.add_utf8(name)?;
                     parameters_for_attribute.push(jvm::attributes::MethodParameter {
                         name_index,
@@ -717,6 +744,9 @@ pub(super) fn create_data_type_classfile_for_class(
                             let variant_class_idx = cp.add_class(&variant_class_name)?;
 
                             for (field_idx, field_ty) in fields.iter().enumerate() {
+                                if !field_ty.has_jvm_value() {
+                                    continue;
+                                }
                                 append_field_equality_check(
                                     module,
                                     &mut cp,
@@ -781,6 +811,9 @@ pub(super) fn create_data_type_classfile_for_class(
                         let mut false_fixups = Vec::new();
 
                         for (field_name, field_ty) in fields {
+                            if !field_ty.has_jvm_value() {
+                                continue;
+                            }
                             append_field_equality_check(
                                 module,
                                 &mut cp,
@@ -943,10 +976,12 @@ pub(super) fn create_data_type_classfile_for_interface(
         // Construct the descriptor: (param1_desc param2_desc ...)return_desc
         let mut descriptor = String::from("(");
         for (_param_name, param_type) in &signature.params {
-            descriptor.push_str(&param_type.to_jvm_descriptor());
+            if param_type.has_jvm_value() {
+                descriptor.push_str(&param_type.to_jvm_descriptor());
+            }
         }
         descriptor.push(')');
-        descriptor.push_str(&signature.ret.to_jvm_descriptor());
+        descriptor.push_str(&signature.ret.to_jvm_return_descriptor());
 
         let name_index = cp.add_utf8(method_name)?;
         let descriptor_index = cp.add_utf8(&descriptor)?;
@@ -1043,7 +1078,7 @@ fn create_code_from_method_name_and_constant_return(
         | oomir::Type::String
         | oomir::Type::Class(_)
         | oomir::Type::Interface(_) => Instruction::Areturn,
-        oomir::Type::Void => Instruction::Return, // Should not happen with Some(op)
+        oomir::Type::Unit | oomir::Type::Void => Instruction::Return,
     };
 
     instructions.push(return_instr);

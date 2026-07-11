@@ -860,20 +860,74 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
     }
 
     /// Appends JVM instructions for loading an operand onto the stack.
+    fn zero_sized_class_name(&self, ty: &oomir::Type) -> Option<String> {
+        let oomir::Type::Class(class_name) = ty else {
+            return None;
+        };
+        match self.module.data_types.get(class_name) {
+            Some(oomir::DataType::Class {
+                fields,
+                is_abstract: false,
+                ..
+            }) if fields.iter().all(|(_, field_ty)| !field_ty.has_jvm_value()) => {
+                Some(class_name.clone())
+            }
+            _ => None,
+        }
+    }
+
+    fn construct_zero_sized_class_value(&mut self, class_name: &str) -> Result<(), jvm::Error> {
+        let class_index = self.constant_pool.add_class(class_name)?;
+        let constructor = self
+            .constant_pool
+            .add_method_ref(class_index, "<init>", "()V")?;
+        self.jvm_instructions.push(Instruction::New(class_index));
+        self.jvm_instructions.push(Instruction::Dup);
+        self.jvm_instructions
+            .push(Instruction::Invokespecial(constructor));
+        Ok(())
+    }
+
+    fn materialize_zero_sized_local(
+        &mut self,
+        var_name: &str,
+        ty: &oomir::Type,
+    ) -> Result<bool, jvm::Error> {
+        if self.local_var_map.contains_key(var_name) {
+            return Ok(false);
+        }
+        let Some(class_name) = self.zero_sized_class_name(ty) else {
+            return Ok(false);
+        };
+        self.construct_zero_sized_class_value(&class_name)?;
+        self.store_result(var_name, ty)?;
+        Ok(true)
+    }
+
     fn load_operand(&mut self, operand: &oomir::Operand) -> Result<(), jvm::Error> {
+        if operand
+            .get_type()
+            .is_some_and(|operand_ty| !operand_ty.has_jvm_value())
+        {
+            return Ok(());
+        }
         match operand {
             oomir::Operand::Constant(c) => {
                 load_constant(&mut self.jvm_instructions, &mut self.constant_pool, c)?
             }
             oomir::Operand::Variable { name: var_name, ty } => {
+                self.materialize_zero_sized_local(var_name, ty)?;
                 // For instance methods, _1 is mapped to slot 0 as the raw 'this' pointer
                 // Use the actual JVM type from local_var_types if available (for _1 in instance methods)
                 // Otherwise use the OOMIR operand type
-                let actual_ty = self
+                let mut actual_ty = self
                     .local_var_types
                     .get(var_name)
                     .cloned()
                     .unwrap_or_else(|| ty.clone());
+                if !actual_ty.has_jvm_value() && ty.has_jvm_value() {
+                    actual_ty = ty.clone();
+                }
                 let index = self.get_or_assign_local(var_name, &actual_ty);
                 let load_instr = get_load_instruction(&actual_ty, index)?;
                 self.jvm_instructions.push(load_instr);
@@ -888,6 +942,24 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         expected_ty: &oomir::Type,
     ) -> Result<(), jvm::Error> {
         let actual_ty = get_operand_type(operand);
+        if !expected_ty.has_jvm_value() {
+            return Ok(());
+        }
+        if matches!(expected_ty, oomir::Type::MutableReference(inner) if !inner.has_jvm_value())
+            && actual_ty != *expected_ty
+        {
+            if actual_ty.has_jvm_value() {
+                self.load_operand(operand)?;
+                self.jvm_instructions.extend(get_cast_instructions(
+                    &actual_ty,
+                    &oomir::Type::Class("java/lang/Object".to_string()),
+                    self.constant_pool,
+                )?);
+            } else {
+                self.construct_zero_sized_class_value("java/lang/Object")?;
+            }
+            return Ok(());
+        }
         if actual_ty != *expected_ty
             && let oomir::Type::Class(class_name) = expected_ty
             && oomir::is_non_null_class_name(class_name)
@@ -929,6 +1001,11 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
     /// Appends JVM instructions for storing the value currently on top of the stack
     /// into a local variable.
     fn store_result(&mut self, dest_var: &str, ty: &oomir::Type) -> Result<(), jvm::Error> {
+        if !ty.has_jvm_value() {
+            self.local_var_types
+                .insert(dest_var.to_string(), ty.clone());
+            return Ok(());
+        }
         // Assign or update the local variable slot with the provided type
         let index: u16 = self.get_or_assign_local(dest_var, ty);
         let store_instr = get_store_instruction(ty, index)?;
@@ -1151,7 +1228,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     | Type::Reference(_)
                     | Type::MutableReference(_)
                     | Type::Array(_) => Ok((t1.clone(), None, None)), // Assume comparable for now, specific logic in main function handles details
-                    Type::Void => Err(jvm::Error::VerificationError {
+                    Type::Unit | Type::Void => Err(jvm::Error::VerificationError {
                         context: format!("Function {}", self.oomir_func.name),
                         message: format!("Cannot compare void types"),
                     }),
@@ -1269,6 +1346,21 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
     ) -> Result<(), jvm::Error> {
         let op1_type = get_operand_type(op1);
         let op2_type = get_operand_type(op2);
+
+        if op1_type == Type::Unit && op2_type == Type::Unit {
+            let value = match comp_op {
+                "eq" | "le" | "ge" => true,
+                "ne" | "lt" | "gt" => false,
+                _ => unreachable!(),
+            };
+            self.jvm_instructions.push(if value {
+                Instruction::Iconst_1
+            } else {
+                Instruction::Iconst_0
+            });
+            self.store_result(dest, &Type::Boolean)?;
+            return Ok(());
+        }
 
         // Determine the type to compare operands as, and if casting is needed
         let (comparison_type, cast1_target, cast2_target) =
@@ -2668,7 +2760,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                             | oomir::Type::String
                             | oomir::Type::Class(_)
                             | oomir::Type::Interface(_) => JI::Areturn,
-                            oomir::Type::Void => JI::Return, // Should not happen with Some(op)
+                            oomir::Type::Unit | oomir::Type::Void => JI::Return,
                         };
                         self.jvm_instructions.push(return_instr);
                     }
@@ -2780,8 +2872,8 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                             ),
                         });
                     }
-                    for (arg, _) in args.iter().zip(target_sig.params.iter()) {
-                        self.load_call_argument(arg)?; // Use helper to handle references properly
+                    for (arg, (_, expected_ty)) in args.iter().zip(target_sig.params.iter()) {
+                        self.load_call_argument_as(arg, expected_ty)?;
                     }
 
                     // 2. Add MethodRef
@@ -2798,11 +2890,11 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
 
                     // 4. Store result or Pop
                     if let Some(dest_var) = dest {
-                        if *target_sig.ret != oomir::Type::Void {
+                        if target_sig.ret.has_jvm_value() {
                             self.store_result(dest_var, &target_sig.ret)?;
                         } else { /* error storing void */
                         }
-                    } else if *target_sig.ret != oomir::Type::Void {
+                    } else if target_sig.ret.has_jvm_value() {
                         match get_type_size(&target_sig.ret) {
                             1 => self.jvm_instructions.push(JI::Pop),
                             2 => self.jvm_instructions.push(JI::Pop2),
@@ -2856,10 +2948,10 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     .push(JI::Invokeinterface(method_ref, count));
 
                 if let Some(dest_var) = dest {
-                    if *signature.ret != oomir::Type::Void {
+                    if signature.ret.has_jvm_value() {
                         self.store_result(dest_var, &signature.ret)?;
                     }
-                } else if *signature.ret != oomir::Type::Void {
+                } else if signature.ret.has_jvm_value() {
                     match get_type_size(&signature.ret) {
                         1 => self.jvm_instructions.push(JI::Pop),
                         2 => self.jvm_instructions.push(JI::Pop2),
@@ -3197,6 +3289,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 let constructor_descriptor = format!(
                     "({})V",
                     args.iter()
+                        .filter(|(_, ty)| ty.has_jvm_value())
                         .map(|(_, ty)| ty.to_jvm_descriptor())
                         .collect::<String>()
                 );
@@ -3213,7 +3306,9 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 self.jvm_instructions.push(JI::Dup); // Stack: [uninitialized_ref, uninitialized_ref]
 
                 for (arg, arg_ty) in args {
-                    self.load_operand_as(arg, arg_ty)?;
+                    if arg_ty.has_jvm_value() {
+                        self.load_operand_as(arg, arg_ty)?;
+                    }
                 }
 
                 // 5. Emit 'invokespecial' to call the constructor
@@ -3226,6 +3321,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 self.store_result(dest, &dest_type)?; // Stack: []
             }
 
+            OI::SetField { field_ty, .. } if !field_ty.has_jvm_value() => {}
             OI::SetField {
                 object,
                 field_name,
@@ -3272,6 +3368,9 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 self.jvm_instructions.push(JI::Putfield(field_ref_index)); // Stack: []
             }
 
+            OI::GetField { dest, field_ty, .. } if !field_ty.has_jvm_value() => {
+                self.local_var_types.insert(dest.clone(), field_ty.clone());
+            }
             OI::GetField {
                 dest,
                 object,
@@ -3353,7 +3452,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 if let Some(dest_var) = dest {
                     // Store the result in the destination variable
                     self.store_result(dest_var, &method_ty.ret)?;
-                } else if *method_ty.ret.as_ref() != oomir::Type::Void {
+                } else if method_ty.ret.has_jvm_value() {
                     // Pop the result if it's not void and no destination is provided
                     match get_type_size(&method_ty.ret) {
                         1 => self.jvm_instructions.push(JI::Pop),
@@ -3363,6 +3462,23 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 }
             }
 
+            OI::InvokeVirtual {
+                dest,
+                method_name,
+                operand,
+                ..
+            } if operand.get_type() == Some(oomir::Type::Unit)
+                && matches!(method_name.as_str(), "eq" | "ne") =>
+            {
+                if let Some(dest_var) = dest {
+                    self.jvm_instructions.push(if method_name == "eq" {
+                        JI::Iconst_1
+                    } else {
+                        JI::Iconst_0
+                    });
+                    self.store_result(dest_var, &oomir::Type::Boolean)?;
+                }
+            }
             OI::InvokeVirtual {
                 dest,
                 class_name,
@@ -3415,7 +3531,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 if let Some(dest_var) = dest {
                     // Store the result in the destination variable
                     self.store_result(dest_var, &method_ty.ret)?;
-                } else if *method_ty.ret.as_ref() != oomir::Type::Void {
+                } else if method_ty.ret.has_jvm_value() {
                     // Pop the result if it's not void and no destination is provided
                     match get_type_size(&method_ty.ret) {
                         1 => self.jvm_instructions.push(JI::Pop),
@@ -3468,7 +3584,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 if let Some(dest_var) = dest {
                     // Store the result in the destination variable
                     self.store_result(dest_var, &method_ty.ret)?;
-                } else if *method_ty.ret.as_ref() != oomir::Type::Void {
+                } else if method_ty.ret.has_jvm_value() {
                     // Pop the result if it's not void and no destination is provided
                     match get_type_size(&method_ty.ret) {
                         1 => self.jvm_instructions.push(JI::Pop),
@@ -3484,9 +3600,23 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
     /// Helper to load an operand specifically for a function call argument.
     /// Handles Reference/MutableReference
     fn load_call_argument(&mut self, operand: &oomir::Operand) -> Result<(), jvm::Error> {
+        if operand
+            .get_type()
+            .is_some_and(|operand_ty| !operand_ty.has_jvm_value())
+        {
+            return Ok(());
+        }
         match operand {
             oomir::Operand::Variable { name: var_name, ty } => {
-                let index = self.get_local_index(var_name)?;
+                self.materialize_zero_sized_local(var_name, ty)?;
+                let index =
+                    self.get_local_index(var_name)
+                        .map_err(|_| jvm::Error::VerificationError {
+                            context: format!("Function {}", self.oomir_func.name),
+                            message: format!(
+                                "Undefined call argument local variable: {var_name} ({ty:?})"
+                            ),
+                        })?;
                 let load_type = match ty {
                     // If the argument is declared as Ref<Primitive>, load the primitive directly
                     oomir::Type::Reference(box inner_ty) if inner_ty.is_jvm_primitive() => {
@@ -3503,6 +3633,35 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 // Constants are loaded directly, no special handling needed here for refs
                 load_constant(&mut self.jvm_instructions, &mut self.constant_pool, c)?;
             }
+        }
+        Ok(())
+    }
+
+    fn load_call_argument_as(
+        &mut self,
+        operand: &oomir::Operand,
+        expected_ty: &oomir::Type,
+    ) -> Result<(), jvm::Error> {
+        if !expected_ty.has_jvm_value() {
+            return Ok(());
+        }
+
+        let actual_ty = get_operand_type(operand);
+        if let Some(class_name) = self.zero_sized_class_name(expected_ty)
+            && actual_ty != *expected_ty
+        {
+            return self.construct_zero_sized_class_value(&class_name);
+        }
+
+        self.load_call_argument(operand)?;
+        if actual_ty != *expected_ty
+            && actual_ty.to_jvm_descriptor() != expected_ty.to_jvm_descriptor()
+        {
+            self.jvm_instructions.extend(get_cast_instructions(
+                &actual_ty,
+                expected_ty,
+                self.constant_pool,
+            )?);
         }
         Ok(())
     }
