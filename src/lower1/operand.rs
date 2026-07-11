@@ -11,7 +11,7 @@ use rustc_middle::{
 };
 use std::collections::HashMap;
 
-mod const_eval;
+pub(super) mod const_eval;
 mod float;
 
 /// Convert a MIR operand to an OOMIR operand.

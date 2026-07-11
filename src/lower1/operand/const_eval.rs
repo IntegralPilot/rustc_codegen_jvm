@@ -10,9 +10,11 @@ use rustc_middle::ty::{
 use std::collections::HashMap;
 
 use super::super::{
+    control_flow::rvalue::ensure_fn_pointer_adapter_class,
     jvm_names, ty_to_oomir_type,
     types::{
-        generate_adt_jvm_class_name, generate_tuple_jvm_class_name, should_define_named_data_type,
+        ensure_fn_ptr_interface, fn_ptr_signature_from_ty, generate_adt_jvm_class_name,
+        generate_tuple_jvm_class_name, should_define_named_data_type,
     },
 };
 use super::float::f128_to_string;
@@ -41,19 +43,28 @@ pub fn read_slice_constant<'tcx>(
         }
     };
 
-    read_slice_backed_value(tcx, allocation, len, pointee_ty, oomir_data_types, instance)
+    read_slice_backed_value(
+        tcx,
+        allocation,
+        Size::ZERO,
+        len,
+        pointee_ty,
+        oomir_data_types,
+        instance,
+    )
 }
 
 fn read_slice_backed_value<'tcx>(
     tcx: TyCtxt<'tcx>,
     allocation: &ConstAllocation,
+    base_offset: Size,
     len: u64,
     ty: Ty<'tcx>,
     oomir_data_types: &mut HashMap<String, oomir::DataType>,
     instance: Instance<'tcx>,
 ) -> Result<oomir::Constant, String> {
     match ty.kind() {
-        TyKind::Str => read_string_from_allocation(allocation, Size::ZERO, Some(len as usize)),
+        TyKind::Str => read_string_from_allocation(allocation, base_offset, Some(len as usize)),
         TyKind::Slice(element_ty) => {
             let element_layout = tcx
                 .layout_of(TypingEnv::fully_monomorphized().as_query_input(*element_ty))
@@ -67,14 +78,14 @@ fn read_slice_backed_value<'tcx>(
             let mut elements = Vec::with_capacity(len as usize);
 
             for index in 0..len {
-                let offset = element_layout
+                let element_offset = element_layout
                     .size
                     .checked_mul(index, &tcx.data_layout)
                     .ok_or_else(|| format!("slice offset overflow at element {}", index))?;
                 elements.push(read_constant_value_from_memory(
                     tcx,
                     allocation,
-                    offset,
+                    base_offset + element_offset,
                     *element_ty,
                     oomir_data_types,
                     instance,
@@ -109,6 +120,7 @@ fn read_slice_backed_value<'tcx>(
             let inner = read_slice_backed_value(
                 tcx,
                 allocation,
+                base_offset,
                 len,
                 field_ty,
                 oomir_data_types,
@@ -190,8 +202,17 @@ pub fn read_scalar_int_constant<'tcx>(
 
         let field_def = non_zst_fields[0];
         let field_name = field_def.ident(tcx).name.to_string();
+        let unnormalized_field_ty = field_def.ty(tcx, substs);
         let field_ty = tcx
-            .normalize_erasing_regions(TypingEnv::fully_monomorphized(), field_def.ty(tcx, substs));
+            .try_normalize_erasing_regions(TypingEnv::fully_monomorphized(), unnormalized_field_ty)
+            .map_err(|error| {
+                format!(
+                    "Could not normalize constant field {} of type {:?}: {:?}",
+                    field_def.ident(tcx),
+                    unnormalized_field_ty,
+                    error
+                )
+            })?;
         let inner_constant =
             read_scalar_int_constant(tcx, scalar_int, field_ty, oomir_data_types, instance)?;
         let mut fields = HashMap::new();
@@ -289,7 +310,12 @@ fn read_pointee_constant<'tcx>(
                 "const-eval",
                 format!("Info: Constant pointer to static: {:?}", def_id)
             );
-            Ok(oomir::Constant::String(format!("StaticPtr({:?})", def_id)))
+            Ok(super::super::statics::static_ref_constant(
+                tcx,
+                def_id,
+                oomir_data_types,
+                instance,
+            ))
         }
         GlobalAlloc::VTable(..) => Err("Unsupported constant pointer to vtable".to_string()),
         GlobalAlloc::TypeId { ty } => Err(format!("Unsupported constant pointer to TypeId {ty:?}")),
@@ -333,6 +359,60 @@ fn read_str_from_fat_pointer<'tcx>(
         }
         other => Err(format!(
             "String data pointer referenced non-memory allocation {:?}",
+            other
+        )),
+    }
+}
+
+fn read_slice_from_fat_pointer<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    allocation: &ConstAllocation,
+    offset: Size,
+    slice_ty: Ty<'tcx>,
+    oomir_data_types: &mut HashMap<String, oomir::DataType>,
+    instance: Instance<'tcx>,
+) -> Result<oomir::Constant, String> {
+    let pointer_size = tcx.data_layout.pointer_size();
+    let data_ptr = read_pointer_from_memory(tcx, allocation, offset)?;
+    let len_scalar = allocation
+        .read_scalar(
+            &tcx.data_layout,
+            AllocRange {
+                start: offset + pointer_size,
+                size: pointer_size,
+            },
+            false,
+        )
+        .map_err(|error| format!("Failed to read slice length at {:?}: {:?}", offset, error))?;
+    let len = match len_scalar {
+        Scalar::Int(len) => len.to_target_usize(tcx),
+        Scalar::Ptr(..) => {
+            return Err(format!(
+                "Expected integer slice length at {:?}, found pointer",
+                offset + pointer_size
+            ));
+        }
+    };
+
+    let (provenance, data_offset) = data_ptr.into_raw_parts();
+    let alloc_id = provenance.get_alloc_id().ok_or_else(|| {
+        format!(
+            "Slice data pointer provenance {:?} has no allocation id",
+            provenance
+        )
+    })?;
+    match tcx.global_alloc(alloc_id) {
+        GlobalAlloc::Memory(const_alloc) => read_slice_backed_value(
+            tcx,
+            const_alloc.inner(),
+            data_offset,
+            len,
+            slice_ty,
+            oomir_data_types,
+            instance,
+        ),
+        other => Err(format!(
+            "Slice data pointer referenced non-memory allocation {:?}",
             other
         )),
     }
@@ -439,20 +519,103 @@ pub fn read_constant_value_from_memory<'tcx>(
             read_scalar_int_constant(tcx, scalar_int, ty, oomir_data_types, instance)
         }
 
-        TyKind::Ref(_, inner_ty, _) | TyKind::RawPtr(inner_ty, _) => {
-            if inner_ty.is_str() {
-                read_str_from_fat_pointer(tcx, allocation, offset)
+        TyKind::Ref(_, inner_ty, mutability) => {
+            if inner_ty.is_str() || inner_ty.is_slice() {
+                let value = if inner_ty.is_str() {
+                    read_str_from_fat_pointer(tcx, allocation, offset)?
+                } else {
+                    read_slice_from_fat_pointer(
+                        tcx,
+                        allocation,
+                        offset,
+                        *inner_ty,
+                        oomir_data_types,
+                        instance,
+                    )?
+                };
+                if mutability.is_mut() {
+                    let value_type = ty_to_oomir_type(*inner_ty, tcx, oomir_data_types, instance);
+                    Ok(oomir::Constant::Array(Box::new(value_type), vec![value]))
+                } else {
+                    Ok(value)
+                }
             } else {
                 let ptr = read_pointer_from_memory(tcx, allocation, offset)?;
-                read_pointee_constant(tcx, ptr, *inner_ty, oomir_data_types, instance)
+                let value = read_pointee_constant(tcx, ptr, *inner_ty, oomir_data_types, instance)?;
+                if mutability.is_mut() {
+                    let pointee_type = ty_to_oomir_type(*inner_ty, tcx, oomir_data_types, instance);
+                    Ok(oomir::Constant::Array(Box::new(pointee_type), vec![value]))
+                } else {
+                    Ok(value)
+                }
             }
+        }
+
+        TyKind::RawPtr(inner_ty, _) => {
+            if inner_ty.is_str() {
+                read_str_from_fat_pointer(tcx, allocation, offset)
+            } else if inner_ty.is_slice() {
+                Err("Unsupported raw slice pointer constant".to_string())
+            } else {
+                let ptr = read_pointer_from_memory(tcx, allocation, offset)?;
+                let value = read_pointee_constant(tcx, ptr, *inner_ty, oomir_data_types, instance)?;
+                let pointee_type = ty_to_oomir_type(*inner_ty, tcx, oomir_data_types, instance);
+                Ok(oomir::Constant::Array(Box::new(pointee_type), vec![value]))
+            }
+        }
+
+        TyKind::FnPtr(..) => {
+            let pointer = read_pointer_from_memory(tcx, allocation, offset)?;
+            let (provenance, _) = pointer.into_raw_parts();
+            let alloc_id = provenance.get_alloc_id().ok_or_else(|| {
+                format!(
+                    "Function pointer provenance {:?} has no allocation id",
+                    provenance
+                )
+            })?;
+            let function_allocation = tcx.global_alloc(alloc_id);
+            let GlobalAlloc::Function {
+                instance: function_instance,
+            } = function_allocation
+            else {
+                return Err(format!(
+                    "Function pointer of type {:?} referred to non-function allocation {:?}",
+                    ty, function_allocation
+                ));
+            };
+
+            let signature = fn_ptr_signature_from_ty(ty, tcx, oomir_data_types, function_instance);
+            let interface_name =
+                ensure_fn_ptr_interface(&signature, oomir_data_types, tcx, function_instance);
+            let function_name =
+                super::super::naming::mono_fn_name_from_instance(tcx, function_instance);
+            let callable_target = function_instance
+                .def_id()
+                .is_local()
+                .then_some(&function_name);
+            let adapter_class = ensure_fn_pointer_adapter_class(
+                oomir_data_types,
+                callable_target,
+                &signature,
+                &interface_name,
+                tcx,
+                function_instance,
+            );
+
+            Ok(oomir::Constant::FunctionPointer {
+                adapter_class,
+                interface_name,
+            })
         }
 
         TyKind::Str => Err("Unsupported type: Direct read of str from memory".to_string()),
 
-        TyKind::Array(elem_ty, len_const) => {
-            let Some(len) = len_const.try_to_target_usize(tcx) else {
-                return Err("Unsupported type: Array with non-constant length".to_string());
+        TyKind::Array(elem_ty, _) => {
+            let FieldsShape::Array { count: len, .. } = layout.fields else {
+                return Err(format!(
+                    "Array type {:?} had non-array layout {:?}",
+                    ty, layout
+                ));
             };
             let elem_pci = TypingEnv::fully_monomorphized().as_query_input(*elem_ty);
             let elem_layout = tcx
@@ -542,7 +705,7 @@ pub fn read_constant_value_from_memory<'tcx>(
             })
         }
 
-        _ => Err("Unsupported type: Complex or unknown type".to_string()),
+        _ => Err(format!("Unsupported constant type: {:?}", ty)),
     }
 }
 
@@ -562,7 +725,17 @@ fn handle_constant_struct<'tcx>(
 
     for (i, field_def) in variant.fields.iter().enumerate() {
         let field_idx = FieldIdx::from_usize(i);
-        let field_ty = field_def.ty(tcx, substs).skip_norm_wip();
+        let unnormalized_field_ty = field_def.ty(tcx, substs);
+        let field_ty = tcx
+            .try_normalize_erasing_regions(TypingEnv::fully_monomorphized(), unnormalized_field_ty)
+            .map_err(|error| {
+                format!(
+                    "Could not normalize constant field {} of type {:?}: {:?}",
+                    field_def.ident(tcx),
+                    unnormalized_field_ty,
+                    error
+                )
+            })?;
         let field_offset = layout.fields.offset(field_idx.into());
         let field_name = field_def.ident(tcx).to_string();
 

@@ -20,6 +20,7 @@ pub struct Module {
     pub name: String,
     pub functions: HashMap<String, Function>,
     pub data_types: HashMap<String, DataType>,
+    pub statics: HashMap<String, Static>,
 }
 
 impl Module {
@@ -52,6 +53,23 @@ impl Module {
 
     pub fn owner_class_for_function<'a>(&'a self, function: &'a Function) -> &'a str {
         function.owner_class.as_deref().unwrap_or(&self.name)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Static {
+    pub owner_class: String,
+    pub field_name: String,
+    pub value_type: Type,
+    pub storage_type: Type,
+    pub initializer: Constant,
+    pub is_mutable: bool,
+    pub is_thread_local: bool,
+}
+
+impl Static {
+    pub fn key(&self) -> String {
+        format!("{}::{}", self.owner_class, self.field_name)
     }
 }
 
@@ -456,6 +474,22 @@ impl Operand {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Constant {
     Unit,
+    StaticRef {
+        owner_class: String,
+        field_name: String,
+        ty: Type,
+    },
+    FunctionPointer {
+        adapter_class: String,
+        interface_name: String,
+    },
+    /// A lower2-generated call to a private factory method. Large static object
+    /// graphs use these to stay within the JVM's per-method bytecode limit.
+    FactoryCall {
+        owner_class: String,
+        method_name: String,
+        ty: Type,
+    },
     /// A typed JVM null. The type is needed when null appears in a constructor
     /// argument list, because constructor descriptors are exact.
     Null(Type),
@@ -484,12 +518,56 @@ pub enum Constant {
 
 impl Eq for Constant {}
 
+impl Constant {
+    /// Whether this value can be substituted freely by the OOMIR constant
+    /// propagation pass. A static reference is an instruction-sized runtime
+    /// field load, not a compile-time value. Containers inherit that property
+    /// so folding never discards a required static load hidden inside one.
+    pub fn is_propagatable(&self) -> bool {
+        match self {
+            Constant::StaticRef { .. } | Constant::FactoryCall { .. } => false,
+            Constant::Array(_, elements) => elements.iter().all(Constant::is_propagatable),
+            Constant::Instance { fields, params, .. } => {
+                fields.values().all(Constant::is_propagatable)
+                    && params.iter().all(Constant::is_propagatable)
+            }
+            _ => true,
+        }
+    }
+}
+
 impl std::hash::Hash for Constant {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         match self {
             Constant::Unit => 0.hash(state),
-            Constant::Null(ty) => {
+            Constant::StaticRef {
+                owner_class,
+                field_name,
+                ty,
+            } => {
                 1.hash(state);
+                owner_class.hash(state);
+                field_name.hash(state);
+                ty.hash(state);
+            }
+            Constant::FunctionPointer {
+                adapter_class,
+                interface_name,
+            } => {
+                adapter_class.hash(state);
+                interface_name.hash(state);
+            }
+            Constant::FactoryCall {
+                owner_class,
+                method_name,
+                ty,
+            } => {
+                owner_class.hash(state);
+                method_name.hash(state);
+                ty.hash(state);
+            }
+            Constant::Null(ty) => {
+                2.hash(state);
                 ty.hash(state);
             }
             Constant::I8(i) => i.hash(state),
@@ -890,6 +968,11 @@ impl Type {
     pub fn from_constant(constant: &Constant) -> Self {
         match constant {
             Constant::Unit => Type::Unit,
+            Constant::StaticRef { ty, .. } => ty.clone(),
+            Constant::FunctionPointer { interface_name, .. } => {
+                Type::Interface(interface_name.clone())
+            }
+            Constant::FactoryCall { ty, .. } => ty.clone(),
             Constant::Null(ty) => ty.clone(),
             Constant::I8(_) => Type::I8,
             Constant::I16(_) => Type::I16,

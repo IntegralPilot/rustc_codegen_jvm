@@ -6,17 +6,18 @@ use crate::oomir::{self, DataType};
 use helpers::oomir_function_stack_floor;
 use jvm_gen::{
     create_data_type_classfile_for_class, create_data_type_classfile_for_interface,
-    create_default_constructor,
+    create_default_constructor, oomir_type_to_ristretto_field_type,
 };
 use translator::FunctionTranslator;
 
 use constant_pool::{InternedConstantPool, verify_no_duplicate_constants};
+use consts::load_constant;
 use ristretto_classfile::{
-    self as jvm, ClassAccessFlags, ClassFile, MethodAccessFlags, Version,
-    attributes::{Attribute, MaxStack},
+    self as jvm, ClassAccessFlags, ClassFile, FieldAccessFlags, MethodAccessFlags, Version,
+    attributes::{Attribute, Instruction, MaxStack},
 };
 use rustc_middle::ty::TyCtxt;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 mod constant_pool;
 mod consts;
@@ -29,6 +30,153 @@ mod translator;
 
 pub const BIG_INTEGER_CLASS: &str = "java/math/BigInteger";
 pub const BIG_DECIMAL_CLASS: &str = "java/math/BigDecimal";
+
+fn factory_return_instruction(ty: &oomir::Type) -> Instruction {
+    match ty {
+        oomir::Type::I8
+        | oomir::Type::I16
+        | oomir::Type::I32
+        | oomir::Type::Boolean
+        | oomir::Type::Char => Instruction::Ireturn,
+        oomir::Type::I64 => Instruction::Lreturn,
+        oomir::Type::F32 => Instruction::Freturn,
+        oomir::Type::F64 => Instruction::Dreturn,
+        oomir::Type::String
+        | oomir::Type::Class(_)
+        | oomir::Type::Array(_)
+        | oomir::Type::Reference(_)
+        | oomir::Type::MutableReference(_)
+        | oomir::Type::Interface(_) => Instruction::Areturn,
+        oomir::Type::Void | oomir::Type::Unit => Instruction::Return,
+    }
+}
+
+fn create_constant_factory(
+    cp: &mut InternedConstantPool,
+    owner_class: &str,
+    constant: &oomir::Constant,
+    methods: &mut Vec<jvm::Method>,
+    next_factory: &mut usize,
+) -> jvm::Result<oomir::Constant> {
+    let prepared = match constant {
+        oomir::Constant::Array(element_type, elements) => oomir::Constant::Array(
+            element_type.clone(),
+            elements
+                .iter()
+                .map(|element| {
+                    create_constant_factory(cp, owner_class, element, methods, next_factory)
+                })
+                .collect::<jvm::Result<Vec<_>>>()?,
+        ),
+        oomir::Constant::Instance {
+            class_name,
+            fields,
+            params,
+        } => oomir::Constant::Instance {
+            class_name: class_name.clone(),
+            fields: fields.clone(),
+            params: params
+                .iter()
+                .map(|param| create_constant_factory(cp, owner_class, param, methods, next_factory))
+                .collect::<jvm::Result<Vec<_>>>()?,
+        },
+        _ => return Ok(constant.clone()),
+    };
+
+    let return_type = oomir::Type::from_constant(&prepared);
+    let method_name = format!("__constant_factory_{}", *next_factory);
+    *next_factory += 1;
+    let descriptor = format!("(){}", return_type.to_jvm_descriptor());
+    let mut instructions = Vec::new();
+    load_constant(&mut instructions, cp, &prepared)?;
+    instructions.push(factory_return_instruction(&return_type));
+    let max_stack = instructions.max_stack(cp)?.saturating_mul(2).max(4);
+    let code = Attribute::Code {
+        name_index: cp.add_utf8("Code")?,
+        max_stack,
+        max_locals: 0,
+        code: instructions,
+        exception_table: Vec::new(),
+        attributes: Vec::new(),
+    };
+    methods.push(jvm::Method {
+        access_flags: MethodAccessFlags::PRIVATE
+            | MethodAccessFlags::STATIC
+            | MethodAccessFlags::SYNTHETIC,
+        name_index: cp.add_utf8(&method_name)?,
+        descriptor_index: cp.add_utf8(&descriptor)?,
+        attributes: vec![code],
+    });
+
+    Ok(oomir::Constant::FactoryCall {
+        owner_class: owner_class.to_string(),
+        method_name,
+        ty: return_type,
+    })
+}
+
+fn create_static_initializer_method(
+    cp: &mut InternedConstantPool,
+    this_class_index: u16,
+    owner_class: &str,
+    statics: &[&oomir::Static],
+    methods: &mut Vec<jvm::Method>,
+) -> jvm::Result<jvm::Method> {
+    let mut instructions = Vec::new();
+    let mut next_factory = 0;
+    for static_value in statics {
+        if static_value.is_thread_local {
+            return Err(jvm::Error::VerificationError {
+                context: format!(
+                    "Static {}::{}",
+                    static_value.owner_class, static_value.field_name
+                ),
+                message: "thread-local statics are not yet representable".to_string(),
+            });
+        }
+
+        let initializer = if static_value.is_mutable {
+            let cell = oomir::Constant::Array(
+                Box::new(static_value.value_type.clone()),
+                vec![static_value.initializer.clone()],
+            );
+            create_constant_factory(cp, owner_class, &cell, methods, &mut next_factory)?
+        } else {
+            create_constant_factory(
+                cp,
+                owner_class,
+                &static_value.initializer,
+                methods,
+                &mut next_factory,
+            )?
+        };
+        load_constant(&mut instructions, cp, &initializer)?;
+
+        let field_ref = cp.add_field_ref(
+            this_class_index,
+            &static_value.field_name,
+            &static_value.storage_type.to_jvm_descriptor(),
+        )?;
+        instructions.push(Instruction::Putstatic(field_ref));
+    }
+    instructions.push(Instruction::Return);
+
+    let max_stack = instructions.max_stack(cp)?.saturating_mul(2).max(4);
+    let code = Attribute::Code {
+        name_index: cp.add_utf8("Code")?,
+        max_stack,
+        max_locals: 0,
+        code: instructions,
+        exception_table: Vec::new(),
+        attributes: Vec::new(),
+    };
+    Ok(jvm::Method {
+        access_flags: MethodAccessFlags::STATIC,
+        name_index: cp.add_utf8("<clinit>")?,
+        descriptor_index: cp.add_utf8("()V")?,
+        attributes: vec![code],
+    })
+}
 
 /// Converts an OOMIR module into JVM class files
 /// Returns a HashMap where the key is the JVM class name (with '/') and the value is the bytecode
@@ -47,7 +195,38 @@ pub fn oomir_to_jvm_bytecode(
             .push(function);
     }
 
-    for (class_name_jvm, functions) in functions_by_class {
+    let mut statics_by_class: BTreeMap<String, Vec<&oomir::Static>> = BTreeMap::new();
+    for static_value in module.statics.values() {
+        statics_by_class
+            .entry(static_value.owner_class.clone())
+            .or_default()
+            .push(static_value);
+    }
+
+    let mut class_names: Vec<_> = functions_by_class
+        .keys()
+        .chain(statics_by_class.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    class_names.sort_by(|left, right| {
+        match (
+            statics_by_class.contains_key(left),
+            statics_by_class.contains_key(right),
+        ) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => left.cmp(right),
+        }
+    });
+
+    for class_name_jvm in class_names {
+        let functions = functions_by_class
+            .remove(&class_name_jvm)
+            .unwrap_or_default();
+        let mut class_statics = statics_by_class.remove(&class_name_jvm).unwrap_or_default();
+        class_statics.sort_by(|left, right| left.field_name.cmp(&right.field_name));
         let mut main_cp = InternedConstantPool::default();
         let super_class_name_jvm = "java/lang/Object"; // Standard superclass
 
@@ -56,7 +235,32 @@ pub fn oomir_to_jvm_bytecode(
         let code_attribute_name_index = main_cp.add_utf8("Code")?;
 
         let mut methods: Vec<jvm::Method> = Vec::new();
+        let mut fields = Vec::new();
         let mut has_constructor = false;
+
+        for static_value in &class_statics {
+            fields.push(jvm::Field {
+                access_flags: FieldAccessFlags::PUBLIC
+                    | FieldAccessFlags::STATIC
+                    | FieldAccessFlags::FINAL,
+                name_index: main_cp.add_utf8(&static_value.field_name)?,
+                descriptor_index: main_cp
+                    .add_utf8(static_value.storage_type.to_jvm_descriptor())?,
+                field_type: oomir_type_to_ristretto_field_type(&static_value.storage_type),
+                attributes: Vec::new(),
+            });
+        }
+
+        if !class_statics.is_empty() {
+            let static_initializer = create_static_initializer_method(
+                &mut main_cp,
+                this_class_index,
+                &class_name_jvm,
+                &class_statics,
+                &mut methods,
+            )?;
+            methods.push(static_initializer);
+        }
 
         for function in functions {
             let instrumented_fn_name = format!("{class_name_jvm}::{}", function.name);
@@ -173,7 +377,7 @@ pub fn oomir_to_jvm_bytecode(
             this_class: this_class_index,
             super_class: super_class_index,
             interfaces: Vec::new(),
-            fields: Vec::new(),
+            fields,
             methods,
             attributes,
         };

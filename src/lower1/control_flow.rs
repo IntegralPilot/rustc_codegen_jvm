@@ -18,7 +18,7 @@ use std::collections::HashMap;
 mod checked_intrinsic_registry;
 pub mod checked_intrinsics;
 mod checked_ops;
-mod rvalue;
+pub(crate) mod rvalue;
 
 pub use checked_intrinsic_registry::take_needed_intrinsics;
 

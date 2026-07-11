@@ -22,6 +22,7 @@ pub mod jvm_names;
 pub mod naming;
 pub mod operand;
 pub mod place;
+pub mod statics;
 pub mod types;
 
 pub use closures::generate_closure_function_name;

@@ -341,5 +341,6 @@ pub fn optimise_module(module: Module) -> Module {
         name: module.name,
         functions: new_funcs,
         data_types: module.data_types, // Assume data_types are read-only for opts
+        statics: module.statics,
     }
 }

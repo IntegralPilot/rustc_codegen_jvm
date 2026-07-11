@@ -316,13 +316,8 @@ fn lower_mono_items<'tcx>(tcx: TyCtxt<'tcx>, oomir_module: &mut oomir::Module) {
             match mono_item {
                 MonoItem::Fn(instance) => lower_mono_function(tcx, instance, oomir_module),
                 MonoItem::Static(def_id) => {
-                    breadcrumbs::log!(
-                        breadcrumbs::LogLevel::Warn,
-                        "mono-lowering",
-                        format!(
-                            "Skipping mono static item without static lowering: {:?}",
-                            def_id
-                        )
+                    lower1::statics::lower_static(tcx, def_id, oomir_module).unwrap_or_else(
+                        |error| panic!("failed to lower static {def_id:?}: {error}"),
                     );
                 }
                 MonoItem::GlobalAsm(item_id) => {
@@ -538,6 +533,7 @@ impl CodegenBackend for MyBackend {
             name: crate_module_class.clone(),
             functions: std::collections::HashMap::new(),
             data_types: std::collections::HashMap::new(),
+            statics: std::collections::HashMap::new(),
         };
 
         let lower1_timer = instrumentation::Timer::phase("lower1", Some(&crate_name));

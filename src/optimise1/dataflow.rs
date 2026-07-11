@@ -147,10 +147,11 @@ pub fn process_block_instructions(
     let mut new_instructions = Vec::with_capacity(info.original_block.instructions.len());
 
     let lookup_const = |op: &Operand, state: &ConstantMap| -> Option<Constant> {
-        match op {
-            Operand::Constant(c) => Some(c.clone()),
-            Operand::Variable { name, .. } => state.get(name).cloned(),
-        }
+        let constant = match op {
+            Operand::Constant(c) => Some(c),
+            Operand::Variable { name, .. } => state.get(name),
+        };
+        constant.filter(|value| value.is_propagatable()).cloned()
     };
 
     for instruction in &info.original_block.instructions {
@@ -1423,8 +1424,11 @@ fn update_state_based_on_operand(
     initial_state: &ConstantMap, // Pass the state *before* this instruction
 ) {
     match src_op {
-        Operand::Constant(c) => {
+        Operand::Constant(c) if c.is_propagatable() => {
             state.insert(dest.clone(), c.clone());
+        }
+        Operand::Constant(_) => {
+            state.remove(dest);
         }
         Operand::Variable { name, .. } => {
             // If the source variable was constant, propagate its value

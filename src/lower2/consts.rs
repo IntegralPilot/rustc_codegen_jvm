@@ -102,6 +102,32 @@ pub fn load_constant(
 
     match constant {
         OC::Unit => {}
+        OC::StaticRef {
+            owner_class,
+            field_name,
+            ty,
+        } => {
+            let owner = cp.add_class(owner_class)?;
+            let field = cp.add_field_ref(owner, field_name, &ty.to_jvm_descriptor())?;
+            instructions_to_add.push(JI::Getstatic(field));
+        }
+        OC::FunctionPointer { adapter_class, .. } => {
+            let class_index = cp.add_class(adapter_class)?;
+            let constructor = cp.add_method_ref(class_index, "<init>", "()V")?;
+            instructions_to_add.push(JI::New(class_index));
+            instructions_to_add.push(JI::Dup);
+            instructions_to_add.push(JI::Invokespecial(constructor));
+        }
+        OC::FactoryCall {
+            owner_class,
+            method_name,
+            ty,
+        } => {
+            let owner = cp.add_class(owner_class)?;
+            let method =
+                cp.add_method_ref(owner, method_name, &format!("(){}", ty.to_jvm_descriptor()))?;
+            instructions_to_add.push(JI::Invokestatic(method));
+        }
         OC::I8(v) => instructions_to_add.push(get_int_const_instr(cp, *v as i32)),
         OC::I16(v) => instructions_to_add.push(get_int_const_instr(cp, *v as i32)),
         OC::I32(v) => instructions_to_add.push(get_int_const_instr(cp, *v)),
@@ -266,27 +292,10 @@ pub fn load_constant(
             // Consumes the top ref and all params, initializes the object pointed to by the second ref.
             instructions_to_add.push(JI::Invokespecial(constructor_ref_index)); // Stack: [initialized_ref]
 
-            // e. Iterate through fields to set them *after* construction
-            for (field_name, field_value) in fields {
-                // i. Duplicate the now *initialized* object reference (needed for putfield)
-                instructions_to_add.push(JI::Dup); // Stack: [initialized_ref, initialized_ref]
-
-                // ii. Load the field's value onto the stack
-                load_constant(&mut instructions_to_add, cp, field_value)?;
-                // Stack: [initialized_ref, initialized_ref, field_value] (size 1 or 2)
-
-                // iii. Add Field reference
-                let field_type = Type::from_constant(field_value);
-                // Assuming Type::to_jvm_descriptor() produces the correct JVM type descriptor, e.g., "Ljava/lang/String;", "I"
-                let field_descriptor = field_type.to_jvm_descriptor();
-                let field_ref_index =
-                    cp.add_field_ref(class_index, field_name, &field_descriptor)?;
-
-                // iv. Emit 'putfield'
-                instructions_to_add.push(JI::Putfield(field_ref_index));
-                // Stack: [initialized_ref] (putfield consumes the top ref and the value)
-            }
-            // After the loop, the final initialized_ref is left on the stack.
+            // The generated constructor initializes all fields from `params`.
+            // `fields` carries named OOMIR metadata and must not be written a
+            // second time here (doing so duplicates referenced object graphs).
+            let _ = fields;
         }
     };
 

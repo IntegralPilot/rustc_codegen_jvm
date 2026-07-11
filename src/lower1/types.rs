@@ -1566,7 +1566,17 @@ pub fn ty_to_oomir_type<'tcx>(
                             .iter()
                             .filter_map(|field_def| {
                                 let field_name = field_def.ident(tcx).to_string();
-                                let field_mir_ty = field_def.ty(tcx, substs).skip_norm_wip();
+                                let field_ty = field_def.ty(tcx, substs);
+                                let field_mir_ty =
+                                    if field_ty.has_param() || field_ty.has_escaping_bound_vars() {
+                                        field_ty.skip_norm_wip()
+                                    } else {
+                                        tcx.try_normalize_erasing_regions(
+                                            TypingEnv::fully_monomorphized(),
+                                            field_ty,
+                                        )
+                                        .unwrap_or_else(|_| field_ty.skip_norm_wip())
+                                    };
                                 let field_oomir_type = ty_to_oomir_type(
                                     field_mir_ty,
                                     tcx,

@@ -95,7 +95,7 @@ fn adapt_value_for_field(
     value_operand
 }
 
-fn ensure_fn_pointer_adapter_class<'tcx>(
+pub(crate) fn ensure_fn_pointer_adapter_class<'tcx>(
     data_types: &mut HashMap<String, oomir::DataType>,
     target_function: Option<&super::super::naming::FnNameData>,
     signature: &oomir::Signature,
