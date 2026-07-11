@@ -9,7 +9,6 @@ use num_traits::{One, ToPrimitive, Zero};
 /// - `+∞` → `"inf"`, `-∞` → `"-inf"`
 /// - `0.0` → `"0.0"`, `-0.0` → `"-0.0"`
 pub fn f128_to_string(x: f128) -> String {
-    // --- Special cases ---
     if x.is_nan() {
         return "NaN".to_string();
     }
@@ -29,7 +28,6 @@ pub fn f128_to_string(x: f128) -> String {
         };
     }
 
-    // --- Unpack IEEE‑754 bits ---
     const PREC: usize = 34; // max significant decimal digits for f128
     const EXP_BIAS: i32 = 16383; // binary128 exponent bias
 
@@ -60,14 +58,12 @@ pub fn f128_to_string(x: f128) -> String {
         den <<= (-exp2) as usize;
     }
 
-    // --- Integer part + remainder ---
     let int_part = &num / &den;
     let rem = num % &den;
 
     // Convert the integer part to decimal
     let mut int_str = int_part.to_str_radix(10);
 
-    // --- Fractional digits generation (PREC+1 for rounding) ---
     let mut frac_digits: Vec<u8> = Vec::new();
     let mut rem2 = rem.clone();
     for _ in 0..=PREC {
@@ -80,7 +76,6 @@ pub fn f128_to_string(x: f128) -> String {
         rem2 %= &den;
     }
 
-    // --- Round to nearest, ties-to-even ---
     if frac_digits.len() > PREC {
         let next = frac_digits[PREC];
         // any non‑zero bits beyond PREC+1 make it “> 5”
@@ -124,7 +119,6 @@ pub fn f128_to_string(x: f128) -> String {
         frac_digits.pop();
     }
 
-    // --- Assemble final string ---
     let mut out = String::new();
     if sign_bit {
         out.push('-');

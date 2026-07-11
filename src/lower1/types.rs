@@ -2,17 +2,8 @@ use super::jvm_names;
 use crate::oomir::{self, DataType, DataTypeMethod};
 
 use rustc_middle::ty::{
-    AdtDef,
-    ExistentialPredicate,
-    FloatTy,
-    GenericArgsRef,
-    IntTy,
-    Ty,
-    TyCtxt,
-    TyKind,
-    TypeVisitableExt, // Added TypeVisitableExt to check for params
-    TypingEnv,
-    UintTy,
+    AdtDef, ExistentialPredicate, FloatTy, GenericArgsRef, IntTy, Ty, TyCtxt, TyKind,
+    TypeVisitableExt, TypingEnv, UintTy,
 };
 use rustc_span::def_id::DefId;
 use sha2::Digest;
@@ -343,6 +334,45 @@ fn ensure_enum_data_types<'tcx>(
     data_types: &mut HashMap<String, oomir::DataType>,
     instance_context: rustc_middle::ty::Instance<'tcx>,
 ) {
+    let mut created_placeholders = Vec::new();
+
+    // 1. Insert a placeholder for the base enum class
+    if !data_types.contains_key(base_enum_name) {
+        data_types.insert(
+            base_enum_name.to_string(),
+            oomir::DataType::Class {
+                fields: vec![],
+                is_abstract: true,
+                methods: HashMap::new(),
+                super_class: None,
+                interfaces: vec![],
+            },
+        );
+        created_placeholders.push(base_enum_name.to_string());
+    }
+
+    // 2. Insert placeholders for all individual variant subclasses
+    for variant in adt_def.variants().iter() {
+        let variant_class_name = format!(
+            "{}${}",
+            base_enum_name,
+            jvm_names::member_name(&variant.name.to_string())
+        );
+        if !data_types.contains_key(&variant_class_name) {
+            data_types.insert(
+                variant_class_name.clone(),
+                oomir::DataType::Class {
+                    fields: vec![],
+                    is_abstract: false,
+                    methods: HashMap::new(),
+                    super_class: Some(base_enum_name.to_string()),
+                    interfaces: vec![],
+                },
+            );
+            created_placeholders.push(variant_class_name);
+        }
+    }
+
     let union_size = simple_enum_union_size(adt_def, tcx).ok();
     let union_factory = union_size
         .map(|size| enum_from_union_discriminant_function(adt_def, size, base_enum_name, tcx));
@@ -368,33 +398,9 @@ fn ensure_enum_data_types<'tcx>(
         })
         .collect();
 
-    if !data_types.contains_key(base_enum_name) {
-        let mut methods = HashMap::new();
-        add_enum_helper_methods(&mut methods, variants_info.clone());
-        if let Some(factory) = union_factory.clone() {
-            methods.insert(
-                ENUM_UNION_DISCRIMINANT_METHOD.to_string(),
-                DataTypeMethod::SimpleConstantReturn(oomir::Type::I64, None),
-            );
-            methods.insert(
-                ENUM_FROM_UNION_DISCRIMINANT_METHOD.to_string(),
-                DataTypeMethod::Function(factory),
-            );
-        }
-        data_types.insert(
-            base_enum_name.to_string(),
-            oomir::DataType::Class {
-                fields: vec![],
-                is_abstract: true,
-                methods,
-                super_class: None,
-                interfaces: vec![],
-            },
-        );
-    } else if let Some(oomir::DataType::Class { methods, .. }) = data_types.get_mut(base_enum_name)
-    {
+    if let Some(oomir::DataType::Class { methods, .. }) = data_types.get_mut(base_enum_name) {
         add_enum_helper_methods(methods, variants_info.clone());
-        if let Some(factory) = union_factory {
+        if let Some(factory) = union_factory.clone() {
             methods
                 .entry(ENUM_UNION_DISCRIMINANT_METHOD.to_string())
                 .or_insert(DataTypeMethod::SimpleConstantReturn(oomir::Type::I64, None));
@@ -411,19 +417,21 @@ fn ensure_enum_data_types<'tcx>(
             base_enum_name,
             jvm_names::member_name(&variant.name.to_string())
         );
-        if let Some(oomir::DataType::Class { methods, .. }) =
-            data_types.get_mut(&variant_class_name)
-        {
-            if union_size.is_some() {
-                let discriminant = discriminants[&variant_idx.into()];
-                methods
-                    .entry(ENUM_UNION_DISCRIMINANT_METHOD.to_string())
-                    .or_insert(DataTypeMethod::SimpleConstantReturn(
-                        oomir::Type::I64,
-                        Some(oomir::Constant::I64(discriminant.val as i64)),
-                    ));
+        if !created_placeholders.contains(&variant_class_name) {
+            if let Some(oomir::DataType::Class { methods, .. }) =
+                data_types.get_mut(&variant_class_name)
+            {
+                if union_size.is_some() {
+                    let discriminant = discriminants[&variant_idx.into()];
+                    methods
+                        .entry(ENUM_UNION_DISCRIMINANT_METHOD.to_string())
+                        .or_insert(DataTypeMethod::SimpleConstantReturn(
+                            oomir::Type::I64,
+                            Some(oomir::Constant::I64(discriminant.val as i64)),
+                        ));
+                }
+                continue;
             }
-            continue;
         }
 
         let fields = variant
@@ -1353,6 +1361,21 @@ pub fn ensure_union_data_type<'tcx>(
 ) -> String {
     let union_class =
         generate_adt_jvm_class_name(adt_def, substs, tcx, data_types, instance_context);
+
+    // Pre-populate with placeholder class to break recursive resolution loops
+    if !data_types.contains_key(&union_class) {
+        data_types.insert(
+            union_class.clone(),
+            oomir::DataType::Class {
+                fields: vec![(UNION_BYTES_FIELD.to_string(), byte_array_type())],
+                is_abstract: false,
+                methods: HashMap::new(),
+                super_class: Some("java/lang/Object".to_string()),
+                interfaces: vec![],
+            },
+        );
+    }
+
     let union_ty = tcx
         .type_of(adt_def.did())
         .instantiate(tcx, substs)
@@ -1526,6 +1549,18 @@ pub fn ty_to_oomir_type<'tcx>(
                 if adt_def.is_struct() {
                     let variant = adt_def.variant(0usize.into());
                     if !data_types.contains_key(&jvm_name_full) {
+                        // Pre-populate with a placeholder class to break recursive resolution loops
+                        data_types.insert(
+                            jvm_name_full.clone(),
+                            oomir::DataType::Class {
+                                fields: vec![],
+                                is_abstract: false,
+                                methods: HashMap::new(),
+                                super_class: None,
+                                interfaces: vec![],
+                            },
+                        );
+
                         let oomir_fields = variant
                             .fields
                             .iter()
@@ -1551,16 +1586,15 @@ pub fn ty_to_oomir_type<'tcx>(
                                 },
                             },
                         );
-                        data_types.insert(
-                            jvm_name_full.clone(),
-                            oomir::DataType::Class {
-                                fields: oomir_fields,
-                                is_abstract: false,
-                                methods,
-                                super_class: None,
-                                interfaces: vec![],
-                            },
-                        );
+                        if let Some(oomir::DataType::Class {
+                            fields,
+                            methods: existing_methods,
+                            ..
+                        }) = data_types.get_mut(&jvm_name_full)
+                        {
+                            *fields = oomir_fields;
+                            *existing_methods = methods;
+                        }
                     } else if let Some(oomir::DataType::Class {
                         fields, methods, ..
                     }) = data_types.get_mut(&jvm_name_full)

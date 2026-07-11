@@ -6,7 +6,6 @@ use std::convert::{TryFrom, TryInto};
 use std::ops::Div;
 use std::str::FromStr; // Needed for parsing
 
-// --- Error Enum (Optional but Recommended) ---
 // Helps distinguish parsing errors from unsupported operations
 enum InterpretError {
     ParseBigInt(ParseBigIntError),
@@ -38,8 +37,6 @@ impl From<ParseBigDecimalError> for InterpretError {
         InterpretError::ParseBigDecimal(e)
     }
 }
-
-// --- Helper Functions ---
 
 fn parse_constant_to_bigint(c: &Constant) -> Result<BigInt, InterpretError> {
     match c {
@@ -121,7 +118,6 @@ fn bigdecimal_to_constant(bd: BigDecimal) -> Constant {
 // Default scale for BigDecimal division (adjust as needed)
 const BIGDECIMAL_DIVISION_SCALE: i64 = 50;
 
-// --- Updated cast_constant ---
 pub fn cast_constant(c: Constant, ty: Type) -> Option<Constant> {
     match (&ty, &c) {
         // Identity casts
@@ -172,7 +168,6 @@ pub fn cast_constant(c: Constant, ty: Type) -> Option<Constant> {
             }
         }
 
-        // --- Existing Primitive Casts (keep as they were) ---
         (_, Constant::I8(val)) => match ty {
             Type::I8 => Some(Constant::I8(*val)),
             Type::I16 => Some(Constant::I16(*val as i16)),
@@ -274,18 +269,15 @@ pub fn cast_constant(c: Constant, ty: Type) -> Option<Constant> {
     }
 }
 
-// --- Updated unify_ops_type ---
 pub fn unify_ops_type(op1: Constant, op2: Constant) -> Option<(Constant, Constant)> {
     let type1 = Type::from_constant(&op1);
     let type2 = Type::from_constant(&op2);
 
     // Determine the target type based on promotion rules
     let target_type = match (&type1, &type2) {
-        // --- Big Decimal involved ---
         (Type::Class(cn1), _) if cn1 == "java/math/BigDecimal" => type1.clone(),
         (_, Type::Class(cn2)) if cn2 == "java/math/BigDecimal" => type2.clone(),
 
-        // --- Big Integer involved (and no BigDecimal) ---
         (Type::Class(cn1), _) if cn1 == "java/math/BigInteger" => match type2 {
             Type::F32 | Type::F64 => Type::Class("java/math/BigDecimal".to_string()), // Promote BigInt to Dec
             _ => type1.clone(), // Promote Int/Bool/Char to BigInt
@@ -295,7 +287,6 @@ pub fn unify_ops_type(op1: Constant, op2: Constant) -> Option<(Constant, Constan
             _ => type2.clone(), // Promote Int/Bool/Char to BigInt
         },
 
-        // --- Standard Primitive Promotions ---
         (Type::F64, _) | (_, Type::F64) => Type::F64,
         (Type::F32, _) | (_, Type::F32) => Type::F32,
         (Type::I64, _) | (_, Type::I64) => Type::I64,
@@ -480,7 +471,6 @@ fn compare_constants(op1: Constant, op2: Constant) -> Option<std::cmp::Ordering>
     // (This part is largely the same as your original eq_constants logic,
     // but simplified as cross-type numeric is handled above by promoting to BigDecimal)
     match (op1, op2) {
-        // --- Primitives (like types) ---
         (Constant::F64(a), Constant::F64(b)) => a.partial_cmp(&b),
         (Constant::F32(a), Constant::F32(b)) => a.partial_cmp(&b),
         (Constant::I64(a), Constant::I64(b)) => Some(a.cmp(&b)),
@@ -600,8 +590,6 @@ pub fn ge_constants(op1: Constant, op2: Constant) -> Option<bool> {
 pub fn le_constants(op1: Constant, op2: Constant) -> Option<bool> {
     compare_constants(op1, op2).map(|ord| ord != std::cmp::Ordering::Greater)
 }
-
-// --- Bitwise/Shift Operations (Generally only apply to Integers) ---
 
 fn do_bitwise_op<F>(op1: Constant, op2: Constant, func: F) -> Option<Constant>
 where

@@ -26,13 +26,8 @@ pub mod types;
 
 pub use closures::generate_closure_function_name;
 
-/// Converts a MIR Body into an OOMIR Function.
-/// This function extracts a function's signature (currently minimal) and builds
-/// a control flow graph of basic blocks.
-///
-/// If `fn_name_override` is provided, it will be used instead of querying rustc for
-/// the item name. This is necessary for closures, which don't have proper item names
-/// in rustc's internal representation.
+/// Converts a MIR body into an OOMIR function and control-flow graph.
+/// `fn_name_override` supplies names for closures, which lack normal rustc item names.
 pub fn mir_to_oomir<'tcx>(
     tcx: TyCtxt<'tcx>,
     instance: Instance<'tcx>,

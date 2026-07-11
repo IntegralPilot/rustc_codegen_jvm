@@ -270,7 +270,7 @@ pub fn convert_rvalue_to_operand<'a>(
                         ty: temp_var_type,
                     };
                 }
-                MirOperand::Constant(_) => {
+                MirOperand::Constant(_) | MirOperand::RuntimeChecks(_) => {
                     // Constant is already an operand, no extra instructions
                     result_operand = convert_operand(
                         mir_operand,
@@ -280,9 +280,6 @@ pub fn convert_rvalue_to_operand<'a>(
                         data_types,
                         &mut instructions,
                     );
-                }
-                MirOperand::RuntimeChecks(_) => {
-                    todo!("RuntimeChecks operand not yet supported")
                 }
             }
         }
@@ -402,7 +399,6 @@ pub fn convert_rvalue_to_operand<'a>(
 
             match borrow_kind {
                 MirBorrowKind::Mut { .. } if !is_trait_object => {
-                    // --- MUTABLE BORROW (&mut T) -> Use Array Hack (but NOT for trait objects) ---
                     breadcrumbs::log!(
                         breadcrumbs::LogLevel::Info,
                         "mir-lowering",
@@ -465,7 +461,6 @@ pub fn convert_rvalue_to_operand<'a>(
                 }
                 MirBorrowKind::Mut { .. } | MirBorrowKind::Shared | MirBorrowKind::Fake { .. } => {
                     // Treat Fake like Shared (used for closures etc.)
-                    // --- SHARED BORROW (&T) or others -> Pass Through Value ---
                     breadcrumbs::log!(
                         breadcrumbs::LogLevel::Info,
                         "mir-lowering",
@@ -1315,52 +1310,6 @@ pub fn convert_rvalue_to_operand<'a>(
                             )
                         );
 
-                        /*
-                        i.e. consider rust code:
-                        ```rust
-                        enum MyEnum {
-                            A(i32),
-                            B{x: String},
-                            C,
-                        }
-                        ```
-
-                        psuedo-java for the plan on how to handle this
-                        ```java
-                        abstract class MyEnum {
-                            public abstract int getVariantIdx();
-                        }
-
-                        class MyEnum$A extends MyEnum {
-                            public int field0;
-
-                            public MyEnum$A(int field0) {
-                                this.field0 = field0;
-                            }
-
-                            @Override
-                            public final int getVariantIdx() { return 0; }
-                        }
-
-                        class MyEnum$B extends MyEnum {
-                            public String field0;
-
-                            public MyEnum$B(String field0) {
-                                this.field0 = field0;
-                            }
-
-                            @Override
-                            public final int getVariantIdx() { return 1; }
-                        }
-
-                        class MyEnum$C extends MyEnum {
-                            @Override
-                            public final int getVariantIdx() { return 2; }
-                        }
-                        ```
-                        */
-
-                        // the enum in general - always ensure helper methods are present
                         if should_define_data_type {
                             let variants_info: Vec<_> = adt_def
                                 .variants()

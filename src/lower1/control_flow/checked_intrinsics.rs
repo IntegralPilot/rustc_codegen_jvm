@@ -82,7 +82,6 @@ pub fn emit_checked_arithmetic_intrinsic(
     let lbl_neg_check_b_non_pos = format!("lbl_{}_neg_chk_b_non_pos", fn_name);
     let lbl_neg_check_final_cmp = format!("lbl_{}_neg_chk_final_cmp", fn_name);
 
-    // --- Start Positive Overflow Check ---
     let tmp_cmp1 = format!("{}_chk_cmp1", fn_name);
     instrs.push(Instruction::Gt {
         dest: tmp_cmp1.clone(),
@@ -98,7 +97,6 @@ pub fn emit_checked_arithmetic_intrinsic(
         false_block: label_check_neg.clone(),
     });
 
-    // --- Positive Check: Check B ---
     instrs.push(Instruction::Label {
         name: lbl_pos_check_b_non_neg.clone(),
     });
@@ -117,7 +115,6 @@ pub fn emit_checked_arithmetic_intrinsic(
         false_block: label_check_neg.clone(),
     });
 
-    // --- Positive Check: Final Comparison (b > MAX - a) ---
     instrs.push(Instruction::Label {
         name: lbl_pos_check_final_cmp.clone(),
     });
@@ -145,7 +142,6 @@ pub fn emit_checked_arithmetic_intrinsic(
         false_block: label_check_neg.clone(),
     });
 
-    // --- Start Negative Overflow Check ---
     instrs.push(Instruction::Label {
         name: label_check_neg.clone(),
     });
@@ -164,7 +160,6 @@ pub fn emit_checked_arithmetic_intrinsic(
         false_block: label_no_overflow.clone(),
     });
 
-    // --- Negative Check: Check B ---
     instrs.push(Instruction::Label {
         name: lbl_neg_check_b_non_pos.clone(),
     });
@@ -183,7 +178,6 @@ pub fn emit_checked_arithmetic_intrinsic(
         false_block: label_no_overflow.clone(),
     });
 
-    // --- Negative Check: Final Comparison (b < MIN - a) ---
     instrs.push(Instruction::Label {
         name: lbl_neg_check_final_cmp.clone(),
     });
@@ -211,7 +205,6 @@ pub fn emit_checked_arithmetic_intrinsic(
         false_block: label_no_overflow.clone(),
     });
 
-    // --- Overflow Path ---
     instrs.push(Instruction::Label {
         name: label_overflow.clone(),
     });
@@ -227,7 +220,6 @@ pub fn emit_checked_arithmetic_intrinsic(
         target: label_end.clone(),
     });
 
-    // --- No Overflow Path ---
     instrs.push(Instruction::Label {
         name: label_no_overflow.clone(),
     });
@@ -260,7 +252,6 @@ pub fn emit_checked_arithmetic_intrinsic(
         target: label_end.clone(),
     });
 
-    // --- End Path ---
     instrs.push(Instruction::Label {
         name: label_end.clone(),
     });

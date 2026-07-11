@@ -84,7 +84,6 @@ pub fn emit_checked_arithmetic_oomir_instructions(
         return (generated_instructions, tmp_pair, tmp_result, tmp_overflow);
     }
 
-    // --- For primitive integer types, emit a call to the checked arithmetic intrinsic ---
     let ty_suffix = match op_ty {
         Type::I32 => "i32",
         Type::I64 => "i64",

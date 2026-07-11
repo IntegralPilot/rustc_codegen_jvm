@@ -39,7 +39,6 @@ pub fn oomir_to_jvm_bytecode(
     // Map to store the generated class files (Class Name -> Bytes)
     let mut generated_classes: HashMap<String, Vec<u8>> = HashMap::new();
 
-    // --- 1. Generate module classes (containing free functions grouped by owner module) ---
     let mut functions_by_class: BTreeMap<String, Vec<&oomir::Function>> = BTreeMap::new();
     for function in module.functions.values() {
         functions_by_class
@@ -197,7 +196,6 @@ pub fn oomir_to_jvm_bytecode(
         );
     }
 
-    // --- 2. Generate Class Files for Data Types ---
     for (dt_name_oomir, data_type) in &module.data_types {
         breadcrumbs::log!(
             breadcrumbs::LogLevel::Info,

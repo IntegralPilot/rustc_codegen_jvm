@@ -1,7 +1,8 @@
 {
-  "arch": "jvm",
-  "binary-format": "wasm",
-  "data-layout": "e-m:e-p:32:32-p10:8:8-p20:8:8-i64:64-i128:128-n32:64-S128-ni:1:10:20",
+  "arch": "sparc64",
+  "data-layout": "e-m:e-p:64:64-i64:64-i128:128-n32:64-S128",
+  "llvm-abiname": "lp64",
+  "target-pointer-width": 64,
   "dll-prefix": "",
   "dll-suffix": ".class",
   "eh-frame-header": false,
@@ -17,6 +18,5 @@
     "tier": 3
   },
   "panic-strategy": "abort",
-  "target-pointer-width": 32,
   "llvm-target": "jvm-unknown-unknown"
 }

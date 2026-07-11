@@ -183,7 +183,6 @@ pub fn load_constant(
                 instructions_to_add.push(JI::Dup); // Stack: [arrayref, arrayref]
                 instructions_to_add.push(get_int_const_instr(cp, i as i32)); // Stack: [arrayref, arrayref, index]
 
-                // --- Corrected Element Loading ---
                 // 1. Record the length of the main instruction vector *before* the recursive call.
                 let original_jvm_len = instructions.len();
 

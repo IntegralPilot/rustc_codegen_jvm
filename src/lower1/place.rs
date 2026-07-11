@@ -1,4 +1,5 @@
 use super::{
+    jvm_names,
     operand::convert_operand,
     types::{
         adapt_simple_enum_operand, get_field_name_from_index, should_define_named_data_type,
@@ -6,99 +7,15 @@ use super::{
     },
 };
 use crate::oomir::{self, DataTypeMethod, Instruction, Operand};
-use regex::Regex;
 use rustc_middle::{
     mir::{Body, Operand as MirOperand, Place, ProjectionElem},
     ty::{AdtDef, GenericArgsRef, Instance, Ty, TyCtxt, TyKind},
 };
-use std::{collections::HashMap, sync::OnceLock};
+use std::collections::HashMap;
 
 pub fn place_to_string<'tcx>(place: &Place<'tcx>, _tcx: TyCtxt<'tcx>) -> String {
     // Base variable name (e.g., "_1")
     format!("_{}", place.local.index()) // Start with base local "_N"
-}
-
-pub fn make_jvm_safe(input: &str) -> String {
-    // --- Static Regex Definitions ---
-    static RE_TRAIT_IMPL: OnceLock<Regex> = OnceLock::new();
-    static RE_TRAIT_IMPL_PATH: OnceLock<Regex> = OnceLock::new();
-    static RE_NONWORD: OnceLock<Regex> = OnceLock::new();
-
-    // Regex to specifically capture the implementing type and the method name
-    // from the pattern: <Type as Trait>::Method
-    // - Group 1: The implementing type (e.g., "U32Holder")
-    // - Group 2: The method name (e.g., "getInnerNumber")
-    // It intentionally ignores the trait name part ("as GetInnerNumber").
-    // Added robustness for potential whitespace variations.
-    let re_trait = RE_TRAIT_IMPL
-        .get_or_init(|| Regex::new(r"^\s*<(.+?)\s+as\s+.*?\s*>\s*::\s*([^:]+)\s*$").unwrap());
-
-    // Regex to capture "Type as Trait" pattern (without angle brackets)
-    // This handles def_path_str output like "SimpleAdder as Calculator::calculate"
-    let re_trait_path =
-        RE_TRAIT_IMPL_PATH.get_or_init(|| Regex::new(r"(.+?)\s+as\s+([^:]+?)(?:::|$)").unwrap());
-
-    // Regex for sequences of characters that are NOT alphanumeric or underscore.
-    // Using \p{Alnum} includes Unicode letters and numbers.
-    let re_nw = RE_NONWORD.get_or_init(|| Regex::new(r"[^a-zA-Z0-9_]+").unwrap());
-
-    // --- Determine Base String ---
-    let base_string = if let Some(caps) = re_trait.captures(input) {
-        // Case 1: Input matches the <Type as Trait>::Method pattern.
-        // Combine the captured Type (group 1) and Method (group 2).
-        // This aims to replicate the naming seen for the definition (e.g., "u32holder_getinnernumber").
-        format!("{}_{}", &caps[1], &caps[2])
-    } else if let Some(caps) = re_trait_path.captures(input) {
-        // Case 1b: Input matches "Type as Trait" pattern.
-        // Extract just the trait name (group 2), ignoring the implementing type.
-        caps[2].to_string()
-    } else {
-        // Case 2: Input does not match the specific trait pattern.
-        // Use the original input string. Subsequent cleaning will handle '::', '<>', etc.
-        // This covers cases like "main", "U32Holder", "std::io::Error".
-        input.to_string()
-    };
-
-    // --- Clean the Base String ---
-    // Replace any run of non-word characters (excluding _) with a single underscore.
-    let cleaned = re_nw.replace_all(&base_string, "_");
-
-    // Trim leading and trailing underscores that might result from cleaning.
-    let trimmed = cleaned.trim_matches('_');
-
-    // If there's more than 1 _ in a row replace it with a single _
-    let re_dup_underscores = Regex::new(r"_{2,}").unwrap();
-    let result = re_dup_underscores.replace_all(&trimmed, "_").to_string();
-
-    // remove any "impl_" as the word "impl" isn't actually related to the function and it's specific monomorphisation
-    let result = result.replace("impl_", "");
-
-    // --- Handle Potential Empty Result ---
-    // If cleaning and trimming resulted in an empty string:
-    let final_result = if result.is_empty() {
-        // If the original input was *also* empty, return a default or empty.
-        if input.is_empty() {
-            "jvm_empty_input".to_string() // Or just ""
-        } else {
-            // Original input wasn't empty, but cleaning made it so (e.g., input="::" or "<>").
-            // Create a fallback. Hashing the original input is robust.
-            // Using a simple placeholder for now, or re-clean original without trimming maybe.
-            // Let's try cleaning the original input again and using it, potentially keeping underscores.
-            let fallback_cleaned = re_nw.replace_all(input, "_");
-            // Check if the fallback is just underscores or empty
-            if fallback_cleaned.chars().all(|c| c == '_') {
-                format!("jvm_fallback_{:x}", md5::compute(input)) // Needs md5 crate
-            // Or a simpler fixed fallback: "jvm_unnamed_fallback".to_string()
-            } else {
-                // Use the fallback cleaning, maybe trim again just in case
-                fallback_cleaned.trim_matches('_').to_string()
-            }
-        }
-    } else {
-        result
-    };
-
-    final_result
 }
 
 fn union_parts_from_ty<'tcx>(ty: Ty<'tcx>) -> Option<(AdtDef<'tcx>, GenericArgsRef<'tcx>)> {
@@ -168,13 +85,8 @@ fn field_name_for_projection<'tcx>(
     })
 }
 
-/// Generates the necessary OOMIR instructions to retrieve the value corresponding
-/// to a given Place that may have a nested projection chain.
-///
-/// This function iterates over the projection chain one by one and emits the instructions
-/// to “drill down” into the nested field or array.
-///
-/// Returns a tuple: (final variable name, generated instructions, final OOMIR type)
+/// Resolves a nested place projection, returning its variable name, emitted
+/// instructions, and final OOMIR type.
 pub fn emit_instructions_to_get_recursive<'tcx>(
     place: &Place<'tcx>,
     tcx: TyCtxt<'tcx>,
@@ -400,7 +312,6 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
             ProjectionElem::Deref => {
                 match type_before_proj {
                     oomir::Type::MutableReference(_) => {
-                        // Clone the type before potentially modifying it
                         let type_before_deref = current_type.clone();
 
                         match type_before_deref.clone() {
@@ -515,7 +426,7 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
                 let variant_class_name = format!(
                     "{}${}",
                     base_enum_oomir_name, // Use OOMIR name already derived
-                    make_jvm_safe(&variant_def.name.to_string())  // Use actual variant name
+                    jvm_names::member_name(&variant_def.name.to_string())
                 );
 
                 // 5. Update current_type directly to the OOMIR Class representing the variant.
@@ -654,7 +565,6 @@ pub fn emit_instructions_to_set_value<'tcx>(
     let mut instructions = Vec::new();
 
     if dest_place.projection.is_empty() {
-        // --- Base Case: Assignment to a simple local variable ---
         // e.g., _1 = source_operand
         let dest_var_name = place_to_string(dest_place, tcx);
         instructions.push(Instruction::Move {
@@ -662,8 +572,6 @@ pub fn emit_instructions_to_set_value<'tcx>(
             src: source_operand,
         });
     } else {
-        // --- Recursive Case: Assignment involves projections (fields/indices) ---
-
         // 1. Separate the destination into the base and the last projection element.
         let (last_projection, base_projection_elems) = dest_place.projection.split_last().unwrap(); // Safe because we checked is_empty()
         let base_place = Place {

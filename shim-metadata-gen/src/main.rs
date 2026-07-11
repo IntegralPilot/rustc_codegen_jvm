@@ -125,7 +125,7 @@ fn generate_metadata(jar_path: &PathBuf, output_path: &PathBuf) -> Result<usize,
             );
 
             shim_map.insert(
-                method_name, // Assumes this matches make_jvm_safe output
+                method_name, // Assumes this matches jvm_names::member_name output
                 ShimInfo {
                     descriptor,
                     is_static: true, // We already filtered for static

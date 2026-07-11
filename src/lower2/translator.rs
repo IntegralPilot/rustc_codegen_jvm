@@ -608,7 +608,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         }
         self.current_fallthrough_block_label = None;
 
-        // --- Branch Fixup Pass ---
         let branch_fixups = std::mem::take(&mut self.branch_fixups);
         for (instr_index, target_label) in branch_fixups {
             let target_instr_index =
@@ -1088,8 +1087,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         Ok(())
     }
 
-    // --- Instruction Translation Helpers ---
-
     fn translate_binary_op(
         &mut self,
         dest: &str,
@@ -1137,7 +1134,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         };
 
         match (op1_type, op2_type) {
-            // --- Both are the same type ---
             (t1, t2) if t1 == t2 => {
                 // Check if the type itself is comparable
                 match t1 {
@@ -1162,7 +1158,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 }
             }
 
-            // --- BigInteger / BigDecimal Handling ---
             (Type::Class(c1), t2) if c1 == BIG_INTEGER_CLASS && is_promotable_primitive(t2) => {
                 Ok((op1_type.clone(), None, Some(op1_type.clone())))
             } // Promote primitive to BigInt
@@ -1204,7 +1199,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 })
             }
 
-            // --- Numeric Primitive Promotion Rules ---
             (t1, t2) if is_promotable_primitive(t1) && is_promotable_primitive(t2) => {
                 // Determine target type based on promotion rules
                 let target_type = if t1 == &Type::F64 || t2 == &Type::F64 {
@@ -1230,7 +1224,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 Ok((target_type, cast1, cast2))
             }
 
-            // --- Reference Type Equality (only eq/ne) ---
             // Handled by the t1 == t2 case for simplicity, but could be explicit:
             (t1, t2) if t1.is_jvm_reference_type() && t2.is_jvm_reference_type() => {
                 // Allow comparison if types are compatible (e.g. String vs String, MyClass vs MyClass)
@@ -1248,7 +1241,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 }
             }
 
-            // --- Fallback for other unsupported combinations ---
             _ => Err(jvm::Error::VerificationError {
                 context: format!("Function {}", self.oomir_func.name),
                 message: format!(
@@ -1297,7 +1289,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             return Ok(());
         }
 
-        // --- Load and Cast Operands ---
         self.load_operand(op1)?;
         if let Some(target_type) = cast1_target {
             // Use the enhanced casting helper which needs the constant pool
@@ -1314,7 +1305,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         }
         // Stack now holds: [value1_promoted, value2_promoted] (both of comparison_type)
 
-        // --- Perform Comparison based on comparison_type ---
         let branch_constructor: Box<dyn Fn(u16) -> Instruction>;
         //let is_reference_comparison = comparison_type.is_jvm_reference_type();
 
@@ -1960,7 +1950,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     }
                 }
             }
-            // --- Comparisons ---
             OI::Eq { dest, op1, op2 } => self.translate_comparison_op(dest, op1, op2, "eq")?,
             OI::Ne { dest, op1, op2 } => self.translate_comparison_op(dest, op1, op2, "ne")?,
             OI::Lt { dest, op1, op2 } => self.translate_comparison_op(dest, op1, op2, "lt")?,
@@ -1968,7 +1957,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             OI::Gt { dest, op1, op2 } => self.translate_comparison_op(dest, op1, op2, "gt")?,
             OI::Ge { dest, op1, op2 } => self.translate_comparison_op(dest, op1, op2, "ge")?,
 
-            // --- Bitwise Operations ---
             OI::BitAnd { dest, op1, op2 } => {
                 let op_type = get_operand_type(op1); // Use helper to get type robustly
 
@@ -2359,7 +2347,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 // No single store_result needed here, handled within each match arm
             }
 
-            // --- Control Flow ---
             OI::Jump { target } => {
                 if self.current_fallthrough_block_label.as_deref() == Some(target) {
                     return Ok(());
@@ -2413,7 +2400,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 // 0. Calculate the type of the discriminant
                 let discr_type = get_operand_type(discr); // Use helper consistently
 
-                // --- Input Validation ---
                 // Check if the discriminant type is suitable for switch comparison
                 let is_valid_switch_type = match &discr_type {
                     Type::I8 | Type::I16 | Type::I32 | Type::Boolean | Type::Char => true, // Promoted to int
@@ -2458,10 +2444,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     let load_instr = get_load_instruction(&discr_type, temp_discr_index)?;
                     self.jvm_instructions.push(load_instr); // Stack: [discr_value] (size 1 or 2)
 
-                    // --- b. Load constant key and perform comparison based on discriminant type ---
-
                     match &discr_type {
-                        // --- Integer-like types (use if_icmpeq) ---
                         Type::I8 | Type::I16 | Type::I32 | Type::Boolean | Type::Char => {
                             let key_value_i32 = match constant_key {
                                 oomir::Constant::I8(v) => i32::from(*v),
@@ -2494,7 +2477,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                                 .push((if_instr_index, target_label.clone()));
                         }
 
-                        // --- I64 (long) type (use lcmp, ifeq) ---
                         Type::I64 => {
                             match constant_key {
                                 oomir::Constant::I64(_) => {} // Expected type
@@ -2520,7 +2502,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                                 .push((if_instr_index, target_label.clone()));
                         }
 
-                        // --- F32 (float) type (use fcmpl, ifeq) ---
                         Type::F32 => {
                             match constant_key {
                                 oomir::Constant::F32(_) => {} // Expected type
@@ -2546,7 +2527,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                                 .push((if_instr_index, target_label.clone()));
                         }
 
-                        // --- F64 (double) type (use dcmpl, ifeq) ---
                         Type::F64 => {
                             match constant_key {
                                 oomir::Constant::F64(_) => {} // Expected type
@@ -2572,7 +2552,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                                 .push((if_instr_index, target_label.clone()));
                         }
 
-                        // --- String type (use .equals(), ifne) ---
                         Type::String => {
                             match constant_key {
                                 oomir::Constant::String(_) => {} // Expected type
@@ -2609,7 +2588,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                                 .push((if_instr_index, target_label.clone()));
                         }
 
-                        // --- BigInteger type (use .compareTo(), ifeq) ---
                         Type::Class(c) if c == BIG_INTEGER_CLASS => {
                             load_constant(
                                 &mut self.jvm_instructions,
@@ -2631,7 +2609,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                                 .push((if_instr_index, target_label.clone()));
                         }
 
-                        // --- BigDecimal type (use .compareTo(), ifeq) ---
                         Type::Class(c) if c == BIG_DECIMAL_CLASS => {
                             load_constant(
                                 &mut self.jvm_instructions,
@@ -2743,7 +2720,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 let mut handled_as_shim = false;
                 let mut is_diverging_call = false;
 
-                // --- Shim Lookup using JSON metadata ---
                 match get_shim_metadata() {
                     Ok(shim_map) => {
                         // Use the lowered function name as the key.
@@ -2776,7 +2752,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     }
                 } // End Shim Lookup
 
-                // --- Intra-Module or linked external call (Fallback) ---
                 if !handled_as_shim {
                     let target_func = module.get_function(class_name.as_deref(), function_name);
                     let owner_class = target_func
@@ -2893,22 +2868,12 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 }
             }
             OI::Move { dest, src } => {
-                // Determine the type of the VALUE being moved (from the source operand)
                 let value_type = match src {
                     OO::Constant(c) => Type::from_constant(c),
                     OO::Variable { ty, .. } => ty.clone(),
                 };
 
-                // 1. Load the source operand's value onto the stack.
-                self.load_operand(src)?; // e.g., pushes I32(11)
-
-                // 2. Store the value from the stack into the destination variable.
-                //    Crucially, use the 'value_type' determined above.
-                //    'store_result' will call 'get_or_assign_local' internally.
-                //    'get_or_assign_local' will handle finding the index (and warning
-                //    if reusing a slot like '_1' with an incompatible type hint).
-                //    'store_result' will then use the correct 'value_type' (e.g., I32)
-                //    to select the appropriate JVM store instruction (e.g., istore_0).
+                self.load_operand(src)?;
                 self.store_result(dest, &value_type)?;
             }
             OI::NewArray {

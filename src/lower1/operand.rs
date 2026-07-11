@@ -7,7 +7,7 @@ use rustc_middle::{
         Body, Const, ConstOperand, ConstValue, Operand as MirOperand, Place,
         interpret::{ErrorHandled, Scalar},
     },
-    ty::{ConstKind, Instance, Ty, TyCtxt, TyKind, TypeVisitableExt, TypingEnv},
+    ty::{ConstKind, Instance, Ty, TyCtxt, TypeVisitableExt, TypingEnv},
 };
 use std::collections::HashMap;
 
@@ -143,14 +143,14 @@ pub fn convert_operand<'tcx>(
                 }
             }
         }
-        MirOperand::RuntimeChecks(_) => {
-            todo!("RuntimeChecks operand not yet supported")
+        MirOperand::RuntimeChecks(checks) => {
+            oomir::Operand::Constant(oomir::Constant::Boolean(checks.value(tcx.sess)))
         }
     }
 }
 
 pub fn handle_const_value<'tcx>(
-    constant: Option<&ConstOperand>,
+    _constant: Option<&ConstOperand>,
     const_val: ConstValue,
     ty: &Ty<'tcx>,
     tcx: TyCtxt<'tcx>,
@@ -192,64 +192,39 @@ pub fn handle_const_value<'tcx>(
                 }
             }
         },
-        ConstValue::Slice {
-            alloc_id: _,
-            meta: _,
-        } => {
-            let is_str_slice_or_ref = match ty.kind() {
-                TyKind::Str | TyKind::Slice(_) => true, // Direct str or slice type
-                TyKind::Ref(_, inner_ty, _) => inner_ty.is_str() || inner_ty.is_slice(), // Reference to str or slice
-                _ => false, // Not a str/slice or reference to one
-            };
-            if is_str_slice_or_ref {
-                match const_val.try_get_slice_bytes_for_diagnostics(tcx) {
-                    Some(bytes) => match String::from_utf8(bytes.to_vec()) {
-                        Ok(s) => {
-                            breadcrumbs::log!(
-                                breadcrumbs::LogLevel::Info,
-                                "const-eval",
-                                format!("Info: Correctly extracted string constant: \"{}\"", s)
-                            );
-                            oomir::Operand::Constant(oomir::Constant::String(s))
-                        }
-                        Err(_) => {
-                            breadcrumbs::log!(
-                                breadcrumbs::LogLevel::Warn,
-                                "const-eval",
-                                format!(
-                                    "Warning: Slice constant bytes are not valid UTF-8: {:?}",
-                                    bytes
-                                )
-                            );
-                            oomir::Operand::Constant(oomir::Constant::String(
-                                "Invalid UTF8".to_string(),
-                            ))
-                        }
-                    },
-                    None => {
-                        breadcrumbs::log!(
-                            breadcrumbs::LogLevel::Warn,
-                            "const-eval",
-                            format!(
-                                "Warning: Could not get slice bytes for diagnostics for: {:?}",
-                                constant
-                            )
-                        );
-                        oomir::Operand::Constant(oomir::Constant::String(
-                            "SliceReadError".to_string(),
-                        ))
-                    }
-                }
-            } else {
+        ConstValue::Slice { alloc_id, meta } => {
+            let pointee_ty = ty.builtin_deref(false).unwrap_or(*ty);
+            let tail_ty = tcx.struct_tail_for_codegen(pointee_ty, TypingEnv::fully_monomorphized());
+
+            if !tail_ty.is_str() && !tail_ty.is_slice() {
                 breadcrumbs::log!(
                     breadcrumbs::LogLevel::Warn,
                     "const-eval",
                     format!(
-                        "Warning: ConstValue::Slice found for non-slice type: {:?}",
-                        ty
+                        "Warning: ConstValue::Slice for type {:?} has unsupported unsized tail {:?}",
+                        ty, tail_ty
                     )
                 );
-                oomir::Operand::Constant(oomir::Constant::String("NonSliceTypeError".to_string()))
+                return oomir::Operand::Constant(oomir::Constant::String(
+                    "UnsupportedSliceTail".to_string(),
+                ));
+            }
+
+            match const_eval::read_slice_constant(
+                tcx, alloc_id, meta, pointee_ty, data_types, instance,
+            ) {
+                Ok(constant) => oomir::Operand::Constant(constant),
+                Err(error) => {
+                    breadcrumbs::log!(
+                        breadcrumbs::LogLevel::Warn,
+                        "const-eval",
+                        format!(
+                            "Warning: Failed to decode slice-backed constant of type {:?}: {}",
+                            ty, error
+                        )
+                    );
+                    oomir::Operand::Constant(oomir::Constant::String("SliceReadError".to_string()))
+                }
             }
         }
         ConstValue::ZeroSized => {

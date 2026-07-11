@@ -426,7 +426,6 @@ pub(super) fn create_data_type_classfile_for_class(
 
     let super_class_index = cp.add_class(super_class_name_jvm)?;
 
-    // --- Process Implemented Interfaces ---
     let mut seen_interfaces = HashSet::new();
     let mut interface_indices: Vec<u16> = Vec::with_capacity(implements_interfaces.len());
     for interface_name in &implements_interfaces {
@@ -438,7 +437,6 @@ pub(super) fn create_data_type_classfile_for_class(
         interface_indices.push(interface_index);
     }
 
-    // --- Create Fields ---
     let mut jvm_fields: Vec<jvm::Field> = Vec::new();
     for (field_name, field_ty) in &fields {
         let name_index = cp.add_utf8(field_name)?;
@@ -460,7 +458,6 @@ pub(super) fn create_data_type_classfile_for_class(
         );
     }
 
-    // --- Create Constructor ---
     // Fielded Rust structs/enums must be initialized with all fields. Only genuinely
     // fieldless classes keep a no-args constructor.
     let constructor = if fields.is_empty() {
@@ -832,7 +829,6 @@ pub(super) fn create_data_type_classfile_for_class(
         }
     }
 
-    // --- Add InnerClasses Attribute (for nested/member classes) ---
     if !subclasses.is_empty() || nest_host.is_some() {
         let mut inner_classes_vec: Vec<InnerClass> = Vec::with_capacity(subclasses.len());
 
@@ -891,7 +887,6 @@ pub(super) fn create_data_type_classfile_for_class(
         });
     }
 
-    // --- Add SourceFile Attribute ---
     let simple_name = class_name_jvm.split('/').last().unwrap_or(class_name_jvm);
     let source_file_name = format!("{}.rs", simple_name);
     let source_file_utf8_index = cp.add_utf8(&source_file_name)?;
@@ -920,7 +915,6 @@ pub(super) fn create_data_type_classfile_for_class(
     };
     verify_no_duplicate_constants(&class_file)?;
 
-    // --- Serialize ---
     let mut byte_vector = Vec::new();
     class_file
         .to_bytes(&mut byte_vector)
@@ -944,7 +938,6 @@ pub(super) fn create_data_type_classfile_for_interface(
     // Interfaces always implicitly extend Object, and must specify it in the classfile
     let super_class_index = cp.add_class("java/lang/Object")?;
 
-    // --- Create Abstract Methods ---
     let mut jvm_methods: Vec<jvm::Method> = Vec::new();
     for (method_name, signature) in methods {
         // Construct the descriptor: (param1_desc param2_desc ...)return_desc
@@ -983,7 +976,6 @@ pub(super) fn create_data_type_classfile_for_interface(
 
     let mut class_attributes = Vec::new();
 
-    // --- Add SourceFile Attribute ---
     let simple_name = interface_name_jvm
         .split('/')
         .last()
@@ -1011,7 +1003,6 @@ pub(super) fn create_data_type_classfile_for_interface(
     };
     verify_no_duplicate_constants(&class_file)?;
 
-    // --- Serialize ---
     let mut byte_vector = Vec::new();
     class_file
         .to_bytes(&mut byte_vector)

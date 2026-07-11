@@ -13,8 +13,6 @@ use reorganisation::{
     convert_labels_to_basic_blocks_in_function, eliminate_duplicate_basic_blocks,
 };
 
-// --- Data Structures ---
-
 #[derive(Debug, Clone)]
 struct BasicBlockInfo {
     original_block: BasicBlock,
@@ -25,8 +23,6 @@ struct BasicBlockInfo {
 type ConstantMap = HashMap<String, Constant>;
 
 type DataflowResult = HashMap<String, ConstantMap>;
-
-// --- CFG Construction ---
 
 fn build_cfg(code_block: &CodeBlock) -> HashMap<String, BasicBlockInfo> {
     let mut cfg: HashMap<String, BasicBlockInfo> = code_block
@@ -48,7 +44,6 @@ fn build_cfg(code_block: &CodeBlock) -> HashMap<String, BasicBlockInfo> {
         return cfg;
     }
 
-    // --- Determine Successors  ---
     let mut all_successors: HashMap<String, Vec<String>> = HashMap::new();
     let cfg_keys: HashSet<String> = cfg.keys().cloned().collect();
 
@@ -84,7 +79,6 @@ fn build_cfg(code_block: &CodeBlock) -> HashMap<String, BasicBlockInfo> {
         }
     }
 
-    // --- Populate Successors and Predecessors ---
     for (label, successors) in &all_successors {
         if let Some(info) = cfg.get_mut(label) {
             info.successors.extend(successors.iter().cloned());
@@ -99,8 +93,6 @@ fn build_cfg(code_block: &CodeBlock) -> HashMap<String, BasicBlockInfo> {
     cfg
 }
 
-// --- Transformation Phase ---
-
 fn transform_function(
     function: &mut Function,
     cfg: &HashMap<String, BasicBlockInfo>,
@@ -112,7 +104,6 @@ fn transform_function(
     // Populate all labels from the original CFG before the loop
     let all_original_labels: HashSet<String> = cfg.keys().cloned().collect();
 
-    // --- Pass 1: Optimize instructions and determine new successors ---
     for (label, info) in cfg {
         // Iterate using original CFG structure
         let block_entry_state = analysis_result
@@ -157,14 +148,12 @@ fn transform_function(
         optimized_successors.insert(label.clone(), current_successors);
     }
 
-    // --- Pass 2: Find reachable blocks based on optimized structure ---
     let reachable_labels = find_reachable_blocks(
         &function.body.entry,
         &optimized_successors,
         &all_original_labels,
     );
 
-    // --- Pass 3: Build the final function body with only reachable blocks ---
     // (Keep the previous fix - don't remove empty reachable blocks)
     let mut final_basic_blocks = HashMap::new();
     for label in &reachable_labels {
@@ -186,7 +175,6 @@ fn transform_function(
         }
     }
 
-    // --- Entry Point Handling & Cleanup ---
     // Check reachability against the original cfg's keyset size or existence check
     if !reachable_labels.contains(&function.body.entry) && !cfg.is_empty() {
         breadcrumbs::log!(
@@ -246,8 +234,6 @@ fn transform_function(
 
     function.body.basic_blocks = final_basic_blocks;
 }
-
-// --- Main Optimization Entry Points ---
 
 pub fn optimise_function(
     mut function: Function,

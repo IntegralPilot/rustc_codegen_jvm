@@ -3,8 +3,6 @@
 use serde::Deserialize;
 use std::{collections::HashMap, str, sync::OnceLock};
 
-// --- Standard Library Shim Metadata Loader ---
-
 #[derive(Deserialize, Debug, Clone)]
 pub(super) struct ShimInfo {
     // pub(super) or pub(crate)
@@ -32,10 +30,8 @@ impl ShimInfo {
     }
 }
 
-// Key: Simplified function name (output of make_jvm_safe)
+// Key: JVM-safe member name (output of jvm_names::member_name)
 pub(super) type ShimMap = HashMap<String, ShimInfo>;
-
-// --- Lazy Static Loader for Shims (Reads JSON File) ---
 
 static SHIM_METADATA: OnceLock<Result<ShimMap, String>> = OnceLock::new();
 

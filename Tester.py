@@ -44,6 +44,7 @@ def build_rust_code(test_dir: str, release_mode: bool, logs: list) -> tuple[bool
         logs.append("|---- 🛠️ Building with JVM target JSON...")
         build_cmd.extend(["--target", "../../../jvm-unknown-unknown.json"])
         build_cmd.extend(["-Zjson-target-spec"])
+        build_cmd.extend(["-Zbuild-std"])
     
     proc = run_command(build_cmd, cwd=test_dir)
     target_dir = "release" if release_mode else "debug"

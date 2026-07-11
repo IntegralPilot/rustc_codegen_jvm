@@ -1,7 +1,5 @@
 use super::*;
 
-// --- Reachability Analysis for DCE ---
-
 // Helper to get potential successors from a single instruction
 pub fn get_instruction_successors(instruction: &Instruction) -> Vec<String> {
     match instruction {

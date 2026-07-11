@@ -1,15 +1,15 @@
 use super::{
     jvm_names,
     operand::convert_operand,
-    place::{emit_instructions_to_get_on_own, emit_instructions_to_set_value, place_to_string},
+    place::{emit_instructions_to_get_on_own, emit_instructions_to_set_value},
     types::mir_int_to_oomir_const,
 };
 use crate::oomir;
 
 use rustc_middle::{
     mir::{
-        BasicBlock, BasicBlockData, Body, Local, Operand as MirOperand, Place, StatementKind,
-        TerminatorKind,
+        BasicBlock, BasicBlockData, Body, Local, NonDivergingIntrinsic, Operand as MirOperand,
+        Place, StatementKind, TerminatorKind,
     },
     ty::{Instance, TyCtxt, TyKind, TypingEnv},
 };
@@ -155,6 +155,12 @@ pub fn convert_basic_block<'tcx>(
             StatementKind::Nop => {
                 // Literally a no-op
             }
+            StatementKind::Intrinsic(box NonDivergingIntrinsic::Assume(operand)) => {
+                // `assume(false)` is UB, so a valid program never needs a JVM-side
+                // branch here. Still lower the operand so any place projection is
+                // evaluated consistently with other MIR operands.
+                let _ = convert_operand(operand, tcx, instance, mir, data_types, &mut instructions);
+            }
             StatementKind::SetDiscriminant {
                 place,
                 variant_index,
@@ -208,30 +214,22 @@ pub fn convert_basic_block<'tcx>(
                 });
             }
             TerminatorKind::SwitchInt { discr, targets, .. } => {
-                // --- GENERAL SwitchInt Handling ---
                 let discr_operand =
                     convert_operand(discr, tcx, instance, mir, data_types, &mut instructions);
-                // Get the actual type of the discriminant from MIR local declarations
                 let discr_ty = discr.ty(&mir.local_decls, tcx);
 
-                // Convert the MIR targets into OOMIR (Constant, Label) pairs
                 let oomir_targets: Vec<(oomir::Constant, String)> = targets
                     .iter()
                     .map(|(value, target_bb)| {
-                        // Convert MIR value (u128) to appropriate OOMIR constant based on discr_ty
-                        let oomir_const = mir_int_to_oomir_const(value, discr_ty, tcx); // Use helper
-                        // Check if the constant type is suitable for a JVM switch
-                    if !oomir_const.is_integer_like() {
-                        breadcrumbs::log!(breadcrumbs::LogLevel::Warn, "mir-lowering", format!("Warning: SwitchInt target value {:?} for type {:?} cannot be directly used in JVM switch. Block: {}", oomir_const, discr_ty, label));
-                             // Decide on fallback: error, skip target, default value?
-                             // For now, let's potentially create an invalid switch target for lower2 to handle/error on.
+                        let oomir_const = mir_int_to_oomir_const(value, discr_ty, tcx);
+                        if !oomir_const.is_integer_like() {
+                            breadcrumbs::log!(breadcrumbs::LogLevel::Warn, "mir-lowering", format!("Warning: SwitchInt target value {:?} for type {:?} cannot be directly used in JVM switch. Block: {}", oomir_const, discr_ty, label));
                         }
                         let target_label = format!("bb{}", target_bb.index());
                         (oomir_const, target_label)
                     })
                     .collect();
 
-                // Get the label for the 'otherwise' block
                 let otherwise_label = format!("bb{}", targets.otherwise().index());
 
                 // Add the single OOMIR Switch instruction
@@ -249,7 +247,6 @@ pub fn convert_basic_block<'tcx>(
                 target,
                 ..
             } => {
-                // --- Argument Processing ---
                 let mut pre_call_instructions = Vec::new();
                 let oomir_operands: Vec<oomir::Operand> = args
                     .iter()
@@ -271,7 +268,6 @@ pub fn convert_basic_block<'tcx>(
                     .is_empty()
                     .then(|| format!("_{}", destination.local.index()));
 
-                // --- Call Type Dispatch ---
                 let func_ty = func.ty(mir, tcx);
                 if let rustc_middle::ty::TyKind::FnDef(def_id, substs) = func_ty.kind() {
                     // Resolve the instance
@@ -333,7 +329,6 @@ pub fn convert_basic_block<'tcx>(
 
                     if let Some(item) = assoc_item {
                         if item.is_method() {
-                            // --- Instance Method (has 'self') ---
                             let receiver_mir_ty = args[0].node.ty(mir, tcx);
                             let receiver_operand = oomir_operands[0].clone();
 
@@ -470,7 +465,6 @@ pub fn convert_basic_block<'tcx>(
                                 }
                             }
                         } else {
-                            // --- Associated Static Function (NO 'self') ---
                             let method_name = super::naming::associated_method_name_from_instance(
                                 tcx,
                                 func_instance,
@@ -521,7 +515,6 @@ pub fn convert_basic_block<'tcx>(
                             }
                         }
                     } else {
-                        // --- Free Function ---
                         let is_closure_call = matches!(instance_ty.kind(), TyKind::Closure(..));
                         let (class_name, function) = if is_closure_call {
                             (
@@ -581,7 +574,6 @@ pub fn convert_basic_block<'tcx>(
                     });
                 }
 
-                // --- Post-call Logic (Unchanged) ---
                 let mut write_back_instrs = Vec::new();
 
                 let mut operand_to_place_map = HashMap::new();
@@ -687,7 +679,6 @@ pub fn convert_basic_block<'tcx>(
                     condition_operand =
                         convert_operand(cond, tcx, instance, mir, data_types, &mut instructions);
                 }
-                // --- End of condition operand handling ---
 
                 // The MIR assert checks `!cond == expected`. Rust asserts check `cond == expected`.
                 // Standard Rust `assert!(expr)` lowers to MIR `assert(expr, expected: true, ...)`
@@ -741,7 +732,6 @@ pub fn convert_basic_block<'tcx>(
                     false_block: failure_block.clone(), // Jump here if assertion fails
                 });
 
-                // --- Add the failure block ---
                 // Extract the message. msg is an AssertMessage.
                 // We need to handle different kinds of AssertMessage.
                 let panic_message = match &**msg {
@@ -810,29 +800,13 @@ pub fn convert_basic_block<'tcx>(
                 );
             }
             TerminatorKind::Drop {
-                place: dropped_place,
+                place: _,
                 target,
                 unwind: _,
                 replace: _,
                 drop: _,
             } => {
-                // In simple cases (no custom Drop trait), a MIR drop often just signifies
-                // the end of a scope before control flow continues.
-                // We need to emit the jump to the target block.
-                // We ignore unwind paths for now.
-                // We also don't emit an explicit OOMIR 'drop' instruction yet,
-                // as standard GC handles memory. If explicit resource cleanup (like file.close())
-                // were needed, this would require much more complex handling (e.g., try-finally).
-
-                breadcrumbs::log!(
-                    breadcrumbs::LogLevel::Info,
-                    "mir-lowering",
-                    format!(
-                        "Info: Handling Drop terminator for place {:?}. Jumping to target bb{}.",
-                        place_to_string(dropped_place, tcx),
-                        target.index()
-                    )
-                );
+                // TODO: RAII
 
                 let target_label = format!("bb{}", target.index());
                 instructions.push(oomir::Instruction::Jump {

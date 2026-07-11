@@ -39,7 +39,6 @@ pub fn convert_labels_to_basic_blocks_in_function(function: &mut Function) {
                         Instruction::Label {
                             name: next_label_name,
                         } => {
-                            // --- Found a label: Finalize the *current* segment ---
                             needs_another_pass = true; // Signal that we changed something
 
                             // 1. Add jump if the last instruction wasn't a terminator

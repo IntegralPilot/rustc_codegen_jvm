@@ -1,6 +1,6 @@
 use rustc_abi::{FieldIdx, FieldsShape, Size, TagEncoding, VariantIdx, Variants};
 use rustc_middle::mir::interpret::{
-    AllocRange, Allocation, CtfeProvenance, GlobalAlloc, Pointer, Provenance, Scalar,
+    AllocId, AllocRange, Allocation, CtfeProvenance, GlobalAlloc, Pointer, Provenance, Scalar,
 };
 use rustc_middle::ty::layout::TyAndLayout;
 use rustc_middle::ty::{
@@ -10,8 +10,7 @@ use rustc_middle::ty::{
 use std::collections::HashMap;
 
 use super::super::{
-    place::make_jvm_safe,
-    ty_to_oomir_type,
+    jvm_names, ty_to_oomir_type,
     types::{
         generate_adt_jvm_class_name, generate_tuple_jvm_class_name, should_define_named_data_type,
     },
@@ -20,6 +19,124 @@ use super::float::f128_to_string;
 use crate::oomir::{self, DataTypeMethod};
 
 type ConstAllocation = Allocation<CtfeProvenance>;
+
+/// Decode the optimized `ConstValue::Slice` representation. Rust uses that
+/// representation for every reference whose pointee has a slice tail, not
+/// merely for `&str` and `&[T]`.
+pub fn read_slice_constant<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    alloc_id: AllocId,
+    len: u64,
+    pointee_ty: Ty<'tcx>,
+    oomir_data_types: &mut HashMap<String, oomir::DataType>,
+    instance: Instance<'tcx>,
+) -> Result<oomir::Constant, String> {
+    let allocation = match tcx.global_alloc(alloc_id) {
+        GlobalAlloc::Memory(allocation) => allocation.inner(),
+        other => {
+            return Err(format!(
+                "slice data referred to non-memory allocation {:?}",
+                other
+            ));
+        }
+    };
+
+    read_slice_backed_value(tcx, allocation, len, pointee_ty, oomir_data_types, instance)
+}
+
+fn read_slice_backed_value<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    allocation: &ConstAllocation,
+    len: u64,
+    ty: Ty<'tcx>,
+    oomir_data_types: &mut HashMap<String, oomir::DataType>,
+    instance: Instance<'tcx>,
+) -> Result<oomir::Constant, String> {
+    match ty.kind() {
+        TyKind::Str => read_string_from_allocation(allocation, Size::ZERO, Some(len as usize)),
+        TyKind::Slice(element_ty) => {
+            let element_layout = tcx
+                .layout_of(TypingEnv::fully_monomorphized().as_query_input(*element_ty))
+                .map_err(|error| {
+                    format!(
+                        "could not get slice element layout for {:?}: {:?}",
+                        element_ty, error
+                    )
+                })?;
+            let element_type = ty_to_oomir_type(*element_ty, tcx, oomir_data_types, instance);
+            let mut elements = Vec::with_capacity(len as usize);
+
+            for index in 0..len {
+                let offset = element_layout
+                    .size
+                    .checked_mul(index, &tcx.data_layout)
+                    .ok_or_else(|| format!("slice offset overflow at element {}", index))?;
+                elements.push(read_constant_value_from_memory(
+                    tcx,
+                    allocation,
+                    offset,
+                    *element_ty,
+                    oomir_data_types,
+                    instance,
+                )?);
+            }
+
+            Ok(oomir::Constant::Array(Box::new(element_type), elements))
+        }
+        TyKind::Adt(adt_def, args) if adt_def.is_struct() && adt_def.repr().transparent() => {
+            let variant = adt_def.variant(VariantIdx::from_usize(0));
+            if variant.fields.len() != 1 {
+                return Err(format!(
+                    "transparent slice-tailed type {:?} has {} fields; only single-field wrappers are currently representable",
+                    ty,
+                    variant.fields.len()
+                ));
+            }
+
+            let field = &variant.fields[FieldIdx::from_usize(0)];
+            let field_ty = tcx
+                .normalize_erasing_regions(TypingEnv::fully_monomorphized(), field.ty(tcx, args));
+            let expected_tail = tcx.struct_tail_for_codegen(ty, TypingEnv::fully_monomorphized());
+            let field_tail =
+                tcx.struct_tail_for_codegen(field_ty, TypingEnv::fully_monomorphized());
+            if field_tail != expected_tail {
+                return Err(format!(
+                    "transparent field {:?} does not contain the slice tail {:?}",
+                    field_ty, expected_tail
+                ));
+            }
+
+            let inner = read_slice_backed_value(
+                tcx,
+                allocation,
+                len,
+                field_ty,
+                oomir_data_types,
+                instance,
+            )?;
+            let class_name = match ty_to_oomir_type(ty, tcx, oomir_data_types, instance) {
+                oomir::Type::Class(class_name) => class_name,
+                other => {
+                    return Err(format!(
+                        "slice-tailed wrapper {:?} mapped to non-class type {:?}",
+                        ty, other
+                    ));
+                }
+            };
+            let mut fields = HashMap::new();
+            fields.insert(field.ident(tcx).to_string(), inner.clone());
+            Ok(oomir::Constant::Instance {
+                class_name,
+                fields,
+                params: vec![inner],
+            })
+        }
+        _ => Err(format!(
+            "unsupported slice-backed pointee type {:?}; expected str, a slice, or a single-field transparent wrapper",
+            ty
+        )),
+    }
+}
 
 pub fn read_scalar_int_constant<'tcx>(
     tcx: TyCtxt<'tcx>,
@@ -286,7 +403,6 @@ pub fn read_constant_value_from_memory<'tcx>(
     );
 
     match ty.kind() {
-        // --- Primitive/Scalar Types ---
         TyKind::Bool | TyKind::Char | TyKind::Int(_) | TyKind::Uint(_) | TyKind::Float(_) => {
             let range = AllocRange {
                 start: offset,
@@ -315,7 +431,6 @@ pub fn read_constant_value_from_memory<'tcx>(
             read_scalar_int_constant(tcx, scalar_int, ty, oomir_data_types, instance)
         }
 
-        // --- Pointer/Reference Types (requires recursive dereference) ---
         TyKind::Ref(_, inner_ty, _) | TyKind::RawPtr(inner_ty, _) => {
             if inner_ty.is_str() {
                 read_str_from_fat_pointer(tcx, allocation, offset)
@@ -325,18 +440,8 @@ pub fn read_constant_value_from_memory<'tcx>(
             }
         }
 
-        // --- String Slice (&str) ---
-        // This case is typically handled via ConstValue::Slice or by reading a fat pointer (Ptr+meta)
-        // A direct read from memory for `str` itself isn't standard, but handle if layout allows.
-        TyKind::Str => {
-            Err("Unsupported type: Direct read of str from memory".to_string())
-            // If `ty` was actually `&str`, it would be handled by TyKind::Ref above.
-            // The pointer read there would give a fat pointer (ptr, len).
-            // Need to extract len and read bytes from pointed-to allocation.
-            // This logic belongs within the TyKind::Ref handler when inner_ty is str.
-        }
+        TyKind::Str => Err("Unsupported type: Direct read of str from memory".to_string()),
 
-        // --- Array ([T; N]) ---
         TyKind::Array(elem_ty, len_const) => {
             let Some(len) = len_const.try_to_target_usize(tcx) else {
                 return Err("Unsupported type: Array with non-constant length".to_string());
@@ -345,10 +450,8 @@ pub fn read_constant_value_from_memory<'tcx>(
             let elem_layout = tcx
                 .layout_of(elem_pci)
                 .map_err(|_| "Couldn't get element layout.".to_string())?;
-            // Determine OOMIR element type (assuming ty_to_oomir_type exists)
             let oomir_elem_type = ty_to_oomir_type(*elem_ty, tcx, oomir_data_types, instance);
 
-            // find values in the array
             let mut values = Vec::with_capacity(len as usize);
             for i in 0..len {
                 let elem_offset =
@@ -364,14 +467,11 @@ pub fn read_constant_value_from_memory<'tcx>(
                 values.push(elem_const);
             }
 
-            // make an oomir constant
             Ok(oomir::Constant::Array(Box::new(oomir_elem_type), values))
         }
 
-        // --- Slice ([T]) ---
         TyKind::Slice(_) => Err("Unsupported type: Direct read of slice from memory".to_string()),
 
-        // --- ADTs (Struct, Enum) ---
         TyKind::Adt(adt_def, substs) => {
             if adt_def.is_struct() {
                 handle_constant_struct(
@@ -397,15 +497,11 @@ pub fn read_constant_value_from_memory<'tcx>(
                     instance,
                 )
             } else {
-                // Union
                 Err("Unsupported type: Union".to_string())
             }
         }
 
-        // --- Tuples ---
         TyKind::Tuple(field_tys) => {
-            // Similar to structs, but fields accessed by index.
-            // OOMIR might represent tuples as generic structs or have a dedicated type.
             let mut fields_map = HashMap::new();
             let mut params = Vec::new();
             match layout.fields {
@@ -421,7 +517,7 @@ pub fn read_constant_value_from_memory<'tcx>(
                             instance,
                         )?;
                         params.push(field_const.clone());
-                        fields_map.insert(format!("field{}", i), field_const); // Use numbered field names
+                        fields_map.insert(format!("field{}", i), field_const);
                     }
                 }
                 _ => return Err("Unsupported tuple layout".to_string()),
@@ -435,13 +531,9 @@ pub fn read_constant_value_from_memory<'tcx>(
             })
         }
 
-        // --- Other Types ---
-        // TyKind::FnDef, TyKind::FnPtr, TyKind::Closure, TyKind::Generator, TyKind::Never, etc.
         _ => Err("Unsupported type: Complex or unknown type".to_string()),
     }
 }
-
-// --- ADT Helper Functions ---
 
 fn handle_constant_struct<'tcx>(
     tcx: TyCtxt<'tcx>,
@@ -510,7 +602,6 @@ fn handle_constant_enum<'tcx>(
 ) -> Result<oomir::Constant, String> {
     let active_variant_idx: VariantIdx;
     match &layout.variants {
-        // --- Case 1: Single Variant (Structs, Unions, Single-Variant Enums) ---
         Variants::Single { index } => {
             breadcrumbs::log!(
                 breadcrumbs::LogLevel::Info,
@@ -524,7 +615,6 @@ fn handle_constant_enum<'tcx>(
             active_variant_idx = *index;
         }
 
-        // --- Case 2: Multiple Variants (Standard Enums) ---
         Variants::Multiple {
             tag, // This is the Scalar layout for the tag's storage location
             tag_encoding,
@@ -541,14 +631,9 @@ fn handle_constant_enum<'tcx>(
                 )
             );
 
-            // --- Step 1: Locate and Read the Tag/Niche Value ---
-
-            // 1a. Get layout information for the tag's storage location
-            // The 'tag' field in Variants::Multiple *is* the Scalar layout
             let tag_scalar_layout = tag;
-            let tag_size = tag_scalar_layout.size(&tcx.data_layout); // Get size from Scalar layout
+            let tag_size = tag_scalar_layout.size(&tcx.data_layout);
 
-            // 1b. Find the offset of the tag field within the enum's overall layout.
             let tag_offset_in_enum = layout.fields.offset((*tag_field).into());
             let absolute_tag_offset = offset + tag_offset_in_enum;
             let absolute_tag_range = AllocRange {
@@ -570,7 +655,6 @@ fn handle_constant_enum<'tcx>(
                 )
             );
 
-            // 1c. Read the tag value from memory (could be Int or Ptr)
             let tag_scalar = allocation
                 .read_scalar(&tcx.data_layout, absolute_tag_range, false)
                 .map_err(|e| format!("Failed to read enum tag/niche for {:?}: {:?}", enum_ty, e))?;
@@ -581,8 +665,6 @@ fn handle_constant_enum<'tcx>(
                 format!("Debug: Read tag scalar: {:?}", tag_scalar)
             );
 
-            // --- Step 2: Determine Active Variant Index based on Tag Encoding ---
-
             match tag_encoding {
                 TagEncoding::Direct => {
                     breadcrumbs::log!(
@@ -590,7 +672,6 @@ fn handle_constant_enum<'tcx>(
                         "const-eval",
                         "Debug: Using Direct tag encoding"
                     );
-                    // Tag value must be an integer for Direct encoding
                     let tag_val = match tag_scalar {
                         Scalar::Int(int) => int,
                         Scalar::Ptr(..) => {
@@ -601,7 +682,6 @@ fn handle_constant_enum<'tcx>(
                         }
                     };
 
-                    // Sanity check the size read
                     if tag_val.size() != tag_size {
                         return Err(format!(
                             "Direct Tag size mismatch for {:?}: read {:?} bytes, but expected size {:?}",
@@ -620,7 +700,6 @@ fn handle_constant_enum<'tcx>(
                         )
                     );
 
-                    // --- Find matching variant (existing logic seems okay) ---
                     let mut found_idx = None;
                     for (v_idx, v_discr) in adt_def.discriminants(tcx) {
                         let mask = (1u128 << tag_size.bits()) - 1;
@@ -659,8 +738,6 @@ fn handle_constant_enum<'tcx>(
                         )
                     );
 
-                    // Extract the bits from the read scalar (Int or Ptr)
-                    // For pointers in niche encoding, we compare the address bits.
                     let read_value_bits = match tag_scalar {
                         Scalar::Int(int) => {
                             if int.size() != tag_size {
@@ -674,7 +751,6 @@ fn handle_constant_enum<'tcx>(
                             int.to_bits(tag_size)
                         }
                         Scalar::Ptr(ptr, _meta) => {
-                            // Pointer size must match tag size for niche encoding
                             if tag_size != tcx.data_layout.pointer_size() {
                                 return Err(format!(
                                     "Niche pointer tag size mismatch for {:?}: pointer size is {:?}, but tag size is {:?}",
@@ -683,8 +759,6 @@ fn handle_constant_enum<'tcx>(
                                     tag_size
                                 ));
                             }
-                            // Use the address part of the pointer for comparison.
-                            // The address is usually u64, safely convert to u128.
                             ptr.into_raw_parts().1.bytes() as u128
                         }
                     };
@@ -694,9 +768,8 @@ fn handle_constant_enum<'tcx>(
                         format!("Debug: Read Niche value bits: {:#x}", read_value_bits)
                     );
 
-                    // --- Compare read_value_bits with expected niche values (existing logic seems okay) ---
                     let mut found_match = false;
-                    let mut matched_idx = *untagged_variant; // Default assumption
+                    let mut matched_idx = *untagged_variant;
 
                     let discriminants: HashMap<VariantIdx, u128> = adt_def
                         .discriminants(tcx)
@@ -719,7 +792,7 @@ fn handle_constant_enum<'tcx>(
                                         v_idx
                                     )
                                 );
-                                continue; // Skip this variant if no discriminant is found
+                                continue;
                             }
                         };
                         let niche_offset = d.wrapping_sub(*niche_start);
@@ -737,7 +810,6 @@ fn handle_constant_enum<'tcx>(
                         );
 
                         if read_value_bits == expected_niche_bits {
-                            // ... (handle match, check ambiguity) ...
                             breadcrumbs::log!(
                                 breadcrumbs::LogLevel::Info,
                                 "const-eval",
@@ -754,9 +826,6 @@ fn handle_constant_enum<'tcx>(
                     if found_match {
                         active_variant_idx = matched_idx;
                     } else {
-                        // If it didn't match any niche, it must be the untagged variant,
-                        // *and* the read value should be valid for the untagged variant's field.
-                        // (We implicitly assume this if no niche matches).
                         breadcrumbs::log!(
                             breadcrumbs::LogLevel::Info,
                             "const-eval",
@@ -767,10 +836,9 @@ fn handle_constant_enum<'tcx>(
                         );
                         active_variant_idx = *untagged_variant;
                     }
-                } // End Niche Encoding
-            } // End match tag_encoding
+                }
+            }
 
-            // --- Step 3: Get Layout for the Active Variant ---
             breadcrumbs::log!(
                 breadcrumbs::LogLevel::Info,
                 "const-eval",
@@ -779,16 +847,15 @@ fn handle_constant_enum<'tcx>(
                     active_variant_idx
                 )
             );
-        } // End Variants::Multiple
+        }
 
-        // --- Case 3: Empty Enum (Uninhabited) ---
         Variants::Empty => {
             return Err(format!(
                 "Cannot read constant value for uninhabited enum type {:?}",
                 enum_ty
             ));
         }
-    } // End match layout.variants
+    }
 
     breadcrumbs::log!(
         breadcrumbs::LogLevel::Info,
@@ -799,12 +866,8 @@ fn handle_constant_enum<'tcx>(
         )
     );
 
-    // --- Start: Steps 3 & 4 (Reading Fields - common logic) ---
-
-    // Get the definition for the *active* variant
     let variant_def = adt_def.variant(active_variant_idx);
 
-    // 3. Read the fields of the active variant using its specific layout (`variant_fields_shape`)
     let mut fields_map = HashMap::new();
     let mut params = Vec::new();
     for (i, field_def) in variant_def.fields.iter().enumerate() {
@@ -814,36 +877,6 @@ fn handle_constant_enum<'tcx>(
         if matches!(field_oomir_ty, oomir::Type::Void) {
             continue;
         }
-
-        // Calculate the offset of the field *within the variant's data area*.
-        // `variant_fields_shape.offset()` gives the offset relative to the start of *this variant's fields*.
-        // For Multiple variants, this data area might not start at offset 0 of the enum.
-        // However, the overall enum layout `layout` should place the variant fields correctly
-        // relative to the enum's start `offset`. We need the *absolute* offset.
-
-        // Determine the absolute offset of the field in the main allocation.
-        // The `variant_fields_shape.offset` is relative to the start of the *variant's data*.
-        // We need to know where the variant's data starts relative to the enum's start `offset`.
-        // For Single variant, it's 0.
-        // For Multiple variants, the base offset of the variant's non-tag fields might differ.
-        // Let's re-check: `layout.fields.offset(idx)` gives offset from the *start* of the enum layout.
-        // If field `idx` belongs to the active variant, this offset should be correct.
-        // BUT: Field indices might restart from 0 for each variant internally.
-        // Let's use the `variant_fields_shape` to get the *relative* offset within the variant,
-        // and assume the *absolute* offset calculation needs care.
-
-        // Revised approach: The offset returned by `variant_fields_shape.offset(field_idx)`
-        // should be the offset relative to the start of the *variant's specific layout data*.
-        // The tricky part is finding the start of *that data* within the overall enum allocation.
-        // Usually, for non-C-like enums, variants overlay, sharing the start offset (after the tag).
-        // Let's *assume* the variant data starts at `offset` (the start of the enum allocation)
-        // and `variant_fields_shape.offset` gives the correct offset from *that* start.
-        // This works if the tag is handled separately or is field 0, and other fields follow.
-        // If variants have different base alignments/offsets, this assumption breaks.
-
-        // Safer assumption: Use the overall `layout.fields.offset()` if we can map
-        // the variant's `field_idx` (0, 1, ...) to the correct index in `layout.fields`.
-        // This mapping isn't directly available.
 
         // Sticking with the previous logic: relative offset within variant shape.
         let field_offset_in_variant_shape = match &layout.variants {
@@ -892,7 +925,7 @@ fn handle_constant_enum<'tcx>(
     let variant_class_name = format!(
         "{}${}", // Using '$' as inner class separator is common in JVM
         base_enum_name,
-        make_jvm_safe(&variant_def.ident(tcx).to_string()) // Use ident for correct name
+        jvm_names::member_name(&variant_def.ident(tcx).to_string())
     );
 
     let should_define_data_type = should_define_named_data_type(tcx, adt_def.did());
@@ -1043,6 +1076,7 @@ pub fn scalar_int_to_oomir_constant(scalar_int: ScalarInt, ty: Ty<'_>) -> oomir:
         TyKind::Ref(_, inner_ty, _) => {
             scalar_int_to_oomir_constant(scalar_int.to_u64().into(), *inner_ty)
         }
+        TyKind::Pat(base_ty, _) => scalar_int_to_oomir_constant(scalar_int, *base_ty),
         _ => panic!("Unsupported type for ScalarInt conversion: {:?}", ty),
     }
 }

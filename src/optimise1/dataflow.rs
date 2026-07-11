@@ -1,7 +1,5 @@
 use super::*;
 
-// --- Dataflow Analysis for Constant Propagation ---
-
 // Meet operator for constant propagation:
 // Merges information from multiple predecessors.
 // A variable is constant only if it has the same constant value coming from all paths.
@@ -156,14 +154,11 @@ pub fn process_block_instructions(
     };
 
     for instruction in &info.original_block.instructions {
-        // --- Constant Folding & Propagation Logic ---
-
         let mut keep_original_instruction = true;
         let mut pre_extra_instructions: Vec<Instruction> = Vec::new();
         let mut optimised_instruction = instruction.clone(); // Start with original
 
         match instruction {
-            // --- Arithmetic, Comparison, Bitwise Operations ---
             Instruction::Add { dest, op1, op2 } => {
                 let const1 = lookup_const(op1, &current_state);
                 let const2 = lookup_const(op2, &current_state);
@@ -179,7 +174,6 @@ pub fn process_block_instructions(
 
                 let mut simplified_algebraically = false;
 
-                // --- Check Algebraic Simplifications ---
                 if is_zero(&new_op2) {
                     // a + 0 = a
                     optimised_instruction = Instruction::Move {
@@ -208,7 +202,6 @@ pub fn process_block_instructions(
                     simplified_algebraically = true;
                 }
 
-                // --- Constant Folding (only if not already simplified) ---
                 if !simplified_algebraically && let (Some(c1), Some(c2)) = (const1, const2) {
                     if let Some(result_const) = interpret::add_constants(c1, c2) {
                         current_state.insert(dest.clone(), result_const.clone());
@@ -246,7 +239,6 @@ pub fn process_block_instructions(
 
                 let mut simplified_algebraically = false;
 
-                // --- Check Algebraic Simplifications ---
                 if is_zero(&new_op2) {
                     // a - 0 = a
                     optimised_instruction = Instruction::Move {
@@ -302,7 +294,6 @@ pub fn process_block_instructions(
                     }
                 }
 
-                // --- Constant Folding (only if not already simplified) ---
                 if !simplified_algebraically && let (Some(c1), Some(c2)) = (const1, const2) {
                     if let Some(result_const) = interpret::subtract_constants(c1, c2) {
                         current_state.insert(dest.clone(), result_const.clone());
@@ -336,7 +327,6 @@ pub fn process_block_instructions(
 
                 let mut simplified_algebraically = false;
 
-                // --- Check Algebraic Simplifications ---
                 if is_zero(&new_op1) || is_zero(&new_op2) {
                     // a * 0 = 0 or 0 * a = 0
                     if let Some(zero_const) = Constant::zero_for_operand(&new_op1) {
@@ -375,7 +365,6 @@ pub fn process_block_instructions(
                     simplified_algebraically = true;
                 }
 
-                // --- Constant Folding ---
                 if !simplified_algebraically && let (Some(c1), Some(c2)) = (const1, const2) {
                     if let Some(result_const) = interpret::multiply_constants(c1, c2) {
                         current_state.insert(dest.clone(), result_const.clone());
@@ -409,7 +398,6 @@ pub fn process_block_instructions(
 
                 let mut simplified_algebraically = false;
 
-                // --- Check Algebraic Simplifications ---
                 // Check for division by zero FIRST if operand 2 is constant zero
                 if is_zero(&new_op2) {
                     // Division by zero!
@@ -453,7 +441,6 @@ pub fn process_block_instructions(
                     }
                 }
 
-                // --- Constant Folding ---
                 if !simplified_algebraically && let (Some(c1), Some(c2)) = (const1, const2) {
                     if let Some(result_const) = interpret::divide_constants(c1, c2) {
                         // Assumes divide_constants handles division by zero internally
@@ -762,7 +749,6 @@ pub fn process_block_instructions(
                 }
             }
 
-            // --- Move ---
             Instruction::Move { dest, src } => {
                 let const_src = lookup_const(src, &current_state);
                 let optimised_src_operand =
@@ -779,7 +765,6 @@ pub fn process_block_instructions(
                 }
             }
 
-            // --- Branch ---
             Instruction::Branch {
                 condition,
                 true_block,
@@ -808,7 +793,6 @@ pub fn process_block_instructions(
                 // State doesn't change based on branch itself
             }
 
-            // --- Switch ---
             Instruction::Switch {
                 discr,
                 targets,
@@ -856,7 +840,6 @@ pub fn process_block_instructions(
                 }
             }
 
-            // --- Instructions that Kill Constants ---
             Instruction::Call {
                 dest,
                 args,
@@ -1053,7 +1036,6 @@ pub fn process_block_instructions(
                 }; // Adjust
                 keep_original_instruction = true;
             }
-            // --- Instructions that Read Constants ---
             Instruction::GetField {
                 dest,
                 object,
