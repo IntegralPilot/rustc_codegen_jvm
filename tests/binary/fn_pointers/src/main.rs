@@ -112,6 +112,45 @@ fn skew(a: i32, b: i32) -> i32 {
     a * 3 - b
 }
 
+type ErasedFormatter = unsafe fn(std::ptr::NonNull<()>, &mut i32) -> i32;
+
+#[derive(Copy, Clone)]
+struct FormatRecord {
+    value: i32,
+}
+
+fn format_i32(value: &i32, state: &mut i32) -> i32 {
+    *state += *value;
+    *state
+}
+
+fn format_i64(value: &i64, state: &mut i32) -> i32 {
+    *state += (*value / 10) as i32;
+    *state
+}
+
+fn format_u128(value: &u128, state: &mut i32) -> i32 {
+    *state += (*value / 100) as i32;
+    *state
+}
+
+fn format_record(value: &FormatRecord, state: &mut i32) -> i32 {
+    *state += value.value;
+    *state
+}
+
+fn format_str(value: &&str, state: &mut i32) -> i32 {
+    *state += value.len() as i32;
+    *state
+}
+
+fn call_erased<T>(value: &T, formatter: fn(&T, &mut i32) -> i32, initial: i32) -> i32 {
+    let erased: ErasedFormatter = unsafe { core::mem::transmute(formatter) };
+    let pointer: std::ptr::NonNull<()> = unsafe { core::mem::transmute(value) };
+    let mut state = initial;
+    unsafe { erased(pointer, &mut state) }
+}
+
 fn main() {
     let res_const = derivative(constant, 10.0, 0.125);
     assert!(res_const == 0.0);
@@ -145,6 +184,12 @@ fn main() {
     let skew_ptr = choose_int_op(false);
     assert!(skew_ptr(9, 4) == 23);
     assert!(combine(skew, 2, 5) == 14);
+
+    assert!(call_erased(&7i32, format_i32, 10) == 17);
+    assert!(call_erased(&90i64, format_i64, 10) == 19);
+    assert!(call_erased(&1_200u128, format_u128, 10) == 22);
+    assert!(call_erased(&FormatRecord { value: 8 }, format_record, 10) == 18);
+    assert!(call_erased(&"bridge", format_str, 10) == 16);
 
     let f64_proc: Processor<f64> = Processor {
         step: ComputeStep::Binary(scale_f64 as fn(f64, f64) -> f64, 3.0),

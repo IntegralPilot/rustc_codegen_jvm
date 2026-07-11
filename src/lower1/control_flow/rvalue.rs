@@ -228,6 +228,208 @@ pub(crate) fn ensure_fn_pointer_adapter_class<'tcx>(
     class_name
 }
 
+fn ensure_erased_receiver_fn_pointer_bridge<'tcx>(
+    data_types: &mut HashMap<String, oomir::DataType>,
+    source_signature: &oomir::Signature,
+    source_interface: &str,
+    target_signature: &oomir::Signature,
+    target_interface: &str,
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
+) -> Result<String, String> {
+    if source_signature.params.len() != target_signature.params.len() {
+        return Err("source and target arities differ".to_string());
+    }
+    if source_signature.ret.to_jvm_return_descriptor()
+        != target_signature.ret.to_jvm_return_descriptor()
+    {
+        return Err("source and target return ABIs differ".to_string());
+    }
+
+    let Some((_, source_receiver_ty)) = source_signature.params.first() else {
+        return Err("function has no receiver parameter to erase".to_string());
+    };
+    let Some((_, target_receiver_ty)) = target_signature.params.first() else {
+        return Err("function has no erased receiver parameter".to_string());
+    };
+    let oomir::Type::Class(carrier_class) = target_receiver_ty else {
+        return Err("target receiver is not a NonNull carrier".to_string());
+    };
+    if !oomir::is_non_null_class_name(carrier_class)
+        || !carrier_class
+            .rsplit('/')
+            .next()
+            .is_some_and(|leaf| leaf.ends_with("_Unit"))
+    {
+        return Err("target receiver is not an erased NonNull<()> carrier".to_string());
+    }
+    if !source_receiver_ty.has_jvm_value() {
+        return Err("zero-sized erased receivers need no bridge".to_string());
+    }
+
+    for ((_, source_ty), (_, target_ty)) in source_signature
+        .params
+        .iter()
+        .skip(1)
+        .zip(target_signature.params.iter().skip(1))
+    {
+        if source_ty.to_jvm_descriptor() != target_ty.to_jvm_descriptor() {
+            return Err("a non-receiver parameter changes JVM ABI".to_string());
+        }
+    }
+
+    let Some(oomir::DataType::Class { fields, .. }) = data_types.get(carrier_class) else {
+        return Err(format!(
+            "erased receiver carrier class {carrier_class} is undefined"
+        ));
+    };
+    let Some((carrier_field_name, carrier_field_ty)) = fields.first().cloned() else {
+        return Err(format!(
+            "erased receiver carrier class {carrier_class} has no payload"
+        ));
+    };
+    if carrier_field_ty.to_jvm_descriptor() != "Ljava/lang/Object;" {
+        return Err(format!(
+            "erased receiver payload has unexpected JVM type {}",
+            carrier_field_ty.to_jvm_descriptor()
+        ));
+    }
+    let erased_payload_ty = oomir::Type::Class("java/lang/Object".to_string());
+
+    let source_descriptor = source_signature.to_jvm_descriptor_with_explicit_params();
+    let target_descriptor = target_signature.to_jvm_descriptor_with_explicit_params();
+    let hash = short_hash(&format!("{source_descriptor}->{target_descriptor}"), 12);
+    let class_name = jvm_names::synthetic_class_for_instance(
+        tcx,
+        instance,
+        format!("FnPtrErasedReceiverBridge_{hash}"),
+    );
+    if data_types.contains_key(&class_name) {
+        return Ok(class_name);
+    }
+
+    let self_operand = oomir::Operand::Variable {
+        name: "_1".to_string(),
+        ty: oomir::Type::Class(class_name.clone()),
+    };
+    let erased_receiver = oomir::Operand::Variable {
+        name: "_2".to_string(),
+        ty: target_receiver_ty.clone(),
+    };
+    let source_pointer_name = "_source_function".to_string();
+    let erased_payload_name = "_erased_receiver_payload".to_string();
+    let typed_carrier_name = "_typed_receiver_carrier".to_string();
+    let typed_receiver_name = "_typed_receiver".to_string();
+    let typed_carrier_ty = oomir::Type::MutableReference(Box::new(source_receiver_ty.clone()));
+
+    let mut instructions = vec![
+        oomir::Instruction::GetField {
+            dest: source_pointer_name.clone(),
+            object: self_operand,
+            field_name: "function".to_string(),
+            field_ty: oomir::Type::Interface(source_interface.to_string()),
+            owner_class: class_name.clone(),
+        },
+        oomir::Instruction::GetField {
+            dest: erased_payload_name.clone(),
+            object: erased_receiver,
+            field_name: carrier_field_name,
+            field_ty: erased_payload_ty.clone(),
+            owner_class: carrier_class.clone(),
+        },
+        oomir::Instruction::Cast {
+            op: oomir::Operand::Variable {
+                name: erased_payload_name,
+                ty: erased_payload_ty,
+            },
+            ty: typed_carrier_ty.clone(),
+            dest: typed_carrier_name.clone(),
+        },
+        oomir::Instruction::ArrayGet {
+            dest: typed_receiver_name.clone(),
+            array: oomir::Operand::Variable {
+                name: typed_carrier_name,
+                ty: typed_carrier_ty,
+            },
+            index: oomir::Operand::Constant(oomir::Constant::I32(0)),
+        },
+    ];
+
+    let mut call_args = vec![oomir::Operand::Variable {
+        name: typed_receiver_name,
+        ty: source_receiver_ty.clone(),
+    }];
+    call_args.extend(
+        target_signature
+            .params
+            .iter()
+            .enumerate()
+            .skip(1)
+            .map(|(index, (_, ty))| oomir::Operand::Variable {
+                name: format!("_{}", index + 2),
+                ty: ty.clone(),
+            }),
+    );
+
+    let call_dest = source_signature
+        .ret
+        .has_jvm_value()
+        .then(|| "_ret".to_string());
+    instructions.push(oomir::Instruction::CallIndirect {
+        dest: call_dest.clone(),
+        function_ptr: Box::new(oomir::Operand::Variable {
+            name: source_pointer_name,
+            ty: oomir::Type::Interface(source_interface.to_string()),
+        }),
+        args: call_args,
+        signature: source_signature.clone(),
+    });
+    instructions.push(oomir::Instruction::Return {
+        operand: call_dest.map(|name| oomir::Operand::Variable {
+            name,
+            ty: source_signature.ret.as_ref().clone(),
+        }),
+    });
+
+    let mut method_params = Vec::with_capacity(target_signature.params.len() + 1);
+    method_params.push(("self".to_string(), oomir::Type::Class(class_name.clone())));
+    method_params.extend(target_signature.params.iter().cloned());
+    let call_method = DataTypeMethod::Function(oomir::Function {
+        name: "call".to_string(),
+        owner_class: None,
+        signature: oomir::Signature {
+            params: method_params,
+            ret: target_signature.ret.clone(),
+            is_static: false,
+        },
+        body: oomir::CodeBlock {
+            entry: "bb0".to_string(),
+            basic_blocks: HashMap::from([(
+                "bb0".to_string(),
+                oomir::BasicBlock {
+                    label: "bb0".to_string(),
+                    instructions,
+                },
+            )]),
+        },
+    });
+
+    data_types.insert(
+        class_name.clone(),
+        oomir::DataType::Class {
+            fields: vec![(
+                "function".to_string(),
+                oomir::Type::Interface(source_interface.to_string()),
+            )],
+            is_abstract: false,
+            methods: HashMap::from([("call".to_string(), call_method)]),
+            super_class: Some("java/lang/Object".to_string()),
+            interfaces: vec![target_interface.to_string()],
+        },
+    );
+    Ok(class_name)
+}
+
 /// Evaluates an Rvalue and returns the resulting OOMIR Operand and any
 /// intermediate instructions needed to calculate it.
 ///
@@ -674,23 +876,33 @@ pub fn convert_rvalue_to_operand<'a>(
                         fn_ptr_signature_from_ty(source_mir_ty, tcx, data_types, instance);
                     let target_signature =
                         fn_ptr_signature_from_ty(*target_mir_ty, tcx, data_types, instance);
+                    let source_interface =
+                        ensure_fn_ptr_interface(&source_signature, data_types, tcx, instance);
                     let target_interface =
                         ensure_fn_ptr_interface(&target_signature, data_types, tcx, instance);
+                    let oomir_operand =
+                        convert_operand(operand, tcx, instance, mir, data_types, &mut instructions);
 
                     if source_signature.to_jvm_descriptor_with_explicit_params()
                         == target_signature.to_jvm_descriptor_with_explicit_params()
                     {
-                        let oomir_operand = convert_operand(
-                            operand,
-                            tcx,
-                            instance,
-                            mir,
-                            data_types,
-                            &mut instructions,
-                        );
                         instructions.push(oomir::Instruction::Move {
                             dest: temp_cast_var.clone(),
                             src: oomir_operand,
+                        });
+                    } else if let Ok(bridge_class) = ensure_erased_receiver_fn_pointer_bridge(
+                        data_types,
+                        &source_signature,
+                        &source_interface,
+                        &target_signature,
+                        &target_interface,
+                        tcx,
+                        instance,
+                    ) {
+                        instructions.push(oomir::Instruction::ConstructObject {
+                            dest: temp_cast_var.clone(),
+                            class_name: bridge_class,
+                            args: vec![(oomir_operand, oomir::Type::Interface(source_interface))],
                         });
                     } else {
                         breadcrumbs::log!(
@@ -912,12 +1124,46 @@ pub fn convert_rvalue_to_operand<'a>(
                                     oomir_operand.get_type().unwrap_or(oomir_source_type);
                                 let needs_cast = field_ty != value_ty
                                     && field_ty.to_jvm_descriptor() != value_ty.to_jvm_descriptor();
-                                let primitive_sentinel_for_reference = value_ty
-                                    .is_jvm_primitive_like()
-                                    && field_ty.is_jvm_reference_type();
+                                let erased_object_field =
+                                    field_ty.to_jvm_descriptor() == "Ljava/lang/Object;";
+                                let constructor_arg_ty = if erased_object_field {
+                                    oomir::Type::Class("java/lang/Object".to_string())
+                                } else {
+                                    field_ty.clone()
+                                };
 
                                 let value_operand =
-                                    if needs_cast && primitive_sentinel_for_reference {
+                                    if matches!(source_mir_ty.kind(), TyKind::Ref(..))
+                                        && erased_object_field
+                                        && value_ty.has_jvm_value()
+                                    {
+                                        let carrier_name = format!("{}_carrier", temp_cast_var);
+                                        let carrier_ty =
+                                            oomir::Type::Array(Box::new(value_ty.clone()));
+                                        instructions.push(oomir::Instruction::NewArray {
+                                            dest: carrier_name.clone(),
+                                            element_type: value_ty.clone(),
+                                            size: oomir::Operand::Constant(oomir::Constant::I32(1)),
+                                        });
+                                        instructions.push(oomir::Instruction::ArrayStore {
+                                            array: carrier_name.clone(),
+                                            index: oomir::Operand::Constant(oomir::Constant::I32(
+                                                0,
+                                            )),
+                                            value: oomir_operand,
+                                        });
+                                        oomir::Operand::Variable {
+                                            name: carrier_name,
+                                            ty: carrier_ty,
+                                        }
+                                    } else if erased_object_field
+                                        && value_ty.is_jvm_reference_type()
+                                    {
+                                        oomir_operand
+                                    } else if needs_cast
+                                        && value_ty.is_jvm_primitive_like()
+                                        && field_ty.is_jvm_reference_type()
+                                    {
                                         oomir::Operand::Constant(oomir::Constant::Null(
                                             field_ty.clone(),
                                         ))
@@ -936,7 +1182,7 @@ pub fn convert_rvalue_to_operand<'a>(
                                         oomir_operand
                                     };
 
-                                constructor_args.push((value_operand, field_ty));
+                                constructor_args.push((value_operand, constructor_arg_ty));
                             }
                         }
                         instructions.push(oomir::Instruction::ConstructObject {
