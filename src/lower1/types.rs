@@ -8,7 +8,6 @@ use rustc_middle::ty::{
     TypeVisitableExt, TypingEnv, UintTy,
 };
 use rustc_span::def_id::DefId;
-use sha2::Digest;
 use std::collections::HashMap;
 
 pub const UNION_BYTES_FIELD: &str = "__bytes";
@@ -3162,10 +3161,7 @@ pub fn ty_to_oomir_type<'tcx>(
 /// Generates a short hash of the input string.
 /// The hash is truncated to the specified length to ensure it fits within JVM class name constraints.
 pub fn short_hash(input: &str, length: usize) -> String {
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(input);
-    let full_hash = format!("{:x}", hasher.finalize());
-    full_hash[..length].to_string()
+    crate::stable_hash::short_hash(input, length)
 }
 
 // Maximum length for a readable tuple name (including the "Tuple_" prefix).

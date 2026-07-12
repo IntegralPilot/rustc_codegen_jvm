@@ -6,7 +6,6 @@ use crate::lower2::BIG_DECIMAL_CLASS;
 use super::lower2::BIG_INTEGER_CLASS;
 use breadcrumbs::LogLevel;
 use ristretto_classfile::attributes::Instruction as JVMInstruction;
-use sha2::Digest;
 use std::{
     collections::{HashMap, HashSet},
     fmt,
@@ -21,41 +20,55 @@ pub const UTF8_VIEW_CLASS: &str = "org/rustlang/runtime/Utf8View";
 #[derive(Debug, Clone)]
 pub struct Module {
     pub name: String,
-    pub functions: HashMap<String, Function>,
+    pub functions: HashMap<FunctionKey, Function>,
     pub data_types: HashMap<String, DataType>,
     pub statics: HashMap<String, Static>,
 }
 
 impl Module {
-    pub fn function_key(&self, owner_class: Option<&str>, function_name: &str) -> String {
-        Self::function_key_for_owner(owner_class.unwrap_or(&self.name), function_name)
-    }
-
-    pub fn function_key_for_owner(owner_class: &str, function_name: &str) -> String {
-        format!("{owner_class}::{function_name}")
-    }
-
     pub fn insert_function(&mut self, function: Function) {
-        let key = self.function_key(function.owner_class.as_deref(), &function.name);
-        self.functions.insert(key, function);
-    }
-
-    pub fn get_function(
-        &self,
-        owner_class: Option<&str>,
-        function_name: &str,
-    ) -> Option<&Function> {
-        let key = self.function_key(owner_class, function_name);
-        self.functions.get(&key).or_else(|| {
-            owner_class
-                .is_none()
-                .then(|| self.functions.get(function_name))
-                .flatten()
-        })
+        let key = FunctionKey::new(
+            function.owner_class.as_deref().unwrap_or(&self.name),
+            &function.name,
+            &function.signature,
+        );
+        if self.functions.insert(key.clone(), function).is_some() {
+            panic!("duplicate OOMIR function has the same JVM identity: {key}");
+        }
     }
 
     pub fn owner_class_for_function<'a>(&'a self, function: &'a Function) -> &'a str {
         function.owner_class.as_deref().unwrap_or(&self.name)
+    }
+}
+
+/// The identity of a method in a JVM class file. Return types are included in the
+/// descriptor for diagnostics and consistency, even though JVM invocation lookup is
+/// principally distinguished by owner, name, and parameter descriptor.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct FunctionKey {
+    pub owner_class: String,
+    pub method_name: String,
+    pub descriptor: String,
+}
+
+impl FunctionKey {
+    pub fn new(owner_class: &str, method_name: &str, signature: &Signature) -> Self {
+        Self {
+            owner_class: owner_class.to_string(),
+            method_name: method_name.to_string(),
+            descriptor: signature.to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for FunctionKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{}::{}{}",
+            self.owner_class, self.method_name, self.descriptor
+        )
     }
 }
 
@@ -173,10 +186,7 @@ impl Signature {
 
     pub fn fn_ptr_interface_name(&self) -> String {
         let descriptor = self.to_jvm_descriptor_with_explicit_params();
-        let mut hasher = sha2::Sha256::new();
-        hasher.update(descriptor.as_bytes());
-        let hash = format!("{:x}", hasher.finalize());
-        format!("FnPtr_{}", &hash[..16])
+        format!("FnPtr_{}", crate::stable_hash::short_hash(&descriptor, 16))
     }
 
     pub fn fn_ptr_interface_method_signature(&self) -> Signature {
@@ -354,13 +364,6 @@ pub enum Instruction {
     },
     Return {
         operand: Option<Operand>, // Optional return value
-    },
-    Call {
-        dest: Option<String>,       // Optional destination variable for the return value
-        class_name: Option<String>, // JVM owner class for module/free functions
-        function: String,           // Name of the function to call
-        signature: Signature,       // Full JVM-callable signature
-        args: Vec<Operand>,         // Arguments to the function
     },
     CallIndirect {
         dest: Option<String>,       // Optional destination variable for the return value

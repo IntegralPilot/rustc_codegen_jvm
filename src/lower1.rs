@@ -156,6 +156,7 @@ pub fn mir_to_oomir<'tcx>(
     let entry_label = "bb0".to_string();
 
     let mir_cloned = mir.clone();
+    let mut mutable_borrows = control_flow::MutableBorrowMap::new();
 
     // Need read-only access to mir for local_decls inside the loop
     for (bb, bb_data) in mir.basic_blocks_mut().iter_enumerated() {
@@ -168,6 +169,7 @@ pub fn mir_to_oomir<'tcx>(
             &return_oomir_ty,
             &mut basic_blocks,
             data_types,
+            &mut mutable_borrows,
         ); // Pass return type here
         basic_blocks.insert(bb_ir.label.clone(), bb_ir);
     }

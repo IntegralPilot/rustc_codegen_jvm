@@ -42,6 +42,26 @@ impl<T> Wrapper<T> {
     }
 }
 
+trait StaticConvert<T> {
+    fn convert(value: T) -> Self;
+}
+
+impl StaticConvert<i32> for i64 {
+    fn convert(value: i32) -> Self {
+        value as i64 + 1
+    }
+}
+
+impl StaticConvert<i32> for bool {
+    fn convert(value: i32) -> Self {
+        value != 0
+    }
+}
+
+fn add_const<const N: i32>(value: i32) -> i32 {
+    value + N
+}
+
 fn main() {
     let a = identity(42);
     let b = identity("hello");
@@ -67,4 +87,10 @@ fn main() {
 
     let wrapped_str = Wrapper::new("generic method");
     assert!(wrapped_str.value().len() == 14);
+
+    assert!(<i64 as StaticConvert<i32>>::convert(41) == 42);
+    assert!(<bool as StaticConvert<i32>>::convert(1));
+
+    assert!(add_const::<1>(41) == 42);
+    assert!(add_const::<2>(40) == 42);
 }

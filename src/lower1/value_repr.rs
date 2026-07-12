@@ -367,6 +367,105 @@ fn adapt_physical_scalar<'tcx>(
     Some(operand_var(dest, target_jvm_ty))
 }
 
+fn mutable_reference_chain_contains(source: &oomir::Type, target: &oomir::Type) -> bool {
+    let mut current = source;
+    while let oomir::Type::MutableReference(inner) = current {
+        if inner.as_ref() == target {
+            return true;
+        }
+        current = inner;
+    }
+    false
+}
+
+fn unwrap_mutable_references(
+    mut source: oomir::Operand,
+    target_jvm_ty: &oomir::Type,
+    temp_prefix: &str,
+    instructions: &mut Vec<oomir::Instruction>,
+) -> oomir::Operand {
+    let mut depth = 0;
+    loop {
+        let Some(oomir::Type::MutableReference(inner)) = source.get_type() else {
+            return source;
+        };
+        let dest = format!("{temp_prefix}_deref_{depth}");
+        instructions.push(oomir::Instruction::ArrayGet {
+            dest: dest.clone(),
+            array: source,
+            index: oomir::Operand::Constant(oomir::Constant::I32(0)),
+        });
+        source = operand_var(dest, inner.as_ref().clone());
+        if inner.as_ref() == target_jvm_ty {
+            return source;
+        }
+        depth += 1;
+    }
+}
+
+fn adapt_mutable_reference_carrier<'tcx>(
+    source: oomir::Operand,
+    target_rust_ty: Ty<'tcx>,
+    target_jvm_ty: &oomir::Type,
+    temp_prefix: &str,
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
+    data_types: &mut HashMap<String, oomir::DataType>,
+    instructions: &mut Vec<oomir::Instruction>,
+) -> oomir::Operand {
+    if source.get_type().as_ref() == Some(target_jvm_ty) {
+        return source;
+    }
+
+    if source
+        .get_type()
+        .as_ref()
+        .is_some_and(|source_ty| mutable_reference_chain_contains(source_ty, target_jvm_ty))
+    {
+        return unwrap_mutable_references(source, target_jvm_ty, temp_prefix, instructions);
+    }
+
+    if let TyKind::Ref(_, pointee_ty, mutability) = target_rust_ty.kind()
+        && mutability.is_mut()
+        && let oomir::Type::MutableReference(target_inner) = target_jvm_ty
+        && target_inner.has_jvm_value()
+    {
+        let pointee = adapt_operand_to_rust_type(
+            source,
+            *pointee_ty,
+            &format!("{temp_prefix}_pointee"),
+            tcx,
+            instance,
+            data_types,
+            instructions,
+        );
+        if pointee.get_type().as_ref() != Some(target_inner.as_ref()) {
+            return pointee;
+        }
+
+        let dest = format!("{temp_prefix}_ref");
+        instructions.push(oomir::Instruction::NewArray {
+            dest: dest.clone(),
+            element_type: target_inner.as_ref().clone(),
+            size: oomir::Operand::Constant(oomir::Constant::I32(1)),
+        });
+        instructions.push(oomir::Instruction::ArrayStore {
+            array: dest.clone(),
+            index: oomir::Operand::Constant(oomir::Constant::I32(0)),
+            value: pointee,
+        });
+        return operand_var(dest, target_jvm_ty.clone());
+    }
+
+    if matches!(source.get_type(), Some(oomir::Type::MutableReference(_)))
+        && !matches!(target_rust_ty.kind(), TyKind::RawPtr(..))
+    {
+        return unwrap_mutable_references(source, target_jvm_ty, temp_prefix, instructions);
+    }
+
+    source
+}
+
 /// Converts rustc's physical carrier into the canonical JVM representation for
 /// a Rust type. This materializes storage-elided ZSTs and decodes scalar ABI
 /// carriers through the shared exact-layout codec when a nominal object is needed.
@@ -380,6 +479,20 @@ pub(super) fn adapt_operand_to_rust_type<'tcx>(
     instructions: &mut Vec<oomir::Instruction>,
 ) -> oomir::Operand {
     let target_rust_ty = resolved_ty(target_rust_ty, tcx, instance);
+    let target_jvm_ty = ty_to_oomir_type(target_rust_ty, tcx, data_types, instance);
+    let source = adapt_mutable_reference_carrier(
+        source,
+        target_rust_ty,
+        &target_jvm_ty,
+        temp_prefix,
+        tcx,
+        instance,
+        data_types,
+        instructions,
+    );
+    if source.get_type().as_ref() == Some(&target_jvm_ty) {
+        return source;
+    }
     if !source
         .get_type()
         .is_some_and(|source_ty| source_ty.is_jvm_reference_type())

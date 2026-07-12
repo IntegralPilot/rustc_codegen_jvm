@@ -159,11 +159,14 @@ pub(crate) fn ensure_fn_pointer_adapter_class<'tcx>(
             })
             .collect();
 
-        let mut instructions = vec![oomir::Instruction::Call {
+        let mut instructions = vec![oomir::Instruction::InvokeStatic {
             dest: call_dest.clone(),
-            class_name: target_function.class_to_call_on.clone(),
-            function: target_function.method_name.clone(),
-            signature: signature.clone(),
+            class_name: target_function
+                .class_to_call_on
+                .clone()
+                .expect("function pointer targets have JVM owners"),
+            method_name: target_function.method_name.clone(),
+            method_ty: signature.clone(),
             args: call_args,
         }];
 

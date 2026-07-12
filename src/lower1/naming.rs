@@ -1,6 +1,7 @@
 //! Naming helpers for functions and monomorphized instances
 
 use super::{jvm_names, types::ty_to_oomir_type};
+use rustc_hir::def::DefKind;
 use rustc_middle::ty::{GenericParamDefKind, Instance, TyCtxt, TypeVisitableExt};
 use std::collections::HashMap;
 
@@ -10,15 +11,6 @@ const MAX_MONO_FN_NAME_LEN: usize = 128;
 pub struct FnNameData {
     pub class_to_call_on: Option<String>,
     pub method_name: String,
-}
-
-impl FnNameData {
-    pub fn key(&self, fallback_class: &str) -> String {
-        crate::oomir::Module::function_key_for_owner(
-            self.class_to_call_on.as_deref().unwrap_or(fallback_class),
-            &self.method_name,
-        )
-    }
 }
 
 pub fn associated_method_name_from_instance<'tcx>(
@@ -52,11 +44,11 @@ pub fn mono_fn_name_from_instance<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'t
 
     // Use only the last path segment as the method base (so "core::panicking::panic" -> "panic")
     let mut safe_base = jvm_names::method_for_function(tcx, instance.def_id());
-    if tcx
-        .opt_associated_item(instance.def_id())
-        .is_some_and(|item| item.is_method())
+    let parent_def_kind = tcx.def_kind(tcx.parent(instance.def_id()));
+    if tcx.opt_associated_item(instance.def_id()).is_some()
+        || matches!(parent_def_kind, DefKind::Fn | DefKind::AssocFn | DefKind::Closure)
     {
-        let impl_hash = super::types::short_hash(
+        let definition_hash = super::types::short_hash(
             &format!(
                 "{:?}:{}",
                 instance.def_id(),
@@ -64,7 +56,7 @@ pub fn mono_fn_name_from_instance<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'t
             ),
             10,
         );
-        safe_base = format!("{safe_base}__{impl_hash}");
+        safe_base = format!("{safe_base}__{definition_hash}");
     }
     // We need a local map for the type conversion, similar to the original function
     let mut data_types = HashMap::new();
@@ -98,11 +90,22 @@ pub fn mono_fn_name_from_instance<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'t
         }
     }
 
-    // 2. Construct the readable name
-    let readable_name = if generic_tokens.is_empty() {
+    // 2. Construct the readable name. Rust instances can differ only in const
+    // arguments, which are not present in `generic_tokens`, so include a hash of
+    // the complete instance arguments whenever this is a generic instance.
+    let readable_base = if generic_tokens.is_empty() {
         safe_base.clone()
     } else {
         format!("{}_{}", safe_base, generic_tokens.join("_"))
+    };
+    let readable_name = if instance.args.is_empty() {
+        readable_base
+    } else {
+        let instance_hash = super::types::short_hash(
+            &format!("{:?}:{:?}", instance.def_id(), instance.args),
+            10,
+        );
+        format!("{readable_base}__{instance_hash}")
     };
 
     // 3. Check length limit. If it fits, return the readable version.
@@ -122,6 +125,7 @@ pub fn mono_fn_name_from_instance<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'t
         descriptor_str.push_str(&ty.to_jvm_descriptor());
         descriptor_str.push('_');
     }
+    descriptor_str.push_str(&format!("{:?}:{:?}", instance.def_id(), instance.args));
 
     let hash = super::types::short_hash(&descriptor_str, 10);
 

@@ -137,11 +137,13 @@ pub(super) fn ensure_trait_object_adapter_class<'tcx>(
                 field_ty: carrier_ty.clone(),
                 owner_class: class_name.clone(),
             },
-            oomir::Instruction::Call {
+            oomir::Instruction::InvokeStatic {
                 dest: call_dest.clone(),
-                class_name: target_name.class_to_call_on,
-                function: target_name.method_name,
-                signature: target_signature,
+                class_name: target_name
+                    .class_to_call_on
+                    .expect("trait-object adapters target functions with JVM owners"),
+                method_name: target_name.method_name,
+                method_ty: target_signature,
                 args: call_args,
             },
             oomir::Instruction::Return {

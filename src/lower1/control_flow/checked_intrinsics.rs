@@ -2,7 +2,6 @@
 // This module emits reusable OOMIR checked arithmetic functions for integer types.
 use crate::oomir::{CodeBlock, DataType, DataTypeMethod, Function, Signature};
 use crate::oomir::{Constant, Instruction, Operand, Type};
-use sha2::Digest;
 use std::collections::HashMap;
 
 /// Generate the intrinsic function name for a checked operation
@@ -11,10 +10,8 @@ pub fn get_intrinsic_function_name(
     ty_suffix: &str,
     result_struct_name: &str,
 ) -> String {
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(result_struct_name.as_bytes());
-    let hash = format!("{:x}", hasher.finalize());
-    format!("__oomir_checked_{}_{}_{}", operation, ty_suffix, &hash[..8])
+    let hash = crate::stable_hash::short_hash(result_struct_name, 8);
+    format!("__oomir_checked_{operation}_{ty_suffix}_{hash}")
 }
 
 /// Emits a checked arithmetic intrinsic function for the given integer type

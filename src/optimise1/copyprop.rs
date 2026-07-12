@@ -302,7 +302,7 @@ fn rewrite_instruction_uses(instruction: &mut Instruction, aliases: &AliasMap) {
                 rewrite_operand(operand, aliases);
             }
         }
-        Instruction::Call { args, .. } | Instruction::InvokeStatic { args, .. } => {
+        Instruction::InvokeStatic { args, .. } => {
             rewrite_operands(args, aliases);
         }
         Instruction::CallIndirect {
@@ -442,7 +442,7 @@ fn collect_instruction_uses(instruction: &Instruction, uses: &mut HashSet<String
                 collect_operand_use(operand, uses);
             }
         }
-        Instruction::Call { args, .. } | Instruction::InvokeStatic { args, .. } => {
+        Instruction::InvokeStatic { args, .. } => {
             collect_operand_uses(args, uses);
         }
         Instruction::CallIndirect {
@@ -533,8 +533,7 @@ fn instruction_defs(instruction: &Instruction) -> HashSet<String> {
         | Instruction::Cast { dest, .. } => {
             defs.insert(dest.clone());
         }
-        Instruction::Call { dest, .. }
-        | Instruction::CallIndirect { dest, .. }
+        Instruction::CallIndirect { dest, .. }
         | Instruction::InvokeInterface { dest, .. }
         | Instruction::InvokeVirtual { dest, .. }
         | Instruction::InvokeStatic { dest, .. } => {

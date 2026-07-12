@@ -841,82 +841,6 @@ pub fn process_block_instructions(
                 }
             }
 
-            Instruction::Call {
-                dest,
-                args,
-                class_name,
-                function,
-                signature,
-                ..
-            } => {
-                // Added 'function' for logging
-                // Propagate constants into arguments
-                let new_args: Vec<Operand> = args
-                    .iter()
-                    .map(|arg| {
-                        lookup_const(arg, &current_state).map_or(arg.clone(), Operand::Constant)
-                    })
-                    .collect();
-
-                // Determine if any argument could potentially have side effects
-                // In our case, passing an Array(_) type signals potential mutation.
-                // We should also consider Class(_) types for future object mutations.
-                let mut has_potential_side_effect_arg = false;
-                for arg_operand in &new_args {
-                    // Check the arguments *after* constant prop
-                    let arg_type = match arg_operand {
-                        Operand::Variable { ty, .. } => Some(ty.clone()),
-                        Operand::Constant(c) => Some(Type::from_constant(c)), // Get type from constant
-                    };
-
-                    if let Some(ty) = arg_type {
-                        // Assume Arrays and Classes passed by reference can be mutated
-                        if matches!(ty, Type::Array(_) | Type::Class(_)) {
-                            has_potential_side_effect_arg = true;
-                            break;
-                        }
-                    }
-                }
-
-                // 1. Invalidate the destination variable
-                if let Some(d) = dest {
-                    current_state.remove(d);
-                }
-
-                // 2. CONSERVATIVE INVALIDATION due to potential side effects:
-                if has_potential_side_effect_arg {
-                    // Keep track of keys to remove to avoid borrowing issues while iterating
-                    let keys_to_remove: Vec<String> = current_state.iter()
-                        .filter_map(|(key, constant_val)| {
-                            // Decide which types are considered "primitive" and immutable
-                            // and won't be affected by side effects through references.
-                            match constant_val {
-                                Constant::I8(_) | Constant::I16(_) | Constant::I32(_) | Constant::I64(_) |
-                                Constant::F32(_) | Constant::F64(_) | Constant::Boolean(_) | Constant::Char(_) |
-                                Constant::String(_) => None, // Keep truly immutable primitives/values
-                                _ => {
-                                     breadcrumbs::log!(breadcrumbs::LogLevel::Info, "optimisation", format!("Optimizer: Invalidating potentially mutable constant '{}' due to call to '{}' with array/class arg.", key, function)); // Debugging
-                                     Some(key.clone()) // Remove others (Array, Instance, Class etc.)
-                                }
-                            }
-                        })
-                        .collect();
-
-                    for key in keys_to_remove {
-                        current_state.remove(&key);
-                    }
-                }
-
-                // Keep the call instruction, but with potentially updated arguments
-                optimised_instruction = Instruction::Call {
-                    dest: dest.clone(),
-                    class_name: class_name.clone(),
-                    function: function.clone(), // Use the captured function name
-                    signature: signature.clone(),
-                    args: new_args,
-                };
-                keep_original_instruction = true; // Always keep the call itself
-            }
             Instruction::CallIndirect {
                 dest,
                 function_ptr,
@@ -1267,6 +1191,52 @@ pub fn process_block_instructions(
                         lookup_const(arg, &current_state).map_or(arg.clone(), Operand::Constant)
                     })
                     .collect();
+
+                if let Some(dest) = dest {
+                    current_state.remove(dest);
+                }
+
+                let may_mutate_referenced_state = new_args.iter().any(|operand| {
+                    let ty = match operand {
+                        Operand::Variable { ty, .. } => ty.clone(),
+                        Operand::Constant(constant) => Type::from_constant(constant),
+                    };
+                    matches!(
+                        ty,
+                        Type::Array(_)
+                            | Type::Slice(_)
+                            | Type::MutableReference(_)
+                            | Type::Class(_)
+                            | Type::Interface(_)
+                    )
+                });
+                if may_mutate_referenced_state {
+                    current_state.retain(|key, constant| {
+                        let keep = matches!(
+                            constant,
+                            Constant::I8(_)
+                                | Constant::I16(_)
+                                | Constant::I32(_)
+                                | Constant::I64(_)
+                                | Constant::F32(_)
+                                | Constant::F64(_)
+                                | Constant::Boolean(_)
+                                | Constant::Char(_)
+                                | Constant::String(_)
+                        );
+                        if !keep {
+                            breadcrumbs::log!(
+                                breadcrumbs::LogLevel::Info,
+                                "optimisation",
+                                format!(
+                                    "Optimizer: invalidating potentially mutable constant '{}' due to static call '{}.{}'.",
+                                    key, class_name, method_name
+                                )
+                            );
+                        }
+                        keep
+                    });
+                }
                 optimised_instruction = Instruction::InvokeStatic {
                     dest: dest.clone(),
                     class_name: class_name.clone(),

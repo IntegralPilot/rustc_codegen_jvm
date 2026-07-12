@@ -46,6 +46,58 @@ fn check_arrays_of_mutable_references() {
     }
 }
 
+fn pass_i32(value: &mut i32) -> &mut i32 {
+    value
+}
+
+fn pass_point(value: &mut Point) -> &mut Point {
+    value
+}
+
+fn adjust_floats(single: &mut f32, double: &mut f64) {
+    *single += 1.25;
+    *double -= 2.5;
+}
+
+fn adjust_nested(value: &mut &mut i32) {
+    **value += 7;
+}
+
+fn check_reference_boundaries() {
+    let mut integer = 5;
+    let returned = pass_i32(&mut integer);
+    *returned *= 3;
+    assert!(integer == 15);
+
+    let mut point = Point { x: 2, y: 4 };
+    let returned = pass_point(&mut point);
+    returned.x += 8;
+    returned.y += 6;
+    assert!(point.x == 10);
+    assert!(point.y == 10);
+
+    let mut single = 1.5_f32;
+    let mut double = 10.0_f64;
+    adjust_floats(&mut single, &mut double);
+    assert!(single == 2.75);
+    assert!(double == 7.5);
+
+    let mut nested_value = 20;
+    let mut first_reference = &mut nested_value;
+    adjust_nested(&mut first_reference);
+    assert!(nested_value == 27);
+
+    let mut captured = 30;
+    {
+        let captured_reference = &mut captured;
+        let mut closure = || {
+            *captured_reference += 12;
+        };
+        closure();
+    }
+    assert!(captured == 42);
+}
+
 
 fn main() {
     // 1. Initial setup
@@ -70,4 +122,5 @@ fn main() {
     assert!(point.y == -5);
 
     check_arrays_of_mutable_references();
+    check_reference_boundaries();
 }

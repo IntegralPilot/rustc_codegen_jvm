@@ -257,6 +257,8 @@ pub fn oomir_to_jvm_bytecode(
         }
     });
 
+    let mut current_index = 0;
+    let total_functions: usize = functions_by_class.values().map(|v| v.len()).sum();
     for class_name_jvm in class_names {
         let functions = functions_by_class
             .remove(&class_name_jvm)
@@ -299,6 +301,7 @@ pub fn oomir_to_jvm_bytecode(
         }
 
         for function in functions {
+            current_index += 1;
             let instrumented_fn_name = format!("{class_name_jvm}::{}", function.name);
             let _timer =
                 crate::instrumentation::Timer::function("lower2", None, &instrumented_fn_name);
@@ -324,7 +327,7 @@ pub fn oomir_to_jvm_bytecode(
                 translator
                     .translate()
                     .map_err(|error| jvm::Error::VerificationError {
-                        context: format!("Function {class_name_jvm}::{}", function.name),
+                        context: format!("Function {class_name_jvm}::{} - {} of {}", function.name, current_index, total_functions),
                         message: format!("Failed to translate function: {error:?}"),
                     })?;
 

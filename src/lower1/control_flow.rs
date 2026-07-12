@@ -13,7 +13,7 @@ use rustc_middle::{
     },
     ty::{EarlyBinder, Instance, TyCtxt, TyKind, TypingEnv},
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 mod checked_intrinsic_registry;
 pub mod checked_intrinsics;
@@ -22,6 +22,91 @@ pub(crate) mod rvalue;
 mod trait_objects;
 
 pub use checked_intrinsic_registry::take_needed_intrinsics;
+
+pub(super) type MutableBorrowMap<'tcx> = HashMap<Local, (Place<'tcx>, String, oomir::Type)>;
+
+fn emit_mutable_borrow_writeback<'tcx>(
+    borrow_local: Local,
+    mutable_borrows: &MutableBorrowMap<'tcx>,
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
+    mir: &Body<'tcx>,
+    data_types: &mut HashMap<String, oomir::DataType>,
+    visited: &mut HashSet<Local>,
+) -> Vec<oomir::Instruction> {
+    if !visited.insert(borrow_local) {
+        return Vec::new();
+    }
+    let mut instructions = Vec::new();
+    let Some((original_place, carrier_name, element_ty)) =
+        mutable_borrows.get(&borrow_local).cloned()
+    else {
+        return instructions;
+    };
+    if !element_ty.has_jvm_value() {
+        return instructions;
+    }
+    let value_name = format!(
+        "_writeback_{}_{}",
+        borrow_local.index(),
+        original_place.local.index()
+    );
+    instructions.push(oomir::Instruction::ArrayGet {
+        dest: value_name.clone(),
+        array: oomir::Operand::Variable {
+            name: carrier_name,
+            ty: oomir::Type::MutableReference(Box::new(element_ty.clone())),
+        },
+        index: oomir::Operand::Constant(oomir::Constant::I32(0)),
+    });
+    instructions.extend(emit_instructions_to_set_value(
+        &original_place,
+        oomir::Operand::Variable {
+            name: value_name,
+            ty: element_ty,
+        },
+        tcx,
+        instance,
+        mir,
+        data_types,
+    ));
+    if mutable_borrows.contains_key(&original_place.local) {
+        instructions.extend(emit_mutable_borrow_writeback(
+            original_place.local,
+            mutable_borrows,
+            tcx,
+            instance,
+            mir,
+            data_types,
+            visited,
+        ));
+    }
+    instructions
+}
+
+fn emit_selected_mutable_borrow_writebacks<'tcx>(
+    borrow_locals: impl IntoIterator<Item = Local>,
+    mutable_borrows: &MutableBorrowMap<'tcx>,
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
+    mir: &Body<'tcx>,
+    data_types: &mut HashMap<String, oomir::DataType>,
+) -> Vec<oomir::Instruction> {
+    let mut instructions = Vec::new();
+    let mut visited = HashSet::new();
+    for borrow_local in borrow_locals {
+        instructions.extend(emit_mutable_borrow_writeback(
+            borrow_local,
+            mutable_borrows,
+            tcx,
+            instance,
+            mir,
+            data_types,
+            &mut visited,
+        ));
+    }
+    instructions
+}
 
 fn requires_compiled_static_dispatch(ty: &oomir::Type) -> bool {
     if let oomir::Type::MutableReference(inner) | oomir::Type::Reference(inner) = ty {
@@ -64,13 +149,12 @@ pub fn convert_basic_block<'tcx>(
     return_oomir_type: &oomir::Type, // Pass function return type
     basic_blocks: &mut HashMap<String, oomir::BasicBlock>,
     data_types: &mut HashMap<String, oomir::DataType>,
+    mutable_borrow_arrays: &mut MutableBorrowMap<'tcx>,
 ) -> oomir::BasicBlock {
     // Use the basic block index as its label.
     let label = format!("bb{}", bb.index());
     let mut instructions = Vec::new();
-    let mut mutable_borrow_arrays: HashMap<Local, (Place<'tcx>, String, oomir::Type)> =
-        HashMap::new();
-
+    let mut initialized_borrows = HashSet::new();
     // Convert each MIR statement in the block.
     for stmt in &bb_data.statements {
         match &stmt.kind {
@@ -135,6 +219,7 @@ pub fn convert_basic_block<'tcx>(
                                                 *element_ty.clone(),
                                             ),
                                         );
+                                        initialized_borrows.insert(place.local);
                                     }
                                     oomir::Type::Slice(_) => {
                                         // Slice views already alias their backing array, so writes
@@ -186,6 +271,18 @@ pub fn convert_basic_block<'tcx>(
 
                 // Add the final assignment instructions (Move, SetField, ArrayStore)
                 instructions.extend(assignment_instructions);
+                if place.projection.iter().any(|projection| {
+                    matches!(projection, rustc_middle::mir::ProjectionElem::Deref)
+                }) {
+                    instructions.extend(emit_selected_mutable_borrow_writebacks(
+                        [place.local],
+                        mutable_borrow_arrays,
+                        tcx,
+                        instance,
+                        mir,
+                        data_types,
+                    ));
+                }
             }
             StatementKind::StorageLive(_) | StatementKind::StorageDead(_) => {
                 // no-op, currently
@@ -251,6 +348,15 @@ pub fn convert_basic_block<'tcx>(
                         tcx,
                         instance,
                         mir,
+                        data_types,
+                        &mut instructions,
+                    );
+                    let return_operand = super::value_repr::adapt_operand_to_rust_type(
+                        return_operand,
+                        Place::return_place().ty(&mir.local_decls, tcx).ty,
+                        &format!("{}_return", label),
+                        tcx,
+                        instance,
                         data_types,
                         &mut instructions,
                     );
@@ -358,19 +464,21 @@ pub fn convert_basic_block<'tcx>(
                         }
                     };
 
-                    for (index, target_ty) in fn_inputs.iter().enumerate() {
-                        let Some(source) = oomir_operands.get(index).cloned() else {
-                            break;
-                        };
-                        oomir_operands[index] = super::value_repr::adapt_operand_to_rust_type(
-                            source,
-                            *target_ty,
-                            &format!("{}_call_arg_{}", label, index),
-                            tcx,
-                            instance,
-                            data_types,
-                            &mut instructions,
-                        );
+                    if !matches!(instance_ty.kind(), TyKind::Closure(..)) {
+                        for (index, target_ty) in fn_inputs.iter().enumerate() {
+                            let Some(source) = oomir_operands.get(index).cloned() else {
+                                break;
+                            };
+                            oomir_operands[index] = super::value_repr::adapt_operand_to_rust_type(
+                                source,
+                                *target_ty,
+                                &format!("{}_call_arg_{}", label, index),
+                                tcx,
+                                instance,
+                                data_types,
+                                &mut instructions,
+                            );
+                        }
                     }
 
                     let oomir_output_type =
@@ -667,7 +775,9 @@ pub fn convert_basic_block<'tcx>(
                             };
 
                             let mut generated = false;
-                            if let Some(self_ty) = self_ty_opt {
+                            if item.trait_container(tcx).is_none()
+                                && let Some(self_ty) = self_ty_opt
+                            {
                                 let class_type = super::types::ty_to_oomir_type(
                                     self_ty,
                                     tcx,
@@ -690,10 +800,12 @@ pub fn convert_basic_block<'tcx>(
                             if !generated {
                                 let fn_name_data =
                                     super::naming::mono_fn_name_from_instance(tcx, func_instance);
-                                instructions.push(oomir::Instruction::Call {
-                                    class_name: fn_name_data.class_to_call_on,
-                                    function: fn_name_data.method_name,
-                                    signature: method_signature.clone(),
+                                instructions.push(oomir::Instruction::InvokeStatic {
+                                    class_name: fn_name_data
+                                        .class_to_call_on
+                                        .expect("monomorphized functions have JVM owners"),
+                                    method_name: fn_name_data.method_name,
+                                    method_ty: method_signature.clone(),
                                     args: oomir_operands.clone(),
                                     dest: effective_dest, // use effective_dest
                                 });
@@ -701,24 +813,30 @@ pub fn convert_basic_block<'tcx>(
                         }
                     } else {
                         let is_closure_call = matches!(instance_ty.kind(), TyKind::Closure(..));
+                        let closure_has_captures = matches!(
+                            instance_ty.kind(),
+                            TyKind::Closure(_, args)
+                                if args.as_closure().upvar_tys().iter().next().is_some()
+                        );
                         let (class_name, function) = if is_closure_call {
                             (
-                                None,
+                                super::jvm_names::crate_module_class(
+                                    tcx,
+                                    func_instance.def_id().krate,
+                                ),
                                 super::generate_closure_function_name(tcx, func_instance),
                             )
                         } else {
                             let fn_name_data =
                                 super::naming::mono_fn_name_from_instance(tcx, func_instance);
-                            (fn_name_data.class_to_call_on, fn_name_data.method_name)
+                            (
+                                fn_name_data
+                                    .class_to_call_on
+                                    .expect("monomorphized functions have JVM owners"),
+                                fn_name_data.method_name,
+                            )
                         };
                         let call_args = if is_closure_call && !oomir_operands.is_empty() {
-                            let closure_has_captures = match instance_ty.kind() {
-                                TyKind::Closure(_, args) => {
-                                    args.as_closure().upvar_tys().iter().next().is_some()
-                                }
-                                _ => false,
-                            };
-
                             if closure_has_captures {
                                 oomir_operands.clone()
                             } else {
@@ -727,12 +845,21 @@ pub fn convert_basic_block<'tcx>(
                         } else {
                             oomir_operands.clone()
                         };
+                        if closure_has_captures {
+                            let closure_env_ty = oomir_operands
+                                .first()
+                                .and_then(oomir::Operand::get_type)
+                                .expect("capturing closure calls have an environment operand");
+                            method_signature
+                                .params
+                                .insert(0, ("closure_env".to_string(), closure_env_ty));
+                        }
                         method_signature.is_static = true;
 
-                        instructions.push(oomir::Instruction::Call {
+                        instructions.push(oomir::Instruction::InvokeStatic {
                             class_name,
-                            function,
-                            signature: method_signature,
+                            method_name: function,
+                            method_ty: method_signature,
                             args: call_args,
                             dest: effective_dest, // use effective_dest
                         });
@@ -774,68 +901,56 @@ pub fn convert_basic_block<'tcx>(
                     });
                 }
 
-                let mut write_back_instrs = Vec::new();
-
-                let mut operand_to_place_map = HashMap::new();
-                for (mir_arg, oomir_op) in args.iter().zip(oomir_operands.iter()) {
-                    if let MirOperand::Move(p) | MirOperand::Copy(p) = &mir_arg.node {
-                        if p.projection.is_empty() {
-                            operand_to_place_map.insert(oomir_op.clone(), p.clone());
-                        }
-                    }
-                }
-
-                for (mir_arg, oomir_arg_operand) in args.iter().zip(oomir_operands.iter()) {
-                    let maybe_arg_place: Option<Place<'tcx>> = match &mir_arg.node {
-                        MirOperand::Move(p) | MirOperand::Copy(p) => Some(p.clone()),
-                        _ => None,
-                    };
-
-                    if let Some(arg_place) = maybe_arg_place {
-                        if let Some((original_place, array_var_name, element_ty)) =
-                            mutable_borrow_arrays.get(&arg_place.local)
-                        {
-                            if let oomir::Operand::Variable { .. } = oomir_arg_operand {
-                                breadcrumbs::log!(
-                                    breadcrumbs::LogLevel::Info,
-                                    "mir-lowering",
-                                    format!(
-                                        "Info: Emitting write-back for mutable borrow. Arg Place: {:?}, Original Place: {:?}, Array Var: {}",
-                                        arg_place, original_place, array_var_name
-                                    )
-                                );
-
-                                let temp_writeback_var =
-                                    format!("_writeback_{}", original_place.local.index());
-
-                                let array_operand = oomir::Operand::Variable {
-                                    name: array_var_name.clone(),
-                                    ty: oomir::Type::Array(Box::new(element_ty.clone())),
-                                };
-                                write_back_instrs.push(oomir::Instruction::ArrayGet {
-                                    dest: temp_writeback_var.clone(),
-                                    array: array_operand,
-                                    index: oomir::Operand::Constant(oomir::Constant::I32(0)),
-                                });
-
-                                let value_to_set = oomir::Operand::Variable {
-                                    name: temp_writeback_var,
-                                    ty: element_ty.clone(),
-                                };
-                                let set_instrs = emit_instructions_to_set_value(
-                                    original_place,
-                                    value_to_set,
-                                    tcx,
-                                    instance,
-                                    mir,
-                                    data_types,
-                                );
-                                write_back_instrs.extend(set_instrs);
+                let destination_ty = destination.ty(&mir.local_decls, tcx).ty;
+                if destination.projection.is_empty()
+                    && matches!(
+                        destination_ty.kind(),
+                        TyKind::Ref(_, _, mutability) if mutability.is_mut()
+                    )
+                {
+                    let aliases = args
+                        .iter()
+                        .filter_map(|arg| match &arg.node {
+                            MirOperand::Move(place) | MirOperand::Copy(place)
+                                if place.projection.is_empty() =>
+                            {
+                                mutable_borrow_arrays.get(&place.local).cloned()
                             }
-                        }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    if let [alias] = aliases.as_slice() {
+                        mutable_borrow_arrays.insert(
+                            destination.local,
+                            (
+                                alias.0.clone(),
+                                super::place::place_to_string(destination, tcx),
+                                alias.2.clone(),
+                            ),
+                        );
+                        initialized_borrows.insert(destination.local);
                     }
                 }
-                instructions.extend(write_back_instrs);
+
+                let mut writeback_locals = initialized_borrows.clone();
+                for arg in args {
+                    if let MirOperand::Move(place) | MirOperand::Copy(place) = &arg.node
+                        && place.projection.is_empty()
+                        && mutable_borrow_arrays.contains_key(&place.local)
+                    {
+                        writeback_locals.insert(place.local);
+                    }
+                }
+                let mut writeback_locals = writeback_locals.into_iter().collect::<Vec<_>>();
+                writeback_locals.sort_by_key(|local| local.index());
+                instructions.extend(emit_selected_mutable_borrow_writebacks(
+                    writeback_locals,
+                    mutable_borrow_arrays,
+                    tcx,
+                    instance,
+                    mir,
+                    data_types,
+                ));
 
                 if let Some(target_bb) = target {
                     let target_label = format!("bb{}", target_bb.index());

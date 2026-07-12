@@ -13,6 +13,20 @@ enum ComplexEnum<'a> {
     Settings(ConfigData),               // Struct data
 }
 
+#[repr(u8)]
+enum ConstantArrayEnum {
+    Zero = 0,
+    One = 1,
+    Seven = 7,
+}
+
+const CONSTANT_ENUMS: [ConstantArrayEnum; 4] = [
+    ConstantArrayEnum::Zero,
+    ConstantArrayEnum::Seven,
+    ConstantArrayEnum::One,
+    ConstantArrayEnum::Seven,
+];
+
 fn main() {
     // Initialize with one variant
     let mut current_state = ComplexEnum::UserData {
@@ -146,4 +160,9 @@ fn main() {
     } else {
         panic!("State should be SimpleVariant");
     }
+
+    assert!(matches!(CONSTANT_ENUMS[0], ConstantArrayEnum::Zero));
+    assert!(matches!(CONSTANT_ENUMS[1], ConstantArrayEnum::Seven));
+    assert!(matches!(CONSTANT_ENUMS[2], ConstantArrayEnum::One));
+    assert!(matches!(CONSTANT_ENUMS[3], ConstantArrayEnum::Seven));
 }

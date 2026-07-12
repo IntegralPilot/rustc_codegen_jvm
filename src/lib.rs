@@ -49,6 +49,7 @@ mod lower1;
 mod lower2;
 mod oomir;
 mod optimise1;
+mod stable_hash;
 
 /// An instance of our Java bytecode codegen backend.
 struct MyBackend;
@@ -244,6 +245,7 @@ fn lower_mono_function<'tcx>(
     tcx: TyCtxt<'tcx>,
     instance: Instance<'tcx>,
     oomir_module: &mut oomir::Module,
+    lowered_instances: &mut HashSet<Instance<'tcx>>,
 ) {
     if !instance.def_id().is_local() {
         breadcrumbs::log!(
@@ -251,6 +253,10 @@ fn lower_mono_function<'tcx>(
             "mono-lowering",
             format!("Skipping non-local mono function: {:?}", instance)
         );
+        return;
+    }
+
+    if !lowered_instances.insert(instance) {
         return;
     }
 
@@ -270,16 +276,6 @@ fn lower_mono_function<'tcx>(
     }
 
     let name = mono_item_name(tcx, instance, oomir_module);
-    let key = name.key(&oomir_module.name);
-    if oomir_module.functions.contains_key(&key) {
-        breadcrumbs::log!(
-            breadcrumbs::LogLevel::Info,
-            "mono-lowering",
-            format!("Mono function {} already lowered, skipping", key)
-        );
-        return;
-    }
-
     let mut mir = tcx.instance_mir(instance.def).clone();
     breadcrumbs::log!(
         breadcrumbs::LogLevel::Info,
@@ -302,7 +298,11 @@ fn lower_mono_function<'tcx>(
     place_or_insert_mono_function(tcx, instance, &name, oomir_function, oomir_module);
 }
 
-fn lower_mono_items<'tcx>(tcx: TyCtxt<'tcx>, oomir_module: &mut oomir::Module) {
+fn lower_mono_items<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    oomir_module: &mut oomir::Module,
+    lowered_instances: &mut HashSet<Instance<'tcx>>,
+) {
     let cgus = tcx.collect_and_partition_mono_items(());
     let mut seen = HashSet::new();
 
@@ -313,7 +313,9 @@ fn lower_mono_items<'tcx>(tcx: TyCtxt<'tcx>, oomir_module: &mut oomir::Module) {
             }
 
             match mono_item {
-                MonoItem::Fn(instance) => lower_mono_function(tcx, instance, oomir_module),
+                MonoItem::Fn(instance) => {
+                    lower_mono_function(tcx, instance, oomir_module, lowered_instances)
+                }
                 MonoItem::Static(def_id) => {
                     lower1::statics::lower_static(tcx, def_id, oomir_module).unwrap_or_else(
                         |error| panic!("failed to lower static {def_id:?}: {error}"),
@@ -490,7 +492,11 @@ fn materialize_java_public_data_type<'tcx>(
     }
 }
 
-fn lower_public_library_exports<'tcx>(tcx: TyCtxt<'tcx>, oomir_module: &mut oomir::Module) {
+fn lower_public_library_exports<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    oomir_module: &mut oomir::Module,
+    lowered_instances: &mut HashSet<Instance<'tcx>>,
+) {
     if !crate_emits_library_artifact(tcx) {
         return;
     }
@@ -499,7 +505,12 @@ fn lower_public_library_exports<'tcx>(tcx: TyCtxt<'tcx>, oomir_module: &mut oomi
 
     for def_id in function_defs {
         if is_lowerable_java_public_function(tcx, def_id) {
-            lower_mono_function(tcx, Instance::mono(tcx, def_id), oomir_module);
+            lower_mono_function(
+                tcx,
+                Instance::mono(tcx, def_id),
+                oomir_module,
+                lowered_instances,
+            );
         }
     }
 
@@ -537,8 +548,9 @@ impl CodegenBackend for MyBackend {
 
         let lower1_timer = instrumentation::Timer::phase("lower1", Some(&crate_name));
 
-        lower_public_library_exports(tcx, &mut oomir_module);
-        lower_mono_items(tcx, &mut oomir_module);
+        let mut lowered_instances = HashSet::new();
+        lower_public_library_exports(tcx, &mut oomir_module, &mut lowered_instances);
+        lower_mono_items(tcx, &mut oomir_module, &mut lowered_instances);
 
         breadcrumbs::log!(
             breadcrumbs::LogLevel::Info,

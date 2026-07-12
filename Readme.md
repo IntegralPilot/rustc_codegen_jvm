@@ -152,7 +152,6 @@ python build.py all
 This builds the following, in dependency order:
 
 - The Java library shim (`library/`)
-- The shim metadata file (`core.json`)
 - The `java-linker` executable
 - The `rustc_codegen_jvm` backend library
 - Configuration files (`config.toml`, `jvm-unknown-unknown.json`)
@@ -215,7 +214,6 @@ Results are printed to the console, and temporary test artifacts are written to 
 ├── java-linker/              # Bundles compiled .class files into .jar archives
 ├── tests/binary/             # Integration tests and example source crates
 ├── library/                  # Java shim implementation for the Rust core library
-├── shim-metadata-gen/        # Tool to generate core.json metadata
 ├── build.py                  # Orchestrator build script
 ├── config.toml.template      # Cargo configuration template
 ├── jvm-unknown-unknown.json.template

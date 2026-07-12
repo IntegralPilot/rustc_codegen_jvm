@@ -1,51 +1,129 @@
-// src/lower2/shim.rs
+//! Explicit mappings from Rust OOMIR calls to the Java runtime ABI.
 
-use serde::Deserialize;
-use std::{collections::HashMap, str, sync::OnceLock};
-
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub(super) struct ShimInfo {
-    // pub(super) or pub(crate)
-    pub(super) descriptor: String,
-    pub(super) is_static: bool,
-    #[serde(default)]
-    pub(super) class_name: Option<String>,
-    #[serde(default)]
-    pub(super) method_name: Option<String>,
+    pub(super) rust_class: Option<&'static str>,
+    pub(super) rust_method: &'static str,
+    pub(super) java_class: &'static str,
+    pub(super) java_method: &'static str,
+    pub(super) descriptor: &'static str,
 }
 
-impl ShimInfo {
-    pub(super) fn java_class<'a>(&'a self, key: &str) -> &'a str {
-        self.class_name.as_deref().unwrap_or_else(|| {
-            if key == "panic" || key == "panic_fmt" {
-                "org/rustlang/core/panicking"
-            } else {
-                "org/rustlang/core/Core"
-            }
-        })
-    }
+const CORE_CLASS: &str = "org/rustlang/core/Core";
+const PANICKING_CLASS: &str = "org/rustlang/core/panicking";
 
-    pub(super) fn java_method<'a>(&'a self, key: &'a str) -> &'a str {
-        self.method_name.as_deref().unwrap_or(key)
+const fn direct(
+    java_class: &'static str,
+    method: &'static str,
+    descriptor: &'static str,
+) -> ShimInfo {
+    ShimInfo {
+        rust_class: None,
+        rust_method: method,
+        java_class,
+        java_method: method,
+        descriptor,
     }
 }
 
-// Key: JVM-safe member name (output of jvm_names::member_name)
-pub(super) type ShimMap = HashMap<String, ShimInfo>;
+const fn alias(
+    rust_class: &'static str,
+    rust_method: &'static str,
+    java_method: &'static str,
+    descriptor: &'static str,
+) -> ShimInfo {
+    ShimInfo {
+        rust_class: Some(rust_class),
+        rust_method,
+        java_class: CORE_CLASS,
+        java_method,
+        descriptor,
+    }
+}
 
-static SHIM_METADATA: OnceLock<Result<ShimMap, String>> = OnceLock::new();
+const SHIMS: &[ShimInfo] = &[
+    direct(
+        CORE_CLASS,
+        "arguments_from_str",
+        "(Ljava/lang/String;)Lorg/rustlang/core/fmt/Arguments__;",
+    ),
+    direct(CORE_CLASS, "encode_utf8_raw", "(J[[S)[[S"),
+    direct(
+        CORE_CLASS,
+        "formatArgs",
+        "([S[Ljava/lang/Object;)Ljava/lang/String;",
+    ),
+    direct(
+        CORE_CLASS,
+        "formatArgumentObject",
+        "(Ljava/lang/Object;)Ljava/lang/String;",
+    ),
+    direct(
+        CORE_CLASS,
+        "formatArgumentType",
+        "(Ljava/lang/Object;)Ljava/lang/String;",
+    ),
+    direct(
+        CORE_CLASS,
+        "formatArguments",
+        "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/String;",
+    ),
+    direct(
+        CORE_CLASS,
+        "fromShortArray",
+        "([S)Ljava/lang/String;",
+    ),
+    direct(
+        CORE_CLASS,
+        "new_arguments",
+        "([S[Ljava/lang/Object;)Lorg/rustlang/core/fmt/Arguments__;",
+    ),
+    direct(
+        CORE_CLASS,
+        "new_display",
+        "(Ljava/lang/Object;)Lorg/rustlang/core/fmt/rt/Argument__;",
+    ),
+    direct(PANICKING_CLASS, "panic", "(Ljava/lang/String;)V"),
+    direct(PANICKING_CLASS, "panic_fmt", "(Ljava/lang/Object;)V"),
+    direct(CORE_CLASS, "starts_with", "([S[S)Z"),
+    direct(
+        CORE_CLASS,
+        "toShortArray",
+        "(Ljava/lang/String;)[S",
+    ),
+    alias(
+        "org/rustlang/core/intrinsics",
+        "compare_bytes",
+        "compare_bytes",
+        "([S[SI)I",
+    ),
+    alias(
+        "org/rustlang/core/fmt/Arguments__",
+        "from_str",
+        "arguments_from_str",
+        "(Ljava/lang/String;)Lorg/rustlang/core/fmt/Arguments__;",
+    ),
+    alias(
+        "org/rustlang/core/fmt/Arguments__",
+        "new",
+        "new_arguments",
+        "([S[Ljava/lang/Object;)Lorg/rustlang/core/fmt/Arguments__;",
+    ),
+    alias(
+        "org/rustlang/core/fmt/rt/Argument__",
+        "new_display",
+        "new_display",
+        "(Ljava/lang/Object;)Lorg/rustlang/core/fmt/rt/Argument__;",
+    ),
+];
 
-pub(super) fn get_shim_metadata() -> Result<&'static ShimMap, &'static str> {
-    SHIM_METADATA
-        .get_or_init(|| {
-            const JSON_BYTES: &[u8] = include_bytes!("../../shim-metadata-gen/core.json"); // Adjust path relative to THIS file
-
-            let json_str = str::from_utf8(JSON_BYTES)
-                .map_err(|e| format!("Failed to decode embedded JSON bytes as UTF-8: {}", e))?;
-
-            serde_json::from_str(json_str)
-                .map_err(|e| format!("Failed to parse embedded JSON string: {}", e))
-        })
-        .as_ref()
-        .map_err(|e| e.as_str())
+pub(super) fn find_shim(class_name: &str, method_name: &str) -> Option<&'static ShimInfo> {
+    SHIMS.iter().find(|shim| {
+        shim.rust_method == method_name
+            && shim
+                .rust_class
+                .map_or(shim.java_class == class_name, |rust_class| {
+                    rust_class == class_name
+                })
+    })
 }

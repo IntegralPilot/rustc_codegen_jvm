@@ -26,7 +26,6 @@ class Config:
     # Subproject Directories
     JAVA_LINKER_DIR = ROOT_DIR / "java-linker"
     LIBRARY_DIR = ROOT_DIR / "library"
-    SHIM_METADATA_GEN_DIR = ROOT_DIR / "shim-metadata-gen"
 
     # Versions (centralized management)
     LIBRARY_VERSION = "0.1.0"
@@ -34,14 +33,12 @@ class Config:
     # Source File Lists (used for dependency tracking)
     # Using glob patterns for automatic discovery
     LIBRARY_SOURCES = sorted(LIBRARY_DIR.glob("src/**/*.java"))
-    SHIM_GEN_RUST_SOURCES = list(SHIM_METADATA_GEN_DIR.glob("src/**/*.rs"))
     BACKEND_RUST_SOURCES = list(ROOT_DIR.glob("src/**/*.rs"))
     LINKER_RUST_SOURCES = list(JAVA_LINKER_DIR.glob("src/**/*.rs"))
 
     # Key Target Files
     LIBRARY_JAR = LIBRARY_DIR / f"build/libs/library-{LIBRARY_VERSION}.jar"
     LIBRARY_CLASSES_DIR = LIBRARY_DIR / "build/classes"
-    CORE_JSON = SHIM_METADATA_GEN_DIR / "core.json"
     CONFIG_TOML = ROOT_DIR / "config.toml"
     JVM_TARGET_JSON = ROOT_DIR / "jvm-unknown-unknown.json"
 
@@ -104,13 +101,11 @@ def clean():
     
     # Subproject cargo clean
     run_command(["cargo", "clean"], cwd=Config.JAVA_LINKER_DIR)
-    run_command(["cargo", "clean"], cwd=Config.SHIM_METADATA_GEN_DIR)
 
     # Remove specific files and directories
     for path in [
         Config.CONFIG_TOML, 
         Config.JVM_TARGET_JSON,
-        Config.CORE_JSON,
         Config.LIBRARY_DIR / "build"
     ]:
         try:
@@ -168,37 +163,9 @@ def build_library():
 
     print(f"{Colors.GREEN}   Java library shim built successfully.{Colors.RESET}")
 
-def generate_shim_metadata():
-    """Generates core.json from the library shim JAR."""
-    if Config.IS_CI:
-        print(f"{Colors.YELLOW}CI mode: skipping shim-metadata-gen (using checked-in file).{Colors.RESET}")
-        if not Config.CORE_JSON.exists():
-            print(f"{Colors.RED}❌ Error: core.json is missing in CI mode!{Colors.RESET}")
-            sys.exit(1)
-        return
-
-    # Dependencies: the library JAR and the generator's own source code.
-    sources = [Config.LIBRARY_JAR] + Config.SHIM_GEN_RUST_SOURCES
-    if not is_stale(Config.CORE_JSON, sources):
-        print(f"{Colors.GREEN}✅ Shim metadata (core.json) is up to date.{Colors.RESET}")
-        return
-
-    print(f"{Colors.CYAN}🛠️  Generating library shim metadata...{Colors.RESET}")
-    
-    # The `cargo run` command needs relative paths from its CWD.
-    relative_jar_path = os.path.relpath(Config.LIBRARY_JAR, Config.SHIM_METADATA_GEN_DIR)
-    
-    run_command([
-        "cargo", "run", "--",
-        str(relative_jar_path),
-        "./core.json"
-    ], cwd=Config.SHIM_METADATA_GEN_DIR)
-    print(f"{Colors.GREEN}   Shim metadata generated successfully.{Colors.RESET}")
-
 def build_rust_backend():
     """Builds the main rustc_codegen_jvm backend."""
-    # Dependencies: backend source files and the core.json metadata.
-    sources = Config.BACKEND_RUST_SOURCES + [Config.CORE_JSON]
+    sources = Config.BACKEND_RUST_SOURCES
     if not is_stale(Config.RUST_BACKEND_DYLIB, sources):
         print(f"{Colors.GREEN}✅ Rust codegen backend is up to date.{Colors.RESET}")
         return
@@ -251,7 +218,6 @@ def all_tasks():
     
     # The order defines the dependency chain.
     build_library()
-    generate_shim_metadata()
     build_rust_backend()
     build_java_linker()
 
