@@ -9,9 +9,8 @@ use super::{
 };
 use crate::oomir::{self, AdtHelperKind, DataTypeMethod, Signature, Type};
 
-use ristretto_classfile::{
-    self as jvm, BaseType, ClassAccessFlags, ClassFile, FieldAccessFlags, MethodAccessFlags,
-    Version,
+use super::jvm::{
+    self, BaseType, ClassAccessFlags, ClassFile, FieldAccessFlags, MethodAccessFlags, Version,
     attributes::{ArrayType, Attribute, InnerClass, Instruction, MaxStack, NestedClassAccessFlags},
 };
 use std::collections::{HashMap, HashSet};
@@ -368,7 +367,7 @@ pub(super) fn create_slice_view_classfile() -> jvm::Result<Vec<u8>> {
             access_flags: FieldAccessFlags::PUBLIC | FieldAccessFlags::FINAL,
             name_index: cp.add_utf8("array")?,
             descriptor_index: cp.add_utf8("Ljava/lang/Object;")?,
-            field_type: jvm::FieldType::Object("java/lang/Object".to_string()),
+            field_type: jvm::FieldType::Object("java/lang/Object".into()),
             attributes: Vec::new(),
         },
         jvm::Field {
@@ -388,6 +387,7 @@ pub(super) fn create_slice_view_classfile() -> jvm::Result<Vec<u8>> {
     ];
 
     let class_file = ClassFile {
+        code_source_url: None,
         version: Version::Java8 { minor: 0 },
         constant_pool: cp.into_inner(),
         access_flags: ClassAccessFlags::PUBLIC | ClassAccessFlags::SUPER,
@@ -698,6 +698,7 @@ pub(super) fn create_utf8_view_classfile() -> jvm::Result<Vec<u8>> {
     };
 
     let class_file = ClassFile {
+        code_source_url: None,
         version: Version::Java8 { minor: 0 },
         constant_pool: cp.into_inner(),
         access_flags: ClassAccessFlags::PUBLIC | ClassAccessFlags::FINAL | ClassAccessFlags::SUPER,
@@ -918,8 +919,8 @@ pub(super) fn oomir_type_to_ristretto_field_type(
         oomir::Type::F64 => jvm::FieldType::Base(BaseType::Double),
         oomir::Type::Boolean => jvm::FieldType::Base(BaseType::Boolean),
         oomir::Type::Char => jvm::FieldType::Base(BaseType::Char),
-        oomir::Type::Str => jvm::FieldType::Object(oomir::UTF8_VIEW_CLASS.to_string()),
-        oomir::Type::String => jvm::FieldType::Object("java/lang/String".to_string()),
+        oomir::Type::Str => jvm::FieldType::Object(oomir::UTF8_VIEW_CLASS.into()),
+        oomir::Type::String => jvm::FieldType::Object("java/lang/String".into()),
         oomir::Type::Reference(ref2) => {
             let inner_ty = ref2.as_ref();
             oomir_type_to_ristretto_field_type(inner_ty)
@@ -928,20 +929,20 @@ pub(super) fn oomir_type_to_ristretto_field_type(
             let inner_field_type = if inner_ty.has_jvm_value() {
                 oomir_type_to_ristretto_field_type(inner_ty)
             } else {
-                jvm::FieldType::Object("java/lang/Object".to_string())
+                jvm::FieldType::Object("java/lang/Object".into())
             };
             jvm::FieldType::Array(Box::new(inner_field_type))
         }
-        oomir::Type::Slice(_) => jvm::FieldType::Object(oomir::SLICE_VIEW_CLASS.to_string()),
+        oomir::Type::Slice(_) => jvm::FieldType::Object(oomir::SLICE_VIEW_CLASS.into()),
         oomir::Type::MutableReference(inner_ty) if !inner_ty.has_jvm_value() => {
-            jvm::FieldType::Object("java/lang/Object".to_string())
+            jvm::FieldType::Object("java/lang/Object".into())
         }
         oomir::Type::MutableReference(inner_ty) => {
             let inner_field_type = oomir_type_to_ristretto_field_type(inner_ty);
             jvm::FieldType::Array(Box::new(inner_field_type))
         }
         oomir::Type::Class(name) | oomir::Type::Interface(name) => {
-            jvm::FieldType::Object(name.clone())
+            jvm::FieldType::Object(name.clone().into())
         }
         oomir::Type::Void => {
             panic!("Void type cannot be used as a field type");
@@ -1565,6 +1566,7 @@ pub(super) fn create_data_type_classfile_for_class(
     });
 
     let class_file = ClassFile {
+        code_source_url: None,
         version: Version::Java8 { minor: 0 },
         constant_pool: cp.into_inner(),
         access_flags: ClassAccessFlags::PUBLIC
@@ -1659,6 +1661,7 @@ pub(super) fn create_data_type_classfile_for_interface(
     });
 
     let class_file = ClassFile {
+        code_source_url: None,
         version: Version::Java8 { minor: 0 },
         constant_pool: cp.into_inner(),
         access_flags: ClassAccessFlags::PUBLIC

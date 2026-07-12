@@ -1,7 +1,7 @@
 use super::{constant_pool::InternedConstantPool, oomir};
 
+use super::jvm::{self, attributes::Instruction};
 use oomir::Type;
-use ristretto_classfile::{self as jvm, attributes::Instruction};
 
 use super::{BIG_DECIMAL_CLASS, BIG_INTEGER_CLASS};
 

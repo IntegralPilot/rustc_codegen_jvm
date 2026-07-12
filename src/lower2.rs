@@ -13,8 +13,8 @@ use translator::FunctionTranslator;
 
 use constant_pool::{InternedConstantPool, verify_no_duplicate_constants};
 use consts::load_constant;
-use ristretto_classfile::{
-    self as jvm, ClassAccessFlags, ClassFile, FieldAccessFlags, MethodAccessFlags, Version,
+use self::jvm::{
+    ClassAccessFlags, ClassFile, FieldAccessFlags, MethodAccessFlags, Version,
     attributes::{Attribute, Instruction, MaxStack},
 };
 use rustc_middle::ty::TyCtxt;
@@ -23,6 +23,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 mod constant_pool;
 mod consts;
 mod helpers;
+mod jvm;
 mod jvm_gen;
 mod optimise2;
 mod shim;
@@ -410,6 +411,7 @@ pub fn oomir_to_jvm_bytecode(
         }];
 
         let class_file = ClassFile {
+            code_source_url: None,
             version: Version::Java8 { minor: 0 },
             constant_pool: main_cp.into_inner(),
             access_flags: ClassAccessFlags::PUBLIC | ClassAccessFlags::SUPER,

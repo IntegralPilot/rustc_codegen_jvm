@@ -1,4 +1,4 @@
-use ristretto_classfile::{self as jvm, ClassFile, Constant, ConstantPool, ReferenceKind};
+use super::jvm::{self, ClassFile, Constant, ConstantPool, ReferenceKind};
 use std::{collections::HashMap, ops::Deref};
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -43,10 +43,10 @@ enum ConstantKey {
     Package(u16),
 }
 
-impl From<&Constant> for ConstantKey {
-    fn from(constant: &Constant) -> Self {
+impl From<&Constant<'_>> for ConstantKey {
+    fn from(constant: &Constant<'_>) -> Self {
         match constant {
-            Constant::Utf8(value) => ConstantKey::Utf8(value.clone()),
+            Constant::Utf8(value) => ConstantKey::Utf8(value.to_string()),
             Constant::Integer(value) => ConstantKey::Integer(*value),
             Constant::Float(value) => ConstantKey::Float(value.to_bits()),
             Constant::Long(value) => ConstantKey::Long(*value),
@@ -111,7 +111,7 @@ impl From<&Constant> for ConstantKey {
 
 #[derive(Clone, Debug)]
 pub(super) struct InternedConstantPool {
-    pool: ConstantPool,
+    pool: ConstantPool<'static>,
     constants: HashMap<ConstantKey, u16>,
 }
 
@@ -125,7 +125,7 @@ impl Default for InternedConstantPool {
 }
 
 impl Deref for InternedConstantPool {
-    type Target = ConstantPool;
+    type Target = ConstantPool<'static>;
 
     fn deref(&self) -> &Self::Target {
         &self.pool
@@ -133,11 +133,11 @@ impl Deref for InternedConstantPool {
 }
 
 impl InternedConstantPool {
-    pub(super) fn into_inner(self) -> ConstantPool {
+    pub(super) fn into_inner(self) -> ConstantPool<'static> {
         self.pool
     }
 
-    pub(super) fn add(&mut self, constant: Constant) -> jvm::Result<u16> {
+    pub(super) fn add(&mut self, constant: Constant<'static>) -> jvm::Result<u16> {
         let key = ConstantKey::from(&constant);
         if let Some(index) = self.constants.get(&key) {
             return Ok(*index);
@@ -148,7 +148,9 @@ impl InternedConstantPool {
     }
 
     pub(super) fn add_utf8<S: AsRef<str>>(&mut self, value: S) -> jvm::Result<u16> {
-        self.add(Constant::Utf8(value.as_ref().to_string()))
+        self.add(Constant::Utf8(
+            jvm::JavaString::from(value.as_ref().to_string()).into(),
+        ))
     }
 
     pub(super) fn add_integer(&mut self, value: i32) -> jvm::Result<u16> {
@@ -288,7 +290,7 @@ impl InternedConstantPool {
     }
 }
 
-pub(super) fn verify_no_duplicate_constants(class_file: &ClassFile) -> jvm::Result<()> {
+pub(super) fn verify_no_duplicate_constants(class_file: &ClassFile<'_>) -> jvm::Result<()> {
     let mut seen = HashMap::<ConstantKey, u16>::new();
     for index in 1..=class_file.constant_pool.len() {
         let index = index as u16;

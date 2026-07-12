@@ -1,9 +1,9 @@
 use super::constant_pool::InternedConstantPool;
-use crate::oomir::{self, Type};
-use ristretto_classfile::{
-    self as jvm, BaseType, Constant, ConstantPool, FieldType,
+use super::jvm::{
+    self, BaseType, Constant, ConstantPool, FieldType,
     attributes::{ArrayType, Attribute, Instruction, StackFrame, VerificationType},
 };
+use crate::oomir::{self, Type};
 use std::{
     collections::{BTreeSet, HashMap, VecDeque},
     io::Cursor,
@@ -209,7 +209,8 @@ pub(super) fn initial_locals_for_descriptor(
         push_local_value(&mut locals, this_value);
     }
 
-    let (params, _) = FieldType::parse_method_descriptor(descriptor)?;
+    let descriptor = jvm::JavaString::from(descriptor);
+    let (params, _) = FieldType::parse_method_descriptor(&descriptor)?;
     for param in &params {
         push_local_value(&mut locals, frame_value_from_field_type(param));
     }
@@ -855,16 +856,14 @@ fn transfer_instruction(
         }
         I::Goto(target) => return Ok(vec![(*target as usize, state)]),
         I::Goto_w(target) => return Ok(vec![(*target as usize, state)]),
-        I::Tableswitch {
-            default, offsets, ..
-        } => {
+        I::Tableswitch(table_switch) => {
             state.pop(context, instruction_index)?;
-            let mut successors = Vec::with_capacity(offsets.len() + 1);
+            let mut successors = Vec::with_capacity(table_switch.offsets.len() + 1);
             successors.push((
-                relative_switch_target(instruction_index, *default, context)?,
+                relative_switch_target(instruction_index, table_switch.default, context)?,
                 state.clone(),
             ));
-            for target in offsets {
+            for target in &table_switch.offsets {
                 successors.push((
                     relative_switch_target(instruction_index, *target, context)?,
                     state.clone(),
@@ -872,14 +871,14 @@ fn transfer_instruction(
             }
             return Ok(successors);
         }
-        I::Lookupswitch { default, pairs } => {
+        I::Lookupswitch(lookup_switch) => {
             state.pop(context, instruction_index)?;
-            let mut successors = Vec::with_capacity(pairs.len() + 1);
+            let mut successors = Vec::with_capacity(lookup_switch.pairs.len() + 1);
             successors.push((
-                relative_switch_target(instruction_index, *default, context)?,
+                relative_switch_target(instruction_index, lookup_switch.default, context)?,
                 state.clone(),
             ));
-            for target in pairs.values() {
+            for target in lookup_switch.pairs.values() {
                 successors.push((
                     relative_switch_target(instruction_index, *target, context)?,
                     state.clone(),
@@ -958,11 +957,11 @@ fn transfer_instruction(
         }
         I::Anewarray(class_index) => {
             state.pop(context, instruction_index)?;
-            let class_name = constant_pool.try_get_class(*class_index)?;
+            let class_name = constant_pool.try_get_class(*class_index)?.to_string();
             let array_name = if class_name.starts_with('[') {
                 format!("[{class_name}")
             } else {
-                format!("[L{};", normalize_class_name(class_name))
+                format!("[L{};", normalize_class_name(&class_name))
             };
             state.stack.push(FrameValue::Object(array_name));
         }
@@ -976,10 +975,10 @@ fn transfer_instruction(
         }
         I::Checkcast(class_index) => {
             state.pop_reference(context, instruction_index)?;
-            let class_name = constant_pool.try_get_class(*class_index)?;
+            let class_name = constant_pool.try_get_class(*class_index)?.to_string();
             state
                 .stack
-                .push(FrameValue::Object(normalize_class_name(class_name)));
+                .push(FrameValue::Object(normalize_class_name(&class_name)));
         }
         I::Instanceof(_) => {
             state.pop_reference(context, instruction_index)?;
@@ -992,10 +991,10 @@ fn transfer_instruction(
             for _ in 0..*dimensions {
                 state.pop(context, instruction_index)?;
             }
-            let class_name = constant_pool.try_get_class(*class_index)?;
+            let class_name = constant_pool.try_get_class(*class_index)?.to_string();
             state
                 .stack
-                .push(FrameValue::Object(normalize_class_name(class_name)));
+                .push(FrameValue::Object(normalize_class_name(&class_name)));
         }
         I::Wide | I::Breakpoint | I::Impdep1 | I::Impdep2 => {}
     }
@@ -1017,7 +1016,8 @@ fn apply_invoke(
     context: &str,
     instruction_index: usize,
 ) -> jvm::Result<()> {
-    let (params, return_type) = FieldType::parse_method_descriptor(&method.descriptor)?;
+    let descriptor = jvm::JavaString::from(method.descriptor.as_str());
+    let (params, return_type) = FieldType::parse_method_descriptor(&descriptor)?;
     for _ in params.iter().rev() {
         state.pop(context, instruction_index)?;
     }
@@ -1314,26 +1314,24 @@ fn instruction_successors(
         }
         I::Goto(target) => vec![usize::from(*target)],
         I::Goto_w(target) if *target >= 0 => vec![*target as usize],
-        I::Tableswitch {
-            default, offsets, ..
-        } => {
-            let mut successors = Vec::with_capacity(offsets.len() + 1);
-            if let Some(default) = relative_switch_target_opt(index, *default) {
+        I::Tableswitch(table_switch) => {
+            let mut successors = Vec::with_capacity(table_switch.offsets.len() + 1);
+            if let Some(default) = relative_switch_target_opt(index, table_switch.default) {
                 successors.push(default);
             }
-            for target in offsets {
+            for target in &table_switch.offsets {
                 if let Some(target) = relative_switch_target_opt(index, *target) {
                     successors.push(target);
                 }
             }
             successors
         }
-        I::Lookupswitch { default, pairs } => {
-            let mut successors = Vec::with_capacity(pairs.len() + 1);
-            if let Some(default) = relative_switch_target_opt(index, *default) {
+        I::Lookupswitch(lookup_switch) => {
+            let mut successors = Vec::with_capacity(lookup_switch.pairs.len() + 1);
+            if let Some(default) = relative_switch_target_opt(index, lookup_switch.default) {
                 successors.push(default);
             }
-            for target in pairs.values() {
+            for target in lookup_switch.pairs.values() {
                 if let Some(target) = relative_switch_target_opt(index, *target) {
                     successors.push(target);
                 }
@@ -1459,23 +1457,25 @@ fn branch_targets(instructions: &[Instruction]) -> BTreeSet<u16> {
                     targets.insert(*target as u16);
                 }
             }
-            Instruction::Tableswitch {
-                default, offsets, ..
-            } => {
-                if let Some(default) = relative_switch_target_opt(instruction_index, *default) {
+            Instruction::Tableswitch(table_switch) => {
+                if let Some(default) =
+                    relative_switch_target_opt(instruction_index, table_switch.default)
+                {
                     targets.insert(default as u16);
                 }
-                for offset in offsets {
+                for offset in &table_switch.offsets {
                     if let Some(target) = relative_switch_target_opt(instruction_index, *offset) {
                         targets.insert(target as u16);
                     }
                 }
             }
-            Instruction::Lookupswitch { default, pairs } => {
-                if let Some(default) = relative_switch_target_opt(instruction_index, *default) {
+            Instruction::Lookupswitch(lookup_switch) => {
+                if let Some(default) =
+                    relative_switch_target_opt(instruction_index, lookup_switch.default)
+                {
                     targets.insert(default as u16);
                 }
-                for offset in pairs.values() {
+                for offset in lookup_switch.pairs.values() {
                     if let Some(target) = relative_switch_target_opt(instruction_index, *offset) {
                         targets.insert(target as u16);
                     }
@@ -1551,7 +1551,9 @@ fn frame_value_from_field_type(field_type: &FieldType) -> FrameValue {
         FieldType::Base(BaseType::Float) => FrameValue::Float,
         FieldType::Base(BaseType::Double) => FrameValue::Double,
         FieldType::Base(_) => FrameValue::Integer,
-        FieldType::Object(class_name) => FrameValue::Object(normalize_class_name(class_name)),
+        FieldType::Object(class_name) => {
+            FrameValue::Object(normalize_class_name(&class_name.to_string()))
+        }
         FieldType::Array(_) => FrameValue::Object(field_type.class_name()),
     }
 }
@@ -1585,7 +1587,7 @@ fn field_type_for_ref(constant_pool: &ConstantPool, field_ref: u16) -> jvm::Resu
     let (_, name_and_type_index) = constant_pool.try_get_field_ref(field_ref)?;
     let (_, descriptor_index) = constant_pool.try_get_name_and_type(*name_and_type_index)?;
     let descriptor = constant_pool.try_get_utf8(*descriptor_index)?;
-    FieldType::parse(descriptor)
+    Ok(FieldType::parse(&descriptor.to_string())?)
 }
 
 fn method_ref_info(
@@ -1598,11 +1600,11 @@ fn method_ref_info(
     } else {
         constant_pool.try_get_method_ref(method_ref)?
     };
-    let class_name = constant_pool.try_get_class(*class_index)?.clone();
+    let class_name = constant_pool.try_get_class(*class_index)?.to_string();
     let (name_index, descriptor_index) =
         constant_pool.try_get_name_and_type(*name_and_type_index)?;
-    let method_name = constant_pool.try_get_utf8(*name_index)?.clone();
-    let descriptor = constant_pool.try_get_utf8(*descriptor_index)?.clone();
+    let method_name = constant_pool.try_get_utf8(*name_index)?.to_string();
+    let descriptor = constant_pool.try_get_utf8(*descriptor_index)?.to_string();
     Ok(MethodRefInfo {
         class_name,
         method_name,

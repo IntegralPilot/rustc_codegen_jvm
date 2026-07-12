@@ -1,9 +1,9 @@
-use super::{constant_pool::InternedConstantPool, helpers::are_types_jvm_compatible};
-use crate::oomir::{self, Type};
-use ristretto_classfile::{
-    self as jvm,
+use super::jvm::{
+    self,
     attributes::{ArrayType, Instruction},
 };
+use super::{constant_pool::InternedConstantPool, helpers::are_types_jvm_compatible};
+use crate::oomir::{self, Type};
 
 // Helper to get the appropriate integer constant loading instruction
 pub fn get_int_const_instr(cp: &mut InternedConstantPool, val: i32) -> Instruction {
@@ -203,7 +203,7 @@ pub fn load_constant(
 
             // 2. Create the new array (primitive or reference)
             if let Some(atype_code) = elem_ty.to_jvm_primitive_array_type_code() {
-                let array_type = ArrayType::from_bytes(&mut std::io::Cursor::new(vec![atype_code])) // Wrap atype_code in Cursor<Vec<u8>>
+                let array_type = ArrayType::from_bytes(&mut jvm::ByteReader::new(&[atype_code]))
                     .map_err(|e| jvm::Error::VerificationError {
                         context: format!("Attempting to load constant {:?}", constant), // Use Display formatting for the error type if available
                         message: format!(

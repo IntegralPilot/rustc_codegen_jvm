@@ -11,8 +11,10 @@ use super::{
 };
 use crate::oomir::{self, Type};
 
-use ristretto_classfile::attributes::{ArrayType, Instruction};
-use ristretto_classfile::{self as jvm};
+use super::jvm::{
+    self,
+    attributes::{ArrayType, Instruction, LookupSwitch, TableSwitch},
+};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::TryInto;
 use std::io::Cursor;
@@ -232,12 +234,13 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                         .unwrap_or_else(|| default_label.clone())
                 })
                 .collect::<Vec<_>>();
-            self.jvm_instructions.push(Instruction::Tableswitch {
-                default: 0,
-                low,
-                high,
-                offsets: vec![0; span],
-            });
+            self.jvm_instructions
+                .push(Instruction::Tableswitch(Box::new(TableSwitch {
+                    default: 0,
+                    low,
+                    high,
+                    offsets: vec![0; span],
+                })));
             self.switch_fixups.push(SwitchFixup {
                 instruction_index,
                 default_label,
@@ -245,10 +248,11 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             });
         } else {
             let target_labels = cases.into_iter().collect::<Vec<_>>();
-            self.jvm_instructions.push(Instruction::Lookupswitch {
-                default: 0,
-                pairs: target_labels.iter().map(|(key, _)| (*key, 0)).collect(),
-            });
+            self.jvm_instructions
+                .push(Instruction::Lookupswitch(Box::new(LookupSwitch {
+                    default: 0,
+                    pairs: target_labels.iter().map(|(key, _)| (*key, 0)).collect(),
+                })));
             self.switch_fixups.push(SwitchFixup {
                 instruction_index,
                 default_label: otherwise.to_string(),
@@ -326,11 +330,11 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 match self.jvm_instructions.get_mut(fixup.instruction_index) {
-                    Some(Instruction::Tableswitch {
-                        default, offsets, ..
-                    }) if offsets.len() == patched_offsets.len() => {
-                        *default = default_target;
-                        *offsets = patched_offsets;
+                    Some(Instruction::Tableswitch(table_switch))
+                        if table_switch.offsets.len() == patched_offsets.len() =>
+                    {
+                        table_switch.default = default_target;
+                        table_switch.offsets = patched_offsets;
                     }
                     Some(_) => {
                         return Err(jvm::Error::VerificationError {
@@ -361,9 +365,9 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     })
                     .collect::<Result<_, _>>()?;
                 match self.jvm_instructions.get_mut(fixup.instruction_index) {
-                    Some(Instruction::Lookupswitch { default, pairs }) => {
-                        *default = default_target;
-                        *pairs = patched_pairs;
+                    Some(Instruction::Lookupswitch(lookup_switch)) => {
+                        lookup_switch.default = default_target;
+                        lookup_switch.pairs = patched_pairs;
                     }
                     Some(_) => {
                         return Err(jvm::Error::VerificationError {
@@ -757,16 +761,14 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                         *target += 1;
                     }
                 }
-                Instruction::Tableswitch {
-                    default, offsets, ..
-                } => {
+                Instruction::Tableswitch(table_switch) => {
                     bump_i32_relative_switch_target(
-                        default,
+                        &mut table_switch.default,
                         instruction_index,
                         insert_at,
                         &context,
                     )?;
-                    for target in offsets {
+                    for target in &mut table_switch.offsets {
                         bump_i32_relative_switch_target(
                             target,
                             instruction_index,
@@ -775,14 +777,14 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                         )?;
                     }
                 }
-                Instruction::Lookupswitch { default, pairs } => {
+                Instruction::Lookupswitch(lookup_switch) => {
                     bump_i32_relative_switch_target(
-                        default,
+                        &mut lookup_switch.default,
                         instruction_index,
                         insert_at,
                         &context,
                     )?;
-                    for target in pairs.values_mut() {
+                    for target in lookup_switch.pairs.values_mut() {
                         bump_i32_relative_switch_target(
                             target,
                             instruction_index,
@@ -3083,7 +3085,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 if let Some(atype_code) = element_type.to_jvm_primitive_array_type_code() {
                     // Primitive array
                     let array_type_enum =
-                        ArrayType::from_bytes(&mut std::io::Cursor::new(vec![atype_code]))
+                        ArrayType::from_bytes(&mut jvm::ByteReader::new(&[atype_code]))
                             .map_err(|e| jvm::Error::VerificationError {
                                 context: format!("Function {}", self.oomir_func.name),
                                 message: format!(
@@ -4054,15 +4056,15 @@ fn instruction_size_at(instruction: &Instruction, byte_offset: usize) -> Result<
         | Instruction::Ifnull(_)
         | Instruction::Ifnonnull(_) => Ok(3),
         Instruction::Goto_w(_) | Instruction::Jsr_w(_) => Ok(5),
-        Instruction::Tableswitch { offsets, .. } => {
+        Instruction::Tableswitch(table_switch) => {
             let position_after_opcode = byte_offset + 1;
             let padding = (4 - (position_after_opcode % 4)) % 4;
-            Ok(1 + padding + 12 + offsets.len() * 4)
+            Ok(1 + padding + 12 + table_switch.offsets.len() * 4)
         }
-        Instruction::Lookupswitch { pairs, .. } => {
+        Instruction::Lookupswitch(lookup_switch) => {
             let position_after_opcode = byte_offset + 1;
             let padding = (4 - (position_after_opcode % 4)) % 4;
-            Ok(1 + padding + 8 + pairs.len() * 8)
+            Ok(1 + padding + 8 + lookup_switch.pairs.len() * 8)
         }
         _ => {
             let mut bytes = Cursor::new(Vec::new());

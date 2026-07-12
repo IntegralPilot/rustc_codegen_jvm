@@ -1,5 +1,5 @@
+use super::jvm::{self, attributes::Instruction};
 use super::stackmaps::FrameValue;
-use ristretto_classfile::{self as jvm, attributes::Instruction};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug)]
@@ -607,29 +607,21 @@ fn thread_jump_targets(mut instructions: Vec<Instruction>) -> jvm::Result<Vec<In
             Instruction::Goto_w(target) => {
                 Instruction::Goto_w(thread_i32_target(&instructions, target)?)
             }
-            Instruction::Tableswitch {
-                default,
-                low,
-                high,
-                mut offsets,
-            } => {
-                let default = thread_switch_target(&instructions, index, default)?;
-                for target in &mut offsets {
+            Instruction::Tableswitch(mut table_switch) => {
+                table_switch.default =
+                    thread_switch_target(&instructions, index, table_switch.default)?;
+                for target in &mut table_switch.offsets {
                     *target = thread_switch_target(&instructions, index, *target)?;
                 }
-                Instruction::Tableswitch {
-                    default,
-                    low,
-                    high,
-                    offsets,
-                }
+                Instruction::Tableswitch(table_switch)
             }
-            Instruction::Lookupswitch { default, mut pairs } => {
-                let default = thread_switch_target(&instructions, index, default)?;
-                for target in pairs.values_mut() {
+            Instruction::Lookupswitch(mut lookup_switch) => {
+                lookup_switch.default =
+                    thread_switch_target(&instructions, index, lookup_switch.default)?;
+                for target in lookup_switch.pairs.values_mut() {
                     *target = thread_switch_target(&instructions, index, *target)?;
                 }
-                Instruction::Lookupswitch { default, pairs }
+                Instruction::Lookupswitch(lookup_switch)
             }
             other => other,
         };
@@ -939,29 +931,19 @@ fn retarget_branches(
         I::Ifnonnull(target) => I::Ifnonnull(map_u16(target)?),
         I::Goto_w(target) => I::Goto_w(map_i32(target)?),
         I::Jsr_w(target) => I::Jsr_w(map_i32(target)?),
-        I::Tableswitch {
-            default,
-            low,
-            high,
-            mut offsets,
-        } => {
-            let default = map_switch_i32(default)?;
-            for target in &mut offsets {
+        I::Tableswitch(mut table_switch) => {
+            table_switch.default = map_switch_i32(table_switch.default)?;
+            for target in &mut table_switch.offsets {
                 *target = map_switch_i32(*target)?;
             }
-            I::Tableswitch {
-                default,
-                low,
-                high,
-                offsets,
-            }
+            I::Tableswitch(table_switch)
         }
-        I::Lookupswitch { default, mut pairs } => {
-            let default = map_switch_i32(default)?;
-            for target in pairs.values_mut() {
+        I::Lookupswitch(mut lookup_switch) => {
+            lookup_switch.default = map_switch_i32(lookup_switch.default)?;
+            for target in lookup_switch.pairs.values_mut() {
                 *target = map_switch_i32(*target)?;
             }
-            I::Lookupswitch { default, pairs }
+            I::Lookupswitch(lookup_switch)
         }
         other => other,
     })
@@ -1781,15 +1763,13 @@ fn instruction_successors(
         }
         I::Goto(target) => vec![usize::from(*target)],
         I::Goto_w(target) if *target >= 0 => vec![*target as usize],
-        I::Tableswitch {
-            default, offsets, ..
-        } => {
-            let mut successors = Vec::with_capacity(offsets.len() + 1);
-            let default = index as i32 + *default;
+        I::Tableswitch(table_switch) => {
+            let mut successors = Vec::with_capacity(table_switch.offsets.len() + 1);
+            let default = index as i32 + table_switch.default;
             if default >= 0 {
                 successors.push(default as usize);
             }
-            for target in offsets {
+            for target in &table_switch.offsets {
                 let target = index as i32 + *target;
                 if target >= 0 {
                     successors.push(target as usize);
@@ -1797,13 +1777,13 @@ fn instruction_successors(
             }
             successors
         }
-        I::Lookupswitch { default, pairs } => {
-            let mut successors = Vec::with_capacity(pairs.len() + 1);
-            let default = index as i32 + *default;
+        I::Lookupswitch(lookup_switch) => {
+            let mut successors = Vec::with_capacity(lookup_switch.pairs.len() + 1);
+            let default = index as i32 + lookup_switch.default;
             if default >= 0 {
                 successors.push(default as usize);
             }
-            for target in pairs.values() {
+            for target in lookup_switch.pairs.values() {
                 let target = index as i32 + *target;
                 if target >= 0 {
                     successors.push(target as usize);
@@ -1841,18 +1821,26 @@ fn branch_targets(index: usize, instruction: &Instruction) -> Vec<i32> {
         | I::Ifnull(target)
         | I::Ifnonnull(target) => vec![i32::from(*target)],
         I::Goto_w(target) | I::Jsr_w(target) => vec![*target],
-        I::Tableswitch {
-            default, offsets, ..
-        } => {
-            let mut targets = Vec::with_capacity(offsets.len() + 1);
-            targets.push(index as i32 + *default);
-            targets.extend(offsets.iter().map(|target| index as i32 + *target));
+        I::Tableswitch(table_switch) => {
+            let mut targets = Vec::with_capacity(table_switch.offsets.len() + 1);
+            targets.push(index as i32 + table_switch.default);
+            targets.extend(
+                table_switch
+                    .offsets
+                    .iter()
+                    .map(|target| index as i32 + *target),
+            );
             targets
         }
-        I::Lookupswitch { default, pairs } => {
-            let mut targets = Vec::with_capacity(pairs.len() + 1);
-            targets.push(index as i32 + *default);
-            targets.extend(pairs.values().map(|target| index as i32 + *target));
+        I::Lookupswitch(lookup_switch) => {
+            let mut targets = Vec::with_capacity(lookup_switch.pairs.len() + 1);
+            targets.push(index as i32 + lookup_switch.default);
+            targets.extend(
+                lookup_switch
+                    .pairs
+                    .values()
+                    .map(|target| index as i32 + *target),
+            );
             targets
         }
         _ => Vec::new(),
