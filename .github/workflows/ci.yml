@@ -31,9 +31,12 @@ jobs:
       with:
         python-version: '3.x'
 
+    - name: Generate configuration files
+      run: python build.py gen-files
+
     - name: Cache cargo dependencies
       uses: Swatinem/rust-cache@v2
-    
+
     - name: Build backend and tools
       run: python3 build.py ci
 
