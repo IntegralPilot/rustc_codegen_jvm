@@ -1534,6 +1534,7 @@ fn frame_value_from_oomir_type(ty: &Type) -> FrameValue {
         Type::String => FrameValue::Object("java/lang/String".to_string()),
         Type::Class(name) | Type::Interface(name) => FrameValue::Object(normalize_class_name(name)),
         Type::Array(_) | Type::MutableReference(_) => FrameValue::Object(ty.to_jvm_descriptor()),
+        Type::Pointer(_) => FrameValue::Object(oomir::POINTER_CLASS.to_string()),
         Type::Slice(_) => FrameValue::Object(oomir::SLICE_VIEW_CLASS.to_string()),
         Type::Reference(inner) => {
             if inner.is_jvm_reference_type() {

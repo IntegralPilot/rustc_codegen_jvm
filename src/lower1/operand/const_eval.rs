@@ -13,8 +13,9 @@ use super::super::{
     control_flow::rvalue::ensure_fn_pointer_adapter_class,
     jvm_names, ty_to_oomir_type,
     types::{
-        ensure_fn_ptr_interface, fn_ptr_signature_from_ty, generate_adt_jvm_class_name,
-        generate_tuple_jvm_class_name, should_define_named_data_type,
+        UNION_BYTES_FIELD, UNION_OBJECTS_FIELD, ensure_fn_ptr_interface, ensure_union_data_type,
+        fn_ptr_signature_from_ty, generate_adt_jvm_class_name, generate_tuple_jvm_class_name,
+        should_define_named_data_type,
     },
 };
 use crate::oomir::{self, DataTypeMethod};
@@ -156,6 +157,23 @@ pub fn read_scalar_int_constant<'tcx>(
     oomir_data_types: &mut HashMap<String, oomir::DataType>,
     instance: Instance<'tcx>,
 ) -> Result<oomir::Constant, String> {
+    if let TyKind::RawPtr(pointee, _) = ty.kind() {
+        let layout = tcx
+            .layout_of(TypingEnv::fully_monomorphized().as_query_input(*pointee))
+            .map_err(|error| format!("Could not determine pointee layout for {ty:?}: {error:?}"))?;
+        return Ok(oomir::Constant::Instance {
+            class_name: oomir::POINTER_CLASS.to_string(),
+            fields: HashMap::new(),
+            params: vec![
+                oomir::Constant::I32(scalar_int.to_target_usize(tcx) as i32),
+                oomir::Constant::I32(
+                    i32::try_from(layout.size.bytes())
+                        .map_err(|_| format!("Pointee layout for {ty:?} exceeds JVM limits"))?,
+                ),
+            ],
+        });
+    }
+
     if let TyKind::Adt(adt_def, substs) = ty.kind() {
         if adt_def.is_enum() {
             let repr_type = adt_def.repr().discr_type();
@@ -708,8 +726,38 @@ pub fn read_constant_value_from_memory<'tcx>(
                     oomir_data_types,
                     instance,
                 )
+            } else if adt_def.is_union() {
+                let class_name =
+                    ensure_union_data_type(adt_def, substs, tcx, oomir_data_types, instance);
+                let start = offset.bytes_usize();
+                let end = start
+                    .checked_add(layout.size.bytes_usize())
+                    .ok_or_else(|| format!("Union constant range overflow for {ty:?}"))?;
+                let bytes = allocation
+                    .inspect_with_uninit_and_ptr_outside_interpreter(start..end)
+                    .iter()
+                    .map(|byte| oomir::Constant::I8(*byte as i8))
+                    .collect::<Vec<_>>();
+                let objects = (0..layout.size.bytes_usize())
+                    .map(|_| {
+                        oomir::Constant::Null(oomir::Type::Class("java/lang/Object".to_string()))
+                    })
+                    .collect::<Vec<_>>();
+                let bytes = oomir::Constant::Array(Box::new(oomir::Type::I8), bytes);
+                let objects = oomir::Constant::Array(
+                    Box::new(oomir::Type::Class("java/lang/Object".to_string())),
+                    objects,
+                );
+                Ok(oomir::Constant::Instance {
+                    class_name,
+                    fields: HashMap::from([
+                        (UNION_BYTES_FIELD.to_string(), bytes.clone()),
+                        (UNION_OBJECTS_FIELD.to_string(), objects.clone()),
+                    ]),
+                    params: vec![bytes, objects],
+                })
             } else {
-                Err("Unsupported type: Union".to_string())
+                Err(format!("Unsupported ADT constant type: {ty:?}"))
             }
         }
 

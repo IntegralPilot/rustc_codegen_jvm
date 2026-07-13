@@ -8,10 +8,107 @@ use super::{
 };
 use crate::oomir::{self, DataTypeMethod, Instruction, Operand};
 use rustc_middle::{
-    mir::{Body, Operand as MirOperand, Place, ProjectionElem},
+    mir::{Body, Local, Operand as MirOperand, Place, ProjectionElem, Rvalue, StatementKind},
     ty::{AdtDef, GenericArgsRef, Instance, Ty, TyCtxt, TyKind},
 };
 use std::collections::HashMap;
+
+fn pointer_getter_for_type(ty: &oomir::Type) -> (&'static str, oomir::Type) {
+    match ty {
+        oomir::Type::Boolean => ("getBoolean", oomir::Type::Boolean),
+        oomir::Type::I8 => ("getI8", oomir::Type::I8),
+        oomir::Type::I16 => ("getI16", oomir::Type::I16),
+        oomir::Type::I32 | oomir::Type::Char => ("getI32", oomir::Type::I32),
+        oomir::Type::I64 => ("getI64", oomir::Type::I64),
+        oomir::Type::F32 => ("getF32", oomir::Type::F32),
+        oomir::Type::F64 => ("getF64", oomir::Type::F64),
+        _ => (
+            "getObject",
+            oomir::Type::Class("java/lang/Object".to_string()),
+        ),
+    }
+}
+
+/// Loads the pointee while retaining the pointer itself as a first-class JVM
+/// value. Reference-valued pointees use Object at the runtime boundary and are
+/// cast back to their precise OOMIR type immediately afterwards.
+pub(crate) fn emit_pointer_read(
+    pointer: Operand,
+    pointee_ty: &oomir::Type,
+    dest: &str,
+    instructions: &mut Vec<Instruction>,
+) -> Operand {
+    if !pointee_ty.has_jvm_value() {
+        return Operand::Constant(oomir::Constant::Unit);
+    }
+    let pointer_ty = pointer
+        .get_type()
+        .expect("a pointer read requires a typed operand");
+    let (method_name, runtime_ret_ty) = pointer_getter_for_type(pointee_ty);
+    let runtime_dest = if runtime_ret_ty == *pointee_ty {
+        dest.to_string()
+    } else {
+        format!("{dest}_object")
+    };
+    instructions.push(Instruction::InvokeVirtual {
+        dest: Some(runtime_dest.clone()),
+        class_name: oomir::POINTER_CLASS.to_string(),
+        method_name: method_name.to_string(),
+        method_ty: oomir::Signature {
+            params: vec![("self".to_string(), pointer_ty)],
+            ret: Box::new(runtime_ret_ty.clone()),
+            is_static: false,
+        },
+        args: Vec::new(),
+        operand: pointer,
+    });
+    if runtime_ret_ty != *pointee_ty {
+        instructions.push(Instruction::Cast {
+            op: Operand::Variable {
+                name: runtime_dest,
+                ty: runtime_ret_ty,
+            },
+            ty: pointee_ty.clone(),
+            dest: dest.to_string(),
+        });
+    }
+    Operand::Variable {
+        name: dest.to_string(),
+        ty: pointee_ty.clone(),
+    }
+}
+
+pub(crate) fn emit_pointer_write(
+    pointer: Operand,
+    pointee_ty: &oomir::Type,
+    value: Operand,
+    instructions: &mut Vec<Instruction>,
+) {
+    if !pointee_ty.has_jvm_value() {
+        return;
+    }
+    let pointer_ty = pointer
+        .get_type()
+        .expect("a pointer write requires a typed operand");
+    instructions.push(Instruction::InvokeVirtual {
+        dest: None,
+        class_name: oomir::POINTER_CLASS.to_string(),
+        method_name: "set".to_string(),
+        method_ty: oomir::Signature {
+            params: vec![
+                ("self".to_string(), pointer_ty),
+                (
+                    "value".to_string(),
+                    oomir::Type::Class("java/lang/Object".to_string()),
+                ),
+            ],
+            ret: Box::new(oomir::Type::Void),
+            is_static: false,
+        },
+        args: vec![value],
+        operand: pointer,
+    });
+}
 
 pub fn emit_slice_view(
     source: Operand,
@@ -42,16 +139,6 @@ pub fn emit_slice_view(
             field_ty: oomir::Type::Class("java/lang/Object".to_string()),
             owner_class: oomir::SLICE_VIEW_CLASS.to_string(),
         });
-        let backing_name = format!("{dest}_backing");
-        let backing_type = oomir::Type::Array(Box::new(element_type));
-        instructions.push(Instruction::Cast {
-            dest: backing_name.clone(),
-            op: Operand::Variable {
-                name: backing_object_name,
-                ty: oomir::Type::Class("java/lang/Object".to_string()),
-            },
-            ty: backing_type.clone(),
-        });
         let offset_name = format!("{dest}_base_offset");
         instructions.push(Instruction::GetField {
             dest: offset_name.clone(),
@@ -62,8 +149,8 @@ pub fn emit_slice_view(
         });
         (
             Operand::Variable {
-                name: backing_name,
-                ty: backing_type,
+                name: backing_object_name,
+                ty: oomir::Type::Class("java/lang/Object".to_string()),
             },
             Operand::Variable {
                 name: offset_name,
@@ -137,6 +224,35 @@ pub fn emit_slice_view(
 pub fn place_to_string<'tcx>(place: &Place<'tcx>, _tcx: TyCtxt<'tcx>) -> String {
     // Base variable name (e.g., "_1")
     format!("_{}", place.local.index()) // Start with base local "_N"
+}
+
+pub(crate) fn local_cell_name(local: Local) -> String {
+    format!("_cell_{}", local.index())
+}
+
+/// Returns true when MIR takes the address of the local's storage itself. Such
+/// locals live in a canonical Pointer cell so every alias observes subsequent
+/// direct and indirect writes without copy-in/copy-out bookkeeping.
+pub(crate) fn local_uses_stable_cell(local: Local, mir: &Body<'_>) -> bool {
+    mir.basic_blocks.iter().any(|block| {
+        block.statements.iter().any(|statement| {
+            let StatementKind::Assign(box (_, rvalue)) = &statement.kind else {
+                return false;
+            };
+            let pointed_place = match rvalue {
+                Rvalue::Ref(_, _, place) | Rvalue::RawPtr(_, place) => place,
+                _ => return false,
+            };
+            // A projected borrow still carries provenance for the complete
+            // enclosing allocation. Keep the root local in one stable cell so
+            // field pointers, whole-object casts, and later reborrows share it.
+            pointed_place.local == local
+                && !matches!(
+                    pointed_place.projection.first(),
+                    Some(ProjectionElem::Deref)
+                )
+        })
+    })
 }
 
 fn union_parts_from_ty<'tcx>(ty: Ty<'tcx>) -> Option<(AdtDef<'tcx>, GenericArgsRef<'tcx>)> {
@@ -223,6 +339,23 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
     let mut current_var = place_to_string(&current_place, tcx);
     let mut current_type = get_place_type(&current_place, mir, tcx, instance, data_types);
     let mut instructions = vec![];
+    if local_uses_stable_cell(place.local, mir) {
+        let pointee_type = current_type.clone();
+        let value_name = format!("{}_value", local_cell_name(place.local));
+        let value = emit_pointer_read(
+            Operand::Variable {
+                name: local_cell_name(place.local),
+                ty: oomir::Type::Pointer(Box::new(pointee_type.clone())),
+            },
+            &pointee_type,
+            &value_name,
+            &mut instructions,
+        );
+        if let Operand::Variable { name, ty } = value {
+            current_var = name;
+            current_type = ty;
+        }
+    }
     let base_rust_ty = current_place.ty(&mir.local_decls, tcx).ty;
     if let Some(value) = super::value_repr::materialize_implicit_zst(
         base_rust_ty,
@@ -465,6 +598,20 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
             }
             ProjectionElem::Deref => {
                 match type_before_proj {
+                    oomir::Type::Pointer(element_type) => {
+                        let next_var = format!("{}_deref", current_var);
+                        let result = emit_pointer_read(
+                            Operand::Variable {
+                                name: current_var.clone(),
+                                ty: oomir::Type::Pointer(element_type.clone()),
+                            },
+                            element_type.as_ref(),
+                            &next_var,
+                            &mut instructions,
+                        );
+                        current_var = result.get_name().unwrap_or(&next_var).to_string();
+                        current_type = element_type.as_ref().clone();
+                    }
                     oomir::Type::MutableReference(_) => {
                         let type_before_deref = current_type.clone();
 
@@ -500,8 +647,6 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
                                 current_type = element_type.as_ref().clone(); // Type becomes T
                             }
                             _ => {
-                                // This could happen with raw pointers (*const T / *mut T)
-                                // which aren't the primary focus here, or if there's a type error.
                                 panic!(
                                     "Attempted to Deref a non-reference (non-array) type: \
                              Variable '{}' has type {:?}. Place: {:?}",
@@ -509,7 +654,6 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
                                     current_type, // Use the original current_type for the error
                                     place
                                 );
-                                // Or, if supporting raw pointers later, add specific logic here.
                             }
                         }
                     }
@@ -729,12 +873,25 @@ pub fn emit_instructions_to_set_value<'tcx>(
     );
 
     if dest_place.projection.is_empty() {
-        // e.g., _1 = source_operand
-        let dest_var_name = place_to_string(dest_place, tcx);
-        instructions.push(Instruction::Move {
-            dest: dest_var_name,
-            src: source_operand,
-        });
+        if local_uses_stable_cell(dest_place.local, mir) {
+            let pointee_type = get_place_type(dest_place, mir, tcx, instance, data_types);
+            emit_pointer_write(
+                Operand::Variable {
+                    name: local_cell_name(dest_place.local),
+                    ty: oomir::Type::Pointer(Box::new(pointee_type.clone())),
+                },
+                &pointee_type,
+                source_operand,
+                &mut instructions,
+            );
+        } else {
+            // e.g., _1 = source_operand
+            let dest_var_name = place_to_string(dest_place, tcx);
+            instructions.push(Instruction::Move {
+                dest: dest_var_name,
+                src: source_operand,
+            });
+        }
     } else {
         // 1. Separate the destination into the base and the last projection element.
         let (last_projection, base_projection_elems) = dest_place.projection.split_last().unwrap(); // Safe because we checked is_empty()
@@ -953,6 +1110,17 @@ pub fn emit_instructions_to_set_value<'tcx>(
                 );
 
                 match &base_oomir_type {
+                    oomir::Type::Pointer(element_type) => {
+                        emit_pointer_write(
+                            Operand::Variable {
+                                name: base_var_name,
+                                ty: base_oomir_type.clone(),
+                            },
+                            element_type,
+                            source_operand,
+                            &mut instructions,
+                        );
+                    }
                     oomir::Type::MutableReference(_element_type) => {
                         instructions.push(Instruction::ArrayStore {
                             array: base_var_name.clone(), // The variable holding the array reference

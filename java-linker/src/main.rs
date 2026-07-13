@@ -132,12 +132,10 @@ fn main() -> Result<(), i32> {
                 input_rlib_files.push(arg.clone());
                 i += 1;
             } else {
-                // If it's not a flag and not a recognized input type, warn or error
-                eprintln!("Warning: Ignoring unrecognized argument: {}", arg);
+                // smth native - not useful to us
                 i += 1; // Move to the next argument
             }
         } else {
-            eprintln!("Warning: Ignoring unknown or unused flag: {}", arg);
             i += 1;
         }
     }
@@ -481,7 +479,6 @@ fn create_jar(
     // --- Stage 2: Create Intermediate JAR (only with loose app classes) ---
     let intermediate_jar_path = temp_dir_path.join("intermediate_app.jar");
     if !app_classes.is_empty() {
-        println!("Creating intermediate JAR for app classes...");
         let output_file = fs::File::create(&intermediate_jar_path)?;
         let mut zip_writer = ZipWriter::new(output_file);
         let options = SimpleFileOptions::default()
@@ -497,15 +494,6 @@ fn create_jar(
             zip_writer.write_all(&class_info.data)?;
         }
         zip_writer.finish()?;
-        println!(
-            "Intermediate JAR created at: {}",
-            intermediate_jar_path.display()
-        );
-    } else {
-        println!(
-            "No loose application .class files found; intermediate JAR will be empty or skipped."
-        );
-        // If app_classes is empty, intermediate_jar_path won't exist. Handle this later.
     }
 
     // --- Stage 3: Bundle generated classes and input JARs ---
@@ -526,16 +514,11 @@ fn create_jar(
     // --- Stage 4: Add Manifest ---
     let final_jar_temp_path = temp_dir_path.join("final_with_manifest.jar");
 
-    println!("Adding manifest to: {}", source_jar_for_manifest.display());
     add_manifest_to_jar(
         &source_jar_for_manifest,
         &final_jar_temp_path,
         main_class_name,
     )?;
-    println!(
-        "Manifest added. Temporary final JAR at: {}",
-        final_jar_temp_path.display()
-    );
 
     // --- Stage 5: Move final JAR to destination ---
     if let Some(parent_dir) = Path::new(final_output_jar_path).parent() {
@@ -553,7 +536,6 @@ fn create_jar(
                     e
                 );
                 fs::copy(&final_jar_temp_path, final_output_jar_path)?;
-                println!("Copied temporary JAR to final destination.");
                 // We might want to manually clean up the source temp file after copy, but tempdir should handle it on drop.
             } else {
                 eprintln!(

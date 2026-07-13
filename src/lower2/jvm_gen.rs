@@ -806,6 +806,7 @@ fn return_instruction_for_type(ty: &Type) -> Instruction {
         Type::F64 => Instruction::Dreturn,
         Type::Unit | Type::Void => Instruction::Return,
         Type::Reference(_)
+        | Type::Pointer(_)
         | Type::MutableReference(_)
         | Type::Array(_)
         | Type::Slice(_)
@@ -925,6 +926,7 @@ pub(super) fn oomir_type_to_ristretto_field_type(
             let inner_ty = ref2.as_ref();
             oomir_type_to_ristretto_field_type(inner_ty)
         }
+        oomir::Type::Pointer(_) => jvm::FieldType::Object(oomir::POINTER_CLASS.into()),
         oomir::Type::Array(inner_ty) => {
             let inner_field_type = if inner_ty.has_jvm_value() {
                 oomir_type_to_ristretto_field_type(inner_ty)
@@ -1711,6 +1713,7 @@ fn create_code_from_method_name_and_constant_return(
         oomir::Type::F32 => Instruction::Freturn,
         oomir::Type::F64 => Instruction::Dreturn,
         oomir::Type::Reference(_)
+        | oomir::Type::Pointer(_)
         | oomir::Type::MutableReference(_)
         | oomir::Type::Array(_)
         | oomir::Type::Slice(_)

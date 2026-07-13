@@ -390,12 +390,7 @@ fn trait_interface_methods<'tcx>(
             .iter()
             .enumerate()
             .filter_map(|(i, ty)| {
-                let is_self_param = matches!(
-                    ty.peel_refs().kind(),
-                    rustc_middle::ty::TyKind::Param(param) if param.name.as_str() == "Self"
-                );
-
-                if is_self_param {
+                if assoc_item.is_method() && i == 0 {
                     None
                 } else {
                     let param_name = format!("arg{}", i);
@@ -408,7 +403,7 @@ fn trait_interface_methods<'tcx>(
         let return_oomir_ty =
             lower1::types::ty_to_oomir_type(return_ty.skip_binder(), tcx, data_types, instance);
 
-        let is_instance_method = params_inputs.len() > params_oomir.len();
+        let is_instance_method = assoc_item.is_method();
         let mut signature = oomir::Signature {
             params: params_oomir,
             ret: Box::new(return_oomir_ty),

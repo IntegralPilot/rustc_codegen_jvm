@@ -12,10 +12,13 @@ use std::collections::HashMap;
 
 pub const UNION_BYTES_FIELD: &str = "__bytes";
 pub const UNION_OBJECTS_FIELD: &str = "__objects";
+pub const MANAGED_OBJECT_POINTER_VIEW_CODEC: &str = "@managed-object";
+pub const RAW_POINTER_VIEW_CODEC: &str = "@raw-pointer";
 pub(super) const ENUM_UNION_DISCRIMINANT_METHOD: &str = "__unionDiscriminant";
 const ENUM_FROM_UNION_DISCRIMINANT_METHOD: &str = "__fromUnionDiscriminant";
 const ENUM_WRITE_UNION_STORAGE_METHOD: &str = "__writeUnionStorage";
 const ENUM_READ_UNION_STORAGE_METHOD: &str = "__readUnionStorage";
+const ENUM_DROP_FIELDS_METHOD: &str = "__rust_drop_fields";
 
 pub fn union_from_method_name(field_name: &str) -> String {
     format!("from_{}", jvm_names::member_name(field_name))
@@ -198,12 +201,20 @@ enum UnionEnumTag {
     },
 }
 
-fn layout_size_bytes<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Result<usize, String> {
+pub(super) fn layout_size_bytes<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Result<usize, String> {
     let ty = normalize_union_ty(tcx, ty)?;
     let layout = tcx
         .layout_of(TypingEnv::fully_monomorphized().as_query_input(ty))
         .map_err(|err| format!("could not get layout for {:?}: {:?}", ty, err))?;
     Ok(layout.size.bytes_usize())
+}
+
+pub(super) fn layout_align_bytes<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Result<usize, String> {
+    let ty = normalize_union_ty(tcx, ty)?;
+    let layout = tcx
+        .layout_of(TypingEnv::fully_monomorphized().as_query_input(ty))
+        .map_err(|err| format!("could not get layout for {:?}: {:?}", ty, err))?;
+    Ok(layout.align.abi.bytes_usize())
 }
 
 fn normalize_union_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Result<Ty<'tcx>, String> {
@@ -439,6 +450,75 @@ fn enum_from_union_discriminant_function<'tcx>(
     }
 }
 
+fn enum_variant_drop_glue_function<'tcx>(
+    variant: &rustc_middle::ty::VariantDef,
+    substs: GenericArgsRef<'tcx>,
+    variant_class_name: &str,
+    tcx: TyCtxt<'tcx>,
+    data_types: &mut HashMap<String, oomir::DataType>,
+    instance_context: rustc_middle::ty::Instance<'tcx>,
+) -> oomir::Function {
+    let self_ty = oomir::Type::Class(variant_class_name.to_string());
+    let self_operand = operand_var("_1", self_ty.clone());
+    let mut instructions = Vec::new();
+    let mut jvm_field_index = 0usize;
+
+    for (field_index, field) in variant.fields.iter().enumerate() {
+        let raw_field_ty = field.ty(tcx, substs).skip_norm_wip();
+        let field_ty =
+            resolve_union_ty(tcx, raw_field_ty, instance_context).unwrap_or(raw_field_ty);
+        let field_oomir_ty = ty_to_oomir_type(field_ty, tcx, data_types, instance_context);
+        let field_value = if field_oomir_ty.has_jvm_value() {
+            let field_name = format!("field{jvm_field_index}");
+            jvm_field_index += 1;
+            let dest = format!("_drop_field_{field_index}");
+            instructions.push(oomir::Instruction::GetField {
+                dest: dest.clone(),
+                object: self_operand.clone(),
+                field_name,
+                field_ty: field_oomir_ty.clone(),
+                owner_class: variant_class_name.to_string(),
+            });
+            operand_var(dest, field_oomir_ty)
+        } else {
+            oomir::Operand::Constant(oomir::Constant::Unit)
+        };
+
+        if field_ty.needs_drop(tcx, TypingEnv::fully_monomorphized()) {
+            super::control_flow::emit_rust_drop_value(
+                field_ty,
+                field_value,
+                &format!("_drop_field_{field_index}"),
+                tcx,
+                instance_context,
+                data_types,
+                &mut instructions,
+            );
+        }
+    }
+    instructions.push(oomir::Instruction::Return { operand: None });
+
+    oomir::Function {
+        name: ENUM_DROP_FIELDS_METHOD.to_string(),
+        owner_class: None,
+        signature: oomir::Signature {
+            params: vec![("self".to_string(), self_ty)],
+            ret: Box::new(oomir::Type::Void),
+            is_static: false,
+        },
+        body: oomir::CodeBlock {
+            entry: "entry".to_string(),
+            basic_blocks: HashMap::from([(
+                "entry".to_string(),
+                oomir::BasicBlock {
+                    label: "entry".to_string(),
+                    instructions,
+                },
+            )]),
+        },
+    }
+}
+
 fn ensure_enum_data_types<'tcx>(
     adt_def: &AdtDef<'tcx>,
     substs: GenericArgsRef<'tcx>,
@@ -514,6 +594,12 @@ fn ensure_enum_data_types<'tcx>(
 
     if let Some(oomir::DataType::Class { methods, .. }) = data_types.get_mut(base_enum_name) {
         add_enum_helper_methods(methods, variants_info.clone());
+        methods
+            .entry(ENUM_DROP_FIELDS_METHOD.to_string())
+            .or_insert(DataTypeMethod::SimpleConstantReturn(
+                oomir::Type::Void,
+                None,
+            ));
         if has_numeric_discriminant {
             methods
                 .entry(ENUM_UNION_DISCRIMINANT_METHOD.to_string())
@@ -583,6 +669,17 @@ fn ensure_enum_data_types<'tcx>(
                 ),
             );
         }
+        methods.insert(
+            ENUM_DROP_FIELDS_METHOD.to_string(),
+            DataTypeMethod::Function(enum_variant_drop_glue_function(
+                variant,
+                substs,
+                &variant_class_name,
+                tcx,
+                data_types,
+                instance_context,
+            )),
+        );
 
         data_types.insert(
             variant_class_name,
@@ -792,6 +889,41 @@ fn emit_scalar_to_union_bytes<'tcx>(
     instructions: &mut Vec<oomir::Instruction>,
     temp_counter: &mut usize,
 ) -> Result<(), String> {
+    if matches!(
+        ty.kind(),
+        TyKind::Int(IntTy::I128) | TyKind::Uint(UintTy::U64 | UintTy::U128)
+    ) {
+        let rust_size = layout_size_bytes(tcx, ty)?;
+        let big_integer_ty = oomir::Type::Class("java/math/BigInteger".to_string());
+        for byte_idx in 0..rust_size {
+            let byte_dest = next_union_temp("union_big_integer_byte", temp_counter);
+            instructions.push(oomir::Instruction::InvokeStatic {
+                dest: Some(byte_dest.clone()),
+                class_name: oomir::POINTER_CLASS.to_string(),
+                method_name: "bigIntegerByte".to_string(),
+                method_ty: oomir::Signature {
+                    params: vec![
+                        ("value".to_string(), big_integer_ty.clone()),
+                        ("byte_index".to_string(), oomir::Type::I32),
+                    ],
+                    ret: Box::new(oomir::Type::I8),
+                    is_static: true,
+                },
+                args: vec![
+                    source.clone(),
+                    oomir::Operand::Constant(oomir::Constant::I32(byte_idx as i32)),
+                ],
+            });
+            let index = storage.byte_index(base_offset + byte_idx, instructions, temp_counter);
+            instructions.push(oomir::Instruction::ArrayStore {
+                array: storage.bytes_var.clone(),
+                index,
+                value: operand_var(byte_dest, oomir::Type::I8),
+            });
+        }
+        return Ok(());
+    }
+
     let (bits_operand, bits_ty, rust_size) = scalar_bit_operand_for_union(
         ty,
         source,
@@ -1422,6 +1554,59 @@ fn emit_object_to_union_storage(
     });
 }
 
+fn emit_managed_object_to_union_bytes(
+    source: oomir::Operand,
+    rust_size: usize,
+    storage: &JvmUnionStorage,
+    base_offset: usize,
+    instructions: &mut Vec<oomir::Instruction>,
+    temp_counter: &mut usize,
+) {
+    let address_dest = next_union_temp("union_managed_object_address", temp_counter);
+    instructions.push(oomir::Instruction::InvokeStatic {
+        dest: Some(address_dest.clone()),
+        class_name: oomir::POINTER_CLASS.to_string(),
+        method_name: "managedObjectAddress".to_string(),
+        method_ty: oomir::Signature {
+            params: vec![(
+                "value".to_string(),
+                oomir::Type::Class("java/lang/Object".to_string()),
+            )],
+            ret: Box::new(oomir::Type::I32),
+            is_static: true,
+        },
+        args: vec![source.clone()],
+    });
+    let wide_dest = next_union_temp("union_managed_object_address_wide", temp_counter);
+    instructions.push(oomir::Instruction::Cast {
+        op: operand_var(address_dest, oomir::Type::I32),
+        ty: oomir::Type::I64,
+        dest: wide_dest.clone(),
+    });
+    let address_bytes = rust_size.min(8);
+    emit_bits_to_union_bytes(
+        operand_var(wide_dest, oomir::Type::I64),
+        oomir::Type::I64,
+        address_bytes,
+        storage,
+        base_offset,
+        instructions,
+        temp_counter,
+    )
+    .expect("an eight-byte managed address is representable");
+    for byte_index in address_bytes..rust_size {
+        let index = storage.byte_index(base_offset + byte_index, instructions, temp_counter);
+        instructions.push(oomir::Instruction::ArrayStore {
+            array: storage.bytes_var.clone(),
+            index,
+            value: oomir::Operand::Constant(oomir::Constant::I8(0)),
+        });
+    }
+    // Keep the side table populated for existing union helpers as well. Raw
+    // pointer codecs can reconstruct solely from the byte address.
+    emit_object_to_union_storage(source, storage, base_offset, instructions, temp_counter);
+}
+
 fn emit_object_from_union_storage(
     target_ty: oomir::Type,
     storage: &JvmUnionStorage,
@@ -1441,6 +1626,55 @@ fn emit_object_from_union_storage(
     }
 
     let typed_dest = next_union_temp("union_typed_object", temp_counter);
+    instructions.push(oomir::Instruction::Cast {
+        op: operand_var(
+            object_dest,
+            oomir::Type::Class("java/lang/Object".to_string()),
+        ),
+        ty: target_ty.clone(),
+        dest: typed_dest.clone(),
+    });
+    operand_var(typed_dest, target_ty)
+}
+
+fn emit_managed_object_from_union_bytes(
+    target_ty: oomir::Type,
+    rust_size: usize,
+    storage: &JvmUnionStorage,
+    base_offset: usize,
+    instructions: &mut Vec<oomir::Instruction>,
+    temp_counter: &mut usize,
+) -> oomir::Operand {
+    let bits = emit_bits_from_union_bytes(
+        oomir::Type::I64,
+        rust_size.min(8),
+        storage,
+        base_offset,
+        instructions,
+        temp_counter,
+    );
+    let address_dest = next_union_temp("union_managed_object_address_narrow", temp_counter);
+    instructions.push(oomir::Instruction::Cast {
+        op: bits,
+        ty: oomir::Type::I32,
+        dest: address_dest.clone(),
+    });
+    let object_dest = next_union_temp("union_managed_object", temp_counter);
+    instructions.push(oomir::Instruction::InvokeStatic {
+        dest: Some(object_dest.clone()),
+        class_name: oomir::POINTER_CLASS.to_string(),
+        method_name: "managedObjectFromAddress".to_string(),
+        method_ty: oomir::Signature {
+            params: vec![("address".to_string(), oomir::Type::I32)],
+            ret: Box::new(oomir::Type::Class("java/lang/Object".to_string())),
+            is_static: true,
+        },
+        args: vec![operand_var(address_dest, oomir::Type::I32)],
+    });
+    if target_ty == oomir::Type::Class("java/lang/Object".to_string()) {
+        return operand_var(object_dest, target_ty);
+    }
+    let typed_dest = next_union_temp("union_typed_managed_object", temp_counter);
     instructions.push(oomir::Instruction::Cast {
         op: operand_var(
             object_dest,
@@ -1537,6 +1771,119 @@ fn emit_ty_to_union_bytes<'tcx>(
             instructions,
             temp_counter,
         ),
+        TyKind::Ref(_, inner, _)
+            if let TyKind::Array(element, _) = inner.kind()
+                && matches!(source.get_type(), Some(oomir::Type::Slice(_))) =>
+        {
+            // `&[T; N]` is a thin Rust pointer even though its JVM carrier is a
+            // SliceView. Transmutes (notably fmt::Arguments::new) must encode the
+            // data address, not the managed identity of the SliceView wrapper.
+            let element_size = layout_size_bytes(tcx, *element)?;
+            let pointer_ty = oomir::Type::Pointer(Box::new(ty_to_oomir_type(
+                *element,
+                tcx,
+                data_types,
+                instance_context,
+            )));
+            let pointer_dest = next_union_temp("union_array_reference_pointer", temp_counter);
+            instructions.push(oomir::Instruction::InvokeStatic {
+                dest: Some(pointer_dest.clone()),
+                class_name: oomir::POINTER_CLASS.to_string(),
+                method_name: "fromSlice".to_string(),
+                method_ty: oomir::Signature {
+                    params: vec![
+                        (
+                            "slice".to_string(),
+                            oomir::Type::Class("java/lang/Object".to_string()),
+                        ),
+                        ("element_size".to_string(), oomir::Type::I32),
+                        ("codec".to_string(), oomir::Type::String),
+                    ],
+                    ret: Box::new(pointer_ty.clone()),
+                    is_static: true,
+                },
+                args: vec![
+                    source,
+                    oomir::Operand::Constant(oomir::Constant::I32(
+                        i32::try_from(element_size)
+                            .map_err(|_| "array element layout exceeds JVM address space")?,
+                    )),
+                    pointer_memory_codec_operand(*element, tcx, data_types, instance_context),
+                ],
+            });
+            let address_dest = next_union_temp("union_array_reference_address", temp_counter);
+            instructions.push(oomir::Instruction::InvokeVirtual {
+                dest: Some(address_dest.clone()),
+                class_name: oomir::POINTER_CLASS.to_string(),
+                method_name: "address".to_string(),
+                method_ty: oomir::Signature {
+                    params: vec![("self".to_string(), pointer_ty)],
+                    ret: Box::new(oomir::Type::I32),
+                    is_static: false,
+                },
+                args: Vec::new(),
+                operand: operand_var(
+                    pointer_dest,
+                    oomir::Type::Pointer(Box::new(ty_to_oomir_type(
+                        *element,
+                        tcx,
+                        data_types,
+                        instance_context,
+                    ))),
+                ),
+            });
+            let wide_dest = next_union_temp("union_array_reference_address_wide", temp_counter);
+            instructions.push(oomir::Instruction::Cast {
+                op: operand_var(address_dest, oomir::Type::I32),
+                ty: oomir::Type::I64,
+                dest: wide_dest.clone(),
+            });
+            emit_bits_to_union_bytes(
+                operand_var(wide_dest, oomir::Type::I64),
+                oomir::Type::I64,
+                layout_size_bytes(tcx, ty)?,
+                storage,
+                base_offset,
+                instructions,
+                temp_counter,
+            )
+        }
+        TyKind::RawPtr(_, _) | TyKind::Ref(_, _, _)
+            if matches!(
+                ty_to_oomir_type(ty, tcx, data_types, instance_context),
+                oomir::Type::Pointer(_)
+            ) =>
+        {
+            let pointer_ty = ty_to_oomir_type(ty, tcx, data_types, instance_context);
+            let address_dest = next_union_temp("union_pointer_address", temp_counter);
+            instructions.push(oomir::Instruction::InvokeVirtual {
+                dest: Some(address_dest.clone()),
+                class_name: oomir::POINTER_CLASS.to_string(),
+                method_name: "address".to_string(),
+                method_ty: oomir::Signature {
+                    params: vec![("self".to_string(), pointer_ty)],
+                    ret: Box::new(oomir::Type::I32),
+                    is_static: false,
+                },
+                args: Vec::new(),
+                operand: source,
+            });
+            let wide_dest = next_union_temp("union_pointer_address_wide", temp_counter);
+            instructions.push(oomir::Instruction::Cast {
+                op: operand_var(address_dest, oomir::Type::I32),
+                ty: oomir::Type::I64,
+                dest: wide_dest.clone(),
+            });
+            emit_bits_to_union_bytes(
+                operand_var(wide_dest, oomir::Type::I64),
+                oomir::Type::I64,
+                layout_size_bytes(tcx, ty)?,
+                storage,
+                base_offset,
+                instructions,
+                temp_counter,
+            )
+        }
         TyKind::Float(FloatTy::F128) => {
             for (method_name, offset) in [("lowBits", 0), ("highBits", 8)] {
                 let bits_dest = next_union_temp("union_f128_bits", temp_counter);
@@ -1710,8 +2057,9 @@ fn emit_ty_to_union_bytes<'tcx>(
         _ => {
             let jvm_ty = ty_to_oomir_type(ty, tcx, data_types, instance_context);
             if jvm_ty.is_jvm_reference_type() {
-                emit_object_to_union_storage(
+                emit_managed_object_to_union_bytes(
                     source,
+                    layout_size_bytes(tcx, ty)?,
                     storage,
                     base_offset,
                     instructions,
@@ -1805,6 +2153,39 @@ fn emit_scalar_from_union_bytes<'tcx>(
 ) -> Result<oomir::Operand, String> {
     let rust_size = layout_size_bytes(tcx, ty)?;
     let oomir_ty = ty_to_oomir_type(ty, tcx, data_types, instance_context);
+    if matches!(
+        ty.kind(),
+        TyKind::Int(IntTy::I128) | TyKind::Uint(UintTy::U64 | UintTy::U128)
+    ) {
+        let offset = storage.byte_index(base_offset, instructions, temp_counter);
+        let dest = next_union_temp("union_big_integer_value", temp_counter);
+        instructions.push(oomir::Instruction::InvokeStatic {
+            dest: Some(dest.clone()),
+            class_name: oomir::POINTER_CLASS.to_string(),
+            method_name: "bigIntegerFromBytes".to_string(),
+            method_ty: oomir::Signature {
+                params: vec![
+                    ("bytes".to_string(), byte_array_type()),
+                    ("offset".to_string(), oomir::Type::I32),
+                    ("size".to_string(), oomir::Type::I32),
+                    ("signed".to_string(), oomir::Type::Boolean),
+                ],
+                ret: Box::new(oomir_ty.clone()),
+                is_static: true,
+            },
+            args: vec![
+                operand_var(storage.bytes_var.clone(), byte_array_type()),
+                offset,
+                oomir::Operand::Constant(oomir::Constant::I32(rust_size as i32)),
+                oomir::Operand::Constant(oomir::Constant::Boolean(matches!(
+                    ty.kind(),
+                    TyKind::Int(IntTy::I128)
+                ))),
+            ],
+        });
+        return Ok(operand_var(dest, oomir_ty));
+    }
+
     let bits_ty = match ty.kind() {
         TyKind::Float(FloatTy::F32) => oomir::Type::I32,
         TyKind::Float(FloatTy::F64) => oomir::Type::I64,
@@ -1907,6 +2288,52 @@ fn emit_ty_from_union_bytes<'tcx>(
             instructions,
             temp_counter,
         ),
+        TyKind::RawPtr(pointee, _) | TyKind::Ref(_, pointee, _)
+            if matches!(
+                ty_to_oomir_type(ty, tcx, data_types, instance_context),
+                oomir::Type::Pointer(_)
+            ) =>
+        {
+            let pointer_ty = ty_to_oomir_type(ty, tcx, data_types, instance_context);
+            let bits = emit_bits_from_union_bytes(
+                oomir::Type::I64,
+                layout_size_bytes(tcx, ty)?,
+                storage,
+                base_offset,
+                instructions,
+                temp_counter,
+            );
+            let address_dest = next_union_temp("union_pointer_address_narrow", temp_counter);
+            instructions.push(oomir::Instruction::Cast {
+                op: bits,
+                ty: oomir::Type::I32,
+                dest: address_dest.clone(),
+            });
+            let pointer_dest = next_union_temp("union_pointer_value", temp_counter);
+            instructions.push(oomir::Instruction::InvokeStatic {
+                dest: Some(pointer_dest.clone()),
+                class_name: oomir::POINTER_CLASS.to_string(),
+                method_name: "fromAddress".to_string(),
+                method_ty: oomir::Signature {
+                    params: vec![
+                        ("address".to_string(), oomir::Type::I32),
+                        ("view_size".to_string(), oomir::Type::I32),
+                        ("view_codec".to_string(), oomir::Type::String),
+                    ],
+                    ret: Box::new(pointer_ty.clone()),
+                    is_static: true,
+                },
+                args: vec![
+                    operand_var(address_dest, oomir::Type::I32),
+                    oomir::Operand::Constant(oomir::Constant::I32(
+                        i32::try_from(layout_size_bytes(tcx, *pointee)?)
+                            .map_err(|_| "pointer pointee layout exceeds JVM address space")?,
+                    )),
+                    pointer_view_codec_operand(*pointee, tcx, data_types, instance_context),
+                ],
+            });
+            Ok(operand_var(pointer_dest, pointer_ty))
+        }
         TyKind::Float(FloatTy::F128) => {
             let low = emit_bits_from_union_bytes(
                 oomir::Type::I64,
@@ -2098,8 +2525,9 @@ fn emit_ty_from_union_bytes<'tcx>(
         _ => {
             let jvm_ty = ty_to_oomir_type(ty, tcx, data_types, instance_context);
             if jvm_ty.is_jvm_reference_type() {
-                Ok(emit_object_from_union_storage(
+                Ok(emit_managed_object_from_union_bytes(
                     jvm_ty,
+                    layout_size_bytes(tcx, ty)?,
                     storage,
                     base_offset,
                     instructions,
@@ -2123,9 +2551,14 @@ fn exact_bytes_supported<'tcx>(
     match ty.kind() {
         TyKind::Bool
         | TyKind::Char
-        | TyKind::Int(IntTy::I8 | IntTy::I16 | IntTy::I32 | IntTy::I64 | IntTy::Isize)
-        | TyKind::Uint(UintTy::U8 | UintTy::U16 | UintTy::U32 | UintTy::Usize)
+        | TyKind::Int(
+            IntTy::I8 | IntTy::I16 | IntTy::I32 | IntTy::I64 | IntTy::I128 | IntTy::Isize,
+        )
+        | TyKind::Uint(
+            UintTy::U8 | UintTy::U16 | UintTy::U32 | UintTy::U64 | UintTy::U128 | UintTy::Usize,
+        )
         | TyKind::Float(FloatTy::F32 | FloatTy::F64 | FloatTy::F128) => Ok(()),
+        TyKind::RawPtr(_, _) | TyKind::Ref(_, _, _) => Ok(()),
         TyKind::Pat(inner, _) => exact_bytes_supported(*inner, tcx, instance_context),
         TyKind::Tuple(elements) => elements
             .iter()
@@ -2221,51 +2654,90 @@ pub(super) fn ensure_exact_transmute_helper<'tcx>(
         return Ok(helper);
     }
 
-    let bytes_name = "_exact_bytes".to_string();
-    let objects_name = "_exact_objects".to_string();
-    let mut instructions = vec![
-        oomir::Instruction::NewArray {
-            dest: bytes_name.clone(),
-            element_type: oomir::Type::I8,
-            size: oomir::Operand::Constant(oomir::Constant::I32(source_size as i32)),
-        },
-        oomir::Instruction::NewArray {
-            dest: objects_name.clone(),
-            element_type: oomir::Type::Class("java/lang/Object".to_string()),
-            size: oomir::Operand::Constant(oomir::Constant::I32(source_size.max(1) as i32)),
-        },
-    ];
-    let storage = JvmUnionStorage::at_start(bytes_name, objects_name);
-    let source = if source_oomir_ty.has_jvm_value() {
-        operand_var("_1", source_oomir_ty)
-    } else {
-        oomir::Operand::Constant(oomir::Constant::Unit)
+    let pointer_pointee = |ty: Ty<'tcx>| match ty.kind() {
+        TyKind::RawPtr(pointee, _) | TyKind::Ref(_, pointee, _) => Some(*pointee),
+        _ => None,
     };
-    let mut temp_counter = 0;
-    emit_ty_to_union_bytes(
-        source_ty,
-        source,
-        &storage,
-        0,
-        tcx,
-        data_types,
-        instance_context,
-        &mut instructions,
-        &mut temp_counter,
-    )?;
-    let result = emit_ty_from_union_bytes(
-        target_ty,
-        &storage,
-        0,
-        tcx,
-        data_types,
-        instance_context,
-        &mut instructions,
-        &mut temp_counter,
-    )?;
-    instructions.push(oomir::Instruction::Return {
-        operand: target_oomir_ty.has_jvm_value().then_some(result),
-    });
+    let source_pointee = pointer_pointee(source_ty);
+    let target_pointee = pointer_pointee(target_ty);
+    let source_is_u8_slice = source_pointee.is_some_and(
+        |pointee| matches!(pointee.kind(), TyKind::Slice(element) if *element == tcx.types.u8),
+    );
+    let target_is_u8_slice = target_pointee.is_some_and(
+        |pointee| matches!(pointee.kind(), TyKind::Slice(element) if *element == tcx.types.u8),
+    );
+    let source_is_str = source_pointee.is_some_and(Ty::is_str);
+    let target_is_str = target_pointee.is_some_and(Ty::is_str);
+    let direct_view_method = if source_is_u8_slice && target_is_str {
+        Some("fromSlice")
+    } else if source_is_str && target_is_u8_slice {
+        Some("asSlice")
+    } else {
+        None
+    };
+
+    let instructions = if let Some(view_method) = direct_view_method {
+        let result = "_view_result".to_string();
+        vec![
+            oomir::Instruction::InvokeStatic {
+                dest: Some(result.clone()),
+                class_name: oomir::UTF8_VIEW_CLASS.to_string(),
+                method_name: view_method.to_string(),
+                method_ty: signature.clone(),
+                args: vec![operand_var("_1", source_oomir_ty)],
+            },
+            oomir::Instruction::Return {
+                operand: Some(operand_var(result, target_oomir_ty.clone())),
+            },
+        ]
+    } else {
+        let bytes_name = "_exact_bytes".to_string();
+        let objects_name = "_exact_objects".to_string();
+        let mut instructions = vec![
+            oomir::Instruction::NewArray {
+                dest: bytes_name.clone(),
+                element_type: oomir::Type::I8,
+                size: oomir::Operand::Constant(oomir::Constant::I32(source_size as i32)),
+            },
+            oomir::Instruction::NewArray {
+                dest: objects_name.clone(),
+                element_type: oomir::Type::Class("java/lang/Object".to_string()),
+                size: oomir::Operand::Constant(oomir::Constant::I32(source_size.max(1) as i32)),
+            },
+        ];
+        let storage = JvmUnionStorage::at_start(bytes_name, objects_name);
+        let source = if source_oomir_ty.has_jvm_value() {
+            operand_var("_1", source_oomir_ty)
+        } else {
+            oomir::Operand::Constant(oomir::Constant::Unit)
+        };
+        let mut temp_counter = 0;
+        emit_ty_to_union_bytes(
+            source_ty,
+            source,
+            &storage,
+            0,
+            tcx,
+            data_types,
+            instance_context,
+            &mut instructions,
+            &mut temp_counter,
+        )?;
+        let result = emit_ty_from_union_bytes(
+            target_ty,
+            &storage,
+            0,
+            tcx,
+            data_types,
+            instance_context,
+            &mut instructions,
+            &mut temp_counter,
+        )?;
+        instructions.push(oomir::Instruction::Return {
+            operand: target_oomir_ty.has_jvm_value().then_some(result),
+        });
+        instructions
+    };
 
     let function = oomir::Function {
         name: method_name.clone(),
@@ -2296,6 +2768,229 @@ pub(super) fn ensure_exact_transmute_helper<'tcx>(
         }
     }
     Ok(helper)
+}
+
+#[derive(Clone)]
+pub(super) struct PointerMemoryCodec {
+    pub class_name: String,
+}
+
+/// Generates an erased runtime codec for aggregate values placed in pointer
+/// storage. The codec deliberately reuses union/transmute's rustc-layout
+/// encoder so raw byte aliases and ordinary field access observe one value.
+pub(super) fn ensure_pointer_memory_codec<'tcx>(
+    ty: Ty<'tcx>,
+    tcx: TyCtxt<'tcx>,
+    data_types: &mut HashMap<String, oomir::DataType>,
+    instance_context: rustc_middle::ty::Instance<'tcx>,
+) -> Result<Option<PointerMemoryCodec>, String> {
+    let ty = resolve_union_ty(tcx, ty, instance_context)?;
+    if !matches!(
+        ty.kind(),
+        TyKind::Tuple(_) | TyKind::Array(_, _) | TyKind::Adt(_, _)
+    ) {
+        return Ok(None);
+    }
+    exact_bytes_supported(ty, tcx, instance_context)?;
+
+    let size = layout_size_bytes(tcx, ty)?;
+    let value_ty = ty_to_oomir_type(ty, tcx, data_types, instance_context);
+    if size == 0 || !value_ty.has_jvm_value() {
+        return Ok(None);
+    }
+    let identity = format!("{ty:?}:{}:{size}", value_ty.to_jvm_descriptor());
+    let class_name = jvm_names::synthetic_class_for_instance(
+        tcx,
+        instance_context,
+        format!("PointerCodec_{}", short_hash(&identity, 12)),
+    );
+    if matches!(
+        data_types.get(&class_name),
+        Some(oomir::DataType::Class { methods, .. })
+            if methods.contains_key("encode") && methods.contains_key("decode")
+    ) {
+        return Ok(Some(PointerMemoryCodec { class_name }));
+    }
+
+    let bytes_ty = byte_array_type();
+
+    let mut encode_instructions = vec![
+        oomir::Instruction::NewArray {
+            dest: "_bytes".to_string(),
+            element_type: oomir::Type::I8,
+            size: oomir::Operand::Constant(oomir::Constant::I32(size as i32)),
+        },
+        oomir::Instruction::NewArray {
+            dest: "_objects".to_string(),
+            element_type: oomir::Type::Class("java/lang/Object".to_string()),
+            size: oomir::Operand::Constant(oomir::Constant::I32(size.max(1) as i32)),
+        },
+    ];
+    let encode_storage = JvmUnionStorage::at_start("_bytes", "_objects");
+    let mut encode_counter = 0;
+    emit_ty_to_union_bytes(
+        ty,
+        if value_ty.has_jvm_value() {
+            operand_var("_1", value_ty.clone())
+        } else {
+            oomir::Operand::Constant(oomir::Constant::Unit)
+        },
+        &encode_storage,
+        0,
+        tcx,
+        data_types,
+        instance_context,
+        &mut encode_instructions,
+        &mut encode_counter,
+    )?;
+    encode_instructions.push(oomir::Instruction::Return {
+        operand: Some(operand_var("_bytes", bytes_ty.clone())),
+    });
+    let encode = oomir::Function {
+        name: "encode".to_string(),
+        owner_class: None,
+        signature: oomir::Signature {
+            params: value_ty
+                .has_jvm_value()
+                .then(|| vec![("value".to_string(), value_ty.clone())])
+                .unwrap_or_default(),
+            ret: Box::new(bytes_ty.clone()),
+            is_static: true,
+        },
+        body: simple_body(encode_instructions),
+    };
+
+    let mut decode_instructions = vec![oomir::Instruction::NewArray {
+        dest: "_objects".to_string(),
+        element_type: oomir::Type::Class("java/lang/Object".to_string()),
+        size: oomir::Operand::Constant(oomir::Constant::I32(size.max(1) as i32)),
+    }];
+    let decode_storage = JvmUnionStorage::at_start("_1", "_objects");
+    let mut decode_counter = 0;
+    let decoded = emit_ty_from_union_bytes(
+        ty,
+        &decode_storage,
+        0,
+        tcx,
+        data_types,
+        instance_context,
+        &mut decode_instructions,
+        &mut decode_counter,
+    )?;
+    decode_instructions.push(oomir::Instruction::Return {
+        operand: value_ty.has_jvm_value().then_some(decoded),
+    });
+    let decode = oomir::Function {
+        name: "decode".to_string(),
+        owner_class: None,
+        signature: oomir::Signature {
+            params: vec![("bytes".to_string(), bytes_ty)],
+            ret: Box::new(value_ty),
+            is_static: true,
+        },
+        body: simple_body(decode_instructions),
+    };
+
+    let methods = HashMap::from([
+        ("encode".to_string(), DataTypeMethod::Function(encode)),
+        ("decode".to_string(), DataTypeMethod::Function(decode)),
+    ]);
+    match data_types.get_mut(&class_name) {
+        Some(oomir::DataType::Class {
+            methods: existing, ..
+        }) => existing.extend(methods),
+        Some(oomir::DataType::Interface { .. }) => {
+            return Err(format!(
+                "pointer codec helper name {class_name} is already an interface"
+            ));
+        }
+        None => {
+            data_types.insert(
+                class_name.clone(),
+                oomir::DataType::Class {
+                    fields: Vec::new(),
+                    is_abstract: false,
+                    methods,
+                    super_class: Some("java/lang/Object".to_string()),
+                    interfaces: Vec::new(),
+                },
+            );
+        }
+    }
+    Ok(Some(PointerMemoryCodec { class_name }))
+}
+
+pub(super) fn pointer_memory_codec_operand<'tcx>(
+    ty: Ty<'tcx>,
+    tcx: TyCtxt<'tcx>,
+    data_types: &mut HashMap<String, oomir::DataType>,
+    instance_context: rustc_middle::ty::Instance<'tcx>,
+) -> oomir::Operand {
+    if let Some(codec) = pointer_builtin_codec_operand(ty, tcx, instance_context) {
+        return codec;
+    }
+    match ensure_pointer_memory_codec(ty, tcx, data_types, instance_context) {
+        Ok(Some(codec)) => oomir::Operand::Constant(oomir::Constant::String(codec.class_name)),
+        Ok(None) => oomir::Operand::Constant(oomir::Constant::Null(oomir::Type::String)),
+        Err(error) => {
+            breadcrumbs::log!(
+                breadcrumbs::LogLevel::Info,
+                "type-mapping",
+                format!("Pointer memory codec is unavailable for {ty:?}: {error}")
+            );
+            oomir::Operand::Constant(oomir::Constant::Null(oomir::Type::String))
+        }
+    }
+}
+
+/// Codec used when a pointer is a subview/cast into an existing allocation.
+/// Aggregate pointees use generated exact-layout codecs. Other JVM reference
+/// carriers (fat strings/slices, function values, managed numeric classes,
+/// etc.) use the runtime's stable managed-object address representation.
+pub(super) fn pointer_view_codec_operand<'tcx>(
+    ty: Ty<'tcx>,
+    tcx: TyCtxt<'tcx>,
+    data_types: &mut HashMap<String, oomir::DataType>,
+    instance_context: rustc_middle::ty::Instance<'tcx>,
+) -> oomir::Operand {
+    if let Some(codec) = pointer_builtin_codec_operand(ty, tcx, instance_context) {
+        return codec;
+    }
+    match ensure_pointer_memory_codec(ty, tcx, data_types, instance_context) {
+        Ok(Some(codec)) => oomir::Operand::Constant(oomir::Constant::String(codec.class_name)),
+        Ok(None) | Err(_) => {
+            let jvm_ty = ty_to_oomir_type(ty, tcx, data_types, instance_context);
+            if jvm_ty.is_jvm_reference_type() {
+                oomir::Operand::Constant(oomir::Constant::String(
+                    MANAGED_OBJECT_POINTER_VIEW_CODEC.to_string(),
+                ))
+            } else {
+                oomir::Operand::Constant(oomir::Constant::Null(oomir::Type::String))
+            }
+        }
+    }
+}
+
+fn pointer_builtin_codec_operand<'tcx>(
+    ty: Ty<'tcx>,
+    tcx: TyCtxt<'tcx>,
+    instance_context: rustc_middle::ty::Instance<'tcx>,
+) -> Option<oomir::Operand> {
+    let ty = resolve_union_ty(tcx, ty, instance_context).ok()?;
+    let codec = match ty.kind() {
+        TyKind::RawPtr(pointee, _) | TyKind::Ref(_, pointee, _)
+            if pointee.is_sized(tcx, TypingEnv::fully_monomorphized()) =>
+        {
+            RAW_POINTER_VIEW_CODEC
+        }
+        TyKind::Int(IntTy::I128) => "@signed-big-integer",
+        TyKind::Uint(UintTy::U64 | UintTy::U128) => "@unsigned-big-integer",
+        TyKind::Float(FloatTy::F128) => "@f128",
+        _ => return None,
+    };
+    Some(oomir::Operand::Constant(oomir::Constant::String(
+        codec.to_string(),
+    )))
 }
 
 fn unsupported_union_body(message: String) -> oomir::CodeBlock {
@@ -2859,10 +3554,14 @@ pub fn ty_to_oomir_type<'tcx>(
             }
         }
         rustc_middle::ty::TyKind::Str => oomir::Type::Str,
+        // Opaque metadata markers such as the compiler's trait-object VTable
+        // carry no standalone JVM value. The data pointer already retains the
+        // JVM interface dispatch information.
+        rustc_middle::ty::TyKind::Foreign(_) => oomir::Type::Unit,
         rustc_middle::ty::TyKind::Pat(inner_ty, _) => {
             ty_to_oomir_type(*inner_ty, tcx, data_types, instance_context)
         }
-        rustc_middle::ty::TyKind::Ref(_, inner_ty, mutability) => {
+        rustc_middle::ty::TyKind::Ref(_, inner_ty, _mutability) => {
             let pointee_oomir_type = ty_to_oomir_type(*inner_ty, tcx, data_types, instance_context);
             // For trait objects (&dyn Trait, &mut dyn Trait), represent as direct Interface
             // rather than using the array wrapper, since we call virtual methods on the object
@@ -2874,16 +3573,20 @@ pub fn ty_to_oomir_type<'tcx>(
             ) {
                 pointee_oomir_type
             } else if let rustc_middle::ty::TyKind::Array(element_ty, _) = inner_ty.kind() {
+                // Fixed arrays retain their JVM array allocation and use a
+                // SliceView when borrowed. Element pointers created from that
+                // view still share the original backing allocation.
                 oomir::Type::Slice(Box::new(ty_to_oomir_type(
                     *element_ty,
                     tcx,
                     data_types,
                     instance_context,
                 )))
-            } else if mutability.is_mut() {
-                oomir::Type::MutableReference(Box::new(pointee_oomir_type))
             } else {
-                pointee_oomir_type
+                // Sized references carry a stable address. Mutability remains
+                // a Rust type-system property; both reference kinds use the
+                // same JVM pointer representation so reborrows preserve identity.
+                oomir::Type::Pointer(Box::new(pointee_oomir_type))
             }
         }
         rustc_middle::ty::TyKind::RawPtr(ty, _mutability) => {
@@ -2898,13 +3601,14 @@ pub fn ty_to_oomir_type<'tcx>(
                     ty_to_oomir_type(component_ty, tcx, data_types, instance_context);
                 oomir::Type::Slice(Box::new(oomir_component_type))
             } else {
-                // For a pointer to a sized type (*const T), use the mutable reference
-                // "array hack" to represent it as a reference that can be written back to.
+                // Sized raw pointers and sized references intentionally share
+                // one address representation. This preserves identity across
+                // const/mut casts and makes arithmetic independent of the JVM ABI.
                 let oomir_pointee_type = ty_to_oomir_type(*ty, tcx, data_types, instance_context);
                 if matches!(oomir_pointee_type, oomir::Type::Void) {
-                    oomir::Type::Class("java/lang/Object".to_string())
+                    oomir::Type::Pointer(Box::new(oomir::Type::Unit))
                 } else {
-                    oomir::Type::MutableReference(Box::new(oomir_pointee_type))
+                    oomir::Type::Pointer(Box::new(oomir_pointee_type))
                 }
             }
         }
@@ -3190,14 +3894,14 @@ pub fn readable_oomir_type_name(t: &oomir::Type) -> String {
         }
         Type::Array(inner) => format!("{}Array", readable_oomir_type_name(inner)),
         Type::Slice(inner) => format!("{}Slice", readable_oomir_type_name(inner)),
+        Type::Pointer(inner) => format!("Ptr{}", readable_oomir_type_name(inner)),
+        Type::Reference(inner) => format!("Ref{}", readable_oomir_type_name(inner)),
         Type::MutableReference(inner) => format!("Ref{}", readable_oomir_type_name(inner)),
         Type::Interface(name) => {
             // prefix interfaces with I to avoid conflicts with classes
             let seg = name.rsplit('/').next().unwrap_or(name);
             format!("I{}", seg)
         }
-        // Fallback for any other variants
-        _ => "Unsupported".to_string(),
     }
 }
 
@@ -3333,7 +4037,9 @@ pub fn mir_int_to_oomir_const<'tcx>(
             IntTy::Isize => oomir::Constant::I32(value as i32), // JVM uses i32 for most "usize" tasks
             IntTy::I128 => oomir::Constant::Instance {
                 class_name: "java/math/BigInteger".to_string(),
-                params: vec![oomir::Constant::String(value.to_string())],
+                // MIR carries integer bits in a u128; preserve the signed
+                // two's-complement interpretation for i128 constants.
+                params: vec![oomir::Constant::String((value as i128).to_string())],
                 fields: HashMap::new(),
             }, // Handle large integers
         },

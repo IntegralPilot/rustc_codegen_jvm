@@ -21,8 +21,8 @@ public final class Arguments__ {
 
     public Arguments__(NonNull_i16 template, NonNull_Argument__ args) {
         this(
-                template == null ? null : template.pointer,
-                args == null ? null : args.pointer
+                template == null ? null : (short[]) template.pointer.backingArray(),
+                args == null ? null : (Object[]) args.pointer.backingArray()
         );
     }
 

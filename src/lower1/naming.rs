@@ -46,7 +46,10 @@ pub fn mono_fn_name_from_instance<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'t
     let mut safe_base = jvm_names::method_for_function(tcx, instance.def_id());
     let parent_def_kind = tcx.def_kind(tcx.parent(instance.def_id()));
     if tcx.opt_associated_item(instance.def_id()).is_some()
-        || matches!(parent_def_kind, DefKind::Fn | DefKind::AssocFn | DefKind::Closure)
+        || matches!(
+            parent_def_kind,
+            DefKind::Fn | DefKind::AssocFn | DefKind::Closure
+        )
     {
         let definition_hash = super::types::short_hash(
             &format!(
@@ -101,10 +104,8 @@ pub fn mono_fn_name_from_instance<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'t
     let readable_name = if instance.args.is_empty() {
         readable_base
     } else {
-        let instance_hash = super::types::short_hash(
-            &format!("{:?}:{:?}", instance.def_id(), instance.args),
-            10,
-        );
+        let instance_hash =
+            super::types::short_hash(&format!("{:?}:{:?}", instance.def_id(), instance.args), 10);
         format!("{readable_base}__{instance_hash}")
     };
 

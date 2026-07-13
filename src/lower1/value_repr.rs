@@ -417,6 +417,129 @@ fn adapt_mutable_reference_carrier<'tcx>(
         return source;
     }
 
+    if matches!(source.get_type(), Some(oomir::Type::Slice(_)))
+        && matches!(target_jvm_ty, oomir::Type::Pointer(_))
+    {
+        let dest = format!("{temp_prefix}_slice_pointer");
+        instructions.push(oomir::Instruction::InvokeStatic {
+            dest: Some(dest.clone()),
+            class_name: oomir::POINTER_CLASS.to_string(),
+            method_name: "fromSlice".to_string(),
+            method_ty: oomir::Signature {
+                params: vec![
+                    (
+                        "slice".to_string(),
+                        oomir::Type::Class("java/lang/Object".to_string()),
+                    ),
+                    ("element_size".to_string(), oomir::Type::I32),
+                    ("codec".to_string(), oomir::Type::String),
+                ],
+                ret: Box::new(target_jvm_ty.clone()),
+                is_static: true,
+            },
+            args: vec![
+                source,
+                oomir::Operand::Constant(oomir::Constant::I32(
+                    i32::try_from(
+                        match target_rust_ty.kind() {
+                            TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _) => {
+                                super::types::layout_size_bytes(
+                                    tcx,
+                                    resolved_ty(*pointee, tcx, instance),
+                                )
+                            }
+                            _ => unreachable!("pointer carrier target must be a pointer type"),
+                        }
+                        .unwrap_or_else(|error| {
+                            panic!("could not determine slice pointer layout: {error}")
+                        }),
+                    )
+                    .expect("slice pointer layout exceeds the JVM runtime address space"),
+                )),
+                match target_rust_ty.kind() {
+                    TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _) => {
+                        super::types::pointer_memory_codec_operand(
+                            resolved_ty(*pointee, tcx, instance),
+                            tcx,
+                            data_types,
+                            instance,
+                        )
+                    }
+                    _ => unreachable!("pointer carrier target must be a pointer type"),
+                },
+            ],
+        });
+        return operand_var(dest, target_jvm_ty.clone());
+    }
+
+    if let oomir::Type::Pointer(target_inner) = target_jvm_ty
+        && let TyKind::Ref(_, pointee_ty, _) | TyKind::RawPtr(pointee_ty, _) = target_rust_ty.kind()
+    {
+        let pointee = adapt_operand_to_rust_type(
+            source,
+            *pointee_ty,
+            &format!("{temp_prefix}_pointee"),
+            tcx,
+            instance,
+            data_types,
+            instructions,
+        );
+        if pointee.get_type().as_ref() != Some(target_inner.as_ref()) {
+            return pointee;
+        }
+        let dest = format!("{temp_prefix}_pointer");
+        instructions.push(oomir::Instruction::InvokeStatic {
+            dest: Some(dest.clone()),
+            class_name: oomir::POINTER_CLASS.to_string(),
+            method_name: "cell".to_string(),
+            method_ty: oomir::Signature {
+                params: vec![
+                    (
+                        "value".to_string(),
+                        oomir::Type::Class("java/lang/Object".to_string()),
+                    ),
+                    ("size".to_string(), oomir::Type::I32),
+                    ("codec".to_string(), oomir::Type::String),
+                ],
+                ret: Box::new(target_jvm_ty.clone()),
+                is_static: true,
+            },
+            args: vec![
+                pointee,
+                oomir::Operand::Constant(oomir::Constant::I32(
+                    i32::try_from(
+                        super::types::layout_size_bytes(
+                            tcx,
+                            resolved_ty(*pointee_ty, tcx, instance),
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!("could not determine pointer cell layout: {error}")
+                        }),
+                    )
+                    .expect("pointer cell layout exceeds the JVM runtime address space"),
+                )),
+                super::types::pointer_memory_codec_operand(
+                    resolved_ty(*pointee_ty, tcx, instance),
+                    tcx,
+                    data_types,
+                    instance,
+                ),
+            ],
+        });
+        return operand_var(dest, target_jvm_ty.clone());
+    }
+
+    if let Some(oomir::Type::Pointer(inner)) = source.get_type()
+        && !matches!(target_rust_ty.kind(), TyKind::RawPtr(..) | TyKind::Ref(..))
+    {
+        return super::place::emit_pointer_read(
+            source,
+            inner.as_ref(),
+            &format!("{temp_prefix}_pointer_value"),
+            instructions,
+        );
+    }
+
     if source
         .get_type()
         .as_ref()

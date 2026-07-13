@@ -7,6 +7,7 @@ import java.util.Map;
 import java.util.WeakHashMap;
 import org.rustlang.core.fmt.Arguments__;
 import org.rustlang.core.fmt.rt.Argument__;
+import org.rustlang.runtime.Pointer;
 
 public final class Core {
     private static final Map<Object, String> DISPLAY_VALUES =
@@ -97,6 +98,17 @@ public final class Core {
         for (int i = 0; i < len; i++) {
             int a = left[i] & 0xff;
             int b = right[i] & 0xff;
+            if (a != b) {
+                return a - b;
+            }
+        }
+        return 0;
+    }
+
+    public static int compare_bytes(Pointer left, Pointer right, int len) {
+        for (int i = 0; i < len; i++) {
+            int a = left.offset(i).getI16() & 0xff;
+            int b = right.offset(i).getI16() & 0xff;
             if (a != b) {
                 return a - b;
             }
@@ -209,6 +221,9 @@ public final class Core {
 
     private static Object unwrapNonNull(Object value) {
         Object pointer = readField(value, "pointer");
+        if (pointer instanceof Pointer) {
+            return ((Pointer) pointer).getObject();
+        }
         return pointer == null ? value : pointer;
     }
 

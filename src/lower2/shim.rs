@@ -68,11 +68,7 @@ const SHIMS: &[ShimInfo] = &[
         "formatArguments",
         "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/String;",
     ),
-    direct(
-        CORE_CLASS,
-        "fromShortArray",
-        "([S)Ljava/lang/String;",
-    ),
+    direct(CORE_CLASS, "fromShortArray", "([S)Ljava/lang/String;"),
     direct(
         CORE_CLASS,
         "new_arguments",
@@ -86,16 +82,12 @@ const SHIMS: &[ShimInfo] = &[
     direct(PANICKING_CLASS, "panic", "(Ljava/lang/String;)V"),
     direct(PANICKING_CLASS, "panic_fmt", "(Ljava/lang/Object;)V"),
     direct(CORE_CLASS, "starts_with", "([S[S)Z"),
-    direct(
-        CORE_CLASS,
-        "toShortArray",
-        "(Ljava/lang/String;)[S",
-    ),
+    direct(CORE_CLASS, "toShortArray", "(Ljava/lang/String;)[S"),
     alias(
         "org/rustlang/core/intrinsics",
         "compare_bytes",
         "compare_bytes",
-        "([S[SI)I",
+        "(Lorg/rustlang/runtime/Pointer;Lorg/rustlang/runtime/Pointer;I)I",
     ),
     alias(
         "org/rustlang/core/fmt/Arguments__",
