@@ -1,6 +1,6 @@
 [build]
 rustflags = [
-  "-Z", "codegen-backend=../../../target/release/librustc_codegen_jvm.dylib",
+  "-Z", "codegen-backend=../../../target/release/@RUST_BACKEND_DYLIB@",
   "-C", "linker=../../../java-linker/target/release/java-linker",
   "-C", "link-args=../../../library/build/libs/library-0.1.0.jar",
   "-C", "strip=none"

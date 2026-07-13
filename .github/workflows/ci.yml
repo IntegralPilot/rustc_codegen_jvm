@@ -8,9 +8,21 @@ on:
 
 jobs:
   build-and-test:
-    runs-on: ubuntu-latest
+    name: Build and test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    env:
+      PYTHONUTF8: '1'
 
     steps:
+    - name: Enable Git symlinks on Windows
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: git config --global core.symlinks true
+
     - name: Checkout repository
       uses: actions/checkout@v4
 
@@ -33,12 +45,12 @@ jobs:
 
     - name: Cache cargo dependencies
       uses: Swatinem/rust-cache@v2
-    
+ 
     - name: Build backend and tools
-      run: python3 build.py ci
+      run: python build.py ci
 
     - name: Run integration tests (debug mode)
-      run: python3 Tester.py
+      run: python Tester.py
 
     - name: Run integration tests (release mode)
-      run: python3 Tester.py --release
+      run: python Tester.py --release

@@ -135,19 +135,26 @@ Because output is standard JVM bytecode rather than a native binary, `rustc_code
 
 - **Rust Nightly** - `rustup default nightly`
 - **JDK 8+** - `java`, `javac`, and `jar` must be on `PATH`
-- **Python 3** - `python3` must be on `PATH`
+- **Python 3** - `python` must resolve to Python 3 (`python3` can be substituted on local Linux systems that do not provide the `python` alias)
+- **Windows only:** enable [Developer Mode](https://learn.microsoft.com/windows/apps/get-started/enable-your-device-for-development) or run Git from an elevated terminal so it can create symbolic links
 
 ## Installation & Build
 
-Clone the repository and build all components with the provided build script:
+Clone the repository and build all components with the provided build script.
+
+On Linux or macOS:
 
 ```bash
 git clone https://github.com/IntegralPilot/rustc_codegen_jvm.git
 cd rustc_codegen_jvm
-
-# On Linux or macOS:
 ./build.py all
-# On Windows:
+```
+
+On Windows, enable symlinks during the initial checkout:
+
+```powershell
+git clone -c core.symlinks=true https://github.com/IntegralPilot/rustc_codegen_jvm.git
+cd rustc_codegen_jvm
 python build.py all
 ```
 
