@@ -18,6 +18,13 @@ pub(super) fn carrier_needs_trait_object_adapter(
             data_types.get(class_name),
             Some(oomir::DataType::Class { .. })
         ),
+        oomir::Type::Pointer(inner) => match inner.as_ref() {
+            oomir::Type::Class(class_name) => !matches!(
+                data_types.get(class_name),
+                Some(oomir::DataType::Class { .. })
+            ),
+            _ => true,
+        },
         _ => true,
     }
 }

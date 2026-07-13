@@ -10,10 +10,10 @@
 use crate::oomir;
 use control_flow::convert_basic_block;
 use rustc_middle::{
-    mir::{Body, Local},
+    mir::{BasicBlock, Body, Local, StatementKind},
     ty::{EarlyBinder, Instance, TyCtxt},
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use types::ty_to_oomir_type;
 
 mod closures;
@@ -27,6 +27,86 @@ pub mod types;
 mod value_repr;
 
 pub use closures::generate_closure_function_name;
+
+fn available_pointer_locals_at_block_entries<'tcx>(
+    mir: &Body<'tcx>,
+    pointer_origins: &control_flow::MutableBorrowMap<'tcx>,
+) -> HashMap<BasicBlock, HashSet<Local>> {
+    let all_pointer_locals = pointer_origins.keys().copied().collect::<HashSet<_>>();
+    let mut generated = HashMap::<BasicBlock, HashSet<Local>>::new();
+    let mut predecessors = HashMap::<BasicBlock, Vec<BasicBlock>>::new();
+    let mut reachable = HashSet::new();
+    let mut queue = VecDeque::from([BasicBlock::from_usize(0)]);
+
+    for (block, data) in mir.basic_blocks.iter_enumerated() {
+        let generated_here = data
+            .statements
+            .iter()
+            .filter_map(|statement| {
+                let StatementKind::Assign(box (place, _)) = &statement.kind else {
+                    return None;
+                };
+                (place.projection.is_empty() && pointer_origins.contains_key(&place.local))
+                    .then_some(place.local)
+            })
+            .collect();
+        generated.insert(block, generated_here);
+        for successor in data.terminator().successors() {
+            predecessors.entry(successor).or_default().push(block);
+        }
+    }
+
+    while let Some(block) = queue.pop_front() {
+        if !reachable.insert(block) {
+            continue;
+        }
+        queue.extend(mir.basic_blocks[block].terminator().successors());
+    }
+
+    let entry = BasicBlock::from_usize(0);
+    let mut available = mir
+        .basic_blocks
+        .indices()
+        .map(|block| {
+            let initial = if block == entry || !reachable.contains(&block) {
+                HashSet::new()
+            } else {
+                all_pointer_locals.clone()
+            };
+            (block, initial)
+        })
+        .collect::<HashMap<_, _>>();
+
+    loop {
+        let mut changed = false;
+        for block in mir.basic_blocks.indices().filter(|block| *block != entry) {
+            if !reachable.contains(&block) {
+                continue;
+            }
+            let incoming = predecessors
+                .get(&block)
+                .into_iter()
+                .flatten()
+                .filter(|predecessor| reachable.contains(predecessor))
+                .map(|predecessor| {
+                    let mut outgoing = available[predecessor].clone();
+                    outgoing.extend(generated[predecessor].iter().copied());
+                    outgoing
+                })
+                .reduce(|left, right| left.intersection(&right).copied().collect())
+                .unwrap_or_default();
+            if available.get(&block) != Some(&incoming) {
+                available.insert(block, incoming);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    available
+}
 
 /// Converts a MIR body into an OOMIR function and control-flow graph.
 /// `fn_name_override` supplies names for closures, which lack normal rustc item names.
@@ -156,7 +236,10 @@ pub fn mir_to_oomir<'tcx>(
     let entry_label = "bb0".to_string();
 
     let mir_cloned = mir.clone();
-    let mut mutable_borrows = control_flow::MutableBorrowMap::new();
+    let mut mutable_borrows =
+        control_flow::collect_pointer_origins(&mir_cloned, tcx, instance, data_types);
+    let available_pointer_locals =
+        available_pointer_locals_at_block_entries(&mir_cloned, &mutable_borrows);
 
     // Need read-only access to mir for local_decls inside the loop
     for (bb, bb_data) in mir.basic_blocks_mut().iter_enumerated() {
@@ -170,6 +253,10 @@ pub fn mir_to_oomir<'tcx>(
             &mut basic_blocks,
             data_types,
             &mut mutable_borrows,
+            available_pointer_locals
+                .get(&bb)
+                .cloned()
+                .unwrap_or_default(),
         ); // Pass return type here
         basic_blocks.insert(bb_ir.label.clone(), bb_ir);
     }
@@ -211,6 +298,84 @@ pub fn mir_to_oomir<'tcx>(
                 }
             }
         }
+    }
+
+    for (local, _) in mir_cloned.local_decls.iter_enumerated() {
+        if !place::local_uses_stable_cell(local, &mir_cloned) {
+            continue;
+        }
+        let value_type = place::get_place_type(
+            &rustc_middle::mir::Place::from(local),
+            &mir_cloned,
+            tcx,
+            instance,
+            data_types,
+        );
+        let implicit_zst = value_repr::materialize_implicit_zst(
+            mir_cloned.local_decls[local].ty,
+            &format!("{}_initial", place::local_cell_name(local)),
+            tcx,
+            instance,
+            data_types,
+            &mut instrs,
+        );
+        let initial_value = if local.index() > 0
+            && local.index() <= mir_cloned.arg_count
+            && value_type.has_jvm_value()
+        {
+            oomir::Operand::Variable {
+                name: format!("_{}", local.index()),
+                ty: value_type.clone(),
+            }
+        } else if let Some(value) = implicit_zst {
+            value
+        } else {
+            oomir::Operand::Constant(oomir::Constant::Null(oomir::Type::Class(
+                "java/lang/Object".to_string(),
+            )))
+        };
+        instrs.push(oomir::Instruction::InvokeStatic {
+            dest: Some(place::local_cell_name(local)),
+            class_name: oomir::POINTER_CLASS.to_string(),
+            method_name: "cell".to_string(),
+            method_ty: oomir::Signature {
+                params: vec![
+                    (
+                        "value".to_string(),
+                        oomir::Type::Class("java/lang/Object".to_string()),
+                    ),
+                    ("size".to_string(), oomir::Type::I32),
+                    ("codec".to_string(), oomir::Type::String),
+                ],
+                ret: Box::new(oomir::Type::Pointer(Box::new(value_type))),
+                is_static: true,
+            },
+            args: vec![
+                initial_value,
+                oomir::Operand::Constant(oomir::Constant::I32(
+                    i32::try_from(
+                        types::layout_size_bytes(
+                            tcx,
+                            EarlyBinder::bind(tcx, mir_cloned.local_decls[local].ty)
+                                .instantiate(tcx, instance.args)
+                                .skip_norm_wip(),
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!("could not determine stable local layout: {error}")
+                        }),
+                    )
+                    .expect("stable local layout exceeds the JVM runtime address space"),
+                )),
+                types::pointer_memory_codec_operand(
+                    EarlyBinder::bind(tcx, mir_cloned.local_decls[local].ty)
+                        .instantiate(tcx, instance.args)
+                        .skip_norm_wip(),
+                    tcx,
+                    data_types,
+                    instance,
+                ),
+            ],
+        });
     }
 
     // add instrs to the start of the entry block

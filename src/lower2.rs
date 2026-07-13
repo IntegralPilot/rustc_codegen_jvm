@@ -3,7 +3,7 @@
 //! This module converts OOMIR into JVM bytecode.
 
 use crate::oomir::{self, DataType};
-use helpers::oomir_function_stack_floor;
+use helpers::{get_cast_instructions, oomir_function_stack_floor};
 use jvm_gen::{
     create_data_type_classfile_for_class, create_data_type_classfile_for_interface,
     create_default_constructor, create_slice_view_classfile, create_utf8_view_classfile,
@@ -11,12 +11,12 @@ use jvm_gen::{
 };
 use translator::FunctionTranslator;
 
-use constant_pool::{InternedConstantPool, verify_no_duplicate_constants};
-use consts::load_constant;
 use self::jvm::{
     ClassAccessFlags, ClassFile, FieldAccessFlags, MethodAccessFlags, Version,
     attributes::{Attribute, Instruction, MaxStack},
 };
+use constant_pool::{InternedConstantPool, verify_no_duplicate_constants};
+use consts::load_constant;
 use rustc_middle::ty::TyCtxt;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -50,6 +50,7 @@ fn factory_return_instruction(ty: &oomir::Type) -> Instruction {
         | oomir::Type::Array(_)
         | oomir::Type::Slice(_)
         | oomir::Type::Reference(_)
+        | oomir::Type::Pointer(_)
         | oomir::Type::MutableReference(_)
         | oomir::Type::Interface(_) => Instruction::Areturn,
         oomir::Type::Void | oomir::Type::Unit => Instruction::Return,
@@ -164,22 +165,35 @@ fn create_static_initializer_method(
             });
         }
 
-        let initializer = if static_value.is_mutable {
-            let cell = oomir::Constant::Array(
-                Box::new(static_value.value_type.clone()),
-                vec![static_value.initializer.clone()],
-            );
-            create_constant_factory(cp, owner_class, &cell, methods, &mut next_factory)?
-        } else {
-            create_constant_factory(
-                cp,
-                owner_class,
-                &static_value.initializer,
-                methods,
-                &mut next_factory,
-            )?
-        };
+        let initializer = create_constant_factory(
+            cp,
+            owner_class,
+            &static_value.initializer,
+            methods,
+            &mut next_factory,
+        )?;
+        let initializer_type = oomir::Type::from_constant(&initializer);
         load_constant(&mut instructions, cp, &initializer)?;
+
+        if matches!(static_value.storage_type, oomir::Type::Pointer(_)) {
+            if initializer_type.has_jvm_value() {
+                instructions.extend(get_cast_instructions(
+                    "<clinit>",
+                    &initializer_type,
+                    &oomir::Type::Class("java/lang/Object".to_string()),
+                    cp,
+                )?);
+            } else {
+                instructions.push(Instruction::Aconst_null);
+            }
+            let pointer_class = cp.add_class(oomir::POINTER_CLASS)?;
+            let cell = cp.add_method_ref(
+                pointer_class,
+                "cell",
+                &format!("(Ljava/lang/Object;)L{};", oomir::POINTER_CLASS),
+            )?;
+            instructions.push(Instruction::Invokestatic(cell));
+        }
 
         let field_ref = cp.add_field_ref(
             this_class_index,
@@ -328,7 +342,10 @@ pub fn oomir_to_jvm_bytecode(
                 translator
                     .translate()
                     .map_err(|error| jvm::Error::VerificationError {
-                        context: format!("Function {class_name_jvm}::{} - {} of {}", function.name, current_index, total_functions),
+                        context: format!(
+                            "Function {class_name_jvm}::{} - {} of {}",
+                            function.name, current_index, total_functions
+                        ),
                         message: format!("Failed to translate function: {error:?}"),
                     })?;
 

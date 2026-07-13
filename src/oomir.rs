@@ -15,6 +15,7 @@ pub mod interpret;
 
 pub const SLICE_VIEW_CLASS: &str = "org/rustlang/runtime/SliceView";
 pub const UTF8_VIEW_CLASS: &str = "org/rustlang/runtime/Utf8View";
+pub const POINTER_CLASS: &str = "org/rustlang/runtime/Pointer";
 
 // OOMIR definitions
 #[derive(Debug, Clone)]
@@ -76,10 +77,8 @@ impl std::fmt::Display for FunctionKey {
 pub struct Static {
     pub owner_class: String,
     pub field_name: String,
-    pub value_type: Type,
     pub storage_type: Type,
     pub initializer: Constant,
-    pub is_mutable: bool,
     pub is_thread_local: bool,
 }
 
@@ -235,7 +234,7 @@ impl Signature {
         let has_self = !self.is_static && !self.params.is_empty() && {
             matches!(
                 &self.params[0].1,
-                Type::Class(_) | Type::Interface(_) | Type::MutableReference(_)
+                Type::Class(_) | Type::Interface(_) | Type::Pointer(_) | Type::MutableReference(_)
             )
         };
         let params_to_iterate = if has_self {
@@ -822,7 +821,8 @@ pub enum Type {
     I64,
     F32,
     F64,
-    MutableReference(Box<Type>), // Same as an Array
+    Pointer(Box<Type>),  // A sized Rust reference or raw pointer.
+    MutableReference(Box<Type>),
     Reference(Box<Type>), // Representing references, not currently constructed but might be useful in future for more complex things.
     Array(Box<Type>),     // Representing arrays
     Slice(Box<Type>),     // A view over an array with an offset and length.
@@ -859,6 +859,7 @@ impl Type {
             // U64 is too large for a primitive; it's mapped to a BigInteger:
             Type::F32 => "F".to_string(),
             Type::F64 => "D".to_string(),
+            Type::Pointer(_) => format!("L{};", POINTER_CLASS),
             Type::Str => format!("L{};", UTF8_VIEW_CLASS),
             Type::String => "Ljava/lang/String;".to_string(),
             Type::Class(name) | Type::Interface(name) => format!("L{};", name.replace('.', "/")),
@@ -924,6 +925,7 @@ impl Type {
             Type::Str => Some(UTF8_VIEW_CLASS.to_string()),
             Type::String => Some("java/lang/String".to_string()),
             Type::Class(name) => Some(name.replace('.', "/")),
+            Type::Pointer(_) => Some(POINTER_CLASS.to_string()),
             Type::Reference(inner) => inner.to_jvm_internal_name(), // delegate to inner type
             // For array-valued types, the descriptor is the component class name
             // expected by `anewarray`. Mutable references use one-element arrays.
@@ -973,6 +975,7 @@ impl Type {
             | Type::Slice(_)
             | Type::Reference(_)
             | Type::MutableReference(_) => Some(JVMInstruction::Aastore),
+            Type::Pointer(_) => Some(JVMInstruction::Aastore),
             Type::Void => None,
             Type::Unit => None,
         }
@@ -1001,6 +1004,7 @@ impl Type {
             | Type::Reference(_)
             | Type::MutableReference(_)
             | Type::Interface(_) => Some(JVMInstruction::Aaload),
+            Type::Pointer(_) => Some(JVMInstruction::Aaload),
             Type::Void => None,
             Type::Unit => None,
         }
@@ -1062,6 +1066,7 @@ impl Type {
         matches!(
             self,
             Type::Reference(_)
+                | Type::Pointer(_)
                 | Type::MutableReference(_)
                 | Type::Array(_)
                 | Type::Slice(_)
@@ -1108,6 +1113,7 @@ impl Type {
     pub fn to_jvm_descriptor_or_internal_name(&self) -> Option<String> {
         match self {
             Type::Class(name) | Type::Interface(name) => Some(name.clone()),
+            Type::Pointer(_) => Some(POINTER_CLASS.to_string()),
             Type::Array(_) => Some(self.to_jvm_descriptor()), // Array descriptor works for checkcast/anewarray
             Type::Slice(_) => Some(SLICE_VIEW_CLASS.to_string()),
             Type::Str => Some(UTF8_VIEW_CLASS.to_string()),
@@ -1132,6 +1138,7 @@ impl Type {
             }
             // Handle nested types recursively
             Type::MutableReference(inner)
+            | Type::Pointer(inner)
             | Type::Reference(inner)
             | Type::Array(inner)
             | Type::Slice(inner) => inner.replace_class(old_name, new_name),
@@ -1168,6 +1175,9 @@ impl Type {
             Type::Array(inner) | Type::MutableReference(inner) | Type::Reference(inner) => {
                 inner.get_class_name()
             }
+            // Method dispatch through a Rust reference targets the pointee;
+            // pointer-native methods are redirected explicitly during lowering.
+            Type::Pointer(inner) => inner.get_class_name(),
             _ => None,
         }
     }
@@ -1181,7 +1191,7 @@ impl fmt::Display for Signature {
         let has_self = !self.is_static && !self.params.is_empty() && {
             matches!(
                 &self.params[0].1,
-                Type::Class(_) | Type::Interface(_) | Type::MutableReference(_)
+                Type::Class(_) | Type::Interface(_) | Type::Pointer(_) | Type::MutableReference(_)
             )
         };
         let params_to_iterate = if has_self {

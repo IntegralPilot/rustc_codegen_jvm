@@ -44,13 +44,16 @@ class Config:
 
     # Platform-specific details
     if platform.system() == "Windows":
+        DYLIB_PREFIX = ""
         DYLIB_SUFFIX = ".dll"
     elif platform.system() == "Darwin":
+        DYLIB_PREFIX = "lib"
         DYLIB_SUFFIX = ".dylib"
     else:
+        DYLIB_PREFIX = "lib"
         DYLIB_SUFFIX = ".so"
         
-    RUST_BACKEND_DYLIB = ROOT_DIR / "target/release" / f"librustc_codegen_jvm{DYLIB_SUFFIX}"
+    RUST_BACKEND_DYLIB = ROOT_DIR / "target/release" / f"{DYLIB_PREFIX}rustc_codegen_jvm{DYLIB_SUFFIX}"
     JAVA_LINKER_EXE = JAVA_LINKER_DIR / "target/release/java-linker"
 
 # --- Helper Functions ---
@@ -195,8 +198,8 @@ def generate_config_files():
 
     # Logic from GenerateFiles.py is now integrated here
     replacements = {
-        "../../../": str(Config.ROOT_DIR) + os.sep,
-        ".dylib": Config.DYLIB_SUFFIX
+        "../../../": Config.ROOT_DIR.as_posix() + "/",
+        "@RUST_BACKEND_DYLIB@": Config.RUST_BACKEND_DYLIB.name,
     }
 
     for template_path in Config.ROOT_DIR.glob("*.template"):

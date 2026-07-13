@@ -193,6 +193,7 @@ pub fn get_load_instruction(ty: &Type, index: u16) -> Result<Instruction, jvm::E
         },
         // Reference-like types
         Type::Reference(_)
+        | Type::Pointer(_)
         | Type::MutableReference(_)
         | Type::Array(_)
         | Type::Slice(_)
@@ -281,8 +282,8 @@ pub fn get_store_instruction(ty: &Type, index: u16) -> Result<Instruction, jvm::
                 Instruction::Dstore_w(index)
             }
         }
-        Reference(_) | MutableReference(_) | Array(_) | Slice(_) | Str | String | Class(_)
-        | Interface(_) => {
+        Reference(_) | Pointer(_) | MutableReference(_) | Array(_) | Slice(_) | Str | String
+        | Class(_) | Interface(_) => {
             if index <= 3 {
                 match index {
                     0 => Instruction::Astore_0,
@@ -513,6 +514,7 @@ pub fn get_cast_instructions(
         Type::F32 => vec![JI::Fconst_0],
         Type::F64 => vec![JI::Dconst_0],
         Type::MutableReference(_)
+        | Type::Pointer(_)
         | Type::Reference(_)
         | Type::Array(_)
         | Type::Slice(_)

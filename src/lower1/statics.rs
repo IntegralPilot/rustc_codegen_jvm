@@ -23,10 +23,10 @@ pub fn static_ref_constant<'tcx>(
 ) -> oomir::Constant {
     let rust_ty = tcx.type_of(def_id).skip_binder();
     let value_type = ty_to_oomir_type(rust_ty, tcx, data_types, instance);
-    let ty = if tcx.is_mutable_static(def_id) {
-        oomir::Type::MutableReference(Box::new(value_type))
-    } else {
+    let ty = if matches!(value_type, oomir::Type::Array(_)) {
         value_type
+    } else {
+        oomir::Type::Pointer(Box::new(value_type))
     };
     let (owner_class, field_name) = identity(tcx, def_id);
     oomir::Constant::StaticRef {
@@ -44,11 +44,10 @@ pub fn lower_static<'tcx>(
     let rust_ty = tcx.type_of(def_id).skip_binder();
     let instance = Instance::mono(tcx, def_id);
     let value_type = ty_to_oomir_type(rust_ty, tcx, &mut module.data_types, instance);
-    let is_mutable = tcx.is_mutable_static(def_id);
-    let storage_type = if is_mutable {
-        oomir::Type::MutableReference(Box::new(value_type.clone()))
-    } else {
+    let storage_type = if matches!(value_type, oomir::Type::Array(_)) {
         value_type.clone()
+    } else {
+        oomir::Type::Pointer(Box::new(value_type.clone()))
     };
     let allocation = tcx
         .eval_static_initializer(def_id)
@@ -65,10 +64,8 @@ pub fn lower_static<'tcx>(
     let static_value = oomir::Static {
         owner_class,
         field_name,
-        value_type,
         storage_type,
         initializer,
-        is_mutable,
         is_thread_local: tcx.is_thread_local_static(def_id),
     };
     module.statics.insert(static_value.key(), static_value);

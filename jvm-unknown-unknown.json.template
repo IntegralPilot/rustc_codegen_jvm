@@ -9,7 +9,7 @@
   "emit-debug-gdb-scripts": false,
   "exe-suffix": ".jar",
   "linker": "../../../java-linker/target/debug/java-linker",
-  "default-codegen-backend": "../../../target/debug/librustc_codegen_jvm.dylib",
+  "default-codegen-backend": "../../../target/debug/@RUST_BACKEND_DYLIB@",
   "max-atomic-width": 64,
   "metadata": {
     "description": "Java Bytecode",

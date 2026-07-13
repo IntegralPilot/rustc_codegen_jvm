@@ -59,6 +59,7 @@ These examples live in `tests/binary`, are compiled to JVM bytecode, and are ver
 | **[Enums](tests/binary/enums/src/main.rs)** / **[Structs](tests/binary/structs/src/main.rs)** | Nested data structures - tuples, arrays, slices |
 | **[Impl blocks](tests/binary/impl/src/main.rs)** / **[Traits](tests/binary/traits/src/main.rs)** | Trait implementations, including dynamic dispatch |
 | **[Function pointers](tests/binary/fn_pointers/src/main.rs)** | Function pointers as values, fields, parameters, returns, and generic members |
+| **[Raw pointers](tests/binary/raw_ptrs/src/main.rs)** | Stable pointer identity, dereferencing, casts, arithmetic, nested pointers and lots more! |
 | **[Unions](tests/binary/unions/src/main.rs)** | `unsafe` union handling, running on the JVM |
 
 ## Features
@@ -74,7 +75,7 @@ These examples live in `tests/binary`, are compiled to JVM bytecode, and are ver
 - **Functions & closures:** calls, recursion, function pointers (as values, parameters, return types, and in generics), and closure capture.
 - **OOP constructs** such as `impl` blocks for ADTs, including `self`, `&self`, and `&mut self`.
 - **Traits** and dynamic dispatch via `&dyn Trait`.
-- **Memory management,** currently mutable borrowing, references, and dereferencing, with more complex stuff currently WIP!
+- **Memory management:** shared and mutable references, raw pointers, stable address identity, dereferencing, typed pointer arithmetic, null pointers, pointer casts, etc.
 - **Unions** support primitive values, references, tuples, structs, fixed-size arrays, and fieldless or data-carrying enums, including recursively nested combinations of these types.
 - **Transmute** between everything supported by unions (uses the same inner machinery)
 - **Outputs** executable, self-contained `.jar` generation for binary crates.
@@ -116,6 +117,7 @@ Rust types map onto the JVM's class model directly, which is what makes interop 
 | `fn(A, B) -> R` | A generated single-method Java interface for that signature, with adapter classes for Rust function definitions |
 | `impl` methods (`self`, `&self`, `&mut self`) | Instance methods on the generated class |
 | `&dyn Trait` | The generated Java interface type, usable as a normal Java argument or return type |
+| Sized `&T`, `&mut T`, `*const T`, `*mut T` | A shared runtime pointer class backed by stable scalar cells / native JVM arrays |
 
 For supported constructs, there is no manual marshalling and no bindings layer to maintain, unlike JNI or Project Panama.
 
@@ -133,19 +135,26 @@ Because output is standard JVM bytecode rather than a native binary, `rustc_code
 
 - **Rust Nightly** - `rustup default nightly`
 - **JDK 8+** - `java`, `javac`, and `jar` must be on `PATH`
-- **Python 3** - `python3` must be on `PATH`
+- **Python 3** - `python` must resolve to Python 3 (`python3` can be substituted on local Linux systems that do not provide the `python` alias)
+- **Windows only:** enable [Developer Mode](https://learn.microsoft.com/windows/apps/get-started/enable-your-device-for-development) or run Git from an elevated terminal so it can create symbolic links
 
 ## Installation & Build
 
-Clone the repository and build all components with the provided build script:
+Clone the repository and build all components with the provided build script.
+
+On Linux or macOS:
 
 ```bash
 git clone https://github.com/IntegralPilot/rustc_codegen_jvm.git
 cd rustc_codegen_jvm
-
-# On Linux or macOS:
 ./build.py all
-# On Windows:
+```
+
+On Windows, enable symlinks during the initial checkout:
+
+```powershell
+git clone -c core.symlinks=true https://github.com/IntegralPilot/rustc_codegen_jvm.git
+cd rustc_codegen_jvm
 python build.py all
 ```
 

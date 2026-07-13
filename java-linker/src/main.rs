@@ -91,8 +91,105 @@ fn record_instrumentation_duration(stage: &'static str, duration: Duration) {
     }
 }
 
+fn msvc_output_path(arg: &str) -> Option<&str> {
+    let prefix = arg.get(..5)?;
+    prefix.eq_ignore_ascii_case("/out:").then(|| &arg[5..])
+}
+
+fn jar_output_path(mut output_name: String) -> String {
+    if output_name.to_ascii_lowercase().ends_with(".exe") {
+        output_name.truncate(output_name.len() - ".exe".len());
+    }
+    if !output_name.to_ascii_lowercase().ends_with(".jar") {
+        output_name.push_str(".jar");
+    }
+    output_name
+}
+
+fn parse_response_lines(content: &str, msvc_quoting: bool) -> Vec<String> {
+    content
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim_end_matches('\r');
+            if line.is_empty() {
+                return None;
+            }
+
+            let line = if msvc_quoting {
+                line.strip_prefix('"')
+                    .and_then(|line| line.strip_suffix('"'))
+                    .unwrap_or(line)
+            } else {
+                line
+            };
+
+            let mut parsed = String::with_capacity(line.len());
+            let mut chars = line.chars().peekable();
+            while let Some(character) = chars.next() {
+                if character == '\\' {
+                    if msvc_quoting {
+                        if chars.peek() == Some(&'"') {
+                            parsed.push(chars.next().unwrap());
+                        } else {
+                            parsed.push(character);
+                        }
+                    } else if let Some(escaped) = chars.next() {
+                        parsed.push(escaped);
+                    } else {
+                        parsed.push(character);
+                    }
+                } else {
+                    parsed.push(character);
+                }
+            }
+            Some(parsed)
+        })
+        .collect()
+}
+
+fn read_response_file(path: &Path) -> io::Result<Vec<String>> {
+    let bytes = fs::read(path)?;
+    if bytes.starts_with(&[0xff, 0xfe]) {
+        let body = &bytes[2..];
+        if body.len() % 2 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "UTF-16 response file has an odd byte length",
+            ));
+        }
+        let units: Vec<u16> = body
+            .chunks_exact(2)
+            .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+            .collect();
+        let content = String::from_utf16(&units)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        Ok(parse_response_lines(&content, true))
+    } else {
+        let content =
+            std::str::from_utf8(bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&bytes))
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        Ok(parse_response_lines(content, false))
+    }
+}
+
+fn linker_args() -> io::Result<Vec<String>> {
+    let mut command_line = env::args();
+    let mut expanded = vec![command_line.next().unwrap_or_else(|| "java-linker".into())];
+    for arg in command_line {
+        if let Some(path) = arg.strip_prefix('@') {
+            expanded.extend(read_response_file(Path::new(path))?);
+        } else {
+            expanded.push(arg);
+        }
+    }
+    Ok(expanded)
+}
+
 fn main() -> Result<(), i32> {
-    let args: Vec<String> = env::args().collect();
+    let args = linker_args().map_err(|error| {
+        eprintln!("Error: Failed to read linker response file: {error}");
+        1
+    })?;
     if args.len() < 3 {
         eprintln!("Usage: java-linker <input_files...> -o <output_jar_file>");
         return Err(1);
@@ -110,16 +207,19 @@ fn main() -> Result<(), i32> {
         let arg = &args[i];
         if arg == "-o" {
             if i + 1 < args.len() {
-                let mut output_name = args[i + 1].clone();
-                if !output_name.ends_with(".jar") {
-                    output_name.push_str(".jar");
-                }
-                output_file = Some(output_name);
+                output_file = Some(jar_output_path(args[i + 1].clone()));
                 i += 2;
             } else {
                 eprintln!("Error: -o flag requires an output file path");
                 return Err(1);
             }
+        } else if let Some(output_name) = msvc_output_path(arg) {
+            if output_name.is_empty() {
+                eprintln!("Error: /OUT: flag requires an output file path");
+                return Err(1);
+            }
+            output_file = Some(jar_output_path(output_name.to_owned()));
+            i += 1;
         } else if !arg.starts_with('-') {
             // Collect potential input files, differentiating classes and JARs
             if arg.ends_with(".class") {
@@ -132,12 +232,10 @@ fn main() -> Result<(), i32> {
                 input_rlib_files.push(arg.clone());
                 i += 1;
             } else {
-                // If it's not a flag and not a recognized input type, warn or error
-                eprintln!("Warning: Ignoring unrecognized argument: {}", arg);
+                // smth native - not useful to us
                 i += 1; // Move to the next argument
             }
         } else {
-            eprintln!("Warning: Ignoring unknown or unused flag: {}", arg);
             i += 1;
         }
     }
@@ -158,7 +256,7 @@ fn main() -> Result<(), i32> {
     let output_file_path = match output_file {
         Some(path) => path,
         None => {
-            eprintln!("Error: Output file (-o) not specified.");
+            eprintln!("Error: Output file (-o or /OUT:) not specified.");
             return Err(1);
         }
     };
@@ -481,7 +579,6 @@ fn create_jar(
     // --- Stage 2: Create Intermediate JAR (only with loose app classes) ---
     let intermediate_jar_path = temp_dir_path.join("intermediate_app.jar");
     if !app_classes.is_empty() {
-        println!("Creating intermediate JAR for app classes...");
         let output_file = fs::File::create(&intermediate_jar_path)?;
         let mut zip_writer = ZipWriter::new(output_file);
         let options = SimpleFileOptions::default()
@@ -497,15 +594,6 @@ fn create_jar(
             zip_writer.write_all(&class_info.data)?;
         }
         zip_writer.finish()?;
-        println!(
-            "Intermediate JAR created at: {}",
-            intermediate_jar_path.display()
-        );
-    } else {
-        println!(
-            "No loose application .class files found; intermediate JAR will be empty or skipped."
-        );
-        // If app_classes is empty, intermediate_jar_path won't exist. Handle this later.
     }
 
     // --- Stage 3: Bundle generated classes and input JARs ---
@@ -526,16 +614,11 @@ fn create_jar(
     // --- Stage 4: Add Manifest ---
     let final_jar_temp_path = temp_dir_path.join("final_with_manifest.jar");
 
-    println!("Adding manifest to: {}", source_jar_for_manifest.display());
     add_manifest_to_jar(
         &source_jar_for_manifest,
         &final_jar_temp_path,
         main_class_name,
     )?;
-    println!(
-        "Manifest added. Temporary final JAR at: {}",
-        final_jar_temp_path.display()
-    );
 
     // --- Stage 5: Move final JAR to destination ---
     if let Some(parent_dir) = Path::new(final_output_jar_path).parent() {
@@ -553,7 +636,6 @@ fn create_jar(
                     e
                 );
                 fs::copy(&final_jar_temp_path, final_output_jar_path)?;
-                println!("Copied temporary JAR to final destination.");
                 // We might want to manually clean up the source temp file after copy, but tempdir should handle it on drop.
             } else {
                 eprintln!(
@@ -847,4 +929,55 @@ fn create_manifest_content(main_class_name: Option<&str>) -> String {
     // Crucial: Ensure the manifest ends with a blank line (CRLF CRLF)
     manifest.push_str("\r\n");
     manifest
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{jar_output_path, msvc_output_path, parse_response_lines};
+
+    #[test]
+    fn recognizes_msvc_output_argument_case_insensitively() {
+        assert_eq!(
+            msvc_output_path("/OUT:C:\\tmp\\app.exe"),
+            Some("C:\\tmp\\app.exe")
+        );
+        assert_eq!(
+            msvc_output_path("/out:C:\\tmp\\app.exe"),
+            Some("C:\\tmp\\app.exe")
+        );
+        assert_eq!(msvc_output_path("/DEBUG"), None);
+    }
+
+    #[test]
+    fn converts_native_output_names_to_jar_names() {
+        assert_eq!(jar_output_path("target/app".into()), "target/app.jar");
+        assert_eq!(jar_output_path("target/app.exe".into()), "target/app.jar");
+        assert_eq!(jar_output_path("target/app.EXE".into()), "target/app.jar");
+        assert_eq!(jar_output_path("target/app.jar".into()), "target/app.jar");
+    }
+
+    #[test]
+    fn parses_rustc_msvc_response_file_lines() {
+        let content = concat!(
+            "\"C:\\project with spaces\\Main.class\"\n",
+            "\"/OUT:C:\\project with spaces\\app.exe\"\n",
+            "\"/PDBALTPATH:%_PDB%\"\n",
+        );
+        assert_eq!(
+            parse_response_lines(content, true),
+            [
+                "C:\\project with spaces\\Main.class",
+                "/OUT:C:\\project with spaces\\app.exe",
+                "/PDBALTPATH:%_PDB%",
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_rustc_gnu_response_file_lines() {
+        assert_eq!(
+            parse_response_lines("path\\ with\\ spaces/Main.class\n-o\noutput\n", false),
+            ["path with spaces/Main.class", "-o", "output"]
+        );
+    }
 }
