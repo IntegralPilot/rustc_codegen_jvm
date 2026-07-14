@@ -35,6 +35,12 @@ def run_command(cmd: list, cwd=None):
     proc = subprocess.run(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     return proc
 
+def log_ci_diagnostic(logs: list, content: str):
+    """If running in a CI environment, formats and appends the diagnostic output to the logs."""
+    if "CI" in os.environ:
+        indented = "\n".join(f"|   > {line}" for line in content.splitlines())
+        logs.append(f"|---- 🔍 CI Diagnostic Output:\n{indented}")
+
 def build_rust_code(test_dir: str, release_mode: bool, logs: list) -> tuple[bool, str]:
     """Builds the Rust code and returns (success, target_dir_name)."""
     logs.append("|--- ⚒️ Building with Cargo...")
@@ -54,6 +60,7 @@ def build_rust_code(test_dir: str, release_mode: bool, logs: list) -> tuple[bool
         output = f"STDOUT:\n{proc.stdout}\n\nSTDERR:\n{proc.stderr}"
         write_to_file(fail_path, output)
         logs.append(f"|---- ❌ cargo build exited with code {proc.returncode}")
+        log_ci_diagnostic(logs, output)
         return False, ""
 
     return True, target_dir
@@ -106,12 +113,14 @@ def check_results(proc, test_dir: str, release_mode: bool, logs: list) -> bool:
             output = f"Expected return code: {expected_returncode}\nActual return code: {proc.returncode}\n\nSTDOUT:\n{proc.stdout}\n\nSTDERR:\n{proc.stderr}"
             write_to_file(fail_path, output)
             logs.append(f"|---- ❌ java exited with code {proc.returncode}, expected {expected_returncode}")
+            log_ci_diagnostic(logs, output)
             return False
     elif proc.returncode != 0:
         fail_path = os.path.join(test_dir, "java-fail.generated")
         output = f"STDOUT:\n{proc.stdout}\n\nSTDERR:\n{proc.stderr}"
         write_to_file(fail_path, output)
         logs.append(f"|---- ❌ java exited with code {proc.returncode}")
+        log_ci_diagnostic(logs, output)
         return False
 
     # Check output
@@ -133,6 +142,7 @@ def check_results(proc, test_dir: str, release_mode: bool, logs: list) -> bool:
             diff_content = f"--- EXPECTED ---\n{read_from_file(expected_file)}\n\n--- ACTUAL STDOUT ---\n{proc.stdout}\n\n--- ACTUAL STDERR ---\n{proc.stderr}\n"
             write_to_file(diff_path, diff_content)
             logs.append("|---- ❌ java output did not match expected output")
+            log_ci_diagnostic(logs, diff_content)
             return False
         else:
             logs.append("|--- ✅ Output matches expected output!")
@@ -157,8 +167,10 @@ def process_binary_test(test_dir: str, release_mode: bool, logs: list) -> bool:
     proc = run_command(["cargo", "clean"], cwd=test_dir)
     if proc.returncode != 0:
         fail_path = os.path.join(test_dir, "cargo-clean-fail.generated")
-        write_to_file(fail_path, f"STDOUT:\n{proc.stdout}\n\nSTDERR:\n{proc.stderr}")
+        output = f"STDOUT:\n{proc.stdout}\n\nSTDERR:\n{proc.stderr}"
+        write_to_file(fail_path, output)
         logs.append(f"|---- ❌ cargo clean exited with code {proc.returncode}")
+        log_ci_diagnostic(logs, output)
         return False
 
     build_ok, target_dir = build_rust_code(test_dir, release_mode, logs)
@@ -222,8 +234,10 @@ def process_integration_test(test_dir: str, release_mode: bool, logs: list) -> b
     proc = run_command(javac_cmd, cwd=test_dir)
     if proc.returncode != 0:
         fail_path = os.path.join(test_dir, "javac-fail.generated")
-        write_to_file(fail_path, f"STDOUT:\n{proc.stdout}\n\nSTDERR:\n{proc.stderr}")
+        output = f"STDOUT:\n{proc.stdout}\n\nSTDERR:\n{proc.stderr}"
+        write_to_file(fail_path, output)
         logs.append(f"|---- ❌ javac exited with code {proc.returncode}")
+        log_ci_diagnostic(logs, output)
         return False
 
     logs.append("|--- 🤖 Running with Java...")

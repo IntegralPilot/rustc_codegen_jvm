@@ -488,9 +488,12 @@ fn enum_variant_drop_glue_function<'tcx>(
             oomir::Operand::Constant(oomir::Constant::Unit)
         };
 
-        if field_ty.needs_drop(tcx, TypingEnv::fully_monomorphized()) {
+        let drop_field_ty = tcx.erase_and_anonymize_regions(field_ty);
+        if !drop_field_ty.has_escaping_bound_vars()
+            && drop_field_ty.needs_drop(tcx, TypingEnv::fully_monomorphized())
+        {
             super::control_flow::emit_rust_drop_value(
-                field_ty,
+                drop_field_ty,
                 field_value,
                 &format!("_drop_field_{field_index}"),
                 tcx,

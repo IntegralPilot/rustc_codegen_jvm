@@ -1258,34 +1258,9 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                     source_place.ty(&mir.local_decls, tcx).ty
                 )
             );
-            let is_trait_object = match dest_ty.kind() {
-                rustc_middle::ty::TyKind::Ref(_, pointee_ty, _) => {
-                    let is_dyn =
-                        matches!(pointee_ty.kind(), rustc_middle::ty::TyKind::Dynamic(_, _));
-                    breadcrumbs::log!(
-                        breadcrumbs::LogLevel::Info,
-                        "mir-lowering",
-                        format!(
-                            "Rvalue::Ref dest_ty is Ref: pointee_ty={:?}, is_dyn={}, is_trait_object={}",
-                            pointee_ty, is_dyn, is_dyn
-                        )
-                    );
-                    is_dyn
-                }
-                _ => {
-                    breadcrumbs::log!(
-                        breadcrumbs::LogLevel::Info,
-                        "mir-lowering",
-                        format!(
-                            "Rvalue::Ref dest_ty is not Ref: {:?}, is_trait_object=false",
-                            dest_ty
-                        )
-                    );
-                    false
-                }
-            };
-
             let reference_oomir_ty = ty_to_oomir_type(dest_ty, tcx, data_types, instance);
+            let is_trait_object = matches!(dest_ty.kind(), TyKind::Ref(..))
+                && matches!(reference_oomir_ty, oomir::Type::Interface(_));
             if matches!(reference_oomir_ty, oomir::Type::Pointer(_)) {
                 result_operand = reuse_pointer_to_place(
                     source_place,
@@ -3394,7 +3369,56 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                             args: vec![data],
                         });
                     } else {
-                        panic!("unsupported raw pointer aggregate pointee {pointee_ty:?}");
+                        let data_ty = data
+                            .get_type()
+                            .expect("thin raw pointer aggregate data pointer is typed");
+                        if let Ok(pointee_size) =
+                            super::super::types::layout_size_bytes(tcx, *pointee_ty)
+                        {
+                            instructions.push(oomir::Instruction::InvokeStatic {
+                                dest: Some(temp_aggregate_var.clone()),
+                                class_name: oomir::POINTER_CLASS.to_string(),
+                                method_name: "retype".to_string(),
+                                method_ty: oomir::Signature {
+                                    params: vec![
+                                        ("pointer".to_string(), data_ty),
+                                        ("view_size".to_string(), oomir::Type::I32),
+                                        ("view_codec".to_string(), oomir::Type::String),
+                                    ],
+                                    ret: Box::new(aggregate_oomir_type.clone()),
+                                    is_static: true,
+                                },
+                                args: vec![
+                                    data,
+                                    oomir::Operand::Constant(oomir::Constant::I32(
+                                        i32::try_from(pointee_size).expect(
+                                            "raw pointer pointee exceeds JVM address space",
+                                        ),
+                                    )),
+                                    super::super::types::pointer_memory_codec_operand(
+                                        *pointee_ty,
+                                        tcx,
+                                        data_types,
+                                        instance,
+                                    ),
+                                ],
+                            });
+                        } else {
+                            // A generic thin pointer has no metadata operand carrying T's
+                            // layout. Its data pointer came through an erased (`*const ()`)
+                            // view, which records the prior concrete view in Pointer.
+                            instructions.push(oomir::Instruction::InvokeStatic {
+                                dest: Some(temp_aggregate_var.clone()),
+                                class_name: oomir::POINTER_CLASS.to_string(),
+                                method_name: "restoreErasedView".to_string(),
+                                method_ty: oomir::Signature {
+                                    params: vec![("pointer".to_string(), data_ty)],
+                                    ret: Box::new(aggregate_oomir_type.clone()),
+                                    is_static: true,
+                                },
+                                args: vec![data],
+                            });
+                        }
                     }
                 }
                 _ => {

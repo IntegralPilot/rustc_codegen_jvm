@@ -3,7 +3,9 @@ use super::jvm::{
     attributes::{ArrayType, Instruction},
 };
 use super::{
-    I128_CLASS, U128_CLASS, constant_pool::InternedConstantPool, helpers::are_types_jvm_compatible,
+    I128_CLASS, U128_CLASS,
+    constant_pool::InternedConstantPool,
+    helpers::{are_types_jvm_compatible, get_cast_instructions},
 };
 use crate::oomir::{self, Type};
 
@@ -209,7 +211,10 @@ pub fn load_constant(
             instructions_to_add.push(get_int_const_instr(cp, array_len as i32));
 
             // 2. Create the new array (primitive or reference)
-            if let Some(atype_code) = elem_ty.to_jvm_primitive_array_type_code() {
+            if !elem_ty.has_jvm_value() {
+                let class_index = cp.add_class("java/lang/Object")?;
+                instructions_to_add.push(JI::Anewarray(class_index));
+            } else if let Some(atype_code) = elem_ty.to_jvm_primitive_array_type_code() {
                 let array_type = ArrayType::from_bytes(&mut jvm::ByteReader::new(&[atype_code]))
                     .map_err(|e| jvm::Error::VerificationError {
                         context: format!("Attempting to load constant {:?}", constant), // Use Display formatting for the error type if available
@@ -227,6 +232,11 @@ pub fn load_constant(
                     context: format!("Attempting to load constant {:?}", constant),
                     message: format!("Cannot create JVM array for element type: {:?}", elem_ty),
                 });
+            }
+
+            if !elem_ty.has_jvm_value() {
+                instructions.extend(instructions_to_add);
+                return Ok(());
             }
 
             let store_instruction = elem_ty.get_jvm_array_store_instruction().ok_or_else(|| {
@@ -326,6 +336,35 @@ pub fn load_constant(
                 instructions_to_add.push(get_long_const_instr(cp, low));
                 instructions_to_add.push(JI::Invokespecial(constructor));
                 instructions.extend(instructions_to_add);
+                return Ok(());
+            }
+
+            if class_name == oomir::POINTER_CLASS
+                && let [value, OC::I32(size), codec] = params.as_slice()
+            {
+                let constructor = cp.add_method_ref(
+                    class_index,
+                    "<init>",
+                    "(Ljava/lang/Object;ILjava/lang/String;)V",
+                )?;
+                instructions_to_add.push(JI::New(class_index));
+                instructions_to_add.push(JI::Dup);
+                instructions.extend(instructions_to_add);
+                load_constant(instructions, cp, value)?;
+                let value_ty = Type::from_constant(value);
+                if !value_ty.has_jvm_value() {
+                    instructions.push(JI::Aconst_null);
+                } else if value_ty != Type::Class("java/lang/Object".to_string()) {
+                    instructions.extend(get_cast_instructions(
+                        "constant Pointer cell",
+                        &value_ty,
+                        &Type::Class("java/lang/Object".to_string()),
+                        cp,
+                    )?);
+                }
+                instructions.push(get_int_const_instr(cp, *size));
+                load_constant(instructions, cp, codec)?;
+                instructions.push(JI::Invokespecial(constructor));
                 return Ok(());
             }
 

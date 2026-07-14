@@ -5,7 +5,7 @@ use rustc_middle::mir::interpret::{
 use rustc_middle::ty::layout::TyAndLayout;
 use rustc_middle::ty::{
     AdtDef, FloatTy, GenericArgsRef, Instance, InstanceKind, IntTy, PseudoCanonicalInput,
-    ScalarInt, ShimKind, Ty, TyCtxt, TyKind, TypingEnv, UintTy, util::IntTypeExt,
+    ScalarInt, ShimKind, Ty, TyCtxt, TyKind, TypingEnv, UintTy,
 };
 use std::collections::HashMap;
 
@@ -17,7 +17,7 @@ use super::super::{
     types::{
         UNION_BYTES_FIELD, UNION_OBJECTS_FIELD, ensure_fn_ptr_interface, ensure_union_data_type,
         fn_ptr_signature_from_ty, generate_adt_jvm_class_name, generate_tuple_jvm_class_name,
-        should_define_named_data_type,
+        pointer_memory_codec_operand, should_define_named_data_type,
     },
 };
 use crate::oomir::{self, DataTypeMethod};
@@ -178,9 +178,24 @@ pub fn read_scalar_int_constant<'tcx>(
 
     if let TyKind::Adt(adt_def, substs) = ty.kind() {
         if adt_def.is_enum() {
-            let repr_type = adt_def.repr().discr_type();
-            let int_ty = repr_type.to_ty(tcx);
-            return Ok(scalar_int_to_oomir_constant(scalar_int, int_ty));
+            // A scalar enum constant is the enum's physical ABI carrier, not
+            // necessarily its source-level discriminant. Niche-encoded enums
+            // in optimized MIR rely on both the exact bits and their width.
+            // Preserve that width so value adaptation can reconstruct the enum
+            // through the exact-layout codec instead of widening it to i64.
+            let carrier_ty = match scalar_int.size().bytes() {
+                1 => tcx.types.u8,
+                2 => tcx.types.u16,
+                4 => tcx.types.u32,
+                8 => tcx.types.u64,
+                16 => tcx.types.u128,
+                size => {
+                    return Err(format!(
+                        "Unsupported {size}-byte scalar carrier for enum {ty:?}"
+                    ));
+                }
+            };
+            return Ok(scalar_int_to_oomir_constant(scalar_int, carrier_ty));
         }
 
         let adt_name = match ty_to_oomir_type(ty, tcx, oomir_data_types, instance) {
@@ -657,7 +672,7 @@ pub fn read_constant_value_from_memory<'tcx>(
             read_scalar_int_constant(tcx, scalar_int, ty, oomir_data_types, instance)
         }
 
-        TyKind::Ref(_, inner_ty, mutability) => {
+        TyKind::Ref(_, inner_ty, _) => {
             if inner_ty.is_str() || inner_ty.is_slice() {
                 let value = if inner_ty.is_str() {
                     read_str_from_fat_pointer(tcx, allocation, offset)?
@@ -684,12 +699,49 @@ pub fn read_constant_value_from_memory<'tcx>(
                         instance,
                     );
                 }
-                if mutability.is_mut() {
-                    let pointee_type = ty_to_oomir_type(*inner_ty, tcx, oomir_data_types, instance);
-                    Ok(oomir::Constant::Array(Box::new(pointee_type), vec![value]))
-                } else {
-                    Ok(value)
+                if matches!(oomir::Type::from_constant(&value), oomir::Type::Pointer(_)) {
+                    // References to statics already are their canonical stable
+                    // Pointer. Wrapping that address would create Pointer<Pointer<T>>.
+                    return Ok(value);
                 }
+                if matches!(inner_ty.kind(), TyKind::Dynamic(..)) {
+                    return Ok(value);
+                }
+                let pointee_layout = tcx
+                    .layout_of(TypingEnv::fully_monomorphized().as_query_input(*inner_ty))
+                    .map_err(|error| {
+                        format!("Could not determine constant reference layout: {error:?}")
+                    })?;
+                let codec = match pointer_memory_codec_operand(
+                    *inner_ty,
+                    tcx,
+                    oomir_data_types,
+                    instance,
+                ) {
+                    oomir::Operand::Constant(codec) => codec,
+                    other => {
+                        return Err(format!(
+                            "Constant reference codec was not constant: {other:?}"
+                        ));
+                    }
+                };
+                Ok(oomir::Constant::Instance {
+                    class_name: oomir::POINTER_CLASS.to_string(),
+                    fields: HashMap::new(),
+                    params: vec![
+                        if oomir::Type::from_constant(&value).has_jvm_value() {
+                            value
+                        } else {
+                            oomir::Constant::Null(oomir::Type::Class(
+                                "java/lang/Object".to_string(),
+                            ))
+                        },
+                        oomir::Constant::I32(i32::try_from(pointee_layout.size.bytes()).map_err(
+                            |_| "Constant reference pointee exceeds JVM limits".to_string(),
+                        )?),
+                        codec,
+                    ],
+                })
             }
         }
 
@@ -699,10 +751,70 @@ pub fn read_constant_value_from_memory<'tcx>(
             } else if inner_ty.is_slice() {
                 Err("Unsupported raw slice pointer constant".to_string())
             } else {
-                let ptr = read_pointer_from_memory(tcx, allocation, offset)?;
-                let value = read_pointee_constant(tcx, ptr, *inner_ty, oomir_data_types, instance)?;
-                let pointee_type = ty_to_oomir_type(*inner_ty, tcx, oomir_data_types, instance);
-                Ok(oomir::Constant::Array(Box::new(pointee_type), vec![value]))
+                let pointer_size = tcx.data_layout.pointer_size();
+                let scalar = allocation
+                    .read_scalar(
+                        &tcx.data_layout,
+                        AllocRange {
+                            start: offset,
+                            size: pointer_size,
+                        },
+                        true,
+                    )
+                    .map_err(|error| {
+                        format!("Failed to read raw pointer {ty:?} at {offset:?}: {error:?}")
+                    })?;
+                match scalar {
+                    Scalar::Int(address) => {
+                        read_scalar_int_constant(tcx, address, ty, oomir_data_types, instance)
+                    }
+                    Scalar::Ptr(pointer, _) => {
+                        let (provenance, pointer_offset) = pointer.into_raw_parts();
+                        if provenance.get_alloc_id().is_some_and(|alloc_id| {
+                            matches!(tcx.global_alloc(alloc_id), GlobalAlloc::TypeId { .. })
+                        }) {
+                            let pointee_layout = tcx
+                                .layout_of(
+                                    TypingEnv::fully_monomorphized().as_query_input(*inner_ty),
+                                )
+                                .map_err(|error| {
+                                    format!(
+                                        "Could not determine pointee layout for {ty:?}: {error:?}"
+                                    )
+                                })?;
+                            Ok(oomir::Constant::Instance {
+                                class_name: oomir::POINTER_CLASS.to_string(),
+                                fields: HashMap::new(),
+                                // TypeId encodes its hash bytes in the offsets of
+                                // provenance-only pointers. At runtime those are
+                                // ordinary exposed-address pointer bits.
+                                params: vec![
+                                    oomir::Constant::U64(pointer_offset.bytes()),
+                                    oomir::Constant::I32(
+                                        i32::try_from(pointee_layout.size.bytes()).map_err(
+                                            |_| {
+                                                format!(
+                                                    "Pointee layout for {ty:?} exceeds JVM limits"
+                                                )
+                                            },
+                                        )?,
+                                    ),
+                                ],
+                            })
+                        } else {
+                            let value = read_pointee_constant(
+                                tcx,
+                                pointer,
+                                *inner_ty,
+                                oomir_data_types,
+                                instance,
+                            )?;
+                            let pointee_type =
+                                ty_to_oomir_type(*inner_ty, tcx, oomir_data_types, instance);
+                            Ok(oomir::Constant::Array(Box::new(pointee_type), vec![value]))
+                        }
+                    }
+                }
             }
         }
 
@@ -834,6 +946,38 @@ pub fn read_constant_value_from_memory<'tcx>(
             Ok(oomir::Constant::Instance {
                 class_name: tuple_class_name,
                 fields: fields_map,
+                params,
+            })
+        }
+
+        TyKind::Closure(_, closure_args) => {
+            let class_name = match ty_to_oomir_type(ty, tcx, oomir_data_types, instance) {
+                oomir::Type::Class(class_name) => class_name,
+                other => {
+                    return Err(format!(
+                        "Closure constant {ty:?} did not map to a JVM class: {other:?}"
+                    ));
+                }
+            };
+            let capture_tys = closure_args.as_closure().upvar_tys();
+            let mut fields = HashMap::new();
+            let mut params = Vec::new();
+            for (index, capture_ty) in capture_tys.iter().enumerate() {
+                let capture_offset = layout.fields.offset(index);
+                let capture = read_constant_value_from_memory(
+                    tcx,
+                    allocation,
+                    offset + capture_offset,
+                    capture_ty,
+                    oomir_data_types,
+                    instance,
+                )?;
+                fields.insert(format!("arg{index}"), capture.clone());
+                params.push(capture);
+            }
+            Ok(oomir::Constant::Instance {
+                class_name,
+                fields,
                 params,
             })
         }

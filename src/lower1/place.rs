@@ -14,6 +14,20 @@ use rustc_middle::{
 };
 use std::collections::HashMap;
 
+fn has_slice_or_str_struct_tail<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {
+    if !matches!(ty.kind(), TyKind::Adt(adt_def, _) if adt_def.is_struct()) {
+        return false;
+    }
+    tcx.try_normalize_erasing_regions(
+        TypingEnv::fully_monomorphized(),
+        rustc_middle::ty::Unnormalized::new_wip(ty),
+    )
+    .is_ok_and(|normalized| {
+        let tail = tcx.struct_tail_for_codegen(normalized, TypingEnv::fully_monomorphized());
+        tail.is_slice() || tail.is_str()
+    })
+}
+
 fn pointer_getter_for_type(ty: &oomir::Type) -> (&'static str, oomir::Type) {
     match ty {
         oomir::Type::Boolean => ("getBoolean", oomir::Type::Boolean),
@@ -386,12 +400,9 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
                         .instantiate(tcx, instance.args)
                         .skip_norm_wip();
 
-                let struct_tail =
-                    tcx.struct_tail_for_codegen(base_rust_ty, TypingEnv::fully_monomorphized());
-                if matches!(current_type, oomir::Type::Pointer(_))
-                    && matches!(base_rust_ty.kind(), TyKind::Adt(adt_def, _) if adt_def.is_struct())
-                    && (struct_tail.is_slice() || struct_tail.is_str())
-                {
+                let has_slice_tail = matches!(current_type, oomir::Type::Pointer(_))
+                    && has_slice_or_str_struct_tail(tcx, base_rust_ty);
+                if has_slice_tail {
                     let layout = tcx
                         .layout_of(
                             TypingEnv::fully_monomorphized().as_query_input(base_rust_ty),
@@ -805,12 +816,8 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
                     TyKind::RawPtr(pointee, _) | TyKind::Ref(_, pointee, _) => Some(*pointee),
                     _ => None,
                 };
-                let preserve_slice_tailed_pointer = pointer_pointee.is_some_and(|pointee| {
-                    let tail =
-                        tcx.struct_tail_for_codegen(pointee, TypingEnv::fully_monomorphized());
-                    matches!(pointee.kind(), TyKind::Adt(adt_def, _) if adt_def.is_struct())
-                        && (tail.is_slice() || tail.is_str())
-                });
+                let preserve_slice_tailed_pointer = pointer_pointee
+                    .is_some_and(|pointee| has_slice_or_str_struct_tail(tcx, pointee));
                 if preserve_slice_tailed_pointer {
                     continue;
                 }
@@ -1128,7 +1135,89 @@ pub fn emit_instructions_to_set_value<'tcx>(
         // 3. Generate the final store instruction based on the *last* projection.
         match last_projection {
             ProjectionElem::Field(field_index, field_mir_ty) => {
-                let base_rust_ty = base_place.ty(&mir.local_decls, tcx).ty;
+                let base_rust_ty = EarlyBinder::bind(tcx, base_place.ty(&mir.local_decls, tcx).ty)
+                    .instantiate(tcx, instance.args)
+                    .skip_norm_wip();
+                if matches!(base_oomir_type, oomir::Type::Pointer(_))
+                    && has_slice_or_str_struct_tail(tcx, base_rust_ty)
+                {
+                    let layout = tcx
+                        .layout_of(TypingEnv::fully_monomorphized().as_query_input(base_rust_ty))
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "could not determine slice-tailed struct layout for field assignment to {base_rust_ty:?}: {error:?}"
+                            )
+                        });
+                    let field_offset = layout.fields.offset(field_index.index()).bytes_usize();
+                    let field_rust_ty = EarlyBinder::bind(tcx, *field_mir_ty)
+                        .instantiate(tcx, instance.args)
+                        .skip_norm_wip();
+                    let field_oomir_ty = ty_to_oomir_type(field_rust_ty, tcx, data_types, instance);
+                    let field_pointer_ty = oomir::Type::Pointer(Box::new(field_oomir_ty.clone()));
+                    let offset_pointer_name = format!("{base_var_name}_field_pointer");
+                    instructions.push(Instruction::InvokeStatic {
+                        dest: Some(offset_pointer_name.clone()),
+                        class_name: oomir::POINTER_CLASS.to_string(),
+                        method_name: "byte_offset".to_string(),
+                        method_ty: oomir::Signature {
+                            params: vec![
+                                ("pointer".to_string(), base_oomir_type.clone()),
+                                ("byte_count".to_string(), oomir::Type::I32),
+                            ],
+                            ret: Box::new(base_oomir_type.clone()),
+                            is_static: true,
+                        },
+                        args: vec![
+                            Operand::Variable {
+                                name: base_var_name.clone(),
+                                ty: base_oomir_type.clone(),
+                            },
+                            Operand::Constant(oomir::Constant::I32(
+                                i32::try_from(field_offset)
+                                    .expect("DST field offset exceeds the JVM address space"),
+                            )),
+                        ],
+                    });
+                    let typed_pointer_name = format!("{base_var_name}_typed_field_pointer");
+                    instructions.push(Instruction::InvokeStatic {
+                        dest: Some(typed_pointer_name.clone()),
+                        class_name: oomir::POINTER_CLASS.to_string(),
+                        method_name: "retype".to_string(),
+                        method_ty: oomir::Signature {
+                            params: vec![
+                                ("pointer".to_string(), base_oomir_type.clone()),
+                                ("view_size".to_string(), oomir::Type::I32),
+                                ("view_codec".to_string(), oomir::Type::String),
+                            ],
+                            ret: Box::new(field_pointer_ty.clone()),
+                            is_static: true,
+                        },
+                        args: vec![
+                            Operand::Variable {
+                                name: offset_pointer_name,
+                                ty: base_oomir_type,
+                            },
+                            Operand::Constant(oomir::Constant::I32(
+                                i32::try_from(
+                                    super::types::layout_size_bytes(tcx, field_rust_ty)
+                                        .expect("sized DST field must have a layout"),
+                                )
+                                .expect("DST field exceeds the JVM address space"),
+                            )),
+                            pointer_view_codec_operand(field_rust_ty, tcx, data_types, instance),
+                        ],
+                    });
+                    emit_pointer_write(
+                        Operand::Variable {
+                            name: typed_pointer_name,
+                            ty: field_pointer_ty,
+                        },
+                        &field_oomir_ty,
+                        source_operand,
+                        &mut instructions,
+                    );
+                    return instructions;
+                }
                 if let Some((adt_def, _substs)) = union_parts_from_ty(base_rust_ty) {
                     let owner_class_name =
                         match ty_to_oomir_type(base_rust_ty, tcx, data_types, instance) {

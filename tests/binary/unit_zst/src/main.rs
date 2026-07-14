@@ -66,6 +66,17 @@ fn consume_marker(_: Marker) -> i32 {
     42
 }
 
+fn update_unit_array(mut values: [(); 4], index: usize) -> usize {
+    values[index] = ();
+    let _ = values[(index + 1) % values.len()];
+    values.len()
+}
+
+fn read_unit_slice(values: &[()], index: usize) -> usize {
+    let _ = values[index];
+    values.len()
+}
+
 fn main() {
     let local = ();
     let moved = local;
@@ -97,6 +108,10 @@ fn main() {
     let captured_marker = marker();
     let marker_closure = move || consume_marker(captured_marker);
     assert!(marker_closure() == 42);
+
+    let units = [(); 4];
+    assert!(update_unit_array(units, 2) == 4);
+    assert!(read_unit_slice(&units, 3) == 4);
 
     assert!(matches!(only_live(), OnlyLive::Live));
     match payload_or_never(42) {

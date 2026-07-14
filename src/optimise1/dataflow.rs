@@ -149,7 +149,9 @@ pub fn process_block_instructions(
     let lookup_const = |op: &Operand, state: &ConstantMap| -> Option<Constant> {
         let constant = match op {
             Operand::Constant(c) => Some(c),
-            Operand::Variable { name, .. } => state.get(name),
+            Operand::Variable { name, ty } => state
+                .get(name)
+                .filter(|constant| Type::from_constant(constant) == *ty),
         };
         constant.filter(|value| value.is_propagatable()).cloned()
     };
@@ -1409,5 +1411,44 @@ fn update_state_based_on_operand(
                 state.remove(dest);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn constant_propagation_does_not_change_operand_type() {
+        let slice_ty = Type::Slice(Box::new(Type::U8));
+        let block = BasicBlock {
+            label: "bb0".to_string(),
+            instructions: vec![Instruction::Length {
+                dest: "length".to_string(),
+                array: Operand::Variable {
+                    name: "value".to_string(),
+                    ty: slice_ty.clone(),
+                },
+            }],
+        };
+        let info = BasicBlockInfo {
+            original_block: block,
+            predecessors: HashSet::new(),
+            successors: HashSet::new(),
+        };
+        let state = ConstantMap::from([("value".to_string(), Constant::I32(-2))]);
+
+        let (_, instructions) = process_block_instructions(&info, &state, true, &HashMap::new());
+
+        assert_eq!(
+            instructions,
+            vec![Instruction::Length {
+                dest: "length".to_string(),
+                array: Operand::Variable {
+                    name: "value".to_string(),
+                    ty: slice_ty,
+                },
+            }]
+        );
     }
 }

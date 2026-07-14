@@ -1705,11 +1705,18 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         op2: &oomir::Operand,
         method_name: &str,
     ) -> Result<(), jvm::Error> {
-        let value_type = get_operand_type(op1);
+        let value_type = [get_operand_type(op1), get_operand_type(op2)]
+            .into_iter()
+            .find(|ty| {
+                matches!(ty, Type::Class(class_name) if class_name == I128_CLASS || class_name == U128_CLASS)
+            })
+            .ok_or_else(|| jvm::Error::VerificationError {
+                context: format!("Function {}", self.oomir_func.name),
+                message: "128-bit integer operation has no i128/u128 carrier operand".to_string(),
+            })?;
         let Type::Class(class_name) = &value_type else {
-            unreachable!("128-bit integer carrier must be a JVM class")
+            unreachable!()
         };
-        debug_assert!(class_name == I128_CLASS || class_name == U128_CLASS);
         self.load_operand_as(op1, &value_type)?;
         self.load_operand_as(op2, &value_type)?;
         let class = self.constant_pool.add_class(class_name)?;
@@ -3862,7 +3869,10 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
 
                 // 2. Determine and add the array creation instruction
                 let array_type_for_dest = oomir::Type::Array(Box::new(element_type.clone()));
-                if let Some(atype_code) = element_type.to_jvm_primitive_array_type_code() {
+                if !element_type.has_jvm_value() {
+                    let class_index = self.constant_pool.add_class("java/lang/Object")?;
+                    self.jvm_instructions.push(JI::Anewarray(class_index));
+                } else if let Some(atype_code) = element_type.to_jvm_primitive_array_type_code() {
                     // Primitive array
                     let array_type_enum =
                         ArrayType::from_bytes(&mut jvm::ByteReader::new(&[atype_code])).map_err(
@@ -3942,7 +3952,11 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     self.jvm_instructions.push(JI::Getfield(offset_field));
                     self.load_jvm_int_operand(index)?;
                     self.jvm_instructions.push(JI::Iadd);
-                    self.load_operand_as(value, &element_type)?;
+                    if element_type.has_jvm_value() {
+                        self.load_operand_as(value, &element_type)?;
+                    } else {
+                        self.jvm_instructions.push(JI::Aconst_null);
+                    }
                     let (suffix, value_descriptor) = match element_type.as_ref() {
                         oomir::Type::Boolean => ("Boolean", "Z"),
                         oomir::Type::I8 | oomir::Type::U8 => ("I8", "B"),
@@ -4013,10 +4027,14 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 self.load_jvm_int_operand(index)?;
 
                 // 4. Load value onto the stack
-                self.load_operand_as(value, &element_type)?; // Stack: [arrayref, index_int, value]
+                if element_type.has_jvm_value() {
+                    self.load_operand_as(value, &element_type)?;
+                } else {
+                    self.jvm_instructions.push(JI::Aconst_null);
+                }
 
                 // 5. Get and add the appropriate array store instruction
-                let store_instr =
+                let store_instr = if element_type.has_jvm_value() {
                     element_type
                         .get_jvm_array_store_instruction()
                         .ok_or_else(|| jvm::Error::VerificationError {
@@ -4025,7 +4043,10 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                                 "Cannot determine array store instruction for element type: {:?}",
                                 element_type
                             ),
-                        })?;
+                        })?
+                } else {
+                    JI::Aastore
+                };
                 self.jvm_instructions.push(store_instr); // Stack: []
 
                 // 6. if it's a string, we need to convert it back
@@ -4077,6 +4098,10 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                         &format!("(Ljava/lang/Object;I){return_descriptor}"),
                     )?;
                     self.jvm_instructions.push(JI::Invokestatic(method));
+                    if !element_type.has_jvm_value() {
+                        self.jvm_instructions.push(JI::Pop);
+                        return Ok(());
+                    }
                     if returns_object && let Some(class_name) = element_type.to_jvm_internal_name()
                     {
                         let class = self.constant_pool.add_class(&class_name)?;
@@ -4174,21 +4199,29 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     self.load_jvm_int_operand(index)?;
 
                     // 4. Get and add the appropriate array load instruction
-                    let load_instr = element_type // Now correctly holds I64, I32, Class(...), etc.
-                    .get_jvm_array_load_instruction() // Should now return laload, iaload, aaload correctly
-                    .ok_or_else(|| jvm::Error::VerificationError {
-                        context: format!("Function {}", self.oomir_func.name),
-                        message: format!(
-                            "Cannot determine array load instruction for element type: {:?}",
-                            element_type // Use the correct element type in error message
-                        ),
-                    })?;
+                    let load_instr = if element_type.has_jvm_value() {
+                        element_type // Now correctly holds I64, I32, Class(...), etc.
+                            .get_jvm_array_load_instruction() // Should now return laload, iaload, aaload correctly
+                            .ok_or_else(|| jvm::Error::VerificationError {
+                                context: format!("Function {}", self.oomir_func.name),
+                                message: format!(
+                                    "Cannot determine array load instruction for element type: {:?}",
+                                    element_type // Use the correct element type in error message
+                                ),
+                            })?
+                    } else {
+                        JI::Aaload
+                    };
                     self.jvm_instructions.push(load_instr); // Pushes the correct instruction (e.g., laload)
                     // Stack: [value] (long value in this case)
 
                     // 5. Store the resulting element (which has the correct element_type)
                     // store_result now receives I64 and should generate lstore correctly.
-                    self.store_result(dest, &element_type)?; // Stack: []
+                    if element_type.has_jvm_value() {
+                        self.store_result(dest, &element_type)?; // Stack: []
+                    } else {
+                        self.jvm_instructions.push(JI::Pop);
+                    }
                 }
             }
             OI::Length { dest, array } => {
@@ -4227,8 +4260,12 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                         return Err(jvm::Error::VerificationError {
                             context: format!("Function {}", self.oomir_func.name),
                             message: format!(
-                                "Operand used in Length instruction is not an array type, found {:?}",
-                                array_actual_type
+                                "Operand {array:?} used in Length instruction is not an array type, found {array_actual_type:?} in block {}: {:?}",
+                                self.current_oomir_block_label,
+                                self.oomir_func
+                                    .body
+                                    .basic_blocks
+                                    .get(&self.current_oomir_block_label)
                             ),
                         });
                     }
@@ -4753,15 +4790,16 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     if let Some(index) = self.get_typed_local_index(var_name, ty) {
                         (index, ty.clone())
                     } else {
-                        let stored_ty = self.local_var_types.get(var_name).cloned().ok_or_else(
-                            || jvm::Error::VerificationError {
-                                context: format!("Function {}", self.oomir_func.name),
-                                message: format!(
-                                    "Undefined call argument local variable: {var_name} ({ty:?})"
-                                ),
-                            },
-                        )?;
-                        let index = self.get_local_index(var_name)?;
+                        // Block layout is independent of control-flow dominance, so a
+                        // call block can be translated before the block that stores its
+                        // argument. Reserve the typed JVM slot now; the later store will
+                        // resolve to the same mapping.
+                        let stored_ty = self
+                            .local_var_types
+                            .get(var_name)
+                            .cloned()
+                            .unwrap_or_else(|| ty.clone());
+                        let index = self.get_or_assign_local(var_name, &stored_ty);
                         (index, stored_ty)
                     };
                 let load_type = match &stored_ty {

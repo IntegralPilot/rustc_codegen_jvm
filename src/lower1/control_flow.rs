@@ -661,12 +661,8 @@ pub(super) fn convert_basic_block<'tcx>(
 
                 if let rustc_middle::mir::Rvalue::Ref(_, _, borrowed_place) = rvalue {
                     let dest_ty = place.ty(&mir.local_decls, tcx).ty;
-                    let borrowed_is_trait_object = match dest_ty.kind() {
-                        rustc_middle::ty::TyKind::Ref(_, pointee_ty, _) => {
-                            matches!(pointee_ty.kind(), rustc_middle::ty::TyKind::Dynamic(_, _))
-                        }
-                        _ => false,
-                    };
+                    let borrowed_is_trait_object = matches!(dest_ty.kind(), TyKind::Ref(..))
+                        && matches!(source_operand.get_type(), Some(oomir::Type::Interface(_)));
                     if borrowed_is_trait_object {
                         // Trait objects do not use the MutableReference array wrapper
                     } else {
@@ -854,16 +850,28 @@ pub(super) fn convert_basic_block<'tcx>(
                         panic!("copy_nonoverlapping MIR statement has non-pointer source {other:?}")
                     }
                 };
-                let element_size =
-                    super::types::layout_size_bytes(tcx, pointee).unwrap_or_else(|error| {
-                        panic!("could not determine copy_nonoverlapping element size: {error}")
+                let (method_name, count) = if let Ok(element_size) =
+                    super::types::layout_size_bytes(tcx, pointee)
+                {
+                    let byte_count_name = format!("{label}_copy_nonoverlapping_bytes");
+                    instructions.push(oomir::Instruction::Mul {
+                        dest: byte_count_name.clone(),
+                        op1: count,
+                        op2: oomir::Operand::Constant(oomir::Constant::U64(element_size as u64)),
                     });
-                let byte_count_name = format!("{label}_copy_nonoverlapping_bytes");
-                instructions.push(oomir::Instruction::Mul {
-                    dest: byte_count_name.clone(),
-                    op1: count,
-                    op2: oomir::Operand::Constant(oomir::Constant::U64(element_size as u64)),
-                });
+                    (
+                        "copyNonOverlapping".to_string(),
+                        oomir::Operand::Variable {
+                            name: byte_count_name,
+                            ty: oomir::Type::U64,
+                        },
+                    )
+                } else {
+                    // Generic `core` bodies can retain `T` here. Pointer values carry
+                    // their concrete view size, so defer the sizeof(T) multiplication
+                    // to the runtime in that case.
+                    ("copyNonOverlappingElements".to_string(), count)
+                };
                 let source_ty = source
                     .get_type()
                     .expect("copy_nonoverlapping source is typed");
@@ -872,7 +880,7 @@ pub(super) fn convert_basic_block<'tcx>(
                     .expect("copy_nonoverlapping destination is typed");
                 instructions.push(oomir::Instruction::InvokeStatic {
                     class_name: oomir::POINTER_CLASS.to_string(),
-                    method_name: "copyNonOverlapping".to_string(),
+                    method_name,
                     method_ty: oomir::Signature {
                         params: vec![
                             ("source".to_string(), source_ty),
@@ -882,14 +890,7 @@ pub(super) fn convert_basic_block<'tcx>(
                         ret: Box::new(oomir::Type::Void),
                         is_static: true,
                     },
-                    args: vec![
-                        source,
-                        destination,
-                        oomir::Operand::Variable {
-                            name: byte_count_name,
-                            ty: oomir::Type::U64,
-                        },
-                    ],
+                    args: vec![source, destination, count],
                     dest: None,
                 });
             }
@@ -1463,6 +1464,14 @@ pub(super) fn convert_basic_block<'tcx>(
                                     });
                                 } else if matches!(&dispatch_receiver_ty, oomir::Type::Pointer(_))
                                     && matches!(declared_method_name.as_str(), "as_ref" | "as_mut")
+                                    && matches!(
+                                        fn_output.kind(),
+                                        TyKind::Adt(adt_def, _)
+                                            if tcx.is_lang_item(
+                                                adt_def.did(),
+                                                rustc_hir::LangItem::Option,
+                                            )
+                                    )
                                 {
                                     if let Some(dest) = effective_dest {
                                         let option_class = oomir_output_type
@@ -1507,6 +1516,17 @@ pub(super) fn convert_basic_block<'tcx>(
                                             },
                                             ty: oomir_output_type.clone(),
                                             dest,
+                                        });
+                                    }
+                                } else if matches!(&dispatch_receiver_ty, oomir::Type::Pointer(_))
+                                    && matches!(declared_method_name.as_str(), "as_ref" | "as_mut")
+                                {
+                                    // NonNull::as_ref/as_mut return a reference directly, unlike
+                                    // raw-pointer methods with the same names which return Option.
+                                    if let Some(dest) = effective_dest {
+                                        instructions.push(oomir::Instruction::Move {
+                                            dest,
+                                            src: receiver_operand,
                                         });
                                     }
                                 } else if matches!(&dispatch_receiver_ty, oomir::Type::Pointer(_))
@@ -2229,7 +2249,8 @@ pub(super) fn convert_basic_block<'tcx>(
                                                 ("codec".to_string(), oomir::Type::String),
                                             ];
                                             let receiver_value_ty = match receiver_mir_ty.kind() {
-                                                TyKind::Ref(_, pointee, _) => *pointee,
+                                                TyKind::Ref(_, pointee, _)
+                                                | TyKind::RawPtr(pointee, _) => *pointee,
                                                 _ => receiver_mir_ty,
                                             };
                                             let element_ty =
@@ -2558,6 +2579,117 @@ pub(super) fn convert_basic_block<'tcx>(
                                     });
                                 }
                             }
+                        } else if intrinsic_name.as_str() == "type_id_eq"
+                            && is_compiler_intrinsic
+                            && oomir_operands.len() == 2
+                            && let Some(dest) = effective_dest.clone()
+                        {
+                            let type_id_ty = oomir_operands[0]
+                                .get_type()
+                                .expect("TypeId equality operands are typed");
+                            let oomir::Type::Class(type_id_class) = &type_id_ty else {
+                                panic!("type_id_eq received non-class operand {type_id_ty:?}");
+                            };
+                            let data_ty = match data_types.get(type_id_class) {
+                                Some(oomir::DataType::Class { fields, .. }) => fields
+                                    .iter()
+                                    .find(|(name, _)| name == "data")
+                                    .map(|(_, ty)| ty.clone())
+                                    .expect("TypeId class has a data field"),
+                                _ => panic!("TypeId class {type_id_class} is not defined"),
+                            };
+                            let oomir::Type::Array(pointer_ty) = &data_ty else {
+                                panic!("TypeId data field is not an array: {data_ty:?}");
+                            };
+                            let left_data = format!("{label}_type_id_left_data");
+                            let right_data = format!("{label}_type_id_right_data");
+                            instructions.push(oomir::Instruction::GetField {
+                                dest: left_data.clone(),
+                                object: oomir_operands[0].clone(),
+                                field_name: "data".to_string(),
+                                field_ty: data_ty.clone(),
+                                owner_class: type_id_class.clone(),
+                            });
+                            instructions.push(oomir::Instruction::GetField {
+                                dest: right_data.clone(),
+                                object: oomir_operands[1].clone(),
+                                field_name: "data".to_string(),
+                                field_ty: data_ty.clone(),
+                                owner_class: type_id_class.clone(),
+                            });
+
+                            let limb_count = 16usize
+                                / usize::try_from(tcx.data_layout.pointer_size().bytes())
+                                    .expect("pointer size fits usize");
+                            let mut equality = None;
+                            for limb in 0..limb_count {
+                                let left_limb = format!("{label}_type_id_left_{limb}");
+                                let right_limb = format!("{label}_type_id_right_{limb}");
+                                let limb_equal = format!("{label}_type_id_equal_{limb}");
+                                let index =
+                                    oomir::Operand::Constant(oomir::Constant::I32(limb as i32));
+                                instructions.push(oomir::Instruction::ArrayGet {
+                                    dest: left_limb.clone(),
+                                    array: oomir::Operand::Variable {
+                                        name: left_data.clone(),
+                                        ty: data_ty.clone(),
+                                    },
+                                    index: index.clone(),
+                                });
+                                instructions.push(oomir::Instruction::ArrayGet {
+                                    dest: right_limb.clone(),
+                                    array: oomir::Operand::Variable {
+                                        name: right_data.clone(),
+                                        ty: data_ty.clone(),
+                                    },
+                                    index,
+                                });
+                                instructions.push(oomir::Instruction::InvokeVirtual {
+                                    class_name: oomir::POINTER_CLASS.to_string(),
+                                    method_name: "sameAddress".to_string(),
+                                    method_ty: oomir::Signature {
+                                        params: vec![
+                                            ("self".to_string(), pointer_ty.as_ref().clone()),
+                                            ("other".to_string(), pointer_ty.as_ref().clone()),
+                                        ],
+                                        ret: Box::new(oomir::Type::Boolean),
+                                        is_static: false,
+                                    },
+                                    args: vec![oomir::Operand::Variable {
+                                        name: right_limb,
+                                        ty: pointer_ty.as_ref().clone(),
+                                    }],
+                                    dest: Some(limb_equal.clone()),
+                                    operand: oomir::Operand::Variable {
+                                        name: left_limb,
+                                        ty: pointer_ty.as_ref().clone(),
+                                    },
+                                });
+                                let limb_equal = oomir::Operand::Variable {
+                                    name: limb_equal,
+                                    ty: oomir::Type::Boolean,
+                                };
+                                equality = Some(if let Some(previous) = equality {
+                                    let combined = format!("{label}_type_id_combined_{limb}");
+                                    instructions.push(oomir::Instruction::BitAnd {
+                                        dest: combined.clone(),
+                                        op1: previous,
+                                        op2: limb_equal,
+                                    });
+                                    oomir::Operand::Variable {
+                                        name: combined,
+                                        ty: oomir::Type::Boolean,
+                                    }
+                                } else {
+                                    limb_equal
+                                });
+                            }
+                            instructions.push(oomir::Instruction::Move {
+                                dest,
+                                src: equality.unwrap_or(oomir::Operand::Constant(
+                                    oomir::Constant::Boolean(true),
+                                )),
+                            });
                         } else if intrinsic_name.as_str() == "forget" && is_external_intrinsic {
                             // `mem::forget` intentionally consumes its argument without
                             // running drop glue. The value is already represented by the
@@ -3140,20 +3272,31 @@ pub(super) fn convert_basic_block<'tcx>(
                                 .types()
                                 .next()
                                 .expect("swap_nonoverlapping has a type argument");
-                            let element_size = super::types::layout_size_bytes(tcx, element_ty)
-                                .unwrap_or_else(|error| {
-                                    panic!(
-                                        "could not determine swap_nonoverlapping element layout: {error}"
-                                    )
+                            let (method_name, count) = if let Ok(element_size) =
+                                super::types::layout_size_bytes(tcx, element_ty)
+                            {
+                                let byte_count_name =
+                                    format!("{label}_swap_nonoverlapping_byte_count");
+                                instructions.push(oomir::Instruction::Mul {
+                                    dest: byte_count_name.clone(),
+                                    op1: oomir_operands[2].clone(),
+                                    op2: oomir::Operand::Constant(oomir::Constant::U64(
+                                        element_size as u64,
+                                    )),
                                 });
-                            let byte_count_name = format!("{label}_swap_nonoverlapping_byte_count");
-                            instructions.push(oomir::Instruction::Mul {
-                                dest: byte_count_name.clone(),
-                                op1: oomir_operands[2].clone(),
-                                op2: oomir::Operand::Constant(oomir::Constant::U64(
-                                    element_size as u64,
-                                )),
-                            });
+                                (
+                                    "swapNonOverlapping".to_string(),
+                                    oomir::Operand::Variable {
+                                        name: byte_count_name,
+                                        ty: oomir::Type::U64,
+                                    },
+                                )
+                            } else {
+                                (
+                                    "swapNonOverlappingElements".to_string(),
+                                    oomir_operands[2].clone(),
+                                )
+                            };
                             let left_ty = oomir_operands[0]
                                 .get_type()
                                 .expect("swap_nonoverlapping left pointer is typed");
@@ -3162,7 +3305,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                 .expect("swap_nonoverlapping right pointer is typed");
                             instructions.push(oomir::Instruction::InvokeStatic {
                                 class_name: oomir::POINTER_CLASS.to_string(),
-                                method_name: "swapNonOverlapping".to_string(),
+                                method_name,
                                 method_ty: oomir::Signature {
                                     params: vec![
                                         ("left".to_string(), left_ty),
@@ -3175,10 +3318,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                 args: vec![
                                     oomir_operands[0].clone(),
                                     oomir_operands[1].clone(),
-                                    oomir::Operand::Variable {
-                                        name: byte_count_name,
-                                        ty: oomir::Type::U64,
-                                    },
+                                    count,
                                 ],
                                 dest: None,
                             });
@@ -3203,27 +3343,30 @@ pub(super) fn convert_basic_block<'tcx>(
                                 .types()
                                 .next()
                                 .expect("pointer memory intrinsic has a type argument");
-                            let element_size = super::types::layout_size_bytes(tcx, element_ty)
-                                .unwrap_or_else(|error| {
-                                    panic!(
-                                        "could not determine element layout for {intrinsic_name}: {error}"
-                                    )
-                                });
                             let count = oomir_operands
                                 .last()
                                 .cloned()
                                 .expect("pointer memory intrinsic has a count argument");
-                            let byte_count_name = format!("{label}_pointer_memory_byte_count");
-                            instructions.push(oomir::Instruction::Mul {
-                                dest: byte_count_name.clone(),
-                                op1: count,
-                                op2: oomir::Operand::Constant(oomir::Constant::U64(
-                                    element_size as u64,
-                                )),
-                            });
-                            let byte_count = oomir::Operand::Variable {
-                                name: byte_count_name,
-                                ty: oomir::Type::U64,
+                            let (uses_runtime_element_size, count) = if let Ok(element_size) =
+                                super::types::layout_size_bytes(tcx, element_ty)
+                            {
+                                let byte_count_name = format!("{label}_pointer_memory_byte_count");
+                                instructions.push(oomir::Instruction::Mul {
+                                    dest: byte_count_name.clone(),
+                                    op1: count,
+                                    op2: oomir::Operand::Constant(oomir::Constant::U64(
+                                        element_size as u64,
+                                    )),
+                                });
+                                (
+                                    false,
+                                    oomir::Operand::Variable {
+                                        name: byte_count_name,
+                                        ty: oomir::Type::U64,
+                                    },
+                                )
+                            } else {
+                                (true, count)
                             };
                             let first_pointer_ty = oomir_operands
                                 .first()
@@ -3234,7 +3377,11 @@ pub(super) fn convert_basic_block<'tcx>(
                             if writes_bytes {
                                 instructions.push(oomir::Instruction::InvokeStatic {
                                     class_name: oomir::POINTER_CLASS.to_string(),
-                                    method_name: "writeBytes".to_string(),
+                                    method_name: if uses_runtime_element_size {
+                                        "writeElements".to_string()
+                                    } else {
+                                        "writeBytes".to_string()
+                                    },
                                     method_ty: oomir::Signature {
                                         params: vec![
                                             ("destination".to_string(), first_pointer_ty),
@@ -3247,7 +3394,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                     args: vec![
                                         oomir_operands[0].clone(),
                                         oomir_operands[1].clone(),
-                                        byte_count,
+                                        count,
                                     ],
                                     dest: None,
                                 });
@@ -3257,8 +3404,12 @@ pub(super) fn convert_basic_block<'tcx>(
                                     .expect("copy intrinsic has a destination pointer");
                                 instructions.push(oomir::Instruction::InvokeStatic {
                                     class_name: oomir::POINTER_CLASS.to_string(),
-                                    method_name: if nonoverlapping {
+                                    method_name: if nonoverlapping && uses_runtime_element_size {
+                                        "copyNonOverlappingElements".to_string()
+                                    } else if nonoverlapping {
                                         "copyNonOverlapping".to_string()
+                                    } else if uses_runtime_element_size {
+                                        "copyElements".to_string()
                                     } else {
                                         "copy".to_string()
                                     },
@@ -3274,7 +3425,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                     args: vec![
                                         oomir_operands[0].clone(),
                                         oomir_operands[1].clone(),
-                                        byte_count,
+                                        count,
                                     ],
                                     dest: None,
                                 });

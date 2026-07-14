@@ -231,6 +231,12 @@ pub(super) fn materialize_implicit_zst<'tcx>(
                 element_type: element_jvm_ty.clone(),
                 size: oomir::Operand::Constant(oomir::Constant::I32(length as i32)),
             });
+            if !element_jvm_ty.has_jvm_value() {
+                return Some(operand_var(
+                    dest,
+                    oomir::Type::Array(Box::new(element_jvm_ty)),
+                ));
+            }
             for index in 0..length {
                 let element_value = materialize_implicit_zst(
                     *element_ty,
@@ -472,7 +478,7 @@ fn adapt_mutable_reference_carrier<'tcx>(
     if let oomir::Type::Pointer(target_inner) = target_jvm_ty
         && let TyKind::Ref(_, pointee_ty, _) | TyKind::RawPtr(pointee_ty, _) = target_rust_ty.kind()
     {
-        let pointee = adapt_operand_to_rust_type(
+        let mut pointee = adapt_operand_to_rust_type(
             source,
             *pointee_ty,
             &format!("{temp_prefix}_pointee"),
@@ -482,7 +488,20 @@ fn adapt_mutable_reference_carrier<'tcx>(
             instructions,
         );
         if pointee.get_type().as_ref() != Some(target_inner.as_ref()) {
-            return pointee;
+            if pointee
+                .get_type()
+                .is_some_and(|ty| ty.is_jvm_reference_type())
+                && target_inner.is_jvm_reference_type()
+            {
+                pointee = cast_direct_operand(
+                    pointee,
+                    target_inner,
+                    &format!("{temp_prefix}_pointee_class"),
+                    instructions,
+                );
+            } else {
+                return pointee;
+            }
         }
         let dest = format!("{temp_prefix}_pointer");
         instructions.push(oomir::Instruction::InvokeStatic {

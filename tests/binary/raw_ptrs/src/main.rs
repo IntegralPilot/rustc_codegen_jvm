@@ -849,6 +849,22 @@ fn raw_slice_metadata() {
     assert!(rebuilt_slice[2] == 9);
 }
 
+fn rebuild_sized_pointer<T>(pointer: *const T) -> *const T {
+    let (data, metadata) = pointer.to_raw_parts();
+    core::ptr::from_raw_parts::<T>(data, metadata)
+}
+
+fn generic_sized_raw_pointer_metadata() {
+    let word = 0x1234_5678_u32;
+    let rebuilt_word = rebuild_sized_pointer(&word);
+    assert!(unsafe { *rebuilt_word } == word);
+
+    let pair = Pair { left: 17, right: 29 };
+    let rebuilt_pair = rebuild_sized_pointer(&pair);
+    assert!(unsafe { (*rebuilt_pair).left } == 17);
+    assert!(unsafe { (*rebuilt_pair).right } == 29);
+}
+
 fn raw_str_metadata() {
     let text = "raw UTF-8 pointer";
     let raw = text as *const str;
@@ -1284,6 +1300,7 @@ fn main() {
     byte_methods_alignment_provenance_and_zsts();
     stable_pointer_api_surface();
     raw_slice_metadata();
+    generic_sized_raw_pointer_metadata();
     raw_str_metadata();
     pointer_backed_raw_slices();
     raw_trait_object_metadata();

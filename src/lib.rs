@@ -41,7 +41,7 @@ use rustc_session::{
     config::{CrateType, OutputFilenames},
 };
 use rustc_span::def_id::{DefId, LOCAL_CRATE};
-use std::{any::Any, io::Write, path::Path, process::Command};
+use std::{any::Any, ffi::OsString, io::Write, path::Path, process::Command};
 
 mod instrumentation;
 mod lower1;
@@ -52,6 +52,26 @@ mod stable_hash;
 
 /// An instance of our Java bytecode codegen backend.
 struct MyBackend;
+
+fn write_linker_response_file(path: &Path, arguments: &[OsString]) -> std::io::Result<()> {
+    let mut contents = vec![0xff, 0xfe];
+    for argument in arguments {
+        let argument = argument.to_string_lossy();
+        if argument.contains('\r') || argument.contains('\n') {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "linker response-file arguments cannot contain newlines",
+            ));
+        }
+
+        let line = format!("\"{}\"\r\n", argument.replace('"', "\\\""));
+        for code_unit in line.encode_utf16() {
+            contents.extend_from_slice(&code_unit.to_le_bytes());
+        }
+    }
+
+    std::fs::write(path, contents)
+}
 
 fn emit_library_sidecar_jar(
     sess: &Session,
@@ -95,16 +115,32 @@ fn emit_library_sidecar_jar(
         });
     }
 
-    let mut command = Command::new(linker);
-    for class_file in class_files {
-        command.arg(class_file);
-    }
+    let mut linker_arguments: Vec<OsString> = class_files
+        .iter()
+        .map(|class_file| class_file.as_os_str().to_os_string())
+        .collect();
     for link_arg in &sess.opts.cg.link_args {
-        command.arg(link_arg);
+        linker_arguments.push(OsString::from(link_arg));
     }
-    command.arg("-o").arg(&jar_path);
+    linker_arguments.push(OsString::from("-o"));
+    linker_arguments.push(jar_path.as_os_str().to_os_string());
 
-    let output = command.output().unwrap_or_else(|e| {
+    let response_path = jar_path.with_extension("jar.rsp");
+    write_linker_response_file(&response_path, &linker_arguments).unwrap_or_else(|e| {
+        panic!(
+            "Could not write JVM linker response file {} for library sidecar jar {}: {}",
+            response_path.display(),
+            jar_path.display(),
+            e
+        )
+    });
+
+    let mut response_argument = OsString::from("@");
+    response_argument.push(&response_path);
+    let output = Command::new(linker).arg(response_argument).output();
+    let _ = std::fs::remove_file(&response_path);
+
+    let output = output.unwrap_or_else(|e| {
         panic!(
             "Could not run JVM linker {} for library sidecar jar {}: {}",
             linker.display(),
@@ -529,106 +565,108 @@ impl CodegenBackend for MyBackend {
     }
 
     fn codegen_crate<'a>(&self, tcx: TyCtxt<'_>) -> Box<dyn Any> {
-        let rust_crate = LOCAL_CRATE;
-        let crate_name = tcx.crate_name(rust_crate).to_string();
-        let crate_module_class = lower1::jvm_names::crate_module_class(tcx, rust_crate);
+        rustc_middle::ty::print::with_no_trimmed_paths!({
+            let rust_crate = LOCAL_CRATE;
+            let crate_name = tcx.crate_name(rust_crate).to_string();
+            let crate_module_class = lower1::jvm_names::crate_module_class(tcx, rust_crate);
 
-        let mut oomir_module = oomir::Module {
-            name: crate_module_class.clone(),
-            functions: std::collections::HashMap::new(),
-            data_types: std::collections::HashMap::new(),
-            statics: std::collections::HashMap::new(),
-        };
+            let mut oomir_module = oomir::Module {
+                name: crate_module_class.clone(),
+                functions: std::collections::HashMap::new(),
+                data_types: std::collections::HashMap::new(),
+                statics: std::collections::HashMap::new(),
+            };
 
-        let lower1_timer = instrumentation::Timer::phase("lower1", Some(&crate_name));
+            let lower1_timer = instrumentation::Timer::phase("lower1", Some(&crate_name));
 
-        let mut lowered_instances = HashSet::new();
-        lower_public_library_exports(tcx, &mut oomir_module, &mut lowered_instances);
-        lower_mono_items(tcx, &mut oomir_module, &mut lowered_instances);
+            let mut lowered_instances = HashSet::new();
+            lower_public_library_exports(tcx, &mut oomir_module, &mut lowered_instances);
+            lower_mono_items(tcx, &mut oomir_module, &mut lowered_instances);
 
-        breadcrumbs::log!(
-            breadcrumbs::LogLevel::Info,
-            "backend",
-            format!("OOMIR module: {:?}", oomir_module)
-        );
+            breadcrumbs::log!(
+                breadcrumbs::LogLevel::Info,
+                "backend",
+                format!("OOMIR module: {:?}", oomir_module)
+            );
 
-        // Emit checked arithmetic intrinsics for all needed operations
-        breadcrumbs::log!(
-            breadcrumbs::LogLevel::Info,
-            "intrinsics",
-            "Emitting checked arithmetic intrinsics..."
-        );
-        let needed_intrinsics = lower1::control_flow::take_needed_intrinsics();
-        if !needed_intrinsics.is_empty() {
+            // Emit checked arithmetic intrinsics for all needed operations
             breadcrumbs::log!(
                 breadcrumbs::LogLevel::Info,
                 "intrinsics",
+                "Emitting checked arithmetic intrinsics..."
+            );
+            let needed_intrinsics = lower1::control_flow::take_needed_intrinsics();
+            if !needed_intrinsics.is_empty() {
+                breadcrumbs::log!(
+                    breadcrumbs::LogLevel::Info,
+                    "intrinsics",
+                    format!(
+                        "Emitting {} intrinsics: {:?}",
+                        needed_intrinsics.len(),
+                        needed_intrinsics
+                    )
+                );
+                let intrinsic_class =
+                    lower1::control_flow::checked_intrinsics::emit_all_needed_intrinsics(
+                        &needed_intrinsics,
+                    );
+                oomir_module
+                    .data_types
+                    .insert("RustcCodegenJVMIntrinsics".to_string(), intrinsic_class);
+            }
+            drop(lower1_timer);
+
+            breadcrumbs::log!(
+                breadcrumbs::LogLevel::Info,
+                "optimisation",
                 format!(
-                    "Emitting {} intrinsics: {:?}",
-                    needed_intrinsics.len(),
-                    needed_intrinsics
+                    "--- Starting OOMIR Optimisation for module: {} ---",
+                    crate_name
                 )
             );
-            let intrinsic_class =
-                lower1::control_flow::checked_intrinsics::emit_all_needed_intrinsics(
-                    &needed_intrinsics,
-                );
-            oomir_module
-                .data_types
-                .insert("RustcCodegenJVMIntrinsics".to_string(), intrinsic_class);
-        }
-        drop(lower1_timer);
 
-        breadcrumbs::log!(
-            breadcrumbs::LogLevel::Info,
-            "optimisation",
-            format!(
-                "--- Starting OOMIR Optimisation for module: {} ---",
-                crate_name
-            )
-        );
+            let optimise1_timer = instrumentation::Timer::phase("optimise1", Some(&crate_name));
+            let oomir_module = optimise1::optimise_module(oomir_module);
+            drop(optimise1_timer);
 
-        let optimise1_timer = instrumentation::Timer::phase("optimise1", Some(&crate_name));
-        let oomir_module = optimise1::optimise_module(oomir_module);
-        drop(optimise1_timer);
+            breadcrumbs::log!(
+                breadcrumbs::LogLevel::Info,
+                "optimisation",
+                format!("Optimised OOMIR module: {:?}", oomir_module)
+            );
 
-        breadcrumbs::log!(
-            breadcrumbs::LogLevel::Info,
-            "optimisation",
-            format!("Optimised OOMIR module: {:?}", oomir_module)
-        );
+            breadcrumbs::log!(
+                breadcrumbs::LogLevel::Info,
+                "optimisation",
+                format!(
+                    "--- Finished OOMIR Optimisation for module: {} ---",
+                    crate_name
+                )
+            );
 
-        breadcrumbs::log!(
-            breadcrumbs::LogLevel::Info,
-            "optimisation",
-            format!(
-                "--- Finished OOMIR Optimisation for module: {} ---",
-                crate_name
-            )
-        );
+            breadcrumbs::log!(
+                breadcrumbs::LogLevel::Info,
+                "bytecode-gen",
+                format!(
+                    "--- Starting OOMIR to JVM Bytecode Lowering for module: {} ---",
+                    crate_name
+                )
+            );
+            let lower2_timer = instrumentation::Timer::phase("lower2", Some(&crate_name));
+            let bytecode = lower2::oomir_to_jvm_bytecode(&oomir_module, tcx).unwrap();
+            drop(lower2_timer);
+            //let bytecode = vec![0; 1024];
+            breadcrumbs::log!(
+                breadcrumbs::LogLevel::Info,
+                "bytecode-gen",
+                format!(
+                    "--- Finished OOMIR to JVM Bytecode Lowering for module: {} ---",
+                    crate_name
+                )
+            );
 
-        breadcrumbs::log!(
-            breadcrumbs::LogLevel::Info,
-            "bytecode-gen",
-            format!(
-                "--- Starting OOMIR to JVM Bytecode Lowering for module: {} ---",
-                crate_name
-            )
-        );
-        let lower2_timer = instrumentation::Timer::phase("lower2", Some(&crate_name));
-        let bytecode = lower2::oomir_to_jvm_bytecode(&oomir_module, tcx).unwrap();
-        drop(lower2_timer);
-        //let bytecode = vec![0; 1024];
-        breadcrumbs::log!(
-            breadcrumbs::LogLevel::Info,
-            "bytecode-gen",
-            format!(
-                "--- Finished OOMIR to JVM Bytecode Lowering for module: {} ---",
-                crate_name
-            )
-        );
-
-        Box::new((bytecode, crate_name))
+            Box::new((bytecode, crate_name))
+        })
     }
 
     fn join_codegen(

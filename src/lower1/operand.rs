@@ -52,6 +52,18 @@ pub fn convert_operand<'tcx>(
                     }
                 }
                 Const::Unevaluated(uv, ty) => {
+                    let uv = EarlyBinder::bind(tcx, uv)
+                        .instantiate(tcx, instance.args)
+                        .skip_norm_wip();
+                    let ty = EarlyBinder::bind(tcx, ty)
+                        .instantiate(tcx, instance.args)
+                        .skip_norm_wip();
+                    let ty = tcx
+                        .try_normalize_erasing_regions(
+                            TypingEnv::fully_monomorphized(),
+                            rustc_middle::ty::Unnormalized::new_wip(ty),
+                        )
+                        .unwrap_or(ty);
                     // If the constant depends on generic parameters (e.g. Self::Assoc),
                     // we cannot evaluate it at compile time (and trying to causes an ICE).
                     if uv.args.has_param() {

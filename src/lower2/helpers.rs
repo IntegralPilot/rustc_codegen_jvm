@@ -333,6 +333,10 @@ pub fn get_cast_instructions(
         return Ok(vec![]);
     }
 
+    if !src.has_jvm_value() && dest.is_jvm_reference_type() {
+        return Ok(vec![JI::Aconst_null]);
+    }
+
     // 1. Primitive <-> Primitive
     if src.is_jvm_primitive_like() && dest.is_jvm_primitive_like() {
         return primitive_to_primitive(src, dest, cp);
@@ -1072,6 +1076,11 @@ pub fn are_types_jvm_compatible(src: &oomir::Type, dest: &oomir::Type) -> bool {
         (oomir::Type::Class(source), oomir::Type::Class(target)) => source
             .strip_prefix(target)
             .is_some_and(|suffix| suffix.starts_with('$') && suffix.len() > 1),
+        // Pointer constants are materialized as ordinary Pointer constructor
+        // instances, while typed operands retain their Rust pointee metadata.
+        // Both have the exact same JVM reference descriptor.
+        (oomir::Type::Class(source), oomir::Type::Pointer(_))
+        | (oomir::Type::Pointer(_), oomir::Type::Class(source)) => source == oomir::POINTER_CLASS,
         // TODO: Add more other compatibility rules (e.g., Interface implementations).
         _ => false,
     }

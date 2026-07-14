@@ -10,7 +10,7 @@ Compile your Rust code into a self-contained, runnable `.jar` compatible with JV
 
 Looking ahead, it is envisioned that with further work this backend could benefit any Rust project, not just those requiring JVM integration. In future, by leveraging this backend and the JVM's robust debugging tools and hot-swapping capabilities, Rust developers could iterate quickly during local development to avoid the compile-time bottlenecks of the native toolchain, before compiling to a native binary for release.
 
-It should be noted that this project is still in early development, but is supporting more of the Rust language as time goes on! The eventual goal is a potential upstreaming with main `rustc`, though that is definently a while away!
+It should be noted that this project is still in an early-to-mid stage of development, but is supporting more of the Rust language as time goes on! The eventual goal is a potential upstreaming with main `rustc`, though that is definently a while away!
 
 **I am so grateful for any stars and support!**
 
@@ -81,7 +81,11 @@ These examples live in `tests/binary`, are compiled to JVM bytecode, and are ver
 - **Outputs** executable, self-contained `.jar` generation for binary crates.
 - **Testing** with integration coverage across debug and release modes for all of the above.
 
-**Current milestone:** full support for the Rust `core` crate.
+Full support for compiling the entire `core` and `compiler_builtins` crates from scratch for `jvm-unknown-unknown` was recently implemented - currently being initially demonstrated and tested through **[the `collatz` testcase](tests/binary/collatz/src/main.rs)**. 
+
+Other tests which need things from `core` currently use the [java shim library](library/), though will be gradually switched over to the full Rust version over time.
+
+The next goal is to integrate the upstream `coretests` to determine miscompilations and how close we are to full language support and potential upstreaming (which would require 100% pass state).
 
 ## How It Works
 

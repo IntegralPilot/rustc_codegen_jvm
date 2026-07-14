@@ -86,6 +86,10 @@ public final class Pointer {
         this(Integer.toUnsignedLong(exposedAddress), viewSize);
     }
 
+    public Pointer(Object value, int viewSize, String codecClassName) {
+        this(new Cell(value), viewSize, 0, viewSize, codecClassName);
+    }
+
     private Pointer(
             Object allocation,
             int allocationElementSize,
@@ -417,6 +421,15 @@ public final class Pointer {
                 pointer.allocationCodecClassName,
                 pointer.allocationCodecClassName,
                 pointer.exposedAddress).withMetadata(pointer.metadata);
+    }
+
+    public static Pointer restoreErasedView(Pointer pointer) {
+        if (pointer.zeroSizedSourceViewSize >= 0) {
+            return pointer.retype(
+                    pointer.zeroSizedSourceViewSize,
+                    pointer.zeroSizedSourceViewCodecClassName);
+        }
+        return restoreAllocationView(pointer);
     }
 
     private Pointer withMetadata(long metadata) {
@@ -769,6 +782,32 @@ public final class Pointer {
 
     public boolean sameAddress(Pointer other) {
         return other != null && address() == other.address();
+    }
+
+    public static boolean arraySameAddresses(Object left, Object right) {
+        if (left == right) {
+            return true;
+        }
+        if (left == null || right == null
+                || !left.getClass().isArray() || !right.getClass().isArray()) {
+            return false;
+        }
+        int length = Array.getLength(left);
+        if (length != Array.getLength(right)) {
+            return false;
+        }
+        for (int index = 0; index < length; index++) {
+            Object leftValue = Array.get(left, index);
+            Object rightValue = Array.get(right, index);
+            if (leftValue == rightValue) {
+                continue;
+            }
+            if (!(leftValue instanceof Pointer) || !(rightValue instanceof Pointer)
+                    || !((Pointer) leftValue).sameAddress((Pointer) rightValue)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     public int compareAddress(Pointer other) {
@@ -1212,6 +1251,11 @@ public final class Pointer {
         copy(source, destination, checkedArrayLength(byteCount));
     }
 
+    public static void copyElements(
+            Pointer source, Pointer destination, long elementCount) {
+        copy(source, destination, checkedElementByteCount(source, elementCount));
+    }
+
     public static void copyNonOverlapping(Pointer source, Pointer destination, int byteCount) {
         if (source.allocation == destination.allocation) {
             long sourceEnd = source.byteOffset + byteCount;
@@ -1226,6 +1270,12 @@ public final class Pointer {
     public static void copyNonOverlapping(
             Pointer source, Pointer destination, long byteCount) {
         copyNonOverlapping(source, destination, checkedArrayLength(byteCount));
+    }
+
+    public static void copyNonOverlappingElements(
+            Pointer source, Pointer destination, long elementCount) {
+        copyNonOverlapping(
+                source, destination, checkedElementByteCount(source, elementCount));
     }
 
     public static void swapNonOverlapping(Pointer left, Pointer right, int byteCount) {
@@ -1248,6 +1298,11 @@ public final class Pointer {
 
     public static void swapNonOverlapping(Pointer left, Pointer right, long byteCount) {
         swapNonOverlapping(left, right, checkedArrayLength(byteCount));
+    }
+
+    public static void swapNonOverlappingElements(
+            Pointer left, Pointer right, long elementCount) {
+        swapNonOverlapping(left, right, checkedElementByteCount(left, elementCount));
     }
 
     public static void swapNonOverlappingNonZero(
@@ -1286,6 +1341,14 @@ public final class Pointer {
 
     public static void writeBytes(Pointer destination, int value, long byteCount) {
         writeBytes(destination, value, checkedArrayLength(byteCount));
+    }
+
+    public static void writeElements(Pointer destination, int value, long elementCount) {
+        writeBytes(destination, value, checkedElementByteCount(destination, elementCount));
+    }
+
+    private static int checkedElementByteCount(Pointer pointer, long elementCount) {
+        return checkedArrayLength(Math.multiplyExact(elementCount, (long) pointer.viewSize));
     }
 
     private static int checkedArrayLength(long length) {

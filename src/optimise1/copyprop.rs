@@ -358,10 +358,16 @@ fn rewrite_operands(operands: &mut [Operand], aliases: &AliasMap) {
 }
 
 fn rewrite_operand(operand: &mut Operand, aliases: &AliasMap) {
-    let Operand::Variable { name, .. } = operand else {
+    let Operand::Variable {
+        name,
+        ty: expected_ty,
+    } = operand
+    else {
         return;
     };
-    if let Some(alias) = resolve_alias(name, aliases) {
+    if let Some(alias) = resolve_alias(name, aliases)
+        && alias.get_type().as_ref() == Some(expected_ty)
+    {
         *operand = alias;
     }
 }
@@ -399,11 +405,58 @@ fn resolve_alias(name: &str, aliases: &AliasMap) -> Option<Operand> {
 }
 
 fn kill_aliases_touching(name: &str, aliases: &mut AliasMap) {
-    aliases.remove(name);
-    aliases.retain(|alias_dest, alias_src| {
-        alias_dest != name
-            && !matches!(alias_src, Operand::Variable { name: src_name, .. } if src_name == name)
-    });
+    let mut invalidated = HashSet::from([name.to_string()]);
+    loop {
+        let dependants = aliases
+            .iter()
+            .filter_map(|(alias_dest, alias_src)| {
+                let touches_invalidated = invalidated.contains(alias_dest)
+                    || matches!(
+                        alias_src,
+                        Operand::Variable { name: src_name, .. }
+                            if invalidated.contains(src_name)
+                    );
+                touches_invalidated.then(|| alias_dest.clone())
+            })
+            .collect::<Vec<_>>();
+        if dependants.is_empty() {
+            break;
+        }
+        for dependant in dependants {
+            aliases.remove(&dependant);
+            invalidated.insert(dependant);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redefining_alias_source_invalidates_transitive_dependants() {
+        let slice_ty = Type::Slice(Box::new(Type::U8));
+        let mut aliases = AliasMap::from([
+            (
+                "a".to_string(),
+                Operand::Variable {
+                    name: "b".to_string(),
+                    ty: slice_ty.clone(),
+                },
+            ),
+            (
+                "b".to_string(),
+                Operand::Variable {
+                    name: "c".to_string(),
+                    ty: slice_ty,
+                },
+            ),
+        ]);
+
+        kill_aliases_touching("c", &mut aliases);
+
+        assert!(aliases.is_empty());
+    }
 }
 
 fn instruction_uses(instruction: &Instruction) -> HashSet<String> {

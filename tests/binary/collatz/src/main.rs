@@ -1,3 +1,20 @@
+#![no_std]
+#![feature(lang_items)]
+#![allow(internal_features)]
+
+#[panic_handler]
+fn panic(_: &core::panic::PanicInfo<'_>) -> ! {
+    // The test's assertions are expected to hold. Keep the core-only panic
+    // handler allocation-free while still lowering to an unreachable terminator.
+    unsafe { core::hint::unreachable_unchecked() }
+}
+
+#[lang = "start"]
+fn start<T>(main: fn() -> T, _: isize, _: *const *const u8, _: u8) -> isize {
+    main();
+    0
+}
+
 fn collatz(n: u32) -> u32 {
     if n == 1 {
         1
@@ -18,7 +35,23 @@ fn check_up_to(current: u32, limit: u32) {
     }
 }
 
+const U32_TYPE_ID: core::any::TypeId = core::any::TypeId::of::<u32>();
+const U64_TYPE_ID: core::any::TypeId = core::any::TypeId::of::<u64>();
+
+// Check some core stuff to check it's compiling right
+fn check_core_constants() {
+    assert!(U32_TYPE_ID == U32_TYPE_ID);
+    assert!(!(U32_TYPE_ID == U64_TYPE_ID));
+
+    let increment = &|value: u32| value + 1;
+    assert!((*increment)(41) == 42);
+
+    let value = Some(7_u8);
+    assert!(value == Some(7));
+}
+
 fn main() {
+    check_core_constants();
     // test check_up_to a few times
     check_up_to(1, 10);
     check_up_to(70, 100);

@@ -1096,6 +1096,16 @@ fn append_field_equality_check(
             instructions.push(Instruction::Invokeinterface(eq_ref, 2));
             append_boolean_false_check(instructions, false_fixups);
         }
+        Type::Array(inner) if matches!(inner.as_ref(), Type::Pointer(_)) => {
+            let pointer_idx = cp.add_class(oomir::POINTER_CLASS)?;
+            let equals_ref = cp.add_method_ref(
+                pointer_idx,
+                "arraySameAddresses",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Z",
+            )?;
+            instructions.push(Instruction::Invokestatic(equals_ref));
+            append_boolean_false_check(instructions, false_fixups);
+        }
         Type::Class(_) | Type::Interface(_) => {
             let object_class_idx = cp.add_class("java/lang/Object")?;
             let equals_ref =
