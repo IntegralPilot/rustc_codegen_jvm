@@ -257,6 +257,24 @@ macro_rules! assert_f128_bits {
     };
 }
 
+fn pass_through<T>(v: T) -> T {
+    v
+}
+
+fn as_f64(v: u128) -> f64 {
+    v as f64
+}
+
+fn as_f32(v: u128) -> f32 {
+    v as f32
+}
+
+fn ratio(a: u128, b: u128) -> f64 {
+    // Mirrors the num_bigint nth_root shape: two big-int derived doubles
+    // combined with float arithmetic.
+    a as f64 / b as f64
+}
+
 fn main() {
     runtime_integer_ops();
     runtime_float_ops();
@@ -554,4 +572,94 @@ fn main() {
     assert!(invalid != invalid, "f128 infinity plus negative infinity is NaN");
     let zero_over_zero = opaque_f128(0.0f128) / opaque_f128(0.0f128);
     assert!(zero_over_zero != zero_over_zero, "f128 zero divided by zero is NaN");
+
+    // Credit for tests from this point on: AnuthaDev
+    // Widening casts out of BigInteger-backed types.
+    let big: u128 = 1_000_000;
+    assert!(big as f64 == 1_000_000.0);
+    assert!(big as f32 == 1_000_000.0f32);
+    assert!(as_f64(big) == 1_000_000.0);
+    assert!(as_f32(big) == 1_000_000.0f32);
+
+    let signed: i128 = -250;
+    assert!(signed as f64 == -250.0);
+    assert!(signed as f32 == -250.0f32);
+
+    // Through a generic call boundary, then converted.
+    let hopped = pass_through(big);
+    assert!(hopped as f64 == 1_000_000.0);
+    let hopped_f = pass_through(big as f64);
+    assert!(hopped_f == 1_000_000.0);
+
+    // Float arithmetic on big-int derived values.
+    assert!(ratio(84, 2) == 42.0);
+    let x: u128 = 7;
+    let y = x as f64 * 6.0;
+    assert!(y == 42.0);
+
+    // Back into BigInteger-backed types.
+    let back = 42.9_f64 as u128;
+    assert!(back == 42);
+    let back_signed = -42.9_f64 as i128;
+    assert!(back_signed == -42);
+
+    // Integer accessor paths must keep working alongside the float ones.
+    assert!(big as u64 == 1_000_000);
+    assert!(big as u32 == 1_000_000);
+    assert!(big as i64 == 1_000_000);
+    assert!((signed as i32) == -250);
+
+    // Round trips.
+    let round: u128 = (big as f64) as u128;
+    assert!(round == 1_000_000);
+    let small: u128 = 3;
+    assert!(small as f32 as u128 == 3);
+
+    let x: i32 = opaque_i32(42);
+    let y: f64 = x as f64;
+    assert!(y == 42.0, "i32 -> f64: expected 42.0, got {}", y);
+
+    let x: i32 = opaque_i32(-100);
+    let y: f64 = x as f64;
+    assert!(y == -100.0, "i32 -> f64 negative: expected -100.0, got {}", y);
+
+    let x: i32 = opaque_i32(i32::MAX);
+    let y: f64 = x as f64;
+    assert!(y == 2147483647.0, "i32 -> f64 max: expected 2147483647.0, got {}", y);
+
+    let x: i32 = opaque_i32(i32::MIN);
+    let y: f64 = x as f64;
+    assert!(y == -2147483648.0, "i32 -> f64 min: expected -2147483648.0, got {}", y);
+
+    let x: i32 = opaque_i32(42);
+    let y: f32 = x as f32;
+    assert!(y == 42.0, "i32 -> f32: expected 42.0, got {}", y);
+
+    let x: u32 = opaque_u32(42);
+    let y: f64 = x as f64;
+    assert!(y == 42.0, "u32 -> f64: expected 42.0, got {}", y);
+
+    let x: i64 = opaque_i64(42);
+    let y: f64 = x as f64;
+    assert!(y == 42.0, "i64 -> f64: expected 42.0, got {}", y);
+
+    let x: f64 = opaque_f64(42.0);
+    let y: i32 = x as i32;
+    assert!(y == 42, "f64 -> i32: expected 42, got {}", y);
+
+    const C: i32 = 42;
+    const CF: f64 = C as f64;
+    assert!(CF == 42.0, "const i32 -> f64: expected 42.0, got {}", CF);
+
+    const C2: i32 = -100;
+    const CF2: f64 = C2 as f64;
+    assert!(CF2 == -100.0, "const i32 -> f64 negative: expected -100.0, got {}", CF2);
+
+    const C3: i32 = i32::MAX;
+    const CF3: f64 = C3 as f64;
+    assert!(CF3 == 2147483647.0, "const i32 -> f64 max: expected 2147483647.0, got {}", CF3);
+
+    const C4: i32 = i32::MIN;
+    const CF4: f64 = C4 as f64;
+    assert!(CF4 == -2147483648.0, "const i32 -> f64 min: expected -2147483648.0, got {}", CF4);
 }
