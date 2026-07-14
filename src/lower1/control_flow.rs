@@ -1193,6 +1193,22 @@ pub(super) fn convert_basic_block<'tcx>(
                                     data_types,
                                     instance,
                                 );
+                                let resolved_receiver_mir_ty =
+                                    EarlyBinder::bind(tcx, receiver_mir_ty)
+                                        .instantiate(tcx, instance.args)
+                                        .skip_norm_wip();
+                                let pointer_api_receiver = {
+                                    let receiver_value_ty = match resolved_receiver_mir_ty.kind() {
+                                        TyKind::Ref(_, pointee, _) => *pointee,
+                                        _ => resolved_receiver_mir_ty,
+                                    };
+                                    matches!(receiver_value_ty.kind(), TyKind::RawPtr(..))
+                                        || matches!(
+                                            receiver_value_ty.kind(),
+                                            TyKind::Adt(adt_def, _)
+                                                if tcx.def_path_str(adt_def.did()).ends_with("::NonNull")
+                                        )
+                                };
                                 let declared_method_name = item.name().as_str().to_string();
                                 let is_pointer_cast_method = [
                                     sym::const_ptr_cast,
@@ -1463,6 +1479,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                         },
                                     });
                                 } else if matches!(&dispatch_receiver_ty, oomir::Type::Pointer(_))
+                                    && pointer_api_receiver
                                     && matches!(declared_method_name.as_str(), "as_ref" | "as_mut")
                                     && matches!(
                                         fn_output.kind(),
@@ -1519,6 +1536,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                         });
                                     }
                                 } else if matches!(&dispatch_receiver_ty, oomir::Type::Pointer(_))
+                                    && pointer_api_receiver
                                     && matches!(declared_method_name.as_str(), "as_ref" | "as_mut")
                                 {
                                     // NonNull::as_ref/as_mut return a reference directly, unlike
@@ -1530,6 +1548,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                         });
                                     }
                                 } else if matches!(&dispatch_receiver_ty, oomir::Type::Pointer(_))
+                                    && pointer_api_receiver
                                     && matches!(
                                         declared_method_name.as_str(),
                                         "as_ref_unchecked" | "as_mut_unchecked"
@@ -1542,6 +1561,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                         });
                                     }
                                 } else if matches!(&dispatch_receiver_ty, oomir::Type::Pointer(_))
+                                    && pointer_api_receiver
                                     && declared_method_name == "is_aligned"
                                 {
                                     let receiver_ty = EarlyBinder::bind(tcx, receiver_mir_ty)
@@ -1586,6 +1606,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                         dest: effective_dest,
                                     });
                                 } else if matches!(&dispatch_receiver_ty, oomir::Type::Pointer(_))
+                                    && pointer_api_receiver
                                     && declared_method_name == "to_raw_parts"
                                 {
                                     if let Some(dest) = effective_dest {
@@ -1653,6 +1674,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                     }
                                 } else if let oomir::Type::Pointer(pointee_ty) =
                                     &dispatch_receiver_ty
+                                    && pointer_api_receiver
                                     && matches!(
                                         declared_method_name.as_str(),
                                         "read" | "read_unaligned" | "read_volatile"
@@ -1681,6 +1703,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                     }
                                 } else if let oomir::Type::Pointer(pointee_ty) =
                                     &dispatch_receiver_ty
+                                    && pointer_api_receiver
                                     && matches!(
                                         declared_method_name.as_str(),
                                         "write" | "write_unaligned" | "write_volatile"
@@ -1708,6 +1731,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                     }
                                 } else if let oomir::Type::Pointer(pointee_ty) =
                                     &dispatch_receiver_ty
+                                    && pointer_api_receiver
                                     && declared_method_name == "replace"
                                     && method_args.len() == 1
                                 {
@@ -1727,6 +1751,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                     );
                                 } else if let oomir::Type::Pointer(pointee_ty) =
                                     &dispatch_receiver_ty
+                                    && pointer_api_receiver
                                     && declared_method_name == "swap"
                                     && method_args.len() == 1
                                 {
@@ -1757,6 +1782,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                         &mut instructions,
                                     );
                                 } else if matches!(&dispatch_receiver_ty, oomir::Type::Pointer(_))
+                                    && pointer_api_receiver
                                     && matches!(
                                         declared_method_name.as_str(),
                                         "copy_to"
@@ -1862,6 +1888,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                         });
                                     }
                                 } else if matches!(&dispatch_receiver_ty, oomir::Type::Pointer(_))
+                                    && pointer_api_receiver
                                     && declared_method_name == "map_addr"
                                     && method_args.len() == 1
                                 {
@@ -2188,14 +2215,6 @@ pub(super) fn convert_basic_block<'tcx>(
                                                 },
                                             ))
                                         }
-                                        oomir::Type::F32 => Some((
-                                            "org/rustlang/primitives/F32".to_string(),
-                                            method_name.clone(),
-                                        )),
-                                        oomir::Type::F64 => Some((
-                                            "org/rustlang/primitives/F64".to_string(),
-                                            method_name.clone(),
-                                        )),
                                         oomir::Type::Class(class_name)
                                             if class_name == crate::lower2::F128_CLASS
                                                 && item.name().as_str() == "to_bits" =>

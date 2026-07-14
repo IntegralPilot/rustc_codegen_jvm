@@ -3,6 +3,15 @@ use rustc_span::def_id::{CrateNum, DefId};
 
 const RUNTIME_CRATES: &[&str] = &["core"];
 
+pub fn is_runtime_crate<'tcx>(tcx: TyCtxt<'tcx>, krate: CrateNum) -> bool {
+    let crate_name = tcx.crate_name(krate);
+    crate_name.as_str() == "core"
+        || tcx
+            .used_crate_source(krate)
+            .paths()
+            .any(|path| path.starts_with(tcx.sess.opts.sysroot.path()))
+}
+
 pub fn member_name(raw: &str) -> String {
     jvm_identifier(raw)
 }
@@ -45,8 +54,8 @@ pub fn closure_class_for_args<'tcx>(
     def_id: DefId,
     args: GenericArgsRef<'tcx>,
 ) -> String {
-    let base = path_segment(&tcx.def_path_str(def_id));
-    let hash = super::types::short_hash(&format!("{def_id:?}:{args:?}"), 10);
+    let base = path_segment(&super::types::stable_def_path(tcx, def_id));
+    let hash = super::types::short_hash(&super::types::stable_instance_key(tcx, def_id, args), 10);
     format!("{}/{}_{}", crate_root(tcx, def_id.krate), base, hash)
 }
 

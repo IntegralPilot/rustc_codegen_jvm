@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::fs::OpenOptions;
@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use regex::Regex;
-use ristretto_classfile::{ClassFile, MethodAccessFlags};
+use ristretto_classfile::attributes::{Attribute, Instruction, StackFrame, VerificationType};
+use ristretto_classfile::{ClassFile, Constant, MethodAccessFlags};
 use tempfile::tempdir;
 use zip::write::{SimpleFileOptions, ZipWriter};
 use zip::{CompressionMethod, ZipArchive};
@@ -17,6 +18,295 @@ use zip::{CompressionMethod, ZipArchive};
 struct ClassInfo {
     jar_entry_name: String,
     data: Vec<u8>,
+}
+
+fn shifted_constant_index(index: u16, offset: u16) -> io::Result<u16> {
+    index.checked_add(offset).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "merged JVM class exceeds the constant-pool index limit",
+        )
+    })
+}
+
+fn remap_constant(mut constant: Constant, offset: u16) -> io::Result<Constant> {
+    match &mut constant {
+        Constant::Class(index)
+        | Constant::String(index)
+        | Constant::MethodType(index)
+        | Constant::Module(index)
+        | Constant::Package(index) => *index = shifted_constant_index(*index, offset)?,
+        Constant::FieldRef {
+            class_index,
+            name_and_type_index,
+        }
+        | Constant::MethodRef {
+            class_index,
+            name_and_type_index,
+        }
+        | Constant::InterfaceMethodRef {
+            class_index,
+            name_and_type_index,
+        } => {
+            *class_index = shifted_constant_index(*class_index, offset)?;
+            *name_and_type_index = shifted_constant_index(*name_and_type_index, offset)?;
+        }
+        Constant::NameAndType {
+            name_index,
+            descriptor_index,
+        } => {
+            *name_index = shifted_constant_index(*name_index, offset)?;
+            *descriptor_index = shifted_constant_index(*descriptor_index, offset)?;
+        }
+        Constant::MethodHandle {
+            reference_index, ..
+        } => *reference_index = shifted_constant_index(*reference_index, offset)?,
+        Constant::Dynamic {
+            name_and_type_index,
+            ..
+        }
+        | Constant::InvokeDynamic {
+            name_and_type_index,
+            ..
+        } => *name_and_type_index = shifted_constant_index(*name_and_type_index, offset)?,
+        Constant::Utf8(_)
+        | Constant::Integer(_)
+        | Constant::Float(_)
+        | Constant::Long(_)
+        | Constant::Double(_) => {}
+    }
+    Ok(constant)
+}
+
+fn remap_verification_type(
+    verification_type: &mut VerificationType,
+    offset: u16,
+) -> io::Result<()> {
+    if let VerificationType::Object { cpool_index } = verification_type {
+        *cpool_index = shifted_constant_index(*cpool_index, offset)?;
+    }
+    Ok(())
+}
+
+fn remap_stack_frame(frame: &mut StackFrame, offset: u16) -> io::Result<()> {
+    match frame {
+        StackFrame::SameLocals1StackItemFrame { stack, .. }
+        | StackFrame::SameLocals1StackItemFrameExtended { stack, .. } => {
+            for item in stack {
+                remap_verification_type(item, offset)?;
+            }
+        }
+        StackFrame::AppendFrame { locals, .. } => {
+            for item in locals {
+                remap_verification_type(item, offset)?;
+            }
+        }
+        StackFrame::FullFrame { locals, stack, .. } => {
+            for item in locals.iter_mut().chain(stack.iter_mut()) {
+                remap_verification_type(item, offset)?;
+            }
+        }
+        StackFrame::SameFrame { .. }
+        | StackFrame::ChopFrame { .. }
+        | StackFrame::SameFrameExtended { .. } => {}
+    }
+    Ok(())
+}
+
+fn remap_instruction(instruction: &mut Instruction, offset: u16) -> io::Result<()> {
+    match instruction {
+        Instruction::Ldc(index) => {
+            let shifted = shifted_constant_index(u16::from(*index), offset)?;
+            if let Ok(short_index) = u8::try_from(shifted) {
+                *index = short_index;
+            } else {
+                *instruction = Instruction::Ldc_w(shifted);
+            }
+        }
+        Instruction::Ldc_w(index)
+        | Instruction::Ldc2_w(index)
+        | Instruction::Getstatic(index)
+        | Instruction::Putstatic(index)
+        | Instruction::Getfield(index)
+        | Instruction::Putfield(index)
+        | Instruction::Invokevirtual(index)
+        | Instruction::Invokespecial(index)
+        | Instruction::Invokestatic(index)
+        | Instruction::Invokedynamic(index)
+        | Instruction::New(index)
+        | Instruction::Anewarray(index)
+        | Instruction::Checkcast(index)
+        | Instruction::Instanceof(index) => *index = shifted_constant_index(*index, offset)?,
+        Instruction::Invokeinterface(index, _) | Instruction::Multianewarray(index, _) => {
+            *index = shifted_constant_index(*index, offset)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn remap_attribute(attribute: &mut Attribute, offset: u16) -> io::Result<()> {
+    match attribute {
+        Attribute::Code {
+            name_index,
+            code,
+            exception_table,
+            attributes,
+            ..
+        } => {
+            *name_index = shifted_constant_index(*name_index, offset)?;
+            for instruction in code {
+                remap_instruction(instruction, offset)?;
+            }
+            for exception in exception_table {
+                if exception.catch_type != 0 {
+                    exception.catch_type = shifted_constant_index(exception.catch_type, offset)?;
+                }
+            }
+            for nested in attributes {
+                remap_attribute(nested, offset)?;
+            }
+        }
+        Attribute::StackMapTable { name_index, frames } => {
+            *name_index = shifted_constant_index(*name_index, offset)?;
+            for frame in frames {
+                remap_stack_frame(frame, offset)?;
+            }
+        }
+        Attribute::Exceptions {
+            name_index,
+            exception_indexes,
+        } => {
+            *name_index = shifted_constant_index(*name_index, offset)?;
+            for index in exception_indexes {
+                *index = shifted_constant_index(*index, offset)?;
+            }
+        }
+        Attribute::Signature {
+            name_index,
+            signature_index,
+        } => {
+            *name_index = shifted_constant_index(*name_index, offset)?;
+            *signature_index = shifted_constant_index(*signature_index, offset)?;
+        }
+        Attribute::LineNumberTable { name_index, .. }
+        | Attribute::Synthetic { name_index }
+        | Attribute::Deprecated { name_index } => {
+            *name_index = shifted_constant_index(*name_index, offset)?;
+        }
+        Attribute::MethodParameters {
+            name_index,
+            parameters,
+        } => {
+            *name_index = shifted_constant_index(*name_index, offset)?;
+            for parameter in parameters {
+                if parameter.name_index != 0 {
+                    parameter.name_index = shifted_constant_index(parameter.name_index, offset)?;
+                }
+            }
+        }
+        other => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "cannot merge generated JVM method with unsupported {} attribute",
+                    other.name()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn class_file_from_data(data: &[u8]) -> io::Result<ClassFile> {
+    ClassFile::from_bytes(&mut Cursor::new(data.to_vec())).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid JVM class while merging generic specializations: {error}"),
+        )
+    })
+}
+
+fn method_identity(class_file: &ClassFile, method_index: usize) -> io::Result<(String, String)> {
+    let method = &class_file.methods[method_index];
+    let name = class_file
+        .constant_pool
+        .try_get_utf8(method.name_index)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    let descriptor = class_file
+        .constant_pool
+        .try_get_utf8(method.descriptor_index)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    Ok((name.clone(), descriptor.clone()))
+}
+
+fn merge_class_data(base_data: &[u8], incoming_data: &[u8]) -> io::Result<Vec<u8>> {
+    let mut base = class_file_from_data(base_data)?;
+    let incoming = class_file_from_data(incoming_data)?;
+    if base.class_name().ok() != incoming.class_name().ok() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "cannot merge class files with different JVM names",
+        ));
+    }
+
+    let mut existing_methods = HashSet::new();
+    for index in 0..base.methods.len() {
+        existing_methods.insert(method_identity(&base, index)?);
+    }
+    let mut missing_method_indexes = Vec::new();
+    for index in 0..incoming.methods.len() {
+        if !existing_methods.contains(&method_identity(&incoming, index)?) {
+            missing_method_indexes.push(index);
+        }
+    }
+    if missing_method_indexes.is_empty() {
+        return Ok(base_data.to_vec());
+    }
+
+    let offset = u16::try_from(base.constant_pool.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "base JVM class constant pool exceeds the index limit",
+        )
+    })?;
+    for constant in &incoming.constant_pool {
+        base.constant_pool
+            .push(remap_constant(constant.clone(), offset)?);
+    }
+
+    for index in missing_method_indexes {
+        let mut method = incoming.methods[index].clone();
+        method.name_index = shifted_constant_index(method.name_index, offset)?;
+        method.descriptor_index = shifted_constant_index(method.descriptor_index, offset)?;
+        for attribute in &mut method.attributes {
+            remap_attribute(attribute, offset)?;
+        }
+        base.methods.push(method);
+    }
+
+    let mut merged = Vec::new();
+    base.to_bytes(&mut merged).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("failed to serialize merged JVM class: {error}"),
+        )
+    })?;
+    Ok(merged)
+}
+
+fn merge_duplicate_classes(classes: Vec<ClassInfo>) -> io::Result<Vec<ClassInfo>> {
+    let mut positions: HashMap<String, usize> = HashMap::new();
+    let mut merged: Vec<ClassInfo> = Vec::new();
+    for class_info in classes {
+        if let Some(&index) = positions.get(&class_info.jar_entry_name) {
+            merged[index].data = merge_class_data(&merged[index].data, &class_info.data)?;
+        } else {
+            positions.insert(class_info.jar_entry_name.clone(), merged.len());
+            merged.push(class_info);
+        }
+    }
+    Ok(merged)
 }
 
 struct InstrumentationTimer {
@@ -562,6 +852,8 @@ fn create_jar(
         app_classes.extend(collect_rlib_classes(path)?);
     }
 
+    let app_classes = merge_duplicate_classes(app_classes)?;
+
     // Input JARs are bundled into the final artifact alongside generated classes.
     let library_jar_paths: Vec<PathBuf> = input_jar_files.iter().map(PathBuf::from).collect();
 
@@ -933,7 +1225,40 @@ fn create_manifest_content(main_class_name: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{jar_output_path, msvc_output_path, parse_response_lines};
+    use super::{
+        class_file_from_data, jar_output_path, merge_class_data, method_identity, msvc_output_path,
+        parse_response_lines,
+    };
+    use ristretto_classfile::{
+        ClassAccessFlags, ClassFile, ConstantPool, Method, MethodAccessFlags, Version,
+    };
+
+    fn abstract_class_with_method(method_name: &str) -> Vec<u8> {
+        let mut constant_pool = ConstantPool::default();
+        let this_class = constant_pool.add_class("test/Generic").unwrap();
+        let super_class = constant_pool.add_class("java/lang/Object").unwrap();
+        let name_index = constant_pool.add_utf8(method_name).unwrap();
+        let descriptor_index = constant_pool.add_utf8("()V").unwrap();
+        let class_file = ClassFile {
+            version: Version::Java8 { minor: 0 },
+            constant_pool,
+            access_flags: ClassAccessFlags::PUBLIC
+                | ClassAccessFlags::ABSTRACT
+                | ClassAccessFlags::SUPER,
+            this_class,
+            super_class,
+            methods: vec![Method {
+                access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::ABSTRACT,
+                name_index,
+                descriptor_index,
+                attributes: Vec::new(),
+            }],
+            ..Default::default()
+        };
+        let mut bytes = Vec::new();
+        class_file.to_bytes(&mut bytes).unwrap();
+        bytes
+    }
 
     #[test]
     fn recognizes_msvc_output_argument_case_insensitively() {
@@ -978,6 +1303,25 @@ mod tests {
         assert_eq!(
             parse_response_lines("path\\ with\\ spaces/Main.class\n-o\noutput\n", false),
             ["path with spaces/Main.class", "-o", "output"]
+        );
+    }
+
+    #[test]
+    fn merges_complementary_generic_class_methods() {
+        let first = abstract_class_with_method("first");
+        let second = abstract_class_with_method("second");
+        let merged = merge_class_data(&first, &second).unwrap();
+        let class_file = class_file_from_data(&merged).unwrap();
+        let methods: Vec<_> = (0..class_file.methods.len())
+            .map(|index| method_identity(&class_file, index).unwrap())
+            .collect();
+
+        assert_eq!(
+            methods,
+            [
+                ("first".into(), "()V".into()),
+                ("second".into(), "()V".into())
+            ]
         );
     }
 }

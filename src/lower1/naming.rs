@@ -17,7 +17,7 @@ pub fn associated_method_name_from_instance<'tcx>(
     tcx: TyCtxt<'tcx>,
     instance: Instance<'tcx>,
 ) -> String {
-    if !instance.def_id().is_local() {
+    if !instance.def_id().is_local() && jvm_names::is_runtime_crate(tcx, instance.def_id().krate) {
         return jvm_names::method_for_function(tcx, instance.def_id());
     }
 
@@ -51,14 +51,8 @@ pub fn mono_fn_name_from_instance<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'t
             DefKind::Fn | DefKind::AssocFn | DefKind::Closure
         )
     {
-        let definition_hash = super::types::short_hash(
-            &format!(
-                "{:?}:{}",
-                instance.def_id(),
-                tcx.def_path_str(instance.def_id())
-            ),
-            10,
-        );
+        let definition_hash =
+            super::types::short_hash(&super::types::stable_def_path(tcx, instance.def_id()), 10);
         safe_base = format!("{safe_base}__{definition_hash}");
     }
     // We need a local map for the type conversion, similar to the original function
@@ -66,7 +60,11 @@ pub fn mono_fn_name_from_instance<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'t
 
     if instance.args.has_param() || instance.args.has_escaping_bound_vars() {
         let hash = super::types::short_hash(
-            &format!("{}_nonconcrete_{:?}", safe_base, instance.args),
+            &format!(
+                "{}_nonconcrete_{}",
+                safe_base,
+                super::types::stable_instance_key(tcx, instance.def_id(), instance.args)
+            ),
             10,
         );
         return FnNameData {
@@ -104,8 +102,10 @@ pub fn mono_fn_name_from_instance<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'t
     let readable_name = if instance.args.is_empty() {
         readable_base
     } else {
-        let instance_hash =
-            super::types::short_hash(&format!("{:?}:{:?}", instance.def_id(), instance.args), 10);
+        let instance_hash = super::types::short_hash(
+            &super::types::stable_instance_key(tcx, instance.def_id(), instance.args),
+            10,
+        );
         format!("{readable_base}__{instance_hash}")
     };
 
@@ -126,7 +126,11 @@ pub fn mono_fn_name_from_instance<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'t
         descriptor_str.push_str(&ty.to_jvm_descriptor());
         descriptor_str.push('_');
     }
-    descriptor_str.push_str(&format!("{:?}:{:?}", instance.def_id(), instance.args));
+    descriptor_str.push_str(&super::types::stable_instance_key(
+        tcx,
+        instance.def_id(),
+        instance.args,
+    ));
 
     let hash = super::types::short_hash(&descriptor_str, 10);
 

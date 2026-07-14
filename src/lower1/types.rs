@@ -3,6 +3,7 @@ use crate::oomir::{self, DataType, DataTypeMethod};
 
 use rustc_abi::{FieldIdx, TagEncoding, VariantIdx, Variants};
 use rustc_middle::ty::layout::TyAndLayout;
+use rustc_middle::ty::print::{with_no_trimmed_paths, with_resolve_crate_name};
 use rustc_middle::ty::{
     AdtDef, ExistentialPredicate, FloatTy, GenericArgsRef, IntTy, Ty, TyCtxt, TyKind,
     TypeVisitableExt, TypingEnv, UintTy,
@@ -3478,7 +3479,7 @@ pub fn ty_to_oomir_type<'tcx>(
                     instance_context,
                 );
 
-                if !should_define_named_data_type(tcx, adt_def.did()) {
+                if !should_define_named_data_type(tcx, adt_def.did()) && substs.is_empty() {
                     return oomir::Type::Class(jvm_name_full);
                 }
 
@@ -3782,17 +3783,10 @@ pub fn ty_to_oomir_type<'tcx>(
                         }
                         resolved_types.push(oomir::Type::Interface(safe_name));
                     }
-                    ExistentialPredicate::Projection(_) => {
-                        breadcrumbs::log!(
-                            breadcrumbs::LogLevel::Warn,
-                            "type-mapping",
-                            format!(
-                                "Warning: Unhandled dynamic projection predicate {:?}",
-                                binder
-                            )
-                        );
-                        resolved_types.push(oomir::Type::Class("java/lang/Object".to_string()));
-                    }
+                    // Associated-type constraints such as `FnOnce<Output = T>`
+                    // refine the primary trait and do not represent another JVM
+                    // interface in the trait object's runtime carrier.
+                    ExistentialPredicate::Projection(_) => {}
                 }
             }
             // Return the first resolved bound, or fall back to Object.
@@ -3808,7 +3802,7 @@ pub fn ty_to_oomir_type<'tcx>(
             let safe_name = jvm_names::closure_class_for_args(tcx, *def_id, args);
 
             // Define the closure class struct if not already present
-            if should_define_named_data_type(tcx, *def_id) && !data_types.contains_key(&safe_name) {
+            if !data_types.contains_key(&safe_name) {
                 let closure_args = args.as_closure();
                 let upvar_tys = closure_args.upvar_tys();
 
@@ -3882,6 +3876,28 @@ pub fn ty_to_oomir_type<'tcx>(
 /// The hash is truncated to the specified length to ensure it fits within JVM class name constraints.
 pub fn short_hash(input: &str, length: usize) -> String {
     crate::stable_hash::short_hash(input, length)
+}
+
+pub fn stable_def_path(tcx: TyCtxt<'_>, def_id: DefId) -> String {
+    let crate_name = tcx.crate_name(def_id.krate).to_string();
+    let path = with_resolve_crate_name!(with_no_trimmed_paths!(tcx.def_path_str(def_id)));
+    path.strip_prefix(&format!("{crate_name}::"))
+        .unwrap_or(&path)
+        .to_string()
+}
+
+pub fn stable_instance_key<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: DefId,
+    args: GenericArgsRef<'tcx>,
+) -> String {
+    let crate_name = tcx.crate_name(def_id.krate).to_string();
+    let path = with_resolve_crate_name!(with_no_trimmed_paths!(
+        tcx.def_path_str_with_args(def_id, args)
+    ));
+    path.strip_prefix(&format!("{crate_name}::"))
+        .unwrap_or(&path)
+        .to_string()
 }
 
 // Maximum length for a readable tuple name (including the "Tuple_" prefix).

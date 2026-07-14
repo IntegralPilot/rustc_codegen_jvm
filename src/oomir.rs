@@ -33,9 +33,7 @@ impl Module {
             &function.name,
             &function.signature,
         );
-        if self.functions.insert(key.clone(), function).is_some() {
-            panic!("duplicate OOMIR function has the same JVM identity: {key}");
-        }
+        self.functions.entry(key).or_insert(function);
     }
 
     pub fn owner_class_for_function<'a>(&'a self, function: &'a Function) -> &'a str {

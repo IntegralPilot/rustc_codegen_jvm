@@ -163,11 +163,7 @@ fn emit_library_sidecar_jar(
     }
 }
 
-fn mono_item_name<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    instance: Instance<'tcx>,
-    oomir_module: &oomir::Module,
-) -> lower1::naming::FnNameData {
+fn mono_item_name<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> lower1::naming::FnNameData {
     let instance_ty = tcx
         .type_of(instance.def_id())
         .instantiate(tcx, instance.args)
@@ -175,7 +171,10 @@ fn mono_item_name<'tcx>(
 
     if matches!(instance_ty.kind(), TyKind::Closure(..)) {
         return lower1::naming::FnNameData {
-            class_to_call_on: Some(oomir_module.name.clone()),
+            class_to_call_on: Some(lower1::jvm_names::crate_module_class(
+                tcx,
+                instance.def_id().krate,
+            )),
             method_name: lower1::generate_closure_function_name(tcx, instance),
         };
     }
@@ -282,11 +281,16 @@ fn lower_mono_function<'tcx>(
     oomir_module: &mut oomir::Module,
     lowered_instances: &mut HashSet<Instance<'tcx>>,
 ) {
-    if !instance.def_id().is_local() {
+    let is_external_runtime_item = !instance.def_id().is_local()
+        && lower1::jvm_names::is_runtime_crate(tcx, instance.def_id().krate);
+    let needs_compiled_primitive_operator = is_external_runtime_item
+        && lower1::jvm_names::owner_class_for_function(tcx, instance.def_id())
+            == "org/rustlang/core/ops/arith";
+    if is_external_runtime_item && !needs_compiled_primitive_operator {
         breadcrumbs::log!(
             breadcrumbs::LogLevel::Info,
             "mono-lowering",
-            format!("Skipping non-local mono function: {:?}", instance)
+            format!("Using runtime implementation for mono function: {instance:?}")
         );
         return;
     }
@@ -310,7 +314,7 @@ fn lower_mono_function<'tcx>(
         return;
     }
 
-    let name = mono_item_name(tcx, instance, oomir_module);
+    let name = mono_item_name(tcx, instance);
     let mut mir = tcx.instance_mir(instance.def).clone();
     breadcrumbs::log!(
         breadcrumbs::LogLevel::Info,
