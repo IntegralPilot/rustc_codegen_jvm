@@ -581,7 +581,8 @@ fn requires_compiled_static_dispatch(ty: &oomir::Type) -> bool {
     {
         return requires_compiled_static_dispatch(inner);
     }
-    ty.is_jvm_primitive_like()
+    matches!(ty, oomir::Type::Unit)
+        || ty.is_jvm_primitive_like()
         || matches!(
             ty,
             oomir::Type::Class(class_name)
@@ -603,7 +604,8 @@ fn supports_direct_equality(ty: &oomir::Type) -> bool {
     {
         return supports_direct_equality(inner);
     }
-    ty.is_jvm_primitive_like()
+    matches!(ty, oomir::Type::Unit)
+        || ty.is_jvm_primitive_like()
         || matches!(
             ty,
             oomir::Type::Class(class_name)
