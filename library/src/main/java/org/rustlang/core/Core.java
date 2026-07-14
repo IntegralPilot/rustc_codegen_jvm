@@ -38,6 +38,10 @@ public final class Core {
         return fillFormatTemplate(template == null ? "" : fromShortArray(template), formatArgArray(args));
     }
 
+    public static String formatArgs(byte[] template, Object[] args) {
+        return fillFormatTemplate(template, formatArgArray(args));
+    }
+
     public static String formatArguments(String message, Object template, Object args) {
         if (message != null) {
             return message;
@@ -73,7 +77,7 @@ public final class Core {
         return argument;
     }
 
-    public static Arguments__ new_arguments(short[] template, Object[] args) {
+    public static Arguments__ new_arguments(byte[] template, Object[] args) {
         String message = formatArgs(template, args);
         Arguments__ arguments = new Arguments__(template, args, message);
         ARGUMENT_MESSAGES.put(arguments, message);
@@ -105,10 +109,10 @@ public final class Core {
         return 0;
     }
 
-    public static int compare_bytes(Pointer left, Pointer right, int len) {
-        for (int i = 0; i < len; i++) {
-            int a = left.offset(i).getI16() & 0xff;
-            int b = right.offset(i).getI16() & 0xff;
+    public static int compare_bytes(Pointer left, Pointer right, long len) {
+        for (long i = 0; i < len; i++) {
+            int a = left.offset(i).getI8() & 0xff;
+            int b = right.offset(i).getI8() & 0xff;
             if (a != b) {
                 return a - b;
             }
@@ -126,7 +130,25 @@ public final class Core {
         return dst;
     }
 
+    public static byte[][] encode_utf8_raw(long code, byte[][] dst) {
+        byte[] encoded = new String(Character.toChars((int) code)).getBytes(StandardCharsets.UTF_8);
+        dst[0] = encoded;
+        return dst;
+    }
+
     public static boolean starts_with(short[] value, short[] prefix) {
+        if (prefix.length > value.length) {
+            return false;
+        }
+        for (int i = 0; i < prefix.length; i++) {
+            if (value[i] != prefix[i]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    public static boolean starts_with(byte[] value, byte[] prefix) {
         if (prefix.length > value.length) {
             return false;
         }
@@ -180,6 +202,38 @@ public final class Core {
             }
         }
 
+        return result.toString();
+    }
+
+    private static String fillFormatTemplate(byte[] raw, Object[] args) {
+        if (raw == null) {
+            return "";
+        }
+        int start = raw.length > 0 && raw[0] == '#' ? 1 : 0;
+        StringBuilder result = new StringBuilder();
+        int argIndex = 0;
+        int index = start;
+        while (index < raw.length) {
+            int marker = index;
+            while (marker + 1 < raw.length
+                    && !((raw[marker] & 0xff) == 0xC0 && raw[marker + 1] == 0)) {
+                marker++;
+            }
+            boolean foundMarker = marker + 1 < raw.length
+                    && (raw[marker] & 0xff) == 0xC0
+                    && raw[marker + 1] == 0;
+            int textEnd = foundMarker ? marker : raw.length;
+            if (textEnd > index) {
+                result.append(new String(raw, index, textEnd - index, StandardCharsets.UTF_8));
+            }
+            if (!foundMarker) {
+                break;
+            }
+            Object arg = args != null && argIndex < args.length ? args[argIndex] : null;
+            result.append(arg == null ? "" : arg);
+            argIndex++;
+            index = marker + 2;
+        }
         return result.toString();
     }
 

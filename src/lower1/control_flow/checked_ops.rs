@@ -4,9 +4,15 @@ use crate::oomir::{Constant, Instruction, Operand, Type};
 pub fn checked_arithmetic_tuple_local_name(op_ty: &Type) -> Option<&'static str> {
     match op_ty {
         Type::I8 => Some("Tuple_i8_bool"),
+        Type::U8 => Some("Tuple_u8_bool"),
         Type::I16 => Some("Tuple_i16_bool"),
+        Type::U16 => Some("Tuple_u16_bool"),
         Type::I32 => Some("Tuple_i32_bool"),
+        Type::U32 => Some("Tuple_u32_bool"),
         Type::I64 => Some("Tuple_i64_bool"),
+        Type::U64 => Some("Tuple_u64_bool"),
+        Type::Class(c) if c == crate::lower2::I128_CLASS => Some("Tuple_I128_bool"),
+        Type::Class(c) if c == crate::lower2::U128_CLASS => Some("Tuple_U128_bool"),
         Type::Class(c) if c == crate::lower2::BIG_INTEGER_CLASS => Some("Tuple_BigInteger_bool"),
         Type::Class(c) if c == crate::lower2::BIG_DECIMAL_CLASS => Some("Tuple_BigDecimal_bool"),
         _ => None,
@@ -86,9 +92,15 @@ pub fn emit_checked_arithmetic_oomir_instructions(
 
     let ty_suffix = match op_ty {
         Type::I32 => "i32",
+        Type::U32 => "u32",
         Type::I64 => "i64",
+        Type::U64 => "u64",
         Type::I16 => "i16",
+        Type::U16 => "u16",
         Type::I8 => "i8",
+        Type::U8 => "u8",
+        Type::Class(c) if c == crate::lower2::I128_CLASS => "i128",
+        Type::Class(c) if c == crate::lower2::U128_CLASS => "u128",
         _ => panic!(
             "Unsupported checked arithmetic operation/type: {} {:?}",
             operation, op_ty

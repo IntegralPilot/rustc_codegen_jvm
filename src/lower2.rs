@@ -33,15 +33,21 @@ mod translator;
 pub const BIG_INTEGER_CLASS: &str = "java/math/BigInteger";
 pub const BIG_DECIMAL_CLASS: &str = "java/math/BigDecimal";
 pub const F128_CLASS: &str = "org/rustlang/runtime/F128";
+pub const I128_CLASS: &str = "org/rustlang/runtime/I128";
+pub const U128_CLASS: &str = "org/rustlang/runtime/U128";
 
 fn factory_return_instruction(ty: &oomir::Type) -> Instruction {
     match ty {
         oomir::Type::I8
+        | oomir::Type::U8
         | oomir::Type::I16
+        | oomir::Type::U16
+        | oomir::Type::F16
         | oomir::Type::I32
+        | oomir::Type::U32
         | oomir::Type::Boolean
         | oomir::Type::Char => Instruction::Ireturn,
-        oomir::Type::I64 => Instruction::Lreturn,
+        oomir::Type::I64 | oomir::Type::U64 => Instruction::Lreturn,
         oomir::Type::F32 => Instruction::Freturn,
         oomir::Type::F64 => Instruction::Dreturn,
         oomir::Type::Str

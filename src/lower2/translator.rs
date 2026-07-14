@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::TryInto;
 use std::io::Cursor;
 
-use super::{BIG_DECIMAL_CLASS, BIG_INTEGER_CLASS, F128_CLASS};
+use super::{BIG_DECIMAL_CLASS, BIG_INTEGER_CLASS, F128_CLASS, I128_CLASS, U128_CLASS};
 
 /// Represents the state during the translation of a single function's body.
 pub struct FunctionTranslator<'a, 'cp> {
@@ -500,10 +500,26 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             || (existing.is_jvm_reference_type() && new.is_jvm_reference_type())
             || (matches!(
                 existing,
-                Type::I8 | Type::I16 | Type::I32 | Type::Boolean | Type::Char
+                Type::I8
+                    | Type::U8
+                    | Type::I16
+                    | Type::U16
+                    | Type::F16
+                    | Type::I32
+                    | Type::U32
+                    | Type::Boolean
+                    | Type::Char
             ) && matches!(
                 new,
-                Type::I8 | Type::I16 | Type::I32 | Type::Boolean | Type::Char
+                Type::I8
+                    | Type::U8
+                    | Type::I16
+                    | Type::U16
+                    | Type::F16
+                    | Type::I32
+                    | Type::U32
+                    | Type::Boolean
+                    | Type::Char
             ))
     }
 
@@ -894,6 +910,18 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     };
                 let load_instr = get_load_instruction(&actual_ty, index)?;
                 self.jvm_instructions.push(load_instr);
+                if !self.direct_this_aliases.contains(var_name)
+                    && actual_ty != *ty
+                    && actual_ty.to_jvm_descriptor() != ty.to_jvm_descriptor()
+                {
+                    let casts = get_cast_instructions(
+                        &self.oomir_func.name,
+                        &actual_ty,
+                        ty,
+                        self.constant_pool,
+                    )?;
+                    self.jvm_instructions.extend(casts);
+                }
             }
         }
         Ok(())
@@ -999,10 +1027,10 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
 
         let (getter, runtime_ty) = match pointee_ty {
             oomir::Type::Boolean => ("getBoolean", oomir::Type::Boolean),
-            oomir::Type::I8 => ("getI8", oomir::Type::I8),
-            oomir::Type::I16 => ("getI16", oomir::Type::I16),
-            oomir::Type::I32 | oomir::Type::Char => ("getI32", oomir::Type::I32),
-            oomir::Type::I64 => ("getI64", oomir::Type::I64),
+            oomir::Type::I8 | oomir::Type::U8 => ("getI8", oomir::Type::I8),
+            oomir::Type::I16 | oomir::Type::U16 | oomir::Type::F16 => ("getI16", oomir::Type::I16),
+            oomir::Type::I32 | oomir::Type::U32 | oomir::Type::Char => ("getI32", oomir::Type::I32),
+            oomir::Type::I64 | oomir::Type::U64 => ("getI64", oomir::Type::I64),
             oomir::Type::F32 => ("getF32", oomir::Type::F32),
             oomir::Type::F64 => ("getF64", oomir::Type::F64),
             _ => (
@@ -1233,12 +1261,12 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         if is_pointer_offset {
             let pointer_ty = get_operand_type(&args[0]);
             self.load_call_argument_as(&args[0], &pointer_ty)?;
-            self.load_call_argument_as(&args[1], &oomir::Type::I32)?;
+            self.load_call_argument_as(&args[1], &oomir::Type::I64)?;
             let pointer_class = self.constant_pool.add_class(oomir::POINTER_CLASS)?;
             let method = self.constant_pool.add_method_ref(
                 pointer_class,
                 "offset",
-                &format!("(L{};I)L{};", oomir::POINTER_CLASS, oomir::POINTER_CLASS),
+                &format!("(L{};J)L{};", oomir::POINTER_CLASS, oomir::POINTER_CLASS),
             )?;
             self.jvm_instructions
                 .push(Instruction::Invokestatic(method));
@@ -1263,14 +1291,14 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             let method = self.constant_pool.add_method_ref(
                 pointer_class,
                 "offset_from",
-                &format!("(L{};L{};)I", oomir::POINTER_CLASS, oomir::POINTER_CLASS),
+                &format!("(L{};L{};)J", oomir::POINTER_CLASS, oomir::POINTER_CLASS),
             )?;
             self.jvm_instructions
                 .push(Instruction::Invokestatic(method));
             if let Some(dest) = dest {
                 self.store_result(dest, signature.ret.as_ref())?;
             } else {
-                self.jvm_instructions.push(Instruction::Pop);
+                self.jvm_instructions.push(Instruction::Pop2);
             }
             return Ok(true);
         }
@@ -1281,7 +1309,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             && matches!(
                 &signature.params[0].1,
                 oomir::Type::Slice(element_type)
-                    if matches!(element_type.as_ref(), oomir::Type::I16)
+                    if matches!(element_type.as_ref(), oomir::Type::U8)
             )
             && matches!(signature.ret.as_ref(), oomir::Type::Str);
         if is_from_utf8_unchecked {
@@ -1312,12 +1340,12 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             && matches!(
                 &signature.params[1].1,
                 oomir::Type::Slice(element_type)
-                    if matches!(element_type.as_ref(), oomir::Type::I16)
+                    if matches!(element_type.as_ref(), oomir::Type::U8)
             )
             && matches!(
                 signature.ret.as_ref(),
                 oomir::Type::Slice(element_type)
-                    if matches!(element_type.as_ref(), oomir::Type::I16)
+                    if matches!(element_type.as_ref(), oomir::Type::U8)
             );
         if !is_encode_utf8 {
             return Ok(false);
@@ -1487,14 +1515,167 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         op2: &oomir::Operand,
         jvm_op: Instruction,
     ) -> Result<(), jvm::Error> {
-        self.load_operand(op1)?;
-        self.load_operand(op2)?;
-        self.jvm_instructions.push(jvm_op);
         let op1_type = match op1 {
             oomir::Operand::Variable { ty, .. } => ty.clone(),
             oomir::Operand::Constant(c) => Type::from_constant(c),
         };
+        self.load_operand_as(op1, &op1_type)?;
+        self.load_operand_as(op2, &op1_type)?;
+        self.jvm_instructions.push(jvm_op);
+        self.normalize_integer_result(&op1_type);
         self.store_result(dest, &op1_type)?;
+        Ok(())
+    }
+
+    /// JVM arithmetic on byte/short/char values produces an `int`.  Rust arithmetic,
+    /// however, wraps at the source type's width after every operation.
+    fn normalize_integer_result(&mut self, ty: &Type) {
+        match ty {
+            Type::I8 | Type::U8 => self.jvm_instructions.push(Instruction::I2b),
+            Type::I16 | Type::F16 => self.jvm_instructions.push(Instruction::I2s),
+            Type::U16 | Type::Char => self.jvm_instructions.push(Instruction::I2c),
+            _ => {}
+        }
+    }
+
+    fn translate_f16_binary_op(
+        &mut self,
+        dest: &str,
+        op1: &oomir::Operand,
+        op2: &oomir::Operand,
+        method_name: &str,
+    ) -> Result<(), jvm::Error> {
+        self.load_operand(op1)?;
+        self.load_operand(op2)?;
+        let class = self
+            .constant_pool
+            .add_class("org/rustlang/runtime/Numbers")?;
+        let method = self
+            .constant_pool
+            .add_method_ref(class, method_name, "(SS)S")?;
+        self.jvm_instructions
+            .push(Instruction::Invokestatic(method));
+        self.store_result(dest, &Type::F16)
+    }
+
+    fn translate_unsigned_div_rem(
+        &mut self,
+        dest: &str,
+        op1: &oomir::Operand,
+        op2: &oomir::Operand,
+        ty: &Type,
+        is_remainder: bool,
+    ) -> Result<(), jvm::Error> {
+        match ty {
+            Type::U8 | Type::U16 => {
+                self.load_operand_as(op1, ty)?;
+                if *ty == Type::U8 {
+                    self.jvm_instructions
+                        .push(get_int_const_instr(self.constant_pool, 0xff));
+                    self.jvm_instructions.push(Instruction::Iand);
+                }
+                self.load_operand_as(op2, ty)?;
+                if *ty == Type::U8 {
+                    self.jvm_instructions
+                        .push(get_int_const_instr(self.constant_pool, 0xff));
+                    self.jvm_instructions.push(Instruction::Iand);
+                }
+                self.jvm_instructions.push(if is_remainder {
+                    Instruction::Irem
+                } else {
+                    Instruction::Idiv
+                });
+                self.normalize_integer_result(ty);
+            }
+            Type::U32 => {
+                self.load_operand_as(op1, ty)?;
+                self.load_operand_as(op2, ty)?;
+                let class = self.constant_pool.add_class("java/lang/Integer")?;
+                let method = self.constant_pool.add_method_ref(
+                    class,
+                    if is_remainder {
+                        "remainderUnsigned"
+                    } else {
+                        "divideUnsigned"
+                    },
+                    "(II)I",
+                )?;
+                self.jvm_instructions
+                    .push(Instruction::Invokestatic(method));
+            }
+            Type::U64 => {
+                self.load_operand_as(op1, ty)?;
+                self.load_operand_as(op2, ty)?;
+                let class = self.constant_pool.add_class("java/lang/Long")?;
+                let method = self.constant_pool.add_method_ref(
+                    class,
+                    if is_remainder {
+                        "remainderUnsigned"
+                    } else {
+                        "divideUnsigned"
+                    },
+                    "(JJ)J",
+                )?;
+                self.jvm_instructions
+                    .push(Instruction::Invokestatic(method));
+            }
+            _ => unreachable!("not an unsigned integer type: {ty:?}"),
+        }
+        self.store_result(dest, ty)
+    }
+
+    fn translate_primitive_shift(
+        &mut self,
+        dest: &str,
+        op1: &oomir::Operand,
+        op2: &oomir::Operand,
+        left: bool,
+    ) -> Result<(), jvm::Error> {
+        let value_type = get_operand_type(op1);
+        let shift_type = get_operand_type(op2);
+        let width = match value_type {
+            Type::I8 | Type::U8 => 8,
+            Type::I16 | Type::U16 => 16,
+            Type::I32 | Type::U32 | Type::Boolean | Type::Char => 32,
+            Type::I64 | Type::U64 => 64,
+            _ => unreachable!("not a primitive shift type: {value_type:?}"),
+        };
+
+        self.load_operand(op1)?;
+        // A u8 is deliberately carried in a JVM byte (and therefore sign-extended when
+        // loaded).  Recover its unsigned numeric value before a logical right shift.
+        if !left && value_type == Type::U8 {
+            self.jvm_instructions
+                .push(get_int_const_instr(self.constant_pool, 0xff));
+            self.jvm_instructions.push(Instruction::Iand);
+        }
+
+        self.load_operand(op2)?;
+        if matches!(shift_type, Type::I64 | Type::U64) {
+            self.jvm_instructions.push(Instruction::L2i);
+        }
+        self.jvm_instructions
+            .push(get_int_const_instr(self.constant_pool, width - 1));
+        self.jvm_instructions.push(Instruction::Iand);
+
+        self.jvm_instructions.push(match (&value_type, left) {
+            (Type::I64 | Type::U64, true) => Instruction::Lshl,
+            (Type::I64, false) => Instruction::Lshr,
+            (Type::U64, false) => Instruction::Lushr,
+            (_, true) => Instruction::Ishl,
+            (Type::U8 | Type::U16 | Type::U32, false) => Instruction::Iushr,
+            (_, false) => Instruction::Ishr,
+        });
+        self.normalize_integer_result(&value_type);
+        self.store_result(dest, &value_type)
+    }
+
+    fn load_jvm_int_operand(&mut self, operand: &oomir::Operand) -> Result<(), jvm::Error> {
+        let ty = get_operand_type(operand);
+        self.load_operand(operand)?;
+        if matches!(ty, Type::I64 | Type::U64) {
+            self.jvm_instructions.push(Instruction::L2i);
+        }
         Ok(())
     }
 
@@ -1517,6 +1698,74 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         self.store_result(dest, &Type::Class(F128_CLASS.to_string()))
     }
 
+    fn translate_int128_binary_op(
+        &mut self,
+        dest: &str,
+        op1: &oomir::Operand,
+        op2: &oomir::Operand,
+        method_name: &str,
+    ) -> Result<(), jvm::Error> {
+        let value_type = get_operand_type(op1);
+        let Type::Class(class_name) = &value_type else {
+            unreachable!("128-bit integer carrier must be a JVM class")
+        };
+        debug_assert!(class_name == I128_CLASS || class_name == U128_CLASS);
+        self.load_operand_as(op1, &value_type)?;
+        self.load_operand_as(op2, &value_type)?;
+        let class = self.constant_pool.add_class(class_name)?;
+        let descriptor = format!("(L{class_name};)L{class_name};");
+        let method = self
+            .constant_pool
+            .add_method_ref(class, method_name, descriptor)?;
+        self.jvm_instructions
+            .push(Instruction::Invokevirtual(method));
+        self.store_result(dest, &value_type)
+    }
+
+    fn translate_int128_shift(
+        &mut self,
+        dest: &str,
+        value: &oomir::Operand,
+        distance: &oomir::Operand,
+        method_name: &str,
+    ) -> Result<(), jvm::Error> {
+        let value_type = get_operand_type(value);
+        let Type::Class(class_name) = &value_type else {
+            unreachable!("128-bit integer carrier must be a JVM class")
+        };
+        self.load_operand(value)?;
+        self.load_jvm_int_operand(distance)?;
+        let class = self.constant_pool.add_class(class_name)?;
+        let descriptor = format!("(I)L{class_name};");
+        let method = self
+            .constant_pool
+            .add_method_ref(class, method_name, descriptor)?;
+        self.jvm_instructions
+            .push(Instruction::Invokevirtual(method));
+        self.store_result(dest, &value_type)
+    }
+
+    fn translate_int128_unary_op(
+        &mut self,
+        dest: &str,
+        value: &oomir::Operand,
+        method_name: &str,
+    ) -> Result<(), jvm::Error> {
+        let value_type = get_operand_type(value);
+        let Type::Class(class_name) = &value_type else {
+            unreachable!("128-bit integer carrier must be a JVM class")
+        };
+        self.load_operand(value)?;
+        let class = self.constant_pool.add_class(class_name)?;
+        let descriptor = format!("()L{class_name};");
+        let method = self
+            .constant_pool
+            .add_method_ref(class, method_name, descriptor)?;
+        self.jvm_instructions
+            .push(Instruction::Invokevirtual(method));
+        self.store_result(dest, &value_type)
+    }
+
     /// Determines the common comparison type based on numeric promotion rules,
     /// including BigInteger and BigDecimal. Also returns necessary cast targets.
     fn determine_comparison_type(
@@ -1527,7 +1776,8 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         // Helper to check if a type is BigInteger or BigDecimal
         let is_big_type = |ty: &Type| {
             matches!(ty,
-            Type::Class(c) if c == BIG_INTEGER_CLASS || c == BIG_DECIMAL_CLASS)
+            Type::Class(c) if c == BIG_INTEGER_CLASS || c == BIG_DECIMAL_CLASS
+                || c == I128_CLASS || c == U128_CLASS)
         };
 
         // Helper to check if a type is numeric primitive or boolean/char
@@ -1535,9 +1785,14 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             matches!(
                 ty,
                 Type::I8
+                    | Type::U8
                     | Type::I16
+                    | Type::U16
+                    | Type::F16
                     | Type::I32
+                    | Type::U32
                     | Type::I64
+                    | Type::U64
                     | Type::F32
                     | Type::F64
                     | Type::Boolean
@@ -1550,9 +1805,14 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 // Check if the type itself is comparable
                 match t1 {
                     Type::I8
+                    | Type::U8
                     | Type::I16
+                    | Type::U16
+                    | Type::F16
                     | Type::I32
+                    | Type::U32
                     | Type::I64
+                    | Type::U64
                     | Type::F32
                     | Type::F64
                     | Type::Boolean
@@ -1620,8 +1880,12 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     Type::F64
                 } else if t1 == &Type::F32 || t2 == &Type::F32 {
                     Type::F32
+                } else if t1 == &Type::U64 || t2 == &Type::U64 {
+                    Type::U64
                 } else if t1 == &Type::I64 || t2 == &Type::I64 {
                     Type::I64
+                } else if t1 == &Type::U32 || t2 == &Type::U32 {
+                    Type::U32
                 } else {
                     Type::I32
                 }; // Promote smaller ints/bool/char to I32
@@ -1755,6 +2019,95 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             return Ok(());
         }
 
+        if comparison_type == Type::F16 {
+            self.load_operand(op1)?;
+            self.load_operand(op2)?;
+            let class = self
+                .constant_pool
+                .add_class("org/rustlang/runtime/Numbers")?;
+            let method = self.constant_pool.add_method_ref(
+                class,
+                &format!("f16{}{}", &comp_op[..1].to_ascii_uppercase(), &comp_op[1..]),
+                "(SS)Z",
+            )?;
+            self.jvm_instructions
+                .push(Instruction::Invokestatic(method));
+            self.store_result(dest, &Type::Boolean)?;
+            return Ok(());
+        }
+
+        if matches!(
+            comparison_type,
+            Type::U8 | Type::U16 | Type::U32 | Type::U64
+        ) {
+            self.load_operand(op1)?;
+            if op1_type != comparison_type {
+                let casts = get_cast_instructions(
+                    &self.oomir_func.name,
+                    &op1_type,
+                    &comparison_type,
+                    self.constant_pool,
+                )?;
+                self.jvm_instructions.extend(casts);
+            }
+            if comparison_type == Type::U8 {
+                self.jvm_instructions
+                    .push(get_int_const_instr(self.constant_pool, 0xff));
+                self.jvm_instructions.push(Instruction::Iand);
+            }
+            self.load_operand(op2)?;
+            if op2_type != comparison_type {
+                let casts = get_cast_instructions(
+                    &self.oomir_func.name,
+                    &op2_type,
+                    &comparison_type,
+                    self.constant_pool,
+                )?;
+                self.jvm_instructions.extend(casts);
+            }
+            if comparison_type == Type::U8 {
+                self.jvm_instructions
+                    .push(get_int_const_instr(self.constant_pool, 0xff));
+                self.jvm_instructions.push(Instruction::Iand);
+            }
+
+            let branch_constructor: Box<dyn Fn(u16) -> Instruction> =
+                if matches!(comparison_type, Type::U32 | Type::U64) {
+                    let (class_name, descriptor) = if comparison_type == Type::U32 {
+                        ("java/lang/Integer", "(II)I")
+                    } else {
+                        ("java/lang/Long", "(JJ)I")
+                    };
+                    let class = self.constant_pool.add_class(class_name)?;
+                    let method =
+                        self.constant_pool
+                            .add_method_ref(class, "compareUnsigned", descriptor)?;
+                    self.jvm_instructions
+                        .push(Instruction::Invokestatic(method));
+                    Box::new(move |offset| match comp_op {
+                        "eq" => Instruction::Ifeq(offset),
+                        "ne" => Instruction::Ifne(offset),
+                        "lt" => Instruction::Iflt(offset),
+                        "le" => Instruction::Ifle(offset),
+                        "gt" => Instruction::Ifgt(offset),
+                        "ge" => Instruction::Ifge(offset),
+                        _ => unreachable!(),
+                    })
+                } else {
+                    Box::new(move |offset| match comp_op {
+                        "eq" => Instruction::If_icmpeq(offset),
+                        "ne" => Instruction::If_icmpne(offset),
+                        "lt" => Instruction::If_icmplt(offset),
+                        "le" => Instruction::If_icmple(offset),
+                        "gt" => Instruction::If_icmpgt(offset),
+                        "ge" => Instruction::If_icmpge(offset),
+                        _ => unreachable!(),
+                    })
+                };
+            self.materialize_boolean_from_branch(dest, branch_constructor)?;
+            return Ok(());
+        }
+
         self.load_operand(op1)?;
         if let Some(target_type) = cast1_target {
             // Use the enhanced casting helper which needs the constant pool
@@ -1840,14 +2193,17 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     _ => unreachable!(),
                 });
             }
-            Type::Class(ref class_name) if class_name == BIG_INTEGER_CLASS => {
+            Type::Class(ref class_name)
+                if class_name == BIG_INTEGER_CLASS
+                    || class_name == I128_CLASS
+                    || class_name == U128_CLASS =>
+            {
                 if !["eq", "ne", "lt", "le", "gt", "ge"].contains(&comp_op) { /* error */ }
-                // Call BigInteger.compareTo(BigInteger) -> int
-                let class_idx = self.constant_pool.add_class(BIG_INTEGER_CLASS)?;
+                let class_idx = self.constant_pool.add_class(class_name)?;
                 let method_ref = self.constant_pool.add_method_ref(
                     class_idx,
                     "compareTo",
-                    "(Ljava/math/BigInteger;)I",
+                    &format!("(L{class_name};)I"),
                 )?;
                 self.jvm_instructions
                     .push(Instruction::Invokevirtual(method_ref)); // Stack: [int_result]
@@ -1981,6 +2337,12 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     || op2_type == Type::Class(BIG_DECIMAL_CLASS.to_string())
                 {
                     Type::Class(BIG_DECIMAL_CLASS.to_string())
+                } else if matches!(&op1_type, Type::Class(c) if c == I128_CLASS || c == U128_CLASS)
+                {
+                    op1_type.clone()
+                } else if matches!(&op2_type, Type::Class(c) if c == I128_CLASS || c == U128_CLASS)
+                {
+                    op2_type.clone()
                 } else if op1_type == Type::Class(BIG_INTEGER_CLASS.to_string())
                     || op2_type == Type::Class(BIG_INTEGER_CLASS.to_string())
                 {
@@ -1991,15 +2353,26 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 };
 
                 match op_type {
-                    Type::I32 | Type::I8 | Type::I16 | Type::Boolean | Type::Char => {
+                    Type::I32
+                    | Type::U32
+                    | Type::I8
+                    | Type::U8
+                    | Type::I16
+                    | Type::U16
+                    | Type::Boolean
+                    | Type::Char => {
                         // TODO: Implement numeric promotion (e.g., i8+i32 -> i32) if not handled by translate_binary_op
                         self.translate_binary_op(dest, op1, op2, JI::Iadd)?
                     }
-                    Type::I64 => self.translate_binary_op(dest, op1, op2, JI::Ladd)?,
+                    Type::I64 | Type::U64 => self.translate_binary_op(dest, op1, op2, JI::Ladd)?,
+                    Type::F16 => self.translate_f16_binary_op(dest, op1, op2, "f16Add")?,
                     Type::F32 => self.translate_binary_op(dest, op1, op2, JI::Fadd)?,
                     Type::F64 => self.translate_binary_op(dest, op1, op2, JI::Dadd)?,
                     Type::Class(ref c) if c == F128_CLASS => {
                         self.translate_f128_binary_op(dest, op1, op2, "add")?
+                    }
+                    Type::Class(ref c) if c == I128_CLASS || c == U128_CLASS => {
+                        self.translate_int128_binary_op(dest, op1, op2, "add")?
                     }
                     Type::Class(ref c) if c == BIG_INTEGER_CLASS => {
                         // BigInteger ADD operation: add(BigInteger)
@@ -2097,6 +2470,12 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     || op2_type == Type::Class(BIG_DECIMAL_CLASS.to_string())
                 {
                     Type::Class(BIG_DECIMAL_CLASS.to_string())
+                } else if matches!(&op1_type, Type::Class(c) if c == I128_CLASS || c == U128_CLASS)
+                {
+                    op1_type.clone()
+                } else if matches!(&op2_type, Type::Class(c) if c == I128_CLASS || c == U128_CLASS)
+                {
+                    op2_type.clone()
                 } else if op1_type == Type::Class(BIG_INTEGER_CLASS.to_string())
                     || op2_type == Type::Class(BIG_INTEGER_CLASS.to_string())
                 {
@@ -2106,14 +2485,23 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 };
 
                 match op_type {
-                    Type::I32 | Type::I8 | Type::I16 | Type::Boolean | Type::Char => {
-                        self.translate_binary_op(dest, op1, op2, JI::Isub)?
-                    }
-                    Type::I64 => self.translate_binary_op(dest, op1, op2, JI::Lsub)?,
+                    Type::I32
+                    | Type::U32
+                    | Type::I8
+                    | Type::U8
+                    | Type::I16
+                    | Type::U16
+                    | Type::Boolean
+                    | Type::Char => self.translate_binary_op(dest, op1, op2, JI::Isub)?,
+                    Type::I64 | Type::U64 => self.translate_binary_op(dest, op1, op2, JI::Lsub)?,
+                    Type::F16 => self.translate_f16_binary_op(dest, op1, op2, "f16Sub")?,
                     Type::F32 => self.translate_binary_op(dest, op1, op2, JI::Fsub)?,
                     Type::F64 => self.translate_binary_op(dest, op1, op2, JI::Dsub)?,
                     Type::Class(ref c) if c == F128_CLASS => {
                         self.translate_f128_binary_op(dest, op1, op2, "subtract")?
+                    }
+                    Type::Class(ref c) if c == I128_CLASS || c == U128_CLASS => {
+                        self.translate_int128_binary_op(dest, op1, op2, "subtract")?
                     }
                     Type::Class(ref c) if c == BIG_INTEGER_CLASS => {
                         // BigInteger SUBTRACT operation: subtract(BigInteger)
@@ -2205,6 +2593,12 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     || op2_type == Type::Class(BIG_DECIMAL_CLASS.to_string())
                 {
                     Type::Class(BIG_DECIMAL_CLASS.to_string())
+                } else if matches!(&op1_type, Type::Class(c) if c == I128_CLASS || c == U128_CLASS)
+                {
+                    op1_type.clone()
+                } else if matches!(&op2_type, Type::Class(c) if c == I128_CLASS || c == U128_CLASS)
+                {
+                    op2_type.clone()
                 } else if op1_type == Type::Class(BIG_INTEGER_CLASS.to_string())
                     || op2_type == Type::Class(BIG_INTEGER_CLASS.to_string())
                 {
@@ -2214,14 +2608,23 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 };
 
                 match op_type {
-                    Type::I32 | Type::I8 | Type::I16 | Type::Boolean | Type::Char => {
-                        self.translate_binary_op(dest, op1, op2, JI::Imul)?
-                    }
-                    Type::I64 => self.translate_binary_op(dest, op1, op2, JI::Lmul)?,
+                    Type::I32
+                    | Type::U32
+                    | Type::I8
+                    | Type::U8
+                    | Type::I16
+                    | Type::U16
+                    | Type::Boolean
+                    | Type::Char => self.translate_binary_op(dest, op1, op2, JI::Imul)?,
+                    Type::I64 | Type::U64 => self.translate_binary_op(dest, op1, op2, JI::Lmul)?,
+                    Type::F16 => self.translate_f16_binary_op(dest, op1, op2, "f16Mul")?,
                     Type::F32 => self.translate_binary_op(dest, op1, op2, JI::Fmul)?,
                     Type::F64 => self.translate_binary_op(dest, op1, op2, JI::Dmul)?,
                     Type::Class(ref c) if c == F128_CLASS => {
                         self.translate_f128_binary_op(dest, op1, op2, "multiply")?
+                    }
+                    Type::Class(ref c) if c == I128_CLASS || c == U128_CLASS => {
+                        self.translate_int128_binary_op(dest, op1, op2, "multiply")?
                     }
                     Type::Class(ref c) if c == BIG_INTEGER_CLASS => {
                         // BigInteger MULTIPLY operation: multiply(BigInteger)
@@ -2310,6 +2713,12 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     || op2_type == Type::Class(BIG_DECIMAL_CLASS.to_string())
                 {
                     Type::Class(BIG_DECIMAL_CLASS.to_string())
+                } else if matches!(&op1_type, Type::Class(c) if c == I128_CLASS || c == U128_CLASS)
+                {
+                    op1_type.clone()
+                } else if matches!(&op2_type, Type::Class(c) if c == I128_CLASS || c == U128_CLASS)
+                {
+                    op2_type.clone()
                 } else if op1_type == Type::Class(BIG_INTEGER_CLASS.to_string())
                     || op2_type == Type::Class(BIG_INTEGER_CLASS.to_string())
                 {
@@ -2323,11 +2732,18 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                         // Potential DivisionByZeroError for primitives handled by JVM
                         self.translate_binary_op(dest, op1, op2, JI::Idiv)?
                     }
+                    Type::U8 | Type::U16 | Type::U32 | Type::U64 => {
+                        self.translate_unsigned_div_rem(dest, op1, op2, &op_type, false)?
+                    }
                     Type::I64 => self.translate_binary_op(dest, op1, op2, JI::Ldiv)?,
+                    Type::F16 => self.translate_f16_binary_op(dest, op1, op2, "f16Div")?,
                     Type::F32 => self.translate_binary_op(dest, op1, op2, JI::Fdiv)?, // Handles +/- Infinity, NaN
                     Type::F64 => self.translate_binary_op(dest, op1, op2, JI::Ddiv)?, // Handles +/- Infinity, NaN
                     Type::Class(ref c) if c == F128_CLASS => {
                         self.translate_f128_binary_op(dest, op1, op2, "divide")?
+                    }
+                    Type::Class(ref c) if c == I128_CLASS || c == U128_CLASS => {
+                        self.translate_int128_binary_op(dest, op1, op2, "divide")?
                     }
                     Type::Class(ref c) if c == BIG_INTEGER_CLASS => {
                         // BigInteger DIVIDE operation: divide(BigInteger)
@@ -2438,6 +2854,12 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     || op2_type == Type::Class(BIG_DECIMAL_CLASS.to_string())
                 {
                     Type::Class(BIG_DECIMAL_CLASS.to_string())
+                } else if matches!(&op1_type, Type::Class(c) if c == I128_CLASS || c == U128_CLASS)
+                {
+                    op1_type.clone()
+                } else if matches!(&op2_type, Type::Class(c) if c == I128_CLASS || c == U128_CLASS)
+                {
+                    op2_type.clone()
                 } else if op1_type == Type::Class(BIG_INTEGER_CLASS.to_string())
                     || op2_type == Type::Class(BIG_INTEGER_CLASS.to_string())
                 {
@@ -2451,11 +2873,18 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                         // Potential DivisionByZeroError handled by JVM
                         self.translate_binary_op(dest, op1, op2, JI::Irem)?
                     }
+                    Type::U8 | Type::U16 | Type::U32 | Type::U64 => {
+                        self.translate_unsigned_div_rem(dest, op1, op2, &op_type, true)?
+                    }
                     Type::I64 => self.translate_binary_op(dest, op1, op2, JI::Lrem)?,
+                    Type::F16 => self.translate_f16_binary_op(dest, op1, op2, "f16Rem")?,
                     Type::F32 => self.translate_binary_op(dest, op1, op2, JI::Frem)?, // Handles NaN
                     Type::F64 => self.translate_binary_op(dest, op1, op2, JI::Drem)?, // Handles NaN
                     Type::Class(ref c) if c == F128_CLASS => {
                         self.translate_f128_binary_op(dest, op1, op2, "remainder")?
+                    }
+                    Type::Class(ref c) if c == I128_CLASS || c == U128_CLASS => {
+                        self.translate_int128_binary_op(dest, op1, op2, "remainder")?
                     }
                     Type::Class(ref c) if c == BIG_INTEGER_CLASS => {
                         // BigInteger REMAINDER operation: remainder(BigInteger)
@@ -2546,10 +2975,18 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 let op_type = get_operand_type(op1); // Use helper to get type robustly
 
                 match op_type {
-                    Type::I32 | Type::I8 | Type::I16 | Type::Boolean | Type::Char => {
-                        self.translate_binary_op(dest, op1, op2, JI::Iand)?
+                    Type::I32
+                    | Type::U32
+                    | Type::I8
+                    | Type::U8
+                    | Type::I16
+                    | Type::U16
+                    | Type::Boolean
+                    | Type::Char => self.translate_binary_op(dest, op1, op2, JI::Iand)?,
+                    Type::I64 | Type::U64 => self.translate_binary_op(dest, op1, op2, JI::Land)?,
+                    Type::Class(ref c) if c == I128_CLASS || c == U128_CLASS => {
+                        self.translate_int128_binary_op(dest, op1, op2, "and")?
                     }
-                    Type::I64 => self.translate_binary_op(dest, op1, op2, JI::Land)?,
                     Type::Class(ref c) if c == BIG_INTEGER_CLASS => {
                         // BigInteger AND operation
                         let class_idx = self.constant_pool.add_class(BIG_INTEGER_CLASS)?;
@@ -2586,13 +3023,23 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 let op_type = get_operand_type(op1);
 
                 match op_type {
-                    Type::I32 | Type::I8 | Type::I16 | Type::Boolean | Type::Char => {
+                    Type::I32
+                    | Type::U32
+                    | Type::I8
+                    | Type::U8
+                    | Type::I16
+                    | Type::U16
+                    | Type::Boolean
+                    | Type::Char => {
                         // Primitive case handled by translate_binary_op below
                         self.translate_binary_op(dest, op1, op2, JI::Ior)?
                     }
-                    Type::I64 => {
+                    Type::I64 | Type::U64 => {
                         // Primitive case handled by translate_binary_op below
                         self.translate_binary_op(dest, op1, op2, JI::Lor)?
+                    }
+                    Type::Class(ref c) if c == I128_CLASS || c == U128_CLASS => {
+                        self.translate_int128_binary_op(dest, op1, op2, "or")?
                     }
                     Type::Class(ref c) if c == BIG_INTEGER_CLASS => {
                         // BigInteger OR operation
@@ -2629,13 +3076,23 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 let op_type = get_operand_type(op1);
 
                 match op_type {
-                    Type::I32 | Type::I8 | Type::I16 | Type::Boolean | Type::Char => {
+                    Type::I32
+                    | Type::U32
+                    | Type::I8
+                    | Type::U8
+                    | Type::I16
+                    | Type::U16
+                    | Type::Boolean
+                    | Type::Char => {
                         // Primitive case handled by translate_binary_op below
                         self.translate_binary_op(dest, op1, op2, JI::Ixor)?
                     }
-                    Type::I64 => {
+                    Type::I64 | Type::U64 => {
                         // Primitive case handled by translate_binary_op below
                         self.translate_binary_op(dest, op1, op2, JI::Lxor)?
+                    }
+                    Type::Class(ref c) if c == I128_CLASS || c == U128_CLASS => {
+                        self.translate_int128_binary_op(dest, op1, op2, "xor")?
                     }
                     Type::Class(ref c) if c == BIG_INTEGER_CLASS => {
                         // BigInteger XOR operation
@@ -2677,33 +3134,18 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 let op2_type = get_operand_type(op2);
 
                 match op1_type {
-                    Type::I32 | Type::I8 | Type::I16 | Type::Boolean | Type::Char => {
-                        // JVM Ishl/Lshl takes int shift amount. op2 might need casting if not I32.
-                        // translate_binary_op implicitly handles this by taking only I32 shift value.
-                        self.load_operand(op1)?; // Load value to shift
-                        self.load_operand(op2)?; // Load shift amount (should be I32)
-                        // Perform potential cast of op1 to I32 if needed (e.g., I8 -> I32)
-                        match get_operand_type(op1) {
-                            // Re-check op1's specific type for casting
-                            Type::I8 | Type::I16 | Type::Boolean | Type::Char => {
-                                let cast_instrs = get_cast_instructions(
-                                    &self.oomir_func.name,
-                                    &get_operand_type(op1),
-                                    &Type::I32,
-                                    self.constant_pool,
-                                )?;
-                                self.jvm_instructions.extend(cast_instrs);
-                            }
-                            _ => {} // Already I32
-                        }
-                        self.jvm_instructions.push(JI::Ishl);
-                        self.store_result(dest, &Type::I32)?; // Result is I32
-                    }
-                    Type::I64 => {
-                        self.load_operand(op1)?; // Load long value
-                        self.load_operand(op2)?; // Load int shift amount
-                        self.jvm_instructions.push(JI::Lshl);
-                        self.store_result(dest, &Type::I64)?; // Result is I64
+                    Type::I8
+                    | Type::U8
+                    | Type::I16
+                    | Type::U16
+                    | Type::I32
+                    | Type::U32
+                    | Type::I64
+                    | Type::U64
+                    | Type::Boolean
+                    | Type::Char => self.translate_primitive_shift(dest, op1, op2, true)?,
+                    Type::Class(ref c) if c == I128_CLASS || c == U128_CLASS => {
+                        self.translate_int128_shift(dest, op1, op2, "shiftLeft")?
                     }
                     Type::Class(ref c) if c == BIG_INTEGER_CLASS => {
                         // BigInteger SHL operation: shiftLeft(int)
@@ -2749,32 +3191,18 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 let op2_type = get_operand_type(op2);
 
                 match op1_type {
-                    Type::I32 | Type::I8 | Type::I16 | Type::Boolean | Type::Char => {
-                        // JVM Ishr/Lshr takes int shift amount. op2 might need casting if not I32.
-                        self.load_operand(op1)?; // Load value to shift
-                        self.load_operand(op2)?; // Load shift amount (should be I32)
-                        // Perform potential cast of op1 to I32 if needed (e.g., I8 -> I32)
-                        match get_operand_type(op1) {
-                            // Re-check op1's specific type for casting
-                            Type::I8 | Type::I16 | Type::Boolean | Type::Char => {
-                                let cast_instrs = get_cast_instructions(
-                                    &self.oomir_func.name,
-                                    &get_operand_type(op1),
-                                    &Type::I32,
-                                    self.constant_pool,
-                                )?;
-                                self.jvm_instructions.extend(cast_instrs);
-                            }
-                            _ => {} // Already I32
-                        }
-                        self.jvm_instructions.push(JI::Ishr); // Use Ishr for signed right shift
-                        self.store_result(dest, &Type::I32)?; // Result is I32
-                    }
-                    Type::I64 => {
-                        self.load_operand(op1)?; // Load long value
-                        self.load_operand(op2)?; // Load int shift amount
-                        self.jvm_instructions.push(JI::Lshr); // Use Lshr for signed right shift
-                        self.store_result(dest, &Type::I64)?; // Result is I64
+                    Type::I8
+                    | Type::U8
+                    | Type::I16
+                    | Type::U16
+                    | Type::I32
+                    | Type::U32
+                    | Type::I64
+                    | Type::U64
+                    | Type::Boolean
+                    | Type::Char => self.translate_primitive_shift(dest, op1, op2, false)?,
+                    Type::Class(ref c) if c == I128_CLASS || c == U128_CLASS => {
+                        self.translate_int128_shift(dest, op1, op2, "shiftRight")?
                     }
                     Type::Class(ref c) if c == BIG_INTEGER_CLASS => {
                         // BigInteger SHR operation: shiftRight(int)
@@ -2823,39 +3251,28 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                         self.jvm_instructions.push(JI::Ixor);
                         self.store_result(dest, &src_type)?; // Store boolean result
                     }
-                    oomir::Type::I8 | oomir::Type::I16 | oomir::Type::I32 | oomir::Type::Char => {
+                    oomir::Type::I8
+                    | oomir::Type::U8
+                    | oomir::Type::I16
+                    | oomir::Type::U16
+                    | oomir::Type::I32
+                    | oomir::Type::U32
+                    | oomir::Type::Char => {
                         self.load_operand(src)?;
-                        // Cast to I32 if necessary before XOR
-                        if src_type != Type::I32 {
-                            let cast_instrs = get_cast_instructions(
-                                &self.oomir_func.name,
-                                &src_type,
-                                &Type::I32,
-                                self.constant_pool,
-                            )?;
-                            self.jvm_instructions.extend(cast_instrs);
-                        }
                         self.jvm_instructions.push(JI::Iconst_m1);
                         self.jvm_instructions.push(JI::Ixor);
-                        // Store result as original type (e.g., if src was I8, dest should be I8)
-                        // Result of IXOR is I32, so cast back if needed
-                        if src_type != Type::I32 {
-                            let cast_instrs = get_cast_instructions(
-                                &self.oomir_func.name,
-                                &Type::I32,
-                                &src_type,
-                                self.constant_pool,
-                            )?;
-                            self.jvm_instructions.extend(cast_instrs);
-                        }
+                        self.normalize_integer_result(&src_type);
                         self.store_result(dest, &src_type)?;
                     }
-                    oomir::Type::I64 => {
+                    oomir::Type::I64 | oomir::Type::U64 => {
                         self.load_operand(src)?;
                         let neg_one_long_index = self.constant_pool.add_long(-1_i64)?;
                         self.jvm_instructions.push(JI::Ldc2_w(neg_one_long_index));
                         self.jvm_instructions.push(JI::Lxor);
                         self.store_result(dest, &src_type)?; // Store long result
+                    }
+                    oomir::Type::Class(ref c) if c == I128_CLASS || c == U128_CLASS => {
+                        self.translate_int128_unary_op(dest, src, "not")?
                     }
                     oomir::Type::Class(ref c) if c == BIG_INTEGER_CLASS => {
                         // BigInteger NOT operation: not()
@@ -2888,35 +3305,19 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 let src_type = get_operand_type(src);
                 match src_type {
                     oomir::Type::I8
+                    | oomir::Type::U8
                     | oomir::Type::I16
+                    | oomir::Type::U16
                     | oomir::Type::I32
+                    | oomir::Type::U32
                     | oomir::Type::Boolean
                     | oomir::Type::Char => {
                         self.load_operand(src)?;
-                        // Cast to I32 if needed before INEG
-                        if src_type != Type::I32 {
-                            let cast_instrs = get_cast_instructions(
-                                &self.oomir_func.name,
-                                &src_type,
-                                &Type::I32,
-                                self.constant_pool,
-                            )?;
-                            self.jvm_instructions.extend(cast_instrs);
-                        }
                         self.jvm_instructions.push(JI::Ineg);
-                        // Cast back if needed
-                        if src_type != Type::I32 {
-                            let cast_instrs = get_cast_instructions(
-                                &self.oomir_func.name,
-                                &Type::I32,
-                                &src_type,
-                                self.constant_pool,
-                            )?;
-                            self.jvm_instructions.extend(cast_instrs);
-                        }
+                        self.normalize_integer_result(&src_type);
                         self.store_result(dest, &src_type)?;
                     }
-                    oomir::Type::I64 => {
+                    oomir::Type::I64 | oomir::Type::U64 => {
                         self.load_operand(src)?;
                         self.jvm_instructions.push(JI::Lneg);
                         self.store_result(dest, &src_type)?;
@@ -2924,6 +3325,14 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     oomir::Type::F32 => {
                         self.load_operand(src)?;
                         self.jvm_instructions.push(JI::Fneg);
+                        self.store_result(dest, &src_type)?;
+                    }
+                    oomir::Type::F16 => {
+                        self.load_operand(src)?;
+                        self.jvm_instructions
+                            .push(get_int_const_instr(self.constant_pool, 0x8000));
+                        self.jvm_instructions.push(JI::Ixor);
+                        self.jvm_instructions.push(JI::I2s);
                         self.store_result(dest, &src_type)?;
                     }
                     oomir::Type::F64 => {
@@ -2940,6 +3349,9 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                         self.load_operand(src)?;
                         self.jvm_instructions.push(JI::Invokevirtual(method));
                         self.store_result(dest, &src_type)?;
+                    }
+                    oomir::Type::Class(ref c) if c == I128_CLASS || c == U128_CLASS => {
+                        self.translate_int128_unary_op(dest, src, "negate")?
                     }
                     oomir::Type::Class(ref c) if c == BIG_INTEGER_CLASS => {
                         // BigInteger Negation operation: negate()
@@ -3023,12 +3435,26 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
 
                 // Check if the discriminant type is suitable for switch comparison
                 let is_valid_switch_type = match &discr_type {
-                    Type::I8 | Type::I16 | Type::I32 | Type::Boolean | Type::Char => true, // Promoted to int
-                    Type::I64 => true,
+                    Type::I8
+                    | Type::U8
+                    | Type::I16
+                    | Type::U16
+                    | Type::I32
+                    | Type::U32
+                    | Type::Boolean
+                    | Type::Char => true,
+                    Type::I64 | Type::U64 => true,
                     Type::F32 => true,
                     Type::F64 => true,
                     Type::String => true, // Use .equals()
-                    Type::Class(c) if c == BIG_INTEGER_CLASS || c == BIG_DECIMAL_CLASS => true, // Use .compareTo()
+                    Type::Class(c)
+                        if c == BIG_INTEGER_CLASS
+                            || c == BIG_DECIMAL_CLASS
+                            || c == I128_CLASS
+                            || c == U128_CLASS =>
+                    {
+                        true
+                    } // Use .compareTo()
                     _ => false,
                 };
 
@@ -3066,11 +3492,21 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     self.jvm_instructions.push(load_instr); // Stack: [discr_value] (size 1 or 2)
 
                     match &discr_type {
-                        Type::I8 | Type::I16 | Type::I32 | Type::Boolean | Type::Char => {
+                        Type::I8
+                        | Type::U8
+                        | Type::I16
+                        | Type::U16
+                        | Type::I32
+                        | Type::U32
+                        | Type::Boolean
+                        | Type::Char => {
                             let key_value_i32 = match constant_key {
                                 oomir::Constant::I8(v) => i32::from(*v),
+                                oomir::Constant::U8(v) => i32::from(*v as i8),
                                 oomir::Constant::I16(v) => i32::from(*v),
+                                oomir::Constant::U16(v) => i32::from(*v),
                                 oomir::Constant::I32(v) => *v,
+                                oomir::Constant::U32(v) => *v as i32,
                                 oomir::Constant::Boolean(b) => {
                                     if *b {
                                         1
@@ -3098,9 +3534,9 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                                 .push((if_instr_index, target_label.clone()));
                         }
 
-                        Type::I64 => {
+                        Type::I64 | Type::U64 => {
                             match constant_key {
-                                oomir::Constant::I64(_) => {} // Expected type
+                                oomir::Constant::I64(_) | oomir::Constant::U64(_) => {}
                                 _ => {
                                     return Err(jvm::Error::VerificationError {
                                         context: format!("Function {}", self.oomir_func.name),
@@ -3251,6 +3687,26 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                                 .push((if_instr_index, target_label.clone()));
                         }
 
+                        Type::Class(c) if c == I128_CLASS || c == U128_CLASS => {
+                            load_constant(
+                                &mut self.jvm_instructions,
+                                &mut self.constant_pool,
+                                constant_key,
+                            )?;
+                            let class_idx = self.constant_pool.add_class(c)?;
+                            let compare_to_ref = self.constant_pool.add_method_ref(
+                                class_idx,
+                                "compareTo",
+                                &format!("(L{c};)I"),
+                            )?;
+                            self.jvm_instructions
+                                .push(JI::Invokevirtual(compare_to_ref));
+                            let if_instr_index = self.jvm_instructions.len();
+                            self.jvm_instructions.push(JI::Ifeq(0));
+                            self.branch_fixups
+                                .push((if_instr_index, target_label.clone()));
+                        }
+
                         // Should be caught by the validation check before the loop
                         _ => unreachable!(
                             "Invalid discriminant type {:?} survived initial check",
@@ -3276,11 +3732,15 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                         self.load_operand(op)?;
                         let return_instr = match **ret_ty {
                             oomir::Type::I8
+                            | oomir::Type::U8
                             | oomir::Type::I16
+                            | oomir::Type::U16
+                            | oomir::Type::F16
                             | oomir::Type::I32
+                            | oomir::Type::U32
                             | oomir::Type::Boolean
                             | oomir::Type::Char => JI::Ireturn,
-                            oomir::Type::I64 => JI::Lreturn,
+                            oomir::Type::I64 | oomir::Type::U64 => JI::Lreturn,
                             oomir::Type::F32 => JI::Freturn,
                             oomir::Type::F64 => JI::Dreturn,
                             oomir::Type::Reference(_)
@@ -3398,7 +3858,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 size,
             } => {
                 // 1. Load size onto the stack
-                self.load_operand(size)?; // Stack: [size_int]
+                self.load_jvm_int_operand(size)?;
 
                 // 2. Determine and add the array creation instruction
                 let array_type_for_dest = oomir::Type::Array(Box::new(element_type.clone()));
@@ -3480,15 +3940,18 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     self.jvm_instructions.push(JI::Getfield(backing_field));
                     self.load_operand(&slice_operand)?;
                     self.jvm_instructions.push(JI::Getfield(offset_field));
-                    self.load_operand(index)?;
+                    self.load_jvm_int_operand(index)?;
                     self.jvm_instructions.push(JI::Iadd);
                     self.load_operand_as(value, &element_type)?;
                     let (suffix, value_descriptor) = match element_type.as_ref() {
                         oomir::Type::Boolean => ("Boolean", "Z"),
-                        oomir::Type::I8 => ("I8", "B"),
-                        oomir::Type::I16 => ("I16", "S"),
-                        oomir::Type::I32 | oomir::Type::Char => ("I32", "I"),
-                        oomir::Type::I64 => ("I64", "J"),
+                        oomir::Type::I8 | oomir::Type::U8 => ("I8", "B"),
+                        oomir::Type::I16 | oomir::Type::F16 => ("I16", "S"),
+                        oomir::Type::I32
+                        | oomir::Type::U16
+                        | oomir::Type::U32
+                        | oomir::Type::Char => ("I32", "I"),
+                        oomir::Type::I64 | oomir::Type::U64 => ("I64", "J"),
                         oomir::Type::F32 => ("F32", "F"),
                         oomir::Type::F64 => ("F64", "D"),
                         _ => ("Object", "Ljava/lang/Object;"),
@@ -3547,7 +4010,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 self.load_operand(&array_operand)?; // Stack: [arrayref]
 
                 // 3. Load value onto the stack
-                self.load_operand(index)?; // Stack: [arrayref, index_int]
+                self.load_jvm_int_operand(index)?;
 
                 // 4. Load value onto the stack
                 self.load_operand_as(value, &element_type)?; // Stack: [arrayref, index_int, value]
@@ -3592,14 +4055,17 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     self.jvm_instructions.push(JI::Getfield(backing_field));
                     self.load_operand(array)?;
                     self.jvm_instructions.push(JI::Getfield(offset_field));
-                    self.load_operand(index)?;
+                    self.load_jvm_int_operand(index)?;
                     self.jvm_instructions.push(JI::Iadd);
                     let (suffix, return_descriptor, returns_object) = match element_type.as_ref() {
                         oomir::Type::Boolean => ("Boolean", "Z", false),
-                        oomir::Type::I8 => ("I8", "B", false),
-                        oomir::Type::I16 => ("I16", "S", false),
-                        oomir::Type::I32 | oomir::Type::Char => ("I32", "I", false),
-                        oomir::Type::I64 => ("I64", "J", false),
+                        oomir::Type::I8 | oomir::Type::U8 => ("I8", "B", false),
+                        oomir::Type::I16 | oomir::Type::F16 => ("I16", "S", false),
+                        oomir::Type::I32
+                        | oomir::Type::U16
+                        | oomir::Type::U32
+                        | oomir::Type::Char => ("I32", "I", false),
+                        oomir::Type::I64 | oomir::Type::U64 => ("I64", "J", false),
                         oomir::Type::F32 => ("F32", "F", false),
                         oomir::Type::F64 => ("F64", "D", false),
                         _ => ("Object", "Ljava/lang/Object;", true),
@@ -3705,7 +4171,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     };
 
                     // 3. Load index
-                    self.load_operand(index)?; // Stack: [arrayref, index_int]
+                    self.load_jvm_int_operand(index)?;
 
                     // 4. Get and add the appropriate array load instruction
                     let load_instr = element_type // Now correctly holds I64, I32, Class(...), etc.
@@ -4283,26 +4749,41 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         match operand {
             oomir::Operand::Variable { name: var_name, ty } => {
                 self.materialize_zero_sized_local(var_name, ty)?;
-                let index = self
-                    .get_typed_local_index(var_name, ty)
-                    .or_else(|| self.local_var_map.get(var_name).copied())
-                    .ok_or_else(|| jvm::Error::VerificationError {
-                        context: format!("Function {}", self.oomir_func.name),
-                        message: format!(
-                            "Undefined call argument local variable: {var_name} ({ty:?})"
-                        ),
-                    })?;
-                let load_type = match ty {
+                let (index, stored_ty) =
+                    if let Some(index) = self.get_typed_local_index(var_name, ty) {
+                        (index, ty.clone())
+                    } else {
+                        let stored_ty = self.local_var_types.get(var_name).cloned().ok_or_else(
+                            || jvm::Error::VerificationError {
+                                context: format!("Function {}", self.oomir_func.name),
+                                message: format!(
+                                    "Undefined call argument local variable: {var_name} ({ty:?})"
+                                ),
+                            },
+                        )?;
+                        let index = self.get_local_index(var_name)?;
+                        (index, stored_ty)
+                    };
+                let load_type = match &stored_ty {
                     // If the argument is declared as Ref<Primitive>, load the primitive directly
                     oomir::Type::Reference(box inner_ty) if inner_ty.is_jvm_primitive() => {
                         inner_ty // Use the inner type for loading
                     }
                     // Otherwise, use the declared type
-                    _ => ty,
+                    _ => &stored_ty,
                 };
 
                 let load_instr = get_load_instruction(load_type, index)?;
                 self.jvm_instructions.push(load_instr);
+                if stored_ty != *ty && stored_ty.to_jvm_descriptor() != ty.to_jvm_descriptor() {
+                    let casts = get_cast_instructions(
+                        &self.oomir_func.name,
+                        &stored_ty,
+                        ty,
+                        self.constant_pool,
+                    )?;
+                    self.jvm_instructions.extend(casts);
+                }
             }
             oomir::Operand::Constant(c) => {
                 // Constants are loaded directly, no special handling needed here for refs
@@ -4489,7 +4970,14 @@ fn make_iinc_instruction(index: u16, amount: i16) -> Instruction {
 fn is_jvm_switch_type(ty: &Type) -> bool {
     matches!(
         ty,
-        Type::I8 | Type::I16 | Type::I32 | Type::Boolean | Type::Char
+        Type::I8
+            | Type::U8
+            | Type::I16
+            | Type::U16
+            | Type::I32
+            | Type::U32
+            | Type::Boolean
+            | Type::Char
     )
 }
 
@@ -4500,8 +4988,11 @@ fn jvm_switch_key(
 ) -> Result<i32, jvm::Error> {
     match (discr_type, constant_key) {
         (Type::I8, oomir::Constant::I8(value)) => Ok(i32::from(*value)),
+        (Type::U8, oomir::Constant::U8(value)) => Ok(i32::from(*value as i8)),
         (Type::I16, oomir::Constant::I16(value)) => Ok(i32::from(*value)),
+        (Type::U16, oomir::Constant::U16(value)) => Ok(i32::from(*value)),
         (Type::I32, oomir::Constant::I32(value)) => Ok(*value),
+        (Type::U32, oomir::Constant::U32(value)) => Ok(*value as i32),
         (Type::Boolean, oomir::Constant::Boolean(value)) => Ok(i32::from(*value)),
         (Type::Char, oomir::Constant::Char(value)) => Ok(*value as i32),
         _ => Err(jvm::Error::VerificationError {

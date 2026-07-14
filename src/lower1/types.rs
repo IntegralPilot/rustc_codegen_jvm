@@ -280,7 +280,7 @@ pub(super) fn enum_union_discriminant_supported<'tcx>(
     };
     let discriminant_ty = discriminant.ty;
     match discriminant_ty.kind() {
-        TyKind::Int(IntTy::I128) | TyKind::Uint(UintTy::U64 | UintTy::U128) => false,
+        TyKind::Int(IntTy::I128) | TyKind::Uint(UintTy::U128) => false,
         TyKind::Int(_) | TyKind::Uint(_) => true,
         _ => false,
     }
@@ -296,7 +296,9 @@ fn masked_enum_discriminant(value: u128, size: usize) -> i64 {
 }
 
 fn scalar_bits_type(rust_size: usize, oomir_ty: &oomir::Type) -> oomir::Type {
-    if matches!(oomir_ty, oomir::Type::I64 | oomir::Type::F64) || rust_size > 4 {
+    if matches!(oomir_ty, oomir::Type::U64) {
+        oomir::Type::U64
+    } else if matches!(oomir_ty, oomir::Type::I64 | oomir::Type::F64) || rust_size > 4 {
         oomir::Type::I64
     } else {
         oomir::Type::I32
@@ -304,7 +306,9 @@ fn scalar_bits_type(rust_size: usize, oomir_ty: &oomir::Type) -> oomir::Type {
 }
 
 fn int_constant_for_type(value: i64, ty: &oomir::Type) -> oomir::Constant {
-    if matches!(ty, oomir::Type::I64) {
+    if matches!(ty, oomir::Type::U64) {
+        oomir::Constant::U64(value as u64)
+    } else if matches!(ty, oomir::Type::I64) {
         oomir::Constant::I64(value)
     } else {
         oomir::Constant::I32(value as i32)
@@ -754,7 +758,7 @@ fn is_direct_union_scalar<'tcx>(ty: Ty<'tcx>) -> bool {
             | TyKind::Char
             | TyKind::Int(_)
             | TyKind::Uint(_)
-            | TyKind::Float(FloatTy::F32 | FloatTy::F64)
+            | TyKind::Float(FloatTy::F16 | FloatTy::F32 | FloatTy::F64)
     )
 }
 
@@ -771,6 +775,25 @@ fn scalar_bit_operand_for_union<'tcx>(
     let oomir_ty = ty_to_oomir_type(ty, tcx, data_types, instance_context);
 
     match ty.kind() {
+        TyKind::Float(FloatTy::F16) => {
+            let dest = next_union_temp("union_f16_bits", temp_counter);
+            instructions.push(oomir::Instruction::InvokeStatic {
+                dest: Some(dest.clone()),
+                class_name: "org/rustlang/runtime/Numbers".to_string(),
+                method_name: "f16ToBits".to_string(),
+                method_ty: oomir::Signature {
+                    params: vec![("value".to_string(), oomir::Type::F16)],
+                    ret: Box::new(oomir::Type::U16),
+                    is_static: true,
+                },
+                args: vec![source],
+            });
+            Ok((
+                operand_var(dest, oomir::Type::U16),
+                oomir::Type::U16,
+                rust_size,
+            ))
+        }
         TyKind::Float(FloatTy::F32) => {
             let dest = next_union_temp("union_f32_bits", temp_counter);
             instructions.push(oomir::Instruction::InvokeStatic {
@@ -810,7 +833,7 @@ fn scalar_bit_operand_for_union<'tcx>(
             ))
         }
         TyKind::Float(_) => Err(format!("unsupported float width in union field: {:?}", ty)),
-        TyKind::Int(IntTy::I128) | TyKind::Uint(UintTy::U64 | UintTy::U128) => {
+        TyKind::Int(IntTy::I128) | TyKind::Uint(UintTy::U128) => {
             Err(format!("unsupported wide integer union field: {:?}", ty))
         }
         TyKind::Bool | TyKind::Char | TyKind::Int(_) | TyKind::Uint(_) => {
@@ -891,19 +914,19 @@ fn emit_scalar_to_union_bytes<'tcx>(
 ) -> Result<(), String> {
     if matches!(
         ty.kind(),
-        TyKind::Int(IntTy::I128) | TyKind::Uint(UintTy::U64 | UintTy::U128)
+        TyKind::Int(IntTy::I128) | TyKind::Uint(UintTy::U128)
     ) {
         let rust_size = layout_size_bytes(tcx, ty)?;
-        let big_integer_ty = oomir::Type::Class("java/math/BigInteger".to_string());
+        let integer128_ty = ty_to_oomir_type(ty, tcx, data_types, instance_context);
         for byte_idx in 0..rust_size {
             let byte_dest = next_union_temp("union_big_integer_byte", temp_counter);
             instructions.push(oomir::Instruction::InvokeStatic {
                 dest: Some(byte_dest.clone()),
                 class_name: oomir::POINTER_CLASS.to_string(),
-                method_name: "bigIntegerByte".to_string(),
+                method_name: "integer128Byte".to_string(),
                 method_ty: oomir::Signature {
                     params: vec![
-                        ("value".to_string(), big_integer_ty.clone()),
+                        ("value".to_string(), integer128_ty.clone()),
                         ("byte_index".to_string(), oomir::Type::I32),
                     ],
                     ret: Box::new(oomir::Type::I8),
@@ -1572,21 +1595,15 @@ fn emit_managed_object_to_union_bytes(
                 "value".to_string(),
                 oomir::Type::Class("java/lang/Object".to_string()),
             )],
-            ret: Box::new(oomir::Type::I32),
+            ret: Box::new(oomir::Type::U64),
             is_static: true,
         },
         args: vec![source.clone()],
     });
-    let wide_dest = next_union_temp("union_managed_object_address_wide", temp_counter);
-    instructions.push(oomir::Instruction::Cast {
-        op: operand_var(address_dest, oomir::Type::I32),
-        ty: oomir::Type::I64,
-        dest: wide_dest.clone(),
-    });
     let address_bytes = rust_size.min(8);
     emit_bits_to_union_bytes(
-        operand_var(wide_dest, oomir::Type::I64),
-        oomir::Type::I64,
+        operand_var(address_dest, oomir::Type::U64),
+        oomir::Type::U64,
         address_bytes,
         storage,
         base_offset,
@@ -1653,23 +1670,17 @@ fn emit_managed_object_from_union_bytes(
         instructions,
         temp_counter,
     );
-    let address_dest = next_union_temp("union_managed_object_address_narrow", temp_counter);
-    instructions.push(oomir::Instruction::Cast {
-        op: bits,
-        ty: oomir::Type::I32,
-        dest: address_dest.clone(),
-    });
     let object_dest = next_union_temp("union_managed_object", temp_counter);
     instructions.push(oomir::Instruction::InvokeStatic {
         dest: Some(object_dest.clone()),
         class_name: oomir::POINTER_CLASS.to_string(),
         method_name: "managedObjectFromAddress".to_string(),
         method_ty: oomir::Signature {
-            params: vec![("address".to_string(), oomir::Type::I32)],
+            params: vec![("address".to_string(), oomir::Type::U64)],
             ret: Box::new(oomir::Type::Class("java/lang/Object".to_string())),
             is_static: true,
         },
-        args: vec![operand_var(address_dest, oomir::Type::I32)],
+        args: vec![bits],
     });
     if target_ty == oomir::Type::Class("java/lang/Object".to_string()) {
         return operand_var(object_dest, target_ty);
@@ -1818,7 +1829,7 @@ fn emit_ty_to_union_bytes<'tcx>(
                 method_name: "address".to_string(),
                 method_ty: oomir::Signature {
                     params: vec![("self".to_string(), pointer_ty)],
-                    ret: Box::new(oomir::Type::I32),
+                    ret: Box::new(oomir::Type::U64),
                     is_static: false,
                 },
                 args: Vec::new(),
@@ -1832,15 +1843,9 @@ fn emit_ty_to_union_bytes<'tcx>(
                     ))),
                 ),
             });
-            let wide_dest = next_union_temp("union_array_reference_address_wide", temp_counter);
-            instructions.push(oomir::Instruction::Cast {
-                op: operand_var(address_dest, oomir::Type::I32),
-                ty: oomir::Type::I64,
-                dest: wide_dest.clone(),
-            });
             emit_bits_to_union_bytes(
-                operand_var(wide_dest, oomir::Type::I64),
-                oomir::Type::I64,
+                operand_var(address_dest, oomir::Type::U64),
+                oomir::Type::U64,
                 layout_size_bytes(tcx, ty)?,
                 storage,
                 base_offset,
@@ -1862,21 +1867,15 @@ fn emit_ty_to_union_bytes<'tcx>(
                 method_name: "address".to_string(),
                 method_ty: oomir::Signature {
                     params: vec![("self".to_string(), pointer_ty)],
-                    ret: Box::new(oomir::Type::I32),
+                    ret: Box::new(oomir::Type::U64),
                     is_static: false,
                 },
                 args: Vec::new(),
                 operand: source,
             });
-            let wide_dest = next_union_temp("union_pointer_address_wide", temp_counter);
-            instructions.push(oomir::Instruction::Cast {
-                op: operand_var(address_dest, oomir::Type::I32),
-                ty: oomir::Type::I64,
-                dest: wide_dest.clone(),
-            });
             emit_bits_to_union_bytes(
-                operand_var(wide_dest, oomir::Type::I64),
-                oomir::Type::I64,
+                operand_var(address_dest, oomir::Type::U64),
+                oomir::Type::U64,
                 layout_size_bytes(tcx, ty)?,
                 storage,
                 base_offset,
@@ -2133,10 +2132,10 @@ fn emit_bits_from_union_bytes(
     }
 
     accum.unwrap_or_else(|| {
-        oomir::Operand::Constant(if matches!(bits_ty, oomir::Type::I64) {
-            oomir::Constant::I64(0)
-        } else {
-            oomir::Constant::I32(0)
+        oomir::Operand::Constant(match bits_ty {
+            oomir::Type::I64 => oomir::Constant::I64(0),
+            oomir::Type::U64 => oomir::Constant::U64(0),
+            _ => oomir::Constant::I32(0),
         })
     })
 }
@@ -2155,14 +2154,18 @@ fn emit_scalar_from_union_bytes<'tcx>(
     let oomir_ty = ty_to_oomir_type(ty, tcx, data_types, instance_context);
     if matches!(
         ty.kind(),
-        TyKind::Int(IntTy::I128) | TyKind::Uint(UintTy::U64 | UintTy::U128)
+        TyKind::Int(IntTy::I128) | TyKind::Uint(UintTy::U128)
     ) {
         let offset = storage.byte_index(base_offset, instructions, temp_counter);
         let dest = next_union_temp("union_big_integer_value", temp_counter);
         instructions.push(oomir::Instruction::InvokeStatic {
             dest: Some(dest.clone()),
             class_name: oomir::POINTER_CLASS.to_string(),
-            method_name: "bigIntegerFromBytes".to_string(),
+            method_name: if matches!(ty.kind(), TyKind::Int(IntTy::I128)) {
+                "i128FromBytes".to_string()
+            } else {
+                "u128FromBytes".to_string()
+            },
             method_ty: oomir::Signature {
                 params: vec![
                     ("bytes".to_string(), byte_array_type()),
@@ -2187,12 +2190,13 @@ fn emit_scalar_from_union_bytes<'tcx>(
     }
 
     let bits_ty = match ty.kind() {
+        TyKind::Float(FloatTy::F16) => oomir::Type::U16,
         TyKind::Float(FloatTy::F32) => oomir::Type::I32,
         TyKind::Float(FloatTy::F64) => oomir::Type::I64,
         TyKind::Float(_) => {
             return Err(format!("unsupported float width in union field: {:?}", ty));
         }
-        TyKind::Int(IntTy::I128) | TyKind::Uint(UintTy::U64 | UintTy::U128) => {
+        TyKind::Int(IntTy::I128) | TyKind::Uint(UintTy::U128) => {
             return Err(format!("unsupported wide integer union field: {:?}", ty));
         }
         TyKind::Bool | TyKind::Char | TyKind::Int(_) | TyKind::Uint(_) => {
@@ -2210,6 +2214,21 @@ fn emit_scalar_from_union_bytes<'tcx>(
     );
 
     match ty.kind() {
+        TyKind::Float(FloatTy::F16) => {
+            let dest = next_union_temp("union_f16_value", temp_counter);
+            instructions.push(oomir::Instruction::InvokeStatic {
+                dest: Some(dest.clone()),
+                class_name: "org/rustlang/runtime/Numbers".to_string(),
+                method_name: "f16FromBits".to_string(),
+                method_ty: oomir::Signature {
+                    params: vec![("bits".to_string(), oomir::Type::U16)],
+                    ret: Box::new(oomir::Type::F16),
+                    is_static: true,
+                },
+                args: vec![bits_operand],
+            });
+            Ok(operand_var(dest, oomir::Type::F16))
+        }
         TyKind::Float(FloatTy::F32) => {
             let dest = next_union_temp("union_f32_value", temp_counter);
             instructions.push(oomir::Instruction::InvokeStatic {
@@ -2303,12 +2322,6 @@ fn emit_ty_from_union_bytes<'tcx>(
                 instructions,
                 temp_counter,
             );
-            let address_dest = next_union_temp("union_pointer_address_narrow", temp_counter);
-            instructions.push(oomir::Instruction::Cast {
-                op: bits,
-                ty: oomir::Type::I32,
-                dest: address_dest.clone(),
-            });
             let pointer_dest = next_union_temp("union_pointer_value", temp_counter);
             instructions.push(oomir::Instruction::InvokeStatic {
                 dest: Some(pointer_dest.clone()),
@@ -2316,7 +2329,7 @@ fn emit_ty_from_union_bytes<'tcx>(
                 method_name: "fromAddress".to_string(),
                 method_ty: oomir::Signature {
                     params: vec![
-                        ("address".to_string(), oomir::Type::I32),
+                        ("address".to_string(), oomir::Type::U64),
                         ("view_size".to_string(), oomir::Type::I32),
                         ("view_codec".to_string(), oomir::Type::String),
                     ],
@@ -2324,7 +2337,7 @@ fn emit_ty_from_union_bytes<'tcx>(
                     is_static: true,
                 },
                 args: vec![
-                    operand_var(address_dest, oomir::Type::I32),
+                    bits,
                     oomir::Operand::Constant(oomir::Constant::I32(
                         i32::try_from(layout_size_bytes(tcx, *pointee)?)
                             .map_err(|_| "pointer pointee layout exceeds JVM address space")?,
@@ -2557,7 +2570,7 @@ fn exact_bytes_supported<'tcx>(
         | TyKind::Uint(
             UintTy::U8 | UintTy::U16 | UintTy::U32 | UintTy::U64 | UintTy::U128 | UintTy::Usize,
         )
-        | TyKind::Float(FloatTy::F32 | FloatTy::F64 | FloatTy::F128) => Ok(()),
+        | TyKind::Float(FloatTy::F16 | FloatTy::F32 | FloatTy::F64 | FloatTy::F128) => Ok(()),
         TyKind::RawPtr(_, _) | TyKind::Ref(_, _, _) => Ok(()),
         TyKind::Pat(inner, _) => exact_bytes_supported(*inner, tcx, instance_context),
         TyKind::Tuple(elements) => elements
@@ -2984,7 +2997,7 @@ fn pointer_builtin_codec_operand<'tcx>(
             RAW_POINTER_VIEW_CODEC
         }
         TyKind::Int(IntTy::I128) => "@signed-big-integer",
-        TyKind::Uint(UintTy::U64 | UintTy::U128) => "@unsigned-big-integer",
+        TyKind::Uint(UintTy::U128) => "@unsigned-big-integer",
         TyKind::Float(FloatTy::F128) => "@f128",
         _ => return None,
     };
@@ -3430,21 +3443,21 @@ pub fn ty_to_oomir_type<'tcx>(
             IntTy::I16 => oomir::Type::I16,
             IntTy::I32 => oomir::Type::I32,
             IntTy::I64 => oomir::Type::I64,
-            IntTy::Isize => oomir::Type::I32,
-            IntTy::I128 => oomir::Type::Class("java/math/BigInteger".to_string()), // doesn't fit in a primitive
+            IntTy::Isize => oomir::Type::I64,
+            IntTy::I128 => oomir::Type::Class(crate::lower2::I128_CLASS.to_string()),
         },
         rustc_middle::ty::TyKind::Uint(uint_ty) => match uint_ty {
-            UintTy::U8 => oomir::Type::I16, // make it the next size up to capture full range
-            UintTy::U16 => oomir::Type::I32,
-            UintTy::U32 => oomir::Type::I64,
-            UintTy::Usize => oomir::Type::I32, // java uses an i32 for most "usize" i.e. array indexes etc.
-            UintTy::U64 => oomir::Type::Class("java/math/BigInteger".to_string()),
-            UintTy::U128 => oomir::Type::Class("java/math/BigInteger".to_string()),
+            UintTy::U8 => oomir::Type::U8,
+            UintTy::U16 => oomir::Type::U16,
+            UintTy::U32 => oomir::Type::U32,
+            UintTy::Usize => oomir::Type::U64,
+            UintTy::U64 => oomir::Type::U64,
+            UintTy::U128 => oomir::Type::Class(crate::lower2::U128_CLASS.to_string()),
         },
         rustc_middle::ty::TyKind::Float(float_ty) => match float_ty {
             FloatTy::F32 => oomir::Type::F32,
             FloatTy::F64 => oomir::Type::F64,
-            FloatTy::F16 => oomir::Type::F32,
+            FloatTy::F16 => oomir::Type::F16,
             FloatTy::F128 => oomir::Type::Class(crate::lower2::F128_CLASS.to_string()),
         },
         rustc_middle::ty::TyKind::Adt(adt_def, substs) => {
@@ -3879,9 +3892,14 @@ pub fn readable_oomir_type_name(t: &oomir::Type) -> String {
         Type::Boolean => "bool".to_string(),
         Type::Char => "char".to_string(),
         Type::I8 => "i8".to_string(),
+        Type::U8 => "u8".to_string(),
         Type::I16 => "i16".to_string(),
+        Type::U16 => "u16".to_string(),
         Type::I32 => "i32".to_string(),
+        Type::U32 => "u32".to_string(),
         Type::I64 => "i64".to_string(),
+        Type::U64 => "u64".to_string(),
+        Type::F16 => "f16".to_string(),
         Type::F32 => "f32".to_string(),
         Type::F64 => "f64".to_string(),
         Type::Str => "Str".to_string(),
@@ -4034,9 +4052,9 @@ pub fn mir_int_to_oomir_const<'tcx>(
             IntTy::I16 => oomir::Constant::I16(value as i16),
             IntTy::I32 => oomir::Constant::I32(value as i32),
             IntTy::I64 => oomir::Constant::I64(value as i64),
-            IntTy::Isize => oomir::Constant::I32(value as i32), // JVM uses i32 for most "usize" tasks
+            IntTy::Isize => oomir::Constant::I64(value as i64),
             IntTy::I128 => oomir::Constant::Instance {
-                class_name: "java/math/BigInteger".to_string(),
+                class_name: crate::lower2::I128_CLASS.to_string(),
                 // MIR carries integer bits in a u128; preserve the signed
                 // two's-complement interpretation for i128 constants.
                 params: vec![oomir::Constant::String((value as i128).to_string())],
@@ -4044,14 +4062,12 @@ pub fn mir_int_to_oomir_const<'tcx>(
             }, // Handle large integers
         },
         TyKind::Uint(uint_ty) => match uint_ty {
-            // JVM uses signed types, treat appropriately
-            // maps to the next size up to capture full range
-            UintTy::U8 => oomir::Constant::I16(value as i16),
-            UintTy::U16 => oomir::Constant::I32(value as i32),
-            UintTy::U32 => oomir::Constant::I64(value as i64),
-            UintTy::Usize => oomir::Constant::I32(value as i32), // java uses an i32 for most "usize" tasks i.e. array indexes etc.
-            UintTy::U64 | UintTy::U128 => oomir::Constant::Instance {
-                class_name: "java/math/BigInteger".to_string(),
+            UintTy::U8 => oomir::Constant::U8(value as u8),
+            UintTy::U16 => oomir::Constant::U16(value as u16),
+            UintTy::U32 => oomir::Constant::U32(value as u32),
+            UintTy::Usize | UintTy::U64 => oomir::Constant::U64(value as u64),
+            UintTy::U128 => oomir::Constant::Instance {
+                class_name: crate::lower2::U128_CLASS.to_string(),
                 params: vec![oomir::Constant::String(value.to_string())],
                 fields: HashMap::new(),
             },

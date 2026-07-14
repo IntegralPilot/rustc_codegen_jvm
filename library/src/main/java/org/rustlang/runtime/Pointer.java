@@ -9,7 +9,7 @@ import java.util.HashMap;
 import java.util.IdentityHashMap;
 import java.util.Map;
 import java.util.WeakHashMap;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 public final class Pointer {
     private static final String MANAGED_OBJECT_VIEW_CODEC = "@managed-object";
@@ -17,15 +17,15 @@ public final class Pointer {
     private static final String SIGNED_BIG_INTEGER_CODEC = "@signed-big-integer";
     private static final String UNSIGNED_BIG_INTEGER_CODEC = "@unsigned-big-integer";
     private static final String F128_CODEC = "@f128";
-    private static final AtomicInteger NEXT_ADDRESS = new AtomicInteger(0x1000);
-    private static final Map<Object, Integer> ALLOCATION_BASES = new WeakHashMap<>();
+    private static final AtomicLong NEXT_ADDRESS = new AtomicLong(0x1_0000_0000L);
+    private static final Map<Object, Long> ALLOCATION_BASES = new WeakHashMap<>();
     private static final Map<Object, Integer> ALLOCATION_ELEMENT_SIZES = new WeakHashMap<>();
     private static final Map<Object, Integer> ALLOCATION_ALIGNMENTS = new WeakHashMap<>();
     private static final Map<Object, String> ALLOCATION_CODECS = new WeakHashMap<>();
-    private static final Map<Integer, ExposedTarget> EXPOSED_ADDRESSES = new HashMap<>();
+    private static final Map<Long, ExposedTarget> EXPOSED_ADDRESSES = new HashMap<>();
     private static final Map<String, Method[]> CODEC_METHODS = new HashMap<>();
-    private static final Map<Object, Integer> MANAGED_OBJECT_ADDRESSES = new IdentityHashMap<>();
-    private static final Map<Integer, WeakReference<Object>> MANAGED_OBJECTS = new HashMap<>();
+    private static final Map<Object, Long> MANAGED_OBJECT_ADDRESSES = new IdentityHashMap<>();
+    private static final Map<Long, WeakReference<Object>> MANAGED_OBJECTS = new HashMap<>();
     private static final Map<String, Pointer> TRAIT_METADATA_MARKERS = new HashMap<>();
 
     private static final class Cell {
@@ -39,20 +39,20 @@ public final class Pointer {
     private static final class ExposedTarget {
         private final WeakReference<Object> allocation;
         private final int allocationElementSize;
-        private final int byteOffset;
+        private final long byteOffset;
         private final String codecClassName;
         private final int viewSize;
         private final String viewCodecClassName;
-        private final int metadata;
+        private final long metadata;
 
         private ExposedTarget(
                 Object allocation,
                 int allocationElementSize,
-                int byteOffset,
+                long byteOffset,
                 String codecClassName,
                 int viewSize,
                 String viewCodecClassName,
-                int metadata) {
+                long metadata) {
             this.allocation = new WeakReference<>(allocation);
             this.allocationElementSize = allocationElementSize;
             this.byteOffset = byteOffset;
@@ -65,12 +65,12 @@ public final class Pointer {
 
     private final Object allocation;
     private final int allocationElementSize;
-    private final int byteOffset;
+    private final long byteOffset;
     private final int viewSize;
     private final String allocationCodecClassName;
     private final String viewCodecClassName;
-    private final int exposedAddress;
-    private int metadata = -1;
+    private final long exposedAddress;
+    private long metadata = -1;
     private int zeroSizedSourceViewSize = -1;
     private String zeroSizedSourceViewCodecClassName;
 
@@ -78,14 +78,18 @@ public final class Pointer {
         this(allocation, allocationElementSize, byteOffset, viewSize, null, null, -1);
     }
 
-    public Pointer(int exposedAddress, int viewSize) {
+    public Pointer(long exposedAddress, int viewSize) {
         this(null, viewSize, 0, viewSize, null, null, exposedAddress);
+    }
+
+    public Pointer(int exposedAddress, int viewSize) {
+        this(Integer.toUnsignedLong(exposedAddress), viewSize);
     }
 
     private Pointer(
             Object allocation,
             int allocationElementSize,
-            int byteOffset,
+            long byteOffset,
             int viewSize,
             String codecClassName) {
         this(
@@ -101,11 +105,11 @@ public final class Pointer {
     private Pointer(
             Object allocation,
             int allocationElementSize,
-            int byteOffset,
+            long byteOffset,
             int viewSize,
             String allocationCodecClassName,
             String viewCodecClassName,
-            int exposedAddress) {
+            long exposedAddress) {
         if (allocationElementSize < 0 || viewSize < 0) {
             throw new IllegalArgumentException("Rust layout sizes cannot be negative");
         }
@@ -236,11 +240,15 @@ public final class Pointer {
         }
     }
 
-    public static Pointer fromAddress(int address, int viewSize) {
+    public static Pointer fromAddress(long address, int viewSize) {
         return fromAddress(address, viewSize, null);
     }
 
-    public static Pointer fromAddress(int address, int viewSize, String viewCodecClassName) {
+    public static Pointer fromAddress(int address, int viewSize) {
+        return fromAddress(Integer.toUnsignedLong(address), viewSize);
+    }
+
+    public static Pointer fromAddress(long address, int viewSize, String viewCodecClassName) {
         synchronized (ALLOCATION_BASES) {
             ExposedTarget target = EXPOSED_ADDRESSES.get(address);
             if (target != null) {
@@ -257,19 +265,19 @@ public final class Pointer {
                 }
                 EXPOSED_ADDRESSES.remove(address);
             }
-            for (Map.Entry<Object, Integer> entry : ALLOCATION_BASES.entrySet()) {
+            for (Map.Entry<Object, Long> entry : ALLOCATION_BASES.entrySet()) {
                 Object allocation = entry.getKey();
-                int base = entry.getValue();
+                long base = entry.getValue();
                 int elementSize = ALLOCATION_ELEMENT_SIZES.getOrDefault(allocation, 1);
                 int capacity = allocation.getClass().isArray()
                         ? Math.multiplyExact(Array.getLength(allocation), elementSize)
                         : elementSize;
-                long delta = Integer.toUnsignedLong(address) - Integer.toUnsignedLong(base);
+                long delta = address - base;
                 if (delta >= 0 && delta <= capacity) {
                     return new Pointer(
                             allocation,
                             elementSize,
-                            (int) delta,
+                            delta,
                             viewSize,
                             ALLOCATION_CODECS.get(allocation),
                             viewCodecClassName,
@@ -281,23 +289,27 @@ public final class Pointer {
                 null, viewSize, 0, viewSize, null, viewCodecClassName, address);
     }
 
-    public static int managedObjectAddress(Object value) {
+    public static Pointer fromAddress(int address, int viewSize, String viewCodecClassName) {
+        return fromAddress(Integer.toUnsignedLong(address), viewSize, viewCodecClassName);
+    }
+
+    public static long managedObjectAddress(Object value) {
         if (value == null) {
             return 0;
         }
         synchronized (MANAGED_OBJECT_ADDRESSES) {
-            Integer existing = MANAGED_OBJECT_ADDRESSES.get(value);
+            Long existing = MANAGED_OBJECT_ADDRESSES.get(value);
             if (existing != null) {
-                return existing.intValue();
+                return existing.longValue();
             }
-            int address = allocateAddress(16, 16);
+            long address = allocateAddress(16, 16);
             MANAGED_OBJECT_ADDRESSES.put(value, address);
             MANAGED_OBJECTS.put(address, new WeakReference<>(value));
             return address;
         }
     }
 
-    public static Object managedObjectFromAddress(int address) {
+    public static Object managedObjectFromAddress(long address) {
         if (address == 0) {
             return null;
         }
@@ -308,13 +320,13 @@ public final class Pointer {
                 MANAGED_OBJECTS.remove(address);
                 throw new IllegalStateException(
                         "managed Rust reference address is no longer live: "
-                                + Integer.toUnsignedString(address));
+                                + Long.toUnsignedString(address));
             }
             return value;
         }
     }
 
-    private static Pointer pointerObjectFromAddress(int address) {
+    private static Pointer pointerObjectFromAddress(long address) {
         if (address == 0) {
             return nullPointer();
         }
@@ -338,18 +350,27 @@ public final class Pointer {
         return fromAddress(address, 1);
     }
 
-    public static Pointer fromAddress(int address) {
+    public static Pointer fromAddress(long address) {
         return fromAddress(address, 1);
     }
 
-    public static Pointer withoutProvenance(int address, int viewSize) {
+    public static Pointer withoutProvenance(long address, int viewSize) {
         return withoutProvenance(address, viewSize, null);
+    }
+
+    public static Pointer withoutProvenance(int address, int viewSize) {
+        return withoutProvenance(Integer.toUnsignedLong(address), viewSize);
+    }
+
+    public static Pointer withoutProvenance(
+            long address, int viewSize, String viewCodecClassName) {
+        return new Pointer(
+                null, viewSize, 0, viewSize, null, viewCodecClassName, address);
     }
 
     public static Pointer withoutProvenance(
             int address, int viewSize, String viewCodecClassName) {
-        return new Pointer(
-                null, viewSize, 0, viewSize, null, viewCodecClassName, address);
+        return withoutProvenance(Integer.toUnsignedLong(address), viewSize, viewCodecClassName);
     }
 
     public Pointer retype(int newViewSize) {
@@ -398,24 +419,28 @@ public final class Pointer {
                 pointer.exposedAddress).withMetadata(pointer.metadata);
     }
 
-    private Pointer withMetadata(int metadata) {
+    private Pointer withMetadata(long metadata) {
         this.metadata = metadata;
         return this;
     }
 
-    public static Pointer withMetadata(Pointer pointer, int metadata) {
+    public static Pointer withMetadata(Pointer pointer, long metadata) {
         return pointer.withMetadata(metadata);
     }
 
-    public int metadata() {
+    public static Pointer withMetadata(Pointer pointer, int metadata) {
+        return pointer.withMetadata(Integer.toUnsignedLong(metadata));
+    }
+
+    public long metadata() {
         if (metadata < 0) {
             throw new IllegalStateException("pointer does not carry dynamically sized metadata");
         }
         return metadata;
     }
 
-    public Pointer offset(int elementCount) {
-        int delta = Math.multiplyExact(elementCount, viewSize);
+    public Pointer offset(long elementCount) {
+        long delta = Math.multiplyExact(elementCount, (long) viewSize);
         if (allocation == null) {
             return new Pointer(
                     null,
@@ -436,27 +461,39 @@ public final class Pointer {
                 -1).withMetadata(metadata);
     }
 
-    public Pointer add(int elementCount) {
+    public Pointer offset(int elementCount) { return offset((long) elementCount); }
+
+    public Pointer add(long elementCount) {
         return offset(elementCount);
     }
 
-    public static Pointer add(Pointer pointer, int elementCount) {
+    public Pointer add(int elementCount) { return add((long) elementCount); }
+
+    public static Pointer add(Pointer pointer, long elementCount) {
         return pointer.add(elementCount);
     }
 
-    public Pointer sub(int elementCount) {
+    public static Pointer add(Pointer pointer, int elementCount) { return pointer.add(elementCount); }
+
+    public Pointer sub(long elementCount) {
         return offset(Math.negateExact(elementCount));
     }
 
-    public static Pointer sub(Pointer pointer, int elementCount) {
+    public Pointer sub(int elementCount) { return sub((long) elementCount); }
+
+    public static Pointer sub(Pointer pointer, long elementCount) {
         return pointer.sub(elementCount);
     }
 
-    public static Pointer offset(Pointer pointer, int elementCount) {
+    public static Pointer sub(Pointer pointer, int elementCount) { return pointer.sub(elementCount); }
+
+    public static Pointer offset(Pointer pointer, long elementCount) {
         return pointer.offset(elementCount);
     }
 
-    public Pointer byte_offset(int byteCount) {
+    public static Pointer offset(Pointer pointer, int elementCount) { return pointer.offset(elementCount); }
+
+    public Pointer byte_offset(long byteCount) {
         if (allocation == null) {
             return new Pointer(
                     null,
@@ -477,31 +514,45 @@ public final class Pointer {
                 -1).withMetadata(metadata);
     }
 
-    public static Pointer byte_offset(Pointer pointer, int byteCount) {
+    public Pointer byte_offset(int byteCount) { return byte_offset((long) byteCount); }
+
+    public static Pointer byte_offset(Pointer pointer, long byteCount) {
         return pointer.byte_offset(byteCount);
     }
 
-    public static Pointer byte_add(Pointer pointer, int byteCount) {
+    public static Pointer byte_offset(Pointer pointer, int byteCount) { return pointer.byte_offset(byteCount); }
+
+    public static Pointer byte_add(Pointer pointer, long byteCount) {
         return pointer.byte_offset(byteCount);
     }
 
-    public static Pointer byte_sub(Pointer pointer, int byteCount) {
+    public static Pointer byte_add(Pointer pointer, int byteCount) { return pointer.byte_offset(byteCount); }
+
+    public static Pointer byte_sub(Pointer pointer, long byteCount) {
         return pointer.byte_offset(Math.negateExact(byteCount));
     }
 
-    public static Pointer wrapping_byte_offset(Pointer pointer, int byteCount) {
+    public static Pointer byte_sub(Pointer pointer, int byteCount) { return pointer.byte_offset(-(long) byteCount); }
+
+    public static Pointer wrapping_byte_offset(Pointer pointer, long byteCount) {
         return pointer.wrappingByteOffset(byteCount);
     }
 
-    public static Pointer wrapping_byte_add(Pointer pointer, int byteCount) {
+    public static Pointer wrapping_byte_offset(Pointer pointer, int byteCount) { return pointer.wrappingByteOffset(byteCount); }
+
+    public static Pointer wrapping_byte_add(Pointer pointer, long byteCount) {
         return pointer.wrappingByteOffset(byteCount);
     }
 
-    public static Pointer wrapping_byte_sub(Pointer pointer, int byteCount) {
+    public static Pointer wrapping_byte_add(Pointer pointer, int byteCount) { return pointer.wrappingByteOffset(byteCount); }
+
+    public static Pointer wrapping_byte_sub(Pointer pointer, long byteCount) {
         return pointer.wrappingByteOffset(-byteCount);
     }
 
-    private Pointer wrappingByteOffset(int byteCount) {
+    public static Pointer wrapping_byte_sub(Pointer pointer, int byteCount) { return pointer.wrappingByteOffset(-(long) byteCount); }
+
+    private Pointer wrappingByteOffset(long byteCount) {
         if (allocation == null) {
             return new Pointer(
                     null,
@@ -522,13 +573,13 @@ public final class Pointer {
                 -1).withMetadata(metadata);
     }
 
-    public int align_offset(int alignment) {
+    public long align_offset(long alignment) {
         if (alignment <= 0 || (alignment & (alignment - 1)) != 0) {
             throw new IllegalArgumentException("Rust pointer alignment must be a power of two");
         }
-        long current = Integer.toUnsignedLong(address());
-        int attempts = viewSize == 0 ? 1 : alignment;
-        for (int elements = 0; elements < attempts; elements++) {
+        long current = address();
+        long attempts = viewSize == 0 ? 1 : alignment;
+        for (long elements = 0; elements < attempts; elements++) {
             if ((current + (long) elements * viewSize) % alignment == 0) {
                 return elements;
             }
@@ -536,27 +587,33 @@ public final class Pointer {
         return -1;
     }
 
+    public static long align_offset(Pointer pointer, long alignment) {
+        return pointer.align_offset(alignment);
+    }
+
+    public int align_offset(int alignment) { return Math.toIntExact(align_offset((long) alignment)); }
+
     public static int align_offset(Pointer pointer, int alignment) {
         return pointer.align_offset(alignment);
     }
 
-    public int addr() {
+    public long addr() {
         return address();
     }
 
-    public static int addr(Pointer pointer) {
+    public static long addr(Pointer pointer) {
         return pointer.addr();
     }
 
-    public int expose_provenance() {
+    public long expose_provenance() {
         return address();
     }
 
-    public static int expose_provenance(Pointer pointer) {
+    public static long expose_provenance(Pointer pointer) {
         return pointer.expose_provenance();
     }
 
-    public Pointer with_addr(int address) {
+    public Pointer with_addr(long address) {
         if (allocation == null) {
             return new Pointer(
                     null,
@@ -567,7 +624,7 @@ public final class Pointer {
                     viewCodecClassName,
                     address).withMetadata(metadata);
         }
-        int base = address() - byteOffset;
+        long base = address() - byteOffset;
         return new Pointer(
                 allocation,
                 allocationElementSize,
@@ -578,8 +635,14 @@ public final class Pointer {
                 -1).withMetadata(metadata);
     }
 
-    public static Pointer with_addr(Pointer pointer, int address) {
+    public Pointer with_addr(int address) { return with_addr(Integer.toUnsignedLong(address)); }
+
+    public static Pointer with_addr(Pointer pointer, long address) {
         return pointer.with_addr(address);
+    }
+
+    public static Pointer with_addr(Pointer pointer, int address) {
+        return pointer.with_addr(Integer.toUnsignedLong(address));
     }
 
     public static Pointer map_addr(Pointer pointer, Object mapper) {
@@ -594,27 +657,33 @@ public final class Pointer {
             if (call == null) {
                 throw new NoSuchMethodException("Rust map_addr closure has no call method");
             }
-            Object mapped = call.invoke(mapper, Integer.valueOf(pointer.address()));
-            return pointer.with_addr(((Number) mapped).intValue());
+            Object mapped = call.invoke(mapper, Long.valueOf(pointer.address()));
+            return pointer.with_addr(((Number) mapped).longValue());
         } catch (ReflectiveOperationException error) {
             throw new IllegalStateException("could not invoke Rust map_addr closure", error);
         }
     }
 
-    public static Pointer wrapping_add(Pointer pointer, int elementCount) {
+    public static Pointer wrapping_add(Pointer pointer, long elementCount) {
         return pointer.wrappingOffset(elementCount);
     }
 
-    public static Pointer wrapping_sub(Pointer pointer, int elementCount) {
+    public static Pointer wrapping_add(Pointer pointer, int elementCount) { return pointer.wrappingOffset(elementCount); }
+
+    public static Pointer wrapping_sub(Pointer pointer, long elementCount) {
         return pointer.wrappingOffset(-elementCount);
     }
 
-    public static Pointer wrapping_offset(Pointer pointer, int elementCount) {
+    public static Pointer wrapping_sub(Pointer pointer, int elementCount) { return pointer.wrappingOffset(-(long) elementCount); }
+
+    public static Pointer wrapping_offset(Pointer pointer, long elementCount) {
         return pointer.wrappingOffset(elementCount);
     }
 
-    private Pointer wrappingOffset(int elementCount) {
-        int delta = elementCount * viewSize;
+    public static Pointer wrapping_offset(Pointer pointer, int elementCount) { return pointer.wrappingOffset(elementCount); }
+
+    private Pointer wrappingOffset(long elementCount) {
+        long delta = elementCount * viewSize;
         if (allocation == null) {
             return new Pointer(
                     null,
@@ -635,37 +704,37 @@ public final class Pointer {
                 -1).withMetadata(metadata);
     }
 
-    public int offsetFrom(Pointer origin) {
+    public long offsetFrom(Pointer origin) {
         if (origin == null || allocation != origin.allocation) {
             throw new IllegalArgumentException("offset_from requires pointers into one allocation");
         }
         if (viewSize == 0) {
             throw new ArithmeticException("offset_from is undefined for zero-sized pointees");
         }
-        int bytes = Math.subtractExact(byteOffset, origin.byteOffset);
+        long bytes = Math.subtractExact(byteOffset, origin.byteOffset);
         if (bytes % viewSize != 0) {
             throw new ArithmeticException("pointer distance is not a whole number of elements");
         }
         return bytes / viewSize;
     }
 
-    public int offset_from(Pointer origin) {
+    public long offset_from(Pointer origin) {
         return offsetFrom(origin);
     }
 
-    public int offset_from_unsigned(Pointer origin) {
-        int distance = offsetFrom(origin);
+    public long offset_from_unsigned(Pointer origin) {
+        long distance = offsetFrom(origin);
         if (distance < 0) {
             throw new ArithmeticException("offset_from_unsigned requires self at or after origin");
         }
         return distance;
     }
 
-    public static int offset_from_unsigned(Pointer pointer, Pointer origin) {
+    public static long offset_from_unsigned(Pointer pointer, Pointer origin) {
         return pointer.offset_from_unsigned(origin);
     }
 
-    public int byte_offset_from(Pointer origin) {
+    public long byte_offset_from(Pointer origin) {
         if (origin == null || allocation != origin.allocation) {
             throw new IllegalArgumentException(
                     "byte_offset_from requires pointers into one allocation");
@@ -673,12 +742,12 @@ public final class Pointer {
         return Math.subtractExact(byteOffset, origin.byteOffset);
     }
 
-    public static int byte_offset_from(Pointer pointer, Pointer origin) {
+    public static long byte_offset_from(Pointer pointer, Pointer origin) {
         return pointer.byte_offset_from(origin);
     }
 
-    public int byte_offset_from_unsigned(Pointer origin) {
-        int distance = byte_offset_from(origin);
+    public long byte_offset_from_unsigned(Pointer origin) {
+        long distance = byte_offset_from(origin);
         if (distance < 0) {
             throw new ArithmeticException(
                     "byte_offset_from_unsigned requires self at or after origin");
@@ -686,15 +755,15 @@ public final class Pointer {
         return distance;
     }
 
-    public static int byte_offset_from_unsigned(Pointer pointer, Pointer origin) {
+    public static long byte_offset_from_unsigned(Pointer pointer, Pointer origin) {
         return pointer.byte_offset_from_unsigned(origin);
     }
 
-    public static int offset_from(Pointer pointer, Pointer origin) {
+    public static long offset_from(Pointer pointer, Pointer origin) {
         return pointer.offsetFrom(origin);
     }
 
-    public static int offsetFrom(Pointer pointer, Pointer origin) {
+    public static long offsetFrom(Pointer pointer, Pointer origin) {
         return pointer.offsetFrom(origin);
     }
 
@@ -703,7 +772,7 @@ public final class Pointer {
     }
 
     public int compareAddress(Pointer other) {
-        return Integer.compareUnsigned(address(), other.address());
+        return Long.compareUnsigned(address(), other.address());
     }
 
     public boolean lessThan(Pointer other) {
@@ -726,11 +795,15 @@ public final class Pointer {
         return pointer == null || pointer.address() == 0;
     }
 
-    public static boolean is_aligned_to(Pointer pointer, int alignment) {
+    public static boolean is_aligned_to(Pointer pointer, long alignment) {
         if (alignment <= 0 || (alignment & (alignment - 1)) != 0) {
             throw new IllegalArgumentException("Rust pointer alignment must be a power of two");
         }
         return (pointer.address() & (alignment - 1)) == 0;
+    }
+
+    public static boolean is_aligned_to(Pointer pointer, int alignment) {
+        return is_aligned_to(pointer, Integer.toUnsignedLong(alignment));
     }
 
     public static Object asRefOption(Pointer pointer, String optionClassName) {
@@ -752,25 +825,25 @@ public final class Pointer {
         }
     }
 
-    public int address() {
+    public long address() {
         if (allocation == null) {
             return exposedAddress;
         }
         synchronized (ALLOCATION_BASES) {
-            Integer base = ALLOCATION_BASES.get(allocation);
+            Long base = ALLOCATION_BASES.get(allocation);
             if (base == null) {
                 int byteCapacity = allocation.getClass().isArray()
                         ? Math.multiplyExact(Array.getLength(allocation), allocationElementSize)
                         : allocationElementSize;
-                int requiredSpan = Math.addExact(byteCapacity, 1);
-                int span = Math.max(16, Math.addExact(requiredSpan, 15) & ~15);
+                long requiredSpan = Math.addExact((long) byteCapacity, 1L);
+                long span = Math.max(16L, Math.addExact(requiredSpan, 15L) & ~15L);
                 int alignment = ALLOCATION_ALIGNMENTS.getOrDefault(allocation, 16);
                 base = allocateAddress(span, alignment);
                 ALLOCATION_BASES.put(allocation, base);
                 ALLOCATION_ELEMENT_SIZES.put(allocation, allocationElementSize);
                 ALLOCATION_CODECS.put(allocation, allocationCodecClassName);
             }
-            int address = base + byteOffset;
+            long address = base + byteOffset;
             EXPOSED_ADDRESSES.put(
                     address,
                     new ExposedTarget(
@@ -785,11 +858,11 @@ public final class Pointer {
         }
     }
 
-    private static int allocateAddress(int span, int alignment) {
+    private static long allocateAddress(long span, int alignment) {
         while (true) {
-            int current = NEXT_ADDRESS.get();
-            int aligned = Math.addExact(current, alignment - 1) & -alignment;
-            int next = Math.addExact(aligned, span);
+            long current = NEXT_ADDRESS.get();
+            long aligned = Math.addExact(current, alignment - 1L) & -((long) alignment);
+            long next = Math.addExact(aligned, span);
             if (NEXT_ADDRESS.compareAndSet(current, next)) {
                 return aligned;
             }
@@ -811,7 +884,7 @@ public final class Pointer {
         if (byteOffset % allocationElementSize != 0) {
             throw new IllegalStateException("object dereference is not aligned to its allocation element");
         }
-        int elementIndex = byteOffset / allocationElementSize;
+        int elementIndex = Math.toIntExact(byteOffset / allocationElementSize);
         if (allocation instanceof Cell) {
             if (elementIndex != 0) {
                 throw new IndexOutOfBoundsException("pointer arithmetic escaped scalar storage");
@@ -832,15 +905,15 @@ public final class Pointer {
         return result;
     }
 
-    private int loadByte(int absoluteByteOffset) {
+    private int loadByte(long absoluteByteOffset) {
         if (allocation == null) {
             throw new NullPointerException("attempted to dereference a null Rust pointer");
         }
         if (allocationElementSize == 0) {
             throw new IndexOutOfBoundsException("zero-sized storage has no addressable bytes");
         }
-        int elementIndex = Math.floorDiv(absoluteByteOffset, allocationElementSize);
-        int withinElement = Math.floorMod(absoluteByteOffset, allocationElementSize);
+        int elementIndex = Math.toIntExact(Math.floorDiv(absoluteByteOffset, allocationElementSize));
+        int withinElement = (int) Math.floorMod(absoluteByteOffset, allocationElementSize);
         Object value;
         if (allocation instanceof Cell) {
             if (elementIndex != 0) {
@@ -852,6 +925,12 @@ public final class Pointer {
         }
         if (value instanceof BigInteger) {
             return bigIntegerByte((BigInteger) value, withinElement) & 0xff;
+        }
+        if (value instanceof I128) {
+            return ((I128) value).byteAt(withinElement) & 0xff;
+        }
+        if (value instanceof U128) {
+            return ((U128) value).byteAt(withinElement) & 0xff;
         }
         if (value instanceof F128) {
             return bigIntegerByte(((F128) value).toBits(), withinElement) & 0xff;
@@ -877,15 +956,15 @@ public final class Pointer {
         }
     }
 
-    private void storeByte(int absoluteByteOffset, int value) {
+    private void storeByte(long absoluteByteOffset, int value) {
         if (allocation == null) {
             throw new NullPointerException("attempted to write through a null Rust pointer");
         }
         if (allocationElementSize == 0) {
             throw new IndexOutOfBoundsException("zero-sized storage has no addressable bytes");
         }
-        int elementIndex = Math.floorDiv(absoluteByteOffset, allocationElementSize);
-        int withinElement = Math.floorMod(absoluteByteOffset, allocationElementSize);
+        int elementIndex = Math.toIntExact(Math.floorDiv(absoluteByteOffset, allocationElementSize));
+        int withinElement = (int) Math.floorMod(absoluteByteOffset, allocationElementSize);
         Object current;
         if (allocation instanceof Cell) {
             if (elementIndex != 0) {
@@ -903,6 +982,14 @@ public final class Pointer {
                     allocationElementSize,
                     SIGNED_BIG_INTEGER_CODEC.equals(allocationCodecClassName));
             writeElement(elementIndex, updated);
+            return;
+        }
+        if (current instanceof I128) {
+            writeElement(elementIndex, ((I128) current).withByte(withinElement, value));
+            return;
+        }
+        if (current instanceof U128) {
+            writeElement(elementIndex, ((U128) current).withByte(withinElement, value));
             return;
         }
         if (current instanceof F128) {
@@ -978,15 +1065,17 @@ public final class Pointer {
         }
         if (MANAGED_OBJECT_VIEW_CODEC.equals(viewCodecClassName)
                 && !isDirectAllocationView()) {
-            return managedObjectFromAddress((int) loadUnsigned(Math.min(viewSize, 8)));
+            return managedObjectFromAddress(loadUnsigned(Math.min(viewSize, 8)));
         }
         if (RAW_POINTER_VIEW_CODEC.equals(viewCodecClassName)
                 && !isDirectAllocationView()) {
-            return pointerObjectFromAddress((int) loadUnsigned(Math.min(viewSize, 8)));
+            return pointerObjectFromAddress(loadUnsigned(Math.min(viewSize, 8)));
         }
         if (isBigIntegerCodec(viewCodecClassName) && !isDirectAllocationView()) {
-            return bigIntegerFromPointerBytes(
-                    viewSize, SIGNED_BIG_INTEGER_CODEC.equals(viewCodecClassName));
+            BigInteger bits = bigIntegerFromPointerBytes(viewSize, false);
+            return SIGNED_BIG_INTEGER_CODEC.equals(viewCodecClassName)
+                    ? I128.fromBigInteger(bits)
+                    : U128.fromBigInteger(bits);
         }
         if (F128_CODEC.equals(viewCodecClassName) && !isDirectAllocationView()) {
             return F128.fromBits(bigIntegerFromPointerBytes(viewSize, false));
@@ -1022,7 +1111,7 @@ public final class Pointer {
             if (byteOffset % allocationElementSize != 0) {
                 throw new IllegalStateException("unaligned pointer cannot be exposed as a JVM array");
             }
-            int elementOffset = byteOffset / allocationElementSize;
+            int elementOffset = Math.toIntExact(byteOffset / allocationElementSize);
             int remaining = Array.getLength(allocation) - elementOffset;
             Object tail = Array.newInstance(allocation.getClass().getComponentType(), remaining);
             System.arraycopy(allocation, elementOffset, tail, 0, remaining);
@@ -1045,7 +1134,7 @@ public final class Pointer {
         if (byteOffset % allocationElementSize != 0) {
             throw new IllegalStateException("slice data pointer is not element-aligned");
         }
-        return byteOffset / allocationElementSize;
+        return Math.toIntExact(byteOffset / allocationElementSize);
     }
 
     public void set(Object value) {
@@ -1062,7 +1151,7 @@ public final class Pointer {
         }
 
         if (isDirectAllocationView()) {
-            int elementIndex = byteOffset / allocationElementSize;
+            int elementIndex = Math.toIntExact(byteOffset / allocationElementSize);
             Object current = allocation instanceof Cell
                     ? ((Cell) allocation).value
                     : Array.get(allocation, elementIndex);
@@ -1074,7 +1163,7 @@ public final class Pointer {
 
         if (viewCodecClassName != null) {
             if (MANAGED_OBJECT_VIEW_CODEC.equals(viewCodecClassName)) {
-                long address = Integer.toUnsignedLong(managedObjectAddress(value));
+                long address = managedObjectAddress(value);
                 byte[] image = new byte[viewSize];
                 for (int index = 0; index < Math.min(viewSize, 8); index++) {
                     image[index] = (byte) (address >>> (index * 8));
@@ -1085,7 +1174,7 @@ public final class Pointer {
             if (RAW_POINTER_VIEW_CODEC.equals(viewCodecClassName)) {
                 long address = value == null
                         ? 0L
-                        : Integer.toUnsignedLong(((Pointer) value).address());
+                        : ((Pointer) value).address();
                 byte[] image = new byte[viewSize];
                 for (int index = 0; index < Math.min(viewSize, 8); index++) {
                     image[index] = (byte) (address >>> (index * 8));
@@ -1094,7 +1183,10 @@ public final class Pointer {
                 return;
             }
             if (isBigIntegerCodec(viewCodecClassName)) {
-                storeBigIntegerBytes((BigInteger) value, viewSize);
+                BigInteger bits = value instanceof I128
+                        ? ((I128) value).toBigInteger()
+                        : ((U128) value).toBigInteger();
+                storeBigIntegerBytes(bits, viewSize);
                 return;
             }
             if (F128_CODEC.equals(viewCodecClassName)) {
@@ -1116,10 +1208,14 @@ public final class Pointer {
         destination.storeRange(temporary);
     }
 
+    public static void copy(Pointer source, Pointer destination, long byteCount) {
+        copy(source, destination, checkedArrayLength(byteCount));
+    }
+
     public static void copyNonOverlapping(Pointer source, Pointer destination, int byteCount) {
         if (source.allocation == destination.allocation) {
-            int sourceEnd = source.byteOffset + byteCount;
-            int destinationEnd = destination.byteOffset + byteCount;
+            long sourceEnd = source.byteOffset + byteCount;
+            long destinationEnd = destination.byteOffset + byteCount;
             if (source.byteOffset < destinationEnd && destination.byteOffset < sourceEnd) {
                 throw new IllegalArgumentException("copy_nonoverlapping regions overlap");
             }
@@ -1127,10 +1223,15 @@ public final class Pointer {
         copy(source, destination, byteCount);
     }
 
+    public static void copyNonOverlapping(
+            Pointer source, Pointer destination, long byteCount) {
+        copyNonOverlapping(source, destination, checkedArrayLength(byteCount));
+    }
+
     public static void swapNonOverlapping(Pointer left, Pointer right, int byteCount) {
         if (left.allocation == right.allocation) {
-            int leftEnd = left.byteOffset + byteCount;
-            int rightEnd = right.byteOffset + byteCount;
+            long leftEnd = left.byteOffset + byteCount;
+            long rightEnd = right.byteOffset + byteCount;
             if (left.byteOffset < rightEnd && right.byteOffset < leftEnd) {
                 throw new IllegalArgumentException("swap_nonoverlapping regions overlap");
             }
@@ -1143,6 +1244,10 @@ public final class Pointer {
         }
         left.storeRange(rightBytes);
         right.storeRange(leftBytes);
+    }
+
+    public static void swapNonOverlapping(Pointer left, Pointer right, long byteCount) {
+        swapNonOverlapping(left, right, checkedArrayLength(byteCount));
     }
 
     public static void swapNonOverlappingNonZero(
@@ -1177,6 +1282,17 @@ public final class Pointer {
             bytes[index] = (byte) value;
         }
         destination.storeRange(bytes);
+    }
+
+    public static void writeBytes(Pointer destination, int value, long byteCount) {
+        writeBytes(destination, value, checkedArrayLength(byteCount));
+    }
+
+    private static int checkedArrayLength(long length) {
+        if (length < 0 || length > Integer.MAX_VALUE) {
+            throw new IllegalArgumentException("Rust memory operation exceeds JVM array limits");
+        }
+        return (int) length;
     }
 
     public static synchronized void volatileFence() {
@@ -1308,9 +1424,9 @@ public final class Pointer {
         }
         int consumed = 0;
         while (consumed < source.length) {
-            int absoluteOffset = byteOffset + consumed;
-            int elementIndex = Math.floorDiv(absoluteOffset, allocationElementSize);
-            int withinElement = Math.floorMod(absoluteOffset, allocationElementSize);
+            long absoluteOffset = byteOffset + consumed;
+            int elementIndex = Math.toIntExact(Math.floorDiv(absoluteOffset, allocationElementSize));
+            int withinElement = (int) Math.floorMod(absoluteOffset, allocationElementSize);
             Object current = allocation instanceof Cell
                     ? ((Cell) allocation).value
                     : Array.get(allocation, elementIndex);
@@ -1405,7 +1521,7 @@ public final class Pointer {
             return ((Number) value).longValue();
         }
         if (value instanceof Pointer && size <= 8) {
-            return Integer.toUnsignedLong(((Pointer) value).address());
+            return ((Pointer) value).address();
         }
         throw new UnsupportedOperationException(
                 "value is not scalar byte-addressable: " + value.getClass().getName());
@@ -1413,6 +1529,14 @@ public final class Pointer {
 
     public static byte bigIntegerByte(BigInteger value, int byteIndex) {
         return value.shiftRight(byteIndex * 8).byteValue();
+    }
+
+    public static byte integer128Byte(I128 value, int byteIndex) {
+        return value.byteAt(byteIndex);
+    }
+
+    public static byte integer128Byte(U128 value, int byteIndex) {
+        return value.byteAt(byteIndex);
     }
 
     public static BigInteger bigIntegerFromBytes(
@@ -1425,6 +1549,14 @@ public final class Pointer {
             value = value.subtract(BigInteger.ONE.shiftLeft(size * 8));
         }
         return value;
+    }
+
+    public static I128 i128FromBytes(byte[] bytes, int offset, int size, boolean signed) {
+        return I128.fromBigInteger(bigIntegerFromBytes(bytes, offset, size, false));
+    }
+
+    public static U128 u128FromBytes(byte[] bytes, int offset, int size, boolean signed) {
+        return U128.fromBigInteger(bigIntegerFromBytes(bytes, offset, size, false));
     }
 
     private BigInteger bigIntegerFromPointerBytes(int size, boolean signed) {
@@ -1503,7 +1635,7 @@ public final class Pointer {
             return Character.valueOf((char) bits);
         }
         if (current instanceof Pointer) {
-            return pointerObjectFromAddress((int) bits);
+            return pointerObjectFromAddress(bits);
         }
         if (current == null) {
             if (size <= 4) {

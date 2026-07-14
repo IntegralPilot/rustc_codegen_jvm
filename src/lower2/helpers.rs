@@ -3,13 +3,14 @@ use super::{constant_pool::InternedConstantPool, oomir};
 use super::jvm::{self, attributes::Instruction};
 use oomir::Type;
 
-use super::{BIG_DECIMAL_CLASS, BIG_INTEGER_CLASS};
+use super::consts::{get_int_const_instr, get_long_const_instr};
+use super::{BIG_DECIMAL_CLASS, BIG_INTEGER_CLASS, F128_CLASS, I128_CLASS, U128_CLASS};
 
 /// Returns the number of JVM local variable slots a type occupies (0, 1, or 2).
 pub fn get_type_size(ty: &Type) -> u16 {
     match ty {
         Type::Unit | Type::Void => 0,
-        Type::I64 | Type::F64 => 2,
+        Type::I64 | Type::U64 | Type::F64 => 2,
         _ => 1,
     }
 }
@@ -18,7 +19,7 @@ fn constant_load_stack_floor(constant: &oomir::Constant) -> u16 {
     use oomir::Constant;
     match constant {
         Constant::Unit => 0,
-        Constant::I64(_) | Constant::F64(_) => 2,
+        Constant::I64(_) | Constant::U64(_) | Constant::F64(_) => 2,
         Constant::Array(_, elements) => elements
             .iter()
             .map(|element| 3 + constant_load_stack_floor(element))
@@ -153,7 +154,15 @@ pub fn oomir_function_stack_floor(function: &oomir::Function) -> u16 {
 pub fn get_load_instruction(ty: &Type, index: u16) -> Result<Instruction, jvm::Error> {
     Ok(match ty {
         // Integer-like types
-        Type::I8 | Type::I16 | Type::I32 | Type::Boolean | Type::Char => {
+        Type::I8
+        | Type::U8
+        | Type::I16
+        | Type::U16
+        | Type::F16
+        | Type::I32
+        | Type::U32
+        | Type::Boolean
+        | Type::Char => {
             match index {
                 0 => Instruction::Iload_0,
                 1 => Instruction::Iload_1,
@@ -165,7 +174,7 @@ pub fn get_load_instruction(ty: &Type, index: u16) -> Result<Instruction, jvm::E
             }
         }
         // Long type
-        Type::I64 => match index {
+        Type::I64 | Type::U64 => match index {
             0 => Instruction::Lload_0,
             1 => Instruction::Lload_1,
             2 => Instruction::Lload_2,
@@ -222,7 +231,7 @@ pub fn get_load_instruction(ty: &Type, index: u16) -> Result<Instruction, jvm::E
 pub fn get_store_instruction(ty: &Type, index: u16) -> Result<Instruction, jvm::Error> {
     use Type::*;
     let instr = match ty {
-        I8 | I16 | I32 | Boolean | Char => {
+        I8 | U8 | I16 | U16 | F16 | I32 | U32 | Boolean | Char => {
             if index <= 3 {
                 match index {
                     0 => Instruction::Istore_0,
@@ -237,7 +246,7 @@ pub fn get_store_instruction(ty: &Type, index: u16) -> Result<Instruction, jvm::
                 Instruction::Istore_w(index)
             }
         }
-        I64 => {
+        I64 | U64 => {
             if index <= 3 {
                 match index {
                     0 => Instruction::Lstore_0,
@@ -326,12 +335,18 @@ pub fn get_cast_instructions(
 
     // 1. Primitive <-> Primitive
     if src.is_jvm_primitive_like() && dest.is_jvm_primitive_like() {
-        return primitive_to_primitive(src, dest);
+        return primitive_to_primitive(src, dest, cp);
     }
 
     // 2. Primitive -> BigInteger / BigDecimal
     if src.is_jvm_primitive_like() {
         if let Type::Class(cn) = dest {
+            if cn == F128_CLASS {
+                return prim_to_f128(src, cp);
+            }
+            if cn == I128_CLASS || cn == U128_CLASS {
+                return prim_to_int128(src, cn, cp);
+            }
             if cn == BIG_INTEGER_CLASS {
                 return prim_to_bigint(src, cp);
             }
@@ -342,10 +357,11 @@ pub fn get_cast_instructions(
                 let wrapper_method = match src {
                     Type::Boolean => Some(("java/lang/Boolean", "(Z)Ljava/lang/Boolean;")),
                     Type::Char => Some(("java/lang/Character", "(C)Ljava/lang/Character;")),
-                    Type::I8 | Type::I16 | Type::I32 => {
-                        Some(("java/lang/Integer", "(I)Ljava/lang/Integer;"))
-                    }
-                    Type::I64 => Some(("java/lang/Long", "(J)Ljava/lang/Long;")),
+                    Type::I8 | Type::U8 => Some(("java/lang/Byte", "(B)Ljava/lang/Byte;")),
+                    Type::I16 | Type::F16 => Some(("java/lang/Short", "(S)Ljava/lang/Short;")),
+                    Type::U16 => Some(("java/lang/Character", "(C)Ljava/lang/Character;")),
+                    Type::I32 | Type::U32 => Some(("java/lang/Integer", "(I)Ljava/lang/Integer;")),
+                    Type::I64 | Type::U64 => Some(("java/lang/Long", "(J)Ljava/lang/Long;")),
                     Type::F32 => Some(("java/lang/Float", "(F)Ljava/lang/Float;")),
                     Type::F64 => Some(("java/lang/Double", "(D)Ljava/lang/Double;")),
                     _ => None,
@@ -376,6 +392,12 @@ pub fn get_cast_instructions(
     // 3. BigInteger / BigDecimal -> Primitive
     if let Type::Class(cn) = src {
         if dest.is_jvm_primitive_like() {
+            if cn == F128_CLASS {
+                return f128_to_prim(dest, cp);
+            }
+            if cn == I128_CLASS || cn == U128_CLASS {
+                return int128_to_prim(cn, dest, cp);
+            }
             if cn == BIG_INTEGER_CLASS {
                 return bigint_to_prim(dest, cp);
             }
@@ -385,8 +407,70 @@ pub fn get_cast_instructions(
         }
     }
 
+    if src == &Type::Class("java/lang/Object".to_string()) && dest.is_jvm_primitive_like() {
+        if dest == &Type::Boolean {
+            let class = cp.add_class("java/lang/Boolean")?;
+            let unbox = cp.add_method_ref(class, "booleanValue", "()Z")?;
+            return Ok(vec![JI::Checkcast(class), JI::Invokevirtual(unbox)]);
+        }
+        let (method, descriptor) = match dest {
+            Type::I8 | Type::U8 => ("objectToI8", "(Ljava/lang/Object;)B"),
+            Type::I16 | Type::F16 => ("objectToI16", "(Ljava/lang/Object;)S"),
+            Type::U16 | Type::Char => ("objectToU16", "(Ljava/lang/Object;)C"),
+            Type::I32 | Type::U32 => ("objectToI32", "(Ljava/lang/Object;)I"),
+            Type::I64 | Type::U64 => ("objectToI64", "(Ljava/lang/Object;)J"),
+            Type::F32 => ("objectToF32", "(Ljava/lang/Object;)F"),
+            Type::F64 => ("objectToF64", "(Ljava/lang/Object;)D"),
+            _ => unreachable!(),
+        };
+        let class = cp.add_class("org/rustlang/runtime/Numbers")?;
+        let unbox = cp.add_method_ref(class, method, descriptor)?;
+        return Ok(vec![JI::Invokestatic(unbox)]);
+    }
+
     // 4. Reference -> Reference (including String, BigInteger, BigDecimal interop)
     if src.is_jvm_reference_type() && dest.is_jvm_reference_type() {
+        if let (Type::Class(src_class), Type::Class(dest_class)) = (src, dest) {
+            if (src_class == I128_CLASS || src_class == U128_CLASS) && dest_class == F128_CLASS {
+                let class = cp.add_class(F128_CLASS)?;
+                let method_name = if src_class == I128_CLASS {
+                    "fromI128Value"
+                } else {
+                    "fromU128Value"
+                };
+                let method = cp.add_method_ref(
+                    class,
+                    method_name,
+                    &format!("(L{src_class};)L{F128_CLASS};"),
+                )?;
+                return Ok(vec![JI::Invokestatic(method)]);
+            }
+            if src_class == F128_CLASS && (dest_class == I128_CLASS || dest_class == U128_CLASS) {
+                let class = cp.add_class(F128_CLASS)?;
+                let method_name = if dest_class == I128_CLASS {
+                    "castToI128"
+                } else {
+                    "castToU128"
+                };
+                let method = cp.add_method_ref(class, method_name, &format!("()L{dest_class};"))?;
+                return Ok(vec![JI::Invokevirtual(method)]);
+            }
+        }
+
+        if let (Type::Class(src_class), Type::Class(dest_class)) = (src, dest)
+            && (src_class == I128_CLASS || src_class == U128_CLASS)
+            && (dest_class == I128_CLASS || dest_class == U128_CLASS)
+        {
+            let owner = cp.add_class(src_class)?;
+            let method_name = if dest_class == I128_CLASS {
+                "toI128"
+            } else {
+                "toU128"
+            };
+            let method = cp.add_method_ref(owner, method_name, &format!("()L{dest_class};"))?;
+            return Ok(vec![JI::Invokevirtual(method)]);
+        }
+
         // String -> BigInteger
         if src == &Type::String && dest == &Type::Class(BIG_INTEGER_CLASS.into()) {
             let bi_idx = cp.add_class(BIG_INTEGER_CLASS)?;
@@ -509,8 +593,16 @@ pub fn get_cast_instructions(
     };
     instructions.extend(match dest {
         Type::Unit | Type::Void => Vec::new(),
-        Type::I8 | Type::I16 | Type::I32 | Type::Boolean | Type::Char => vec![JI::Iconst_0],
-        Type::I64 => vec![JI::Lconst_0],
+        Type::I8
+        | Type::U8
+        | Type::I16
+        | Type::U16
+        | Type::F16
+        | Type::I32
+        | Type::U32
+        | Type::Boolean
+        | Type::Char => vec![JI::Iconst_0],
+        Type::I64 | Type::U64 => vec![JI::Lconst_0],
         Type::F32 => vec![JI::Fconst_0],
         Type::F64 => vec![JI::Dconst_0],
         Type::MutableReference(_)
@@ -526,114 +618,314 @@ pub fn get_cast_instructions(
     Ok(instructions)
 }
 
-/// Helper for primitive→primitive casts via a small JVM‐opcode graph + narrowing.
-fn primitive_to_primitive(src: &Type, dest: &Type) -> Result<Vec<Instruction>, jvm::Error> {
+/// Semantic Rust primitive casts.  The JVM descriptor alone is insufficient here:
+/// `u32` is carried in an `int`, `u64` in a `long`, and `f16` in a `short` bit-pattern.
+fn primitive_to_primitive(
+    src: &Type,
+    dest: &Type,
+    cp: &mut InternedConstantPool,
+) -> Result<Vec<Instruction>, jvm::Error> {
     use Instruction as JI;
-    use std::collections::{HashMap, HashSet, VecDeque};
 
-    // Normalize smaller ints → I32
-    fn normalize(ty: &Type) -> Type {
+    fn int_width(ty: &Type) -> Option<u32> {
         match ty {
-            Type::I8 | Type::I16 | Type::Char | Type::Boolean => Type::I32,
-            _ => ty.clone(),
+            Type::Boolean => Some(1),
+            Type::I8 | Type::U8 => Some(8),
+            Type::I16 | Type::U16 | Type::Char => Some(16),
+            Type::I32 | Type::U32 => Some(32),
+            Type::I64 | Type::U64 => Some(64),
+            _ => None,
         }
     }
-    // Final narrowing instr for byte/char/short
-    fn narrow(dest: &Type) -> Option<Instruction> {
-        Some(match dest {
-            Type::I8 => JI::I2b,
-            Type::Char => JI::I2c,
-            Type::I16 => JI::I2s,
-            _ => return None,
-        })
+
+    fn is_unsigned(ty: &Type) -> bool {
+        matches!(
+            ty,
+            Type::Boolean | Type::U8 | Type::U16 | Type::U32 | Type::U64 | Type::Char
+        )
     }
 
-    let ns = normalize(src);
-    let nd = normalize(dest);
-
-    // If same, just maybe narrow
-    if ns == nd {
-        return Ok(narrow(dest).into_iter().collect());
+    fn narrow(ty: &Type) -> Option<Instruction> {
+        match ty {
+            Type::I8 | Type::U8 => Some(JI::I2b),
+            Type::I16 => Some(JI::I2s),
+            Type::U16 | Type::Char => Some(JI::I2c),
+            _ => None,
+        }
     }
 
-    // Build graph
-    let graph: HashMap<_, _> = [
-        (
-            Type::I32,
-            vec![
-                (Type::I64, JI::I2l),
-                (Type::F64, JI::I2d),
-                (Type::F32, JI::I2f),
-            ],
-        ),
-        (
-            Type::I64,
-            vec![
-                (Type::I32, JI::L2i),
-                (Type::F64, JI::L2d),
-                (Type::F32, JI::L2f),
-            ],
-        ),
-        (
-            Type::F64,
-            vec![
-                (Type::I32, JI::D2i),
-                (Type::I64, JI::D2l),
-                (Type::F32, JI::D2f),
-            ],
-        ),
-        (
-            Type::F32,
-            vec![
-                (Type::I32, JI::F2i),
-                (Type::I64, JI::F2l),
-                (Type::F64, JI::F2d),
-            ],
-        ),
-    ]
-    .into_iter()
-    .collect();
-
-    // BFS
-    #[derive(Clone)]
-    struct Node {
-        ty: Type,
-        path: Vec<Instruction>,
+    fn numbers_call(
+        cp: &mut InternedConstantPool,
+        name: &str,
+        descriptor: &str,
+    ) -> Result<Instruction, jvm::Error> {
+        let class = cp.add_class("org/rustlang/runtime/Numbers")?;
+        let method = cp.add_method_ref(class, name, descriptor)?;
+        Ok(JI::Invokestatic(method))
     }
-    let mut q = VecDeque::new();
-    let mut seen = HashSet::new();
-    q.push_back(Node {
-        ty: ns.clone(),
-        path: vec![],
-    });
-    seen.insert(ns.clone());
 
-    while let Some(Node { ty, path }) = q.pop_front() {
-        if ty == nd {
-            let mut p = path;
-            if let Some(n) = narrow(dest) {
-                p.push(n);
+    // binary16 is stored as raw bits. Decode before a cast out, and round once on a cast in.
+    if src == &Type::F16 {
+        let mut result = vec![numbers_call(cp, "f16ToF32", "(S)F")?];
+        result.extend(primitive_to_primitive(&Type::F32, dest, cp)?);
+        return Ok(result);
+    }
+    if dest == &Type::F16 {
+        return match src {
+            Type::F32 => Ok(vec![numbers_call(cp, "f32ToF16", "(F)S")?]),
+            Type::F64 => Ok(vec![numbers_call(cp, "f64ToF16", "(D)S")?]),
+            _ if int_width(src).is_some() => {
+                let mut result = primitive_to_primitive(src, &Type::F64, cp)?;
+                result.push(numbers_call(cp, "f64ToF16", "(D)S")?);
+                Ok(result)
             }
-            return Ok(p);
+            _ => Err(jvm::Error::VerificationError {
+                context: "primitive_to_primitive".into(),
+                message: format!("No path {src:?}→F16"),
+            }),
+        };
+    }
+
+    if matches!(src, Type::F32 | Type::F64) && matches!(dest, Type::F32 | Type::F64) {
+        return Ok(match (src, dest) {
+            (Type::F32, Type::F64) => vec![JI::F2d],
+            (Type::F64, Type::F32) => vec![JI::D2f],
+            _ => Vec::new(),
+        });
+    }
+
+    if matches!(src, Type::F32 | Type::F64) && int_width(dest).is_some() {
+        let prefix = if src == &Type::F32 { "f32" } else { "f64" };
+        let source_descriptor = if src == &Type::F32 { "F" } else { "D" };
+        let (suffix, return_descriptor, direct) = match dest {
+            Type::I8 => ("ToI8", "B", None),
+            Type::I16 => ("ToI16", "S", None),
+            Type::I32 => (
+                "",
+                "",
+                Some(if src == &Type::F32 { JI::F2i } else { JI::D2i }),
+            ),
+            Type::I64 => (
+                "",
+                "",
+                Some(if src == &Type::F32 { JI::F2l } else { JI::D2l }),
+            ),
+            Type::U8 | Type::Boolean => ("ToU8", "B", None),
+            Type::U16 | Type::Char => ("ToU16", "C", None),
+            Type::U32 => ("ToU32", "I", None),
+            Type::U64 => ("ToU64", "J", None),
+            _ => unreachable!(),
+        };
+        if let Some(op) = direct {
+            return Ok(vec![op]);
         }
-        if let Some(neigh) = graph.get(&ty) {
-            for (nty, op) in neigh {
-                if seen.insert(nty.clone()) {
-                    let mut p2 = path.clone();
-                    p2.push(op.clone());
-                    q.push_back(Node {
-                        ty: nty.clone(),
-                        path: p2,
-                    });
+        return Ok(vec![numbers_call(
+            cp,
+            &format!("{prefix}{suffix}"),
+            &format!("({source_descriptor}){return_descriptor}"),
+        )?]);
+    }
+
+    if int_width(src).is_some() && matches!(dest, Type::F32 | Type::F64) {
+        let to_f32 = dest == &Type::F32;
+        return Ok(match src {
+            Type::U32 => vec![numbers_call(
+                cp,
+                if to_f32 { "u32ToF32" } else { "u32ToF64" },
+                if to_f32 { "(I)F" } else { "(I)D" },
+            )?],
+            Type::U64 => vec![numbers_call(
+                cp,
+                if to_f32 { "u64ToF32" } else { "u64ToF64" },
+                if to_f32 { "(J)F" } else { "(J)D" },
+            )?],
+            Type::I64 => vec![if to_f32 { JI::L2f } else { JI::L2d }],
+            Type::U8 => vec![
+                get_int_const_instr(cp, 0xff),
+                JI::Iand,
+                if to_f32 { JI::I2f } else { JI::I2d },
+            ],
+            _ => vec![if to_f32 { JI::I2f } else { JI::I2d }],
+        });
+    }
+
+    if let (Some(src_width), Some(dest_width)) = (int_width(src), int_width(dest)) {
+        let mut result = Vec::new();
+        if dest_width <= 32 {
+            if src_width == 64 {
+                result.push(JI::L2i);
+            }
+            if let Some(op) = narrow(dest) {
+                result.push(op);
+            }
+            return Ok(result);
+        }
+
+        if src_width < 64 {
+            match src {
+                Type::U8 => {
+                    result.push(get_int_const_instr(cp, 0xff));
+                    result.push(JI::Iand);
+                    result.push(JI::I2l);
                 }
+                Type::U32 => {
+                    result.push(JI::I2l);
+                    result.push(get_long_const_instr(cp, 0xffff_ffff));
+                    result.push(JI::Land);
+                }
+                _ if is_unsigned(src) => result.push(JI::I2l),
+                _ => result.push(JI::I2l),
             }
         }
+        return Ok(result);
     }
 
     Err(jvm::Error::VerificationError {
         context: "primitive_to_primitive".into(),
-        message: format!("No path {:?}→{:?}", src, dest),
+        message: format!("No path {src:?}→{dest:?}"),
     })
+}
+
+fn prim_to_int128(
+    src: &Type,
+    dest_class: &str,
+    cp: &mut InternedConstantPool,
+) -> Result<Vec<Instruction>, jvm::Error> {
+    use Instruction as JI;
+
+    let class = cp.add_class(dest_class)?;
+    let return_descriptor = format!("L{dest_class};");
+    match src {
+        Type::F16 => {
+            let numbers = cp.add_class("org/rustlang/runtime/Numbers")?;
+            let decode = cp.add_method_ref(numbers, "f16ToF32", "(S)F")?;
+            let convert =
+                cp.add_method_ref(class, "fromF32", &format!("(F){return_descriptor}"))?;
+            Ok(vec![JI::Invokestatic(decode), JI::Invokestatic(convert)])
+        }
+        Type::F32 => {
+            let convert =
+                cp.add_method_ref(class, "fromF32", &format!("(F){return_descriptor}"))?;
+            Ok(vec![JI::Invokestatic(convert)])
+        }
+        Type::F64 => {
+            let convert =
+                cp.add_method_ref(class, "fromF64", &format!("(D){return_descriptor}"))?;
+            Ok(vec![JI::Invokestatic(convert)])
+        }
+        _ => {
+            let unsigned = matches!(
+                src,
+                Type::Boolean | Type::Char | Type::U8 | Type::U16 | Type::U32 | Type::U64
+            );
+            let carrier_type = if unsigned { Type::U64 } else { Type::I64 };
+            let mut instructions = primitive_to_primitive(src, &carrier_type, cp)?;
+            let method_name = if unsigned { "fromU64" } else { "fromI64" };
+            let convert =
+                cp.add_method_ref(class, method_name, &format!("(J){return_descriptor}"))?;
+            instructions.push(JI::Invokestatic(convert));
+            Ok(instructions)
+        }
+    }
+}
+
+fn prim_to_f128(src: &Type, cp: &mut InternedConstantPool) -> Result<Vec<Instruction>, jvm::Error> {
+    use Instruction as JI;
+
+    let class = cp.add_class(F128_CLASS)?;
+    match src {
+        Type::F16 => {
+            let numbers = cp.add_class("org/rustlang/runtime/Numbers")?;
+            let decode = cp.add_method_ref(numbers, "f16ToF32", "(S)F")?;
+            let convert = cp.add_method_ref(class, "fromF32", &format!("(F)L{F128_CLASS};"))?;
+            Ok(vec![JI::Invokestatic(decode), JI::Invokestatic(convert)])
+        }
+        Type::F32 => {
+            let convert = cp.add_method_ref(class, "fromF32", &format!("(F)L{F128_CLASS};"))?;
+            Ok(vec![JI::Invokestatic(convert)])
+        }
+        Type::F64 => {
+            let convert = cp.add_method_ref(class, "fromF64", &format!("(D)L{F128_CLASS};"))?;
+            Ok(vec![JI::Invokestatic(convert)])
+        }
+        _ => {
+            let unsigned = matches!(
+                src,
+                Type::Boolean | Type::Char | Type::U8 | Type::U16 | Type::U32 | Type::U64
+            );
+            let carrier_type = if unsigned { Type::U64 } else { Type::I64 };
+            let mut instructions = primitive_to_primitive(src, &carrier_type, cp)?;
+            let method_name = if unsigned { "fromU64" } else { "fromI64" };
+            let convert = cp.add_method_ref(class, method_name, &format!("(J)L{F128_CLASS};"))?;
+            instructions.push(JI::Invokestatic(convert));
+            Ok(instructions)
+        }
+    }
+}
+
+fn f128_to_prim(
+    dest: &Type,
+    cp: &mut InternedConstantPool,
+) -> Result<Vec<Instruction>, jvm::Error> {
+    use Instruction as JI;
+
+    let class = cp.add_class(F128_CLASS)?;
+    let (method_name, descriptor) = match dest {
+        Type::I8 => ("castToI8", "()B"),
+        Type::U8 | Type::Boolean => ("castToU8", "()B"),
+        Type::I16 => ("castToI16", "()S"),
+        Type::U16 | Type::Char => ("castToU16", "()C"),
+        Type::I32 => ("castToI32", "()I"),
+        Type::U32 => ("castToU32", "()I"),
+        Type::I64 => ("castToI64", "()J"),
+        Type::U64 => ("castToU64", "()J"),
+        Type::F32 => ("castToF32", "()F"),
+        Type::F64 => ("castToF64", "()D"),
+        Type::F16 => ("castToF16", "()S"),
+        _ => {
+            return Err(jvm::Error::VerificationError {
+                context: "f128_to_prim".into(),
+                message: format!("Cannot cast F128 to {dest:?}"),
+            });
+        }
+    };
+    let method = cp.add_method_ref(class, method_name, descriptor)?;
+    Ok(vec![JI::Invokevirtual(method)])
+}
+
+fn int128_to_prim(
+    src_class: &str,
+    dest: &Type,
+    cp: &mut InternedConstantPool,
+) -> Result<Vec<Instruction>, jvm::Error> {
+    use Instruction as JI;
+
+    let class = cp.add_class(src_class)?;
+    match dest {
+        Type::F16 => {
+            let to_double = cp.add_method_ref(class, "doubleValue", "()D")?;
+            let numbers = cp.add_class("org/rustlang/runtime/Numbers")?;
+            let to_half = cp.add_method_ref(numbers, "f64ToF16", "(D)S")?;
+            Ok(vec![
+                JI::Invokevirtual(to_double),
+                JI::Invokestatic(to_half),
+            ])
+        }
+        Type::F32 => {
+            let method = cp.add_method_ref(class, "floatValue", "()F")?;
+            Ok(vec![JI::Invokevirtual(method)])
+        }
+        Type::F64 => {
+            let method = cp.add_method_ref(class, "doubleValue", "()D")?;
+            Ok(vec![JI::Invokevirtual(method)])
+        }
+        _ => {
+            let method = cp.add_method_ref(class, "longValue", "()J")?;
+            let mut instructions = vec![JI::Invokevirtual(method)];
+            instructions.extend(primitive_to_primitive(&Type::I64, dest, cp)?);
+            Ok(instructions)
+        }
+    }
 }
 
 /// primitive → BigInteger via BigInteger.valueOf(long)

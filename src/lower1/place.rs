@@ -17,10 +17,10 @@ use std::collections::HashMap;
 fn pointer_getter_for_type(ty: &oomir::Type) -> (&'static str, oomir::Type) {
     match ty {
         oomir::Type::Boolean => ("getBoolean", oomir::Type::Boolean),
-        oomir::Type::I8 => ("getI8", oomir::Type::I8),
-        oomir::Type::I16 => ("getI16", oomir::Type::I16),
-        oomir::Type::I32 | oomir::Type::Char => ("getI32", oomir::Type::I32),
-        oomir::Type::I64 => ("getI64", oomir::Type::I64),
+        oomir::Type::I8 | oomir::Type::U8 => ("getI8", oomir::Type::I8),
+        oomir::Type::I16 | oomir::Type::U16 | oomir::Type::F16 => ("getI16", oomir::Type::I16),
+        oomir::Type::I32 | oomir::Type::U32 | oomir::Type::Char => ("getI32", oomir::Type::I32),
+        oomir::Type::I64 | oomir::Type::U64 => ("getI64", oomir::Type::I64),
         oomir::Type::F32 => ("getF32", oomir::Type::F32),
         oomir::Type::F64 => ("getF64", oomir::Type::F64),
         _ => (
@@ -478,7 +478,7 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
                             method_name: "metadata".to_string(),
                             method_ty: oomir::Signature {
                                 params: vec![("self".to_string(), base_pointer_ty.clone())],
-                                ret: Box::new(oomir::Type::I32),
+                                ret: Box::new(oomir::Type::U64),
                                 is_static: false,
                             },
                             args: Vec::new(),
@@ -486,6 +486,15 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
                                 name: base_pointer_name,
                                 ty: base_pointer_ty,
                             },
+                        });
+                        let metadata_i32_name = format!("{current_var}_metadata_i32");
+                        instructions.push(Instruction::Cast {
+                            dest: metadata_i32_name.clone(),
+                            op: Operand::Variable {
+                                name: metadata_name,
+                                ty: oomir::Type::U64,
+                            },
+                            ty: oomir::Type::I32,
                         });
                         let object_name = format!("{current_var}_slice_object");
                         instructions.push(Instruction::ConstructObject {
@@ -502,7 +511,7 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
                                 (Operand::Constant(oomir::Constant::I32(0)), oomir::Type::I32),
                                 (
                                     Operand::Variable {
-                                        name: metadata_name,
+                                        name: metadata_i32_name,
                                         ty: oomir::Type::I32,
                                     },
                                     oomir::Type::I32,

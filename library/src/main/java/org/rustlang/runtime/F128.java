@@ -1,6 +1,9 @@
 package org.rustlang.runtime;
 
 import java.math.BigInteger;
+import java.math.BigDecimal;
+import java.math.MathContext;
+import java.math.RoundingMode;
 
 /** An immutable IEEE 754 binary128 value, stored without losing payload bits. */
 public final class F128 {
@@ -11,6 +14,8 @@ public final class F128 {
     private static final BigInteger FRACTION_MASK = TWO_112.subtract(BigInteger.ONE);
     private static final BigInteger MASK_64 = BigInteger.ONE.shiftLeft(64).subtract(BigInteger.ONE);
     private static final BigInteger MASK_128 = BigInteger.ONE.shiftLeft(128).subtract(BigInteger.ONE);
+    private static final BigInteger TWO_127 = BigInteger.ONE.shiftLeft(127);
+    private static final BigInteger TWO_128 = BigInteger.ONE.shiftLeft(128);
     private static final F128 NAN = new F128(0x7fff800000000000L, 0L);
 
     private final long high;
@@ -33,12 +38,16 @@ public final class F128 {
         return unsignedLong(high).shiftLeft(64).or(unsignedLong(low));
     }
 
-    public BigInteger to_bits() {
-        return toBits();
+    public U128 to_bits() {
+        return new U128(high, low);
     }
 
-    public static BigInteger to_bits(F128 value) {
-        return value.toBits();
+    public static U128 to_bits(F128 value) {
+        return value.to_bits();
+    }
+
+    public U128 toU128() {
+        return new U128(high, low);
     }
 
     public static F128 fromBits(BigInteger bits) {
@@ -48,6 +57,184 @@ public final class F128 {
 
     public static F128 from_bits(BigInteger bits) {
         return fromBits(bits);
+    }
+
+    public static F128 from_bits(U128 bits) {
+        return new F128(bits.high, bits.low);
+    }
+
+    public static F128 fromU128(U128 bits) {
+        return new F128(bits.high, bits.low);
+    }
+
+    public static F128 fromI64(long value) {
+        return fromInteger(BigInteger.valueOf(value));
+    }
+
+    public static F128 fromU64(long value) {
+        return fromInteger(unsignedLong(value));
+    }
+
+    public static F128 fromI128Value(I128 value) {
+        return fromInteger(value.toBigInteger());
+    }
+
+    public static F128 fromU128Value(U128 value) {
+        return fromInteger(value.toBigInteger());
+    }
+
+    public static F128 fromF32(float value) {
+        return fromF64(value);
+    }
+
+    /** Exact widening conversion from an IEEE binary64 value. */
+    public static F128 fromF64(double value) {
+        long bits = Double.doubleToRawLongBits(value);
+        boolean negative = bits < 0;
+        int exponent = (int) ((bits >>> 52) & 0x7ffL);
+        long fraction = bits & 0x000f_ffff_ffff_ffffL;
+        if (exponent == 0x7ff) {
+            if (fraction == 0) return infinity(negative);
+            long payload = fraction << 12;
+            return new F128((negative ? Long.MIN_VALUE : 0L)
+                    | 0x7fff_0000_0000_0000L
+                    | payload
+                    | 0x0000_8000_0000_0000L, 0L);
+        }
+        if (exponent == 0 && fraction == 0) return zero(negative);
+
+        BigInteger significand;
+        int power;
+        if (exponent == 0) {
+            significand = BigInteger.valueOf(fraction);
+            power = 1 - 1023 - 52;
+        } else {
+            significand = BigInteger.valueOf(fraction | (1L << 52));
+            power = exponent - 1023 - 52;
+        }
+        BigInteger numerator = significand;
+        BigInteger denominator = BigInteger.ONE;
+        if (power >= 0) numerator = numerator.shiftLeft(power);
+        else denominator = denominator.shiftLeft(-power);
+        if (negative) numerator = numerator.negate();
+        return fromRational(numerator, denominator, negative);
+    }
+
+    private static F128 fromInteger(BigInteger value) {
+        return fromRational(value, BigInteger.ONE, false);
+    }
+
+    private BigInteger clampedInteger(BigInteger minimum, BigInteger maximum) {
+        if (isNaN()) return BigInteger.ZERO;
+        if (isInfinite()) return isNegative() ? minimum : maximum;
+        Rational rational = finiteRational();
+        BigInteger integer = rational.numerator.divide(rational.denominator);
+        if (integer.compareTo(minimum) < 0) return minimum;
+        if (integer.compareTo(maximum) > 0) return maximum;
+        return integer;
+    }
+
+    public byte castToI8() {
+        return clampedInteger(BigInteger.valueOf(Byte.MIN_VALUE), BigInteger.valueOf(Byte.MAX_VALUE)).byteValue();
+    }
+
+    public byte castToU8() {
+        return clampedInteger(BigInteger.ZERO, BigInteger.valueOf(255)).byteValue();
+    }
+
+    public short castToI16() {
+        return clampedInteger(BigInteger.valueOf(Short.MIN_VALUE), BigInteger.valueOf(Short.MAX_VALUE)).shortValue();
+    }
+
+    public char castToU16() {
+        return (char) clampedInteger(BigInteger.ZERO, BigInteger.valueOf(65535)).intValue();
+    }
+
+    public int castToI32() {
+        return clampedInteger(BigInteger.valueOf(Integer.MIN_VALUE), BigInteger.valueOf(Integer.MAX_VALUE)).intValue();
+    }
+
+    public int castToU32() {
+        return clampedInteger(BigInteger.ZERO, BigInteger.ONE.shiftLeft(32).subtract(BigInteger.ONE)).intValue();
+    }
+
+    public long castToI64() {
+        return clampedInteger(BigInteger.valueOf(Long.MIN_VALUE), BigInteger.valueOf(Long.MAX_VALUE)).longValue();
+    }
+
+    public long castToU64() {
+        return clampedInteger(BigInteger.ZERO, BigInteger.ONE.shiftLeft(64).subtract(BigInteger.ONE)).longValue();
+    }
+
+    public I128 castToI128() {
+        return I128.fromBigInteger(clampedInteger(TWO_127.negate(), TWO_127.subtract(BigInteger.ONE)));
+    }
+
+    public U128 castToU128() {
+        return U128.fromBigInteger(clampedInteger(BigInteger.ZERO, TWO_128.subtract(BigInteger.ONE)));
+    }
+
+    public float castToF32() {
+        if (isNaN()) return Float.NaN;
+        if (isInfinite()) return isNegative() ? Float.NEGATIVE_INFINITY : Float.POSITIVE_INFINITY;
+        if (isZero()) return isNegative() ? -0.0f : 0.0f;
+        Rational rational = finiteRational();
+        BigDecimal decimal = new BigDecimal(rational.numerator).divide(
+                new BigDecimal(rational.denominator),
+                new MathContext(200, RoundingMode.HALF_EVEN));
+        return decimal.floatValue();
+    }
+
+    public double castToF64() {
+        if (isNaN()) return Double.NaN;
+        if (isInfinite()) return isNegative() ? Double.NEGATIVE_INFINITY : Double.POSITIVE_INFINITY;
+        if (isZero()) return isNegative() ? -0.0d : 0.0d;
+        Rational rational = finiteRational();
+        BigDecimal decimal = new BigDecimal(rational.numerator).divide(
+                new BigDecimal(rational.denominator),
+                new MathContext(200, RoundingMode.HALF_EVEN));
+        return decimal.doubleValue();
+    }
+
+    /** Correctly rounded IEEE binary128 to binary16 conversion. */
+    public short castToF16() {
+        int sign = isNegative() ? 0x8000 : 0;
+        if (isNaN()) return (short) (sign | 0x7e00);
+        if (isInfinite()) return (short) (sign | 0x7c00);
+        if (isZero()) return (short) sign;
+
+        Rational rational = finiteRational();
+        BigInteger numerator = rational.numerator.abs();
+        BigInteger denominator = rational.denominator;
+        int exponent = floorLog2(numerator, denominator);
+        if (exponent > 15) return (short) (sign | 0x7c00);
+
+        BigInteger significand;
+        int encodedExponent;
+        if (exponent >= -14) {
+            int scale = 10 - exponent;
+            significand = scale >= 0
+                    ? roundToEven(numerator.shiftLeft(scale), denominator)
+                    : roundToEven(numerator, denominator.shiftLeft(-scale));
+            if (significand.bitLength() > 11) {
+                significand = significand.shiftRight(1);
+                exponent++;
+                if (exponent > 15) return (short) (sign | 0x7c00);
+            }
+            encodedExponent = exponent + 15;
+            significand = significand.subtract(BigInteger.ONE.shiftLeft(10));
+        } else {
+            // A binary16 subnormal stores value * 2^24 as its fraction.
+            significand = roundToEven(numerator.shiftLeft(24), denominator);
+            if (significand.signum() == 0) return (short) sign;
+            if (significand.compareTo(BigInteger.ONE.shiftLeft(10)) >= 0) {
+                encodedExponent = 1;
+                significand = BigInteger.ZERO;
+            } else {
+                encodedExponent = 0;
+            }
+        }
+        return (short) (sign | (encodedExponent << 10) | significand.intValue());
     }
 
     public F128 negate() {

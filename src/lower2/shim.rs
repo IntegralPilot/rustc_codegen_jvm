@@ -47,11 +47,11 @@ const SHIMS: &[ShimInfo] = &[
         "arguments_from_str",
         "(Ljava/lang/String;)Lorg/rustlang/core/fmt/Arguments__;",
     ),
-    direct(CORE_CLASS, "encode_utf8_raw", "(J[[S)[[S"),
+    direct(CORE_CLASS, "encode_utf8_raw", "(J[[B)[[B"),
     direct(
         CORE_CLASS,
         "formatArgs",
-        "([S[Ljava/lang/Object;)Ljava/lang/String;",
+        "([B[Ljava/lang/Object;)Ljava/lang/String;",
     ),
     direct(
         CORE_CLASS,
@@ -72,7 +72,7 @@ const SHIMS: &[ShimInfo] = &[
     direct(
         CORE_CLASS,
         "new_arguments",
-        "([S[Ljava/lang/Object;)Lorg/rustlang/core/fmt/Arguments__;",
+        "([B[Ljava/lang/Object;)Lorg/rustlang/core/fmt/Arguments__;",
     ),
     direct(
         CORE_CLASS,
@@ -81,14 +81,21 @@ const SHIMS: &[ShimInfo] = &[
     ),
     direct(PANICKING_CLASS, "panic", "(Ljava/lang/String;)V"),
     direct(PANICKING_CLASS, "panic_fmt", "(Ljava/lang/Object;)V"),
-    direct(CORE_CLASS, "starts_with", "([S[S)Z"),
+    direct(CORE_CLASS, "starts_with", "([B[B)Z"),
     direct(CORE_CLASS, "toShortArray", "(Ljava/lang/String;)[S"),
     alias(
         "org/rustlang/core/intrinsics",
         "compare_bytes",
         "compare_bytes",
-        "(Lorg/rustlang/runtime/Pointer;Lorg/rustlang/runtime/Pointer;I)I",
+        "(Lorg/rustlang/runtime/Pointer;Lorg/rustlang/runtime/Pointer;J)I",
     ),
+    ShimInfo {
+        rust_class: Some("org/rustlang/core/char/methods"),
+        rust_method: "encode_utf8_raw",
+        java_class: "org/rustlang/runtime/SliceView",
+        java_method: "encodeUtf8",
+        descriptor: "(ILorg/rustlang/runtime/SliceView;)Lorg/rustlang/runtime/Utf8View;",
+    },
     alias(
         "org/rustlang/core/fmt/Arguments__",
         "from_str",
@@ -99,7 +106,7 @@ const SHIMS: &[ShimInfo] = &[
         "org/rustlang/core/fmt/Arguments__",
         "new",
         "new_arguments",
-        "([S[Ljava/lang/Object;)Lorg/rustlang/core/fmt/Arguments__;",
+        "([B[Ljava/lang/Object;)Lorg/rustlang/core/fmt/Arguments__;",
     ),
     alias(
         "org/rustlang/core/fmt/rt/Argument__",

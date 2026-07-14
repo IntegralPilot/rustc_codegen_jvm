@@ -135,6 +135,20 @@ fn emit_array_pointer(
         .get_type()
         .expect("array pointer source must be typed");
     if matches!(source_ty, oomir::Type::Slice(_)) {
+        let index = if index.get_type() == Some(oomir::Type::U64) {
+            index
+        } else {
+            let index_u64 = format!("{dest}_slice_index_u64");
+            instructions.push(oomir::Instruction::Cast {
+                dest: index_u64.clone(),
+                op: index,
+                ty: oomir::Type::U64,
+            });
+            oomir::Operand::Variable {
+                name: index_u64,
+                ty: oomir::Type::U64,
+            }
+        };
         let base_dest = format!("{dest}_slice_base");
         instructions.push(oomir::Instruction::InvokeStatic {
             dest: Some(base_dest.clone()),
@@ -161,7 +175,7 @@ fn emit_array_pointer(
             method_ty: oomir::Signature {
                 params: vec![
                     ("pointer".to_string(), pointer_ty.clone()),
-                    ("count".to_string(), oomir::Type::I32),
+                    ("count".to_string(), oomir::Type::U64),
                 ],
                 ret: Box::new(pointer_ty.clone()),
                 is_static: true,
@@ -1555,7 +1569,7 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                     }
 
                     if matches!(oomir_source_type, oomir::Type::Pointer(_))
-                        && oomir_target_type == oomir::Type::I32
+                        && oomir_target_type == oomir::Type::U64
                         && matches!(
                             cast_kind,
                             CastKind::Transmute | CastKind::PointerExposeProvenance
@@ -1567,7 +1581,7 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                             method_name: "address".to_string(),
                             method_ty: oomir::Signature {
                                 params: vec![("self".to_string(), oomir_source_type)],
-                                ret: Box::new(oomir::Type::I32),
+                                ret: Box::new(oomir::Type::U64),
                                 is_static: false,
                             },
                             args: Vec::new(),
@@ -1577,12 +1591,12 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                             instructions,
                             oomir::Operand::Variable {
                                 name: temp_cast_var,
-                                ty: oomir::Type::I32,
+                                ty: oomir::Type::U64,
                             },
                         );
                     }
 
-                    if oomir_source_type == oomir::Type::I32
+                    if oomir_source_type == oomir::Type::U64
                         && matches!(oomir_target_type, oomir::Type::Pointer(_))
                         && matches!(
                             cast_kind,
@@ -1595,7 +1609,7 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                             method_name: "fromAddress".to_string(),
                             method_ty: oomir::Signature {
                                 params: vec![
-                                    ("address".to_string(), oomir::Type::I32),
+                                    ("address".to_string(), oomir::Type::U64),
                                     ("view_size".to_string(), oomir::Type::I32),
                                     ("view_codec".to_string(), oomir::Type::String),
                                 ],
@@ -1702,12 +1716,12 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                         && oomir_source_type
                             == oomir::Type::Class(crate::lower2::F128_CLASS.to_string())
                         && oomir_target_type
-                            == oomir::Type::Class(crate::lower2::BIG_INTEGER_CLASS.to_string())
+                            == oomir::Type::Class(crate::lower2::U128_CLASS.to_string())
                     {
                         instructions.push(oomir::Instruction::InvokeVirtual {
                             dest: Some(temp_cast_var.clone()),
                             class_name: crate::lower2::F128_CLASS.to_string(),
-                            method_name: "toBits".to_string(),
+                            method_name: "toU128".to_string(),
                             method_ty: oomir::Signature {
                                 params: Vec::new(),
                                 ret: Box::new(oomir_target_type.clone()),
@@ -1718,14 +1732,14 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                         });
                     } else if matches!(cast_kind, CastKind::Transmute)
                         && oomir_source_type
-                            == oomir::Type::Class(crate::lower2::BIG_INTEGER_CLASS.to_string())
+                            == oomir::Type::Class(crate::lower2::U128_CLASS.to_string())
                         && oomir_target_type
                             == oomir::Type::Class(crate::lower2::F128_CLASS.to_string())
                     {
                         instructions.push(oomir::Instruction::InvokeStatic {
                             dest: Some(temp_cast_var.clone()),
                             class_name: crate::lower2::F128_CLASS.to_string(),
-                            method_name: "fromBits".to_string(),
+                            method_name: "fromU128".to_string(),
                             method_ty: oomir::Signature {
                                 params: vec![("bits".to_string(), oomir_source_type.clone())],
                                 ret: Box::new(oomir_target_type.clone()),
@@ -2194,7 +2208,7 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                         method_ty: oomir::Signature {
                             params: vec![
                                 ("self".to_string(), oomir_op1.get_type().unwrap()),
-                                ("elements".to_string(), oomir::Type::I32),
+                                ("elements".to_string(), oomir::Type::I64),
                             ],
                             ret: Box::new(oomir_result_type.clone()),
                             is_static: false,
@@ -2481,9 +2495,18 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                         _ => operand_ty,
                     };
                     if pointee.is_slice() || pointee.is_str() {
+                        let length_i32 = format!("{temp_unop_var}_i32");
                         instructions.push(oomir::Instruction::Length {
-                            dest: temp_unop_var.clone(),
+                            dest: length_i32.clone(),
                             array: oomir_src_operand,
+                        });
+                        instructions.push(oomir::Instruction::Cast {
+                            dest: temp_unop_var.clone(),
+                            op: oomir::Operand::Variable {
+                                name: length_i32,
+                                ty: oomir::Type::I32,
+                            },
+                            ty: oomir::Type::U64,
                         });
                         produced_value = true;
                     } else if matches!(pointee.kind(), TyKind::Dynamic(..))
@@ -2515,7 +2538,7 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                                             .get_type()
                                             .expect("DST metadata pointer must be typed"),
                                     )],
-                                    ret: Box::new(oomir::Type::I32),
+                                    ret: Box::new(oomir::Type::U64),
                                     is_static: false,
                                 },
                                 args: Vec::new(),

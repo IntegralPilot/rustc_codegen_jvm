@@ -499,9 +499,15 @@ pub enum Constant {
     /// argument list, because constructor descriptors are exact.
     Null(Type),
     I8(i8),
+    U8(u8),
     I16(i16),
+    U16(u16),
     I32(i32),
+    U32(u32),
     I64(i64),
+    U64(u64),
+    /// Raw IEEE 754 binary16 bits.
+    F16(u16),
     F32(f32),
     F64(f64),
     Boolean(bool),
@@ -587,9 +593,14 @@ impl std::hash::Hash for Constant {
                 ty.hash(state);
             }
             Constant::I8(i) => i.hash(state),
+            Constant::U8(i) => i.hash(state),
             Constant::I16(i) => i.hash(state),
+            Constant::U16(i) => i.hash(state),
             Constant::I32(i) => i.hash(state),
+            Constant::U32(i) => i.hash(state),
             Constant::I64(i) => i.hash(state),
+            Constant::U64(i) => i.hash(state),
+            Constant::F16(bits) => bits.hash(state),
             Constant::F32(f) => f.to_bits().hash(state),
             Constant::F64(f) => f.to_bits().hash(state),
             Constant::Boolean(b) => b.hash(state),
@@ -636,12 +647,20 @@ impl Constant {
     pub fn is_integer_like(&self) -> bool {
         match self {
             Constant::I8(_)
+            | Constant::U8(_)
             | Constant::I16(_)
+            | Constant::U16(_)
             | Constant::I32(_)
+            | Constant::U32(_)
             | Constant::I64(_)
+            | Constant::U64(_)
             | Constant::Char(_) // Chars can be switched on in JVM
             | Constant::Boolean(_) => true,
-            Constant::Instance { class_name, .. } => class_name == BIG_INTEGER_CLASS,
+            Constant::Instance { class_name, .. } => {
+                class_name == BIG_INTEGER_CLASS
+                    || class_name == "org/rustlang/runtime/I128"
+                    || class_name == "org/rustlang/runtime/U128"
+            }
             _ => false,
         }
     }
@@ -816,12 +835,17 @@ pub enum Type {
     Boolean,
     Char,
     I8,
+    U8,
     I16,
+    U16,
     I32,
+    U32,
     I64,
+    U64,
+    F16,
     F32,
     F64,
-    Pointer(Box<Type>),  // A sized Rust reference or raw pointer.
+    Pointer(Box<Type>), // A sized Rust reference or raw pointer.
     MutableReference(Box<Type>),
     Reference(Box<Type>), // Representing references, not currently constructed but might be useful in future for more complex things.
     Array(Box<Type>),     // Representing arrays
@@ -849,14 +873,13 @@ impl Type {
             Type::Unit => "V".to_string(),
             Type::Boolean => "Z".to_string(),
             Type::Char => "C".to_string(),
-            Type::I8 => "B".to_string(),
-            // I16 holds both native I16 and promoted U8:
+            Type::I8 | Type::U8 => "B".to_string(),
             Type::I16 => "S".to_string(),
-            // I32 holds both native I32 and promoted U16:
-            Type::I32 => "I".to_string(),
-            // I64 holds both native I64 and promoted U32:
-            Type::I64 => "J".to_string(),
-            // U64 is too large for a primitive; it's mapped to a BigInteger:
+            Type::U16 => "C".to_string(),
+            Type::I32 | Type::U32 => "I".to_string(),
+            Type::I64 | Type::U64 => "J".to_string(),
+            // Binary16 is stored as its raw 16-bit IEEE representation.
+            Type::F16 => "S".to_string(),
             Type::F32 => "F".to_string(),
             Type::F64 => "D".to_string(),
             Type::Pointer(_) => format!("L{};", POINTER_CLASS),
@@ -940,30 +963,29 @@ impl Type {
     /// See https://docs.oracle.com/javase/specs/jvms/se8/html/jvms-6.html#jvms-6.5.newarray
     pub fn to_jvm_primitive_array_type_code(&self) -> Option<u8> {
         match self {
-            Type::Boolean => Some(4), // T_BOOLEAN
-            Type::Char => Some(5),    // T_CHAR
-            Type::F32 => Some(6),     // T_FLOAT
-            Type::F64 => Some(7),     // T_DOUBLE
-            Type::I8 => Some(8),      // T_BYTE
-            Type::I16 => Some(9),     // T_SHORT
-            Type::I32 => Some(10),    // T_INT
-            Type::I64 => Some(11),    // T_LONG
-            _ => None,                // Not a primitive type suitable for newarray
+            Type::Boolean => Some(4),          // T_BOOLEAN
+            Type::Char => Some(5),             // T_CHAR
+            Type::F32 => Some(6),              // T_FLOAT
+            Type::F64 => Some(7),              // T_DOUBLE
+            Type::I8 | Type::U8 => Some(8),    // T_BYTE
+            Type::I16 | Type::F16 => Some(9),  // T_SHORT
+            Type::U16 => Some(5),              // T_CHAR
+            Type::I32 | Type::U32 => Some(10), // T_INT
+            Type::I64 | Type::U64 => Some(11), // T_LONG
+            _ => None,                         // Not a primitive type suitable for newarray
         }
     }
 
     /// Returns the appropriate JVM array element store instruction.
     pub fn get_jvm_array_store_instruction(&self) -> Option<JVMInstruction> {
         match self {
-            Type::I8 => Some(JVMInstruction::Bastore),
-            // I16 (including promoted U8) is stored with Sastore:
-            Type::I16 => Some(JVMInstruction::Sastore),
+            Type::I8 | Type::U8 => Some(JVMInstruction::Bastore),
+            Type::I16 | Type::F16 => Some(JVMInstruction::Sastore),
+            Type::U16 => Some(JVMInstruction::Castore),
             Type::Boolean => Some(JVMInstruction::Bastore),
             Type::Char => Some(JVMInstruction::Castore),
-            // I32 (including promoted U16) is stored with Iastore:
-            Type::I32 => Some(JVMInstruction::Iastore),
-            // I64 (including promoted U32) is stored with Lastore:
-            Type::I64 => Some(JVMInstruction::Lastore),
+            Type::I32 | Type::U32 => Some(JVMInstruction::Iastore),
+            Type::I64 | Type::U64 => Some(JVMInstruction::Lastore),
             Type::F32 => Some(JVMInstruction::Fastore),
             Type::F64 => Some(JVMInstruction::Dastore),
             // Reference types:
@@ -984,15 +1006,13 @@ impl Type {
     /// Returns the appropriate JVM array element load instruction.
     pub fn get_jvm_array_load_instruction(&self) -> Option<JVMInstruction> {
         match self {
-            Type::I8 => Some(JVMInstruction::Baload),
-            // I16 (including promoted U8) is loaded with Saload:
-            Type::I16 => Some(JVMInstruction::Saload),
+            Type::I8 | Type::U8 => Some(JVMInstruction::Baload),
+            Type::I16 | Type::F16 => Some(JVMInstruction::Saload),
+            Type::U16 => Some(JVMInstruction::Caload),
             Type::Boolean => Some(JVMInstruction::Baload),
             Type::Char => Some(JVMInstruction::Caload),
-            // I32 (including promoted U16) is loaded with Iaload:
-            Type::I32 => Some(JVMInstruction::Iaload),
-            // I64 (including promoted U32) is loaded with Laload:
-            Type::I64 => Some(JVMInstruction::Laload),
+            Type::I32 | Type::U32 => Some(JVMInstruction::Iaload),
+            Type::I64 | Type::U64 => Some(JVMInstruction::Laload),
             Type::F32 => Some(JVMInstruction::Faload),
             Type::F64 => Some(JVMInstruction::Daload),
             // Reference types:
@@ -1021,9 +1041,14 @@ impl Type {
             Constant::FactoryCall { ty, .. } => ty.clone(),
             Constant::Null(ty) => ty.clone(),
             Constant::I8(_) => Type::I8,
+            Constant::U8(_) => Type::U8,
             Constant::I16(_) => Type::I16,
+            Constant::U16(_) => Type::U16,
             Constant::I32(_) => Type::I32,
+            Constant::U32(_) => Type::U32,
             Constant::I64(_) => Type::I64,
+            Constant::U64(_) => Type::U64,
+            Constant::F16(_) => Type::F16,
             Constant::F32(_) => Type::F32,
             Constant::F64(_) => Type::F64,
             Constant::Array(inner_ty, _) => Type::Array(inner_ty.clone()),
@@ -1052,9 +1077,14 @@ impl Type {
             Type::Boolean
                 | Type::Char
                 | Type::I8
+                | Type::U8
                 | Type::I16
+                | Type::U16
                 | Type::I32
+                | Type::U32
                 | Type::I64
+                | Type::U64
+                | Type::F16
                 | Type::F32
                 | Type::F64
         )
@@ -1082,11 +1112,14 @@ impl Type {
     /// Otherwise returns None.
     pub fn get_boxing_info(&self) -> Option<(&'static str, &'static str, &'static str)> {
         match self {
-            Type::I32 => Some(("java/lang/Integer", "valueOf", "(I)Ljava/lang/Integer;")),
-            Type::I16 => Some(("java/lang/Short", "valueOf", "(S)Ljava/lang/Short;")),
-            Type::I8 => Some(("java/lang/Byte", "valueOf", "(B)Ljava/lang/Byte;")),
+            Type::I32 | Type::U32 => {
+                Some(("java/lang/Integer", "valueOf", "(I)Ljava/lang/Integer;"))
+            }
+            Type::I16 | Type::F16 => Some(("java/lang/Short", "valueOf", "(S)Ljava/lang/Short;")),
+            Type::I8 | Type::U8 => Some(("java/lang/Byte", "valueOf", "(B)Ljava/lang/Byte;")),
+            Type::U16 => Some(("java/lang/Character", "valueOf", "(C)Ljava/lang/Character;")),
             Type::Boolean => Some(("java/lang/Boolean", "valueOf", "(Z)Ljava/lang/Boolean;")),
-            Type::I64 => Some(("java/lang/Long", "valueOf", "(J)Ljava/lang/Long;")),
+            Type::I64 | Type::U64 => Some(("java/lang/Long", "valueOf", "(J)Ljava/lang/Long;")),
             Type::F32 => Some(("java/lang/Float", "valueOf", "(F)Ljava/lang/Float;")),
             Type::F64 => Some(("java/lang/Double", "valueOf", "(D)Ljava/lang/Double;")),
             Type::Char => Some(("java/lang/Character", "valueOf", "(C)Ljava/lang/Character;")),
@@ -1099,9 +1132,14 @@ impl Type {
         matches!(
             self,
             Type::I8
+                | Type::U8
                 | Type::I16
+                | Type::U16
                 | Type::I32
+                | Type::U32
                 | Type::I64
+                | Type::U64
+                | Type::F16
                 | Type::F32
                 | Type::F64
                 | Type::Char
@@ -1148,9 +1186,14 @@ impl Type {
             | Type::Boolean
             | Type::Char
             | Type::I8
+            | Type::U8
             | Type::I16
+            | Type::U16
             | Type::I32
+            | Type::U32
             | Type::I64
+            | Type::U64
+            | Type::F16
             | Type::F32
             | Type::F64
             | Type::Str

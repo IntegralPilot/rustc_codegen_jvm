@@ -586,6 +586,8 @@ fn requires_compiled_static_dispatch(ty: &oomir::Type) -> bool {
             ty,
             oomir::Type::Class(class_name)
                 if class_name == crate::lower2::BIG_INTEGER_CLASS
+                    || class_name == crate::lower2::I128_CLASS
+                    || class_name == crate::lower2::U128_CLASS
                     || class_name == crate::lower2::F128_CLASS
         )
         || matches!(
@@ -606,6 +608,8 @@ fn supports_direct_equality(ty: &oomir::Type) -> bool {
             ty,
             oomir::Type::Class(class_name)
                 if class_name == crate::lower2::BIG_INTEGER_CLASS
+                    || class_name == crate::lower2::I128_CLASS
+                    || class_name == crate::lower2::U128_CLASS
                     || class_name == crate::lower2::F128_CLASS
         )
         || matches!(ty, oomir::Type::Str | oomir::Type::String)
@@ -856,10 +860,7 @@ pub(super) fn convert_basic_block<'tcx>(
                 instructions.push(oomir::Instruction::Mul {
                     dest: byte_count_name.clone(),
                     op1: count,
-                    op2: oomir::Operand::Constant(oomir::Constant::I32(
-                        i32::try_from(element_size)
-                            .expect("copy_nonoverlapping element exceeds JVM limits"),
-                    )),
+                    op2: oomir::Operand::Constant(oomir::Constant::U64(element_size as u64)),
                 });
                 let source_ty = source
                     .get_type()
@@ -874,7 +875,7 @@ pub(super) fn convert_basic_block<'tcx>(
                         params: vec![
                             ("source".to_string(), source_ty),
                             ("destination".to_string(), destination_ty),
-                            ("byte_count".to_string(), oomir::Type::I32),
+                            ("byte_count".to_string(), oomir::Type::U64),
                         ],
                         ret: Box::new(oomir::Type::Void),
                         is_static: true,
@@ -884,7 +885,7 @@ pub(super) fn convert_basic_block<'tcx>(
                         destination,
                         oomir::Operand::Variable {
                             name: byte_count_name,
-                            ty: oomir::Type::I32,
+                            ty: oomir::Type::U64,
                         },
                     ],
                     dest: None,
@@ -1210,7 +1211,116 @@ pub(super) fn convert_basic_block<'tcx>(
                                         && supports_direct_equality(&dispatch_receiver_ty)
                                         && oomir_operands.len() == 2;
 
-                                if direct_equality {
+                                let direct_wrapping_integer_op = matches!(
+                                    declared_method_name.as_str(),
+                                    "wrapping_add" | "wrapping_sub" | "wrapping_mul"
+                                ) && (matches!(
+                                    &dispatch_receiver_ty,
+                                    oomir::Type::I8
+                                        | oomir::Type::U8
+                                        | oomir::Type::I16
+                                        | oomir::Type::U16
+                                        | oomir::Type::I32
+                                        | oomir::Type::U32
+                                        | oomir::Type::I64
+                                        | oomir::Type::U64
+                                ) || matches!(
+                                    &dispatch_receiver_ty,
+                                    oomir::Type::Class(class_name)
+                                        if class_name == crate::lower2::I128_CLASS
+                                            || class_name == crate::lower2::U128_CLASS
+                                )) && oomir_operands.len() == 2;
+
+                                let direct_overflowing_integer_op = matches!(
+                                    declared_method_name.as_str(),
+                                    "overflowing_add" | "overflowing_sub" | "overflowing_mul"
+                                ) && (matches!(
+                                    &dispatch_receiver_ty,
+                                    oomir::Type::I8
+                                        | oomir::Type::U8
+                                        | oomir::Type::I16
+                                        | oomir::Type::U16
+                                        | oomir::Type::I32
+                                        | oomir::Type::U32
+                                        | oomir::Type::I64
+                                        | oomir::Type::U64
+                                ) || matches!(
+                                    &dispatch_receiver_ty,
+                                    oomir::Type::Class(class_name)
+                                        if class_name == crate::lower2::I128_CLASS
+                                            || class_name == crate::lower2::U128_CLASS
+                                )) && oomir_operands.len() == 2;
+
+                                let direct_f16_to_bits = dispatch_receiver_ty == oomir::Type::F16
+                                    && declared_method_name == "to_bits"
+                                    && oomir_operands.len() == 1;
+
+                                if direct_f16_to_bits {
+                                    if let Some(dest) = effective_dest {
+                                        instructions.push(oomir::Instruction::InvokeStatic {
+                                            dest: Some(dest),
+                                            class_name: "org/rustlang/runtime/Numbers".to_string(),
+                                            method_name: "f16ToBits".to_string(),
+                                            method_ty: oomir::Signature {
+                                                params: vec![(
+                                                    "value".to_string(),
+                                                    oomir::Type::F16,
+                                                )],
+                                                ret: Box::new(oomir::Type::U16),
+                                                is_static: true,
+                                            },
+                                            args: vec![oomir_operands[0].clone()],
+                                        });
+                                    }
+                                } else if direct_overflowing_integer_op {
+                                    if let Some(dest) = effective_dest {
+                                        let tuple_class = oomir_output_type
+                                            .get_class_name()
+                                            .expect(
+                                                "overflowing integer result must be a tuple class",
+                                            )
+                                            .to_string();
+                                        let operation = declared_method_name
+                                            .strip_prefix("overflowing_")
+                                            .expect("overflowing operation prefix");
+                                        let (generated, pair, _, _) =
+                                            checked_ops::emit_checked_arithmetic_oomir_instructions(
+                                                &dest,
+                                                &oomir_operands[0],
+                                                &oomir_operands[1],
+                                                &dispatch_receiver_ty,
+                                                operation,
+                                                instructions.len(),
+                                                &tuple_class,
+                                            );
+                                        instructions.extend(generated);
+                                        instructions.push(oomir::Instruction::Move {
+                                            dest,
+                                            src: oomir::Operand::Variable {
+                                                name: pair,
+                                                ty: oomir::Type::Class(tuple_class),
+                                            },
+                                        });
+                                    }
+                                } else if direct_wrapping_integer_op {
+                                    if let Some(dest) = effective_dest {
+                                        let op1 = oomir_operands[0].clone();
+                                        let op2 = oomir_operands[1].clone();
+                                        let instruction = match declared_method_name.as_str() {
+                                            "wrapping_add" => {
+                                                oomir::Instruction::Add { dest, op1, op2 }
+                                            }
+                                            "wrapping_sub" => {
+                                                oomir::Instruction::Sub { dest, op1, op2 }
+                                            }
+                                            "wrapping_mul" => {
+                                                oomir::Instruction::Mul { dest, op1, op2 }
+                                            }
+                                            _ => unreachable!(),
+                                        };
+                                        instructions.push(instruction);
+                                    }
+                                } else if direct_equality {
                                     if let Some(dest) = effective_dest {
                                         let mut left = oomir_operands[0].clone();
                                         let mut right = oomir_operands[1].clone();
@@ -1657,15 +1767,13 @@ pub(super) fn convert_basic_block<'tcx>(
                                     instructions.push(oomir::Instruction::Mul {
                                         dest: byte_count_name.clone(),
                                         op1: method_args[1].clone(),
-                                        op2: oomir::Operand::Constant(oomir::Constant::I32(
-                                            i32::try_from(element_size).expect(
-                                                "pointer memory element exceeds JVM address space",
-                                            ),
+                                        op2: oomir::Operand::Constant(oomir::Constant::U64(
+                                            element_size as u64,
                                         )),
                                     });
                                     let byte_count = oomir::Operand::Variable {
                                         name: byte_count_name,
-                                        ty: oomir::Type::I32,
+                                        ty: oomir::Type::U64,
                                     };
                                     if declared_method_name == "write_bytes" {
                                         instructions.push(oomir::Instruction::InvokeStatic {
@@ -1678,7 +1786,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                                         dispatch_receiver_ty.clone(),
                                                     ),
                                                     ("value".to_string(), oomir::Type::I32),
-                                                    ("byte_count".to_string(), oomir::Type::I32),
+                                                    ("byte_count".to_string(), oomir::Type::U64),
                                                 ],
                                                 ret: Box::new(oomir::Type::Void),
                                                 is_static: true,
@@ -1722,7 +1830,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                                 params: vec![
                                                     ("source".to_string(), source_ty),
                                                     ("destination".to_string(), destination_ty),
-                                                    ("byte_count".to_string(), oomir::Type::I32),
+                                                    ("byte_count".to_string(), oomir::Type::U64),
                                                 ],
                                                 ret: Box::new(oomir::Type::Void),
                                                 is_static: true,
@@ -1752,7 +1860,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                                 "pointer".to_string(),
                                                 dispatch_receiver_ty.clone(),
                                             )],
-                                            ret: Box::new(oomir::Type::I32),
+                                            ret: Box::new(oomir::Type::U64),
                                             is_static: true,
                                         },
                                         args: vec![receiver_operand.clone()],
@@ -1761,7 +1869,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                     let mapped_address_dest = format!("{label}_map_addr_output");
                                     let address_operand = oomir::Operand::Variable {
                                         name: address_dest,
-                                        ty: oomir::Type::I32,
+                                        ty: oomir::Type::U64,
                                     };
                                     match mapper_ty.kind() {
                                         TyKind::Closure(closure_def_id, closure_args) => {
@@ -1794,7 +1902,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                                     class_name: closure_tuple_class,
                                                     args: vec![(
                                                         address_operand.clone(),
-                                                        oomir::Type::I32,
+                                                        oomir::Type::U64,
                                                     )],
                                                 },
                                             );
@@ -1845,7 +1953,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                                 ),
                                                 method_ty: oomir::Signature {
                                                     params: closure_params,
-                                                    ret: Box::new(oomir::Type::I32),
+                                                    ret: Box::new(oomir::Type::U64),
                                                     is_static: true,
                                                 },
                                                 args: closure_call_args,
@@ -1872,9 +1980,9 @@ pub(super) fn convert_basic_block<'tcx>(
                                                 method_ty: oomir::Signature {
                                                     params: vec![(
                                                         "address".to_string(),
-                                                        oomir::Type::I32,
+                                                        oomir::Type::U64,
                                                     )],
-                                                    ret: Box::new(oomir::Type::I32),
+                                                    ret: Box::new(oomir::Type::U64),
                                                     is_static: true,
                                                 },
                                                 args: vec![address_operand],
@@ -1908,7 +2016,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                                     "pointer".to_string(),
                                                     dispatch_receiver_ty.clone(),
                                                 ),
-                                                ("address".to_string(), oomir::Type::I32),
+                                                ("address".to_string(), oomir::Type::U64),
                                             ],
                                             ret: Box::new(dispatch_receiver_ty.clone()),
                                             is_static: true,
@@ -1917,7 +2025,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                             receiver_operand,
                                             oomir::Operand::Variable {
                                                 name: mapped_address_dest,
-                                                ty: oomir::Type::I32,
+                                                ty: oomir::Type::U64,
                                             },
                                         ],
                                         dest: effective_dest,
@@ -1999,6 +2107,12 @@ pub(super) fn convert_basic_block<'tcx>(
                                             "org/rustlang/primitives/RustString".to_string(),
                                             method_name.clone(),
                                         )),
+                                        oomir::Type::Slice(_) if method_name == "starts_with" => {
+                                            Some((
+                                                oomir::SLICE_VIEW_CLASS.to_string(),
+                                                "startsWith".to_string(),
+                                            ))
+                                        }
                                         oomir::Type::Slice(_)
                                             if matches!(
                                                 method_name.as_str(),
@@ -2272,7 +2386,31 @@ pub(super) fn convert_basic_block<'tcx>(
                                     func_instance,
                                 );
 
-                                if let Some(class_name) = class_type.get_class_name() {
+                                if class_type == oomir::Type::F16
+                                    && method_name == "from_bits"
+                                    && oomir_operands.len() == 1
+                                {
+                                    if let Some(dest) = effective_dest.clone() {
+                                        instructions.push(oomir::Instruction::InvokeStatic {
+                                            dest: Some(dest),
+                                            class_name: "org/rustlang/runtime/Numbers".to_string(),
+                                            method_name: "f16FromBits".to_string(),
+                                            method_ty: oomir::Signature {
+                                                params: vec![(
+                                                    "bits".to_string(),
+                                                    oomir::Type::U16,
+                                                )],
+                                                ret: Box::new(oomir::Type::F16),
+                                                is_static: true,
+                                            },
+                                            args: vec![oomir_operands[0].clone()],
+                                        });
+                                    }
+                                    generated = true;
+                                }
+
+                                if !generated && let Some(class_name) = class_type.get_class_name()
+                                {
                                     instructions.push(oomir::Instruction::InvokeStatic {
                                         class_name: class_name.to_string(),
                                         method_name: method_name.clone(),
@@ -2506,17 +2644,15 @@ pub(super) fn convert_basic_block<'tcx>(
                                 method_name: "withoutProvenance".to_string(),
                                 method_ty: oomir::Signature {
                                     params: vec![
-                                        ("address".to_string(), oomir::Type::I32),
+                                        ("address".to_string(), oomir::Type::U64),
                                         ("view_size".to_string(), oomir::Type::I32),
                                     ],
                                     ret: method_signature.ret.clone(),
                                     is_static: true,
                                 },
                                 args: vec![
-                                    oomir::Operand::Constant(oomir::Constant::I32(
-                                        i32::try_from(pointee_alignment).expect(
-                                            "dangling pointer alignment exceeds JVM integer",
-                                        ),
+                                    oomir::Operand::Constant(oomir::Constant::U64(
+                                        pointee_alignment as u64,
                                     )),
                                     oomir::Operand::Constant(oomir::Constant::I32(
                                         i32::try_from(pointee_size)
@@ -2621,13 +2757,28 @@ pub(super) fn convert_basic_block<'tcx>(
                             }))
                         {
                             if let Some(dest) = effective_dest.clone() {
+                                let length_dest = if oomir_output_type == oomir::Type::I32 {
+                                    dest.clone()
+                                } else {
+                                    format!("{dest}_slice_metadata_i32")
+                                };
                                 instructions.push(oomir::Instruction::GetField {
-                                    dest,
+                                    dest: length_dest.clone(),
                                     object: oomir_operands[0].clone(),
                                     field_name: "length".to_string(),
                                     field_ty: oomir::Type::I32,
                                     owner_class: oomir::SLICE_VIEW_CLASS.to_string(),
                                 });
+                                if oomir_output_type != oomir::Type::I32 {
+                                    instructions.push(oomir::Instruction::Cast {
+                                        op: oomir::Operand::Variable {
+                                            name: length_dest,
+                                            ty: oomir::Type::I32,
+                                        },
+                                        ty: oomir_output_type.clone(),
+                                        dest,
+                                    });
+                                }
                             }
                         } else if matches!(intrinsic_name.as_str(), "metadata" | "ptr_metadata")
                             && is_core_ptr
@@ -2799,7 +2950,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                 },
                                 method_ty: oomir::Signature {
                                     params: vec![
-                                        ("address".to_string(), oomir::Type::I32),
+                                        ("address".to_string(), oomir::Type::U64),
                                         ("view_size".to_string(), oomir::Type::I32),
                                         ("view_codec".to_string(), oomir::Type::String),
                                     ],
@@ -2997,10 +3148,8 @@ pub(super) fn convert_basic_block<'tcx>(
                             instructions.push(oomir::Instruction::Mul {
                                 dest: byte_count_name.clone(),
                                 op1: oomir_operands[2].clone(),
-                                op2: oomir::Operand::Constant(oomir::Constant::I32(
-                                    i32::try_from(element_size).expect(
-                                        "swap_nonoverlapping element exceeds JVM address space",
-                                    ),
+                                op2: oomir::Operand::Constant(oomir::Constant::U64(
+                                    element_size as u64,
                                 )),
                             });
                             let left_ty = oomir_operands[0]
@@ -3016,7 +3165,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                     params: vec![
                                         ("left".to_string(), left_ty),
                                         ("right".to_string(), right_ty),
-                                        ("byte_count".to_string(), oomir::Type::I32),
+                                        ("byte_count".to_string(), oomir::Type::U64),
                                     ],
                                     ret: Box::new(oomir::Type::Void),
                                     is_static: true,
@@ -3026,7 +3175,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                     oomir_operands[1].clone(),
                                     oomir::Operand::Variable {
                                         name: byte_count_name,
-                                        ty: oomir::Type::I32,
+                                        ty: oomir::Type::U64,
                                     },
                                 ],
                                 dest: None,
@@ -3066,14 +3215,13 @@ pub(super) fn convert_basic_block<'tcx>(
                             instructions.push(oomir::Instruction::Mul {
                                 dest: byte_count_name.clone(),
                                 op1: count,
-                                op2: oomir::Operand::Constant(oomir::Constant::I32(
-                                    i32::try_from(element_size)
-                                        .expect("pointer memory element exceeds JVM address space"),
+                                op2: oomir::Operand::Constant(oomir::Constant::U64(
+                                    element_size as u64,
                                 )),
                             });
                             let byte_count = oomir::Operand::Variable {
                                 name: byte_count_name,
-                                ty: oomir::Type::I32,
+                                ty: oomir::Type::U64,
                             };
                             let first_pointer_ty = oomir_operands
                                 .first()
@@ -3089,7 +3237,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                         params: vec![
                                             ("destination".to_string(), first_pointer_ty),
                                             ("value".to_string(), oomir::Type::I32),
-                                            ("byte_count".to_string(), oomir::Type::I32),
+                                            ("byte_count".to_string(), oomir::Type::U64),
                                         ],
                                         ret: Box::new(oomir::Type::Void),
                                         is_static: true,
@@ -3116,7 +3264,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                         params: vec![
                                             ("source".to_string(), first_pointer_ty),
                                             ("destination".to_string(), second_pointer_ty),
-                                            ("byte_count".to_string(), oomir::Type::I32),
+                                            ("byte_count".to_string(), oomir::Type::U64),
                                         ],
                                         ret: Box::new(oomir::Type::Void),
                                         is_static: true,

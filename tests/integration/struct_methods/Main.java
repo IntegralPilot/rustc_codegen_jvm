@@ -27,11 +27,11 @@ public class Main {
         Constructor<struct_methods.NamedCounter> constructor =
                 struct_methods.NamedCounter.class.getConstructor(
                         org.rustlang.runtime.Utf8View.class,
-                        long.class,
-                        long.class,
+                        int.class,
+                        int.class,
                         boolean.class);
         struct_methods.NamedCounter counter = constructor.newInstance(
-                org.rustlang.runtime.Utf8View.fromJavaString("Michael"), 2L, 99L, true);
+                org.rustlang.runtime.Utf8View.fromJavaString("Michael"), 2, 99, true);
 
         if (!org.rustlang.runtime.Utf8View.toJavaString(counter.name).equals("Michael")) {
             throw new AssertionError("field constructor should initialize name");
@@ -43,20 +43,20 @@ public class Main {
 
     private static void assertStaticAssociatedFunctions() throws Exception {
         Method newMethod = struct_methods.NamedCounter.class.getMethod(
-                "new", org.rustlang.runtime.Utf8View.class, long.class);
+                "new", org.rustlang.runtime.Utf8View.class, int.class);
         if (!Modifier.isStatic(newMethod.getModifiers())) {
             throw new AssertionError("NamedCounter.new must be static");
         }
 
         struct_methods.NamedCounter counter = (struct_methods.NamedCounter) newMethod.invoke(
-                null, org.rustlang.runtime.Utf8View.fromJavaString("Michael"), 99L);
+                null, org.rustlang.runtime.Utf8View.fromJavaString("Michael"), 99);
         if (!org.rustlang.runtime.Utf8View.toJavaString(counter.name).equals("Michael")
                 || counter.count != 0L || counter.limit != 99L || !counter.enabled) {
             throw new AssertionError("static NamedCounter.new should initialize the counter");
         }
 
         struct_methods.NamedCounter disabled = struct_methods.NamedCounter.new_disabled(
-                org.rustlang.runtime.Utf8View.fromJavaString("Offline"), 7L);
+                org.rustlang.runtime.Utf8View.fromJavaString("Offline"), 7);
         if (!org.rustlang.runtime.Utf8View.toJavaString(disabled.name).equals("Offline")
                 || disabled.count != 0L || disabled.limit != 7L || disabled.enabled) {
             throw new AssertionError("other no-self associated functions should also be static");
@@ -65,9 +65,9 @@ public class Main {
 
     private static void assertInstanceAndStaticSelfMethods() throws Exception {
         Method newMethod = struct_methods.NamedCounter.class.getMethod(
-                "new", org.rustlang.runtime.Utf8View.class, long.class);
+                "new", org.rustlang.runtime.Utf8View.class, int.class);
         struct_methods.NamedCounter counter = (struct_methods.NamedCounter) newMethod.invoke(
-                null, org.rustlang.runtime.Utf8View.fromJavaString("Michael"), 99L);
+                null, org.rustlang.runtime.Utf8View.fromJavaString("Michael"), 99);
 
         if (counter.get_limit() != 99L) {
             throw new AssertionError("self methods should be callable as instance methods");

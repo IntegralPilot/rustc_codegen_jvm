@@ -1526,8 +1526,16 @@ fn load_hint_for_instruction(instruction: &Instruction) -> FrameValue {
 fn frame_value_from_oomir_type(ty: &Type) -> FrameValue {
     match ty {
         Type::Unit | Type::Void => FrameValue::Top,
-        Type::Boolean | Type::Char | Type::I8 | Type::I16 | Type::I32 => FrameValue::Integer,
-        Type::I64 => FrameValue::Long,
+        Type::Boolean
+        | Type::Char
+        | Type::I8
+        | Type::U8
+        | Type::I16
+        | Type::U16
+        | Type::F16
+        | Type::I32
+        | Type::U32 => FrameValue::Integer,
+        Type::I64 | Type::U64 => FrameValue::Long,
         Type::F32 => FrameValue::Float,
         Type::F64 => FrameValue::Double,
         Type::Str => FrameValue::Object(oomir::UTF8_VIEW_CLASS.to_string()),

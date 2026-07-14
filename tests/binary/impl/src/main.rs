@@ -81,7 +81,11 @@ impl NamedCounter {
         }
 
         let current_count = self.count;
-        let potential_count = current_count + amount;
+        let potential_count = if amount > u32::MAX - current_count {
+            u32::MAX
+        } else {
+            current_count + amount
+        };
 
         if potential_count >= self.limit {
              // Clamp to limit

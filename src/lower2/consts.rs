@@ -2,7 +2,9 @@ use super::jvm::{
     self,
     attributes::{ArrayType, Instruction},
 };
-use super::{constant_pool::InternedConstantPool, helpers::are_types_jvm_compatible};
+use super::{
+    I128_CLASS, U128_CLASS, constant_pool::InternedConstantPool, helpers::are_types_jvm_compatible,
+};
 use crate::oomir::{self, Type};
 
 // Helper to get the appropriate integer constant loading instruction
@@ -129,9 +131,14 @@ pub fn load_constant(
             instructions_to_add.push(JI::Invokestatic(method));
         }
         OC::I8(v) => instructions_to_add.push(get_int_const_instr(cp, *v as i32)),
+        OC::U8(v) => instructions_to_add.push(get_int_const_instr(cp, i32::from(*v as i8))),
         OC::I16(v) => instructions_to_add.push(get_int_const_instr(cp, *v as i32)),
+        OC::U16(v) => instructions_to_add.push(get_int_const_instr(cp, i32::from(*v))),
         OC::I32(v) => instructions_to_add.push(get_int_const_instr(cp, *v)),
+        OC::U32(v) => instructions_to_add.push(get_int_const_instr(cp, *v as i32)),
         OC::I64(v) => instructions_to_add.push(get_long_const_instr(cp, *v)),
+        OC::U64(v) => instructions_to_add.push(get_long_const_instr(cp, *v as i64)),
+        OC::F16(bits) => instructions_to_add.push(get_int_const_instr(cp, i32::from(*bits as i16))),
         OC::F32(v) => instructions_to_add.push(get_float_const_instr(cp, *v)),
         OC::F64(v) => instructions_to_add.push(get_double_const_instr(cp, *v)),
         OC::Boolean(v) => instructions_to_add.push(if *v { JI::Iconst_1 } else { JI::Iconst_0 }),
@@ -285,6 +292,42 @@ pub fn load_constant(
         } => {
             // 1. Add Class reference to constant pool
             let class_index = cp.add_class(class_name)?;
+
+            // i128/u128 constants are represented in OOMIR as decimal strings so
+            // that the interpreter can manipulate them without losing width. At
+            // bytecode generation time, materialise their two primitive limbs
+            // directly. This avoids String and BigInteger work every time a wide
+            // constant is loaded at runtime.
+            if (class_name == I128_CLASS || class_name == U128_CLASS)
+                && let [OC::String(value)] = params.as_slice()
+            {
+                let (high, low) =
+                    if class_name == I128_CLASS {
+                        let value = value.parse::<i128>().map_err(|error| {
+                            jvm::Error::VerificationError {
+                                context: format!("Attempting to load constant {constant:?}"),
+                                message: format!("Invalid i128 constant '{value}': {error}"),
+                            }
+                        })?;
+                        ((value >> 64) as i64, value as i64)
+                    } else {
+                        let value = value.parse::<u128>().map_err(|error| {
+                            jvm::Error::VerificationError {
+                                context: format!("Attempting to load constant {constant:?}"),
+                                message: format!("Invalid u128 constant '{value}': {error}"),
+                            }
+                        })?;
+                        ((value >> 64) as i64, value as i64)
+                    };
+                let constructor = cp.add_method_ref(class_index, "<init>", "(JJ)V")?;
+                instructions_to_add.push(JI::New(class_index));
+                instructions_to_add.push(JI::Dup);
+                instructions_to_add.push(get_long_const_instr(cp, high));
+                instructions_to_add.push(get_long_const_instr(cp, low));
+                instructions_to_add.push(JI::Invokespecial(constructor));
+                instructions.extend(instructions_to_add);
+                return Ok(());
+            }
 
             if params.is_empty() && !fields.is_empty() {
                 return Err(jvm::Error::VerificationError {

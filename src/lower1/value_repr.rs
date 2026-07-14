@@ -311,21 +311,18 @@ fn physical_scalar_rust_ty<'tcx>(
     match (source_ty, rust_size) {
         (oomir::Type::Boolean, 1) => Some(tcx.types.bool),
         (oomir::Type::I8, 1) => Some(tcx.types.i8),
-        (oomir::Type::I16, 1) => Some(tcx.types.u8),
+        (oomir::Type::U8, 1) => Some(tcx.types.u8),
         (oomir::Type::I16, 2) => Some(tcx.types.i16),
-        (oomir::Type::I32, 2) => Some(tcx.types.u16),
+        (oomir::Type::U16, 2) => Some(tcx.types.u16),
         (oomir::Type::I32, 4) => Some(tcx.types.i32),
-        (oomir::Type::I64, 4) => Some(tcx.types.u32),
+        (oomir::Type::U32, 4) => Some(tcx.types.u32),
         (oomir::Type::I64, 8) => Some(tcx.types.i64),
-        (oomir::Type::F32, 2) => Some(tcx.types.f16),
+        (oomir::Type::U64, 8) => Some(tcx.types.u64),
+        (oomir::Type::F16, 2) => Some(tcx.types.f16),
         (oomir::Type::F32, 4) => Some(tcx.types.f32),
         (oomir::Type::F64, 8) => Some(tcx.types.f64),
-        (oomir::Type::Class(name), 8) if name == crate::lower2::BIG_INTEGER_CLASS => {
-            Some(tcx.types.u64)
-        }
-        (oomir::Type::Class(name), 16) if name == crate::lower2::BIG_INTEGER_CLASS => {
-            Some(tcx.types.u128)
-        }
+        (oomir::Type::Class(name), 16) if name == crate::lower2::I128_CLASS => Some(tcx.types.i128),
+        (oomir::Type::Class(name), 16) if name == crate::lower2::U128_CLASS => Some(tcx.types.u128),
         (oomir::Type::Class(name), 16) if name == crate::lower2::F128_CLASS => Some(tcx.types.f128),
         _ => None,
     }

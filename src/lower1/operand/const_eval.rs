@@ -165,7 +165,7 @@ pub fn read_scalar_int_constant<'tcx>(
             class_name: oomir::POINTER_CLASS.to_string(),
             fields: HashMap::new(),
             params: vec![
-                oomir::Constant::I32(scalar_int.to_target_usize(tcx) as i32),
+                oomir::Constant::U64(scalar_int.to_target_usize(tcx) as u64),
                 oomir::Constant::I32(
                     i32::try_from(layout.size.bytes())
                         .map_err(|_| format!("Pointee layout for {ty:?} exceeds JVM limits"))?,
@@ -975,7 +975,11 @@ fn handle_constant_enum<'tcx>(
 
                     let mut found_idx = None;
                     for (v_idx, v_discr) in adt_def.discriminants(tcx) {
-                        let mask = (1u128 << tag_size.bits()) - 1;
+                        let mask = if tag_size.bits() == 128 {
+                            u128::MAX
+                        } else {
+                            (1u128 << tag_size.bits()) - 1
+                        };
                         let canonical_discr_val_masked = v_discr.val & mask;
                         breadcrumbs::log!(
                             breadcrumbs::LogLevel::Info,
@@ -1229,34 +1233,26 @@ pub fn scalar_int_to_oomir_constant(scalar_int: ScalarInt, ty: Ty<'_>) -> oomir:
             IntTy::I8 => oomir::Constant::I8(signed as i8),
             IntTy::I16 => oomir::Constant::I16(signed as i16),
             IntTy::I32 => oomir::Constant::I32(signed as i32),
-            IntTy::Isize => oomir::Constant::I32(signed as i32),
+            IntTy::Isize => oomir::Constant::I64(signed as i64),
             IntTy::I64 => oomir::Constant::I64(signed as i64),
             IntTy::I128 => {
                 let param = oomir::Constant::String(signed.to_string());
                 oomir::Constant::Instance {
-                    class_name: "java/math/BigInteger".into(),
+                    class_name: crate::lower2::I128_CLASS.into(),
                     fields: HashMap::new(),
                     params: vec![param],
                 }
             }
         },
         TyKind::Uint(uint_ty) => match uint_ty {
-            UintTy::U8 => oomir::Constant::I16(bits as u8 as i16),
-            UintTy::U16 => oomir::Constant::I32(bits as u16 as i32),
-            UintTy::U32 => oomir::Constant::I64(bits as u32 as i64),
-            UintTy::Usize => oomir::Constant::I32(bits as i32),
-            UintTy::U64 => {
-                let param = oomir::Constant::String((bits as u64).to_string());
-                oomir::Constant::Instance {
-                    class_name: "java/math/BigInteger".into(),
-                    fields: HashMap::new(),
-                    params: vec![param],
-                }
-            }
+            UintTy::U8 => oomir::Constant::U8(bits as u8),
+            UintTy::U16 => oomir::Constant::U16(bits as u16),
+            UintTy::U32 => oomir::Constant::U32(bits as u32),
+            UintTy::Usize | UintTy::U64 => oomir::Constant::U64(bits as u64),
             UintTy::U128 => {
                 let param = oomir::Constant::String(bits.to_string());
                 oomir::Constant::Instance {
-                    class_name: "java/math/BigInteger".into(),
+                    class_name: crate::lower2::U128_CLASS.into(),
                     fields: HashMap::new(),
                     params: vec![param],
                 }
@@ -1265,10 +1261,7 @@ pub fn scalar_int_to_oomir_constant(scalar_int: ScalarInt, ty: Ty<'_>) -> oomir:
         TyKind::Bool => oomir::Constant::Boolean(scalar_int.try_to_bool().unwrap_or(false)),
         TyKind::Char => oomir::Constant::I32(scalar_int.to_u32() as i32),
         TyKind::Float(float_ty) => match float_ty {
-            FloatTy::F16 => {
-                let f16_val = half::f16::from_bits(scalar_int.to_u16());
-                oomir::Constant::F32(f16_val.to_f32())
-            }
+            FloatTy::F16 => oomir::Constant::F16(scalar_int.to_u16()),
             FloatTy::F32 => oomir::Constant::F32(f32::from_bits(scalar_int.to_u32())),
             FloatTy::F64 => oomir::Constant::F64(f64::from_bits(scalar_int.to_u64())),
             FloatTy::F128 => {
