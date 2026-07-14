@@ -153,6 +153,41 @@ fn call_erased<T>(value: &T, formatter: fn(&T, &mut i32) -> i32, initial: i32) -
 
 fn dummy() {}
 
+struct Ops {
+    unary: fn(i32) -> i32,
+    binary: fn(i32, i32) -> i32,
+}
+
+fn named_add_one(x: i32) -> i32 {
+    x + 1
+}
+
+// Const-eval path: closures inside a const initializer.
+const CLOSURE_OPS: Ops = Ops {
+    unary: |x| x * 3,
+    binary: |a, b| a + b,
+};
+
+// Const-eval path with a named fn, which must keep working alongside shims.
+const NAMED_OPS: Ops = Ops {
+    unary: named_add_one,
+    binary: |a, b| a * b,
+};
+
+// Static (memory-read) path.
+static STATIC_UNARY: fn(i32) -> i32 = |x| x - 4;
+
+const ZERO_ARG_CLOSURE: fn() -> i32 = || 42;
+const CLOSURE_TABLE: [fn(i32) -> i32; 2] = [|x| x + 2, |x| x * 2];
+
+fn apply(f: fn(i32) -> i32, v: i32) -> i32 {
+    f(v)
+}
+
+fn apply2(f: fn(i32, i32) -> i32, a: i32, b: i32) -> i32 {
+    f(a, b)
+}
+
 fn main() {
     let res_const = derivative(constant, 10.0, 0.125);
     assert!(res_const == 0.0);
@@ -238,4 +273,39 @@ fn main() {
     assert!(!raw_addr.is_null());
     let back_again: fn() = unsafe { std::mem::transmute(raw_addr) };
     back_again();
+
+    // Credit from this point on: AnuthaDev
+
+    let double: fn(i32) -> i32 = |x| x * 2;
+    assert!(double(21) == 42);
+
+    assert!(apply(|x| x + 10, 5) == 15);
+
+    let sub: fn(i32, i32) -> i32 = |a, b| a - b;
+    assert!(sub(10, 3) == 7);
+    assert!(apply2(|a, b| a * b + 1, 4, 5) == 21);
+
+    assert!((CLOSURE_OPS.unary)(7) == 21);
+    assert!((CLOSURE_OPS.binary)(20, 22) == 42);
+    assert!((NAMED_OPS.unary)(41) == 42);
+    assert!((NAMED_OPS.binary)(6, 7) == 42);
+
+    assert!(STATIC_UNARY(46) == 42);
+    assert!(apply(STATIC_UNARY, 10) == 6);
+
+    assert!(ZERO_ARG_CLOSURE() == 42);
+    let sink: fn(i32) = |value| assert!(value == 42);
+    sink(42);
+    let unsafe_increment: unsafe fn(i32) -> i32 = |value| value + 1;
+    assert!(unsafe { unsafe_increment(41) } == 42);
+
+    assert!(CLOSURE_TABLE[0](40) == 42);
+    assert!(CLOSURE_TABLE[1](21) == 42);
+
+    let picked = if sub(1, 0) == 1 {
+        CLOSURE_OPS.unary
+    } else {
+        NAMED_OPS.unary
+    };
+    assert!(picked(2) == 6);
 }

@@ -947,7 +947,7 @@ impl Type {
         match self {
             Type::Str => Some(UTF8_VIEW_CLASS.to_string()),
             Type::String => Some("java/lang/String".to_string()),
-            Type::Class(name) => Some(name.replace('.', "/")),
+            Type::Class(name) | Type::Interface(name) => Some(name.replace('.', "/")),
             Type::Pointer(_) => Some(POINTER_CLASS.to_string()),
             Type::Reference(inner) => inner.to_jvm_internal_name(), // delegate to inner type
             // For array-valued types, the descriptor is the component class name

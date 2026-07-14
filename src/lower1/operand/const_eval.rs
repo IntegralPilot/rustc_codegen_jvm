@@ -4,13 +4,15 @@ use rustc_middle::mir::interpret::{
 };
 use rustc_middle::ty::layout::TyAndLayout;
 use rustc_middle::ty::{
-    AdtDef, FloatTy, GenericArgsRef, Instance, IntTy, PseudoCanonicalInput, ScalarInt, Ty, TyCtxt,
-    TyKind, TypingEnv, UintTy, util::IntTypeExt,
+    AdtDef, FloatTy, GenericArgsRef, Instance, InstanceKind, IntTy, PseudoCanonicalInput,
+    ScalarInt, ShimKind, Ty, TyCtxt, TyKind, TypingEnv, UintTy, util::IntTypeExt,
 };
 use std::collections::HashMap;
 
 use super::super::{
-    control_flow::rvalue::ensure_fn_pointer_adapter_class,
+    control_flow::rvalue::{
+        ensure_closure_fn_pointer_adapter_class, ensure_fn_pointer_adapter_class,
+    },
     jvm_names, ty_to_oomir_type,
     types::{
         UNION_BYTES_FIELD, UNION_OBJECTS_FIELD, ensure_fn_ptr_interface, ensure_union_data_type,
@@ -252,6 +254,9 @@ pub fn read_pointer_constant<'tcx>(
     instance: Instance<'tcx>,
 ) -> Result<oomir::Constant, String> {
     match ty.kind() {
+        TyKind::FnPtr(..) => {
+            read_function_pointer_constant(tcx, pointer, ty, oomir_data_types, instance)
+        }
         TyKind::Ref(_, inner_ty, _) if inner_ty.is_array() => {
             let value = read_pointee_constant(tcx, pointer, *inner_ty, oomir_data_types, instance)?;
             array_reference_to_slice(tcx, *inner_ty, value, oomir_data_types, instance)
@@ -261,6 +266,84 @@ pub fn read_pointer_constant<'tcx>(
         }
         _ => read_pointee_constant(tcx, pointer, ty, oomir_data_types, instance),
     }
+}
+
+fn read_function_pointer_constant<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    pointer: Pointer<CtfeProvenance>,
+    ty: Ty<'tcx>,
+    oomir_data_types: &mut HashMap<String, oomir::DataType>,
+    instance: Instance<'tcx>,
+) -> Result<oomir::Constant, String> {
+    let (provenance, _) = pointer.into_raw_parts();
+    let alloc_id = provenance.get_alloc_id().ok_or_else(|| {
+        format!(
+            "Function pointer provenance {:?} has no allocation id",
+            provenance
+        )
+    })?;
+    let function_allocation = tcx.global_alloc(alloc_id);
+    let GlobalAlloc::Function {
+        instance: function_instance,
+    } = function_allocation
+    else {
+        return Err(format!(
+            "Function pointer of type {:?} referred to non-function allocation {:?}",
+            ty, function_allocation
+        ));
+    };
+
+    let signature = fn_ptr_signature_from_ty(ty, tcx, oomir_data_types, instance);
+    let interface_name = ensure_fn_ptr_interface(&signature, oomir_data_types, tcx, instance);
+
+    let closure_instance = match function_instance.def {
+        InstanceKind::Item(def_id) => {
+            let item_ty = function_instance.ty(tcx, TypingEnv::fully_monomorphized());
+            matches!(item_ty.kind(), TyKind::Closure(..))
+                .then_some(Instance::new_raw(def_id, function_instance.args))
+        }
+        InstanceKind::Shim(ShimKind::ClosureOnce { closure, .. }) => {
+            match function_instance.args.type_at(0).kind() {
+                TyKind::Closure(def_id, closure_args) => {
+                    debug_assert_eq!(*def_id, closure);
+                    Some(Instance::new_raw(*def_id, closure_args))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+
+    let adapter_class = if let Some(closure_instance) = closure_instance {
+        ensure_closure_fn_pointer_adapter_class(
+            oomir_data_types,
+            closure_instance,
+            &signature,
+            &interface_name,
+            tcx,
+            instance,
+        )
+    } else {
+        let function_name =
+            super::super::naming::mono_fn_name_from_instance(tcx, function_instance);
+        let callable_target = function_instance
+            .def_id()
+            .is_local()
+            .then_some(&function_name);
+        ensure_fn_pointer_adapter_class(
+            oomir_data_types,
+            callable_target,
+            &signature,
+            &interface_name,
+            tcx,
+            instance,
+        )
+    };
+
+    Ok(oomir::Constant::FunctionPointer {
+        adapter_class,
+        interface_name,
+    })
 }
 
 fn array_reference_to_slice<'tcx>(
@@ -625,46 +708,7 @@ pub fn read_constant_value_from_memory<'tcx>(
 
         TyKind::FnPtr(..) => {
             let pointer = read_pointer_from_memory(tcx, allocation, offset)?;
-            let (provenance, _) = pointer.into_raw_parts();
-            let alloc_id = provenance.get_alloc_id().ok_or_else(|| {
-                format!(
-                    "Function pointer provenance {:?} has no allocation id",
-                    provenance
-                )
-            })?;
-            let function_allocation = tcx.global_alloc(alloc_id);
-            let GlobalAlloc::Function {
-                instance: function_instance,
-            } = function_allocation
-            else {
-                return Err(format!(
-                    "Function pointer of type {:?} referred to non-function allocation {:?}",
-                    ty, function_allocation
-                ));
-            };
-
-            let signature = fn_ptr_signature_from_ty(ty, tcx, oomir_data_types, function_instance);
-            let interface_name =
-                ensure_fn_ptr_interface(&signature, oomir_data_types, tcx, function_instance);
-            let function_name =
-                super::super::naming::mono_fn_name_from_instance(tcx, function_instance);
-            let callable_target = function_instance
-                .def_id()
-                .is_local()
-                .then_some(&function_name);
-            let adapter_class = ensure_fn_pointer_adapter_class(
-                oomir_data_types,
-                callable_target,
-                &signature,
-                &interface_name,
-                tcx,
-                function_instance,
-            );
-
-            Ok(oomir::Constant::FunctionPointer {
-                adapter_class,
-                interface_name,
-            })
+            read_function_pointer_constant(tcx, pointer, ty, oomir_data_types, instance)
         }
 
         TyKind::Str => Err("Unsupported type: Direct read of str from memory".to_string()),
