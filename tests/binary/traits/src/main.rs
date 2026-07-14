@@ -122,6 +122,56 @@ fn check_properties(calc: &dyn Calculator) -> (i32, u8) {
     (calc.get_value(), calc.id())
 }
 
+trait Score {
+    fn score(&self, base: i32) -> i32;
+    fn tag(&self) -> i32;
+}
+
+impl Score for () {
+    fn score(&self, base: i32) -> i32 {
+        base + 1
+    }
+
+    fn tag(&self) -> i32 {
+        7
+    }
+}
+
+// Zero-sized struct receiver: same class of bug as `()`.
+#[derive(Clone, Copy)]
+struct Marker;
+
+impl Score for Marker {
+    fn score(&self, base: i32) -> i32 {
+        base * 2
+    }
+
+    fn tag(&self) -> i32 {
+        11
+    }
+}
+
+// Forwarding impl mirroring core's `impl Debug for &T`, which is where the
+// original failure surfaced: `<&() as Debug>::fmt` re-dispatching to
+// `<() as Debug>::fmt` on the pointee.
+impl<T: Score> Score for &T {
+    fn score(&self, base: i32) -> i32 {
+        (**self).score(base)
+    }
+
+    fn tag(&self) -> i32 {
+        (**self).tag()
+    }
+}
+
+// Generic dispatch so the receiver type is only known at monomorphization.
+fn total<T: Score>(value: T, base: i32) -> i32 {
+    value.score(base) + value.tag()
+}
+
+fn by_ref<T: Score>(value: &T, base: i32) -> i32 {
+    value.score(base)
+}
 
 fn main() {
     assert!(41i32.carrier_value() == 42);
@@ -214,6 +264,25 @@ fn main() {
 
     assert!(perform_calculation(calc2, 2, 3) == 6);
     assert!(check_properties(calc2) == (10, 6));
+
+    // Credit from this point on: AnuthaDev
+    // Direct calls on the unit value.
+    let unit = ();
+    assert!(unit.score(10) == 11);
+    assert!(unit.tag() == 7);
+
+    // Through generics (T = () and T = Marker).
+    assert!(total((), 100) == 108);
+    assert!(total(Marker, 100) == 211);
+
+    // Through the &T forwarding impl (T = () — the original failure shape).
+    assert!(by_ref(&(), 5) == 6);
+    assert!(total(&(), 20) == 28);
+    assert!(by_ref(&Marker, 5) == 10);
+
+    // Double indirection for good measure.
+    let unit_ref = &();
+    assert!(by_ref(&unit_ref, 3) == 4);
 
     // If we reach here without panic, the test passes
 }
