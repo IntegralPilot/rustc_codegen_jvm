@@ -337,7 +337,7 @@ pub fn mir_to_oomir<'tcx>(
         instrs.push(oomir::Instruction::InvokeStatic {
             dest: Some(place::local_cell_name(local)),
             class_name: oomir::POINTER_CLASS.to_string(),
-            method_name: "cell".to_string(),
+            method_name: "cellAligned".to_string(),
             method_ty: oomir::Signature {
                 params: vec![
                     (
@@ -346,6 +346,7 @@ pub fn mir_to_oomir<'tcx>(
                     ),
                     ("size".to_string(), oomir::Type::I32),
                     ("codec".to_string(), oomir::Type::String),
+                    ("alignment".to_string(), oomir::Type::I32),
                 ],
                 ret: Box::new(oomir::Type::Pointer(Box::new(value_type))),
                 is_static: true,
@@ -374,6 +375,20 @@ pub fn mir_to_oomir<'tcx>(
                     data_types,
                     instance,
                 ),
+                oomir::Operand::Constant(oomir::Constant::I32(
+                    i32::try_from(
+                        types::layout_align_bytes(
+                            tcx,
+                            EarlyBinder::bind(tcx, mir_cloned.local_decls[local].ty)
+                                .instantiate(tcx, instance.args)
+                                .skip_norm_wip(),
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!("could not determine stable local alignment: {error}")
+                        }),
+                    )
+                    .expect("stable local alignment exceeds the JVM runtime address space"),
+                )),
             ],
         });
     }

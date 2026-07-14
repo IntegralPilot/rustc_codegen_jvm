@@ -989,6 +989,278 @@ fn automatic_recursive_drop_glue() {
     }
 }
 
+fn pointer_niche_layouts() {
+    use core::ptr::NonNull;
+
+    assert_eq!(
+        core::mem::size_of::<Option<NonNull<i32>>>(),
+        core::mem::size_of::<*mut i32>()
+    );
+
+    let opt_none: Option<NonNull<i32>> = None;
+    let raw_none = unsafe { std::mem::transmute::<Option<NonNull<i32>>, *mut i32>(opt_none) };
+    assert!(raw_none.is_null());
+}
+
+#[repr(C)]
+struct CustomDst {
+    header: u32,
+    slice: [u8],
+}
+
+fn custom_dst_projections() {
+    let mut storage = (42_u32, [1_u8, 2, 3, 4]);
+    let raw_dst = core::ptr::slice_from_raw_parts_mut(&mut storage as *mut _ as *mut u8, 4)
+        as *mut CustomDst;
+
+    unsafe {
+        assert_eq!((*raw_dst).header, 42);
+        assert_eq!((*raw_dst).slice[2], 3);
+
+        assert_eq!(core::ptr::metadata(raw_dst), 4);
+    }
+}
+
+#[inline(never)]
+unsafe fn aliasing_test(ref_val: &mut i32, raw_ptr: *mut i32) {
+    *ref_val = 10;
+    *raw_ptr = 20;
+    assert_eq!(*ref_val, 20);
+}
+
+fn verify_noalias_handling() {
+    let mut val = 0_i32;
+    let raw = &mut val as *mut i32;
+    unsafe {
+        aliasing_test(&mut val, raw);
+    }
+}
+
+trait Inspector {
+    fn inspect(&self) -> i32;
+}
+
+struct Item {
+    value: i32,
+}
+
+impl Inspector for Item {
+    fn inspect(&self) -> i32 {
+        self.value
+    }
+}
+
+#[inline(never)]
+fn pass_trait_object(ptr: *const dyn Inspector) -> *const dyn Inspector {
+    ptr
+}
+
+#[inline(never)]
+fn pass_slice_pointer(ptr: *const [i32]) -> *const [i32] {
+    ptr
+}
+
+fn fat_pointer_abi_boundaries() {
+    let mut item = Item { value: 1234 };
+    let raw_trait: *const dyn Inspector = &item;
+
+    let returned_trait = pass_trait_object(raw_trait);
+    unsafe {
+        assert_eq!((*returned_trait).inspect(), 1234);
+        assert_eq!(core::ptr::metadata(raw_trait), core::ptr::metadata(returned_trait));
+    }
+
+    let array = [10, 20, 30, 40];
+    let raw_slice: *const [i32] = &array;
+    let returned_slice = pass_slice_pointer(raw_slice);
+    unsafe {
+        assert_eq!((&(*returned_slice)).len(), 4);
+        assert_eq!((*returned_slice)[3], 40);
+    }
+}
+
+#[repr(align(128))]
+struct AlignedData {
+    value: u32,
+    payload: [u8; 124],
+}
+
+#[inline(never)]
+fn allocate_on_stack() -> usize {
+    let data = AlignedData { value: 42, payload: [0; 124] };
+    let ptr = &data as *const AlignedData;
+    ptr as usize
+}
+
+fn stack_realignment() {
+    let addr = allocate_on_stack();
+    assert_eq!(addr % 128, 0);
+}
+
+struct Empty;
+
+#[repr(C)]
+struct MixedStruct {
+    first: u16,
+    empty_middle: Empty,
+    second: u32,
+    empty_end: Empty,
+    third: u64,
+}
+
+fn zst_and_padding_offsets() {
+    let mut data = MixedStruct {
+        first: 0x1122,
+        empty_middle: Empty,
+        second: 0x55667788,
+        empty_end: Empty,
+        third: 0x99AABBCCDDEEFF00,
+    };
+
+    let base = &mut data as *mut MixedStruct;
+    unsafe {
+        let first_ptr = core::ptr::addr_of!(data.first);
+        let second_ptr = core::ptr::addr_of!(data.second);
+        let third_ptr = core::ptr::addr_of!(data.third);
+
+        let offset_second = (second_ptr as usize) - (first_ptr as usize);
+        let offset_third = (third_ptr as usize) - (first_ptr as usize);
+
+        assert_eq!(offset_second, 4);
+        assert_eq!(offset_third, 8);
+
+        assert_eq!(*second_ptr, 0x55667788);
+        assert_eq!(*third_ptr, 0x99AABBCCDDEEFF00);
+    }
+}
+
+#[repr(u8)]
+enum CustomEnum {
+    Alpha(u32) = 1,
+    Beta(u32) = 2,
+}
+
+fn enum_discriminant_pointer_manipulation() {
+    let mut val = CustomEnum::Alpha(100);
+    let ptr = &mut val as *mut CustomEnum;
+
+    unsafe {
+        let tag_ptr = ptr as *mut u8;
+        assert_eq!(*tag_ptr, 1);
+
+        *tag_ptr = 2;
+
+        let payload_ptr = (ptr as *mut u8).add(4) as *mut u32;
+        *payload_ptr = 200;
+    }
+
+    match val {
+        CustomEnum::Beta(payload) => assert_eq!(payload, 200),
+        CustomEnum::Alpha(_) => panic!("Failed to change variant via raw pointer"),
+    }
+}
+
+fn multidimensional_pointer_flat_map() {
+    let mut matrix = [
+        [1, 2, 3],
+        [4, 5, 6],
+        [7, 8, 9],
+    ];
+
+    let base_ptr = matrix.as_mut_ptr() as *mut i32;
+    unsafe {
+        let row = 2;
+        let col = 1;
+        let width = 3;
+        let element_ptr = base_ptr.add(row * width + col);
+        assert_eq!(*element_ptr, 8);
+
+        *element_ptr = 88;
+    }
+    assert_eq!(matrix[2][1], 88);
+}
+
+#[repr(packed)]
+struct PackedDataset {
+    tag: u8,
+    data_u64: u64,
+    data_u32: u32,
+}
+
+fn packed_unaligned_fields() {
+    let dataset = PackedDataset {
+        tag: 0xAA,
+        data_u64: 0x1122334455667788,
+        data_u32: 0x99AABBCC,
+    };
+
+    let base = &dataset as *const PackedDataset;
+    unsafe {
+        let u64_ptr = core::ptr::addr_of!(dataset.data_u64);
+        let u32_ptr = core::ptr::addr_of!(dataset.data_u32);
+
+        assert_eq!(u64_ptr as usize - base as usize, 1);
+        assert_eq!(u32_ptr as usize - base as usize, 9);
+
+        assert_eq!(u64_ptr.read_unaligned(), 0x1122334455667788);
+        assert_eq!(u32_ptr.read_unaligned(), 0x99AABBCC);
+    }
+}
+
+fn sized_to_unsized_coercion() {
+    let mut data = [100_i32, 200, 300, 400];
+    let sized_ptr: *mut [i32; 4] = &mut data;
+
+    let unsized_ptr: *mut [i32] = sized_ptr;
+
+    unsafe {
+        assert!(core::ptr::metadata(unsized_ptr) == 4);
+
+        assert!((*unsized_ptr)[0] == 100);
+        assert!( (*unsized_ptr)[3] == 400);
+
+        (*unsized_ptr)[2] = 999;
+    }
+    assert!(data[2] == 999);
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct SegmentA {
+    low: u16,
+    high: u16,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct SegmentB {
+    full: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+union NestedUnion {
+    parts: SegmentA,
+    whole: SegmentB,
+}
+
+fn nested_union_reinterpretation() {
+    assert!(core::mem::size_of::<NestedUnion>() == 4);
+
+    let mut u = NestedUnion {
+        parts: SegmentA { low: 0x4433, high: 0x2211 }
+    };
+
+    unsafe {
+        assert!(u.whole.full == 0x22114433);
+
+        u.whole.full = 0xAABBCCDD;
+
+        assert!(u.parts.low == 0xCCDD);
+        assert!(u.parts.high == 0xAABB);
+    }
+}
+
 fn main() {
     basic_raw_pointer_round_trip();
     array_pointer_arithmetic();
@@ -1018,4 +1290,15 @@ fn main() {
     replace_and_swap();
     raw_drop_in_place();
     automatic_recursive_drop_glue();
+    pointer_niche_layouts();
+    custom_dst_projections();
+    verify_noalias_handling();
+    fat_pointer_abi_boundaries();
+    stack_realignment();
+    zst_and_padding_offsets();
+    enum_discriminant_pointer_manipulation();
+    multidimensional_pointer_flat_map();
+    packed_unaligned_fields();
+    sized_to_unsized_coercion();
+    nested_union_reinterpretation();
 }

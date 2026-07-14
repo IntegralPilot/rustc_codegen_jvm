@@ -20,11 +20,13 @@ public final class Pointer {
     private static final AtomicInteger NEXT_ADDRESS = new AtomicInteger(0x1000);
     private static final Map<Object, Integer> ALLOCATION_BASES = new WeakHashMap<>();
     private static final Map<Object, Integer> ALLOCATION_ELEMENT_SIZES = new WeakHashMap<>();
+    private static final Map<Object, Integer> ALLOCATION_ALIGNMENTS = new WeakHashMap<>();
     private static final Map<Object, String> ALLOCATION_CODECS = new WeakHashMap<>();
     private static final Map<Integer, ExposedTarget> EXPOSED_ADDRESSES = new HashMap<>();
     private static final Map<String, Method[]> CODEC_METHODS = new HashMap<>();
     private static final Map<Object, Integer> MANAGED_OBJECT_ADDRESSES = new IdentityHashMap<>();
     private static final Map<Integer, WeakReference<Object>> MANAGED_OBJECTS = new HashMap<>();
+    private static final Map<String, Pointer> TRAIT_METADATA_MARKERS = new HashMap<>();
 
     private static final class Cell {
         private Object value;
@@ -41,6 +43,7 @@ public final class Pointer {
         private final String codecClassName;
         private final int viewSize;
         private final String viewCodecClassName;
+        private final int metadata;
 
         private ExposedTarget(
                 Object allocation,
@@ -48,13 +51,15 @@ public final class Pointer {
                 int byteOffset,
                 String codecClassName,
                 int viewSize,
-                String viewCodecClassName) {
+                String viewCodecClassName,
+                int metadata) {
             this.allocation = new WeakReference<>(allocation);
             this.allocationElementSize = allocationElementSize;
             this.byteOffset = byteOffset;
             this.codecClassName = codecClassName;
             this.viewSize = viewSize;
             this.viewCodecClassName = viewCodecClassName;
+            this.metadata = metadata;
         }
     }
 
@@ -65,6 +70,7 @@ public final class Pointer {
     private final String allocationCodecClassName;
     private final String viewCodecClassName;
     private final int exposedAddress;
+    private int metadata = -1;
     private int zeroSizedSourceViewSize = -1;
     private String zeroSizedSourceViewCodecClassName;
 
@@ -113,7 +119,22 @@ public final class Pointer {
     }
 
     public static Pointer cell(Object value, int size, String codecClassName) {
-        return new Pointer(new Cell(value), size, 0, size, codecClassName);
+        return cellAligned(value, size, codecClassName, 16);
+    }
+
+    public static Pointer cellAligned(
+            Object value,
+            int size,
+            String codecClassName,
+            int alignment) {
+        if (alignment <= 0 || (alignment & (alignment - 1)) != 0) {
+            throw new IllegalArgumentException("Rust allocation alignment must be a power of two");
+        }
+        Cell cell = new Cell(value);
+        synchronized (ALLOCATION_BASES) {
+            ALLOCATION_ALIGNMENTS.put(cell, alignment);
+        }
+        return new Pointer(cell, size, 0, size, codecClassName);
     }
 
     public static Pointer cell(Object value, int size) {
@@ -158,19 +179,22 @@ public final class Pointer {
         try {
             Field arrayField = sliceView.getClass().getField("array");
             Field offsetField = sliceView.getClass().getField("offset");
+            Field lengthField = sliceView.getClass().getField("length");
             Object backing = arrayField.get(sliceView);
             int offset = offsetField.getInt(sliceView);
+            int length = lengthField.getInt(sliceView);
             if (backing instanceof Pointer) {
                 return ((Pointer) backing)
                         .sliceStorageView()
                         .add(offset)
-                        .retype(elementSize, codecClassName);
+                        .retype(elementSize, codecClassName)
+                        .withMetadata(length);
             }
             return array(
                     backing,
                     offset,
                     elementSize,
-                    codecClassName);
+                    codecClassName).withMetadata(length);
         } catch (ReflectiveOperationException error) {
             throw new IllegalArgumentException("invalid Rust slice view", error);
         }
@@ -201,6 +225,17 @@ public final class Pointer {
         return nullPointer(1);
     }
 
+    public static Pointer traitMetadataMarker(Pointer pointer, String metadataClassName) {
+        Object value = pointer == null ? null : pointer.getObject();
+        String concreteClassName = value == null ? "<null>" : value.getClass().getName();
+        String key = metadataClassName + '\0' + concreteClassName;
+        synchronized (TRAIT_METADATA_MARKERS) {
+            return TRAIT_METADATA_MARKERS.computeIfAbsent(
+                    key,
+                    ignored -> cell(null, 0, null));
+        }
+    }
+
     public static Pointer fromAddress(int address, int viewSize) {
         return fromAddress(address, viewSize, null);
     }
@@ -218,7 +253,7 @@ public final class Pointer {
                             viewSize,
                             target.codecClassName,
                             viewCodecClassName,
-                            -1);
+                            -1).withMetadata(target.metadata);
                 }
                 EXPOSED_ADDRESSES.remove(address);
             }
@@ -255,7 +290,7 @@ public final class Pointer {
             if (existing != null) {
                 return existing.intValue();
             }
-            int address = NEXT_ADDRESS.getAndAdd(16);
+            int address = allocateAddress(16, 16);
             MANAGED_OBJECT_ADDRESSES.put(value, address);
             MANAGED_OBJECTS.put(address, new WeakReference<>(value));
             return address;
@@ -295,7 +330,7 @@ public final class Pointer {
                             target.viewSize,
                             target.codecClassName,
                             target.viewCodecClassName,
-                            -1);
+                            -1).withMetadata(target.metadata);
                 }
                 EXPOSED_ADDRESSES.remove(address);
             }
@@ -329,7 +364,7 @@ public final class Pointer {
                 newViewSize,
                 allocationCodecClassName,
                 newViewCodecClassName,
-                exposedAddress);
+                exposedAddress).withMetadata(metadata);
         if (newViewSize == 0 && newViewCodecClassName == null) {
             if (viewSize == 0 && zeroSizedSourceViewSize >= 0) {
                 result.zeroSizedSourceViewSize = zeroSizedSourceViewSize;
@@ -360,7 +395,23 @@ public final class Pointer {
                 pointer.allocationElementSize,
                 pointer.allocationCodecClassName,
                 pointer.allocationCodecClassName,
-                pointer.exposedAddress);
+                pointer.exposedAddress).withMetadata(pointer.metadata);
+    }
+
+    private Pointer withMetadata(int metadata) {
+        this.metadata = metadata;
+        return this;
+    }
+
+    public static Pointer withMetadata(Pointer pointer, int metadata) {
+        return pointer.withMetadata(metadata);
+    }
+
+    public int metadata() {
+        if (metadata < 0) {
+            throw new IllegalStateException("pointer does not carry dynamically sized metadata");
+        }
+        return metadata;
     }
 
     public Pointer offset(int elementCount) {
@@ -373,7 +424,7 @@ public final class Pointer {
                     viewSize,
                     allocationCodecClassName,
                     viewCodecClassName,
-                    Math.addExact(exposedAddress, delta));
+                    Math.addExact(exposedAddress, delta)).withMetadata(metadata);
         }
         return new Pointer(
                 allocation,
@@ -382,7 +433,7 @@ public final class Pointer {
                 viewSize,
                 allocationCodecClassName,
                 viewCodecClassName,
-                -1);
+                -1).withMetadata(metadata);
     }
 
     public Pointer add(int elementCount) {
@@ -414,7 +465,7 @@ public final class Pointer {
                     viewSize,
                     allocationCodecClassName,
                     viewCodecClassName,
-                    Math.addExact(exposedAddress, byteCount));
+                    Math.addExact(exposedAddress, byteCount)).withMetadata(metadata);
         }
         return new Pointer(
                 allocation,
@@ -423,7 +474,7 @@ public final class Pointer {
                 viewSize,
                 allocationCodecClassName,
                 viewCodecClassName,
-                -1);
+                -1).withMetadata(metadata);
     }
 
     public static Pointer byte_offset(Pointer pointer, int byteCount) {
@@ -459,7 +510,7 @@ public final class Pointer {
                     viewSize,
                     allocationCodecClassName,
                     viewCodecClassName,
-                    exposedAddress + byteCount);
+                    exposedAddress + byteCount).withMetadata(metadata);
         }
         return new Pointer(
                 allocation,
@@ -468,7 +519,7 @@ public final class Pointer {
                 viewSize,
                 allocationCodecClassName,
                 viewCodecClassName,
-                -1);
+                -1).withMetadata(metadata);
     }
 
     public int align_offset(int alignment) {
@@ -514,7 +565,7 @@ public final class Pointer {
                     viewSize,
                     allocationCodecClassName,
                     viewCodecClassName,
-                    address);
+                    address).withMetadata(metadata);
         }
         int base = address() - byteOffset;
         return new Pointer(
@@ -524,7 +575,7 @@ public final class Pointer {
                 viewSize,
                 allocationCodecClassName,
                 viewCodecClassName,
-                -1);
+                -1).withMetadata(metadata);
     }
 
     public static Pointer with_addr(Pointer pointer, int address) {
@@ -572,7 +623,7 @@ public final class Pointer {
                     viewSize,
                     allocationCodecClassName,
                     viewCodecClassName,
-                    exposedAddress + delta);
+                    exposedAddress + delta).withMetadata(metadata);
         }
         return new Pointer(
                 allocation,
@@ -581,7 +632,7 @@ public final class Pointer {
                 viewSize,
                 allocationCodecClassName,
                 viewCodecClassName,
-                -1);
+                -1).withMetadata(metadata);
     }
 
     public int offsetFrom(Pointer origin) {
@@ -713,7 +764,8 @@ public final class Pointer {
                         : allocationElementSize;
                 int requiredSpan = Math.addExact(byteCapacity, 1);
                 int span = Math.max(16, Math.addExact(requiredSpan, 15) & ~15);
-                base = NEXT_ADDRESS.getAndAdd(span);
+                int alignment = ALLOCATION_ALIGNMENTS.getOrDefault(allocation, 16);
+                base = allocateAddress(span, alignment);
                 ALLOCATION_BASES.put(allocation, base);
                 ALLOCATION_ELEMENT_SIZES.put(allocation, allocationElementSize);
                 ALLOCATION_CODECS.put(allocation, allocationCodecClassName);
@@ -727,8 +779,20 @@ public final class Pointer {
                             byteOffset,
                             allocationCodecClassName,
                             viewSize,
-                            viewCodecClassName));
+                            viewCodecClassName,
+                            metadata));
             return address;
+        }
+    }
+
+    private static int allocateAddress(int span, int alignment) {
+        while (true) {
+            int current = NEXT_ADDRESS.get();
+            int aligned = Math.addExact(current, alignment - 1) & -alignment;
+            int next = Math.addExact(aligned, span);
+            if (NEXT_ADDRESS.compareAndSet(current, next)) {
+                return aligned;
+            }
         }
     }
 
@@ -909,7 +973,7 @@ public final class Pointer {
                             zeroSizedSourceViewSize,
                             allocationCodecClassName,
                             zeroSizedSourceViewCodecClassName,
-                            exposedAddress)
+                            exposedAddress).withMetadata(metadata)
                     .getObject();
         }
         if (MANAGED_OBJECT_VIEW_CODEC.equals(viewCodecClassName)

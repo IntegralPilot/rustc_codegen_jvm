@@ -151,6 +151,8 @@ fn call_erased<T>(value: &T, formatter: fn(&T, &mut i32) -> i32, initial: i32) -
     unsafe { erased(pointer, &mut state) }
 }
 
+fn dummy() {}
+
 fn main() {
     let res_const = derivative(constant, 10.0, 0.125);
     assert!(res_const == 0.0);
@@ -230,4 +232,10 @@ fn main() {
             assert!(false);
         }
     }
+
+    let fn_ptr: fn() = dummy;
+    let raw_addr = fn_ptr as *const ();
+    assert!(!raw_addr.is_null());
+    let back_again: fn() = unsafe { std::mem::transmute(raw_addr) };
+    back_again();
 }

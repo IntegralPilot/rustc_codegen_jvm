@@ -37,6 +37,103 @@ pub(super) struct PointerOrigin<'tcx> {
 
 pub(super) type MutableBorrowMap<'tcx> = HashMap<Local, PointerOrigin<'tcx>>;
 
+fn emit_trait_object_metadata(
+    pointer: oomir::Operand,
+    output_type: &oomir::Type,
+    dest: String,
+    temp_prefix: &str,
+    data_types: &HashMap<String, oomir::DataType>,
+    instructions: &mut Vec<oomir::Instruction>,
+) {
+    let metadata_class = output_type
+        .get_class_name()
+        .expect("trait-object metadata must be represented by a JVM class")
+        .to_string();
+    let metadata_fields = match data_types.get(&metadata_class) {
+        Some(oomir::DataType::Class { fields, .. }) => fields.clone(),
+        other => panic!("trait-object metadata class is unavailable: {other:?}"),
+    };
+    let [(_, vtable_type), (_, phantom_type)] = metadata_fields.as_slice() else {
+        panic!("trait-object metadata must contain vtable and phantom fields")
+    };
+    let vtable_class = vtable_type
+        .get_class_name()
+        .expect("trait-object vtable pointer must be represented by a JVM class")
+        .to_string();
+    let vtable_fields = match data_types.get(&vtable_class) {
+        Some(oomir::DataType::Class { fields, .. }) => fields.clone(),
+        other => panic!("trait-object vtable pointer class is unavailable: {other:?}"),
+    };
+    let [(_, marker_type)] = vtable_fields.as_slice() else {
+        panic!("trait-object vtable pointer must contain exactly one pointer field")
+    };
+    let phantom_class = phantom_type
+        .get_class_name()
+        .expect("trait-object metadata phantom field must be a JVM class")
+        .to_string();
+
+    let marker_name = format!("{temp_prefix}_vtable_marker");
+    let pointer_type = pointer
+        .get_type()
+        .expect("trait-object metadata source must be typed");
+    instructions.push(oomir::Instruction::InvokeStatic {
+        dest: Some(marker_name.clone()),
+        class_name: oomir::POINTER_CLASS.to_string(),
+        method_name: "traitMetadataMarker".to_string(),
+        method_ty: oomir::Signature {
+            params: vec![
+                ("pointer".to_string(), pointer_type),
+                ("metadata_class".to_string(), oomir::Type::String),
+            ],
+            ret: Box::new(marker_type.clone()),
+            is_static: true,
+        },
+        args: vec![
+            pointer,
+            oomir::Operand::Constant(oomir::Constant::String(metadata_class.clone())),
+        ],
+    });
+
+    let vtable_name = format!("{temp_prefix}_vtable");
+    instructions.push(oomir::Instruction::ConstructObject {
+        dest: vtable_name.clone(),
+        class_name: vtable_class,
+        args: vec![(
+            oomir::Operand::Variable {
+                name: marker_name,
+                ty: marker_type.clone(),
+            },
+            marker_type.clone(),
+        )],
+    });
+    let phantom_name = format!("{temp_prefix}_phantom");
+    instructions.push(oomir::Instruction::ConstructObject {
+        dest: phantom_name.clone(),
+        class_name: phantom_class,
+        args: Vec::new(),
+    });
+    instructions.push(oomir::Instruction::ConstructObject {
+        dest,
+        class_name: metadata_class,
+        args: vec![
+            (
+                oomir::Operand::Variable {
+                    name: vtable_name,
+                    ty: vtable_type.clone(),
+                },
+                vtable_type.clone(),
+            ),
+            (
+                oomir::Operand::Variable {
+                    name: phantom_name,
+                    ty: phantom_type.clone(),
+                },
+                phantom_type.clone(),
+            ),
+        ],
+    });
+}
+
 pub(super) fn emit_rust_drop_value<'tcx>(
     rust_ty: Ty<'tcx>,
     mut value: oomir::Operand,
@@ -949,7 +1046,10 @@ pub(super) fn convert_basic_block<'tcx>(
                 if let rustc_middle::ty::TyKind::FnDef(def_id, substs) = func_ty.kind() {
                     // Resolve the instance
                     let func_instance = rustc_middle::ty::Instance::resolve_for_fn_ptr(
-                        tcx, typing_env, *def_id, substs,
+                        tcx,
+                        typing_env,
+                        *def_id,
+                        substs.no_bound_vars().unwrap(),
                     )
                     .unwrap();
 
@@ -1757,7 +1857,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                                 tcx,
                                                 typing_env,
                                                 *def_id,
-                                                generic_args,
+                                                generic_args.no_bound_vars().unwrap(),
                                             )
                                             .expect("map_addr function item resolves");
                                             let target = super::naming::mono_fn_name_from_instance(
@@ -2533,16 +2633,57 @@ pub(super) fn convert_basic_block<'tcx>(
                             && is_core_ptr
                             && matches!(oomir_operands[0].get_type(), Some(oomir::Type::Pointer(_)))
                         {
-                            // JVM interface dispatch already carries a trait object's vtable.
-                            // Retain a typed marker for the Rust metadata API; sized pointees
-                            // use unit metadata and therefore have no JVM destination.
                             if let Some(dest) = effective_dest.clone() {
-                                instructions.push(oomir::Instruction::Move {
-                                    dest,
-                                    src: oomir::Operand::Constant(oomir::Constant::Null(
-                                        oomir_output_type.clone(),
-                                    )),
+                                let pointee = fn_inputs.first().and_then(|input| {
+                                    let (TyKind::RawPtr(pointee, _) | TyKind::Ref(_, pointee, _)) =
+                                        input.kind()
+                                    else {
+                                        return None;
+                                    };
+                                    Some(*pointee)
                                 });
+                                let slice_tailed_pointee = pointee.and_then(|pointee| {
+                                    let tail = tcx.struct_tail_for_codegen(
+                                        pointee,
+                                        TypingEnv::fully_monomorphized(),
+                                    );
+                                    (tail.is_slice() || tail.is_str()).then_some(pointee)
+                                });
+                                if slice_tailed_pointee.is_some() {
+                                    let pointer_ty = oomir_operands[0]
+                                        .get_type()
+                                        .expect("DST metadata operand must be typed");
+                                    instructions.push(oomir::Instruction::InvokeVirtual {
+                                        dest: Some(dest),
+                                        class_name: oomir::POINTER_CLASS.to_string(),
+                                        method_name: "metadata".to_string(),
+                                        method_ty: oomir::Signature {
+                                            params: vec![("self".to_string(), pointer_ty)],
+                                            ret: Box::new(oomir_output_type.clone()),
+                                            is_static: false,
+                                        },
+                                        args: Vec::new(),
+                                        operand: oomir_operands[0].clone(),
+                                    });
+                                } else if pointee.is_some_and(|pointee| {
+                                    matches!(pointee.kind(), TyKind::Dynamic(..))
+                                }) {
+                                    emit_trait_object_metadata(
+                                        oomir_operands[0].clone(),
+                                        &oomir_output_type,
+                                        dest,
+                                        &format!("{label}_trait_metadata"),
+                                        data_types,
+                                        &mut instructions,
+                                    );
+                                } else {
+                                    instructions.push(oomir::Instruction::Move {
+                                        dest,
+                                        src: oomir::Operand::Constant(oomir::Constant::Null(
+                                            oomir_output_type.clone(),
+                                        )),
+                                    });
+                                }
                             }
                         } else if matches!(
                             intrinsic_name.as_str(),
@@ -3149,6 +3290,11 @@ pub(super) fn convert_basic_block<'tcx>(
                     let target_label = format!("bb{}", target_bb.index());
                     instructions.push(oomir::Instruction::Jump {
                         target: target_label,
+                    });
+                } else {
+                    instructions.push(oomir::Instruction::ThrowNewWithMessage {
+                        exception_class: "java/lang/AssertionError".to_string(),
+                        message: "Diverging Rust call returned unexpectedly".to_string(),
                     });
                 }
             }
