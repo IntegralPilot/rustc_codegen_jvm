@@ -196,9 +196,9 @@ Then, build the project with cargo for `jvm-unknown-unknown`.
 
 ```bash
 cargo build \
-  --target "/path/jvm-unknown-unknown.json" \
+  --target "/path/to/rustc_codegen_jvm/jvm-unknown-unknown.json" \
   -Zjson-target-spec \
-  -Zbuild-std=core,compiler_builtins \
+  -Zbuild-std=core,compiler_builtins
 ```
 
 Add `--release` for an optimised build. The generated JAR is under the crate's `target/jvm-unknown-unknown/debug` or `target/jvm-unknown-unknown/release` directory and can be run with `java -jar`.
