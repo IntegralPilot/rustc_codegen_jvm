@@ -81,9 +81,9 @@ These examples live in `tests/binary`, are compiled to JVM bytecode, and are ver
 - **Outputs** executable, self-contained `.jar` generation for binary crates.
 - **Testing** with integration coverage across debug and release modes for all of the above.
 
-Full support for compiling the entire `core` and `compiler_builtins` crates from scratch for `jvm-unknown-unknown` was recently implemented - currently being initially demonstrated and tested through **[the `collatz` testcase](tests/binary/collatz/src/main.rs)**. 
+Full support for compiling the entire `core` and `compiler_builtins` crates from scratch for `jvm-unknown-unknown` was recently implemented and is currently demonstrated by the **[`collatz` testcase](tests/binary/collatz/src/main.rs)** and the **[`panic` testcase](tests/binary/panic/src/main.rs)**.
 
-Other tests which need things from `core` currently use the [java shim library](library/), though will be gradually switched over to the full Rust version over time.
+The [Java library](library/) contains JVM runtime support such as pointer and 128-bit-number carriers. It does not provide a substitute implementation of Rust's `core` APIs.
 
 The next goal is to integrate the upstream `coretests` to determine miscompilations and how close we are to full language support and potential upstreaming (which would require 100% pass state).
 
@@ -106,7 +106,7 @@ graph TD
 2. **lower1** generates a custom "Object-Oriented MIR" (OOMIR) by reshaping MIR into constructs closer to the JVM's object model.
 3. **optimise1** applies constant folding, constant propagation, dead code elimination, and algebraic simplification.
 4. **lower2** translates OOMIR into `.class` files via `ristretto_classfile`, including stack map frame generation.
-5. **java-linker** bundles the `.class` files with a small runtime shim into a self-contained, runnable `.jar` with an appropriate `META-INF/MANIFEST.MF`.
+5. **java-linker** bundles the `.class` files with the Java runtime support library into a self-contained, runnable `.jar` with an appropriate `META-INF/MANIFEST.MF`.
 
 ## Interop Model
 
@@ -164,7 +164,7 @@ python build.py all
 
 This builds the following, in dependency order:
 
-- The Java library shim (`library/`)
+- The Java runtime support library (`library/`)
 - The `java-linker` executable
 - The `rustc_codegen_jvm` backend library
 - Configuration files (`config.toml`, `jvm-unknown-unknown.json`)
@@ -226,7 +226,7 @@ Results are printed to the console, and temporary test artifacts are written to 
 │   └── oomir.rs              # OOMIR data definitions
 ├── java-linker/              # Bundles compiled .class files into .jar archives
 ├── tests/binary/             # Integration tests and example source crates
-├── library/                  # Java shim implementation for the Rust core library
+├── library/                  # Java runtime support classes
 ├── build.py                  # Orchestrator build script
 ├── config.toml.template      # Cargo configuration template
 ├── jvm-unknown-unknown.json.template

@@ -4,10 +4,7 @@ use super::jvm::{
     attributes::{ArrayType, Attribute, Instruction, StackFrame, VerificationType},
 };
 use crate::oomir::{self, Type};
-use std::{
-    collections::{BTreeSet, HashMap, VecDeque},
-    io::Cursor,
-};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum FrameValue {
@@ -250,12 +247,8 @@ pub(super) fn build_stack_map_attributes(
         context,
     )?;
 
-    let instruction_to_byte_map = instruction_to_byte_offsets(instructions)?;
     let name_index = constant_pool.add_utf8("StackMapTable")?;
     let mut previous_instruction_offset: Option<u16> = None;
-    let mut previous_byte_offset: Option<u16> = None;
-    let mut previous_locals =
-        locals_for_stack_map(initial_locals, constant_pool, &mut HashMap::new())?;
     let mut frames = Vec::new();
     let mut verification_class_cache = HashMap::new();
     for target in target_offsets {
@@ -265,35 +258,26 @@ pub(super) fn build_stack_map_attributes(
         let Some(state) = states.get(target as usize).and_then(Option::as_ref) else {
             continue;
         };
-        let byte_offset =
-            *instruction_to_byte_map
-                .get(&target)
-                .ok_or_else(|| jvm::Error::VerificationError {
-                    context: context.to_string(),
-                    message: format!("No byte offset for stack-map target instruction {target}"),
-                })?;
         let instruction_delta = match previous_instruction_offset {
             Some(previous) => target.saturating_sub(previous).saturating_sub(1),
             None => target,
-        };
-        let byte_delta = match previous_byte_offset {
-            Some(previous) => byte_offset.saturating_sub(previous).saturating_sub(1),
-            None => byte_offset,
         };
         let locals =
             locals_for_stack_map(&state.locals, constant_pool, &mut verification_class_cache)?;
         let stack =
             stack_for_stack_map(&state.stack, constant_pool, &mut verification_class_cache)?;
-        frames.push(compact_stack_frame(
-            &previous_locals,
-            &locals,
+        // Full frames are deliberately used here. Ristretto expects logical
+        // instruction deltas at this stage and converts them to JVM byte
+        // deltas while serializing the Code attribute. Keeping a single frame
+        // form avoids the compact-frame conversion that could desynchronise a
+        // StackMapTable and make a frame byte look like a verification tag.
+        frames.push(StackFrame::FullFrame {
+            frame_type: 255,
+            offset_delta: instruction_delta,
+            locals,
             stack,
-            instruction_delta,
-            byte_delta,
-        )?);
+        });
         previous_instruction_offset = Some(target);
-        previous_byte_offset = Some(byte_offset);
-        previous_locals = locals;
     }
 
     if frames.is_empty() {
@@ -301,88 +285,6 @@ pub(super) fn build_stack_map_attributes(
     } else {
         Ok(vec![Attribute::StackMapTable { name_index, frames }])
     }
-}
-
-fn instruction_to_byte_offsets(instructions: &[Instruction]) -> jvm::Result<HashMap<u16, u16>> {
-    let mut bytes = Cursor::new(Vec::new());
-    let mut offsets = HashMap::new();
-    for (index, instruction) in instructions.iter().enumerate() {
-        offsets.insert(u16::try_from(index)?, u16::try_from(bytes.position())?);
-        instruction.to_bytes(&mut bytes)?;
-    }
-    Ok(offsets)
-}
-
-fn compact_stack_frame(
-    previous_locals: &[VerificationType],
-    locals: &[VerificationType],
-    stack: Vec<VerificationType>,
-    instruction_delta: u16,
-    byte_delta: u16,
-) -> jvm::Result<StackFrame> {
-    if locals == previous_locals {
-        return if stack.is_empty() {
-            Ok(if byte_delta <= 63 {
-                StackFrame::SameFrame {
-                    frame_type: u8::try_from(instruction_delta)?,
-                }
-            } else {
-                StackFrame::SameFrameExtended {
-                    frame_type: 251,
-                    offset_delta: instruction_delta,
-                }
-            })
-        } else if stack.len() == 1 {
-            Ok(if byte_delta <= 63 {
-                StackFrame::SameLocals1StackItemFrame {
-                    frame_type: u8::try_from(instruction_delta.saturating_add(64))?,
-                    stack,
-                }
-            } else {
-                StackFrame::SameLocals1StackItemFrameExtended {
-                    frame_type: 247,
-                    offset_delta: instruction_delta,
-                    stack,
-                }
-            })
-        } else {
-            Ok(StackFrame::FullFrame {
-                frame_type: 255,
-                offset_delta: instruction_delta,
-                locals: locals.to_vec(),
-                stack,
-            })
-        };
-    }
-
-    if stack.is_empty() {
-        if previous_locals.starts_with(locals) {
-            let removed = previous_locals.len().saturating_sub(locals.len());
-            if (1..=3).contains(&removed) {
-                return Ok(StackFrame::ChopFrame {
-                    frame_type: u8::try_from(251usize.saturating_sub(removed))?,
-                    offset_delta: instruction_delta,
-                });
-            }
-        }
-        if locals.starts_with(previous_locals) {
-            let added = locals.len().saturating_sub(previous_locals.len());
-            if (1..=3).contains(&added) {
-                return Ok(StackFrame::AppendFrame {
-                    frame_type: u8::try_from(251 + added)?,
-                    offset_delta: instruction_delta,
-                    locals: locals[previous_locals.len()..].to_vec(),
-                });
-            }
-        }
-    }
-
-    Ok(StackFrame::FullFrame {
-        frame_type: 255,
-        offset_delta: instruction_delta,
-        locals: locals.to_vec(),
-        stack,
-    })
 }
 
 fn solve_frame_states(
@@ -1539,7 +1441,6 @@ fn frame_value_from_oomir_type(ty: &Type) -> FrameValue {
         Type::F32 => FrameValue::Float,
         Type::F64 => FrameValue::Double,
         Type::Str => FrameValue::Object(oomir::UTF8_VIEW_CLASS.to_string()),
-        Type::String => FrameValue::Object("java/lang/String".to_string()),
         Type::Class(name) | Type::Interface(name) => FrameValue::Object(normalize_class_name(name)),
         Type::Array(_) | Type::MutableReference(_) => FrameValue::Object(ty.to_jvm_descriptor()),
         Type::Pointer(_) => FrameValue::Object(oomir::POINTER_CLASS.to_string()),

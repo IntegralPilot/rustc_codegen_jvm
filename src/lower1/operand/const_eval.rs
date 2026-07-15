@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use super::super::{
     control_flow::rvalue::{
-        ensure_closure_fn_pointer_adapter_class, ensure_fn_pointer_adapter_class,
+        ensure_closure_fn_pointer_adapter_class, ensure_fn_pointer_adapter_class, fn_pointer_target,
     },
     jvm_names, ty_to_oomir_type,
     types::{
@@ -339,15 +339,10 @@ fn read_function_pointer_constant<'tcx>(
             instance,
         )
     } else {
-        let function_name =
-            super::super::naming::mono_fn_name_from_instance(tcx, function_instance);
-        let callable_target = function_instance
-            .def_id()
-            .is_local()
-            .then_some(&function_name);
+        let callable_target = fn_pointer_target(tcx, function_instance, &signature);
         ensure_fn_pointer_adapter_class(
             oomir_data_types,
-            callable_target,
+            callable_target.as_ref(),
             &signature,
             &interface_name,
             tcx,

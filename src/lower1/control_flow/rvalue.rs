@@ -91,7 +91,7 @@ fn emit_pointer_factory(
                 oomir::Type::Class("java/lang/Object".to_string()),
             ),
             ("size".to_string(), oomir::Type::I32),
-            ("codec".to_string(), oomir::Type::String),
+            ("codec".to_string(), oomir::Type::java_string()),
         ],
         "array" => vec![
             (
@@ -100,7 +100,7 @@ fn emit_pointer_factory(
             ),
             ("offset".to_string(), oomir::Type::I32),
             ("element_size".to_string(), oomir::Type::I32),
-            ("codec".to_string(), oomir::Type::String),
+            ("codec".to_string(), oomir::Type::java_string()),
         ],
         "nullPointer" => Vec::new(),
         other => panic!("unknown pointer factory {other}"),
@@ -161,7 +161,7 @@ fn emit_array_pointer(
                         oomir::Type::Class("java/lang/Object".to_string()),
                     ),
                     ("element_size".to_string(), oomir::Type::I32),
-                    ("codec".to_string(), oomir::Type::String),
+                    ("codec".to_string(), oomir::Type::java_string()),
                 ],
                 ret: Box::new(pointer_ty.clone()),
                 is_static: true,
@@ -242,7 +242,12 @@ fn emit_pointer_to_place<'tcx>(
                 let (base_name, base_instructions, base_ty) =
                     emit_instructions_to_get_on_own(&base_place, tcx, instance, mir, data_types);
                 instructions.extend(base_instructions);
-                if matches!(base_ty, oomir::Type::Pointer(_)) {
+                let dereferences_direct_jvm_self = base_place.local.index() == 1
+                    && base_place.projection.is_empty()
+                    && tcx
+                        .opt_associated_item(instance.def_id())
+                        .is_some_and(|item| item.is_method());
+                if matches!(base_ty, oomir::Type::Pointer(_)) && !dereferences_direct_jvm_self {
                     let dest = format!("{temp_prefix}_reborrow");
                     instructions.push(oomir::Instruction::Move {
                         dest: dest.clone(),
@@ -284,7 +289,7 @@ fn emit_pointer_to_place<'tcx>(
                             params: vec![
                                 ("self".to_string(), pointer_ty.clone()),
                                 ("view_size".to_string(), oomir::Type::I32),
-                                ("view_codec".to_string(), oomir::Type::String),
+                                ("view_codec".to_string(), oomir::Type::java_string()),
                             ],
                             ret: Box::new(pointer_ty.clone()),
                             is_static: false,
@@ -408,7 +413,9 @@ fn emit_pointer_to_place<'tcx>(
                                 ty: value_ty,
                             },
                             oomir::Operand::Constant(oomir::Constant::I32(0)),
-                            oomir::Operand::Constant(oomir::Constant::Null(oomir::Type::String)),
+                            oomir::Operand::Constant(oomir::Constant::Null(
+                                oomir::Type::java_string(),
+                            )),
                         ],
                         pointer_ty,
                         &format!("{temp_prefix}_zst_field_ptr_{}", field_index.index()),
@@ -475,7 +482,7 @@ fn emit_pointer_to_place<'tcx>(
                             params: vec![
                                 ("pointer".to_string(), base_pointer_ty),
                                 ("view_size".to_string(), oomir::Type::I32),
-                                ("view_codec".to_string(), oomir::Type::String),
+                                ("view_codec".to_string(), oomir::Type::java_string()),
                             ],
                             ret: Box::new(pointer_ty.clone()),
                             is_static: true,
@@ -636,9 +643,85 @@ fn adapt_value_for_field<'tcx>(
     value_operand
 }
 
+#[derive(Debug, Clone)]
+pub(crate) enum FnPointerTarget {
+    Static(super::super::naming::FnNameData),
+    Virtual {
+        class_name: String,
+        method_name: String,
+    },
+    Interface {
+        class_name: String,
+        method_name: String,
+    },
+}
+
+impl FnPointerTarget {
+    fn display_name(&self) -> String {
+        match self {
+            Self::Static(target) => target.class_to_call_on.as_deref().map_or_else(
+                || target.method_name.clone(),
+                |class| format!("{class}::{}", target.method_name),
+            ),
+            Self::Virtual {
+                class_name,
+                method_name,
+            }
+            | Self::Interface {
+                class_name,
+                method_name,
+            } => format!("{class_name}::{method_name}"),
+        }
+    }
+}
+
+/// Finds a callable JVM target for a Rust function pointer. Dependency
+/// functions normally have a static entry point in their own jar. An external
+/// trait method whose receiver is a managed object is instead dispatched
+/// through that object's generated JVM method, because its Rust function
+/// pointer ABI carries `&Self` as a Pointer.
+pub(crate) fn fn_pointer_target<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    target_instance: Instance<'tcx>,
+    signature: &oomir::Signature,
+) -> Option<FnPointerTarget> {
+    let static_name = super::super::naming::mono_fn_name_from_instance(tcx, target_instance);
+    if target_instance.def_id().is_local() {
+        return Some(FnPointerTarget::Static(static_name));
+    }
+
+    let Some(associated_item) = tcx.opt_associated_item(target_instance.def_id()) else {
+        return Some(FnPointerTarget::Static(static_name));
+    };
+    if !associated_item.is_method() {
+        return Some(FnPointerTarget::Static(static_name));
+    }
+    let (_, receiver_ty) = signature.params.first()?;
+    let receiver_ty = match receiver_ty {
+        oomir::Type::Pointer(inner) | oomir::Type::Reference(inner) => inner.as_ref(),
+        other => other,
+    };
+    let method_name =
+        super::super::naming::associated_method_name_from_instance(tcx, target_instance);
+    match receiver_ty {
+        oomir::Type::Class(class_name) => Some(FnPointerTarget::Virtual {
+            class_name: class_name.clone(),
+            method_name,
+        }),
+        oomir::Type::Interface(class_name) => Some(FnPointerTarget::Interface {
+            class_name: class_name.clone(),
+            method_name,
+        }),
+        // Primitive and slice-like receivers have no JVM object on which to
+        // dispatch. Their compiled-core implementation is emitted as a static
+        // method with the Rust function-pointer ABI.
+        _ => Some(FnPointerTarget::Static(static_name)),
+    }
+}
+
 pub(crate) fn ensure_fn_pointer_adapter_class<'tcx>(
     data_types: &mut HashMap<String, oomir::DataType>,
-    target_function: Option<&super::super::naming::FnNameData>,
+    target_function: Option<&FnPointerTarget>,
     signature: &oomir::Signature,
     interface_name: &str,
     tcx: TyCtxt<'tcx>,
@@ -646,12 +729,7 @@ pub(crate) fn ensure_fn_pointer_adapter_class<'tcx>(
 ) -> String {
     let descriptor = signature.to_jvm_descriptor_with_explicit_params();
     let target_name = target_function
-        .map(|target| {
-            target.class_to_call_on.as_deref().map_or_else(
-                || target.method_name.clone(),
-                |class| format!("{class}::{}", target.method_name),
-            )
-        })
+        .map(FnPointerTarget::display_name)
         .unwrap_or_else(|| "unsupported".to_string());
     let hash = short_hash(&format!("{target_name}:{descriptor}"), 10);
     let base_name: String = jvm_names::path_segment(&target_name)
@@ -674,7 +752,7 @@ pub(crate) fn ensure_fn_pointer_adapter_class<'tcx>(
         } else {
             Some("_ret".to_string())
         };
-        let call_args = signature
+        let mut call_args: Vec<_> = signature
             .params
             .iter()
             .enumerate()
@@ -684,16 +762,51 @@ pub(crate) fn ensure_fn_pointer_adapter_class<'tcx>(
             })
             .collect();
 
-        let mut instructions = vec![oomir::Instruction::InvokeStatic {
-            dest: call_dest.clone(),
-            class_name: target_function
-                .class_to_call_on
-                .clone()
-                .expect("function pointer targets have JVM owners"),
-            method_name: target_function.method_name.clone(),
-            method_ty: signature.clone(),
-            args: call_args,
-        }];
+        let call = match target_function {
+            FnPointerTarget::Static(target) => oomir::Instruction::InvokeStatic {
+                dest: call_dest.clone(),
+                class_name: target
+                    .class_to_call_on
+                    .clone()
+                    .expect("function pointer targets have JVM owners"),
+                method_name: target.method_name.clone(),
+                method_ty: signature.clone(),
+                args: call_args,
+            },
+            FnPointerTarget::Virtual {
+                class_name,
+                method_name,
+            } => {
+                let receiver = call_args.remove(0);
+                let mut method_ty = signature.clone();
+                method_ty.is_static = false;
+                oomir::Instruction::InvokeVirtual {
+                    dest: call_dest.clone(),
+                    class_name: class_name.clone(),
+                    method_name: method_name.clone(),
+                    method_ty,
+                    args: call_args,
+                    operand: receiver,
+                }
+            }
+            FnPointerTarget::Interface {
+                class_name,
+                method_name,
+            } => {
+                let receiver = call_args.remove(0);
+                let mut method_ty = signature.clone();
+                method_ty.is_static = false;
+                oomir::Instruction::InvokeInterface {
+                    dest: call_dest.clone(),
+                    class_name: class_name.clone(),
+                    method_name: method_name.clone(),
+                    method_ty,
+                    args: call_args,
+                    operand: receiver,
+                }
+            }
+        };
+        let mut instructions = vec![call];
 
         instructions.push(oomir::Instruction::Return {
             operand: call_dest.map(|name| oomir::Operand::Variable {
@@ -1224,6 +1337,7 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                         array: temp_array_var.clone(),
                         index: index_operand,
                         value: oomir_elem_op.clone(),
+                        copy_value: true,
                     });
                 }
                 result_operand = oomir::Operand::Variable {
@@ -1360,6 +1474,7 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                         array: array_ref_var_name.clone(),
                         index: oomir::Operand::Constant(oomir::Constant::I32(0)),
                         value: pointee_value_operand,
+                        copy_value: false,
                     });
 
                     // 6. The result is the reference to the newly created array.
@@ -1549,7 +1664,7 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                         fn_ptr_signature_from_ty(*target_mir_ty, tcx, data_types, instance);
                     let interface_name =
                         ensure_fn_ptr_interface(&signature, data_types, tcx, instance);
-                    let callable_target = func_instance.def_id().is_local().then_some(&fn_name);
+                    let callable_target = fn_pointer_target(tcx, func_instance, &signature);
                     if callable_target.is_none() {
                         breadcrumbs::log!(
                             breadcrumbs::LogLevel::Warn,
@@ -1562,7 +1677,7 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                     }
                     let adapter_class = ensure_fn_pointer_adapter_class(
                         data_types,
-                        callable_target,
+                        callable_target.as_ref(),
                         &signature,
                         &interface_name,
                         tcx,
@@ -1694,7 +1809,7 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                                         oomir::Type::Class("java/lang/Object".to_string()),
                                     ),
                                     ("size".to_string(), oomir::Type::I32),
-                                    ("codec".to_string(), oomir::Type::String),
+                                    ("codec".to_string(), oomir::Type::java_string()),
                                 ],
                                 ret: Box::new(oomir_target_type.clone()),
                                 is_static: true,
@@ -1775,7 +1890,7 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                                 params: vec![
                                     ("address".to_string(), oomir::Type::U64),
                                     ("view_size".to_string(), oomir::Type::I32),
-                                    ("view_codec".to_string(), oomir::Type::String),
+                                    ("view_codec".to_string(), oomir::Type::java_string()),
                                 ],
                                 ret: Box::new(oomir_target_type.clone()),
                                 is_static: true,
@@ -1941,7 +2056,7 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                                         oomir::Type::Class("java/lang/Object".to_string()),
                                     ),
                                     ("element_size".to_string(), oomir::Type::I32),
-                                    ("codec".to_string(), oomir::Type::String),
+                                    ("codec".to_string(), oomir::Type::java_string()),
                                 ],
                                 ret: Box::new(oomir_target_type.clone()),
                                 is_static: true,
@@ -1968,7 +2083,7 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                                 params: vec![
                                     ("self".to_string(), oomir_target_type.clone()),
                                     ("view_size".to_string(), oomir::Type::I32),
-                                    ("view_codec".to_string(), oomir::Type::String),
+                                    ("view_codec".to_string(), oomir::Type::java_string()),
                                 ],
                                 ret: Box::new(oomir_target_type.clone()),
                                 is_static: false,
@@ -2014,7 +2129,7 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                                 params: vec![
                                     ("self".to_string(), oomir_source_type.clone()),
                                     ("view_size".to_string(), oomir::Type::I32),
-                                    ("view_codec".to_string(), oomir::Type::String),
+                                    ("view_codec".to_string(), oomir::Type::java_string()),
                                 ],
                                 ret: Box::new(oomir_target_type.clone()),
                                 is_static: false,
@@ -2062,68 +2177,6 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                             args: vec![oomir_operand],
                             dest: Some(temp_cast_var.clone()),
                         });
-                    } else if matches!(
-                        (&oomir_source_type, &oomir_target_type),
-                        (oomir::Type::Str, oomir::Type::String)
-                    ) {
-                        instructions.push(oomir::Instruction::InvokeStatic {
-                            class_name: oomir::UTF8_VIEW_CLASS.to_string(),
-                            method_name: "toJavaString".to_string(),
-                            method_ty: oomir::Signature {
-                                params: vec![("value".to_string(), oomir::Type::Str)],
-                                ret: Box::new(oomir::Type::String),
-                                is_static: true,
-                            },
-                            args: vec![oomir_operand],
-                            dest: Some(temp_cast_var.clone()),
-                        });
-                    } else if matches!(
-                        (&oomir_source_type, &oomir_target_type),
-                        (oomir::Type::String, oomir::Type::Str)
-                    ) {
-                        instructions.push(oomir::Instruction::InvokeStatic {
-                            class_name: oomir::UTF8_VIEW_CLASS.to_string(),
-                            method_name: "fromJavaString".to_string(),
-                            method_ty: oomir::Signature {
-                                params: vec![("value".to_string(), oomir::Type::String)],
-                                ret: Box::new(oomir::Type::Str),
-                                is_static: true,
-                            },
-                            args: vec![oomir_operand],
-                            dest: Some(temp_cast_var.clone()),
-                        });
-                    } else if matches!(
-                        (&oomir_source_type, &oomir_target_type),
-                        (oomir::Type::Slice(element_type), oomir::Type::String)
-                            if matches!(element_type.as_ref(), oomir::Type::I16)
-                    ) {
-                        instructions.push(oomir::Instruction::InvokeStatic {
-                            class_name: oomir::SLICE_VIEW_CLASS.to_string(),
-                            method_name: "toUtf8String".to_string(),
-                            method_ty: oomir::Signature {
-                                params: vec![("value".to_string(), oomir_source_type.clone())],
-                                ret: Box::new(oomir::Type::String),
-                                is_static: true,
-                            },
-                            args: vec![oomir_operand],
-                            dest: Some(temp_cast_var.clone()),
-                        });
-                    } else if matches!(
-                        (&oomir_source_type, &oomir_target_type),
-                        (oomir::Type::String, oomir::Type::Slice(element_type))
-                            if matches!(element_type.as_ref(), oomir::Type::I16)
-                    ) {
-                        instructions.push(oomir::Instruction::InvokeStatic {
-                            class_name: oomir::SLICE_VIEW_CLASS.to_string(),
-                            method_name: "fromString".to_string(),
-                            method_ty: oomir::Signature {
-                                params: vec![("value".to_string(), oomir::Type::String)],
-                                ret: Box::new(oomir_target_type.clone()),
-                                is_static: true,
-                            },
-                            args: vec![oomir_operand],
-                            dest: Some(temp_cast_var.clone()),
-                        });
                     } else if matches!(oomir_target_type, oomir::Type::Slice(_))
                         && (matches!(
                             oomir_source_type,
@@ -2165,7 +2218,7 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                                         params: vec![
                                             ("pointer".to_string(), oomir_source_type.clone()),
                                             ("view_size".to_string(), oomir::Type::I32),
-                                            ("view_codec".to_string(), oomir::Type::String),
+                                            ("view_codec".to_string(), oomir::Type::java_string()),
                                         ],
                                         ret: Box::new(element_pointer_ty.clone()),
                                         is_static: true,
@@ -2829,6 +2882,7 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                             array: temp_aggregate_var.clone(),
                             index: index_operand,
                             value: value_operand,
+                            copy_value: false,
                         });
                     }
                 }
@@ -3276,6 +3330,9 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                     }
                 }
                 rustc_middle::mir::AggregateKind::RawPtr(pointee_ty, _) => {
+                    let pointee_ty = EarlyBinder::bind(tcx, *pointee_ty)
+                        .instantiate(tcx, instance.args)
+                        .skip_norm_wip();
                     let data = convert_operand(
                         &operands[FieldIdx::from_usize(0)],
                         tcx,
@@ -3373,7 +3430,7 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                             .get_type()
                             .expect("thin raw pointer aggregate data pointer is typed");
                         if let Ok(pointee_size) =
-                            super::super::types::layout_size_bytes(tcx, *pointee_ty)
+                            super::super::types::layout_size_bytes(tcx, pointee_ty)
                         {
                             instructions.push(oomir::Instruction::InvokeStatic {
                                 dest: Some(temp_aggregate_var.clone()),
@@ -3383,7 +3440,7 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                                     params: vec![
                                         ("pointer".to_string(), data_ty),
                                         ("view_size".to_string(), oomir::Type::I32),
-                                        ("view_codec".to_string(), oomir::Type::String),
+                                        ("view_codec".to_string(), oomir::Type::java_string()),
                                     ],
                                     ret: Box::new(aggregate_oomir_type.clone()),
                                     is_static: true,
@@ -3396,10 +3453,7 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                                         ),
                                     )),
                                     super::super::types::pointer_memory_codec_operand(
-                                        *pointee_ty,
-                                        tcx,
-                                        data_types,
-                                        instance,
+                                        pointee_ty, tcx, data_types, instance,
                                     ),
                                 ],
                             });

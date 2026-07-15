@@ -63,14 +63,14 @@ pub fn fn_ptr_signature_from_ty<'tcx>(
 pub fn ensure_fn_ptr_interface<'tcx>(
     signature: &oomir::Signature,
     data_types: &mut HashMap<String, oomir::DataType>,
-    tcx: TyCtxt<'tcx>,
-    instance_context: rustc_middle::ty::Instance<'tcx>,
+    _tcx: TyCtxt<'tcx>,
+    _instance_context: rustc_middle::ty::Instance<'tcx>,
 ) -> String {
-    let interface_name = jvm_names::synthetic_class_for_instance(
-        tcx,
-        instance_context,
-        signature.fn_ptr_interface_name(),
-    );
+    // A function-pointer ABI is identified by its descriptor, not by the
+    // crate which happened to instantiate it. Crate-local owners allowed the
+    // same core aggregate field to alternate between core.FnPtr_*,
+    // compiler_builtins.FnPtr_*, and panic.FnPtr_* as jars were merged.
+    let interface_name = format!("org/rustlang/runtime/{}", signature.fn_ptr_interface_name());
     let method_signature = signature.fn_ptr_interface_method_signature();
 
     match data_types.get_mut(&interface_name) {
@@ -899,6 +899,7 @@ fn emit_bits_to_union_bytes(
             array: storage.bytes_var.clone(),
             index,
             value: operand_var(byte_dest, oomir::Type::I8),
+            copy_value: false,
         });
     }
 
@@ -946,6 +947,7 @@ fn emit_scalar_to_union_bytes<'tcx>(
                 array: storage.bytes_var.clone(),
                 index,
                 value: operand_var(byte_dest, oomir::Type::I8),
+                copy_value: false,
             });
         }
         return Ok(());
@@ -1578,6 +1580,7 @@ fn emit_object_to_union_storage(
         array: storage.objects_var.clone(),
         index,
         value: source,
+        copy_value: false,
     });
 }
 
@@ -1621,6 +1624,7 @@ fn emit_managed_object_to_union_bytes(
             array: storage.bytes_var.clone(),
             index,
             value: oomir::Operand::Constant(oomir::Constant::I8(0)),
+            copy_value: false,
         });
     }
     // Keep the side table populated for existing union helpers as well. Raw
@@ -1725,6 +1729,7 @@ fn emit_union_storage_copy(
             array: target.bytes_var.clone(),
             index: target_index,
             value: operand_var(byte_dest, oomir::Type::I8),
+            copy_value: false,
         });
 
         let object_dest = next_union_temp("union_copied_object", temp_counter);
@@ -1744,6 +1749,7 @@ fn emit_union_storage_copy(
                 object_dest,
                 oomir::Type::Class("java/lang/Object".to_string()),
             ),
+            copy_value: false,
         });
     }
 }
@@ -1812,7 +1818,7 @@ fn emit_ty_to_union_bytes<'tcx>(
                             oomir::Type::Class("java/lang/Object".to_string()),
                         ),
                         ("element_size".to_string(), oomir::Type::I32),
-                        ("codec".to_string(), oomir::Type::String),
+                        ("codec".to_string(), oomir::Type::java_string()),
                     ],
                     ret: Box::new(pointer_ty.clone()),
                     is_static: true,
@@ -2335,7 +2341,7 @@ fn emit_ty_from_union_bytes<'tcx>(
                     params: vec![
                         ("address".to_string(), oomir::Type::U64),
                         ("view_size".to_string(), oomir::Type::I32),
-                        ("view_codec".to_string(), oomir::Type::String),
+                        ("view_codec".to_string(), oomir::Type::java_string()),
                     ],
                     ret: Box::new(pointer_ty.clone()),
                     is_static: true,
@@ -2415,6 +2421,7 @@ fn emit_ty_from_union_bytes<'tcx>(
                     array: array_dest.clone(),
                     index: oomir::Operand::Constant(oomir::Constant::I32(index as i32)),
                     value: element_value,
+                    copy_value: false,
                 });
             }
             Ok(operand_var(array_dest, array_ty))
@@ -2948,14 +2955,14 @@ pub(super) fn pointer_memory_codec_operand<'tcx>(
     }
     match ensure_pointer_memory_codec(ty, tcx, data_types, instance_context) {
         Ok(Some(codec)) => oomir::Operand::Constant(oomir::Constant::String(codec.class_name)),
-        Ok(None) => oomir::Operand::Constant(oomir::Constant::Null(oomir::Type::String)),
+        Ok(None) => oomir::Operand::Constant(oomir::Constant::Null(oomir::Type::java_string())),
         Err(error) => {
             breadcrumbs::log!(
                 breadcrumbs::LogLevel::Info,
                 "type-mapping",
                 format!("Pointer memory codec is unavailable for {ty:?}: {error}")
             );
-            oomir::Operand::Constant(oomir::Constant::Null(oomir::Type::String))
+            oomir::Operand::Constant(oomir::Constant::Null(oomir::Type::java_string()))
         }
     }
 }
@@ -2977,12 +2984,22 @@ pub(super) fn pointer_view_codec_operand<'tcx>(
         Ok(Some(codec)) => oomir::Operand::Constant(oomir::Constant::String(codec.class_name)),
         Ok(None) | Err(_) => {
             let jvm_ty = ty_to_oomir_type(ty, tcx, data_types, instance_context);
-            if jvm_ty.is_jvm_reference_type() {
+            if matches!(
+                ty.kind(),
+                TyKind::Tuple(_) | TyKind::Array(_, _) | TyKind::Adt(_, _)
+            ) {
+                // Aggregate allocations store their JVM carrier directly. If an exact byte
+                // codec is unavailable, retaining the allocation's direct view still permits
+                // ordinary aligned dereferences. `@managed-object` instead describes an
+                // object reference stored *inside* memory and would try to decode address
+                // bytes from the aggregate object itself.
+                oomir::Operand::Constant(oomir::Constant::Null(oomir::Type::java_string()))
+            } else if jvm_ty.is_jvm_reference_type() {
                 oomir::Operand::Constant(oomir::Constant::String(
                     MANAGED_OBJECT_POINTER_VIEW_CODEC.to_string(),
                 ))
             } else {
-                oomir::Operand::Constant(oomir::Constant::Null(oomir::Type::String))
+                oomir::Operand::Constant(oomir::Constant::Null(oomir::Type::java_string()))
             }
         }
     }
@@ -3465,110 +3482,94 @@ pub fn ty_to_oomir_type<'tcx>(
             FloatTy::F128 => oomir::Type::Class(crate::lower2::F128_CLASS.to_string()),
         },
         rustc_middle::ty::TyKind::Adt(adt_def, substs) => {
-            // Get the full path string for the ADT
-            let full_path_str = tcx.def_path_str(adt_def.did());
+            let jvm_name_full =
+                generate_adt_jvm_class_name(&adt_def, substs, tcx, data_types, instance_context);
 
-            if full_path_str == "String" || full_path_str == "std::string::String" {
-                oomir::Type::String
-            } else {
-                let jvm_name_full = generate_adt_jvm_class_name(
+            if !should_define_named_data_type(tcx, adt_def.did()) && substs.is_empty() {
+                return oomir::Type::Class(jvm_name_full);
+            }
+
+            if adt_def.is_struct() {
+                let variant = adt_def.variant(0usize.into());
+                if !data_types.contains_key(&jvm_name_full) {
+                    // Pre-populate with a placeholder class to break recursive resolution loops
+                    data_types.insert(
+                        jvm_name_full.clone(),
+                        oomir::DataType::Class {
+                            fields: vec![],
+                            is_abstract: false,
+                            methods: HashMap::new(),
+                            super_class: None,
+                            interfaces: vec![],
+                        },
+                    );
+
+                    let oomir_fields = variant
+                        .fields
+                        .iter()
+                        .filter_map(|field_def| {
+                            let field_name = field_def.ident(tcx).to_string();
+                            let field_ty = field_def.ty(tcx, substs);
+                            let field_mir_ty =
+                                if field_ty.has_param() || field_ty.has_escaping_bound_vars() {
+                                    field_ty.skip_norm_wip()
+                                } else {
+                                    tcx.try_normalize_erasing_regions(
+                                        TypingEnv::fully_monomorphized(),
+                                        field_ty,
+                                    )
+                                    .unwrap_or_else(|_| field_ty.skip_norm_wip())
+                                };
+                            let field_oomir_type =
+                                ty_to_oomir_type(field_mir_ty, tcx, data_types, instance_context);
+                            field_oomir_type
+                                .has_jvm_value()
+                                .then_some((field_name, field_oomir_type))
+                        })
+                        .collect::<Vec<_>>();
+                    let mut methods = HashMap::new();
+                    methods.insert(
+                        "eq".to_string(),
+                        DataTypeMethod::AdtHelperMethod {
+                            kind: oomir::AdtHelperKind::PartialEqClass {
+                                fields: oomir_fields.clone(),
+                            },
+                        },
+                    );
+                    if let Some(oomir::DataType::Class {
+                        fields,
+                        methods: existing_methods,
+                        ..
+                    }) = data_types.get_mut(&jvm_name_full)
+                    {
+                        *fields = oomir_fields;
+                        *existing_methods = methods;
+                    }
+                } else if let Some(oomir::DataType::Class {
+                    fields, methods, ..
+                }) = data_types.get_mut(&jvm_name_full)
+                {
+                    methods.entry("eq".to_string()).or_insert_with(|| {
+                        DataTypeMethod::AdtHelperMethod {
+                            kind: oomir::AdtHelperKind::PartialEqClass {
+                                fields: fields.clone(),
+                            },
+                        }
+                    });
+                }
+            } else if adt_def.is_enum() {
+                ensure_enum_data_types(
                     &adt_def,
                     substs,
+                    &jvm_name_full,
                     tcx,
                     data_types,
                     instance_context,
                 );
-
-                if !should_define_named_data_type(tcx, adt_def.did()) && substs.is_empty() {
-                    return oomir::Type::Class(jvm_name_full);
-                }
-
-                if adt_def.is_struct() {
-                    let variant = adt_def.variant(0usize.into());
-                    if !data_types.contains_key(&jvm_name_full) {
-                        // Pre-populate with a placeholder class to break recursive resolution loops
-                        data_types.insert(
-                            jvm_name_full.clone(),
-                            oomir::DataType::Class {
-                                fields: vec![],
-                                is_abstract: false,
-                                methods: HashMap::new(),
-                                super_class: None,
-                                interfaces: vec![],
-                            },
-                        );
-
-                        let oomir_fields = variant
-                            .fields
-                            .iter()
-                            .filter_map(|field_def| {
-                                let field_name = field_def.ident(tcx).to_string();
-                                let field_ty = field_def.ty(tcx, substs);
-                                let field_mir_ty =
-                                    if field_ty.has_param() || field_ty.has_escaping_bound_vars() {
-                                        field_ty.skip_norm_wip()
-                                    } else {
-                                        tcx.try_normalize_erasing_regions(
-                                            TypingEnv::fully_monomorphized(),
-                                            field_ty,
-                                        )
-                                        .unwrap_or_else(|_| field_ty.skip_norm_wip())
-                                    };
-                                let field_oomir_type = ty_to_oomir_type(
-                                    field_mir_ty,
-                                    tcx,
-                                    data_types,
-                                    instance_context,
-                                );
-                                field_oomir_type
-                                    .has_jvm_value()
-                                    .then_some((field_name, field_oomir_type))
-                            })
-                            .collect::<Vec<_>>();
-                        let mut methods = HashMap::new();
-                        methods.insert(
-                            "eq".to_string(),
-                            DataTypeMethod::AdtHelperMethod {
-                                kind: oomir::AdtHelperKind::PartialEqClass {
-                                    fields: oomir_fields.clone(),
-                                },
-                            },
-                        );
-                        if let Some(oomir::DataType::Class {
-                            fields,
-                            methods: existing_methods,
-                            ..
-                        }) = data_types.get_mut(&jvm_name_full)
-                        {
-                            *fields = oomir_fields;
-                            *existing_methods = methods;
-                        }
-                    } else if let Some(oomir::DataType::Class {
-                        fields, methods, ..
-                    }) = data_types.get_mut(&jvm_name_full)
-                    {
-                        methods.entry("eq".to_string()).or_insert_with(|| {
-                            DataTypeMethod::AdtHelperMethod {
-                                kind: oomir::AdtHelperKind::PartialEqClass {
-                                    fields: fields.clone(),
-                                },
-                            }
-                        });
-                    }
-                } else if adt_def.is_enum() {
-                    ensure_enum_data_types(
-                        &adt_def,
-                        substs,
-                        &jvm_name_full,
-                        tcx,
-                        data_types,
-                        instance_context,
-                    );
-                } else if adt_def.is_union() {
-                    ensure_union_data_type(&adt_def, substs, tcx, data_types, instance_context);
-                }
-                oomir::Type::Class(jvm_name_full)
+            } else if adt_def.is_union() {
+                ensure_union_data_type(&adt_def, substs, tcx, data_types, instance_context);
             }
+            oomir::Type::Class(jvm_name_full)
         }
         rustc_middle::ty::TyKind::Str => oomir::Type::Str,
         // Opaque metadata markers such as the compiler's trait-object VTable
@@ -3922,7 +3923,6 @@ pub fn readable_oomir_type_name(t: &oomir::Type) -> String {
         Type::F32 => "f32".to_string(),
         Type::F64 => "f64".to_string(),
         Type::Str => "Str".to_string(),
-        Type::String => "String".to_string(),
         Type::Void => "Void".to_string(),
         Type::Unit => "Unit".to_string(),
         Type::Class(name) => {
@@ -3939,6 +3939,52 @@ pub fn readable_oomir_type_name(t: &oomir::Type) -> String {
             let seg = name.rsplit('/').next().unwrap_or(name);
             format!("I{}", seg)
         }
+    }
+}
+
+/// Produce a readable type token without erasing Rust distinctions that share a
+/// JVM carrier. In particular, DST references such as `&str` are represented by
+/// the same `Utf8View` carrier as `str`, but they are different generic types and
+/// must not be assigned the same generated class name.
+pub fn readable_rust_type_name<'tcx>(
+    ty: Ty<'tcx>,
+    tcx: TyCtxt<'tcx>,
+    data_types: &mut HashMap<String, oomir::DataType>,
+    instance_context: rustc_middle::ty::Instance<'tcx>,
+) -> String {
+    match ty.kind() {
+        TyKind::Ref(_, inner, mutability) => format!(
+            "{}{}",
+            if mutability.is_mut() { "MutRef" } else { "Ref" },
+            readable_rust_type_name(*inner, tcx, data_types, instance_context)
+        ),
+        TyKind::RawPtr(inner, mutability) => format!(
+            "{}{}",
+            if mutability.is_mut() {
+                "MutPtr"
+            } else {
+                "ConstPtr"
+            },
+            readable_rust_type_name(*inner, tcx, data_types, instance_context)
+        ),
+        TyKind::Array(inner, length) => {
+            let length = length
+                .try_to_target_usize(tcx)
+                .map(|length| length.to_string())
+                .unwrap_or_else(|| "Unknown".to_string());
+            format!(
+                "{}Array{}",
+                readable_rust_type_name(*inner, tcx, data_types, instance_context),
+                length
+            )
+        }
+        TyKind::Slice(inner) => format!(
+            "{}Slice",
+            readable_rust_type_name(*inner, tcx, data_types, instance_context)
+        ),
+        TyKind::Int(IntTy::Isize) => "isize".to_string(),
+        TyKind::Uint(UintTy::Usize) => "usize".to_string(),
+        _ => readable_oomir_type_name(&ty_to_oomir_type(ty, tcx, data_types, instance_context)),
     }
 }
 
@@ -3968,8 +4014,7 @@ pub fn generate_adt_jvm_class_name<'tcx>(
     let mut generic_tokens: Vec<String> = Vec::new();
     for arg in substs.iter() {
         if let Some(arg_ty) = arg.as_type() {
-            let oomir_ty = ty_to_oomir_type(arg_ty, tcx, data_types, instance_context);
-            let token = readable_oomir_type_name(&oomir_ty);
+            let token = readable_rust_type_name(arg_ty, tcx, data_types, instance_context);
             generic_tokens.push(sanitize_name_token(&token));
         } else {
             generic_tokens.push("_".to_string());

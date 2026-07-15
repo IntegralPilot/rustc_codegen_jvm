@@ -6,6 +6,7 @@ import subprocess
 import shutil
 import argparse
 import platform
+import zipfile
 from pathlib import Path
 from typing import List
 
@@ -56,6 +57,8 @@ class Config:
     RUST_BACKEND_DYLIB = ROOT_DIR / "target/release" / f"{DYLIB_PREFIX}rustc_codegen_jvm{DYLIB_SUFFIX}"
     JAVA_LINKER_EXE = JAVA_LINKER_DIR / "target/release/java-linker"
 
+    RUNTIME_CLASS_PREFIX = "org/rustlang/runtime/"
+
 # --- Helper Functions ---
 
 def run_command(cmd: List[str], cwd: Path = None, check: bool = True):
@@ -93,6 +96,19 @@ def is_stale(target: Path, sources: List[Path]) -> bool:
             return True
     return False
 
+def contains_non_runtime_classes(jar_path: Path) -> bool:
+    """Checks whether a runtime JAR contains classes outside its owned package."""
+    if not jar_path.exists():
+        return False
+    try:
+        with zipfile.ZipFile(jar_path) as archive:
+            return any(
+                name.endswith(".class") and not name.startswith(Config.RUNTIME_CLASS_PREFIX)
+                for name in archive.namelist()
+            )
+    except (OSError, zipfile.BadZipFile):
+        return True
+
 # --- Build Tasks (Replaces Makefile Targets) ---
 
 def clean():
@@ -126,16 +142,17 @@ def install_rust_components():
     run_command(["rustup", "component", "add", "rustc-dev", "llvm-tools"])
 
 def build_library():
-    """Builds the Java standard library shim."""
-    if not is_stale(Config.LIBRARY_JAR, Config.LIBRARY_SOURCES):
-        print(f"{Colors.GREEN}✅ Java library shim is up to date.{Colors.RESET}")
+    """Builds the Java runtime support library."""
+    if (not is_stale(Config.LIBRARY_JAR, Config.LIBRARY_SOURCES)
+            and not contains_non_runtime_classes(Config.LIBRARY_JAR)):
+        print(f"{Colors.GREEN}✅ Java runtime library is up to date.{Colors.RESET}")
         return
 
     if not Config.LIBRARY_SOURCES:
         print(f"{Colors.RED}❌ No Java sources found under {Config.LIBRARY_DIR / 'src'}{Colors.RESET}")
         sys.exit(1)
 
-    print(f"{Colors.CYAN}📚 Building Java library shim...{Colors.RESET}")
+    print(f"{Colors.CYAN}📚 Building Java runtime library...{Colors.RESET}")
 
     if Config.LIBRARY_CLASSES_DIR.exists():
         shutil.rmtree(Config.LIBRARY_CLASSES_DIR)
@@ -163,8 +180,11 @@ def build_library():
     if not Config.LIBRARY_JAR.exists():
         print(f"{Colors.RED}❌ Expected library JAR was not created: {Config.LIBRARY_JAR}{Colors.RESET}")
         sys.exit(1)
+    if contains_non_runtime_classes(Config.LIBRARY_JAR):
+        print(f"{Colors.RED}❌ Java runtime JAR contains classes outside org.rustlang.runtime.{Colors.RESET}")
+        sys.exit(1)
 
-    print(f"{Colors.GREEN}   Java library shim built successfully.{Colors.RESET}")
+    print(f"{Colors.GREEN}   Java runtime library built successfully.{Colors.RESET}")
 
 def build_rust_backend():
     """Builds the main rustc_codegen_jvm backend."""
@@ -243,7 +263,7 @@ TARGETS = {
     "rust-components": (install_rust_components, "Install needed Rust components."),
     "rust": (build_rust_backend, "Build the Rust root project."),
     "java-linker": (build_java_linker, "Build the Java Linker subproject."),
-    "library": (build_library, "Build the standard library shim."),
+    "library": (build_library, "Build the Java runtime support library."),
     "gen-files": (generate_config_files, "Generate necessary files from templates."),
     "help": (help_message, "Show this help message."),
 }

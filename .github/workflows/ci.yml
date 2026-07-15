@@ -52,6 +52,9 @@ jobs:
     - name: Build backend and tools
       run: python build.py ci
 
+    - name: Run cargo unit tests
+      run: cargo test
+
     - name: Run integration tests (debug mode)
       run: python Tester.py
 

@@ -920,6 +920,7 @@ pub fn process_block_instructions(
                 array,
                 index,
                 value,
+                copy_value,
             } => {
                 let new_index =
                     lookup_const(index, &current_state).map_or(index.clone(), Operand::Constant);
@@ -938,6 +939,7 @@ pub fn process_block_instructions(
                     array: array.clone(),
                     index: new_index,
                     value: new_value,
+                    copy_value: *copy_value,
                 };
                 keep_original_instruction = true;
             }

@@ -324,6 +324,7 @@ fn rewrite_instruction_uses(instruction: &mut Instruction, aliases: &AliasMap) {
             array,
             index,
             value,
+            ..
         } => {
             rewrite_variable_name(array, aliases);
             rewrite_operand(index, aliases);
@@ -517,6 +518,7 @@ fn collect_instruction_uses(instruction: &Instruction, uses: &mut HashSet<String
             array,
             index,
             value,
+            ..
         } => {
             uses.insert(array.clone());
             collect_operand_use(index, uses);

@@ -13,6 +13,7 @@ pub mod interpret;
 pub const SLICE_VIEW_CLASS: &str = "org/rustlang/runtime/SliceView";
 pub const UTF8_VIEW_CLASS: &str = "org/rustlang/runtime/Utf8View";
 pub const POINTER_CLASS: &str = "org/rustlang/runtime/Pointer";
+pub const JAVA_STRING_CLASS: &str = "java/lang/String";
 pub const CALLER_LOCATION_PARAM_NAME: &str = "__caller_location";
 
 // OOMIR definitions
@@ -397,6 +398,7 @@ pub enum Instruction {
         array: String,
         index: Operand,
         value: Operand,
+        copy_value: bool,
     },
     ArrayGet {
         dest: String,
@@ -745,7 +747,6 @@ pub enum Type {
     Array(Box<Type>),     // Representing arrays
     Slice(Box<Type>),     // A view over an array with an offset and length.
     Str,                  // A borrowed UTF-8 byte view.
-    String,               // String type
     Class(String),        // For structs, enums, and potentially Objects
     Interface(String),    // dyn TraitName
 }
@@ -758,6 +759,11 @@ pub fn is_non_null_class_name(class_name: &str) -> bool {
 }
 
 impl Type {
+    /// The JVM's own immutable string class, used only for JVM ABI values.
+    pub fn java_string() -> Self {
+        Self::Class(JAVA_STRING_CLASS.to_string())
+    }
+
     /// Returns the JVM type descriptor string (e.g., "I", "Ljava/lang/String;", "[I").
     pub fn to_jvm_descriptor(&self) -> String {
         match self {
@@ -778,7 +784,6 @@ impl Type {
             Type::F64 => "D".to_string(),
             Type::Pointer(_) => format!("L{};", POINTER_CLASS),
             Type::Str => format!("L{};", UTF8_VIEW_CLASS),
-            Type::String => "Ljava/lang/String;".to_string(),
             Type::Class(name) | Type::Interface(name) => format!("L{};", name.replace('.', "/")),
             Type::Reference(inner) => inner.to_jvm_descriptor(),
             Type::MutableReference(inner) => {
@@ -811,36 +816,11 @@ impl Type {
         !matches!(self, Type::Unit | Type::Void)
     }
 
-    pub fn from_jvm_descriptor(descriptor: &str) -> Self {
-        match descriptor.chars().next() {
-            Some('V') => Type::Void,
-            Some('Z') => Type::Boolean,
-            Some('C') => Type::Char,
-            Some('B') => Type::I8,
-            Some('S') => Type::I16,
-            Some('I') => Type::I32,
-            Some('J') => Type::I64,
-            Some('F') => Type::F32,
-            Some('D') => Type::F64,
-            Some('L') => {
-                let class_name = descriptor[1..descriptor.len() - 1].replace('/', ".");
-                Type::Class(class_name)
-            }
-            Some('[') => {
-                let inner_descriptor = &descriptor[1..];
-                let inner_type = Self::from_jvm_descriptor(inner_descriptor);
-                Type::Array(Box::new(inner_type))
-            }
-            _ => panic!("Unknown JVM type descriptor: {}", descriptor),
-        }
-    }
-
     /// Returns the JVM internal name for class/interface types used by anewarray.
     /// Returns None for primitive types.
     pub fn to_jvm_internal_name(&self) -> Option<String> {
         match self {
             Type::Str => Some(UTF8_VIEW_CLASS.to_string()),
-            Type::String => Some("java/lang/String".to_string()),
             Type::Class(name) | Type::Interface(name) => Some(name.replace('.', "/")),
             Type::Pointer(_) => Some(POINTER_CLASS.to_string()),
             Type::Reference(inner) => inner.to_jvm_internal_name(), // delegate to inner type
@@ -884,7 +864,6 @@ impl Type {
             Type::F64 => Some(JVMInstruction::Dastore),
             // Reference types:
             Type::Str
-            | Type::String
             | Type::Class(_)
             | Type::Interface(_)
             | Type::Array(_)
@@ -911,7 +890,6 @@ impl Type {
             Type::F64 => Some(JVMInstruction::Daload),
             // Reference types:
             Type::Str
-            | Type::String
             | Type::Class(_)
             | Type::Array(_)
             | Type::Slice(_)
@@ -951,18 +929,10 @@ impl Type {
             Constant::Boolean(_) => Type::Boolean,
             Constant::Char(_) => Type::Char,
             Constant::Str(_) => Type::Str,
-            Constant::String(_) => Type::String,
+            Constant::String(_) => Type::java_string(),
             Constant::Class(name) => Type::Class(name.to_string()),
             Constant::Instance { class_name, .. } => Type::Class(class_name.to_string()),
         }
-    }
-
-    pub fn from_jvm_descriptor_return_type(descriptor: &str) -> Self {
-        // this contains the whole desciptor for the function, extract the return type from it
-        // i.e. "(I)V" -> "V"
-        let ret_type_start = descriptor.find(')').unwrap() + 1;
-        let ret_type = &descriptor[ret_type_start..];
-        Self::from_jvm_descriptor(ret_type)
     }
 
     pub fn is_jvm_primitive(&self) -> bool {
@@ -995,31 +965,11 @@ impl Type {
                 | Type::Array(_)
                 | Type::Slice(_)
                 | Type::Str
-                | Type::String
                 | Type::Class(_)
                 | Type::Interface(_)
         )
     }
 
-    /// If this is one of the primitive types that Java boxes,
-    /// returns (wrapper_class_internal_name, "valueOf", valueOf_descriptor).
-    /// Otherwise returns None.
-    pub fn get_boxing_info(&self) -> Option<(&'static str, &'static str, &'static str)> {
-        match self {
-            Type::I32 | Type::U32 => {
-                Some(("java/lang/Integer", "valueOf", "(I)Ljava/lang/Integer;"))
-            }
-            Type::I16 | Type::F16 => Some(("java/lang/Short", "valueOf", "(S)Ljava/lang/Short;")),
-            Type::I8 | Type::U8 => Some(("java/lang/Byte", "valueOf", "(B)Ljava/lang/Byte;")),
-            Type::U16 => Some(("java/lang/Character", "valueOf", "(C)Ljava/lang/Character;")),
-            Type::Boolean => Some(("java/lang/Boolean", "valueOf", "(Z)Ljava/lang/Boolean;")),
-            Type::I64 | Type::U64 => Some(("java/lang/Long", "valueOf", "(J)Ljava/lang/Long;")),
-            Type::F32 => Some(("java/lang/Float", "valueOf", "(F)Ljava/lang/Float;")),
-            Type::F64 => Some(("java/lang/Double", "valueOf", "(D)Ljava/lang/Double;")),
-            Type::Char => Some(("java/lang/Character", "valueOf", "(C)Ljava/lang/Character;")),
-            _ => None,
-        }
-    }
     /// Checks if the type is treated as a primitive on the JVM stack
     /// (byte, short, int, long, float, double, char, boolean).
     pub fn is_jvm_primitive_like(&self) -> bool {
@@ -1049,7 +999,6 @@ impl Type {
             Type::Array(_) => Some(self.to_jvm_descriptor()), // Array descriptor works for checkcast/anewarray
             Type::Slice(_) => Some(SLICE_VIEW_CLASS.to_string()),
             Type::Str => Some(UTF8_VIEW_CLASS.to_string()),
-            Type::String => Some("java/lang/String".to_string()),
             Type::Reference(inner) => inner.to_jvm_descriptor_or_internal_name(),
             Type::MutableReference(inner) => {
                 Type::Array(inner.clone()).to_jvm_descriptor_or_internal_name()
@@ -1074,7 +1023,7 @@ impl Type {
             | Type::Reference(inner)
             | Type::Array(inner)
             | Type::Slice(inner) => inner.replace_class(old_name, new_name),
-            // Primitive types, Void, and String are unaffected
+            // Primitive types and Void are unaffected.
             Type::Void
             | Type::Unit
             | Type::Boolean
@@ -1090,8 +1039,7 @@ impl Type {
             | Type::F16
             | Type::F32
             | Type::F64
-            | Type::Str
-            | Type::String => {
+            | Type::Str => {
                 // No class names to replace here
                 false
             }
@@ -1108,7 +1056,6 @@ impl Type {
         match self {
             Type::Class(name) | Type::Interface(name) => Some(name),
             Type::Str => Some(UTF8_VIEW_CLASS),
-            Type::String => Some("org/rustlang/primitives/RustString"),
             Type::Array(inner) | Type::MutableReference(inner) | Type::Reference(inner) => {
                 inner.get_class_name()
             }

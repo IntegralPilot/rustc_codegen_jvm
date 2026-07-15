@@ -207,7 +207,6 @@ pub fn get_load_instruction(ty: &Type, index: u16) -> Result<Instruction, jvm::E
         | Type::Array(_)
         | Type::Slice(_)
         | Type::Str
-        | Type::String
         | Type::Class(_)
         | Type::Interface(_) => match index {
             0 => Instruction::Aload_0,
@@ -291,8 +290,8 @@ pub fn get_store_instruction(ty: &Type, index: u16) -> Result<Instruction, jvm::
                 Instruction::Dstore_w(index)
             }
         }
-        Reference(_) | Pointer(_) | MutableReference(_) | Array(_) | Slice(_) | Str | String
-        | Class(_) | Interface(_) => {
+        Reference(_) | Pointer(_) | MutableReference(_) | Array(_) | Slice(_) | Str | Class(_)
+        | Interface(_) => {
             if index <= 3 {
                 match index {
                     0 => Instruction::Astore_0,
@@ -370,19 +369,6 @@ pub fn get_cast_instructions(
                     let mref = cp.add_method_ref(wrapper_idx, "valueOf", descriptor)?;
                     return Ok(vec![JI::Invokestatic(mref)]);
                 }
-            }
-            if oomir::is_non_null_class_name(cn) {
-                let class_idx = cp.add_class(cn)?;
-                let init = cp.add_method_ref(class_idx, "<init>", "()V")?;
-                let mut instrs = Vec::new();
-                match get_type_size(src) {
-                    2 => instrs.push(JI::Pop2),
-                    _ => instrs.push(JI::Pop),
-                }
-                instrs.push(JI::New(class_idx));
-                instrs.push(JI::Dup);
-                instrs.push(JI::Invokespecial(init));
-                return Ok(instrs);
             }
         }
     }
@@ -463,39 +449,6 @@ pub fn get_cast_instructions(
             return Ok(vec![JI::Invokevirtual(method)]);
         }
 
-        if let Type::Class(cn) = dest {
-            if oomir::is_non_null_class_name(cn) {
-                let class_idx = cp.add_class(cn)?;
-                let init = cp.add_method_ref(class_idx, "<init>", "()V")?;
-                return Ok(vec![
-                    JI::Pop,
-                    JI::New(class_idx),
-                    JI::Dup,
-                    JI::Invokespecial(init),
-                ]);
-            }
-        }
-
-        // String → short[] (also used for raw/slice pointer stand-ins).
-        if src == &Type::String
-            && (dest == &Type::Array(Box::new(Type::I16))
-                || dest == &Type::MutableReference(Box::new(Type::I16)))
-        {
-            let core_idx = cp.add_class("org/rustlang/core/Core")?;
-            let mref = cp.add_method_ref(core_idx, "toShortArray", "(Ljava/lang/String;)[S")?;
-            return Ok(vec![Instruction::Invokestatic(mref)]);
-        }
-
-        // short[] → String
-        if (src == &Type::Array(Box::new(Type::I16))
-            || src == &Type::MutableReference(Box::new(Type::I16)))
-            && dest == &Type::String
-        {
-            let core_idx = cp.add_class("org/rustlang/core/Core")?;
-            let mref = cp.add_method_ref(core_idx, "fromShortArray", "([S)Ljava/lang/String;")?;
-            return Ok(vec![Instruction::Invokestatic(mref)]);
-        }
-
         if let Type::MutableReference(box inner) = src {
             let mut instrs = vec![JI::Iconst_0, JI::Aaload];
             if dest != inner {
@@ -556,7 +509,6 @@ pub fn get_cast_instructions(
         | Type::Array(_)
         | Type::Slice(_)
         | Type::Str
-        | Type::String
         | Type::Class(_)
         | Type::Interface(_) => vec![JI::Aconst_null],
     });
@@ -905,87 +857,4 @@ pub fn are_types_jvm_compatible(src: &oomir::Type, dest: &oomir::Type) -> bool {
         // TODO: Add more other compatibility rules (e.g., Interface implementations).
         _ => false,
     }
-}
-
-/// Parses a JVM method descriptor and returns the parameter types as a vector of strings.
-pub fn parse_jvm_descriptor_params(descriptor: &str) -> Result<Vec<String>, String> {
-    // 1. Find the '(' and the closing ')'
-    let start = descriptor
-        .find('(')
-        .ok_or_else(|| "Descriptor must start with '('".to_string())?;
-    let end = descriptor[start + 1..]
-        .find(')')
-        .ok_or_else(|| "Descriptor missing ')'".to_string())?
-        + start
-        + 1;
-    let params = &descriptor[start + 1..end];
-
-    let bytes = params.as_bytes();
-    let mut i = 0;
-    let mut out = Vec::new();
-
-    while i < bytes.len() {
-        let tok_start = i;
-        match bytes[i] as char {
-            // 2a. Primitive
-            'B' | 'C' | 'D' | 'F' | 'I' | 'J' | 'S' | 'Z' => {
-                i += 1;
-            }
-
-            // 2b. Object type
-            'L' => {
-                i += 1;
-                // scan until ';'
-                while i < bytes.len() && bytes[i] as char != ';' {
-                    i += 1;
-                }
-                if i == bytes.len() {
-                    return Err("Unterminated object type (missing `;`)".into());
-                }
-                i += 1; // include ';'
-            }
-
-            // 2c. Array: one or more '[' then a component descriptor
-            '[' => {
-                i += 1;
-                // multi-dimensional arrays
-                while i < bytes.len() && bytes[i] as char == '[' {
-                    i += 1;
-                }
-                if i == bytes.len() {
-                    return Err("Array type without component descriptor".into());
-                }
-                match bytes[i] as char {
-                    // primitive component
-                    'B' | 'C' | 'D' | 'F' | 'I' | 'J' | 'S' | 'Z' => {
-                        i += 1;
-                    }
-                    // object component
-                    'L' => {
-                        i += 1;
-                        while i < bytes.len() && bytes[i] as char != ';' {
-                            i += 1;
-                        }
-                        if i == bytes.len() {
-                            return Err("Unterminated object type in array".into());
-                        }
-                        i += 1;
-                    }
-                    other => {
-                        return Err(format!("Invalid array component descriptor '{}'", other));
-                    }
-                }
-            }
-
-            // anything else is invalid
-            other => {
-                return Err(format!("Invalid descriptor character '{}'", other));
-            }
-        }
-
-        // slice out the full token and push
-        out.push(params[tok_start..i].to_string());
-    }
-
-    Ok(out)
 }

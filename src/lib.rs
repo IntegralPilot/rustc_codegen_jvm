@@ -421,7 +421,10 @@ fn trait_interface_methods<'tcx>(
 
     for assoc_item in tcx.associated_items(trait_def_id).in_definition_order() {
         let def_id = assoc_item.def_id;
-        if !assoc_item.is_fn() {
+        // Trait functions without a receiver are statically dispatched. JVM
+        // interfaces cannot declare an abstract static method, so only methods
+        // which participate in interface dispatch belong in this table.
+        if !assoc_item.is_method() {
             continue;
         }
 
@@ -451,11 +454,10 @@ fn trait_interface_methods<'tcx>(
         let return_oomir_ty =
             lower1::types::ty_to_oomir_type(return_ty.skip_binder(), tcx, data_types, instance);
 
-        let is_instance_method = assoc_item.is_method();
         let mut signature = oomir::Signature {
             params: params_oomir,
             ret: Box::new(return_oomir_ty),
-            is_static: !is_instance_method,
+            is_static: false,
         };
         let (params_changed, _) = signature.replace_class_in_signature("Self", interface_name);
 

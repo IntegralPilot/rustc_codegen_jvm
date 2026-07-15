@@ -457,7 +457,7 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
                                 params: vec![
                                     ("pointer".to_string(), base_pointer_ty.clone()),
                                     ("view_size".to_string(), oomir::Type::I32),
-                                    ("view_codec".to_string(), oomir::Type::String),
+                                    ("view_codec".to_string(), oomir::Type::java_string()),
                                 ],
                                 ret: Box::new(element_pointer_ty.clone()),
                                 is_static: true,
@@ -552,7 +552,7 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
                                 params: vec![
                                     ("pointer".to_string(), base_pointer_ty.clone()),
                                     ("view_size".to_string(), oomir::Type::I32),
-                                    ("view_codec".to_string(), oomir::Type::String),
+                                    ("view_codec".to_string(), oomir::Type::java_string()),
                                 ],
                                 ret: Box::new(field_pointer_ty.clone()),
                                 is_static: true,
@@ -1187,7 +1187,7 @@ pub fn emit_instructions_to_set_value<'tcx>(
                             params: vec![
                                 ("pointer".to_string(), base_oomir_type.clone()),
                                 ("view_size".to_string(), oomir::Type::I32),
-                                ("view_codec".to_string(), oomir::Type::String),
+                                ("view_codec".to_string(), oomir::Type::java_string()),
                             ],
                             ret: Box::new(field_pointer_ty.clone()),
                             is_static: true,
@@ -1391,6 +1391,7 @@ pub fn emit_instructions_to_set_value<'tcx>(
                     array: base_var_name.clone(),
                     index: oomir_index_operand, // The index operand
                     value: source_operand,      // The value to store
+                    copy_value: false,
                 });
             }
 
@@ -1453,6 +1454,7 @@ pub fn emit_instructions_to_set_value<'tcx>(
                     array: base_var_name.clone(), // The array retrieved in step 2
                     index: index_operand,         // The constant or calculated index
                     value: source_operand,        // The value to store
+                    copy_value: false,
                 });
             }
 
@@ -1484,6 +1486,7 @@ pub fn emit_instructions_to_set_value<'tcx>(
                             // Index is always 0 for our reference representation
                             index: Operand::Constant(oomir::Constant::I32(0)),
                             value: source_operand, // The value being assigned
+                            copy_value: false,
                         });
                     }
                     _ => {

@@ -26,7 +26,6 @@ mod helpers;
 mod jvm;
 mod jvm_gen;
 mod optimise2;
-mod shim;
 mod stackmaps;
 mod translator;
 
@@ -49,7 +48,6 @@ fn factory_return_instruction(ty: &oomir::Type) -> Instruction {
         oomir::Type::F32 => Instruction::Freturn,
         oomir::Type::F64 => Instruction::Dreturn,
         oomir::Type::Str
-        | oomir::Type::String
         | oomir::Type::Class(_)
         | oomir::Type::Array(_)
         | oomir::Type::Slice(_)

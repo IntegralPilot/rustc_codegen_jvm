@@ -849,7 +849,6 @@ fn return_instruction_for_type(ty: &Type) -> Instruction {
         | Type::Array(_)
         | Type::Slice(_)
         | Type::Str
-        | Type::String
         | Type::Class(_)
         | Type::Interface(_) => Instruction::Areturn,
     }
@@ -960,7 +959,6 @@ pub(super) fn oomir_type_to_ristretto_field_type(
         oomir::Type::Boolean => jvm::FieldType::Base(BaseType::Boolean),
         oomir::Type::Char => jvm::FieldType::Base(BaseType::Char),
         oomir::Type::Str => jvm::FieldType::Object(oomir::UTF8_VIEW_CLASS.into()),
-        oomir::Type::String => jvm::FieldType::Object("java/lang/String".into()),
         oomir::Type::Reference(ref2) => {
             let inner_ty = ref2.as_ref();
             oomir_type_to_ristretto_field_type(inner_ty)
@@ -1063,13 +1061,6 @@ fn append_field_equality_check(
         | Type::Char => {
             false_fixups.push(instructions.len());
             instructions.push(Instruction::If_icmpne(0));
-        }
-        Type::String => {
-            let string_class_idx = cp.add_class("java/lang/String")?;
-            let equals_ref =
-                cp.add_method_ref(string_class_idx, "equals", "(Ljava/lang/Object;)Z")?;
-            instructions.push(Instruction::Invokevirtual(equals_ref));
-            append_boolean_false_check(instructions, false_fixups);
         }
         Type::Str => {
             let view_class = cp.add_class(oomir::UTF8_VIEW_CLASS)?;
@@ -1779,7 +1770,6 @@ fn create_code_from_method_name_and_constant_return(
         | oomir::Type::Array(_)
         | oomir::Type::Slice(_)
         | oomir::Type::Str
-        | oomir::Type::String
         | oomir::Type::Class(_)
         | oomir::Type::Interface(_) => Instruction::Areturn,
         oomir::Type::Unit | oomir::Type::Void => Instruction::Return,

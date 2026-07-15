@@ -6,7 +6,7 @@ import sys
 import argparse
 import shutil
 
-SHIM_JAR = os.path.join("library", "build", "libs", "library-0.1.0.jar")
+RUNTIME_JAR = os.path.join("library", "build", "libs", "library-0.1.0.jar")
 
 
 # --- Helper Functions ---
@@ -200,7 +200,7 @@ def investigate_test(test_name: str, release_mode: bool):
     print("|-- 🤖 Running with Java and capturing logs...")
     
     if use_raw_classfiles and deps_dir is not None:
-        classpath = os.pathsep.join([SHIM_JAR, deps_dir])
+        classpath = os.pathsep.join([RUNTIME_JAR, deps_dir])
         print(f"|---- Using deps directory in classpath: {deps_dir}")
         java_cmd = ["java", "-cp", classpath, test_name]
     else:

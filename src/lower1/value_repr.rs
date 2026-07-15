@@ -250,6 +250,7 @@ pub(super) fn materialize_implicit_zst<'tcx>(
                     array: dest.clone(),
                     index: oomir::Operand::Constant(oomir::Constant::I32(index as i32)),
                     value: element_value,
+                    copy_value: false,
                 });
             }
             Some(operand_var(
@@ -435,7 +436,7 @@ fn adapt_mutable_reference_carrier<'tcx>(
                         oomir::Type::Class("java/lang/Object".to_string()),
                     ),
                     ("element_size".to_string(), oomir::Type::I32),
-                    ("codec".to_string(), oomir::Type::String),
+                    ("codec".to_string(), oomir::Type::java_string()),
                 ],
                 ret: Box::new(target_jvm_ty.clone()),
                 is_static: true,
@@ -515,7 +516,7 @@ fn adapt_mutable_reference_carrier<'tcx>(
                         oomir::Type::Class("java/lang/Object".to_string()),
                     ),
                     ("size".to_string(), oomir::Type::I32),
-                    ("codec".to_string(), oomir::Type::String),
+                    ("codec".to_string(), oomir::Type::java_string()),
                 ],
                 ret: Box::new(target_jvm_ty.clone()),
                 is_static: true,
@@ -592,6 +593,7 @@ fn adapt_mutable_reference_carrier<'tcx>(
             array: dest.clone(),
             index: oomir::Operand::Constant(oomir::Constant::I32(0)),
             value: pointee,
+            copy_value: false,
         });
         return operand_var(dest, target_jvm_ty.clone());
     }

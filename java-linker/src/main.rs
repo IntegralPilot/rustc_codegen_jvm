@@ -1130,14 +1130,14 @@ fn merge_input_jars(
     let mut zip_writer = ZipWriter::new(output_file);
     let mut seen_entries = HashSet::new();
 
-    for library_jar_path in library_jar_paths {
-        copy_jar_entries(library_jar_path, &mut zip_writer, &mut seen_entries)?;
-    }
-
-    // Runtime shim classes are authoritative for Java-owned core APIs such as
-    // fmt::Arguments. Generated app classes with the same names are skipped.
+    // Compiled Rust classes are authoritative. In particular, a stale runtime
+    // JAR must never shadow classes produced by compiling the real core crate.
     if let Some(app_jar) = app_jar_path {
         copy_jar_entries(app_jar, &mut zip_writer, &mut seen_entries)?;
+    }
+
+    for library_jar_path in library_jar_paths {
+        copy_jar_entries(library_jar_path, &mut zip_writer, &mut seen_entries)?;
     }
 
     zip_writer.finish()?;
@@ -1226,12 +1226,15 @@ fn create_manifest_content(main_class_name: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        class_file_from_data, jar_output_path, merge_class_data, method_identity, msvc_output_path,
-        parse_response_lines,
+        class_file_from_data, jar_output_path, merge_class_data, merge_input_jars, method_identity,
+        msvc_output_path, parse_response_lines,
     };
     use ristretto_classfile::{
         ClassAccessFlags, ClassFile, ConstantPool, Method, MethodAccessFlags, Version,
     };
+    use std::{fs::File, io::Read, io::Write};
+    use tempfile::tempdir;
+    use zip::{ZipArchive, write::SimpleFileOptions, write::ZipWriter};
 
     fn abstract_class_with_method(method_name: &str) -> Vec<u8> {
         let mut constant_pool = ConstantPool::default();
@@ -1258,6 +1261,15 @@ mod tests {
         let mut bytes = Vec::new();
         class_file.to_bytes(&mut bytes).unwrap();
         bytes
+    }
+
+    fn write_test_jar(path: &std::path::Path, name: &str, contents: &[u8]) {
+        let mut writer = ZipWriter::new(File::create(path).unwrap());
+        writer
+            .start_file(name, SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(contents).unwrap();
+        writer.finish().unwrap();
     }
 
     #[test]
@@ -1323,5 +1335,23 @@ mod tests {
                 ("second".into(), "()V".into())
             ]
         );
+    }
+
+    #[test]
+    fn compiled_classes_take_precedence_over_runtime_jar_entries() {
+        let directory = tempdir().unwrap();
+        let app = directory.path().join("app.jar");
+        let runtime = directory.path().join("runtime.jar");
+        let output = directory.path().join("output.jar");
+        let entry = "example/Owner.class";
+        write_test_jar(&app, entry, b"compiled");
+        write_test_jar(&runtime, entry, b"runtime");
+
+        merge_input_jars(Some(&app), &[runtime], &output).unwrap();
+
+        let mut archive = ZipArchive::new(File::open(output).unwrap()).unwrap();
+        let mut contents = Vec::new();
+        archive.by_name(entry).unwrap().read_to_end(&mut contents).unwrap();
+        assert_eq!(contents, b"compiled");
     }
 }

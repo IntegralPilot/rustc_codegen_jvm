@@ -1,8 +1,12 @@
 pub struct Ciallo {
     pub count: i32,
-    pub desc: String,
+    pub desc: &'static str,
 }
 
-pub fn ciallo(_a: Ciallo) -> &'static str {
-    "Hello from Rust!"
+pub fn ciallo(a: Ciallo) -> &'static str {
+    if a.count == 233 && a.desc == "wooooooooo" {
+        "Hello from Rust!"
+    } else {
+        "An error occured"
+    }
 }

@@ -352,7 +352,7 @@ pub fn mir_to_oomir<'tcx>(
                         oomir::Type::Class("java/lang/Object".to_string()),
                     ),
                     ("size".to_string(), oomir::Type::I32),
-                    ("codec".to_string(), oomir::Type::String),
+                    ("codec".to_string(), oomir::Type::java_string()),
                     ("alignment".to_string(), oomir::Type::I32),
                 ],
                 ret: Box::new(oomir::Type::Pointer(Box::new(value_type))),
