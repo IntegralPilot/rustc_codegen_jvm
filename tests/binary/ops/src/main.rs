@@ -677,7 +677,7 @@ fn main() {
     assert!(zero_over_zero != zero_over_zero, "f128 zero divided by zero is NaN");
 
     // Credit for tests from this point on: AnuthaDev
-    // Widening casts out of BigInteger-backed types.
+    // Widening casts out of 128-bit integer types.
     let big: u128 = 1_000_000;
     assert!(big as f64 == 1_000_000.0);
     assert!(big as f32 == 1_000_000.0f32);
@@ -700,7 +700,7 @@ fn main() {
     let y = x as f64 * 6.0;
     assert!(y == 42.0);
 
-    // Back into BigInteger-backed types.
+    // Back into 128-bit integer types.
     let back = 42.9_f64 as u128;
     assert!(back == 42);
     let back_signed = -42.9_f64 as i128;

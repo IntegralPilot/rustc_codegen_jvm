@@ -1,5 +1,5 @@
 use super::{checked_intrinsic_registry, checked_intrinsics};
-use crate::oomir::{Constant, Instruction, Operand, Type};
+use crate::oomir::{Instruction, Operand, Type};
 
 pub fn checked_arithmetic_tuple_local_name(op_ty: &Type) -> Option<&'static str> {
     match op_ty {
@@ -13,8 +13,6 @@ pub fn checked_arithmetic_tuple_local_name(op_ty: &Type) -> Option<&'static str>
         Type::U64 => Some("Tuple_u64_bool"),
         Type::Class(c) if c == crate::lower2::I128_CLASS => Some("Tuple_I128_bool"),
         Type::Class(c) if c == crate::lower2::U128_CLASS => Some("Tuple_U128_bool"),
-        Type::Class(c) if c == crate::lower2::BIG_INTEGER_CLASS => Some("Tuple_BigInteger_bool"),
-        Type::Class(c) if c == crate::lower2::BIG_DECIMAL_CLASS => Some("Tuple_BigDecimal_bool"),
         _ => None,
     }
 }
@@ -35,60 +33,6 @@ pub fn emit_checked_arithmetic_oomir_instructions(
     let tmp_pair = format!("{}_{}_chk_pair_{}", dest_base_name, operation, unique_id);
     let tmp_result = format!("{}_{}_chk_res_{}", dest_base_name, operation, unique_id);
     let tmp_overflow = format!("{}_{}_chk_ovf_{}", dest_base_name, operation, unique_id);
-
-    // For BigInt/BigDec, overflow doesn't happen in the fixed-size sense.
-    if matches!(op_ty, Type::Class(c) if c == crate::lower2::BIG_INTEGER_CLASS || c == crate::lower2::BIG_DECIMAL_CLASS)
-    {
-        let op_instr = match operation {
-            "add" => Instruction::Add {
-                dest: tmp_result.clone(),
-                op1: op1.clone(),
-                op2: op2.clone(),
-            },
-            "sub" => Instruction::Sub {
-                dest: tmp_result.clone(),
-                op1: op1.clone(),
-                op2: op2.clone(),
-            },
-            "mul" => Instruction::Mul {
-                dest: tmp_result.clone(),
-                op1: op1.clone(),
-                op2: op2.clone(),
-            },
-            _ => panic!(
-                "Unsupported checked operation for BigInt/BigDec: {}",
-                operation
-            ),
-        };
-        generated_instructions.push(op_instr);
-        generated_instructions.push(Instruction::Move {
-            dest: tmp_overflow.clone(),
-            src: Operand::Constant(Constant::Boolean(false)),
-        });
-
-        generated_instructions.push(Instruction::ConstructObject {
-            dest: tmp_pair.clone(),
-            class_name: result_tuple_class.to_string(),
-            args: vec![
-                (
-                    Operand::Variable {
-                        name: tmp_result.clone(),
-                        ty: op_ty.clone(),
-                    },
-                    op_ty.clone(),
-                ),
-                (
-                    Operand::Variable {
-                        name: tmp_overflow.clone(),
-                        ty: Type::Boolean,
-                    },
-                    Type::Boolean,
-                ),
-            ],
-        });
-
-        return (generated_instructions, tmp_pair, tmp_result, tmp_overflow);
-    }
 
     let ty_suffix = match op_ty {
         Type::I32 => "i32",

@@ -30,8 +30,6 @@ mod shim;
 mod stackmaps;
 mod translator;
 
-pub const BIG_INTEGER_CLASS: &str = "java/math/BigInteger";
-pub const BIG_DECIMAL_CLASS: &str = "java/math/BigDecimal";
 pub const F128_CLASS: &str = "org/rustlang/runtime/F128";
 pub const I128_CLASS: &str = "org/rustlang/runtime/I128";
 pub const U128_CLASS: &str = "org/rustlang/runtime/U128";

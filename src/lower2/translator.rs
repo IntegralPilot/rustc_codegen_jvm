@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::TryInto;
 use std::io::Cursor;
 
-use super::{BIG_DECIMAL_CLASS, BIG_INTEGER_CLASS, F128_CLASS, I128_CLASS, U128_CLASS};
+use super::{F128_CLASS, I128_CLASS, U128_CLASS};
 
 /// Represents the state during the translation of a single function's body.
 pub struct FunctionTranslator<'a, 'cp> {
@@ -1774,17 +1774,16 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
     }
 
     /// Determines the common comparison type based on numeric promotion rules,
-    /// including BigInteger and BigDecimal. Also returns necessary cast targets.
+    /// Also returns necessary cast targets.
     fn determine_comparison_type(
         &self, // Keep self if error reporting needs function context
         op1_type: &oomir::Type,
         op2_type: &oomir::Type,
     ) -> Result<(oomir::Type, Option<oomir::Type>, Option<oomir::Type>), jvm::Error> {
-        // Helper to check if a type is BigInteger or BigDecimal
+        // Helper to check if a type is a wide integer
         let is_big_type = |ty: &Type| {
             matches!(ty,
-            Type::Class(c) if c == BIG_INTEGER_CLASS || c == BIG_DECIMAL_CLASS
-                || c == I128_CLASS || c == U128_CLASS)
+            Type::Class(c) if c == I128_CLASS || c == U128_CLASS)
         };
 
         // Helper to check if a type is numeric primitive or boolean/char
@@ -1839,35 +1838,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     }),
                 }
             }
-
-            (Type::Class(c1), t2) if c1 == BIG_INTEGER_CLASS && is_promotable_primitive(t2) => {
-                Ok((op1_type.clone(), None, Some(op1_type.clone())))
-            } // Promote primitive to BigInt
-            (t1, Type::Class(c2)) if c2 == BIG_INTEGER_CLASS && is_promotable_primitive(t1) => {
-                Ok((op2_type.clone(), Some(op2_type.clone()), None))
-            } // Promote primitive to BigInt
-
-            (Type::Class(c1), t2) if c1 == BIG_DECIMAL_CLASS && is_promotable_primitive(t2) => {
-                Ok((op1_type.clone(), None, Some(op1_type.clone())))
-            } // Promote primitive to BigDec
-            (t1, Type::Class(c2)) if c2 == BIG_DECIMAL_CLASS && is_promotable_primitive(t1) => {
-                Ok((op2_type.clone(), Some(op2_type.clone()), None))
-            } // Promote primitive to BigDec
-
-            // Prevent comparing BigInt with BigDec directly (require explicit cast in source)
-            (Type::Class(c1), Type::Class(c2))
-                if (c1 == BIG_INTEGER_CLASS && c2 == BIG_DECIMAL_CLASS)
-                    || (c1 == BIG_DECIMAL_CLASS && c2 == BIG_INTEGER_CLASS) =>
-            {
-                Err(jvm::Error::VerificationError {
-                    context: format!("Function {}", self.oomir_func.name),
-                    message: format!(
-                        "Cannot directly compare BigInteger and BigDecimal. Cast one operand explicitly."
-                    ),
-                })
-            }
-
-            // Prevent comparing Big types with other non-primitive reference types for now
+            // Prevent comparing wide integers with other non-primitive reference types for now.
             (t1, t2)
                 if (is_big_type(t1) && !is_promotable_primitive(t2) && !is_big_type(t2))
                     || (is_big_type(t2) && !is_promotable_primitive(t1) && !is_big_type(t1)) =>
@@ -1875,7 +1846,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 Err(jvm::Error::VerificationError {
                     context: format!("Function {}", self.oomir_func.name),
                     message: format!(
-                        "Cannot compare BigInteger/BigDecimal with non-primitive type: {:?} vs {:?}",
+                        "Cannot compare wide integer with non-primitive type: {:?} vs {:?}",
                         op1_type, op2_type
                     ),
                 })
@@ -2200,40 +2171,13 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     _ => unreachable!(),
                 });
             }
-            Type::Class(ref class_name)
-                if class_name == BIG_INTEGER_CLASS
-                    || class_name == I128_CLASS
-                    || class_name == U128_CLASS =>
-            {
+            Type::Class(ref class_name) if class_name == I128_CLASS || class_name == U128_CLASS => {
                 if !["eq", "ne", "lt", "le", "gt", "ge"].contains(&comp_op) { /* error */ }
                 let class_idx = self.constant_pool.add_class(class_name)?;
                 let method_ref = self.constant_pool.add_method_ref(
                     class_idx,
                     "compareTo",
                     &format!("(L{class_name};)I"),
-                )?;
-                self.jvm_instructions
-                    .push(Instruction::Invokevirtual(method_ref)); // Stack: [int_result]
-                // Branch based on the int result compared to 0
-                branch_constructor = Box::new(move |offset| match comp_op {
-                    // move comp_op
-                    "eq" => Instruction::Ifeq(offset),
-                    "ne" => Instruction::Ifne(offset),
-                    "lt" => Instruction::Iflt(offset),
-                    "le" => Instruction::Ifle(offset),
-                    "gt" => Instruction::Ifgt(offset),
-                    "ge" => Instruction::Ifge(offset),
-                    _ => unreachable!(),
-                });
-            }
-            Type::Class(ref class_name) if class_name == BIG_DECIMAL_CLASS => {
-                if !["eq", "ne", "lt", "le", "gt", "ge"].contains(&comp_op) { /* error */ }
-                // Call BigDecimal.compareTo(BigDecimal) -> int
-                let class_idx = self.constant_pool.add_class(BIG_DECIMAL_CLASS)?;
-                let method_ref = self.constant_pool.add_method_ref(
-                    class_idx,
-                    "compareTo",
-                    "(Ljava/math/BigDecimal;)I",
                 )?;
                 self.jvm_instructions
                     .push(Instruction::Invokevirtual(method_ref)); // Stack: [int_result]
@@ -2334,28 +2278,19 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 let op1_type = get_operand_type(op1);
                 let op2_type = get_operand_type(op2); // Get type of op2 as well
 
-                // Promote based on types (Simplified: assumes BigInt/BigDec promote others)
+                // Promote based on operand types
                 // A more robust system would use determine_comparison_type logic
                 let op_type = if op1_type == Type::Class(F128_CLASS.to_string())
                     || op2_type == Type::Class(F128_CLASS.to_string())
                 {
                     Type::Class(F128_CLASS.to_string())
-                } else if op1_type == Type::Class(BIG_DECIMAL_CLASS.to_string())
-                    || op2_type == Type::Class(BIG_DECIMAL_CLASS.to_string())
-                {
-                    Type::Class(BIG_DECIMAL_CLASS.to_string())
                 } else if matches!(&op1_type, Type::Class(c) if c == I128_CLASS || c == U128_CLASS)
                 {
                     op1_type.clone()
                 } else if matches!(&op2_type, Type::Class(c) if c == I128_CLASS || c == U128_CLASS)
                 {
                     op2_type.clone()
-                } else if op1_type == Type::Class(BIG_INTEGER_CLASS.to_string())
-                    || op2_type == Type::Class(BIG_INTEGER_CLASS.to_string())
-                {
-                    Type::Class(BIG_INTEGER_CLASS.to_string())
                 } else {
-                    // Fallback to op1's type for primitive promotion (translate_binary_op handles this)
                     op1_type.clone()
                 };
 
@@ -2381,77 +2316,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     Type::Class(ref c) if c == I128_CLASS || c == U128_CLASS => {
                         self.translate_int128_binary_op(dest, op1, op2, "add")?
                     }
-                    Type::Class(ref c) if c == BIG_INTEGER_CLASS => {
-                        // BigInteger ADD operation: add(BigInteger)
-                        let class_idx = self.constant_pool.add_class(BIG_INTEGER_CLASS)?;
-                        let method_ref = self.constant_pool.add_method_ref(
-                            class_idx,
-                            "add",
-                            "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
-                        )?;
-
-                        // 1. Load op1, casting to BigInt if needed
-                        self.load_operand(op1)?;
-                        if op1_type != op_type {
-                            let cast_instrs = get_cast_instructions(
-                                &self.oomir_func.name,
-                                &op1_type,
-                                &op_type,
-                                self.constant_pool,
-                            )?;
-                            self.jvm_instructions.extend(cast_instrs);
-                        }
-                        // 2. Load op2, casting to BigInt if needed
-                        self.load_operand(op2)?;
-                        if op2_type != op_type {
-                            let cast_instrs = get_cast_instructions(
-                                &self.oomir_func.name,
-                                &op2_type,
-                                &op_type,
-                                self.constant_pool,
-                            )?;
-                            self.jvm_instructions.extend(cast_instrs);
-                        }
-                        // 3. Call the method
-                        self.jvm_instructions.push(JI::Invokevirtual(method_ref)); // Stack: [result]
-                        // 4. Store the result
-                        self.store_result(dest, &op_type)?; // Stack: []
-                    }
-                    Type::Class(ref c) if c == BIG_DECIMAL_CLASS => {
-                        // BigDecimal ADD operation: add(BigDecimal)
-                        let class_idx = self.constant_pool.add_class(BIG_DECIMAL_CLASS)?;
-                        let method_ref = self.constant_pool.add_method_ref(
-                            class_idx,
-                            "add",
-                            "(Ljava/math/BigDecimal;)Ljava/math/BigDecimal;",
-                        )?;
-                        // 1. Load op1, casting to BigDec if needed
-                        self.load_operand(op1)?;
-                        if op1_type != op_type {
-                            let cast_instrs = get_cast_instructions(
-                                &self.oomir_func.name,
-                                &op1_type,
-                                &op_type,
-                                self.constant_pool,
-                            )?;
-                            self.jvm_instructions.extend(cast_instrs);
-                        }
-                        // 2. Load op2, casting to BigDec if needed
-                        self.load_operand(op2)?;
-                        if op2_type != op_type {
-                            let cast_instrs = get_cast_instructions(
-                                &self.oomir_func.name,
-                                &op2_type,
-                                &op_type,
-                                self.constant_pool,
-                            )?;
-                            self.jvm_instructions.extend(cast_instrs);
-                        }
-                        // 3. Call the method
-                        self.jvm_instructions.push(JI::Invokevirtual(method_ref)); // Stack: [result]
-                        // 4. Store the result
-                        self.store_result(dest, &op_type)?; // Stack: []
-                    }
                     _ => {
                         return Err(jvm::Error::VerificationError {
                             context: format!("Function {}", self.oomir_func.name),
@@ -2473,20 +2337,12 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     || op2_type == Type::Class(F128_CLASS.to_string())
                 {
                     Type::Class(F128_CLASS.to_string())
-                } else if op1_type == Type::Class(BIG_DECIMAL_CLASS.to_string())
-                    || op2_type == Type::Class(BIG_DECIMAL_CLASS.to_string())
-                {
-                    Type::Class(BIG_DECIMAL_CLASS.to_string())
                 } else if matches!(&op1_type, Type::Class(c) if c == I128_CLASS || c == U128_CLASS)
                 {
                     op1_type.clone()
                 } else if matches!(&op2_type, Type::Class(c) if c == I128_CLASS || c == U128_CLASS)
                 {
                     op2_type.clone()
-                } else if op1_type == Type::Class(BIG_INTEGER_CLASS.to_string())
-                    || op2_type == Type::Class(BIG_INTEGER_CLASS.to_string())
-                {
-                    Type::Class(BIG_INTEGER_CLASS.to_string())
                 } else {
                     op1_type.clone()
                 };
@@ -2510,77 +2366,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     Type::Class(ref c) if c == I128_CLASS || c == U128_CLASS => {
                         self.translate_int128_binary_op(dest, op1, op2, "subtract")?
                     }
-                    Type::Class(ref c) if c == BIG_INTEGER_CLASS => {
-                        // BigInteger SUBTRACT operation: subtract(BigInteger)
-                        let class_idx = self.constant_pool.add_class(BIG_INTEGER_CLASS)?;
-                        let method_ref = self.constant_pool.add_method_ref(
-                            class_idx,
-                            "subtract", // Correct method name
-                            "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
-                        )?;
-
-                        // 1. Load op1, casting if needed
-                        self.load_operand(op1)?;
-                        if op1_type != op_type {
-                            let cast_instrs = get_cast_instructions(
-                                &self.oomir_func.name,
-                                &op1_type,
-                                &op_type,
-                                self.constant_pool,
-                            )?;
-                            self.jvm_instructions.extend(cast_instrs);
-                        }
-                        // 2. Load op2, casting if needed
-                        self.load_operand(op2)?;
-                        if op2_type != op_type {
-                            let cast_instrs = get_cast_instructions(
-                                &self.oomir_func.name,
-                                &op2_type,
-                                &op_type,
-                                self.constant_pool,
-                            )?;
-                            self.jvm_instructions.extend(cast_instrs);
-                        }
-                        // 3. Call the method
-                        self.jvm_instructions.push(JI::Invokevirtual(method_ref));
-                        // 4. Store the result
-                        self.store_result(dest, &op_type)?;
-                    }
-                    Type::Class(ref c) if c == BIG_DECIMAL_CLASS => {
-                        // BigDecimal SUBTRACT operation: subtract(BigDecimal)
-                        let class_idx = self.constant_pool.add_class(BIG_DECIMAL_CLASS)?;
-                        let method_ref = self.constant_pool.add_method_ref(
-                            class_idx,
-                            "subtract", // Correct method name
-                            "(Ljava/math/BigDecimal;)Ljava/math/BigDecimal;",
-                        )?;
-                        // 1. Load op1, casting if needed
-                        self.load_operand(op1)?;
-                        if op1_type != op_type {
-                            let cast_instrs = get_cast_instructions(
-                                &self.oomir_func.name,
-                                &op1_type,
-                                &op_type,
-                                self.constant_pool,
-                            )?;
-                            self.jvm_instructions.extend(cast_instrs);
-                        }
-                        // 2. Load op2, casting if needed
-                        self.load_operand(op2)?;
-                        if op2_type != op_type {
-                            let cast_instrs = get_cast_instructions(
-                                &self.oomir_func.name,
-                                &op2_type,
-                                &op_type,
-                                self.constant_pool,
-                            )?;
-                            self.jvm_instructions.extend(cast_instrs);
-                        }
-                        // 3. Call the method
-                        self.jvm_instructions.push(JI::Invokevirtual(method_ref));
-                        // 4. Store the result
-                        self.store_result(dest, &op_type)?;
-                    }
                     _ => {
                         return Err(jvm::Error::VerificationError {
                             context: format!("Function {}", self.oomir_func.name),
@@ -2596,20 +2381,12 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     || op2_type == Type::Class(F128_CLASS.to_string())
                 {
                     Type::Class(F128_CLASS.to_string())
-                } else if op1_type == Type::Class(BIG_DECIMAL_CLASS.to_string())
-                    || op2_type == Type::Class(BIG_DECIMAL_CLASS.to_string())
-                {
-                    Type::Class(BIG_DECIMAL_CLASS.to_string())
                 } else if matches!(&op1_type, Type::Class(c) if c == I128_CLASS || c == U128_CLASS)
                 {
                     op1_type.clone()
                 } else if matches!(&op2_type, Type::Class(c) if c == I128_CLASS || c == U128_CLASS)
                 {
                     op2_type.clone()
-                } else if op1_type == Type::Class(BIG_INTEGER_CLASS.to_string())
-                    || op2_type == Type::Class(BIG_INTEGER_CLASS.to_string())
-                {
-                    Type::Class(BIG_INTEGER_CLASS.to_string())
                 } else {
                     op1_type.clone()
                 };
@@ -2633,74 +2410,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     Type::Class(ref c) if c == I128_CLASS || c == U128_CLASS => {
                         self.translate_int128_binary_op(dest, op1, op2, "multiply")?
                     }
-                    Type::Class(ref c) if c == BIG_INTEGER_CLASS => {
-                        // BigInteger MULTIPLY operation: multiply(BigInteger)
-                        let class_idx = self.constant_pool.add_class(BIG_INTEGER_CLASS)?;
-                        let method_ref = self.constant_pool.add_method_ref(
-                            class_idx,
-                            "multiply", // Correct method name
-                            "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
-                        )?;
-
-                        self.load_operand(op1)?; // Load op1
-                        if op1_type != op_type {
-                            // Cast if needed
-                            let cast_instrs = get_cast_instructions(
-                                &self.oomir_func.name,
-                                &op1_type,
-                                &op_type,
-                                self.constant_pool,
-                            )?;
-                            self.jvm_instructions.extend(cast_instrs);
-                        }
-                        self.load_operand(op2)?; // Load op2
-                        if op2_type != op_type {
-                            // Cast if needed
-                            let cast_instrs = get_cast_instructions(
-                                &self.oomir_func.name,
-                                &op2_type,
-                                &op_type,
-                                self.constant_pool,
-                            )?;
-                            self.jvm_instructions.extend(cast_instrs);
-                        }
-                        self.jvm_instructions.push(JI::Invokevirtual(method_ref)); // Call
-                        self.store_result(dest, &op_type)?; // Store
-                    }
-                    Type::Class(ref c) if c == BIG_DECIMAL_CLASS => {
-                        // BigDecimal MULTIPLY operation: multiply(BigDecimal)
-                        let class_idx = self.constant_pool.add_class(BIG_DECIMAL_CLASS)?;
-                        let method_ref = self.constant_pool.add_method_ref(
-                            class_idx,
-                            "multiply", // Correct method name
-                            "(Ljava/math/BigDecimal;)Ljava/math/BigDecimal;",
-                        )?;
-
-                        self.load_operand(op1)?; // Load op1
-                        if op1_type != op_type {
-                            // Cast if needed
-                            let cast_instrs = get_cast_instructions(
-                                &self.oomir_func.name,
-                                &op1_type,
-                                &op_type,
-                                self.constant_pool,
-                            )?;
-                            self.jvm_instructions.extend(cast_instrs);
-                        }
-                        self.load_operand(op2)?; // Load op2
-                        if op2_type != op_type {
-                            // Cast if needed
-                            let cast_instrs = get_cast_instructions(
-                                &self.oomir_func.name,
-                                &op2_type,
-                                &op_type,
-                                self.constant_pool,
-                            )?;
-                            self.jvm_instructions.extend(cast_instrs);
-                        }
-                        self.jvm_instructions.push(JI::Invokevirtual(method_ref)); // Call
-                        self.store_result(dest, &op_type)?; // Store
-                    }
                     _ => {
                         return Err(jvm::Error::VerificationError {
                             context: format!("Function {}", self.oomir_func.name),
@@ -2716,20 +2425,12 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     || op2_type == Type::Class(F128_CLASS.to_string())
                 {
                     Type::Class(F128_CLASS.to_string())
-                } else if op1_type == Type::Class(BIG_DECIMAL_CLASS.to_string())
-                    || op2_type == Type::Class(BIG_DECIMAL_CLASS.to_string())
-                {
-                    Type::Class(BIG_DECIMAL_CLASS.to_string())
                 } else if matches!(&op1_type, Type::Class(c) if c == I128_CLASS || c == U128_CLASS)
                 {
                     op1_type.clone()
                 } else if matches!(&op2_type, Type::Class(c) if c == I128_CLASS || c == U128_CLASS)
                 {
                     op2_type.clone()
-                } else if op1_type == Type::Class(BIG_INTEGER_CLASS.to_string())
-                    || op2_type == Type::Class(BIG_INTEGER_CLASS.to_string())
-                {
-                    Type::Class(BIG_INTEGER_CLASS.to_string())
                 } else {
                     op1_type.clone()
                 };
@@ -2752,96 +2453,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     Type::Class(ref c) if c == I128_CLASS || c == U128_CLASS => {
                         self.translate_int128_binary_op(dest, op1, op2, "divide")?
                     }
-                    Type::Class(ref c) if c == BIG_INTEGER_CLASS => {
-                        // BigInteger DIVIDE operation: divide(BigInteger)
-                        // Throws ArithmeticException if divisor is zero.
-                        let class_idx = self.constant_pool.add_class(BIG_INTEGER_CLASS)?;
-                        let method_ref = self.constant_pool.add_method_ref(
-                            class_idx,
-                            "divide", // Correct method name
-                            "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
-                        )?;
-
-                        self.load_operand(op1)?; // Load op1
-                        if op1_type != op_type {
-                            // Cast if needed
-                            let cast_instrs = get_cast_instructions(
-                                &self.oomir_func.name,
-                                &op1_type,
-                                &op_type,
-                                self.constant_pool,
-                            )?;
-                            self.jvm_instructions.extend(cast_instrs);
-                        }
-                        self.load_operand(op2)?; // Load op2
-                        if op2_type != op_type {
-                            // Cast if needed
-                            let cast_instrs = get_cast_instructions(
-                                &self.oomir_func.name,
-                                &op2_type,
-                                &op_type,
-                                self.constant_pool,
-                            )?;
-                            self.jvm_instructions.extend(cast_instrs);
-                        }
-                        self.jvm_instructions.push(JI::Invokevirtual(method_ref)); // Call
-                        self.store_result(dest, &op_type)?; // Store
-                    }
-                    Type::Class(ref c) if c == BIG_DECIMAL_CLASS => {
-                        // BigDecimal DIVIDE operation: divide(BigDecimal, RoundingMode)
-                        // Using RoundingMode.HALF_UP.
-                        // Throws ArithmeticException if divisor is zero or exact result requires infinite digits.
-                        let rounding_mode_enum = "java/math/RoundingMode";
-                        let rounding_mode_field = "HALF_UP"; // Example default
-
-                        let big_dec_class_idx = self.constant_pool.add_class(BIG_DECIMAL_CLASS)?;
-                        let rounding_mode_class_idx =
-                            self.constant_pool.add_class(rounding_mode_enum)?;
-
-                        // Method ref for divide(BigDecimal, RoundingMode)
-                        let method_ref = self.constant_pool.add_method_ref(
-                            big_dec_class_idx,
-                            "divide",
-                            &format!(
-                                "(Ljava/math/BigDecimal;L{};)Ljava/math/BigDecimal;",
-                                rounding_mode_enum
-                            ),
-                        )?;
-                        // Field ref for the RoundingMode constant
-                        let field_ref = self.constant_pool.add_field_ref(
-                            rounding_mode_class_idx,
-                            rounding_mode_field,
-                            &format!("L{};", rounding_mode_enum), // Descriptor for the enum field
-                        )?;
-
-                        self.load_operand(op1)?; // Load op1 (dividend)
-                        if op1_type != op_type {
-                            // Cast if needed
-                            let cast_instrs = get_cast_instructions(
-                                &self.oomir_func.name,
-                                &op1_type,
-                                &op_type,
-                                self.constant_pool,
-                            )?;
-                            self.jvm_instructions.extend(cast_instrs);
-                        }
-                        self.load_operand(op2)?; // Load op2 (divisor)
-                        if op2_type != op_type {
-                            // Cast if needed
-                            let cast_instrs = get_cast_instructions(
-                                &self.oomir_func.name,
-                                &op2_type,
-                                &op_type,
-                                self.constant_pool,
-                            )?;
-                            self.jvm_instructions.extend(cast_instrs);
-                        }
-                        // Load the RoundingMode constant
-                        self.jvm_instructions.push(JI::Getstatic(field_ref)); // Stack: [op1, op2, rounding_mode]
-
-                        self.jvm_instructions.push(JI::Invokevirtual(method_ref)); // Call
-                        self.store_result(dest, &op_type)?; // Store
-                    }
                     _ => {
                         return Err(jvm::Error::VerificationError {
                             context: format!("Function {}", self.oomir_func.name),
@@ -2857,20 +2468,12 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     || op2_type == Type::Class(F128_CLASS.to_string())
                 {
                     Type::Class(F128_CLASS.to_string())
-                } else if op1_type == Type::Class(BIG_DECIMAL_CLASS.to_string())
-                    || op2_type == Type::Class(BIG_DECIMAL_CLASS.to_string())
-                {
-                    Type::Class(BIG_DECIMAL_CLASS.to_string())
                 } else if matches!(&op1_type, Type::Class(c) if c == I128_CLASS || c == U128_CLASS)
                 {
                     op1_type.clone()
                 } else if matches!(&op2_type, Type::Class(c) if c == I128_CLASS || c == U128_CLASS)
                 {
                     op2_type.clone()
-                } else if op1_type == Type::Class(BIG_INTEGER_CLASS.to_string())
-                    || op2_type == Type::Class(BIG_INTEGER_CLASS.to_string())
-                {
-                    Type::Class(BIG_INTEGER_CLASS.to_string())
                 } else {
                     op1_type.clone()
                 };
@@ -2892,76 +2495,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     }
                     Type::Class(ref c) if c == I128_CLASS || c == U128_CLASS => {
                         self.translate_int128_binary_op(dest, op1, op2, "remainder")?
-                    }
-                    Type::Class(ref c) if c == BIG_INTEGER_CLASS => {
-                        // BigInteger REMAINDER operation: remainder(BigInteger)
-                        // Throws ArithmeticException if divisor is zero.
-                        let class_idx = self.constant_pool.add_class(BIG_INTEGER_CLASS)?;
-                        let method_ref = self.constant_pool.add_method_ref(
-                            class_idx,
-                            "remainder", // Correct method name
-                            "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
-                        )?;
-
-                        self.load_operand(op1)?; // Load op1
-                        if op1_type != op_type {
-                            // Cast if needed
-                            let cast_instrs = get_cast_instructions(
-                                &self.oomir_func.name,
-                                &op1_type,
-                                &op_type,
-                                self.constant_pool,
-                            )?;
-                            self.jvm_instructions.extend(cast_instrs);
-                        }
-                        self.load_operand(op2)?; // Load op2
-                        if op2_type != op_type {
-                            // Cast if needed
-                            let cast_instrs = get_cast_instructions(
-                                &self.oomir_func.name,
-                                &op2_type,
-                                &op_type,
-                                self.constant_pool,
-                            )?;
-                            self.jvm_instructions.extend(cast_instrs);
-                        }
-                        self.jvm_instructions.push(JI::Invokevirtual(method_ref)); // Call
-                        self.store_result(dest, &op_type)?; // Store
-                    }
-                    Type::Class(ref c) if c == BIG_DECIMAL_CLASS => {
-                        // BigDecimal REMAINDER operation: remainder(BigDecimal)
-                        // Throws ArithmeticException if divisor is zero.
-                        let class_idx = self.constant_pool.add_class(BIG_DECIMAL_CLASS)?;
-                        let method_ref = self.constant_pool.add_method_ref(
-                            class_idx,
-                            "remainder", // Correct method name
-                            "(Ljava/math/BigDecimal;)Ljava/math/BigDecimal;",
-                        )?;
-
-                        self.load_operand(op1)?; // Load op1
-                        if op1_type != op_type {
-                            // Cast if needed
-                            let cast_instrs = get_cast_instructions(
-                                &self.oomir_func.name,
-                                &op1_type,
-                                &op_type,
-                                self.constant_pool,
-                            )?;
-                            self.jvm_instructions.extend(cast_instrs);
-                        }
-                        self.load_operand(op2)?; // Load op2
-                        if op2_type != op_type {
-                            // Cast if needed
-                            let cast_instrs = get_cast_instructions(
-                                &self.oomir_func.name,
-                                &op2_type,
-                                &op_type,
-                                self.constant_pool,
-                            )?;
-                            self.jvm_instructions.extend(cast_instrs);
-                        }
-                        self.jvm_instructions.push(JI::Invokevirtual(method_ref)); // Call
-                        self.store_result(dest, &op_type)?; // Store
                     }
                     _ => {
                         return Err(jvm::Error::VerificationError {
@@ -2993,26 +2526,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     Type::I64 | Type::U64 => self.translate_binary_op(dest, op1, op2, JI::Land)?,
                     Type::Class(ref c) if c == I128_CLASS || c == U128_CLASS => {
                         self.translate_int128_binary_op(dest, op1, op2, "and")?
-                    }
-                    Type::Class(ref c) if c == BIG_INTEGER_CLASS => {
-                        // BigInteger AND operation
-                        let class_idx = self.constant_pool.add_class(BIG_INTEGER_CLASS)?;
-                        let method_ref = self.constant_pool.add_method_ref(
-                            class_idx,
-                            "and",
-                            "(Ljava/math/BigInteger;)Ljava/math/BigInteger;", // Correct descriptor
-                        )?;
-
-                        // 1. Load the instance (`op1`)
-                        self.load_operand(op1)?; // Stack: [instance]
-                        // 2. Load the argument (`op2`)
-                        self.load_operand(op2)?; // Stack: [instance, argument]
-                        // 3. Call the method
-                        self.jvm_instructions.push(JI::Invokevirtual(method_ref)); // Stack: [result]
-                        // 4. Store the result into 'dest'
-                        //    The result type is known from the method signature's return type
-                        let result_type = Type::Class(BIG_INTEGER_CLASS.to_string());
-                        self.store_result(dest, &result_type)?; // Stack: []
                     }
                     _ => {
                         return Err(jvm::Error::VerificationError {
@@ -3048,27 +2561,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     Type::Class(ref c) if c == I128_CLASS || c == U128_CLASS => {
                         self.translate_int128_binary_op(dest, op1, op2, "or")?
                     }
-                    Type::Class(ref c) if c == BIG_INTEGER_CLASS => {
-                        // BigInteger OR operation
-                        let class_idx = self.constant_pool.add_class(BIG_INTEGER_CLASS)?;
-                        let method_ref = self.constant_pool.add_method_ref(
-                            class_idx,
-                            "or",
-                            "(Ljava/math/BigInteger;)Ljava/math/BigInteger;", // Correct descriptor
-                        )?;
-
-                        // 1. Load the instance (`op1`)
-                        self.load_operand(op1)?; // Stack: [instance]
-                        // 2. Load the argument (`op2`)
-                        self.load_operand(op2)?; // Stack: [instance, argument]
-                        // 3. Call the method
-                        self.jvm_instructions.push(JI::Invokevirtual(method_ref)); // Stack: [result]
-                        // 4. Store the result into 'dest'
-                        let result_type = Type::Class(BIG_INTEGER_CLASS.to_string());
-                        self.store_result(dest, &result_type)?; // Stack: []
-
-                        // No premature return! Ok(()) implicitly returned at end of block
-                    }
                     _ => {
                         return Err(jvm::Error::VerificationError {
                             context: format!("Function {}", self.oomir_func.name),
@@ -3101,27 +2593,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     Type::Class(ref c) if c == I128_CLASS || c == U128_CLASS => {
                         self.translate_int128_binary_op(dest, op1, op2, "xor")?
                     }
-                    Type::Class(ref c) if c == BIG_INTEGER_CLASS => {
-                        // BigInteger XOR operation
-                        let class_idx = self.constant_pool.add_class(BIG_INTEGER_CLASS)?;
-                        let method_ref = self.constant_pool.add_method_ref(
-                            class_idx,
-                            "xor",
-                            "(Ljava/math/BigInteger;)Ljava/math/BigInteger;", // Correct descriptor
-                        )?;
-
-                        // 1. Load the instance (`op1`)
-                        self.load_operand(op1)?; // Stack: [instance]
-                        // 2. Load the argument (`op2`)
-                        self.load_operand(op2)?; // Stack: [instance, argument]
-                        // 3. Call the method
-                        self.jvm_instructions.push(JI::Invokevirtual(method_ref)); // Stack: [result]
-                        // 4. Store the result into 'dest'
-                        let result_type = Type::Class(BIG_INTEGER_CLASS.to_string());
-                        self.store_result(dest, &result_type)?; // Stack: []
-
-                        // No premature return! Ok(()) implicitly returned at end of block
-                    }
                     _ => {
                         return Err(jvm::Error::VerificationError {
                             context: format!("Function {}", self.oomir_func.name),
@@ -3137,9 +2608,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             OI::Shl { dest, op1, op2 } => {
                 // Type of the object being shifted
                 let op1_type = get_operand_type(op1);
-                // Type of the shift amount (must be int for BigInteger.shiftLeft/Right)
-                let op2_type = get_operand_type(op2);
-
                 match op1_type {
                     Type::I8
                     | Type::U8
@@ -3154,35 +2622,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     Type::Class(ref c) if c == I128_CLASS || c == U128_CLASS => {
                         self.translate_int128_shift(dest, op1, op2, "shiftLeft")?
                     }
-                    Type::Class(ref c) if c == BIG_INTEGER_CLASS => {
-                        // BigInteger SHL operation: shiftLeft(int)
-                        let class_idx = self.constant_pool.add_class(BIG_INTEGER_CLASS)?;
-                        let method_ref = self.constant_pool.add_method_ref(
-                            class_idx,
-                            "shiftLeft",
-                            "(I)Ljava/math/BigInteger;", // Takes int!
-                        )?;
-
-                        // 1. Load the instance (`op1`)
-                        self.load_operand(op1)?; // Stack: [instance]
-                        // 2. Load the shift amount (`op2`) and ensure it's int
-                        self.load_operand(op2)?; // Stack: [instance, shift_amount_raw]
-                        if op2_type != Type::I32 {
-                            // Cast op2 to int if necessary (e.g., from I64, I16, I8)
-                            let cast_instrs = get_cast_instructions(
-                                &self.oomir_func.name,
-                                &op2_type,
-                                &Type::I32,
-                                self.constant_pool,
-                            )?;
-                            self.jvm_instructions.extend(cast_instrs); // Stack: [instance, shift_amount_int]
-                        }
-                        // 3. Call the method
-                        self.jvm_instructions.push(JI::Invokevirtual(method_ref)); // Stack: [result]
-                        // 4. Store the result into 'dest'
-                        let result_type = Type::Class(BIG_INTEGER_CLASS.to_string());
-                        self.store_result(dest, &result_type)?; // Stack: []
-                    }
                     _ => {
                         return Err(jvm::Error::VerificationError {
                             context: format!("Function {}", self.oomir_func.name),
@@ -3194,9 +2633,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             OI::Shr { dest, op1, op2 } => {
                 // Type of the object being shifted
                 let op1_type = get_operand_type(op1);
-                // Type of the shift amount (must be int for BigInteger.shiftLeft/Right)
-                let op2_type = get_operand_type(op2);
-
                 match op1_type {
                     Type::I8
                     | Type::U8
@@ -3210,35 +2646,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     | Type::Char => self.translate_primitive_shift(dest, op1, op2, false)?,
                     Type::Class(ref c) if c == I128_CLASS || c == U128_CLASS => {
                         self.translate_int128_shift(dest, op1, op2, "shiftRight")?
-                    }
-                    Type::Class(ref c) if c == BIG_INTEGER_CLASS => {
-                        // BigInteger SHR operation: shiftRight(int)
-                        let class_idx = self.constant_pool.add_class(BIG_INTEGER_CLASS)?;
-                        let method_ref = self.constant_pool.add_method_ref(
-                            class_idx,
-                            "shiftRight",
-                            "(I)Ljava/math/BigInteger;", // Takes int!
-                        )?;
-
-                        // 1. Load the instance (`op1`)
-                        self.load_operand(op1)?; // Stack: [instance]
-                        // 2. Load the shift amount (`op2`) and ensure it's int
-                        self.load_operand(op2)?; // Stack: [instance, shift_amount_raw]
-                        if op2_type != Type::I32 {
-                            // Cast op2 to int if necessary (e.g., from I64, I16, I8)
-                            let cast_instrs = get_cast_instructions(
-                                &self.oomir_func.name,
-                                &op2_type,
-                                &Type::I32,
-                                self.constant_pool,
-                            )?;
-                            self.jvm_instructions.extend(cast_instrs); // Stack: [instance, shift_amount_int]
-                        }
-                        // 3. Call the method
-                        self.jvm_instructions.push(JI::Invokevirtual(method_ref)); // Stack: [result]
-                        // 4. Store the result into 'dest'
-                        let result_type = Type::Class(BIG_INTEGER_CLASS.to_string());
-                        self.store_result(dest, &result_type)?; // Stack: []
                     }
                     _ => {
                         return Err(jvm::Error::VerificationError {
@@ -3280,23 +2687,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     }
                     oomir::Type::Class(ref c) if c == I128_CLASS || c == U128_CLASS => {
                         self.translate_int128_unary_op(dest, src, "not")?
-                    }
-                    oomir::Type::Class(ref c) if c == BIG_INTEGER_CLASS => {
-                        // BigInteger NOT operation: not()
-                        let class_idx = self.constant_pool.add_class(BIG_INTEGER_CLASS)?;
-                        let method_ref = self.constant_pool.add_method_ref(
-                            class_idx,
-                            "not",
-                            "()Ljava/math/BigInteger;", // Takes no args!
-                        )?;
-
-                        // 1. Load the instance (`src`)
-                        self.load_operand(src)?; // Stack: [instance]
-                        // 2. Call the method
-                        self.jvm_instructions.push(JI::Invokevirtual(method_ref)); // Stack: [result]
-                        // 3. Store the result into 'dest'
-                        let result_type = Type::Class(BIG_INTEGER_CLASS.to_string());
-                        self.store_result(dest, &result_type)?; // Stack: []
                     }
                     _ => {
                         return Err(jvm::Error::VerificationError {
@@ -3359,23 +2749,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     }
                     oomir::Type::Class(ref c) if c == I128_CLASS || c == U128_CLASS => {
                         self.translate_int128_unary_op(dest, src, "negate")?
-                    }
-                    oomir::Type::Class(ref c) if c == BIG_INTEGER_CLASS => {
-                        // BigInteger Negation operation: negate()
-                        let class_idx = self.constant_pool.add_class(BIG_INTEGER_CLASS)?;
-                        let method_ref = self.constant_pool.add_method_ref(
-                            class_idx,
-                            "negate",
-                            "()Ljava/math/BigInteger;", // Takes no args!
-                        )?;
-
-                        // 1. Load the instance (`src`)
-                        self.load_operand(src)?; // Stack: [instance]
-                        // 2. Call the method
-                        self.jvm_instructions.push(JI::Invokevirtual(method_ref)); // Stack: [result]
-                        // 3. Store the result into 'dest'
-                        let result_type = Type::Class(BIG_INTEGER_CLASS.to_string());
-                        self.store_result(dest, &result_type)?; // Stack: []
                     }
                     _ => {
                         return Err(jvm::Error::VerificationError {
@@ -3454,14 +2827,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     Type::F32 => true,
                     Type::F64 => true,
                     Type::String => true, // Use .equals()
-                    Type::Class(c)
-                        if c == BIG_INTEGER_CLASS
-                            || c == BIG_DECIMAL_CLASS
-                            || c == I128_CLASS
-                            || c == U128_CLASS =>
-                    {
-                        true
-                    } // Use .compareTo()
+                    Type::Class(c) if c == I128_CLASS || c == U128_CLASS => true, // Use .compareTo()
                     _ => false,
                 };
 
@@ -3648,48 +3014,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                             let if_instr_index = self.jvm_instructions.len();
                             // Jump if the result is non-zero (i.e., true)
                             self.jvm_instructions.push(JI::Ifne(0));
-                            self.branch_fixups
-                                .push((if_instr_index, target_label.clone()));
-                        }
-
-                        Type::Class(c) if c == BIG_INTEGER_CLASS => {
-                            load_constant(
-                                &mut self.jvm_instructions,
-                                &mut self.constant_pool,
-                                constant_key,
-                            )?; // Stack: [discr(BI_ref), key(BI_ref)]
-
-                            let class_idx = self.constant_pool.add_class(BIG_INTEGER_CLASS)?;
-                            let compare_to_ref = self.constant_pool.add_method_ref(
-                                class_idx,
-                                "compareTo",
-                                "(Ljava/math/BigInteger;)I",
-                            )?;
-                            self.jvm_instructions
-                                .push(JI::Invokevirtual(compare_to_ref)); // Stack: [cmp_result(int)]
-                            let if_instr_index = self.jvm_instructions.len();
-                            self.jvm_instructions.push(JI::Ifeq(0)); // Jump if equal (cmp_result == 0)
-                            self.branch_fixups
-                                .push((if_instr_index, target_label.clone()));
-                        }
-
-                        Type::Class(c) if c == BIG_DECIMAL_CLASS => {
-                            load_constant(
-                                &mut self.jvm_instructions,
-                                &mut self.constant_pool,
-                                constant_key,
-                            )?; // Stack: [discr(BD_ref), key(BD_ref)]
-
-                            let class_idx = self.constant_pool.add_class(BIG_DECIMAL_CLASS)?;
-                            let compare_to_ref = self.constant_pool.add_method_ref(
-                                class_idx,
-                                "compareTo",
-                                "(Ljava/math/BigDecimal;)I",
-                            )?;
-                            self.jvm_instructions
-                                .push(JI::Invokevirtual(compare_to_ref)); // Stack: [cmp_result(int)]
-                            let if_instr_index = self.jvm_instructions.len();
-                            self.jvm_instructions.push(JI::Ifeq(0)); // Jump if equal (cmp_result == 0)
                             self.branch_fixups
                                 .push((if_instr_index, target_label.clone()));
                         }

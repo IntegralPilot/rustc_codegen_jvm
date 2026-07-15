@@ -4,7 +4,7 @@ use super::jvm::{self, attributes::Instruction};
 use oomir::Type;
 
 use super::consts::{get_int_const_instr, get_long_const_instr};
-use super::{BIG_DECIMAL_CLASS, BIG_INTEGER_CLASS, F128_CLASS, I128_CLASS, U128_CLASS};
+use super::{F128_CLASS, I128_CLASS, U128_CLASS};
 
 /// Returns the number of JVM local variable slots a type occupies (0, 1, or 2).
 pub fn get_type_size(ty: &Type) -> u16 {
@@ -342,7 +342,7 @@ pub fn get_cast_instructions(
         return primitive_to_primitive(src, dest, cp);
     }
 
-    // 2. Primitive -> BigInteger / BigDecimal
+    // 2. Primitive -> runtime numeric wrapper
     if src.is_jvm_primitive_like() {
         if let Type::Class(cn) = dest {
             if cn == F128_CLASS {
@@ -350,12 +350,6 @@ pub fn get_cast_instructions(
             }
             if cn == I128_CLASS || cn == U128_CLASS {
                 return prim_to_int128(src, cn, cp);
-            }
-            if cn == BIG_INTEGER_CLASS {
-                return prim_to_bigint(src, cp);
-            }
-            if cn == BIG_DECIMAL_CLASS {
-                return prim_to_bigdec(src, cp);
             }
             if cn == "java/lang/Object" {
                 let wrapper_method = match src {
@@ -393,7 +387,7 @@ pub fn get_cast_instructions(
         }
     }
 
-    // 3. BigInteger / BigDecimal -> Primitive
+    // 3. Runtime numeric wrapper -> Primitive
     if let Type::Class(cn) = src {
         if dest.is_jvm_primitive_like() {
             if cn == F128_CLASS {
@@ -401,12 +395,6 @@ pub fn get_cast_instructions(
             }
             if cn == I128_CLASS || cn == U128_CLASS {
                 return int128_to_prim(cn, dest, cp);
-            }
-            if cn == BIG_INTEGER_CLASS {
-                return bigint_to_prim(dest, cp);
-            }
-            if cn == BIG_DECIMAL_CLASS {
-                return bigdec_to_prim(dest, cp);
             }
         }
     }
@@ -432,7 +420,7 @@ pub fn get_cast_instructions(
         return Ok(vec![JI::Invokestatic(unbox)]);
     }
 
-    // 4. Reference -> Reference (including String, BigInteger, BigDecimal interop)
+    // 4. Reference -> Reference
     if src.is_jvm_reference_type() && dest.is_jvm_reference_type() {
         if let (Type::Class(src_class), Type::Class(dest_class)) = (src, dest) {
             if (src_class == I128_CLASS || src_class == U128_CLASS) && dest_class == F128_CLASS {
@@ -473,53 +461,6 @@ pub fn get_cast_instructions(
             };
             let method = cp.add_method_ref(owner, method_name, &format!("()L{dest_class};"))?;
             return Ok(vec![JI::Invokevirtual(method)]);
-        }
-
-        // String -> BigInteger
-        if src == &Type::String && dest == &Type::Class(BIG_INTEGER_CLASS.into()) {
-            let bi_idx = cp.add_class(BIG_INTEGER_CLASS)?;
-            let ctor = cp.add_method_ref(bi_idx, "<init>", "(Ljava/lang/String;)V")?;
-            return Ok(vec![JI::New(bi_idx), JI::Swap, JI::Invokespecial(ctor)]);
-        }
-
-        // BigInteger -> String
-        if src == &Type::Class(BIG_INTEGER_CLASS.into()) && dest == &Type::String {
-            let bi_idx = cp.add_class(BIG_INTEGER_CLASS)?;
-            let mref = cp.add_method_ref(bi_idx, "toString", "()Ljava/lang/String;")?;
-            return Ok(vec![JI::Invokevirtual(mref)]);
-        }
-
-        // String -> BigDecimal
-        if src == &Type::String && dest == &Type::Class(BIG_DECIMAL_CLASS.into()) {
-            let bd_idx = cp.add_class(BIG_DECIMAL_CLASS)?;
-            let ctor = cp.add_method_ref(bd_idx, "<init>", "(Ljava/lang/String;)V")?;
-            return Ok(vec![JI::New(bd_idx), JI::Swap, JI::Invokespecial(ctor)]);
-        }
-
-        // BigDecimal -> String
-        if src == &Type::Class(BIG_DECIMAL_CLASS.into()) && dest == &Type::String {
-            let bd_idx = cp.add_class(BIG_DECIMAL_CLASS)?;
-            let mref = cp.add_method_ref(bd_idx, "toString", "()Ljava/lang/String;")?;
-            return Ok(vec![JI::Invokevirtual(mref)]);
-        }
-
-        // BigInteger -> BigDecimal
-        if src == &Type::Class(BIG_INTEGER_CLASS.into())
-            && dest == &Type::Class(BIG_DECIMAL_CLASS.into())
-        {
-            let bd_idx = cp.add_class(BIG_DECIMAL_CLASS)?;
-            let ctor = cp.add_method_ref(bd_idx, "<init>", "(Ljava/math/BigInteger;)V")?;
-            return Ok(vec![JI::New(bd_idx), JI::Swap, JI::Invokespecial(ctor)]);
-        }
-
-        // BigDecimal -> BigInteger
-        if src == &Type::Class(BIG_DECIMAL_CLASS.into())
-            && dest == &Type::Class(BIG_INTEGER_CLASS.into())
-        {
-            let bd_idx = cp.add_class(BIG_DECIMAL_CLASS)?;
-            let mref =
-                cp.add_method_ref(bd_idx, "toBigIntegerExact", "()Ljava/math/BigInteger;")?;
-            return Ok(vec![JI::Invokevirtual(mref)]);
         }
 
         if let Type::Class(cn) = dest {
@@ -929,126 +870,6 @@ fn int128_to_prim(
             instructions.extend(primitive_to_primitive(&Type::I64, dest, cp)?);
             Ok(instructions)
         }
-    }
-}
-
-/// primitive → BigInteger via BigInteger.valueOf(long)
-fn prim_to_bigint(
-    src: &Type,
-    cp: &mut InternedConstantPool,
-) -> Result<Vec<Instruction>, jvm::Error> {
-    use Instruction as JI;
-    let bi_idx = cp.add_class(BIG_INTEGER_CLASS)?;
-    let mref = cp.add_method_ref(bi_idx, "valueOf", "(J)Ljava/math/BigInteger;")?;
-    let mut ins = Vec::new();
-    match src {
-        Type::I64            => ins.push(JI::Invokestatic(mref)),
-        _ /* smaller ints */ => {
-            ins.push(JI::I2l);
-            ins.push(JI::Invokestatic(mref));
-        }
-    }
-    Ok(ins)
-}
-
-/// primitive → BigDecimal via BigDecimal.valueOf(long|double)
-fn prim_to_bigdec(
-    src: &Type,
-    cp: &mut InternedConstantPool,
-) -> Result<Vec<Instruction>, jvm::Error> {
-    use Instruction as JI;
-    let bd_idx = cp.add_class(BIG_DECIMAL_CLASS)?;
-    let (cast, sig) = match src {
-        Type::F32           => (Some(JI::F2d), "(D)Ljava/math/BigDecimal;"),
-        Type::F64           => (None,          "(D)Ljava/math/BigDecimal;"),
-        _ /* ints */        => (Some(JI::I2l), "(J)Ljava/math/BigDecimal;"),
-    };
-    let mref = cp.add_method_ref(bd_idx, "valueOf", sig)?;
-    let mut ins = Vec::new();
-    if let Some(c) = cast {
-        ins.push(c)
-    }
-    ins.push(JI::Invokestatic(mref));
-    Ok(ins)
-}
-
-/// BigInteger → primitive via intValue/longValue/doubleValue(...)
-fn bigint_to_prim(
-    dest: &Type,
-    cp: &mut InternedConstantPool,
-) -> Result<Vec<Instruction>, jvm::Error> {
-    use Instruction as JI;
-    let bi_idx = cp.add_class(BIG_INTEGER_CLASS)?;
-    let mut ins = Vec::new();
-    match dest {
-        Type::I32 | Type::I8 | Type::I16 | Type::Char | Type::Boolean => {
-            let m = cp.add_method_ref(bi_idx, "intValue", "()I")?;
-            ins.push(JI::Invokevirtual(m));
-            if let Some(n) = final_conversion(dest) {
-                ins.push(n)
-            }
-        }
-        Type::I64 => {
-            let m = cp.add_method_ref(bi_idx, "longValue", "()J")?;
-            ins.push(JI::Invokevirtual(m));
-        }
-        Type::F32 => {
-            let m = cp.add_method_ref(bi_idx, "doubleValue", "()D")?;
-            ins.push(JI::Invokevirtual(m));
-            ins.push(JI::D2f);
-        }
-        Type::F64 => {
-            let m = cp.add_method_ref(bi_idx, "doubleValue", "()D")?;
-            ins.push(JI::Invokevirtual(m));
-        }
-        _ => {
-            return Err(jvm::Error::VerificationError {
-                context: "bigint_to_prim".into(),
-                message: format!("Cannot unbox BigInteger → {:?}", dest),
-            });
-        }
-    }
-    Ok(ins)
-}
-
-/// BigDecimal → primitive via intValue/longValue/floatValue/doubleValue(...)
-fn bigdec_to_prim(
-    dest: &Type,
-    cp: &mut InternedConstantPool,
-) -> Result<Vec<Instruction>, jvm::Error> {
-    use Instruction as JI;
-    let bd_idx = cp.add_class(BIG_DECIMAL_CLASS)?;
-    let mut ins = Vec::new();
-    let (name, sig) = match dest {
-        Type::I32 | Type::I8 | Type::I16 | Type::Char | Type::Boolean => ("intValue", "()I"),
-        Type::I64 => ("longValue", "()J"),
-        Type::F32 => ("floatValue", "()F"),
-        Type::F64 => ("doubleValue", "()D"),
-        _ => {
-            return Err(jvm::Error::VerificationError {
-                context: "bigdec_to_prim".into(),
-                message: format!("Cannot unbox BigDecimal → {:?}", dest),
-            });
-        }
-    };
-    let m = cp.add_method_ref(bd_idx, name, sig)?;
-    ins.push(JI::Invokevirtual(m));
-    if matches!(dest, Type::I8 | Type::I16 | Type::Char) {
-        if let Some(n) = final_conversion(dest) {
-            ins.push(n)
-        }
-    }
-    Ok(ins)
-}
-
-/// Final narrowing for byte/short/char
-fn final_conversion(dest: &Type) -> Option<Instruction> {
-    use Instruction::*;
-    match dest {
-        Type::I8 => Some(I2b),
-        Type::Char => Some(I2c),
-        Type::I16 => Some(I2s),
-        _ => None,
     }
 }
 

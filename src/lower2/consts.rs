@@ -306,7 +306,7 @@ pub fn load_constant(
             // i128/u128 constants are represented in OOMIR as decimal strings so
             // that the interpreter can manipulate them without losing width. At
             // bytecode generation time, materialise their two primitive limbs
-            // directly. This avoids String and BigInteger work every time a wide
+            // directly. This avoids string allocation every time a wide
             // constant is loaded at runtime.
             if (class_name == I128_CLASS || class_name == U128_CLASS)
                 && let [OC::String(value)] = params.as_slice()

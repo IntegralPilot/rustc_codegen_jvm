@@ -586,8 +586,7 @@ fn requires_compiled_static_dispatch(ty: &oomir::Type) -> bool {
         || matches!(
             ty,
             oomir::Type::Class(class_name)
-                if class_name == crate::lower2::BIG_INTEGER_CLASS
-                    || class_name == crate::lower2::I128_CLASS
+                if class_name == crate::lower2::I128_CLASS
                     || class_name == crate::lower2::U128_CLASS
                     || class_name == crate::lower2::F128_CLASS
         )
@@ -638,8 +637,7 @@ fn supports_direct_equality(ty: &oomir::Type) -> bool {
         || matches!(
             ty,
             oomir::Type::Class(class_name)
-                if class_name == crate::lower2::BIG_INTEGER_CLASS
-                    || class_name == crate::lower2::I128_CLASS
+                if class_name == crate::lower2::I128_CLASS
                     || class_name == crate::lower2::U128_CLASS
                     || class_name == crate::lower2::F128_CLASS
         )
@@ -652,8 +650,7 @@ fn supports_direct_ordering(ty: &oomir::Type) -> bool {
         || matches!(
             ty,
             oomir::Type::Class(class_name)
-                if class_name == crate::lower2::BIG_INTEGER_CLASS
-                    || class_name == crate::lower2::I128_CLASS
+                if class_name == crate::lower2::I128_CLASS
                     || class_name == crate::lower2::U128_CLASS
                     || class_name == crate::lower2::F128_CLASS
         )

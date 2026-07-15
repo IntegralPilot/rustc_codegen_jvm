@@ -1,28 +1,22 @@
 use super::{Constant, Type};
-use bigdecimal::{BigDecimal, FromPrimitive, ParseBigDecimalError, RoundingMode, ToPrimitive};
 use num_bigint::{BigInt, ParseBigIntError};
-use num_traits::Zero;
+use num_traits::{ToPrimitive, Zero};
 use std::convert::{TryFrom, TryInto};
-use std::ops::Div;
 use std::str::FromStr; // Needed for parsing
 
 // Helps distinguish parsing errors from unsupported operations
 enum InterpretError {
     ParseBigInt(ParseBigIntError),
-    ParseBigDecimal(ParseBigDecimalError),
     UnsupportedOperation,
     DivisionByZero,
-    Overflow, // For lossy casts back to primitives if needed
 }
 
 impl std::fmt::Debug for InterpretError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             InterpretError::ParseBigInt(e) => write!(f, "ParseBigIntError: {:?}", e),
-            InterpretError::ParseBigDecimal(e) => write!(f, "ParseBigDecimalError: {:?}", e),
             InterpretError::UnsupportedOperation => write!(f, "UnsupportedOperation"),
             InterpretError::DivisionByZero => write!(f, "DivisionByZero"),
-            InterpretError::Overflow => write!(f, "Overflow"),
         }
     }
 }
@@ -30,11 +24,6 @@ impl std::fmt::Debug for InterpretError {
 impl From<ParseBigIntError> for InterpretError {
     fn from(e: ParseBigIntError) -> Self {
         InterpretError::ParseBigInt(e)
-    }
-}
-impl From<ParseBigDecimalError> for InterpretError {
-    fn from(e: ParseBigDecimalError) -> Self {
-        InterpretError::ParseBigDecimal(e)
     }
 }
 
@@ -54,7 +43,7 @@ fn parse_constant_to_bigint(c: &Constant) -> Result<BigInt, InterpretError> {
             class_name, params, ..
         } if matches!(
             class_name.as_str(),
-            "java/math/BigInteger" | "org/rustlang/runtime/I128" | "org/rustlang/runtime/U128"
+            "org/rustlang/runtime/I128" | "org/rustlang/runtime/U128"
         ) =>
         {
             if params.len() == 1 {
@@ -68,57 +57,6 @@ fn parse_constant_to_bigint(c: &Constant) -> Result<BigInt, InterpretError> {
             }
         }
         _ => Err(InterpretError::UnsupportedOperation), // Cannot parse other types to BigInt directly
-    }
-}
-
-fn parse_constant_to_bigdecimal(c: &Constant) -> Result<BigDecimal, InterpretError> {
-    match c {
-        Constant::I8(v) => BigDecimal::from_i8(*v).ok_or(InterpretError::Overflow),
-        Constant::I16(v) => BigDecimal::from_i16(*v).ok_or(InterpretError::Overflow),
-        Constant::I32(v) => BigDecimal::from_i32(*v).ok_or(InterpretError::Overflow),
-        Constant::I64(v) => BigDecimal::from_i64(*v).ok_or(InterpretError::Overflow),
-        Constant::U8(v) => BigDecimal::from_u8(*v).ok_or(InterpretError::Overflow),
-        Constant::U16(v) => BigDecimal::from_u16(*v).ok_or(InterpretError::Overflow),
-        Constant::U32(v) => BigDecimal::from_u32(*v).ok_or(InterpretError::Overflow),
-        Constant::U64(v) => BigDecimal::from_u64(*v).ok_or(InterpretError::Overflow),
-        Constant::F32(v) => BigDecimal::from_f32(*v).ok_or(InterpretError::UnsupportedOperation), // May lose precision
-        Constant::F64(v) => BigDecimal::from_f64(*v).ok_or(InterpretError::UnsupportedOperation), // May lose precision
-        Constant::Boolean(v) => BigDecimal::from_i8(*v as i8).ok_or(InterpretError::Overflow),
-        Constant::Char(v) => BigDecimal::from_u32(*v as u32).ok_or(InterpretError::Overflow),
-        Constant::Instance { class_name, .. }
-            if matches!(
-                class_name.as_str(),
-                "java/math/BigInteger" | "org/rustlang/runtime/I128" | "org/rustlang/runtime/U128"
-            ) =>
-        {
-            // Convert BigInt instance to BigDecimal
-            let bigint = parse_constant_to_bigint(c)?;
-            Ok(BigDecimal::from(bigint))
-        }
-        Constant::Instance {
-            class_name, params, ..
-        } if class_name == "java/math/BigDecimal" => {
-            if params.len() == 1 {
-                if let Constant::String(ref s) = params[0] {
-                    // Handle "0.0" vs "-0.0" string parsing explicitly if library doesn't normalize
-                    // BigDecimal::from_str usually handles this fine.
-                    Ok(BigDecimal::from_str(&s)?)
-                } else {
-                    Err(InterpretError::UnsupportedOperation) // Expected string param
-                }
-            } else {
-                Err(InterpretError::UnsupportedOperation) // Wrong number of params
-            }
-        }
-        _ => Err(InterpretError::UnsupportedOperation), // Cannot parse other types
-    }
-}
-
-fn bigint_to_constant(bi: BigInt) -> Constant {
-    Constant::Instance {
-        class_name: "java/math/BigInteger".to_string(),
-        fields: Default::default(), // Assuming no fields needed for constant representation
-        params: vec![Constant::String(bi.to_string())],
     }
 }
 
@@ -144,13 +82,6 @@ fn bigint_to_integer_constant_like(value: BigInt, template: &Constant) -> Option
         Constant::U64(_) => (64, false),
         Constant::Instance { class_name, .. } if is_i128_class(class_name) => (128, true),
         Constant::Instance { class_name, .. } if is_u128_class(class_name) => (128, false),
-        Constant::Instance { class_name, .. }
-            if class_name == "java/math/BigInteger"
-                || is_i128_class(class_name)
-                || is_u128_class(class_name) =>
-        {
-            return Some(bigint_to_constant(value));
-        }
         _ => return None,
     };
 
@@ -189,68 +120,10 @@ fn bigint_to_integer_constant_like(value: BigInt, template: &Constant) -> Option
     }
 }
 
-fn bigdecimal_to_constant(bd: BigDecimal) -> Constant {
-    // Ensure consistent string representation (e.g., avoid trailing zeros if possible, match Java?)
-    // bd.to_string() is usually sufficient. Use `.normalized()` if needed.
-    Constant::Instance {
-        class_name: "java/math/BigDecimal".to_string(),
-        fields: Default::default(),
-        params: vec![Constant::String(bd.to_string())],
-    }
-}
-
-// Default scale for BigDecimal division (adjust as needed)
-const BIGDECIMAL_DIVISION_SCALE: i64 = 50;
-
 pub fn cast_constant(c: Constant, ty: Type) -> Option<Constant> {
     match (&ty, &c) {
         // Identity casts
         _ if Type::from_constant(&c) == ty => Some(c),
-
-        // To BigInt
-        (Type::Class(cn), _) if cn == "java/math/BigInteger" => {
-            parse_constant_to_bigint(&c).ok().map(bigint_to_constant)
-        }
-        // To BigDecimal
-        (Type::Class(cn), _) if cn == "java/math/BigDecimal" => parse_constant_to_bigdecimal(&c)
-            .ok()
-            .map(bigdecimal_to_constant),
-
-        // From BigInt
-        (_, Constant::Instance { class_name, .. }) if class_name == "java/math/BigInteger" => {
-            let bigint = parse_constant_to_bigint(&c).ok()?;
-            match ty {
-                Type::I8 => bigint.to_i8().map(Constant::I8),
-                Type::I16 => bigint.to_i16().map(Constant::I16),
-                Type::I32 => bigint.to_i32().map(Constant::I32),
-                Type::I64 => bigint.to_i64().map(Constant::I64),
-                Type::F32 => bigint.to_f32().map(Constant::F32), // Precision loss possible
-                Type::F64 => bigint.to_f64().map(Constant::F64), // Precision loss possible
-                Type::Boolean => Some(Constant::Boolean(!bigint.is_zero())),
-                Type::Char => bigint
-                    .to_u32()
-                    .and_then(std::char::from_u32)
-                    .map(Constant::Char),
-                // Cannot cast BigInt to String, Array, other Class constantly
-                _ => None,
-            }
-        }
-        // From BigDecimal
-        (_, Constant::Instance { class_name, .. }) if class_name == "java/math/BigDecimal" => {
-            let bigdec = parse_constant_to_bigdecimal(&c).ok()?;
-            match ty {
-                // Truncates towards zero for float -> int
-                Type::I8 => bigdec.to_i8().map(Constant::I8),
-                Type::I16 => bigdec.to_i16().map(Constant::I16),
-                Type::I32 => bigdec.to_i32().map(Constant::I32),
-                Type::I64 => bigdec.to_i64().map(Constant::I64),
-                Type::F32 => bigdec.to_f32().map(Constant::F32), // Precision loss possible
-                Type::F64 => bigdec.to_f64().map(Constant::F64), // Precision loss possible
-                Type::Boolean => Some(Constant::Boolean(!bigdec.is_zero())),
-                // Cannot cast BigDecimal to Char, String, Array, other Class constantly
-                _ => None,
-            }
-        }
 
         (_, Constant::I8(val)) => match ty {
             Type::I8 => Some(Constant::I8(*val)),
@@ -363,18 +236,6 @@ pub fn unify_ops_type(op1: Constant, op2: Constant) -> Option<(Constant, Constan
 
     // Determine the target type based on promotion rules
     let target_type = match (&type1, &type2) {
-        (Type::Class(cn1), _) if cn1 == "java/math/BigDecimal" => type1.clone(),
-        (_, Type::Class(cn2)) if cn2 == "java/math/BigDecimal" => type2.clone(),
-
-        (Type::Class(cn1), _) if cn1 == "java/math/BigInteger" => match type2 {
-            Type::F32 | Type::F64 => Type::Class("java/math/BigDecimal".to_string()), // Promote BigInt to Dec
-            _ => type1.clone(), // Promote Int/Bool/Char to BigInt
-        },
-        (_, Type::Class(cn2)) if cn2 == "java/math/BigInteger" => match type1 {
-            Type::F32 | Type::F64 => Type::Class("java/math/BigDecimal".to_string()), // Promote BigInt to Dec
-            _ => type2.clone(), // Promote Int/Bool/Char to BigInt
-        },
-
         (Type::Class(cn1), _) if is_i128_class(cn1) || is_u128_class(cn1) => type1.clone(),
         (_, Type::Class(cn2)) if is_i128_class(cn2) || is_u128_class(cn2) => type2.clone(),
 
@@ -437,18 +298,11 @@ pub fn add_constants(op1: Constant, op2: Constant) -> Option<Constant> {
     let (unified_op1, unified_op2) = unify_ops_type(op1, op2)?;
     match &unified_op1 {
         Constant::Instance { class_name, .. }
-            if class_name == "java/math/BigInteger"
-                || is_i128_class(class_name)
-                || is_u128_class(class_name) =>
+            if is_i128_class(class_name) || is_u128_class(class_name) =>
         {
             let bi1 = parse_constant_to_bigint(&unified_op1).ok()?;
             let bi2 = parse_constant_to_bigint(&unified_op2).ok()?;
             bigint_to_integer_constant_like(bi1 + bi2, &unified_op1)
-        }
-        Constant::Instance { class_name, .. } if class_name == "java/math/BigDecimal" => {
-            let bd1 = parse_constant_to_bigdecimal(&unified_op1).ok()?;
-            let bd2 = parse_constant_to_bigdecimal(&unified_op2).ok()?;
-            Some(bigdecimal_to_constant(bd1 + bd2))
         }
         _ => primitive_arithmetic!(unified_op1, unified_op2, +, wrapping_add),
     }
@@ -458,18 +312,11 @@ pub fn subtract_constants(op1: Constant, op2: Constant) -> Option<Constant> {
     let (unified_op1, unified_op2) = unify_ops_type(op1, op2)?;
     match &unified_op1 {
         Constant::Instance { class_name, .. }
-            if class_name == "java/math/BigInteger"
-                || is_i128_class(class_name)
-                || is_u128_class(class_name) =>
+            if is_i128_class(class_name) || is_u128_class(class_name) =>
         {
             let bi1 = parse_constant_to_bigint(&unified_op1).ok()?;
             let bi2 = parse_constant_to_bigint(&unified_op2).ok()?;
             bigint_to_integer_constant_like(bi1 - bi2, &unified_op1)
-        }
-        Constant::Instance { class_name, .. } if class_name == "java/math/BigDecimal" => {
-            let bd1 = parse_constant_to_bigdecimal(&unified_op1).ok()?;
-            let bd2 = parse_constant_to_bigdecimal(&unified_op2).ok()?;
-            Some(bigdecimal_to_constant(bd1 - bd2))
         }
         _ => primitive_arithmetic!(unified_op1, unified_op2, -, wrapping_sub),
     }
@@ -479,18 +326,11 @@ pub fn multiply_constants(op1: Constant, op2: Constant) -> Option<Constant> {
     let (unified_op1, unified_op2) = unify_ops_type(op1, op2)?;
     match &unified_op1 {
         Constant::Instance { class_name, .. }
-            if class_name == "java/math/BigInteger"
-                || is_i128_class(class_name)
-                || is_u128_class(class_name) =>
+            if is_i128_class(class_name) || is_u128_class(class_name) =>
         {
             let bi1 = parse_constant_to_bigint(&unified_op1).ok()?;
             let bi2 = parse_constant_to_bigint(&unified_op2).ok()?;
             bigint_to_integer_constant_like(bi1 * bi2, &unified_op1)
-        }
-        Constant::Instance { class_name, .. } if class_name == "java/math/BigDecimal" => {
-            let bd1 = parse_constant_to_bigdecimal(&unified_op1).ok()?;
-            let bd2 = parse_constant_to_bigdecimal(&unified_op2).ok()?;
-            Some(bigdecimal_to_constant(bd1 * bd2))
         }
         _ => primitive_arithmetic!(unified_op1, unified_op2, *, wrapping_mul), // Note: F32/F64 have '-' in the template, correct is '*'
     }
@@ -499,7 +339,9 @@ pub fn multiply_constants(op1: Constant, op2: Constant) -> Option<Constant> {
 pub fn divide_constants(op1: Constant, op2: Constant) -> Option<Constant> {
     let (unified_op1, unified_op2) = unify_ops_type(op1, op2)?;
     match &unified_op1 {
-        Constant::Instance { class_name, .. } if class_name == "java/math/BigInteger" => {
+        Constant::Instance { class_name, .. }
+            if is_i128_class(class_name) || is_u128_class(class_name) =>
+        {
             let bi1 = parse_constant_to_bigint(&unified_op1).ok()?;
             let bi2 = parse_constant_to_bigint(&unified_op2).ok()?;
             if bi2.is_zero() {
@@ -508,23 +350,6 @@ pub fn divide_constants(op1: Constant, op2: Constant) -> Option<Constant> {
             // Use checked_div for integer division semantics (truncates)
             bi1.checked_div(&bi2)
                 .and_then(|value| bigint_to_integer_constant_like(value, &unified_op1))
-        }
-        Constant::Instance { class_name, .. } if class_name == "java/math/BigDecimal" => {
-            let bd1 = parse_constant_to_bigdecimal(&unified_op1).ok()?;
-            let bd2 = parse_constant_to_bigdecimal(&unified_op2).ok()?;
-            if bd2.is_zero() {
-                return None;
-            } // Division by zero
-            // Perform division with a specified scale and rounding mode
-            // Java's default is often complex; HALF_UP is common. Adjust scale as needed.
-            if bd2.is_zero() {
-                None
-            } else {
-                let result = bd1
-                    .div(&bd2)
-                    .with_scale_round(BIGDECIMAL_DIVISION_SCALE, RoundingMode::HalfUp);
-                Some(bigdecimal_to_constant(result))
-            }
         }
         _ => {
             primitive_arithmetic!(unified_op1, unified_op2, /, checked_div, InterpretError::DivisionByZero)
@@ -536,9 +361,7 @@ pub fn rem_constants(op1: Constant, op2: Constant) -> Option<Constant> {
     let (unified_op1, unified_op2) = unify_ops_type(op1, op2)?;
     match &unified_op1 {
         Constant::Instance { class_name, .. }
-            if class_name == "java/math/BigInteger"
-                || is_i128_class(class_name)
-                || is_u128_class(class_name) =>
+            if is_i128_class(class_name) || is_u128_class(class_name) =>
         {
             let bi1 = parse_constant_to_bigint(&unified_op1).ok()?;
             let bi2 = parse_constant_to_bigint(&unified_op2).ok()?;
@@ -548,17 +371,6 @@ pub fn rem_constants(op1: Constant, op2: Constant) -> Option<Constant> {
             // Use checked_rem
             bigint_to_integer_constant_like(bi1 % bi2, &unified_op1)
         }
-        Constant::Instance { class_name, .. } if class_name == "java/math/BigDecimal" => {
-            let bd1 = parse_constant_to_bigdecimal(&unified_op1).ok()?;
-            let bd2 = parse_constant_to_bigdecimal(&unified_op2).ok()?;
-            if bd2.is_zero() {
-                return None;
-            } // Division by zero
-            // BigDecimal's remainder might differ slightly from % on floats.
-            // Java's BigDecimal remainder: a.remainder(b) = a - a.divideToIntegralValue(b).multiply(b)
-            // This matches num_bigint's `rem` behaviour more closely than floats `%`.
-            Some(bigdecimal_to_constant(bd1 % bd2)) // Use the '%' operator defined for BigDecimal
-        }
         _ => {
             primitive_arithmetic!(unified_op1, unified_op2, %, checked_rem, InterpretError::DivisionByZero)
         }
@@ -567,15 +379,6 @@ pub fn rem_constants(op1: Constant, op2: Constant) -> Option<Constant> {
 
 // Helper for comparisons
 fn compare_constants(op1: Constant, op2: Constant) -> Option<std::cmp::Ordering> {
-    // Try comparing as BigDecimals first (most general numeric type here)
-    if let (Ok(bd1), Ok(bd2)) = (
-        parse_constant_to_bigdecimal(&op1),
-        parse_constant_to_bigdecimal(&op2),
-    ) {
-        return Some(bd1.cmp(&bd2));
-    }
-
-    // If BigDecimal fails (e.g., non-numeric involved), try BigInt
     if let (Ok(bi1), Ok(bi2)) = (
         parse_constant_to_bigint(&op1),
         parse_constant_to_bigint(&op2),
@@ -583,9 +386,7 @@ fn compare_constants(op1: Constant, op2: Constant) -> Option<std::cmp::Ordering>
         return Some(bi1.cmp(&bi2));
     }
 
-    // Fallback to primitive comparisons if big nums failed or weren't applicable
-    // (This part is largely the same as your original eq_constants logic,
-    // but simplified as cross-type numeric is handled above by promoting to BigDecimal)
+    // Fallback to primitive comparisons if wide-integer comparison was not applicable.
     match (op1, op2) {
         (Constant::F64(a), Constant::F64(b)) => a.partial_cmp(&b),
         (Constant::F32(a), Constant::F32(b)) => a.partial_cmp(&b),
@@ -774,9 +575,6 @@ fn get_shift_amount(op2: &Constant) -> Option<usize> {
         Constant::U16(v) => Some(usize::from(*v)),
         Constant::U32(v) => usize::try_from(*v).ok(),
         Constant::U64(v) => usize::try_from(*v).ok(),
-        Constant::Instance { class_name, .. } if class_name == "java/math/BigInteger" => {
-            parse_constant_to_bigint(op2).ok()?.to_usize()
-        }
         _ => None, // Invalid shift amount type
     }
 }
@@ -826,20 +624,12 @@ pub fn not_constant(op1: Constant) -> Option<Constant> {
 
 pub fn neg_constant(op1: Constant) -> Option<Constant> {
     match op1 {
-        // BigInt Negation
+        // 128-bit integer negation
         Constant::Instance { ref class_name, .. }
-            if class_name == "java/math/BigInteger"
-                || is_i128_class(class_name)
-                || is_u128_class(class_name) =>
+            if is_i128_class(class_name) || is_u128_class(class_name) =>
         {
             let value = parse_constant_to_bigint(&op1).ok()?;
             bigint_to_integer_constant_like(-value, &op1)
-        }
-        // BigDecimal Negation
-        Constant::Instance { ref class_name, .. } if class_name == "java/math/BigDecimal" => {
-            parse_constant_to_bigdecimal(&op1)
-                .ok()
-                .map(|bd| bigdecimal_to_constant(-bd))
         }
         // Primitive Negation
         Constant::I8(a) => Some(Constant::I8(a.wrapping_neg())), // Use wrapping_neg for primitives

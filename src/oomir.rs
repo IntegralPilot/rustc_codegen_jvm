@@ -1,9 +1,6 @@
 // src/oomir.rs
 //! This is the output of the stage 1 lowering pass of the compiler.
 //! It is responsible for converting the MIR into a lower-level IR, called OOMIR (defined in this file).
-use crate::lower2::BIG_DECIMAL_CLASS;
-
-use super::lower2::BIG_INTEGER_CLASS;
 use breadcrumbs::LogLevel;
 use ristretto_classfile::attributes::Instruction as JVMInstruction;
 use std::{
@@ -655,8 +652,7 @@ impl Constant {
             | Constant::Char(_) // Chars can be switched on in JVM
             | Constant::Boolean(_) => true,
             Constant::Instance { class_name, .. } => {
-                class_name == BIG_INTEGER_CLASS
-                    || class_name == "org/rustlang/runtime/I128"
+                class_name == "org/rustlang/runtime/I128"
                     || class_name == "org/rustlang/runtime/U128"
             }
             _ => false,
@@ -672,33 +668,6 @@ impl Constant {
             Constant::F32(f) => *f == 0.0,
             Constant::F64(f) => *f == 0.0,
             Constant::Char(c) => *c == '\0',
-            Constant::Instance {
-                class_name, params, ..
-            } => {
-                if class_name == BIG_INTEGER_CLASS {
-                    // Check if the params are all zero
-                    let param0 = params[0].clone(); // string of the number to be made
-                    if let Constant::String(s) = param0 {
-                        // Check if the string is "0" or "-0"
-                        return s == "0" || s == "-0";
-                    }
-                } else if class_name == BIG_DECIMAL_CLASS {
-                    // Check if the params are all zero
-                    let param0 = params[0].clone();
-                    if let Constant::String(s) = param0 {
-                        // remove all - and .
-                        let s = s.replace("-", "").replace(".", "");
-                        // check if every char is 0
-                        for c in s.chars() {
-                            if c != '0' {
-                                return false;
-                            }
-                        }
-                        return true;
-                    }
-                }
-                return false;
-            }
             Constant::Boolean(b) => !*b,
             _ => false, // Null, String, Array, etc. are not zero
         }
@@ -714,48 +683,6 @@ impl Constant {
             Constant::F64(f) => *f == 1.0,
             Constant::Char(c) => *c == '1',
             Constant::Boolean(b) => *b,
-            Constant::Instance {
-                class_name, params, ..
-            } => {
-                if class_name == BIG_INTEGER_CLASS {
-                    // Check if the params are all one
-                    let param0 = params[0].clone(); // string of the number to be made
-                    if let Constant::String(s) = param0 {
-                        // Check if the string is "1"
-                        return s == "1";
-                    }
-                } else if class_name == BIG_DECIMAL_CLASS {
-                    // Check if the params are all one
-                    let param0 = params[0].clone();
-                    if let Constant::String(s) = param0 {
-                        let mut after_dp = false;
-                        let mut had_before_dp_1 = false;
-                        for c in s.chars() {
-                            if c == '.' {
-                                after_dp = true;
-                                continue;
-                            }
-                            if after_dp {
-                                if c != '0' {
-                                    return false;
-                                }
-                            } else {
-                                if !had_before_dp_1 {
-                                    if c != '0' {
-                                        return false;
-                                    }
-                                    if c == '1' {
-                                        had_before_dp_1 = true;
-                                    }
-                                } else {
-                                    return false;
-                                }
-                            }
-                        }
-                    }
-                }
-                return false;
-            }
             _ => false, // Null, String, Array, Instance are not one
         }
     }
@@ -772,22 +699,6 @@ impl Constant {
             Operand::Constant(Constant::F64(_)) => Some(Constant::F64(0.0)),
             Operand::Constant(Constant::Char(_)) => Some(Constant::Char('\0')),
             Operand::Constant(Constant::Boolean(_)) => Some(Constant::Boolean(false)),
-            Operand::Constant(Constant::Instance { class_name, .. }) => {
-                if class_name == BIG_INTEGER_CLASS {
-                    return Some(Constant::Instance {
-                        class_name: class_name.clone(),
-                        fields: std::collections::HashMap::new(),
-                        params: vec![Constant::String("0".to_string())],
-                    });
-                } else if class_name == BIG_DECIMAL_CLASS {
-                    return Some(Constant::Instance {
-                        class_name: class_name.clone(),
-                        fields: std::collections::HashMap::new(),
-                        params: vec![Constant::String("0".to_string())],
-                    });
-                }
-                None
-            }
             _ => None,
         }
     }
@@ -803,22 +714,6 @@ impl Constant {
             Operand::Constant(Constant::F64(_)) => Some(Constant::F64(1.0)),
             Operand::Constant(Constant::Char(_)) => Some(Constant::Char('1')),
             Operand::Constant(Constant::Boolean(_)) => Some(Constant::Boolean(true)),
-            Operand::Constant(Constant::Instance { class_name, .. }) => {
-                if class_name == BIG_INTEGER_CLASS {
-                    return Some(Constant::Instance {
-                        class_name: class_name.clone(),
-                        fields: std::collections::HashMap::new(),
-                        params: vec![Constant::String("1".to_string())],
-                    });
-                } else if class_name == BIG_DECIMAL_CLASS {
-                    return Some(Constant::Instance {
-                        class_name: class_name.clone(),
-                        fields: std::collections::HashMap::new(),
-                        params: vec![Constant::String("1".to_string())],
-                    });
-                }
-                None
-            }
             _ => None,
         }
     }
