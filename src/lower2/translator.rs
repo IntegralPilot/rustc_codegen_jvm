@@ -3865,7 +3865,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
 
                 // 2.2 Load arguments according to the invoked descriptor. The
                 // first signature parameter is the implicit JVM receiver.
-                let explicit_params = Self::explicit_instance_params(method_ty);
+                let explicit_params = method_ty.explicit_params();
                 if args.len() != explicit_params.len() {
                     return Err(jvm::Error::VerificationError {
                         context: format!("Function {}", self.oomir_func.name),
@@ -4037,7 +4037,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
 
                 // 3. Load arguments onto the stack. Pointer.set has an erased
                 // Object boundary so primitive Rust carriers must be boxed.
-                let explicit_params = Self::explicit_instance_params(method_ty);
+                let explicit_params = method_ty.explicit_params();
                 if args.len() != explicit_params.len() {
                     return Err(jvm::Error::VerificationError {
                         context: format!("Function {}", self.oomir_func.name),
@@ -4134,26 +4134,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             }
         }
         Ok(())
-    }
-
-    /// Helper to load an operand specifically for a function call argument.
-    /// Handles Reference/MutableReference
-    fn explicit_instance_params(method_ty: &oomir::Signature) -> &[(String, oomir::Type)] {
-        let has_self = !method_ty.is_static
-            && method_ty.params.first().is_some_and(|(_, ty)| {
-                matches!(
-                    ty,
-                    oomir::Type::Class(_)
-                        | oomir::Type::Interface(_)
-                        | oomir::Type::Pointer(_)
-                        | oomir::Type::MutableReference(_)
-                )
-            });
-        if has_self {
-            &method_ty.params[1..]
-        } else {
-            &method_ty.params
-        }
     }
 
     fn load_call_argument(&mut self, operand: &oomir::Operand) -> Result<(), jvm::Error> {

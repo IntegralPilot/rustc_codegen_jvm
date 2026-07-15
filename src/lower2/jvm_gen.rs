@@ -1344,21 +1344,12 @@ pub(super) fn create_data_type_classfile_for_class(
                     attributes: code_attributes,
                 };
 
-                // Create MethodParameters attribute to preserve parameter names
-                // For instance methods where the first param is self, skip it as it's implicit in JVM
+                // Create MethodParameters attribute to preserve parameter names.
+                // The `self` receiver is implicit in the JVM descriptor, so it must
+                // be stripped here too — otherwise the parameter-name entries drift
+                // out of alignment with the descriptor produced by `to_string`.
                 let mut parameters_for_attribute = Vec::new();
-                let has_self =
-                    !function.signature.is_static && !function.signature.params.is_empty() && {
-                        matches!(
-                            &function.signature.params[0].1,
-                            Type::Class(_) | Type::MutableReference(_)
-                        )
-                    };
-                let params_to_iterate = if has_self {
-                    &function.signature.params[1..]
-                } else {
-                    &function.signature.params[..]
-                };
+                let params_to_iterate = function.signature.explicit_params();
                 for (name, param_ty) in params_to_iterate {
                     if !param_ty.has_jvm_value() {
                         continue;
