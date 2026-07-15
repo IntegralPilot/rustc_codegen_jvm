@@ -38,6 +38,8 @@ pub struct FunctionTranslator<'a, 'cp> {
     current_fallthrough_block_label: Option<String>,
     initial_locals: Vec<stackmaps::FrameValue>,
     direct_this_aliases: HashSet<String>,
+    jvm_source_locations: Vec<Option<oomir::SourceLocation>>,
+    current_source_location: Option<oomir::SourceLocation>,
 
     // For max_locals calculation - track highest index used + size
     max_locals_used: u16,
@@ -82,6 +84,8 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 owner_class_name,
             ),
             direct_this_aliases: HashSet::new(),
+            jvm_source_locations: Vec::new(),
+            current_source_location: None,
             max_locals_used: 0,
         };
 
@@ -578,7 +582,15 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
 
             // Translate instructions in the block
             for instr in &block.instructions {
+                if let oomir::Instruction::SourceLocation(location) = instr {
+                    self.current_source_location = Some(location.clone());
+                    continue;
+                }
                 self.translate_instruction(instr)?;
+                self.jvm_source_locations.resize(
+                    self.jvm_instructions.len(),
+                    self.current_source_location.clone(),
+                );
             }
 
             if block.instructions.is_empty() && self.oomir_func.body.basic_blocks.len() > 1 {
@@ -654,6 +666,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         let fixed_prefix_slots = self.initial_locals.len() as u16;
         let optimised = optimise2::optimise(
             std::mem::take(&mut self.jvm_instructions),
+            std::mem::take(&mut self.jvm_source_locations),
             self.max_locals_used,
             fixed_prefix_slots,
         )
@@ -662,6 +675,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             message: format!("Failed to run optimise2: {error:?}"),
         })?;
         self.jvm_instructions = optimised.instructions;
+        self.jvm_source_locations = optimised.source_locations;
         self.max_locals_used = optimised.max_locals;
 
         self.widen_branches()
@@ -675,7 +689,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             &optimised.local_slot_map,
             self.max_locals_used,
         );
-        let stack_map_attributes = stackmaps::build_stack_map_attributes(
+        let mut code_attributes = stackmaps::build_stack_map_attributes(
             &self.jvm_instructions,
             &self.initial_locals,
             &local_hints,
@@ -688,11 +702,45 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             message: format!("Failed to build StackMapTable: {error:?}"),
         })?;
 
-        Ok((
-            self.jvm_instructions,
-            self.max_locals_used,
-            stack_map_attributes,
-        ))
+        let mut line_numbers = Vec::new();
+        let mut previous_line = None;
+        for (instruction_index, location) in self.jvm_source_locations.iter().enumerate() {
+            let Some(location) = location else {
+                continue;
+            };
+            if previous_line == Some(location.line) {
+                continue;
+            }
+            // ristretto's in-memory code attributes use instruction indices;
+            // serialization converts them to bytecode offsets together with
+            // branch and stack-map entries.
+            let start_pc =
+                u16::try_from(instruction_index).map_err(|_| jvm::Error::VerificationError {
+                    context: format!("Function {}", self.oomir_func.name),
+                    message: "JVM instruction index exceeds the LineNumberTable limit".to_string(),
+                })?;
+            let line_number =
+                u16::try_from(location.line).map_err(|_| jvm::Error::VerificationError {
+                    context: format!("Function {}", self.oomir_func.name),
+                    message: format!(
+                        "Rust source line {} exceeds the JVM LineNumberTable limit",
+                        location.line
+                    ),
+                })?;
+            line_numbers.push(jvm::attributes::LineNumber {
+                start_pc,
+                line_number,
+            });
+            previous_line = Some(location.line);
+        }
+        if !line_numbers.is_empty() {
+            code_attributes.push(jvm::attributes::Attribute::LineNumberTable {
+                name_index: self.constant_pool.add_utf8("LineNumberTable")?,
+                line_numbers,
+            });
+        }
+
+        Ok((self.jvm_instructions, self.max_locals_used, code_attributes))
     }
 
     fn widen_branches(&mut self) -> Result<(), jvm::Error> {
@@ -736,6 +784,9 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                             })?;
                     self.jvm_instructions
                         .insert(insert_at, Instruction::Goto_w(i32::from(adjusted_target)));
+                    let inserted_location = self.jvm_source_locations[index].clone();
+                    self.jvm_source_locations
+                        .insert(insert_at, inserted_location);
                     changed = true;
                     break;
                 }
@@ -2219,6 +2270,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         use oomir::Operand as OO;
 
         match instr {
+            OI::SourceLocation(_) => {}
             OI::Add { dest, op1, op2 } => {
                 if self.emit_iinc_add(dest, op1, op2)? {
                     return Ok(());

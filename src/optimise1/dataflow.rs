@@ -1319,7 +1319,9 @@ pub fn process_block_instructions(
                 }
             }
 
-            Instruction::ThrowNewWithMessage { .. } | Instruction::Label { .. } => {
+            Instruction::SourceLocation(_)
+            | Instruction::ThrowNewWithMessage { .. }
+            | Instruction::Label { .. } => {
                 // nothing to do
                 keep_original_instruction = true;
             }

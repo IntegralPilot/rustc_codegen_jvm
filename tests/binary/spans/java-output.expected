@@ -1,0 +1,5 @@
+STDOUT:STDERR:Exception in thread "main" java.lang.RuntimeException: Rust panic: 
+	at org.rustlang.runtime.PanicSupport.raise(PanicSupport.java:18)
+	at spans.nested.leaf(nested.rs:8)
+	at spans.nested.outer(nested.rs:13)
+	at spans.spans.main(main.rs:10)

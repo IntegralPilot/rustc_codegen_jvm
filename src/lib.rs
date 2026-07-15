@@ -605,6 +605,10 @@ impl CodegenBackend for MyBackend {
 
             let mut oomir_module = oomir::Module {
                 name: crate_module_class.clone(),
+                source_file: tcx
+                    .sess
+                    .local_crate_source_file()
+                    .map(|file_name| rustc_span::FileName::Real(file_name).short().to_string()),
                 functions: std::collections::HashMap::new(),
                 data_types: std::collections::HashMap::new(),
                 statics: std::collections::HashMap::new(),

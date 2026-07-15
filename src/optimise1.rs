@@ -339,6 +339,7 @@ pub fn optimise_module(module: Module) -> Module {
     );
     Module {
         name: module.name,
+        source_file: module.source_file,
         functions: new_funcs,
         data_types: module.data_types, // Assume data_types are read-only for opts
         statics: module.statics,

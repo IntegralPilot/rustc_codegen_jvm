@@ -346,7 +346,8 @@ fn rewrite_instruction_uses(instruction: &mut Instruction, aliases: &AliasMap) {
         Instruction::GetField { object, .. } | Instruction::Cast { op: object, .. } => {
             rewrite_operand(object, aliases);
         }
-        Instruction::Jump { .. }
+        Instruction::SourceLocation(_)
+        | Instruction::Jump { .. }
         | Instruction::ThrowNewWithMessage { .. }
         | Instruction::Label { .. } => {}
     }
@@ -540,7 +541,8 @@ fn collect_instruction_uses(instruction: &Instruction, uses: &mut HashSet<String
         Instruction::GetField { object, .. } | Instruction::Cast { op: object, .. } => {
             collect_operand_use(object, uses);
         }
-        Instruction::Jump { .. }
+        Instruction::SourceLocation(_)
+        | Instruction::Jump { .. }
         | Instruction::ThrowNewWithMessage { .. }
         | Instruction::Label { .. } => {}
     }
@@ -596,7 +598,8 @@ fn instruction_defs(instruction: &Instruction) -> HashSet<String> {
                 defs.insert(dest.clone());
             }
         }
-        Instruction::Jump { .. }
+        Instruction::SourceLocation(_)
+        | Instruction::Jump { .. }
         | Instruction::Branch { .. }
         | Instruction::Return { .. }
         | Instruction::ThrowNewWithMessage { .. }

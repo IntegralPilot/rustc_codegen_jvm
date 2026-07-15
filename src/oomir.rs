@@ -16,10 +16,21 @@ pub const POINTER_CLASS: &str = "org/rustlang/runtime/Pointer";
 pub const JAVA_STRING_CLASS: &str = "java/lang/String";
 pub const CALLER_LOCATION_PARAM_NAME: &str = "__caller_location";
 
+/// A Rust source position attached to generated code.
+///
+/// JVM line tables only store line numbers; the corresponding file name is
+/// stored once on the containing class through its `SourceFile` attribute.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SourceLocation {
+    pub file_name: String,
+    pub line: u32,
+}
+
 // OOMIR definitions
 #[derive(Debug, Clone)]
 pub struct Module {
     pub name: String,
+    pub source_file: Option<String>,
     pub functions: HashMap<FunctionKey, Function>,
     pub data_types: HashMap<String, DataType>,
     pub statics: HashMap<String, Static>,
@@ -37,6 +48,21 @@ impl Module {
 
     pub fn owner_class_for_function<'a>(&'a self, function: &'a Function) -> &'a str {
         function.owner_class.as_deref().unwrap_or(&self.name)
+    }
+}
+
+impl Function {
+    /// Returns the definition file marker placed at the start of a MIR-lowered
+    /// function. Synthetic helper functions intentionally have no marker.
+    pub fn source_file(&self) -> Option<&str> {
+        let entry = self.body.basic_blocks.get(&self.body.entry)?;
+        entry
+            .instructions
+            .iter()
+            .find_map(|instruction| match instruction {
+                Instruction::SourceLocation(location) => Some(location.file_name.as_str()),
+                _ => None,
+            })
     }
 }
 
@@ -260,6 +286,7 @@ pub struct BasicBlock {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Instruction {
+    SourceLocation(SourceLocation), // metadata. does not emit JVM bytecode.
     Add {
         dest: String,
         op1: Operand,

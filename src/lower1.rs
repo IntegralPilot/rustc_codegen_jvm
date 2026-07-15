@@ -13,6 +13,7 @@ use rustc_middle::{
     mir::{BasicBlock, Body, Local, StatementKind},
     ty::{EarlyBinder, Instance, TyCtxt},
 };
+use rustc_span::{Span, hygiene};
 use std::collections::{HashMap, HashSet, VecDeque};
 use types::ty_to_oomir_type;
 
@@ -27,6 +28,23 @@ pub mod types;
 mod value_repr;
 
 pub use closures::generate_closure_function_name;
+
+pub(crate) fn source_location(
+    tcx: TyCtxt<'_>,
+    function_span: Span,
+    span: Span,
+) -> Option<oomir::SourceLocation> {
+    if span.is_dummy() {
+        return None;
+    }
+
+    let span = hygiene::walk_chain_collapsed(span, function_span);
+    let location = tcx.sess.source_map().lookup_char_pos(span.lo());
+    Some(oomir::SourceLocation {
+        file_name: location.file.name.short().to_string(),
+        line: u32::try_from(location.line).ok()?,
+    })
+}
 
 fn available_pointer_locals_at_block_entries<'tcx>(
     mir: &Body<'tcx>,
@@ -398,6 +416,10 @@ pub fn mir_to_oomir<'tcx>(
                 )),
             ],
         });
+    }
+
+    if let Some(location) = source_location(tcx, mir_cloned.span, mir_cloned.span) {
+        instrs.insert(0, oomir::Instruction::SourceLocation(location));
     }
 
     // add instrs to the start of the entry block

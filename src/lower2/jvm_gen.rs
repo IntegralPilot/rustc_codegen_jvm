@@ -24,7 +24,8 @@ fn code_attribute_with_stack_maps(
     context: &str,
 ) -> jvm::Result<Attribute> {
     let fixed_prefix_slots = initial_locals.len() as u16;
-    let optimised = optimise2::optimise(code, max_locals, fixed_prefix_slots)?;
+    let source_locations = vec![None; code.len()];
+    let optimised = optimise2::optimise(code, source_locations, max_locals, fixed_prefix_slots)?;
     let code = optimised.instructions;
     let max_locals = optimised.max_locals;
     let name_index = cp.add_utf8("Code")?;
@@ -1181,6 +1182,23 @@ pub(super) fn create_data_type_classfile_for_class(
     subclasses: Vec<String>,
     nest_host: Option<String>,
 ) -> jvm::Result<Vec<u8>> {
+    let source_files = methods
+        .values()
+        .filter_map(|method| match method {
+            DataTypeMethod::Function(function) => function.source_file(),
+            _ => None,
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    if source_files.len() > 1 {
+        breadcrumbs::log!(
+            breadcrumbs::LogLevel::Warn,
+            "bytecode-gen",
+            format!(
+                "JVM class {class_name_jvm} contains Rust methods from multiple files: {source_files:?}"
+            )
+        );
+    }
+    let source_file_name = source_files.first().map(|file| (*file).to_string());
     let fields: Vec<_> = fields
         .into_iter()
         .filter(|(_, field_ty)| field_ty.has_jvm_value())
@@ -1661,14 +1679,12 @@ pub(super) fn create_data_type_classfile_for_class(
         });
     }
 
-    let simple_name = class_name_jvm.split('/').last().unwrap_or(class_name_jvm);
-    let source_file_name = format!("{}.rs", simple_name);
-    let source_file_utf8_index = cp.add_utf8(&source_file_name)?;
-    let source_file_attr_name_index = cp.add_utf8("SourceFile")?;
-    class_attributes.push(Attribute::SourceFile {
-        name_index: source_file_attr_name_index,
-        source_file_index: source_file_utf8_index,
-    });
+    if let Some(source_file_name) = source_file_name {
+        class_attributes.push(Attribute::SourceFile {
+            name_index: cp.add_utf8("SourceFile")?,
+            source_file_index: cp.add_utf8(source_file_name)?,
+        });
+    }
 
     let class_file = ClassFile {
         code_source_url: None,
@@ -1751,20 +1767,6 @@ pub(super) fn create_data_type_classfile_for_interface(
         );
     }
 
-    let mut class_attributes = Vec::new();
-
-    let simple_name = interface_name_jvm
-        .split('/')
-        .last()
-        .unwrap_or(interface_name_jvm);
-    let source_file_name = format!("{}.rs", simple_name); // Or .java
-    let source_file_utf8_index = cp.add_utf8(&source_file_name)?;
-    let source_file_attr_name_index = cp.add_utf8("SourceFile")?;
-    class_attributes.push(Attribute::SourceFile {
-        name_index: source_file_attr_name_index,
-        source_file_index: source_file_utf8_index,
-    });
-
     let class_file = ClassFile {
         code_source_url: None,
         version: Version::Java8 { minor: 0 },
@@ -1777,7 +1779,7 @@ pub(super) fn create_data_type_classfile_for_interface(
         interfaces: Vec::new(),
         fields: Vec::new(),
         methods: jvm_methods,
-        attributes: class_attributes,
+        attributes: Vec::new(),
     };
     verify_no_duplicate_constants(&class_file)?;
 

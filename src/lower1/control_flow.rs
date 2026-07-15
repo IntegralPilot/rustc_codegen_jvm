@@ -716,6 +716,7 @@ pub(super) fn convert_basic_block<'tcx>(
     let mut initialized_borrows = initially_available_pointer_locals;
     // Convert each MIR statement in the block.
     for stmt in &bb_data.statements {
+        let instruction_start = instructions.len();
         match &stmt.kind {
             StatementKind::Assign(box (place, rvalue)) => {
                 breadcrumbs::log!(
@@ -1011,10 +1012,19 @@ pub(super) fn convert_basic_block<'tcx>(
                 );
             }
         }
+        if instructions.len() > instruction_start
+            && let Some(location) = super::source_location(tcx, mir.span, stmt.source_info.span)
+        {
+            instructions.insert(
+                instruction_start,
+                oomir::Instruction::SourceLocation(location),
+            );
+        }
     }
 
     // Convert the MIR terminator into corresponding OOMIR instructions.
     if let Some(terminator) = &bb_data.terminator {
+        let instruction_start = instructions.len();
         match &terminator.kind {
             TerminatorKind::Return => {
                 // Handle Return without operand
@@ -4065,10 +4075,16 @@ pub(super) fn convert_basic_block<'tcx>(
                     }
                 };
 
-                let fail_instructions = vec![oomir::Instruction::ThrowNewWithMessage {
+                let mut fail_instructions = Vec::new();
+                if let Some(location) =
+                    super::source_location(tcx, mir.span, terminator.source_info.span)
+                {
+                    fail_instructions.push(oomir::Instruction::SourceLocation(location));
+                }
+                fail_instructions.push(oomir::Instruction::ThrowNewWithMessage {
                     exception_class: "java/lang/RuntimeException".to_string(), // Or ArithmeticException for overflows?
                     message: panic_message,
-                }];
+                });
                 breadcrumbs::log!(
                     breadcrumbs::LogLevel::Info,
                     "mir-lowering",
@@ -4136,6 +4152,15 @@ pub(super) fn convert_basic_block<'tcx>(
                     format!("Warning: Unhandled terminator {:?}", terminator.kind)
                 );
             }
+        }
+        if instructions.len() > instruction_start
+            && let Some(location) =
+                super::source_location(tcx, mir.span, terminator.source_info.span)
+        {
+            instructions.insert(
+                instruction_start,
+                oomir::Instruction::SourceLocation(location),
+            );
         }
     }
 

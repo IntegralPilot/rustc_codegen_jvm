@@ -280,6 +280,23 @@ pub fn oomir_to_jvm_bytecode(
         let functions = functions_by_class
             .remove(&class_name_jvm)
             .unwrap_or_default();
+        let source_files = functions
+            .iter()
+            .filter_map(|function| function.source_file())
+            .collect::<BTreeSet<_>>();
+        if source_files.len() > 1 {
+            breadcrumbs::log!(
+                breadcrumbs::LogLevel::Warn,
+                "bytecode-gen",
+                format!(
+                    "JVM class {class_name_jvm} contains Rust functions from multiple files: {source_files:?}"
+                )
+            );
+        }
+        let source_file_name = (class_name_jvm == module.name)
+            .then(|| module.source_file.clone())
+            .flatten()
+            .or_else(|| source_files.first().map(|file| (*file).to_string()));
         let mut class_statics = statics_by_class.remove(&class_name_jvm).unwrap_or_default();
         class_statics.sort_by(|left, right| left.field_name.cmp(&right.field_name));
         let mut main_cp = InternedConstantPool::default();
@@ -415,19 +432,14 @@ pub fn oomir_to_jvm_bytecode(
         }
 
         // Add SourceFile attribute
-        let source_file_name = format!(
-            "{}.rs",
-            class_name_jvm
-                .split('/')
-                .next_back()
-                .unwrap_or(&class_name_jvm)
-        );
-        let source_file_utf8_index = main_cp.add_utf8(&source_file_name)?;
-        let source_file_attr_name_index = main_cp.add_utf8("SourceFile")?;
-        let attributes = vec![Attribute::SourceFile {
-            name_index: source_file_attr_name_index,
-            source_file_index: source_file_utf8_index,
-        }];
+        let attributes = if let Some(source_file_name) = source_file_name {
+            vec![Attribute::SourceFile {
+                name_index: main_cp.add_utf8("SourceFile")?,
+                source_file_index: main_cp.add_utf8(source_file_name)?,
+            }]
+        } else {
+            Vec::new()
+        };
 
         let class_file = ClassFile {
             code_source_url: None,
