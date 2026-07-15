@@ -1,0 +1,55 @@
+Compiled from "main.rs"
+
+public static int exercise_variable_names(int, long);
+LineNumberTable:
+line 9: 0
+line 10: 29
+line 11: 32
+line 12: 35
+line 13: 42
+line 14: 72
+line 12: 102
+line 16: 105
+line 17: 136
+line 16: 137
+line 17: 139
+line 18: 147
+line 17: 149
+LocalVariableTable:
+Start Length Slot Name Signature
+0 132 0 first I
+147 2 0 first I
+0 155 1 wide J
+29 118 7 doubled I
+149 6 7 doubled I
+32 115 8 total I
+149 6 8 total I
+35 112 9 index I
+149 6 9 index I
+139 8 25 first I
+149 6 25 first I
+
+public static long start_Unit__e8fbf9352b(org.rustlang.runtime.FnPtr_09edc617f6bf6664, long, org.rustlang.runtime.Pointer, byte);
+LineNumberTable:
+line 102: 0
+line 104: 6
+LocalVariableTable:
+Start Length Slot Name Signature
+0 8 0 main Lorg/rustlang/runtime/FnPtr_09edc617f6bf6664;
+0 8 1 arg1 J
+0 8 3 arg2 Lorg/rustlang/runtime/Pointer;
+0 8 4 arg3 B
+
+public static void main(java.lang.String[]);
+LineNumberTable:
+line 21: 0
+line 22: 5
+line 21: 6
+line 22: 7
+line 23: 11
+line 22: 12
+LocalVariableTable:
+Start Length Slot Name Signature
+0 71 0 args [Ljava/lang/String;
+7 4 1 result I
+12 59 1 result I

@@ -11,8 +11,9 @@ use crate::oomir;
 
 use rustc_middle::{
     mir::{
-        BasicBlock, BasicBlockData, Body, Local, NonDivergingIntrinsic, Operand as MirOperand,
-        Place, SourceInfo, StatementKind, TerminatorKind,
+        BasicBlock, BasicBlockData, Body, Local, Location, NonDivergingIntrinsic,
+        Operand as MirOperand, Place, SourceInfo, StatementKind, TerminatorKind,
+        visit::{PlaceContext, Visitor},
     },
     ty::{EarlyBinder, Instance, InstanceKind, ShimKind, Ty, TyCtxt, TyKind, TypingEnv},
 };
@@ -77,6 +78,19 @@ pub(super) struct PointerOrigin<'tcx> {
 }
 
 pub(super) type MutableBorrowMap<'tcx> = HashMap<Local, PointerOrigin<'tcx>>;
+
+#[derive(Default)]
+struct DebugLocalCollector {
+    locals: HashSet<Local>,
+}
+
+impl<'tcx> Visitor<'tcx> for DebugLocalCollector {
+    fn visit_local(&mut self, local: Local, context: PlaceContext, _: Location) {
+        if !matches!(context, PlaceContext::NonUse(_)) {
+            self.locals.insert(local);
+        }
+    }
+}
 
 fn emit_trait_object_metadata(
     pointer: oomir::Operand,
@@ -708,6 +722,8 @@ pub(super) fn convert_basic_block<'tcx>(
     basic_blocks: &mut HashMap<String, oomir::BasicBlock>,
     data_types: &mut HashMap<String, oomir::DataType>,
     mutable_borrow_arrays: &mut MutableBorrowMap<'tcx>,
+    debug_variables: &[oomir::DebugVariable],
+    debug_variable_scopes: &[rustc_middle::mir::SourceScope],
     initially_available_pointer_locals: HashSet<Local>,
 ) -> oomir::BasicBlock {
     // Use the basic block index as its label.
@@ -715,7 +731,13 @@ pub(super) fn convert_basic_block<'tcx>(
     let mut instructions = Vec::new();
     let mut initialized_borrows = initially_available_pointer_locals;
     // Convert each MIR statement in the block.
-    for stmt in &bb_data.statements {
+    for (statement_index, stmt) in bb_data.statements.iter().enumerate() {
+        let statement_location = Location {
+            block: bb,
+            statement_index,
+        };
+        let mut debug_local_collector = DebugLocalCollector::default();
+        debug_local_collector.visit_statement(stmt, statement_location);
         let instruction_start = instructions.len();
         match &stmt.kind {
             StatementKind::Assign(box (place, rvalue)) => {
@@ -1012,18 +1034,30 @@ pub(super) fn convert_basic_block<'tcx>(
                 );
             }
         }
-        if instructions.len() > instruction_start
-            && let Some(location) = super::source_location(tcx, mir.span, stmt.source_info.span)
-        {
-            instructions.insert(
-                instruction_start,
-                oomir::Instruction::SourceLocation(location),
-            );
+        if instructions.len() > instruction_start {
+            let mut metadata = Vec::new();
+            if let Some(location) = super::source_location(tcx, mir.span, stmt.source_info.span) {
+                metadata.push(oomir::Instruction::SourceLocation(location));
+            }
+            metadata.push(super::local_variable_scope(
+                mir,
+                stmt.source_info.scope,
+                &debug_local_collector.locals,
+                debug_variables,
+                debug_variable_scopes,
+            ));
+            instructions.splice(instruction_start..instruction_start, metadata);
         }
     }
 
     // Convert the MIR terminator into corresponding OOMIR instructions.
     if let Some(terminator) = &bb_data.terminator {
+        let terminator_location = Location {
+            block: bb,
+            statement_index: bb_data.statements.len(),
+        };
+        let mut debug_local_collector = DebugLocalCollector::default();
+        debug_local_collector.visit_terminator(terminator, terminator_location);
         let instruction_start = instructions.len();
         match &terminator.kind {
             TerminatorKind::Return => {
@@ -4081,6 +4115,13 @@ pub(super) fn convert_basic_block<'tcx>(
                 {
                     fail_instructions.push(oomir::Instruction::SourceLocation(location));
                 }
+                fail_instructions.push(super::local_variable_scope(
+                    mir,
+                    terminator.source_info.scope,
+                    &debug_local_collector.locals,
+                    debug_variables,
+                    debug_variable_scopes,
+                ));
                 fail_instructions.push(oomir::Instruction::ThrowNewWithMessage {
                     exception_class: "java/lang/RuntimeException".to_string(), // Or ArithmeticException for overflows?
                     message: panic_message,
@@ -4153,14 +4194,21 @@ pub(super) fn convert_basic_block<'tcx>(
                 );
             }
         }
-        if instructions.len() > instruction_start
-            && let Some(location) =
+        if instructions.len() > instruction_start {
+            let mut metadata = Vec::new();
+            if let Some(location) =
                 super::source_location(tcx, mir.span, terminator.source_info.span)
-        {
-            instructions.insert(
-                instruction_start,
-                oomir::Instruction::SourceLocation(location),
-            );
+            {
+                metadata.push(oomir::Instruction::SourceLocation(location));
+            }
+            metadata.push(super::local_variable_scope(
+                mir,
+                terminator.source_info.scope,
+                &debug_local_collector.locals,
+                debug_variables,
+                debug_variable_scopes,
+            ));
+            instructions.splice(instruction_start..instruction_start, metadata);
         }
     }
 

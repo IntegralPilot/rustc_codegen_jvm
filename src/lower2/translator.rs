@@ -13,7 +13,7 @@ use super::jvm::{
     self,
     attributes::{ArrayType, Instruction, LookupSwitch, TableSwitch},
 };
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::convert::TryInto;
 use std::io::Cursor;
 
@@ -38,8 +38,9 @@ pub struct FunctionTranslator<'a, 'cp> {
     current_fallthrough_block_label: Option<String>,
     initial_locals: Vec<stackmaps::FrameValue>,
     direct_this_aliases: HashSet<String>,
-    jvm_source_locations: Vec<Option<oomir::SourceLocation>>,
+    jvm_metadata: Vec<optimise2::BytecodeMetadata>,
     current_source_location: Option<oomir::SourceLocation>,
+    current_active_variables: Vec<usize>,
 
     // For max_locals calculation - track highest index used + size
     max_locals_used: u16,
@@ -84,8 +85,9 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 owner_class_name,
             ),
             direct_this_aliases: HashSet::new(),
-            jvm_source_locations: Vec::new(),
+            jvm_metadata: Vec::new(),
             current_source_location: None,
+            current_active_variables: Vec::new(),
             max_locals_used: 0,
         };
 
@@ -546,6 +548,24 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             })
     }
 
+    fn debug_variable_local(&self, variable: &oomir::DebugVariable) -> Option<(u16, oomir::Type)> {
+        if let Some(index) = self
+            .typed_local_var_map
+            .get(&(variable.oomir_name.clone(), variable.ty.clone()))
+            .copied()
+        {
+            return Some((index, variable.ty.clone()));
+        }
+
+        let index = self.local_var_map.get(&variable.oomir_name).copied()?;
+        let actual_type = self
+            .local_var_types
+            .get(&variable.oomir_name)
+            .cloned()
+            .unwrap_or_else(|| variable.ty.clone());
+        Some((index, actual_type))
+    }
+
     /// Translates the entire function body.
     pub fn translate(
         mut self,
@@ -586,10 +606,17 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     self.current_source_location = Some(location.clone());
                     continue;
                 }
+                if let oomir::Instruction::LocalVariableScope(variables) = instr {
+                    self.current_active_variables.clone_from(variables);
+                    continue;
+                }
                 self.translate_instruction(instr)?;
-                self.jvm_source_locations.resize(
+                self.jvm_metadata.resize(
                     self.jvm_instructions.len(),
-                    self.current_source_location.clone(),
+                    optimise2::BytecodeMetadata {
+                        source_location: self.current_source_location.clone(),
+                        active_variables: self.current_active_variables.clone(),
+                    },
                 );
             }
 
@@ -664,18 +691,25 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             self.max_locals_used,
         );
         let fixed_prefix_slots = self.initial_locals.len() as u16;
+        let pinned_local_slots = self
+            .oomir_func
+            .debug_variables
+            .iter()
+            .filter_map(|variable| self.debug_variable_local(variable).map(|(slot, _)| slot))
+            .collect::<BTreeSet<_>>();
         let optimised = optimise2::optimise(
             std::mem::take(&mut self.jvm_instructions),
-            std::mem::take(&mut self.jvm_source_locations),
+            std::mem::take(&mut self.jvm_metadata),
             self.max_locals_used,
             fixed_prefix_slots,
+            &pinned_local_slots,
         )
         .map_err(|error| jvm::Error::VerificationError {
             context: format!("Function {}", self.oomir_func.name),
             message: format!("Failed to run optimise2: {error:?}"),
         })?;
         self.jvm_instructions = optimised.instructions;
-        self.jvm_source_locations = optimised.source_locations;
+        self.jvm_metadata = optimised.metadata;
         self.max_locals_used = optimised.max_locals;
 
         self.widen_branches()
@@ -704,8 +738,8 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
 
         let mut line_numbers = Vec::new();
         let mut previous_line = None;
-        for (instruction_index, location) in self.jvm_source_locations.iter().enumerate() {
-            let Some(location) = location else {
+        for (instruction_index, metadata) in self.jvm_metadata.iter().enumerate() {
+            let Some(location) = &metadata.source_location else {
                 continue;
             };
             if previous_line == Some(location.line) {
@@ -737,6 +771,100 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             code_attributes.push(jvm::attributes::Attribute::LineNumberTable {
                 name_index: self.constant_pool.add_utf8("LineNumberTable")?,
                 line_numbers,
+            });
+        }
+
+        let byte_offsets = instruction_byte_offsets(&self.jvm_instructions)?;
+        let mut local_variables = Vec::new();
+        for (variable_index, variable) in self.oomir_func.debug_variables.iter().enumerate() {
+            let Some((old_slot, actual_type)) = self.debug_variable_local(variable) else {
+                continue;
+            };
+            let Some(slot) = optimised.local_slot_map.get(&old_slot).copied() else {
+                // The value was completely optimized out and has no final JVM slot.
+                continue;
+            };
+
+            let width = get_type_size(&actual_type);
+            let slot_is_valid = slot
+                .checked_add(width)
+                .is_some_and(|end| end <= self.max_locals_used);
+            let is_parameter = slot < fixed_prefix_slots;
+            let is_materialized = is_parameter
+                || self
+                    .jvm_instructions
+                    .iter()
+                    .any(|instruction| optimise2::instruction_uses_local(instruction, slot));
+            if !slot_is_valid || !is_materialized {
+                // Late peepholes can remove a store/load pair after slot
+                // allocation. Such a binding is genuinely optimized out and
+                // must not leave a stale or out-of-bounds LVT entry behind.
+                continue;
+            }
+
+            let initialized_at =
+                if is_parameter {
+                    0
+                } else {
+                    let Some(write_index) = self.jvm_instructions.iter().position(|instruction| {
+                        optimise2::instruction_writes_local(instruction, slot)
+                    }) else {
+                        continue;
+                    };
+                    write_index + 1
+                };
+
+            let name_index = self.constant_pool.add_utf8(&variable.name)?;
+            let descriptor_index = self
+                .constant_pool
+                .add_utf8(actual_type.to_jvm_descriptor())?;
+            let mut range_start = None;
+            for instruction_index in 0..=self.jvm_metadata.len() {
+                let is_visible = self
+                    .jvm_metadata
+                    .get(instruction_index)
+                    .is_some_and(|metadata| {
+                        instruction_index >= initialized_at
+                            && metadata.active_variables.contains(&variable_index)
+                    });
+                match (range_start, is_visible) {
+                    (None, true) => range_start = Some(instruction_index),
+                    (Some(start), false) => {
+                        let start_pc = byte_offsets[start];
+                        let end_pc = byte_offsets[instruction_index];
+                        if end_pc > start_pc {
+                            local_variables.push(jvm::attributes::LocalVariableTable {
+                                start_pc: u16::try_from(start_pc).map_err(|_| {
+                                    jvm::Error::VerificationError {
+                                        context: format!("Function {}", self.oomir_func.name),
+                                        message:
+                                            "Local variable start offset exceeds the JVM limit"
+                                                .to_string(),
+                                    }
+                                })?,
+                                length: u16::try_from(end_pc - start_pc).map_err(|_| {
+                                    jvm::Error::VerificationError {
+                                        context: format!("Function {}", self.oomir_func.name),
+                                        message: "Local variable range exceeds the JVM limit"
+                                            .to_string(),
+                                    }
+                                })?,
+                                name_index,
+                                descriptor_index,
+                                index: slot,
+                            });
+                        }
+                        range_start = None;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        local_variables.sort_by_key(|variable| (variable.index, variable.start_pc));
+        if !local_variables.is_empty() {
+            code_attributes.push(jvm::attributes::Attribute::LocalVariableTable {
+                name_index: self.constant_pool.add_utf8("LocalVariableTable")?,
+                variables: local_variables,
             });
         }
 
@@ -784,9 +912,8 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                             })?;
                     self.jvm_instructions
                         .insert(insert_at, Instruction::Goto_w(i32::from(adjusted_target)));
-                    let inserted_location = self.jvm_source_locations[index].clone();
-                    self.jvm_source_locations
-                        .insert(insert_at, inserted_location);
+                    let inserted_metadata = self.jvm_metadata[index].clone();
+                    self.jvm_metadata.insert(insert_at, inserted_metadata);
                     changed = true;
                     break;
                 }
@@ -2270,7 +2397,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         use oomir::Operand as OO;
 
         match instr {
-            OI::SourceLocation(_) => {}
+            OI::SourceLocation(_) | OI::LocalVariableScope(_) => {}
             OI::Add { dest, op1, op2 } => {
                 if self.emit_iinc_add(dest, op1, op2)? {
                     return Ok(());

@@ -26,6 +26,14 @@ pub struct SourceLocation {
     pub line: u32,
 }
 
+/// A source-level Rust variable that can be represented by a JVM local slot.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DebugVariable {
+    pub name: String,
+    pub oomir_name: String,
+    pub ty: Type,
+}
+
 // OOMIR definitions
 #[derive(Debug, Clone)]
 pub struct Module {
@@ -178,6 +186,7 @@ pub struct Function {
     pub name: String,
     pub owner_class: Option<String>,
     pub signature: Signature,
+    pub debug_variables: Vec<DebugVariable>,
     pub body: CodeBlock,
 }
 
@@ -287,6 +296,7 @@ pub struct BasicBlock {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Instruction {
     SourceLocation(SourceLocation), // metadata. does not emit JVM bytecode.
+    LocalVariableScope(Vec<usize>), // same
     Add {
         dest: String,
         op1: Operand,

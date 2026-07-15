@@ -24,8 +24,14 @@ fn code_attribute_with_stack_maps(
     context: &str,
 ) -> jvm::Result<Attribute> {
     let fixed_prefix_slots = initial_locals.len() as u16;
-    let source_locations = vec![None; code.len()];
-    let optimised = optimise2::optimise(code, source_locations, max_locals, fixed_prefix_slots)?;
+    let source_locations = vec![optimise2::BytecodeMetadata::default(); code.len()];
+    let optimised = optimise2::optimise(
+        code,
+        source_locations,
+        max_locals,
+        fixed_prefix_slots,
+        &std::collections::BTreeSet::new(),
+    )?;
     let code = optimised.instructions;
     let max_locals = optimised.max_locals;
     let name_index = cp.add_utf8("Code")?;

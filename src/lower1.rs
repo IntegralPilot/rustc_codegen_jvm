@@ -10,7 +10,10 @@
 use crate::oomir;
 use control_flow::convert_basic_block;
 use rustc_middle::{
-    mir::{BasicBlock, Body, Local, StatementKind},
+    mir::{
+        BasicBlock, Body, Local, OUTERMOST_SOURCE_SCOPE, SourceScope, StatementKind,
+        VarDebugInfoContents,
+    },
     ty::{EarlyBinder, Instance, TyCtxt},
 };
 use rustc_span::{Span, hygiene};
@@ -44,6 +47,78 @@ pub(crate) fn source_location(
         file_name: location.file.name.short().to_string(),
         line: u32::try_from(location.line).ok()?,
     })
+}
+
+fn source_scope_contains<'tcx>(
+    mir: &Body<'tcx>,
+    ancestor: SourceScope,
+    mut scope: SourceScope,
+) -> bool {
+    loop {
+        if scope == ancestor {
+            return true;
+        }
+        let Some(parent) = mir.source_scopes[scope].parent_scope else {
+            return false;
+        };
+        scope = parent;
+    }
+}
+
+pub(crate) fn local_variable_scope(
+    mir: &Body<'_>,
+    scope: SourceScope,
+    referenced_locals: &HashSet<Local>,
+    debug_variables: &[oomir::DebugVariable],
+    debug_variable_scopes: &[SourceScope],
+) -> oomir::Instruction {
+    let mut visible_by_name = HashMap::<String, (usize, SourceScope)>::new();
+    for (index, variable_scope) in debug_variable_scopes.iter().copied().enumerate() {
+        if !source_scope_contains(mir, variable_scope, scope) {
+            continue;
+        }
+        let Some(variable) = debug_variables.get(index) else {
+            continue;
+        };
+        match visible_by_name.get(&variable.name).copied() {
+            Some((_, visible_scope))
+                if source_scope_contains(mir, visible_scope, variable_scope) =>
+            {
+                // A binding in the more deeply nested Rust scope shadows the
+                // outer binding with the same source name.
+                visible_by_name.insert(variable.name.clone(), (index, variable_scope));
+            }
+            None => {
+                visible_by_name.insert(variable.name.clone(), (index, variable_scope));
+            }
+            _ => {}
+        }
+    }
+
+    for local in referenced_locals {
+        let plain_name = format!("_{}", local.index());
+        let cell_name = place::local_cell_name(*local);
+        for (index, variable) in debug_variables.iter().enumerate() {
+            if variable.oomir_name != plain_name && variable.oomir_name != cell_name {
+                continue;
+            }
+            let variable_scope = debug_variable_scopes
+                .get(index)
+                .copied()
+                .unwrap_or(OUTERMOST_SOURCE_SCOPE);
+            // MIR optimizations can move a binding's definition or use into
+            // its parent source scope. A referenced debug local is still the
+            // visible binding and shadows an outer binding by source name.
+            visible_by_name.insert(variable.name.clone(), (index, variable_scope));
+        }
+    }
+
+    let mut visible = visible_by_name
+        .into_values()
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    visible.sort_unstable();
+    oomir::Instruction::LocalVariableScope(visible)
 }
 
 fn available_pointer_locals_at_block_entries<'tcx>(
@@ -255,6 +330,79 @@ pub fn mir_to_oomir<'tcx>(
         }
     }
 
+    let mut debug_variables = Vec::new();
+    let mut debug_variable_scopes = Vec::new();
+    let mut seen_debug_variables = HashSet::new();
+    for variable in &mir.var_debug_info {
+        let VarDebugInfoContents::Place(debug_place) = &variable.value else {
+            continue;
+        };
+        if variable.composite.is_some() || !debug_place.projection.is_empty() {
+            continue;
+        }
+
+        let source_name = variable.name.to_string();
+        if source_name.is_empty() {
+            continue;
+        }
+        let local = debug_place.local;
+        let value_type = place::get_place_type(
+            &rustc_middle::mir::Place::from(local),
+            mir,
+            tcx,
+            instance,
+            data_types,
+        );
+        let (oomir_name, debug_type) = if place::local_uses_stable_cell(local, mir) {
+            (
+                place::local_cell_name(local),
+                oomir::Type::Pointer(Box::new(value_type)),
+            )
+        } else {
+            (format!("_{}", local.index()), value_type)
+        };
+        if !debug_type.has_jvm_value()
+            || !seen_debug_variables.insert((
+                source_name.clone(),
+                oomir_name.clone(),
+                variable.source_info.scope,
+            ))
+        {
+            continue;
+        }
+        debug_variables.push(oomir::DebugVariable {
+            name: source_name,
+            oomir_name,
+            ty: debug_type,
+        });
+        debug_variable_scopes.push(variable.source_info.scope);
+    }
+
+    // Preserve descriptor parameters even when rustc did not create a
+    // VarDebugInfo entry (notably the JVM `String[] args` main parameter).
+    for (index, (param_name, param_type)) in signature.params.iter().enumerate() {
+        if param_name == oomir::CALLER_LOCATION_PARAM_NAME || !param_type.has_jvm_value() {
+            continue;
+        }
+        let oomir_name = if signature.is_static && fn_name == "main" && index == 0 {
+            "param_0".to_string()
+        } else {
+            format!("_{}", index + 1)
+        };
+        if debug_variables
+            .iter()
+            .any(|variable| variable.oomir_name == oomir_name)
+        {
+            continue;
+        }
+        debug_variables.push(oomir::DebugVariable {
+            name: param_name.clone(),
+            oomir_name,
+            ty: param_type.clone(),
+        });
+        debug_variable_scopes.push(OUTERMOST_SOURCE_SCOPE);
+    }
+
     // Build a CodeBlock from the MIR basic blocks.
     let mut basic_blocks = HashMap::new();
     // MIR guarantees that the start block is BasicBlock 0.
@@ -278,6 +426,8 @@ pub fn mir_to_oomir<'tcx>(
             &mut basic_blocks,
             data_types,
             &mut mutable_borrows,
+            &debug_variables,
+            &debug_variable_scopes,
             available_pointer_locals
                 .get(&bb)
                 .cloned()
@@ -421,6 +571,20 @@ pub fn mir_to_oomir<'tcx>(
     if let Some(location) = source_location(tcx, mir_cloned.span, mir_cloned.span) {
         instrs.insert(0, oomir::Instruction::SourceLocation(location));
     }
+    let no_referenced_debug_locals = HashSet::new();
+    instrs.insert(
+        usize::from(matches!(
+            instrs.first(),
+            Some(oomir::Instruction::SourceLocation(_))
+        )),
+        local_variable_scope(
+            &mir_cloned,
+            OUTERMOST_SOURCE_SCOPE,
+            &no_referenced_debug_locals,
+            &debug_variables,
+            &debug_variable_scopes,
+        ),
+    );
 
     // add instrs to the start of the entry block
     if !instrs.is_empty() {
@@ -438,6 +602,7 @@ pub fn mir_to_oomir<'tcx>(
         name: fn_name,
         owner_class: fn_name_data.class_to_call_on,
         signature,
+        debug_variables,
         body: codeblock,
     }
 }

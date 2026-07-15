@@ -3,12 +3,17 @@ use super::*;
 type AliasMap = HashMap<String, Operand>;
 
 pub fn propagate_copies_and_eliminate_dead_moves(function: &mut Function) {
-    propagate_copies(function);
-    eliminate_dead_moves(function);
+    let debug_locals = function
+        .debug_variables
+        .iter()
+        .map(|variable| variable.oomir_name.clone())
+        .collect::<HashSet<_>>();
+    propagate_copies(function, &debug_locals);
+    eliminate_dead_moves(function, &debug_locals);
 }
 
-fn propagate_copies(function: &mut Function) {
-    let block_entry_aliases = analyze_copy_aliases(function);
+fn propagate_copies(function: &mut Function, debug_locals: &HashSet<String>) {
+    let block_entry_aliases = analyze_copy_aliases(function, debug_locals);
     let mut labels: Vec<String> = function.body.basic_blocks.keys().cloned().collect();
     labels.sort();
 
@@ -20,12 +25,15 @@ fn propagate_copies(function: &mut Function) {
 
         for instruction in &mut block.instructions {
             rewrite_instruction_uses(instruction, &aliases);
-            transfer_aliases_through_instruction(instruction, &mut aliases);
+            transfer_aliases_through_instruction(instruction, &mut aliases, debug_locals);
         }
     }
 }
 
-fn analyze_copy_aliases(function: &Function) -> HashMap<String, AliasMap> {
+fn analyze_copy_aliases(
+    function: &Function,
+    debug_locals: &HashSet<String>,
+) -> HashMap<String, AliasMap> {
     let mut labels: Vec<String> = function.body.basic_blocks.keys().cloned().collect();
     labels.sort();
 
@@ -51,7 +59,9 @@ fn analyze_copy_aliases(function: &Function) -> HashMap<String, AliasMap> {
                 .body
                 .basic_blocks
                 .get(label)
-                .map(|block| transfer_aliases_through_block(block, next_entry.clone()))
+                .map(|block| {
+                    transfer_aliases_through_block(block, next_entry.clone(), debug_locals)
+                })
                 .unwrap_or_default();
 
             if entry_aliases.get(label) != Some(&next_entry) {
@@ -117,14 +127,22 @@ fn meet_predecessor_aliases(
     aliases
 }
 
-fn transfer_aliases_through_block(block: &BasicBlock, mut aliases: AliasMap) -> AliasMap {
+fn transfer_aliases_through_block(
+    block: &BasicBlock,
+    mut aliases: AliasMap,
+    debug_locals: &HashSet<String>,
+) -> AliasMap {
     for instruction in &block.instructions {
-        transfer_aliases_through_instruction(instruction, &mut aliases);
+        transfer_aliases_through_instruction(instruction, &mut aliases, debug_locals);
     }
     aliases
 }
 
-fn transfer_aliases_through_instruction(instruction: &Instruction, aliases: &mut AliasMap) {
+fn transfer_aliases_through_instruction(
+    instruction: &Instruction,
+    aliases: &mut AliasMap,
+    debug_locals: &HashSet<String>,
+) {
     let rewritten_move_src = if let Instruction::Move { src, .. } = instruction {
         let mut src = src.clone();
         rewrite_operand(&mut src, aliases);
@@ -141,12 +159,13 @@ fn transfer_aliases_through_instruction(instruction: &Instruction, aliases: &mut
     if let (Instruction::Move { dest, .. }, Some(Operand::Variable { name, ty })) =
         (instruction, rewritten_move_src)
         && dest != &name
+        && !debug_locals.contains(dest)
     {
         aliases.insert(dest.clone(), Operand::Variable { name, ty });
     }
 }
 
-fn eliminate_dead_moves(function: &mut Function) {
+fn eliminate_dead_moves(function: &mut Function, debug_locals: &HashSet<String>) {
     loop {
         let live_out = block_live_out(function);
         let mut removed_any = false;
@@ -167,6 +186,7 @@ fn eliminate_dead_moves(function: &mut Function) {
 
                 if let Instruction::Move { dest, .. } = instruction
                     && !live.contains(dest)
+                    && !debug_locals.contains(dest)
                 {
                     keep[index] = false;
                     removed_any = true;
@@ -347,6 +367,7 @@ fn rewrite_instruction_uses(instruction: &mut Instruction, aliases: &AliasMap) {
             rewrite_operand(object, aliases);
         }
         Instruction::SourceLocation(_)
+        | Instruction::LocalVariableScope(_)
         | Instruction::Jump { .. }
         | Instruction::ThrowNewWithMessage { .. }
         | Instruction::Label { .. } => {}
@@ -542,6 +563,7 @@ fn collect_instruction_uses(instruction: &Instruction, uses: &mut HashSet<String
             collect_operand_use(object, uses);
         }
         Instruction::SourceLocation(_)
+        | Instruction::LocalVariableScope(_)
         | Instruction::Jump { .. }
         | Instruction::ThrowNewWithMessage { .. }
         | Instruction::Label { .. } => {}
@@ -599,6 +621,7 @@ fn instruction_defs(instruction: &Instruction) -> HashSet<String> {
             }
         }
         Instruction::SourceLocation(_)
+        | Instruction::LocalVariableScope(_)
         | Instruction::Jump { .. }
         | Instruction::Branch { .. }
         | Instruction::Return { .. }

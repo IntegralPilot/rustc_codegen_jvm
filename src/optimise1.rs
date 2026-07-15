@@ -101,6 +101,11 @@ fn transform_function(
 ) {
     let mut optimized_blocks_intermediate: HashMap<String, BasicBlock> = HashMap::new();
     let mut optimized_successors: HashMap<String, HashSet<String>> = HashMap::new();
+    let debug_locals = function
+        .debug_variables
+        .iter()
+        .map(|variable| variable.oomir_name.clone())
+        .collect::<HashSet<_>>();
     // Populate all labels from the original CFG before the loop
     let all_original_labels: HashSet<String> = cfg.keys().cloned().collect();
 
@@ -111,7 +116,7 @@ fn transform_function(
             .expect("Analysis result missing for block");
 
         let (_, transformed_instructions) =
-            process_block_instructions(info, block_entry_state, true, data_types);
+            process_block_instructions(info, block_entry_state, true, data_types, &debug_locals);
 
         let optimized_block = BasicBlock {
             label: label.clone(),

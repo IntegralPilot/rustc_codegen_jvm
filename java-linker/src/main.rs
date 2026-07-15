@@ -145,6 +145,76 @@ fn remap_instruction(instruction: &mut Instruction, offset: u16) -> io::Result<(
     Ok(())
 }
 
+fn instruction_byte_offsets(instructions: &[Instruction]) -> io::Result<Vec<u16>> {
+    let mut bytes = Cursor::new(Vec::new());
+    let mut offsets = Vec::with_capacity(instructions.len() + 1);
+    for instruction in instructions {
+        offsets.push(u16::try_from(bytes.position()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "JVM method exceeds the bytecode offset limit",
+            )
+        })?);
+        instruction.to_bytes(&mut bytes).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("could not measure JVM instruction: {error}"),
+            )
+        })?;
+    }
+    offsets.push(u16::try_from(bytes.position()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "JVM method exceeds the bytecode offset limit",
+        )
+    })?);
+    Ok(offsets)
+}
+
+fn remap_code_offset(pc: u16, old_offsets: &[u16], new_offsets: &[u16]) -> io::Result<u16> {
+    let instruction_index = old_offsets.binary_search(&pc).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("local-variable PC {pc} is not an instruction boundary"),
+        )
+    })?;
+    new_offsets.get(instruction_index).copied().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "local-variable PC has no remapped instruction boundary",
+        )
+    })
+}
+
+fn remap_local_variable_ranges(
+    attributes: &mut [Attribute],
+    old_offsets: &[u16],
+    new_offsets: &[u16],
+) -> io::Result<()> {
+    for attribute in attributes {
+        if let Attribute::LocalVariableTable { variables, .. } = attribute {
+            for variable in variables {
+                let old_end = variable.start_pc.checked_add(variable.length).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "local-variable bytecode range overflows u16",
+                    )
+                })?;
+                let new_start = remap_code_offset(variable.start_pc, old_offsets, new_offsets)?;
+                let new_end = remap_code_offset(old_end, old_offsets, new_offsets)?;
+                variable.start_pc = new_start;
+                variable.length = new_end.checked_sub(new_start).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "remapped local-variable bytecode range is reversed",
+                    )
+                })?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn remap_attribute(attribute: &mut Attribute, offset: u16) -> io::Result<()> {
     match attribute {
         Attribute::Code {
@@ -155,9 +225,12 @@ fn remap_attribute(attribute: &mut Attribute, offset: u16) -> io::Result<()> {
             ..
         } => {
             *name_index = shifted_constant_index(*name_index, offset)?;
-            for instruction in code {
+            let old_byte_offsets = instruction_byte_offsets(code)?;
+            for instruction in code.iter_mut() {
                 remap_instruction(instruction, offset)?;
             }
+            let new_byte_offsets = instruction_byte_offsets(code)?;
+            remap_local_variable_ranges(attributes, &old_byte_offsets, &new_byte_offsets)?;
             for exception in exception_table {
                 if exception.catch_type != 0 {
                     exception.catch_type = shifted_constant_index(exception.catch_type, offset)?;
@@ -193,6 +266,17 @@ fn remap_attribute(attribute: &mut Attribute, offset: u16) -> io::Result<()> {
         | Attribute::Synthetic { name_index }
         | Attribute::Deprecated { name_index } => {
             *name_index = shifted_constant_index(*name_index, offset)?;
+        }
+        Attribute::LocalVariableTable {
+            name_index,
+            variables,
+        } => {
+            *name_index = shifted_constant_index(*name_index, offset)?;
+            for variable in variables {
+                variable.name_index = shifted_constant_index(variable.name_index, offset)?;
+                variable.descriptor_index =
+                    shifted_constant_index(variable.descriptor_index, offset)?;
+            }
         }
         Attribute::MethodParameters {
             name_index,
@@ -1226,9 +1310,11 @@ fn create_manifest_content(main_class_name: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        class_file_from_data, jar_output_path, merge_class_data, merge_input_jars, method_identity,
-        msvc_output_path, parse_response_lines,
+        class_file_from_data, instruction_byte_offsets, jar_output_path, merge_class_data,
+        merge_input_jars, method_identity, msvc_output_path, parse_response_lines,
+        remap_local_variable_ranges,
     };
+    use ristretto_classfile::attributes::{Attribute, Instruction, LocalVariableTable};
     use ristretto_classfile::{
         ClassAccessFlags, ClassFile, ConstantPool, Method, MethodAccessFlags, Version,
     };
@@ -1283,6 +1369,34 @@ mod tests {
             Some("C:\\tmp\\app.exe")
         );
         assert_eq!(msvc_output_path("/DEBUG"), None);
+    }
+
+    #[test]
+    fn remaps_local_variable_ranges_when_ldc_widens() {
+        let old_offsets = instruction_byte_offsets(&[Instruction::Ldc(1), Instruction::Return])
+            .expect("old bytecode offsets");
+        let new_offsets =
+            instruction_byte_offsets(&[Instruction::Ldc_w(256), Instruction::Return])
+                .expect("new bytecode offsets");
+        let mut attributes = vec![Attribute::LocalVariableTable {
+            name_index: 1,
+            variables: vec![LocalVariableTable {
+                start_pc: 2,
+                length: 1,
+                name_index: 2,
+                descriptor_index: 3,
+                index: 0,
+            }],
+        }];
+
+        remap_local_variable_ranges(&mut attributes, &old_offsets, &new_offsets)
+            .expect("remapped local variable range");
+
+        let Attribute::LocalVariableTable { variables, .. } = &attributes[0] else {
+            panic!("expected local variable table")
+        };
+        assert_eq!(variables[0].start_pc, 3);
+        assert_eq!(variables[0].length, 1);
     }
 
     #[test]

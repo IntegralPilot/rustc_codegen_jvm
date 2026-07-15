@@ -140,6 +140,7 @@ pub fn process_block_instructions(
     initial_state: &ConstantMap,
     transform: bool, // If true, generate new instructions; otherwise, just calculate state
     _data_types: &HashMap<String, DataType>, // needed later if we try to handle more advanced optimisation
+    debug_locals: &HashSet<String>,
 ) -> (ConstantMap, Vec<Instruction>) {
     // Returns final state and (if transform=true) new instructions
 
@@ -1320,6 +1321,7 @@ pub fn process_block_instructions(
             }
 
             Instruction::SourceLocation(_)
+            | Instruction::LocalVariableScope(_)
             | Instruction::ThrowNewWithMessage { .. }
             | Instruction::Label { .. } => {
                 // nothing to do
@@ -1327,9 +1329,19 @@ pub fn process_block_instructions(
             }
         }
 
-        if transform && keep_original_instruction {
-            new_instructions.extend(pre_extra_instructions);
-            new_instructions.push(optimised_instruction);
+        if transform {
+            if keep_original_instruction {
+                new_instructions.extend(pre_extra_instructions);
+                new_instructions.push(optimised_instruction);
+            } else if let Some(dest) = instruction_destination(instruction)
+                && debug_locals.contains(dest)
+                && let Some(value) = current_state.get(dest)
+            {
+                new_instructions.push(Instruction::Move {
+                    dest: dest.to_string(),
+                    src: Operand::Constant(value.clone()),
+                });
+            }
         }
     }
 
@@ -1341,8 +1353,53 @@ fn calculate_block_output_state(info: &BasicBlockInfo, in_state: &ConstantMap) -
     // For analysis, we only need the state, not the instructions.
     // Pass dummy data_types if not needed for state calculation itself.
     let dummy_data_types = HashMap::new();
-    let (out_state, _) = process_block_instructions(info, in_state, false, &dummy_data_types);
+    let (out_state, _) =
+        process_block_instructions(info, in_state, false, &dummy_data_types, &HashSet::new());
     out_state
+}
+
+fn instruction_destination(instruction: &Instruction) -> Option<&str> {
+    match instruction {
+        Instruction::Add { dest, .. }
+        | Instruction::Sub { dest, .. }
+        | Instruction::Mul { dest, .. }
+        | Instruction::Div { dest, .. }
+        | Instruction::Rem { dest, .. }
+        | Instruction::Eq { dest, .. }
+        | Instruction::Ne { dest, .. }
+        | Instruction::Lt { dest, .. }
+        | Instruction::Le { dest, .. }
+        | Instruction::Gt { dest, .. }
+        | Instruction::Ge { dest, .. }
+        | Instruction::BitAnd { dest, .. }
+        | Instruction::BitOr { dest, .. }
+        | Instruction::BitXor { dest, .. }
+        | Instruction::Shl { dest, .. }
+        | Instruction::Shr { dest, .. }
+        | Instruction::Not { dest, .. }
+        | Instruction::Neg { dest, .. }
+        | Instruction::Move { dest, .. }
+        | Instruction::NewArray { dest, .. }
+        | Instruction::ArrayGet { dest, .. }
+        | Instruction::Length { dest, .. }
+        | Instruction::ConstructObject { dest, .. }
+        | Instruction::GetField { dest, .. }
+        | Instruction::Cast { dest, .. } => Some(dest),
+        Instruction::CallIndirect { dest, .. }
+        | Instruction::InvokeInterface { dest, .. }
+        | Instruction::InvokeVirtual { dest, .. }
+        | Instruction::InvokeStatic { dest, .. } => dest.as_deref(),
+        Instruction::SourceLocation(_)
+        | Instruction::LocalVariableScope(_)
+        | Instruction::Jump { .. }
+        | Instruction::Branch { .. }
+        | Instruction::Return { .. }
+        | Instruction::ThrowNewWithMessage { .. }
+        | Instruction::Switch { .. }
+        | Instruction::ArrayStore { .. }
+        | Instruction::SetField { .. }
+        | Instruction::Label { .. } => None,
+    }
 }
 
 impl Instruction {
@@ -1442,7 +1499,8 @@ mod tests {
         };
         let state = ConstantMap::from([("value".to_string(), Constant::I32(-2))]);
 
-        let (_, instructions) = process_block_instructions(&info, &state, true, &HashMap::new());
+        let (_, instructions) =
+            process_block_instructions(&info, &state, true, &HashMap::new(), &HashSet::new());
 
         assert_eq!(
             instructions,

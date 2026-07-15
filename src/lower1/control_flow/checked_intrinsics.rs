@@ -240,6 +240,7 @@ pub fn emit_checked_arithmetic_intrinsic(
     Function {
         name: fn_name,
         owner_class: None,
+        debug_variables: Vec::new(),
         signature: Signature {
             params: vec![(a.into(), ty.clone()), (b.into(), ty.clone())],
             ret: Box::new(Type::Class(result_struct_name.to_string())),

@@ -175,6 +175,7 @@ pub(super) fn ensure_trait_object_adapter_class<'tcx>(
             oomir::DataTypeMethod::Function(oomir::Function {
                 name: method_name,
                 owner_class: None,
+                debug_variables: Vec::new(),
                 signature: oomir::Signature {
                     params: std::iter::once((
                         "self".to_string(),

@@ -825,6 +825,7 @@ pub(crate) fn ensure_fn_pointer_adapter_class<'tcx>(
     let call_method = oomir::DataTypeMethod::Function(oomir::Function {
         name: "call".to_string(),
         owner_class: None,
+        debug_variables: Vec::new(),
         signature: oomir::Signature {
             params: method_params,
             ret: signature.ret.clone(),
@@ -991,6 +992,7 @@ pub(crate) fn ensure_closure_fn_pointer_adapter_class<'tcx>(
     let call_method = oomir::DataTypeMethod::Function(oomir::Function {
         name: "call".to_string(),
         owner_class: None,
+        debug_variables: Vec::new(),
         signature: oomir::Signature {
             params: method_params,
             ret: signature.ret.clone(),
@@ -1200,6 +1202,7 @@ fn ensure_erased_receiver_fn_pointer_bridge<'tcx>(
     let call_method = DataTypeMethod::Function(oomir::Function {
         name: "call".to_string(),
         owner_class: None,
+        debug_variables: Vec::new(),
         signature: oomir::Signature {
             params: method_params,
             ret: target_signature.ret.clone(),

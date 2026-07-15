@@ -443,6 +443,7 @@ fn enum_from_union_discriminant_function<'tcx>(
     oomir::Function {
         name: ENUM_FROM_UNION_DISCRIMINANT_METHOD.to_string(),
         owner_class: None,
+        debug_variables: Vec::new(),
         signature: oomir::Signature {
             params: vec![("discriminant".to_string(), oomir::Type::I64)],
             ret: Box::new(oomir::Type::Class(base_enum_name.to_string())),
@@ -509,6 +510,7 @@ fn enum_variant_drop_glue_function<'tcx>(
     oomir::Function {
         name: ENUM_DROP_FIELDS_METHOD.to_string(),
         owner_class: None,
+        debug_variables: Vec::new(),
         signature: oomir::Signature {
             params: vec![("self".to_string(), self_ty)],
             ret: Box::new(oomir::Type::Void),
@@ -1321,6 +1323,7 @@ fn enum_variant_union_writer<'tcx>(
         oomir::Function {
             name: ENUM_WRITE_UNION_STORAGE_METHOD.to_string(),
             owner_class: None,
+            debug_variables: Vec::new(),
             signature: enum_union_write_signature(&variant_layout.class_name),
             body: simple_body(instructions),
         },
@@ -1474,6 +1477,7 @@ fn enum_union_reader<'tcx>(
     Ok(oomir::Function {
         name: ENUM_READ_UNION_STORAGE_METHOD.to_string(),
         owner_class: None,
+        debug_variables: Vec::new(),
         signature: enum_union_read_signature(enum_class),
         body: oomir::CodeBlock {
             entry,
@@ -1503,6 +1507,7 @@ fn ensure_enum_union_codec<'tcx>(
     let base_writer = oomir::Function {
         name: ENUM_WRITE_UNION_STORAGE_METHOD.to_string(),
         owner_class: None,
+        debug_variables: Vec::new(),
         signature: enum_union_write_signature(enum_class),
         body: unsupported_union_body(format!(
             "enum base class {enum_class} has no concrete union representation"
@@ -2766,6 +2771,7 @@ pub(super) fn ensure_exact_transmute_helper<'tcx>(
     let function = oomir::Function {
         name: method_name.clone(),
         owner_class: None,
+        debug_variables: Vec::new(),
         signature,
         body: simple_body(instructions),
     };
@@ -2873,6 +2879,7 @@ pub(super) fn ensure_pointer_memory_codec<'tcx>(
     let encode = oomir::Function {
         name: "encode".to_string(),
         owner_class: None,
+        debug_variables: Vec::new(),
         signature: oomir::Signature {
             params: value_ty
                 .has_jvm_value()
@@ -2907,6 +2914,7 @@ pub(super) fn ensure_pointer_memory_codec<'tcx>(
     let decode = oomir::Function {
         name: "decode".to_string(),
         owner_class: None,
+        debug_variables: Vec::new(),
         signature: oomir::Signature {
             params: vec![("bytes".to_string(), bytes_ty)],
             ret: Box::new(value_ty),
@@ -3128,6 +3136,7 @@ fn union_from_function<'tcx>(
     oomir::Function {
         name: union_from_method_name(field_name),
         owner_class: None,
+        debug_variables: Vec::new(),
         signature: oomir::Signature {
             params: if is_unit {
                 vec![]
@@ -3154,6 +3163,7 @@ fn union_getter_function<'tcx>(
         return oomir::Function {
             name: union_getter_method_name(field_name),
             owner_class: None,
+            debug_variables: Vec::new(),
             signature: oomir::Signature {
                 params: vec![(
                     "self".to_string(),
@@ -3216,6 +3226,7 @@ fn union_getter_function<'tcx>(
     oomir::Function {
         name: union_getter_method_name(field_name),
         owner_class: None,
+        debug_variables: Vec::new(),
         signature: oomir::Signature {
             params: vec![(
                 "self".to_string(),
@@ -3287,6 +3298,7 @@ fn union_setter_function<'tcx>(
     oomir::Function {
         name: union_setter_method_name(field_name),
         owner_class: None,
+        debug_variables: Vec::new(),
         signature: oomir::Signature {
             params: vec![(
                 "self".to_string(),

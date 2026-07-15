@@ -3,10 +3,16 @@ use super::stackmaps::FrameValue;
 use crate::oomir::SourceLocation;
 use std::collections::{BTreeMap, BTreeSet};
 
+#[derive(Clone, Debug, Default)]
+pub(super) struct BytecodeMetadata {
+    pub source_location: Option<SourceLocation>,
+    pub active_variables: Vec<usize>,
+}
+
 #[derive(Debug)]
 pub(super) struct Optimise2Result {
     pub instructions: Vec<Instruction>,
-    pub source_locations: Vec<Option<SourceLocation>>,
+    pub metadata: Vec<BytecodeMetadata>,
     pub max_locals: u16,
     pub local_slot_map: BTreeMap<u16, u16>,
 }
@@ -42,13 +48,14 @@ struct LocalLiveness {
     live_out: Vec<BTreeSet<u16>>,
 }
 
-type LocatedInstructions = (Vec<Instruction>, Vec<Option<SourceLocation>>);
+type LocatedInstructions = (Vec<Instruction>, Vec<BytecodeMetadata>);
 
 pub(super) fn optimise(
     instructions: Vec<Instruction>,
-    source_locations: Vec<Option<SourceLocation>>,
+    source_locations: Vec<BytecodeMetadata>,
     max_locals: u16,
     fixed_prefix_slots: u16,
+    pinned_local_slots: &BTreeSet<u16>,
 ) -> jvm::Result<Optimise2Result> {
     // Lower2 sees final JVM control flow, so it can safely do bytecode-level
     // peepholes and local-slot reuse before StackMapTable generation.
@@ -59,25 +66,30 @@ pub(super) fn optimise(
         });
     }
     let (instructions, source_locations) =
-        fold_boolean_branch_materialization(instructions, source_locations)?;
+        fold_boolean_branch_materialization(instructions, source_locations, pinned_local_slots)?;
     let (instructions, source_locations) =
         remove_redundant_instructions(instructions, source_locations)?;
     let instructions = thread_jump_targets(instructions)?;
     let (instructions, source_locations) = fold_branch_over_goto(instructions, source_locations)?;
     let (instructions, source_locations) =
         remove_unreachable_instructions(instructions, source_locations)?;
-    let local_slot_map = allocate_local_slots(&instructions, max_locals, fixed_prefix_slots);
+    let local_slot_map = allocate_local_slots(
+        &instructions,
+        max_locals,
+        fixed_prefix_slots,
+        pinned_local_slots,
+    );
     let (instructions, _) = rewrite_locals(instructions, &local_slot_map);
-    let instructions = rewrite_store_load_pairs(instructions);
+    let (instructions, source_locations) = rewrite_store_load_pairs(instructions, source_locations);
     let (instructions, source_locations) = fold_iinc_patterns(instructions, source_locations)?;
     let (instructions, source_locations) =
         fold_null_branch_comparisons(instructions, source_locations)?;
     let (instructions, source_locations) =
-        fold_boolean_zero_comparisons(instructions, source_locations)?;
+        fold_boolean_zero_comparisons(instructions, source_locations, pinned_local_slots)?;
     let (instructions, source_locations) =
-        fold_stack_boolean_zero_comparisons(instructions, source_locations)?;
+        fold_stack_boolean_zero_comparisons(instructions, source_locations, pinned_local_slots)?;
     let (instructions, source_locations) =
-        remove_dead_duplicate_stores(instructions, source_locations)?;
+        remove_dead_duplicate_stores(instructions, source_locations, pinned_local_slots)?;
     let instructions = thread_jump_targets(instructions)?;
     let (instructions, source_locations) = fold_branch_over_goto(instructions, source_locations)?;
     let (instructions, source_locations) =
@@ -89,7 +101,7 @@ pub(super) fn optimise(
 
     Ok(Optimise2Result {
         instructions,
-        source_locations,
+        metadata: source_locations,
         max_locals,
         local_slot_map,
     })
@@ -142,7 +154,8 @@ pub(super) fn remap_frame_values(
 
 fn fold_boolean_branch_materialization(
     mut instructions: Vec<Instruction>,
-    source_locations: Vec<Option<SourceLocation>>,
+    source_locations: Vec<BytecodeMetadata>,
+    pinned_local_slots: &BTreeSet<u16>,
 ) -> jvm::Result<LocatedInstructions> {
     if instructions.len() < 7 {
         return Ok((instructions, source_locations));
@@ -188,7 +201,8 @@ fn fold_boolean_branch_materialization(
             index += 1;
             continue;
         };
-        if stored_bool.index != loaded_bool.index {
+        if stored_bool.index != loaded_bool.index || pinned_local_slots.contains(&stored_bool.index)
+        {
             index += 1;
             continue;
         }
@@ -262,7 +276,8 @@ fn only_expected_incoming(incoming: &[BTreeSet<usize>], pattern_start: usize) ->
 
 fn fold_boolean_zero_comparisons(
     mut instructions: Vec<Instruction>,
-    source_locations: Vec<Option<SourceLocation>>,
+    source_locations: Vec<BytecodeMetadata>,
+    pinned_local_slots: &BTreeSet<u16>,
 ) -> jvm::Result<LocatedInstructions> {
     if instructions.len() < 6 {
         return Ok((instructions, source_locations));
@@ -312,6 +327,9 @@ fn fold_boolean_zero_comparisons(
 
         if cursor + 1 >= instructions.len()
             || !matches!(instructions[cursor], Instruction::Iconst_0)
+            || stored_locals
+                .iter()
+                .any(|local| pinned_local_slots.contains(local))
         {
             index += 1;
             continue;
@@ -381,7 +399,8 @@ fn only_expected_incoming_for_zero_compare(
 
 fn fold_stack_boolean_zero_comparisons(
     mut instructions: Vec<Instruction>,
-    source_locations: Vec<Option<SourceLocation>>,
+    source_locations: Vec<BytecodeMetadata>,
+    pinned_local_slots: &BTreeSet<u16>,
 ) -> jvm::Result<LocatedInstructions> {
     if instructions.len() < 4 {
         return Ok((instructions, source_locations));
@@ -432,7 +451,10 @@ fn fold_stack_boolean_zero_comparisons(
 
         let mut kept_live_stores = BTreeSet::new();
         for (dup_index, store_index, local) in stores.into_iter().rev() {
-            if liveness.live_out[branch_index].contains(&local) && kept_live_stores.insert(local) {
+            if pinned_local_slots.contains(&local)
+                || liveness.live_out[branch_index].contains(&local)
+                    && kept_live_stores.insert(local)
+            {
                 continue;
             }
             keep[dup_index] = false;
@@ -461,7 +483,8 @@ fn range_has_no_incoming(incoming: &[BTreeSet<usize>], start: usize, end: usize)
 
 fn remove_dead_duplicate_stores(
     instructions: Vec<Instruction>,
-    source_locations: Vec<Option<SourceLocation>>,
+    source_locations: Vec<BytecodeMetadata>,
+    pinned_local_slots: &BTreeSet<u16>,
 ) -> jvm::Result<LocatedInstructions> {
     if instructions.len() < 2 {
         return Ok((instructions, source_locations));
@@ -487,7 +510,10 @@ fn remove_dead_duplicate_stores(
             Instruction::Dup2 => local_width(store_kind) == 2,
             _ => false,
         };
-        if !duplicate_matches_store || liveness.live_out[index + 1].contains(&stored.index) {
+        if !duplicate_matches_store
+            || pinned_local_slots.contains(&stored.index)
+            || liveness.live_out[index + 1].contains(&stored.index)
+        {
             index += 1;
             continue;
         }
@@ -502,7 +528,7 @@ fn remove_dead_duplicate_stores(
 
 fn remove_redundant_instructions(
     instructions: Vec<Instruction>,
-    source_locations: Vec<Option<SourceLocation>>,
+    source_locations: Vec<BytecodeMetadata>,
 ) -> jvm::Result<LocatedInstructions> {
     if instructions.is_empty() {
         return Ok((instructions, source_locations));
@@ -553,7 +579,7 @@ fn remove_redundant_instructions(
 
 fn remove_unreachable_instructions(
     instructions: Vec<Instruction>,
-    source_locations: Vec<Option<SourceLocation>>,
+    source_locations: Vec<BytecodeMetadata>,
 ) -> jvm::Result<LocatedInstructions> {
     if instructions.is_empty() {
         return Ok((instructions, source_locations));
@@ -664,7 +690,7 @@ fn thread_jump_targets(mut instructions: Vec<Instruction>) -> jvm::Result<Vec<In
 
 fn fold_branch_over_goto(
     mut instructions: Vec<Instruction>,
-    source_locations: Vec<Option<SourceLocation>>,
+    source_locations: Vec<BytecodeMetadata>,
 ) -> jvm::Result<LocatedInstructions> {
     if instructions.len() < 3 {
         return Ok((instructions, source_locations));
@@ -718,9 +744,12 @@ fn fold_branch_over_goto(
     compact_instructions(instructions, source_locations, &keep)
 }
 
-fn rewrite_store_load_pairs(mut instructions: Vec<Instruction>) -> Vec<Instruction> {
+fn rewrite_store_load_pairs(
+    mut instructions: Vec<Instruction>,
+    mut metadata: Vec<BytecodeMetadata>,
+) -> LocatedInstructions {
     if instructions.len() < 2 {
-        return instructions;
+        return (instructions, metadata);
     }
 
     let protected = protected_instruction_indices(&instructions);
@@ -745,14 +774,18 @@ fn rewrite_store_load_pairs(mut instructions: Vec<Instruction>) -> Vec<Instructi
             Instruction::Dup
         };
         instructions[index + 1] = make_store(store_kind, stored.index);
+        // The store moves one instruction later, while the duplicate takes
+        // the place of the original load. Keep source scopes and locations
+        // attached to those semantic operations, not their old positions.
+        metadata.swap(index, index + 1);
     }
 
-    instructions
+    (instructions, metadata)
 }
 
 fn fold_iinc_patterns(
     mut instructions: Vec<Instruction>,
-    source_locations: Vec<Option<SourceLocation>>,
+    source_locations: Vec<BytecodeMetadata>,
 ) -> jvm::Result<LocatedInstructions> {
     if instructions.len() < 4 {
         return Ok((instructions, source_locations));
@@ -793,7 +826,7 @@ fn fold_iinc_patterns(
 
 fn fold_null_branch_comparisons(
     mut instructions: Vec<Instruction>,
-    source_locations: Vec<Option<SourceLocation>>,
+    source_locations: Vec<BytecodeMetadata>,
 ) -> jvm::Result<LocatedInstructions> {
     if instructions.len() < 3 {
         return Ok((instructions, source_locations));
@@ -863,7 +896,7 @@ fn protected_instruction_indices(instructions: &[Instruction]) -> BTreeSet<usize
 
 fn compact_instructions(
     instructions: Vec<Instruction>,
-    source_locations: Vec<Option<SourceLocation>>,
+    source_locations: Vec<BytecodeMetadata>,
     keep: &[bool],
 ) -> jvm::Result<LocatedInstructions> {
     let mut old_to_new = vec![None; keep.len()];
@@ -996,6 +1029,7 @@ fn allocate_local_slots(
     instructions: &[Instruction],
     max_locals: u16,
     fixed_prefix_slots: u16,
+    pinned_local_slots: &BTreeSet<u16>,
 ) -> BTreeMap<u16, u16> {
     let live_ranges = compute_live_ranges(instructions);
     let mut slot_map = BTreeMap::new();
@@ -1004,15 +1038,27 @@ fn allocate_local_slots(
         slot_map.insert(old_slot, old_slot);
     }
 
+    let mut active: Vec<(u16, u16, usize)> = pinned_local_slots
+        .iter()
+        .filter(|slot| **slot >= fixed_prefix_slots)
+        .filter_map(|slot| {
+            live_ranges.get(slot).map(|range| {
+                slot_map.insert(*slot, *slot);
+                (*slot, range.width, usize::MAX)
+            })
+        })
+        .collect();
+
     let mut intervals: Vec<(u16, LiveRange)> = live_ranges
         .into_iter()
-        .filter(|(old_slot, _)| *old_slot >= fixed_prefix_slots)
+        .filter(|(old_slot, _)| {
+            *old_slot >= fixed_prefix_slots && !pinned_local_slots.contains(old_slot)
+        })
         .collect();
     intervals.sort_by_key(|(old_slot, range)| (range.first, range.last, *old_slot));
 
-    let mut active: Vec<(u16, u16, usize)> = Vec::new();
     for (old_slot, range) in intervals {
-        active.retain(|(_, _, last)| *last >= range.first);
+        active.retain(|(_, _, last)| *last == usize::MAX || *last >= range.first);
         let mut candidate = fixed_prefix_slots;
         while active.iter().any(|(physical_slot, width, _)| {
             ranges_overlap(candidate, range.width, *physical_slot, *width)
@@ -1576,6 +1622,19 @@ fn local_writes(instruction: &Instruction) -> Vec<LocalRef> {
         _ => {}
     }
     writes
+}
+
+pub(super) fn instruction_uses_local(instruction: &Instruction, index: u16) -> bool {
+    local_reads(instruction)
+        .into_iter()
+        .chain(local_writes(instruction))
+        .any(|local| local.index == index)
+}
+
+pub(super) fn instruction_writes_local(instruction: &Instruction, index: u16) -> bool {
+    local_writes(instruction)
+        .into_iter()
+        .any(|local| local.index == index)
 }
 
 fn local_load(instruction: &Instruction) -> Option<(LocalKind, LocalRef)> {
