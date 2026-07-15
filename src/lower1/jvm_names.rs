@@ -1,7 +1,20 @@
 use rustc_middle::ty::{GenericArgsRef, Instance, TyCtxt};
+use rustc_session::config::CrateType;
 use rustc_span::def_id::{CrateNum, DefId};
 
 const RUNTIME_CRATES: &[&str] = &["core"];
+
+pub fn uses_compiled_core(tcx: TyCtxt<'_>) -> bool {
+    tcx.sess.target.llvm_target.as_ref() == "jvm-unknown-unknown"
+}
+
+pub fn compiles_external_core_instances(tcx: TyCtxt<'_>) -> bool {
+    uses_compiled_core(tcx)
+        && tcx
+            .crate_types()
+            .iter()
+            .any(|crate_type| matches!(crate_type, CrateType::Executable))
+}
 
 pub fn is_runtime_crate<'tcx>(tcx: TyCtxt<'tcx>, krate: CrateNum) -> bool {
     let crate_name = tcx.crate_name(krate);

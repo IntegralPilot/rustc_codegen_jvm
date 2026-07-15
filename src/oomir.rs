@@ -13,6 +13,7 @@ pub mod interpret;
 pub const SLICE_VIEW_CLASS: &str = "org/rustlang/runtime/SliceView";
 pub const UTF8_VIEW_CLASS: &str = "org/rustlang/runtime/Utf8View";
 pub const POINTER_CLASS: &str = "org/rustlang/runtime/Pointer";
+pub const CALLER_LOCATION_PARAM_NAME: &str = "__caller_location";
 
 // OOMIR definitions
 #[derive(Debug, Clone)]

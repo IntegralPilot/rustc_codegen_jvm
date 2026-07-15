@@ -42,7 +42,7 @@ const fn alias(
 }
 
 const SHIMS: &[ShimInfo] = &[
-    direct(
+    /*direct(
         CORE_CLASS,
         "arguments_from_str",
         "(Ljava/lang/String;)Lorg/rustlang/core/fmt/Arguments__;",
@@ -82,14 +82,14 @@ const SHIMS: &[ShimInfo] = &[
     direct(PANICKING_CLASS, "panic", "(Ljava/lang/String;)V"),
     direct(PANICKING_CLASS, "panic_fmt", "(Ljava/lang/Object;)V"),
     direct(CORE_CLASS, "starts_with", "([B[B)Z"),
-    direct(CORE_CLASS, "toShortArray", "(Ljava/lang/String;)[S"),
+    direct(CORE_CLASS, "toShortArray", "(Ljava/lang/String;)[S"),*/
     alias(
         "org/rustlang/core/intrinsics",
         "compare_bytes",
         "compare_bytes",
         "(Lorg/rustlang/runtime/Pointer;Lorg/rustlang/runtime/Pointer;J)I",
     ),
-    ShimInfo {
+    /*ShimInfo {
         rust_class: Some("org/rustlang/core/char/methods"),
         rust_method: "encode_utf8_raw",
         java_class: "org/rustlang/runtime/SliceView",
@@ -113,7 +113,7 @@ const SHIMS: &[ShimInfo] = &[
         "new_display",
         "new_display",
         "(Ljava/lang/Object;)Lorg/rustlang/core/fmt/rt/Argument__;",
-    ),
+    ),*/
 ];
 
 pub(super) fn find_shim(class_name: &str, method_name: &str) -> Option<&'static ShimInfo> {

@@ -1,11 +1,13 @@
 //! Naming helpers for functions and monomorphized instances
 
 use super::{jvm_names, types::ty_to_oomir_type};
-use rustc_hir::def::DefKind;
+use rustc_hir::{LangItem, def::DefKind};
 use rustc_middle::ty::{GenericParamDefKind, Instance, TyCtxt, TypeVisitableExt};
+use rustc_span::sym;
 use std::collections::HashMap;
 
 const MAX_MONO_FN_NAME_LEN: usize = 128;
+const WEAK_LANG_ITEMS_CLASS: &str = "org/rustlang/runtime/WeakLangItems";
 
 #[derive(Debug, Clone)]
 pub struct FnNameData {
@@ -17,7 +19,10 @@ pub fn associated_method_name_from_instance<'tcx>(
     tcx: TyCtxt<'tcx>,
     instance: Instance<'tcx>,
 ) -> String {
-    if !instance.def_id().is_local() && jvm_names::is_runtime_crate(tcx, instance.def_id().krate) {
+    if !instance.def_id().is_local()
+        && jvm_names::is_runtime_crate(tcx, instance.def_id().krate)
+        && !jvm_names::compiles_external_core_instances(tcx)
+    {
         return jvm_names::method_for_function(tcx, instance.def_id());
     }
 
@@ -40,6 +45,19 @@ pub fn associated_method_name_from_instance<'tcx>(
 /// (e.g., `my_func_i32_String`). Falls back to a hash of the type descriptors if the
 /// resulting name becomes too long.
 pub fn mono_fn_name_from_instance<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> FnNameData {
+    let is_core_panic_impl_declaration = tcx.is_foreign_item(instance.def_id())
+        && tcx.opt_item_name(instance.def_id()) == Some(sym::panic_impl)
+        && tcx.crate_name(instance.def_id().krate) == sym::core;
+    if is_core_panic_impl_declaration || tcx.is_lang_item(instance.def_id(), LangItem::PanicImpl) {
+        return FnNameData {
+            class_to_call_on: Some(WEAK_LANG_ITEMS_CLASS.to_string()),
+            method_name: LangItem::PanicImpl
+                .link_name()
+                .expect("panic_impl has a weak link name")
+                .to_string(),
+        };
+    }
+
     let class = Some(jvm_names::owner_class_for_function(tcx, instance.def_id()));
 
     // Use only the last path segment as the method base (so "core::panicking::panic" -> "panic")

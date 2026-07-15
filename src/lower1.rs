@@ -200,6 +200,13 @@ pub fn mir_to_oomir<'tcx>(
         params_oomir.insert(0, ("closure_env".to_string(), closure_env_ty));
     }
 
+    if instance.def.requires_caller_location(tcx) {
+        params_oomir.push((
+            oomir::CALLER_LOCATION_PARAM_NAME.to_string(),
+            ty_to_oomir_type(tcx.caller_location_ty(), tcx, data_types, instance),
+        ));
+    }
+
     let return_oomir_ty: oomir::Type =
         ty_to_oomir_type(return_ty.skip_binder(), tcx, data_types, instance);
 

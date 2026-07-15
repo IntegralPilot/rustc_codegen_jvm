@@ -1,5 +1,18 @@
-// Tests panicking. Formatting is technically `alloc` stuff, we're only trying to get `core` working for now
-// Tester.py compares the actual panic output (message + backtrace) with the expected output
+#![no_std]
+#![feature(lang_items)]
+#![allow(internal_features)]
+
+#[panic_handler]
+fn panic(_: &core::panic::PanicInfo<'_>) -> ! {
+    unsafe { core::hint::unreachable_unchecked() }
+}
+
+#[lang = "start"]
+fn start<T>(main: fn() -> T, _: isize, _: *const *const u8, _: u8) -> isize {
+    main();
+    0
+}
+
 
 fn main() {
     let value = 42;

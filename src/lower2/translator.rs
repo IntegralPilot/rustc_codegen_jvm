@@ -126,8 +126,14 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             let param_translator_name: String = format!("param_{}", i);
             // Signature params are aligned with MIR locals: param[0] is _1.
             // For instance methods, _1 is the implicit JVM receiver in slot 0.
-            let param_oomir_name = format!("_{}", i + 1);
-            let (_param_name, param_ty) = &oomir_func.signature.params[i];
+            // The hidden track-caller parameter is not a MIR local and keeps a
+            // reserved name so it cannot alias the first body temporary.
+            let (param_name, param_ty) = &oomir_func.signature.params[i];
+            let param_oomir_name = if param_name == oomir::CALLER_LOCATION_PARAM_NAME {
+                param_name.clone()
+            } else {
+                format!("_{}", i + 1)
+            };
             let is_synthetic_jvm_main_arg = is_static
                 && oomir_func.name == "main"
                 && i == 0

@@ -204,7 +204,12 @@ fn place_or_insert_mono_function<'tcx>(
             );
 
             if let Type::Class(class_name) = self_oomir_ty {
-                if !class_name.starts_with("java/") && !class_name.starts_with("org/rustlang/") {
+                let can_extend_compiled_core_class = lower1::jvm_names::uses_compiled_core(tcx)
+                    && (instance.def_id().is_local()
+                        || lower1::jvm_names::compiles_external_core_instances(tcx));
+                let is_runtime_owned_class =
+                    class_name.starts_with("org/rustlang/") && !can_extend_compiled_core_class;
+                if !class_name.starts_with("java/") && !is_runtime_owned_class {
                     oomir_function.name =
                         lower1::naming::associated_method_name_from_instance(tcx, instance);
                     oomir_function.owner_class = None;
@@ -283,12 +288,14 @@ fn lower_mono_function<'tcx>(
 ) {
     let is_external_runtime_item = !instance.def_id().is_local()
         && lower1::jvm_names::is_runtime_crate(tcx, instance.def_id().krate);
-    let needs_compiled_primitive_operator = is_external_runtime_item
+    let uses_runtime_implementation =
+        is_external_runtime_item && !lower1::jvm_names::compiles_external_core_instances(tcx);
+    let needs_compiled_primitive_operator = uses_runtime_implementation
         && matches!(
             lower1::jvm_names::owner_class_for_function(tcx, instance.def_id()).as_str(),
             "org/rustlang/core/ops/arith" | "org/rustlang/core/ops/bit"
         );
-    if is_external_runtime_item && !needs_compiled_primitive_operator {
+    if uses_runtime_implementation && !needs_compiled_primitive_operator {
         breadcrumbs::log!(
             breadcrumbs::LogLevel::Info,
             "mono-lowering",

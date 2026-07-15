@@ -12,7 +12,7 @@ use crate::oomir;
 use rustc_middle::{
     mir::{
         BasicBlock, BasicBlockData, Body, Local, NonDivergingIntrinsic, Operand as MirOperand,
-        Place, StatementKind, TerminatorKind,
+        Place, SourceInfo, StatementKind, TerminatorKind,
     },
     ty::{EarlyBinder, Instance, InstanceKind, ShimKind, Ty, TyCtxt, TyKind, TypingEnv},
 };
@@ -26,6 +26,47 @@ pub(crate) mod rvalue;
 mod trait_objects;
 
 pub use checked_intrinsic_registry::take_needed_intrinsics;
+
+fn caller_location_operand<'tcx>(
+    source_info: SourceInfo,
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
+    mir: &Body<'tcx>,
+    data_types: &mut HashMap<String, oomir::DataType>,
+    instructions: &mut Vec<oomir::Instruction>,
+    temp_prefix: &str,
+) -> oomir::Operand {
+    let location_ty = tcx.caller_location_ty();
+    let location_oomir_ty = super::types::ty_to_oomir_type(location_ty, tcx, data_types, instance);
+    let inherited_location =
+        instance
+            .def
+            .requires_caller_location(tcx)
+            .then(|| oomir::Operand::Variable {
+                name: oomir::CALLER_LOCATION_PARAM_NAME.to_string(),
+                ty: location_oomir_ty,
+            });
+
+    mir.caller_location_span(source_info, inherited_location, tcx, |span| {
+        let raw_location = super::operand::handle_const_value(
+            None,
+            tcx.span_as_caller_location(span),
+            &location_ty,
+            tcx,
+            data_types,
+            instance,
+        );
+        super::value_repr::adapt_operand_to_rust_type(
+            raw_location,
+            location_ty,
+            temp_prefix,
+            tcx,
+            instance,
+            data_types,
+            instructions,
+        )
+    })
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct PointerOrigin<'tcx> {
@@ -1088,13 +1129,13 @@ pub(super) fn convert_basic_block<'tcx>(
                     .skip_norm_wip();
                 if let rustc_middle::ty::TyKind::FnDef(def_id, substs) = func_ty.kind() {
                     // Resolve the instance
-                    let func_instance = rustc_middle::ty::Instance::resolve_for_fn_ptr(
+                    let func_instance = rustc_middle::ty::Instance::expect_resolve(
                         tcx,
                         typing_env,
                         *def_id,
                         substs.no_bound_vars().unwrap(),
-                    )
-                    .unwrap();
+                        terminator.source_info.span,
+                    );
 
                     let instance_ty = func_instance.ty(tcx, typing_env);
                     let (fn_inputs, fn_output) = match instance_ty.kind() {
@@ -1153,6 +1194,25 @@ pub(super) fn convert_basic_block<'tcx>(
                         ret: Box::new(oomir_output_type.clone()),
                         is_static: false,
                     };
+
+                    if func_instance.def.requires_caller_location(tcx) {
+                        let location = caller_location_operand(
+                            terminator.source_info,
+                            tcx,
+                            instance,
+                            mir,
+                            data_types,
+                            &mut instructions,
+                            &format!("{label}_caller_location"),
+                        );
+                        let location_ty = location
+                            .get_type()
+                            .expect("caller location operand must have a JVM type");
+                        method_signature
+                            .params
+                            .push((oomir::CALLER_LOCATION_PARAM_NAME.to_string(), location_ty));
+                        oomir_operands.push(location);
+                    }
 
                     let assoc_item = tcx.opt_associated_item(func_instance.def_id());
 
@@ -2625,7 +2685,24 @@ pub(super) fn convert_basic_block<'tcx>(
                         let is_size_of_val = (is_compiler_intrinsic
                             && intrinsic_name.as_str() == "size_of_val")
                             || has_diagnostic_item("mem_size_of_val");
-                        if (is_size_of || is_align_of)
+                        if intrinsic_name.as_str() == "caller_location"
+                            && is_compiler_intrinsic
+                            && let Some(dest) = effective_dest.clone()
+                        {
+                            let location = caller_location_operand(
+                                terminator.source_info,
+                                tcx,
+                                instance,
+                                mir,
+                                data_types,
+                                &mut instructions,
+                                &format!("{label}_caller_location_intrinsic"),
+                            );
+                            instructions.push(oomir::Instruction::Move {
+                                dest,
+                                src: location,
+                            });
+                        } else if (is_size_of || is_align_of)
                             && let Some(dest) = effective_dest.clone()
                         {
                             let measured_ty = func_instance
