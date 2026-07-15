@@ -3910,11 +3910,11 @@ pub(super) fn convert_basic_block<'tcx>(
 
                 let destination_ty = destination.ty(&mir.local_decls, tcx).ty;
                 if destination.projection.is_empty()
-                    && matches!(
-                        destination_ty.kind(),
-                        TyKind::Ref(_, _, mutability) if mutability.is_mut()
-                    )
+                    && let TyKind::Ref(_, referent_ty, mutability) = destination_ty.kind()
+                    && mutability.is_mut()
                 {
+                    let destination_pointee =
+                        super::types::ty_to_oomir_type(*referent_ty, tcx, data_types, instance);
                     let aliases = args
                         .iter()
                         .filter_map(|arg| match &arg.node {
@@ -3926,7 +3926,17 @@ pub(super) fn convert_basic_block<'tcx>(
                             _ => None,
                         })
                         .collect::<Vec<_>>();
-                    if let [alias] = aliases.as_slice() {
+                    // Only treat the returned reference as aliasing the argument's
+                    // borrowed place when it views that place at the *same* type.
+                    // Wrapper accessors such as `MaybeDangling::as_mut` or
+                    // `ManuallyDrop::deref_mut` return a reference to an inner
+                    // transparent-wrapper field whose pointee type is deeper than
+                    // the argument's; inheriting the argument's origin verbatim
+                    // would emit a write-back that reads the inner view under the
+                    // wrong (outer) type and fails at runtime with a ClassCastException.
+                    if let [alias] = aliases.as_slice()
+                        && alias.pointee_type == destination_pointee
+                    {
                         mutable_borrow_arrays.insert(
                             destination.local,
                             PointerOrigin {
