@@ -284,8 +284,10 @@ fn lower_mono_function<'tcx>(
     let is_external_runtime_item = !instance.def_id().is_local()
         && lower1::jvm_names::is_runtime_crate(tcx, instance.def_id().krate);
     let needs_compiled_primitive_operator = is_external_runtime_item
-        && lower1::jvm_names::owner_class_for_function(tcx, instance.def_id())
-            == "org/rustlang/core/ops/arith";
+        && matches!(
+            lower1::jvm_names::owner_class_for_function(tcx, instance.def_id()).as_str(),
+            "org/rustlang/core/ops/arith" | "org/rustlang/core/ops/bit"
+        );
     if is_external_runtime_item && !needs_compiled_primitive_operator {
         breadcrumbs::log!(
             breadcrumbs::LogLevel::Info,

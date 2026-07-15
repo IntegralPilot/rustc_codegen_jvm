@@ -251,6 +251,108 @@ fn runtime_pointer_width() {
     assert!((address as u64) > u32::MAX as u64, "pointer to u64 preserves high bits");
 }
 
+#[inline(never)]
+fn add_refs(x: &i32, y: &i32) -> i32 {
+    x + y
+}
+
+macro_rules! assert_forwarded_ref_binop {
+    ($left:expr, $right:expr, $op:tt, $expected:expr, $name:literal) => {
+        assert!(
+            ($left) $op &($right) == $expected,
+            concat!($name, ": value op &value")
+        );
+        assert!(
+            &($left) $op ($right) == $expected,
+            concat!($name, ": &value op value")
+        );
+        assert!(
+            &($left) $op &($right) == $expected,
+            concat!($name, ": &value op &value")
+        );
+    };
+}
+
+fn forwarded_reference_ops() {
+    let a = opaque_i32(20);
+    let b = opaque_i32(5);
+
+    // Keep the original regression behind a function boundary so the operands
+    // remain JVM pointers and cannot be folded into an owned-value operation.
+    assert!(add_refs(&a, &b) == 25, "add_refs(&i32, &i32)");
+
+    // core forwards all three owned/reference combinations for primitive
+    // binary operators. Exercise every forwarded integer operator here.
+    assert_forwarded_ref_binop!(a, b, +, 25, "reference add");
+    assert_forwarded_ref_binop!(a, b, -, 15, "reference sub");
+    assert_forwarded_ref_binop!(a, b, *, 100, "reference mul");
+    assert_forwarded_ref_binop!(a, b, /, 4, "reference div");
+    assert_forwarded_ref_binop!(a, b, %, 0, "reference rem");
+    assert_forwarded_ref_binop!(a, b, &, 4, "reference bitand");
+    assert_forwarded_ref_binop!(a, b, |, 21, "reference bitor");
+    assert_forwarded_ref_binop!(a, b, ^, 17, "reference bitxor");
+
+    let shift = opaque_u32(2);
+    assert_forwarded_ref_binop!(a, shift, <<, 80, "reference shl");
+    assert_forwarded_ref_binop!(a, shift, >>, 5, "reference shr");
+    assert!(-&a == -20, "reference neg");
+    assert!(!&a == !20, "reference not");
+
+    // Assignment operators have a separate core forwarding macro: T op= &T.
+    let mut assigned = opaque_i32(20);
+    assigned += &b;
+    assert!(assigned == 25, "reference add_assign");
+    assigned -= &b;
+    assert!(assigned == 20, "reference sub_assign");
+    assigned *= &b;
+    assert!(assigned == 100, "reference mul_assign");
+    assigned /= &b;
+    assert!(assigned == 20, "reference div_assign");
+    assigned %= &b;
+    assert!(assigned == 0, "reference rem_assign");
+
+    assigned = opaque_i32(20);
+    assigned &= &b;
+    assert!(assigned == 4, "reference bitand_assign");
+    assigned |= &b;
+    assert!(assigned == 5, "reference bitor_assign");
+    assigned ^= &b;
+    assert!(assigned == 0, "reference bitxor_assign");
+    assigned = opaque_i32(20);
+    assigned <<= &shift;
+    assert!(assigned == 80, "reference shl_assign");
+    assigned >>= &shift;
+    assert!(assigned == 20, "reference shr_assign");
+
+    // Cover the other JVM value representations used by primitive operators.
+    let wide_a = opaque_i128(1_i128 << 100);
+    let wide_b = opaque_i128(7);
+    assert!(&wide_a + &wide_b == (1_i128 << 100) + 7, "i128 reference add");
+
+    let float_a = opaque_f64(10.0);
+    let float_b = opaque_f64(4.0);
+    assert_forwarded_ref_binop!(float_a, float_b, +, 14.0, "f64 reference add");
+    assert_forwarded_ref_binop!(float_a, float_b, -, 6.0, "f64 reference sub");
+    assert_forwarded_ref_binop!(float_a, float_b, *, 40.0, "f64 reference mul");
+    assert_forwarded_ref_binop!(float_a, float_b, /, 2.5, "f64 reference div");
+    assert_forwarded_ref_binop!(float_a, float_b, %, 2.0, "f64 reference rem");
+    assert!(-&float_a == -10.0, "f64 reference neg");
+
+    let quad_a = opaque_f128(10.0f128);
+    let quad_b = opaque_f128(4.0f128);
+    assert!(&quad_a + &quad_b == 14.0f128, "f128 reference add");
+
+    // Reference comparisons compare pointees, not JVM pointer identity.
+    let same_as_a = opaque_i32(20);
+    assert!(&a == &same_as_a, "reference value equality");
+    assert!(!core::ptr::eq(&a, &same_as_a), "distinct reference identity");
+    assert!(&a != &b, "reference inequality");
+    assert!(&b < &a, "reference less than");
+    assert!(&b <= &a, "reference less than or equal");
+    assert!(&a > &b, "reference greater than");
+    assert!(&a >= &b, "reference greater than or equal");
+}
+
 macro_rules! assert_f128_bits {
     ($value:expr, $expected:expr, $message:literal $(,)?) => {
         assert!($value.to_bits() == $expected, $message);
@@ -280,6 +382,7 @@ fn main() {
     runtime_float_ops();
     runtime_casts();
     runtime_pointer_width();
+    forwarded_reference_ops();
 
     assert!(sparse_switch(-1000) == 10, "sparse switch negative case");
     assert!(sparse_switch(0) == 20, "sparse switch zero case");

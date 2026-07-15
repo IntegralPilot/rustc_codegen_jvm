@@ -597,15 +597,44 @@ fn requires_compiled_static_dispatch(ty: &oomir::Type) -> bool {
         )
 }
 
-fn supports_direct_equality(ty: &oomir::Type) -> bool {
-    if let oomir::Type::MutableReference(inner)
-    | oomir::Type::Reference(inner)
-    | oomir::Type::Pointer(inner) = ty
-    {
-        return supports_direct_equality(inner);
+fn comparison_value_type<'tcx>(mut ty: oomir::Type, mut mir_ty: Ty<'tcx>) -> oomir::Type {
+    while let TyKind::Ref(_, pointee, _) = mir_ty.kind() {
+        let oomir::Type::Pointer(inner) = ty else {
+            break;
+        };
+        ty = *inner;
+        mir_ty = *pointee;
     }
+    ty
+}
+
+fn emit_comparison_value<'tcx>(
+    mut operand: oomir::Operand,
+    mut mir_ty: Ty<'tcx>,
+    dest_prefix: &str,
+    instructions: &mut Vec<oomir::Instruction>,
+) -> oomir::Operand {
+    let mut depth = 0;
+    while let TyKind::Ref(_, pointee, _) = mir_ty.kind() {
+        let Some(oomir::Type::Pointer(inner)) = operand.get_type() else {
+            break;
+        };
+        operand = emit_pointer_read(
+            operand,
+            inner.as_ref(),
+            &format!("{dest_prefix}_{depth}"),
+            instructions,
+        );
+        mir_ty = *pointee;
+        depth += 1;
+    }
+    operand
+}
+
+fn supports_direct_equality(ty: &oomir::Type) -> bool {
     matches!(ty, oomir::Type::Unit)
         || ty.is_jvm_primitive_like()
+        || matches!(ty, oomir::Type::Pointer(_))
         || matches!(
             ty,
             oomir::Type::Class(class_name)
@@ -615,6 +644,19 @@ fn supports_direct_equality(ty: &oomir::Type) -> bool {
                     || class_name == crate::lower2::F128_CLASS
         )
         || matches!(ty, oomir::Type::Str | oomir::Type::String)
+}
+
+fn supports_direct_ordering(ty: &oomir::Type) -> bool {
+    ty.is_jvm_primitive_like()
+        || matches!(ty, oomir::Type::Pointer(_))
+        || matches!(
+            ty,
+            oomir::Type::Class(class_name)
+                if class_name == crate::lower2::BIG_INTEGER_CLASS
+                    || class_name == crate::lower2::I128_CLASS
+                    || class_name == crate::lower2::U128_CLASS
+                    || class_name == crate::lower2::F128_CLASS
+        )
 }
 
 /// Convert a single MIR basic block into an OOMIR basic block.
@@ -1225,10 +1267,20 @@ pub(super) fn convert_basic_block<'tcx>(
                                     func_instance.def_id(),
                                 ) || tcx
                                     .is_diagnostic_item(sym::ptr_is_null, func_instance.def_id());
+                                let comparison_value_ty = comparison_value_type(
+                                    dispatch_receiver_ty.clone(),
+                                    resolved_receiver_mir_ty,
+                                );
                                 let direct_equality =
                                     matches!(declared_method_name.as_str(), "eq" | "ne")
-                                        && supports_direct_equality(&dispatch_receiver_ty)
+                                        && supports_direct_equality(&comparison_value_ty)
                                         && oomir_operands.len() == 2;
+                                let direct_ordering = matches!(
+                                    declared_method_name.as_str(),
+                                    "lt" | "le" | "gt" | "ge"
+                                ) && supports_direct_ordering(
+                                    &comparison_value_ty,
+                                ) && oomir_operands.len() == 2;
 
                                 let direct_wrapping_integer_op = matches!(
                                     declared_method_name.as_str(),
@@ -1339,38 +1391,101 @@ pub(super) fn convert_basic_block<'tcx>(
                                         };
                                         instructions.push(instruction);
                                     }
-                                } else if direct_equality {
+                                } else if direct_equality || direct_ordering {
                                     if let Some(dest) = effective_dest {
-                                        let mut left = oomir_operands[0].clone();
-                                        let mut right = oomir_operands[1].clone();
-                                        if let oomir::Type::Pointer(inner) = &dispatch_receiver_ty {
-                                            left = super::place::emit_pointer_read(
-                                                left,
-                                                inner,
-                                                &format!("{}_eq_left", label),
-                                                &mut instructions,
-                                            );
-                                            right = super::place::emit_pointer_read(
-                                                right,
-                                                inner,
-                                                &format!("{}_eq_right", label),
-                                                &mut instructions,
-                                            );
-                                        }
-                                        let instruction = if declared_method_name == "eq" {
-                                            oomir::Instruction::Eq {
-                                                dest,
-                                                op1: left,
-                                                op2: right,
+                                        let left = emit_comparison_value(
+                                            oomir_operands[0].clone(),
+                                            fn_inputs[0],
+                                            &format!("{label}_comparison_left"),
+                                            &mut instructions,
+                                        );
+                                        let right = emit_comparison_value(
+                                            oomir_operands[1].clone(),
+                                            fn_inputs[1],
+                                            &format!("{label}_comparison_right"),
+                                            &mut instructions,
+                                        );
+                                        if matches!(left.get_type(), Some(oomir::Type::Pointer(_)))
+                                        {
+                                            let pointer_result = if declared_method_name == "ne" {
+                                                format!("{dest}_pointer_eq")
+                                            } else {
+                                                dest.clone()
+                                            };
+                                            let method_name = match declared_method_name.as_str() {
+                                                "eq" | "ne" => "sameAddress",
+                                                "lt" => "lessThan",
+                                                "le" => "lessOrEqual",
+                                                "gt" => "greaterThan",
+                                                "ge" => "greaterOrEqual",
+                                                _ => unreachable!(),
+                                            };
+                                            instructions.push(oomir::Instruction::InvokeVirtual {
+                                                dest: Some(pointer_result.clone()),
+                                                class_name: oomir::POINTER_CLASS.to_string(),
+                                                method_name: method_name.to_string(),
+                                                method_ty: oomir::Signature {
+                                                    params: vec![
+                                                        (
+                                                            "self".to_string(),
+                                                            left.get_type().unwrap(),
+                                                        ),
+                                                        (
+                                                            "other".to_string(),
+                                                            right.get_type().unwrap(),
+                                                        ),
+                                                    ],
+                                                    ret: Box::new(oomir::Type::Boolean),
+                                                    is_static: false,
+                                                },
+                                                args: vec![right],
+                                                operand: left,
+                                            });
+                                            if declared_method_name == "ne" {
+                                                instructions.push(oomir::Instruction::Not {
+                                                    dest,
+                                                    src: oomir::Operand::Variable {
+                                                        name: pointer_result,
+                                                        ty: oomir::Type::Boolean,
+                                                    },
+                                                });
                                             }
                                         } else {
-                                            oomir::Instruction::Ne {
-                                                dest,
-                                                op1: left,
-                                                op2: right,
-                                            }
-                                        };
-                                        instructions.push(instruction);
+                                            let instruction = match declared_method_name.as_str() {
+                                                "eq" => oomir::Instruction::Eq {
+                                                    dest,
+                                                    op1: left,
+                                                    op2: right,
+                                                },
+                                                "ne" => oomir::Instruction::Ne {
+                                                    dest,
+                                                    op1: left,
+                                                    op2: right,
+                                                },
+                                                "lt" => oomir::Instruction::Lt {
+                                                    dest,
+                                                    op1: left,
+                                                    op2: right,
+                                                },
+                                                "le" => oomir::Instruction::Le {
+                                                    dest,
+                                                    op1: left,
+                                                    op2: right,
+                                                },
+                                                "gt" => oomir::Instruction::Gt {
+                                                    dest,
+                                                    op1: left,
+                                                    op2: right,
+                                                },
+                                                "ge" => oomir::Instruction::Ge {
+                                                    dest,
+                                                    op1: left,
+                                                    op2: right,
+                                                },
+                                                _ => unreachable!(),
+                                            };
+                                            instructions.push(instruction);
+                                        }
                                     }
                                 } else if matches!(
                                     &dispatch_receiver_ty,
@@ -2174,35 +2289,36 @@ pub(super) fn convert_basic_block<'tcx>(
                                             ))
                                         }
                                         oomir::Type::Pointer(_)
-                                            if is_pointer_cast_method
-                                                || is_pointer_null_method
-                                                || matches!(
-                                                    method_name.as_str(),
-                                                    "add"
-                                                        | "sub"
-                                                        | "offset"
-                                                        | "offset_from"
-                                                        | "offsetFrom"
-                                                        | "offset_from_unsigned"
-                                                        | "byte_offset_from"
-                                                        | "byte_offset_from_unsigned"
-                                                        | "wrapping_add"
-                                                        | "wrapping_sub"
-                                                        | "wrapping_offset"
-                                                        | "byte_add"
-                                                        | "byte_sub"
-                                                        | "byte_offset"
-                                                        | "wrapping_byte_add"
-                                                        | "wrapping_byte_sub"
-                                                        | "wrapping_byte_offset"
-                                                        | "align_offset"
-                                                        | "is_aligned_to"
-                                                        | "addr"
-                                                        | "expose_provenance"
-                                                        | "with_addr"
-                                                        | "map_addr"
-                                                        | "with_metadata_of"
-                                                ) =>
+                                            if pointer_api_receiver
+                                                && (is_pointer_cast_method
+                                                    || is_pointer_null_method
+                                                    || matches!(
+                                                        method_name.as_str(),
+                                                        "add"
+                                                            | "sub"
+                                                            | "offset"
+                                                            | "offset_from"
+                                                            | "offsetFrom"
+                                                            | "offset_from_unsigned"
+                                                            | "byte_offset_from"
+                                                            | "byte_offset_from_unsigned"
+                                                            | "wrapping_add"
+                                                            | "wrapping_sub"
+                                                            | "wrapping_offset"
+                                                            | "byte_add"
+                                                            | "byte_sub"
+                                                            | "byte_offset"
+                                                            | "wrapping_byte_add"
+                                                            | "wrapping_byte_sub"
+                                                            | "wrapping_byte_offset"
+                                                            | "align_offset"
+                                                            | "is_aligned_to"
+                                                            | "addr"
+                                                            | "expose_provenance"
+                                                            | "with_addr"
+                                                            | "map_addr"
+                                                            | "with_metadata_of"
+                                                    )) =>
                                         {
                                             Some((
                                                 oomir::POINTER_CLASS.to_string(),
