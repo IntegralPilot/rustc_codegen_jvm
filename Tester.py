@@ -62,8 +62,10 @@ def check_results(proc, test: TestCase, release: bool, logs: list[str]) -> bool:
     if not expected_path.exists():
         return True
 
-    expected = "".join(read(expected_path).strip().split())
-    actual = "".join(f"STDOUT:{proc.stdout.strip()}STDERR:{proc.stderr.strip()}".split())
+    # so it works on Windows
+    expected = "".join(read(expected_path).strip().split()).replace("\\", "/")
+    actual = "".join(f"STDOUT:{proc.stdout.strip()}STDERR:{proc.stderr.strip()}".split()).replace("\\", "/")
+    
     if actual == expected:
         logs.append("|--- ✅ Output matches expected output!")
         return True
@@ -77,7 +79,6 @@ def check_results(proc, test: TestCase, release: bool, logs: list[str]) -> bool:
     logs.append("|---- ❌ java output did not match expected output")
     ci_diagnostic(logs, diff)
     return False
-
 
 def run_java(test: TestCase, jar: Path, release: bool, logs: list[str]) -> bool:
     if test.kind != "integration":

@@ -6,7 +6,7 @@
 [![CI](https://github.com/IntegralPilot/rustc_codegen_jvm/actions/workflows/ci.yml/badge.svg)](https://github.com/IntegralPilot/rustc_codegen_jvm/actions)
 [![Rust: Nightly](https://img.shields.io/badge/Rust-Nightly-orange.svg)](https://rustup.rs/)
 
-Compile your Rust code into a self-contained, runnable `.jar` compatible with JVM 8+. This backend transparently compiles Rust constructs to Java classes and interfaces, enabling rich interop between JVM and Rust code at a level mostly unreachable by FFI solutions. It supports some complicated features that are tricky on the JVM, including **[raw pointers](tests/binary/raw_ptrs/src/main.rs)** and **[unions](tests/binary/raw_ptrs/src/main.rs)**.
+Compile your Rust code into a self-contained, runnable `.jar` compatible with JVM 8+. This backend transparently compiles Rust constructs to Java classes and interfaces, enabling rich interop between JVM and Rust code at a level mostly unreachable by FFI solutions. It supports some complicated features that are tricky on the JVM, including **[raw pointers and complex pointer arithmetic](tests/binary/raw_ptrs/src/main.rs)** and **[unions](tests/binary/raw_ptrs/src/main.rs)**.
 
 Looking ahead, it is envisioned that with further work this backend could benefit any Rust project, not just those requiring JVM integration. By leveraging this backend and the JVM's robust debugging tools and hot-swapping capabilities, Rust developers could iterate quickly during local development to avoid the compile-time bottlenecks of the native toolchain, before compiling to a native binary for release.
 
