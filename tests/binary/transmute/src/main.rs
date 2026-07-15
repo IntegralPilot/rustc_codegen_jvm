@@ -1,3 +1,9 @@
+#![no_std]
+#![feature(lang_items)]
+#![allow(internal_features)]
+
+include!("../../../support/test_prelude.rs");
+
 use core::mem::{size_of, transmute};
 
 #[repr(u8)]

@@ -5,7 +5,7 @@ use rustc_abi::{FieldIdx, TagEncoding, VariantIdx, Variants};
 use rustc_middle::ty::layout::TyAndLayout;
 use rustc_middle::ty::print::{with_no_trimmed_paths, with_resolve_crate_name};
 use rustc_middle::ty::{
-    AdtDef, ExistentialPredicate, FloatTy, GenericArgsRef, IntTy, Ty, TyCtxt, TyKind,
+    AdtDef, EarlyBinder, ExistentialPredicate, FloatTy, GenericArgsRef, IntTy, Ty, TyCtxt, TyKind,
     TypeVisitableExt, TypingEnv, UintTy,
 };
 use rustc_span::def_id::DefId;
@@ -3952,6 +3952,10 @@ pub fn readable_rust_type_name<'tcx>(
     data_types: &mut HashMap<String, oomir::DataType>,
     instance_context: rustc_middle::ty::Instance<'tcx>,
 ) -> String {
+    let instantiated = EarlyBinder::bind(tcx, ty).instantiate(tcx, instance_context.args);
+    let ty = tcx
+        .try_normalize_erasing_regions(TypingEnv::fully_monomorphized(), instantiated)
+        .unwrap_or_else(|_| instantiated.skip_norm_wip());
     match ty.kind() {
         TyKind::Ref(_, inner, mutability) => format!(
             "{}{}",

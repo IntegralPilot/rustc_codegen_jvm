@@ -1,3 +1,9 @@
+#![no_std]
+#![feature(lang_items)]
+#![allow(internal_features)]
+
+include!("../../../support/test_prelude.rs");
+
 pub struct Ciallo {
     pub count: i32,
     pub desc: &'static str,

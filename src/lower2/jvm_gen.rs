@@ -390,6 +390,60 @@ pub(super) fn create_slice_view_classfile() -> jvm::Result<Vec<u8>> {
         )?],
     };
 
+    // Byte slices may be backed either directly by a JVM byte array or by a
+    // runtime Pointer carrying a codec (notably `[MaybeUninit<u8>]` during
+    // optimised UTF-8 construction). Pointer.sliceGetI8 handles both forms.
+    let pointer_class = cp.add_class(oomir::POINTER_CLASS)?;
+    let slice_get_i8 = cp.add_method_ref(pointer_class, "sliceGetI8", "(Ljava/lang/Object;I)B")?;
+    let starts_with_i8 = jvm::Method {
+        access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
+        name_index: cp.add_utf8("startsWithI8")?,
+        descriptor_index: cp.add_utf8(&starts_with_descriptor)?,
+        attributes: vec![code_attribute_for_descriptor(
+            &mut cp,
+            4,
+            3,
+            vec![
+                Instruction::Aload_1,
+                Instruction::Getfield(length_field),
+                Instruction::Aload_0,
+                Instruction::Getfield(length_field),
+                Instruction::If_icmpgt(30),
+                Instruction::Iconst_0,
+                Instruction::Istore_2,
+                Instruction::Iload_2,
+                Instruction::Aload_1,
+                Instruction::Getfield(length_field),
+                Instruction::If_icmpge(28),
+                Instruction::Aload_0,
+                Instruction::Getfield(array_field),
+                Instruction::Aload_0,
+                Instruction::Getfield(offset_field),
+                Instruction::Iload_2,
+                Instruction::Iadd,
+                Instruction::Invokestatic(slice_get_i8),
+                Instruction::Aload_1,
+                Instruction::Getfield(array_field),
+                Instruction::Aload_1,
+                Instruction::Getfield(offset_field),
+                Instruction::Iload_2,
+                Instruction::Iadd,
+                Instruction::Invokestatic(slice_get_i8),
+                Instruction::If_icmpne(30),
+                Instruction::Iinc(2, 1),
+                Instruction::Goto(7),
+                Instruction::Iconst_1,
+                Instruction::Ireturn,
+                Instruction::Iconst_0,
+                Instruction::Ireturn,
+            ],
+            &starts_with_descriptor,
+            true,
+            Some(oomir::SLICE_VIEW_CLASS),
+            "startsWithI8",
+        )?],
+    };
+
     let fields = vec![
         jvm::Field {
             access_flags: FieldAccessFlags::PUBLIC | FieldAccessFlags::FINAL,
@@ -430,6 +484,7 @@ pub(super) fn create_slice_view_classfile() -> jvm::Result<Vec<u8>> {
             to_utf8_string,
             encode_utf8,
             starts_with,
+            starts_with_i8,
         ],
         attributes: Vec::new(),
     };

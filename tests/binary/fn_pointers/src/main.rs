@@ -1,3 +1,9 @@
+#![no_std]
+#![feature(lang_items)]
+#![allow(internal_features)]
+
+include!("../../../support/test_prelude.rs");
+
 #[derive(Copy, Clone)]
 enum ComputeStep<T> {
     Unary(fn(T) -> T),
@@ -112,7 +118,7 @@ fn skew(a: i32, b: i32) -> i32 {
     a * 3 - b
 }
 
-type ErasedFormatter = unsafe fn(std::ptr::NonNull<()>, &mut i32) -> i32;
+type ErasedFormatter = unsafe fn(core::ptr::NonNull<()>, &mut i32) -> i32;
 
 #[derive(Copy, Clone)]
 struct FormatRecord {
@@ -146,7 +152,7 @@ fn format_str(value: &&str, state: &mut i32) -> i32 {
 
 fn call_erased<T>(value: &T, formatter: fn(&T, &mut i32) -> i32, initial: i32) -> i32 {
     let erased: ErasedFormatter = unsafe { core::mem::transmute(formatter) };
-    let pointer: std::ptr::NonNull<()> = unsafe { core::mem::transmute(value) };
+    let pointer: core::ptr::NonNull<()> = unsafe { core::mem::transmute(value) };
     let mut state = initial;
     unsafe { erased(pointer, &mut state) }
 }
@@ -271,7 +277,7 @@ fn main() {
     let fn_ptr: fn() = dummy;
     let raw_addr = fn_ptr as *const ();
     assert!(!raw_addr.is_null());
-    let back_again: fn() = unsafe { std::mem::transmute(raw_addr) };
+    let back_again: fn() = unsafe { core::mem::transmute(raw_addr) };
     back_again();
 
     // Credit from this point on: AnuthaDev

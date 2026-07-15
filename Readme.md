@@ -6,11 +6,11 @@
 [![CI](https://github.com/IntegralPilot/rustc_codegen_jvm/actions/workflows/ci.yml/badge.svg)](https://github.com/IntegralPilot/rustc_codegen_jvm/actions)
 [![Rust: Nightly](https://img.shields.io/badge/Rust-Nightly-orange.svg)](https://rustup.rs/)
 
-Compile your Rust code into a self-contained, runnable `.jar` compatible with JVM 8+. This backend transparently compiles Rust constructs to Java classes and interfaces, enabling rich interop between JVM and Rust code at a level mostly unreachable by FFI solutions. 
+Compile your Rust code into a self-contained, runnable `.jar` compatible with JVM 8+. This backend transparently compiles Rust constructs to Java classes and interfaces, enabling rich interop between JVM and Rust code at a level mostly unreachable by FFI solutions. It supports some complicated features that are tricky on the JVM, including **[raw pointers](tests/binary/raw_ptrs/src/main.rs)** and **[unions](tests/binary/raw_ptrs/src/main.rs)**.
 
-Looking ahead, it is envisioned that with further work this backend could benefit any Rust project, not just those requiring JVM integration. In future, by leveraging this backend and the JVM's robust debugging tools and hot-swapping capabilities, Rust developers could iterate quickly during local development to avoid the compile-time bottlenecks of the native toolchain, before compiling to a native binary for release.
+Looking ahead, it is envisioned that with further work this backend could benefit any Rust project, not just those requiring JVM integration. By leveraging this backend and the JVM's robust debugging tools and hot-swapping capabilities, Rust developers could iterate quickly during local development to avoid the compile-time bottlenecks of the native toolchain, before compiling to a native binary for release.
 
-It should be noted that this project is still in an early-to-mid stage of development, but is supporting more of the Rust language as time goes on! The eventual goal is a potential upstreaming with main `rustc`, though that is definently a while away!
+It should be noted that this project is still in an early-to-mid stage of development, but is supporting more of the Rust language as time goes on. The eventual goal is a potential upstreaming with main `rustc`, though that is definently a while away!
 
 **I am so grateful for any stars and support!**
 
@@ -22,14 +22,17 @@ Rust enums, generics, function pointers, unions and other supported constructs m
 
 ### It's fast for debugging, a known problem with native Rust
 
-Fresh compilation for most small test crates takes **under 1 second**, making the backend practical for rapid experimentation compared to native compilation. Due to the rich hot reload and debugging ecosystem of the JVM, my vision is that this project can in future make rapidly iterating on Rust code (which is a known drawback of Rust) fast and enjoyable. Though there is still lots of work to be done on both making this compiler faster, and making it easy for Rust code to tap into that ecosystem!
+Once the shared `core` artifacts are warm, compilation for most small test crates is fast, making the backend practical for rapid experimentation compared to native compilation. Due to the rich hot reload and debugging ecosystem of the JVM, my vision is that this project can in future make rapidly iterating on Rust code (which is a known drawback of Rust) fast and enjoyable. Though there is still lots of work to be done on both making this compiler faster, and making it easy for Rust code to tap into that ecosystem!
+
+### It can with help re-writing JVM projects in Rust
+
+So much of the modern internet runs on a JVM stack. If a company (or open-source project) wants to switch a project to native Rust for the runtime speed and energy benefits, they can't just do it overnight. `rustc_codegen_jvm`, with its rich interop, enables ergonomic gradual re-writing where the project can still target the JVM while increasing the share of Rust code, and decreasing the share of other code. Then, when the re-write is complete, the Rust code can compile to native to get the runtime speed boost, and the developers might continue using the JVM target for fast debugging/iteration or legacy compatibility purposes.
 
 ### Code runs anywhere a JVM runs
 
 Because the output is standard bytecode rather than a native binary, your Rust code can target environments where native FFI solutions like Panama are difficult or unavailable, including **sandboxed environments like Minecraft mod loaders** and **Android** (if you convert to DEX files).
 
-Future visions for the project include it being able to help you leverage the JVM's safety to debug undefined behaviour, like [Miri](https://github.com/rust-lang/miri/) but faster because of the JVM's JIT.
- 
+Future visions for the project include it being able to help you leverage the JVM's safety to debug undefined behaviour, like [Miri](https://github.com/rust-lang/miri/) but faster because of the JVM's JIT. Particually with raw pointers, in some cases of UB you will already get a nice Java exception with full traceback saying where it happened, but there is still a lot more to do in this area.
 
 ## Table of Contents
 1. [Demos](#demos)
@@ -47,7 +50,7 @@ Future visions for the project include it being able to help you leverage the JV
 
 ## Demos
 
-These examples live in `tests/binary`, are compiled to JVM bytecode, and are verified on every CI run as part of the integration test suite. Most small examples cold-compile and run in **under 1 second** - verify it yourself with `Instrument.py`.
+These examples live in `tests/binary`, are compiled with upstream Rust `core` to JVM bytecode, and are verified on every CI run as part of the integration test suite. Use `Instrument.py` to inspect compilation timings.
 
 | Example | Demonstrates |
 |---|---|
@@ -81,9 +84,9 @@ These examples live in `tests/binary`, are compiled to JVM bytecode, and are ver
 - **Outputs** executable, self-contained `.jar` generation for binary crates.
 - **Testing** with integration coverage across debug and release modes for all of the above.
 
-Full support for compiling the entire `core` and `compiler_builtins` crates from scratch for `jvm-unknown-unknown` was recently implemented and is currently demonstrated by the **[`collatz` testcase](tests/binary/collatz/src/main.rs)** and the **[`panic` testcase](tests/binary/panic/src/main.rs)**.
+Every test crate is compiled from scratch for `jvm-unknown-unknown` alongside upstream Rust `core` and `compiler_builtins`.
 
-The [Java library](library/) contains JVM runtime support such as pointer and 128-bit-number carriers. It does not provide a substitute implementation of Rust's `core` APIs.
+The [runtime](runtime/) contains JVM runtime support such as pointer and 128-bit-number carriers and is automatically integrated into generated jars.
 
 The next goal is to integrate the upstream `coretests` to determine miscompilations and how close we are to full language support and potential upstreaming (which would require 100% pass state).
 
@@ -106,7 +109,7 @@ graph TD
 2. **lower1** generates a custom "Object-Oriented MIR" (OOMIR) by reshaping MIR into constructs closer to the JVM's object model.
 3. **optimise1** applies constant folding, constant propagation, dead code elimination, and algebraic simplification.
 4. **lower2** translates OOMIR into `.class` files via `ristretto_classfile`, including stack map frame generation.
-5. **java-linker** bundles the `.class` files with the Java runtime support library into a self-contained, runnable `.jar` with an appropriate `META-INF/MANIFEST.MF`.
+5. **java-linker** bundles the `.class` files with the Java runtime support runtime into a self-contained, runnable `.jar` with an appropriate `META-INF/MANIFEST.MF`.
 
 ## Interop Model
 
@@ -137,9 +140,9 @@ Because output is standard JVM bytecode rather than a native binary, `rustc_code
 
 ## Prerequisites
 
-- **Rust Nightly** - `rustup default nightly`
+- **Rust Nightly** with `rustc-dev`, `rust-src`, and `llvm-tools-preview` (the checked-in `rust-toolchain.toml` selects these automatically)
 - **JDK 8+** - `java`, `javac`, and `jar` must be on `PATH`
-- **Python 3** - `python` must resolve to Python 3 (`python3` can be substituted on local Linux systems that do not provide the `python` alias)
+- **Python 3** - use `python3` on Linux/macOS or `python` on Windows
 - **Windows only:** enable [Developer Mode](https://learn.microsoft.com/windows/apps/get-started/enable-your-device-for-development) or run Git from an elevated terminal so it can create symbolic links
 
 ## Installation & Build
@@ -164,35 +167,41 @@ python build.py all
 
 This builds the following, in dependency order:
 
-- The Java runtime support library (`library/`)
+- The Java support runtime (`runtime/`)
 - The `java-linker` executable
-- The `rustc_codegen_jvm` backend library
+- The `rustc_codegen_jvm` backend runtime
 - Configuration files (`config.toml`, `jvm-unknown-unknown.json`)
 
 `build.py` checks file timestamps on subsequent runs, so only modified components are rebuilt.
 
 ## Usage
 
-1. **Configure your project**
-   In your target Rust project, create or update `.cargo/config.toml` using the template provided in the root of this repository. Your `Cargo.toml` must also enable per-profile compilation flags:
+Create a Rust project like normal.
 
-   ```toml
-   cargo-features = ["profile-rustflags"]
-   ```
+Then, copy the `config.toml` at the root of this project (generated after running the build as detailed above) into `.cargo/config.toml` of your Rust project.
 
-2. **Build with Cargo**
+JVM crates currently need to be `#![no_std]`, because we can compile upstream `core`, but `std` would require changes to upstream which can only be made once the integration of the JVM target upstream begins. 
 
-   ```bash
-   cargo build           # Debug build
-   cargo build --release # Optimised build
-   ```
+A reusable prelude has been created to deal with this. Simply prepend this to your `main.rs`, and then write the rest of the crate (including a `main` function) like you normally would (without calling any APIs that are in `std` but not `core`).
 
-3. **Run the generated JAR**
+```rust
+#![no_std]
+#![feature(lang_items)]
+#![allow(internal_features)]
 
-   ```bash
-   java -jar target/debug/deps/your_crate*.jar   # Debug build
-   java -jar target/release/deps/your_crate*.jar # Release build
-   ```
+include!("/path/to/rustc_codegen_jvm/tests/support/test_prelude.rs");
+```
+
+Then, build the project with cargo for `jvm-unknown-unknown`.
+
+```bash
+cargo build \
+  --target "/path/jvm-unknown-unknown.json" \
+  -Zjson-target-spec \
+  -Zbuild-std=core,compiler_builtins \
+```
+
+Add `--release` for an optimised build. The generated JAR is under the crate's `target/jvm-unknown-unknown/debug` or `target/jvm-unknown-unknown/release` directory and can be run with `java -jar`.
 
 ## Running Tests
 
@@ -208,11 +217,11 @@ python build.py all
 Then run the test suite:
 
 ```bash
-python Tester.py             # Debug mode
-python Tester.py --release   # Release mode
+python3 Tester.py             # Debug mode
+python3 Tester.py --release   # Release mode
 ```
 
-Results are printed to the console, and temporary test artifacts are written to `.generated/` for inspection. The runner defaults to your local CPU core count; override it with `-j` / `--jobs`.
+Results are printed to the console.
 
 ## Project structure
 
@@ -225,12 +234,19 @@ Results are printed to the console, and temporary test artifacts are written to 
 │   ├── lower2/               # OOMIR -> JVM bytecode translation
 │   └── oomir.rs              # OOMIR data definitions
 ├── java-linker/              # Bundles compiled .class files into .jar archives
-├── tests/binary/             # Integration tests and example source crates
-├── library/                  # Java runtime support classes
+├── tests/
+│   ├── binary/               # Runnable Rust test and example crates
+│   ├── integration/          # Rust libraries exercised from Java
+│   ├── multicrate/           # Tests with multiple Rust crates
+│   └── support/              # Shared no_std prelude and core cache seed crate
+├── runtime/                  # Java runtime support classes
 ├── build.py                  # Orchestrator build script
 ├── config.toml.template      # Cargo configuration template
 ├── jvm-unknown-unknown.json.template
+├── test_harness.py           # Shared target-only test build machinery
 ├── Tester.py                 # Automated test runner
+├── Investigate.py            # JAR/classfile investigation helper
+├── Instrument.py             # Compiler timing helper
 └── LICENSE, LICENSE-Apache
 ```
 

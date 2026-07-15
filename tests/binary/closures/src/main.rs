@@ -1,3 +1,9 @@
+#![no_std]
+#![feature(lang_items)]
+#![allow(internal_features)]
+
+include!("../../../support/test_prelude.rs");
+
 fn main() {
     // A simple closure that adds two numbers
     let add = |a: i32, b: i32| a + b;

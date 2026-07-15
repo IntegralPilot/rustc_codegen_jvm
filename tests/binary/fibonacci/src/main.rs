@@ -1,3 +1,9 @@
+#![no_std]
+#![feature(lang_items)]
+#![allow(internal_features)]
+
+include!("../../../support/test_prelude.rs");
+
 fn fibonacci(n: usize) -> usize {
     if n == 0 { return 0; }
     if n == 1 { return 1; }

@@ -26,20 +26,20 @@ class Config:
 
     # Subproject Directories
     JAVA_LINKER_DIR = ROOT_DIR / "java-linker"
-    LIBRARY_DIR = ROOT_DIR / "library"
+    RUNTIME_DIR = ROOT_DIR / "runtime"
 
     # Versions (centralized management)
-    LIBRARY_VERSION = "0.1.0"
+    RUNTIME_VERSION = "0.1.0"
 
     # Source File Lists (used for dependency tracking)
     # Using glob patterns for automatic discovery
-    LIBRARY_SOURCES = sorted(LIBRARY_DIR.glob("src/**/*.java"))
+    RUNTIME_SOURCES = sorted(RUNTIME_DIR.glob("src/**/*.java"))
     BACKEND_RUST_SOURCES = list(ROOT_DIR.glob("src/**/*.rs"))
     LINKER_RUST_SOURCES = list(JAVA_LINKER_DIR.glob("src/**/*.rs"))
 
     # Key Target Files
-    LIBRARY_JAR = LIBRARY_DIR / f"build/libs/library-{LIBRARY_VERSION}.jar"
-    LIBRARY_CLASSES_DIR = LIBRARY_DIR / "build/classes"
+    RUNTIME_JAR = RUNTIME_DIR / f"build/libs/runtime-{RUNTIME_VERSION}.jar"
+    RUNTIME_CLASSES_DIR = RUNTIME_DIR / "build/classes"
     CONFIG_TOML = ROOT_DIR / "config.toml"
     JVM_TARGET_JSON = ROOT_DIR / "jvm-unknown-unknown.json"
 
@@ -125,7 +125,7 @@ def clean():
     for path in [
         Config.CONFIG_TOML, 
         Config.JVM_TARGET_JSON,
-        Config.LIBRARY_DIR / "build"
+        Config.RUNTIME_DIR / "build"
     ]:
         try:
             if path.is_dir():
@@ -141,26 +141,26 @@ def install_rust_components():
     print(f"{Colors.CYAN}🔧 Installing Rust components...{Colors.RESET}")
     run_command(["rustup", "component", "add", "rustc-dev", "llvm-tools"])
 
-def build_library():
-    """Builds the Java runtime support library."""
-    if (not is_stale(Config.LIBRARY_JAR, Config.LIBRARY_SOURCES)
-            and not contains_non_runtime_classes(Config.LIBRARY_JAR)):
-        print(f"{Colors.GREEN}✅ Java runtime library is up to date.{Colors.RESET}")
+def build_runtime():
+    """Builds the Java runtime support JAR."""
+    if (not is_stale(Config.RUNTIME_JAR, Config.RUNTIME_SOURCES)
+            and not contains_non_runtime_classes(Config.RUNTIME_JAR)):
+        print(f"{Colors.GREEN}✅ Java runtime is up to date.{Colors.RESET}")
         return
 
-    if not Config.LIBRARY_SOURCES:
-        print(f"{Colors.RED}❌ No Java sources found under {Config.LIBRARY_DIR / 'src'}{Colors.RESET}")
+    if not Config.RUNTIME_SOURCES:
+        print(f"{Colors.RED}❌ No Java sources found under {Config.RUNTIME_DIR / 'src'}{Colors.RESET}")
         sys.exit(1)
 
-    print(f"{Colors.CYAN}📚 Building Java runtime library...{Colors.RESET}")
+    print(f"{Colors.CYAN}📚 Building Java runtime...{Colors.RESET}")
 
-    if Config.LIBRARY_CLASSES_DIR.exists():
-        shutil.rmtree(Config.LIBRARY_CLASSES_DIR)
-    Config.LIBRARY_CLASSES_DIR.mkdir(parents=True, exist_ok=True)
-    Config.LIBRARY_JAR.parent.mkdir(parents=True, exist_ok=True)
+    if Config.RUNTIME_CLASSES_DIR.exists():
+        shutil.rmtree(Config.RUNTIME_CLASSES_DIR)
+    Config.RUNTIME_CLASSES_DIR.mkdir(parents=True, exist_ok=True)
+    Config.RUNTIME_JAR.parent.mkdir(parents=True, exist_ok=True)
 
-    source_paths = [str(path) for path in Config.LIBRARY_SOURCES]
-    javac_base = ["javac", "-Xlint:-options", "-d", str(Config.LIBRARY_CLASSES_DIR)]
+    source_paths = [str(path) for path in Config.RUNTIME_SOURCES]
+    javac_base = ["javac", "-Xlint:-options", "-d", str(Config.RUNTIME_CLASSES_DIR)]
     proc = run_command(["javac", "--release", "8"] + javac_base[1:] + source_paths, check=False)
     if proc.returncode != 0:
         print(
@@ -171,20 +171,20 @@ def build_library():
     run_command([
         "jar",
         "cf",
-        str(Config.LIBRARY_JAR),
+        str(Config.RUNTIME_JAR),
         "-C",
-        str(Config.LIBRARY_CLASSES_DIR),
+        str(Config.RUNTIME_CLASSES_DIR),
         ".",
     ])
 
-    if not Config.LIBRARY_JAR.exists():
-        print(f"{Colors.RED}❌ Expected library JAR was not created: {Config.LIBRARY_JAR}{Colors.RESET}")
+    if not Config.RUNTIME_JAR.exists():
+        print(f"{Colors.RED}❌ Expected runtime JAR was not created: {Config.RUNTIME_JAR}{Colors.RESET}")
         sys.exit(1)
-    if contains_non_runtime_classes(Config.LIBRARY_JAR):
+    if contains_non_runtime_classes(Config.RUNTIME_JAR):
         print(f"{Colors.RED}❌ Java runtime JAR contains classes outside org.rustlang.runtime.{Colors.RESET}")
         sys.exit(1)
 
-    print(f"{Colors.GREEN}   Java runtime library built successfully.{Colors.RESET}")
+    print(f"{Colors.GREEN}   Java runtime built successfully.{Colors.RESET}")
 
 def build_rust_backend():
     """Builds the main rustc_codegen_jvm backend."""
@@ -240,7 +240,7 @@ def all_tasks():
     generate_config_files()
     
     # The order defines the dependency chain.
-    build_library()
+    build_runtime()
     build_rust_backend()
     build_java_linker()
 
@@ -263,7 +263,7 @@ TARGETS = {
     "rust-components": (install_rust_components, "Install needed Rust components."),
     "rust": (build_rust_backend, "Build the Rust root project."),
     "java-linker": (build_java_linker, "Build the Java Linker subproject."),
-    "library": (build_library, "Build the Java runtime support library."),
+    "runtime": (build_runtime, "Build the Java runtime support JAR."),
     "gen-files": (generate_config_files, "Generate necessary files from templates."),
     "help": (help_message, "Show this help message."),
 }

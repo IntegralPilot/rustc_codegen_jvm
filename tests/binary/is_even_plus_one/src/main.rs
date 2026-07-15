@@ -1,3 +1,9 @@
+#![no_std]
+#![feature(lang_items)]
+#![allow(internal_features)]
+
+include!("../../../support/test_prelude.rs");
+
 fn is_even_plus_one(n: i32) -> i32 {
     if n % 2 == 0 {
         n + 1

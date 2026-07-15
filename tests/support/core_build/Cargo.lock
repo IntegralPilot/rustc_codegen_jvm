@@ -3,12 +3,5 @@
 version = 4
 
 [[package]]
-name = "data_types"
-version = "0.1.0"
-dependencies = [
- "data_types_provider",
-]
-
-[[package]]
-name = "data_types_provider"
+name = "jvm_test_core_build"
 version = "0.1.0"

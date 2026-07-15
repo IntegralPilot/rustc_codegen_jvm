@@ -1,4 +1,9 @@
+#![no_std]
+#![feature(lang_items)]
+#![allow(internal_features)]
 #![feature(f16, f128, ptr_metadata, set_ptr_value)]
+
+include!("../../../support/test_prelude.rs");
 
 fn basic_raw_pointer_round_trip() {
     let mut value = 41_i32;
@@ -1014,7 +1019,7 @@ fn pointer_niche_layouts() {
     );
 
     let opt_none: Option<NonNull<i32>> = None;
-    let raw_none = unsafe { std::mem::transmute::<Option<NonNull<i32>>, *mut i32>(opt_none) };
+    let raw_none = unsafe { core::mem::transmute::<Option<NonNull<i32>>, *mut i32>(opt_none) };
     assert!(raw_none.is_null());
 }
 

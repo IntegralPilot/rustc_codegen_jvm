@@ -1,3 +1,5 @@
+#![no_std]
+
 // Provider crate for the generic_reuse regression test. The downstream binary
 // instantiates these generics with types the provider never used, and re-uses
 // instantiations the provider only partially exercised.

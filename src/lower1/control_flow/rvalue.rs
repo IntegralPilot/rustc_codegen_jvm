@@ -13,8 +13,8 @@ use super::{
         jvm_names,
         operand::{convert_operand, get_placeholder_operand},
         place::{
-            emit_instructions_to_get_on_own, emit_pointer_read, emit_slice_view, get_place_type,
-            place_to_string,
+            emit_instructions_to_get_on_own, emit_pointer_read, emit_pointer_slice_parts,
+            emit_slice_view, get_place_type, place_to_string,
         },
         types::{
             ENUM_UNION_DISCRIMINANT_METHOD, adapt_simple_enum_operand,
@@ -3357,47 +3357,7 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                             oomir::SLICE_VIEW_CLASS
                         };
                         let (backing, offset) = if is_str {
-                            let data_ty = data
-                                .get_type()
-                                .expect("raw str aggregate data pointer is typed");
-                            let backing_name = format!("{temp_aggregate_var}_backing");
-                            instructions.push(oomir::Instruction::InvokeVirtual {
-                                dest: Some(backing_name.clone()),
-                                class_name: oomir::POINTER_CLASS.to_string(),
-                                method_name: "sliceBackingArray".to_string(),
-                                method_ty: oomir::Signature {
-                                    params: vec![("self".to_string(), data_ty.clone())],
-                                    ret: Box::new(oomir::Type::Class(
-                                        "java/lang/Object".to_string(),
-                                    )),
-                                    is_static: false,
-                                },
-                                args: Vec::new(),
-                                operand: data.clone(),
-                            });
-                            let offset_name = format!("{temp_aggregate_var}_offset");
-                            instructions.push(oomir::Instruction::InvokeVirtual {
-                                dest: Some(offset_name.clone()),
-                                class_name: oomir::POINTER_CLASS.to_string(),
-                                method_name: "sliceElementOffset".to_string(),
-                                method_ty: oomir::Signature {
-                                    params: vec![("self".to_string(), data_ty)],
-                                    ret: Box::new(oomir::Type::I32),
-                                    is_static: false,
-                                },
-                                args: Vec::new(),
-                                operand: data,
-                            });
-                            (
-                                oomir::Operand::Variable {
-                                    name: backing_name,
-                                    ty: oomir::Type::Class("java/lang/Object".to_string()),
-                                },
-                                oomir::Operand::Variable {
-                                    name: offset_name,
-                                    ty: oomir::Type::I32,
-                                },
-                            )
+                            emit_pointer_slice_parts(data, &temp_aggregate_var, &mut instructions)
                         } else {
                             (data, oomir::Operand::Constant(oomir::Constant::I32(0)))
                         };

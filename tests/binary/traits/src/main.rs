@@ -1,3 +1,9 @@
+#![no_std]
+#![feature(lang_items)]
+#![allow(internal_features)]
+
+include!("../../../support/test_prelude.rs");
+
 trait Calculator {
     // Performs a primary calculation
     fn calculate(&self, a: i32, b: i32) -> i32;

@@ -1275,6 +1275,14 @@ pub(super) fn convert_basic_block<'tcx>(
 
                             // Separate args for InvokeInterface/InvokeVirtual (receiver handled via 'operand')
                             let method_args = oomir_operands[1..].to_vec();
+                            let explicit_method_args =
+                                if method_signature.params.last().is_some_and(|(name, _)| {
+                                    name == oomir::CALLER_LOCATION_PARAM_NAME
+                                }) {
+                                    &method_args[..method_args.len() - 1]
+                                } else {
+                                    &method_args[..]
+                                };
                             let method_name = super::naming::associated_method_name_from_instance(
                                 tcx,
                                 func_instance,
@@ -1336,6 +1344,19 @@ pub(super) fn convert_basic_block<'tcx>(
                                         )
                                 };
                                 let declared_method_name = item.name().as_str().to_string();
+                                // Upstream core passes the zero-sized `Clone::clone` function
+                                // item through `FnOnce` in helpers such as `Option::cloned`.
+                                // Lower its single tuple argument directly because a JVM
+                                // function-item carrier has no captured receiver state.
+                                let direct_fn_def_clone = match resolved_receiver_mir_ty.kind() {
+                                    TyKind::FnDef(def_id, _) => tcx
+                                        .opt_item_name(*def_id)
+                                        .is_some_and(|name| name == sym::clone),
+                                    _ => false,
+                                } && matches!(
+                                    declared_method_name.as_str(),
+                                    "call" | "call_mut" | "call_once"
+                                ) && explicit_method_args.len() == 1;
                                 let is_pointer_cast_method = [
                                     sym::const_ptr_cast,
                                     sym::ptr_cast,
@@ -1569,6 +1590,55 @@ pub(super) fn convert_basic_block<'tcx>(
                                                 _ => unreachable!(),
                                             };
                                             instructions.push(instruction);
+                                        }
+                                    }
+                                } else if direct_fn_def_clone {
+                                    if let Some(dest) = effective_dest {
+                                        let tuple_operand = explicit_method_args[0].clone();
+                                        let tuple_class = tuple_operand
+                                            .get_type()
+                                            .and_then(|ty| ty.get_class_name().map(str::to_string))
+                                            .expect("FnOnce argument tuple must be a JVM class");
+                                        let tuple_mir_ty = EarlyBinder::bind(tcx, fn_inputs[1])
+                                            .instantiate(tcx, instance.args)
+                                            .skip_norm_wip();
+                                        let TyKind::Tuple(tuple_fields) = tuple_mir_ty.kind()
+                                        else {
+                                            panic!(
+                                                "FnOnce argument is not a Rust tuple: {tuple_mir_ty:?}"
+                                            )
+                                        };
+                                        let field_mir_ty = tuple_fields[0];
+                                        let field_ty = super::types::ty_to_oomir_type(
+                                            field_mir_ty,
+                                            tcx,
+                                            data_types,
+                                            instance,
+                                        );
+                                        let field_name = format!("{label}_fn_def_clone_arg");
+                                        instructions.push(oomir::Instruction::GetField {
+                                            dest: field_name.clone(),
+                                            object: tuple_operand,
+                                            field_name: "field0".to_string(),
+                                            field_ty: field_ty.clone(),
+                                            owner_class: tuple_class,
+                                        });
+                                        let field = oomir::Operand::Variable {
+                                            name: field_name,
+                                            ty: field_ty.clone(),
+                                        };
+                                        if let oomir::Type::Pointer(inner) = field_ty {
+                                            super::place::emit_pointer_read(
+                                                field,
+                                                &inner,
+                                                &dest,
+                                                &mut instructions,
+                                            );
+                                        } else {
+                                            instructions.push(oomir::Instruction::Move {
+                                                dest,
+                                                src: field,
+                                            });
                                         }
                                     }
                                 } else if matches!(
@@ -1935,12 +2005,12 @@ pub(super) fn convert_basic_block<'tcx>(
                                         declared_method_name.as_str(),
                                         "write" | "write_unaligned" | "write_volatile"
                                     )
-                                    && method_args.len() == 1
+                                    && explicit_method_args.len() == 1
                                 {
                                     super::place::emit_pointer_write(
                                         receiver_operand,
                                         pointee_ty,
-                                        method_args[0].clone(),
+                                        explicit_method_args[0].clone(),
                                         &mut instructions,
                                     );
                                     if declared_method_name == "write_volatile" {
@@ -1960,7 +2030,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                     &dispatch_receiver_ty
                                     && pointer_api_receiver
                                     && declared_method_name == "replace"
-                                    && method_args.len() == 1
+                                    && explicit_method_args.len() == 1
                                 {
                                     if let Some(dest) = effective_dest {
                                         super::place::emit_pointer_read(
@@ -1973,14 +2043,14 @@ pub(super) fn convert_basic_block<'tcx>(
                                     super::place::emit_pointer_write(
                                         receiver_operand,
                                         pointee_ty,
-                                        method_args[0].clone(),
+                                        explicit_method_args[0].clone(),
                                         &mut instructions,
                                     );
                                 } else if let oomir::Type::Pointer(pointee_ty) =
                                     &dispatch_receiver_ty
                                     && pointer_api_receiver
                                     && declared_method_name == "swap"
-                                    && method_args.len() == 1
+                                    && explicit_method_args.len() == 1
                                 {
                                     let left_name = format!("{label}_method_swap_left");
                                     let right_name = format!("{label}_method_swap_right");
@@ -1991,7 +2061,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                         &mut instructions,
                                     );
                                     let right = super::place::emit_pointer_read(
-                                        method_args[0].clone(),
+                                        explicit_method_args[0].clone(),
                                         pointee_ty,
                                         &right_name,
                                         &mut instructions,
@@ -2003,7 +2073,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                         &mut instructions,
                                     );
                                     super::place::emit_pointer_write(
-                                        method_args[0].clone(),
+                                        explicit_method_args[0].clone(),
                                         pointee_ty,
                                         left,
                                         &mut instructions,
@@ -2018,7 +2088,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                             | "copy_from_nonoverlapping"
                                             | "write_bytes"
                                     )
-                                    && method_args.len() == 2
+                                    && explicit_method_args.len() == 2
                                 {
                                     let receiver_ty = EarlyBinder::bind(tcx, receiver_mir_ty)
                                         .instantiate(tcx, instance.args)
@@ -2041,7 +2111,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                         format!("{label}_{declared_method_name}_byte_count");
                                     instructions.push(oomir::Instruction::Mul {
                                         dest: byte_count_name.clone(),
-                                        op1: method_args[1].clone(),
+                                        op1: explicit_method_args[1].clone(),
                                         op2: oomir::Operand::Constant(oomir::Constant::U64(
                                             element_size as u64,
                                         )),
@@ -2068,7 +2138,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                             },
                                             args: vec![
                                                 receiver_operand,
-                                                method_args[0].clone(),
+                                                explicit_method_args[0].clone(),
                                                 byte_count,
                                             ],
                                             dest: None,
@@ -2079,10 +2149,10 @@ pub(super) fn convert_basic_block<'tcx>(
                                         let source = if from_receiver {
                                             receiver_operand.clone()
                                         } else {
-                                            method_args[0].clone()
+                                            explicit_method_args[0].clone()
                                         };
                                         let destination = if from_receiver {
-                                            method_args[0].clone()
+                                            explicit_method_args[0].clone()
                                         } else {
                                             receiver_operand
                                         };
@@ -2117,7 +2187,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                 } else if matches!(&dispatch_receiver_ty, oomir::Type::Pointer(_))
                                     && pointer_api_receiver
                                     && declared_method_name == "map_addr"
-                                    && method_args.len() == 1
+                                    && explicit_method_args.len() == 1
                                 {
                                     // `map_addr` is generic over a Rust `FnOnce`. A closure value is
                                     // only its captured environment on the JVM; its body is emitted as
@@ -2207,7 +2277,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                                     ty: closure_arg_oomir_ty,
                                                 }];
                                             if captures {
-                                                let environment_ty = method_args[0]
+                                                let environment_ty = explicit_method_args[0]
                                                     .get_type()
                                                     .expect(
                                                         "capturing map_addr closure has an environment",
@@ -2216,7 +2286,8 @@ pub(super) fn convert_basic_block<'tcx>(
                                                     0,
                                                     ("closure_env".to_string(), environment_ty),
                                                 );
-                                                closure_call_args.insert(0, method_args[0].clone());
+                                                closure_call_args
+                                                    .insert(0, explicit_method_args[0].clone());
                                             }
                                             instructions.push(oomir::Instruction::InvokeStatic {
                                                 class_name: super::jvm_names::crate_module_class(
@@ -2274,7 +2345,9 @@ pub(super) fn convert_basic_block<'tcx>(
                                             );
                                             instructions.push(oomir::Instruction::CallIndirect {
                                                 dest: Some(mapped_address_dest.clone()),
-                                                function_ptr: Box::new(method_args[0].clone()),
+                                                function_ptr: Box::new(
+                                                    explicit_method_args[0].clone(),
+                                                ),
                                                 args: vec![address_operand],
                                                 signature,
                                             });
@@ -2380,6 +2453,18 @@ pub(super) fn convert_basic_block<'tcx>(
                                         oomir::Type::Str if declared_method_name == "len" => Some(
                                             (oomir::UTF8_VIEW_CLASS.to_string(), "len".to_string()),
                                         ),
+                                        oomir::Type::Slice(element)
+                                            if declared_method_name == "starts_with"
+                                                && matches!(
+                                                    element.as_ref(),
+                                                    oomir::Type::I8 | oomir::Type::U8
+                                                ) =>
+                                        {
+                                            Some((
+                                                oomir::SLICE_VIEW_CLASS.to_string(),
+                                                "startsWithI8".to_string(),
+                                            ))
+                                        }
                                         oomir::Type::Slice(_)
                                             if declared_method_name == "starts_with" =>
                                         {
@@ -2571,6 +2656,16 @@ pub(super) fn convert_basic_block<'tcx>(
                                             static_signature.params[1].1 =
                                                 oomir::Type::Class("java/lang/Object".to_string());
                                         }
+                                        if class_name.starts_with("org/rustlang/runtime/")
+                                            && static_signature.params.last().is_some_and(
+                                                |(name, _)| {
+                                                    name == oomir::CALLER_LOCATION_PARAM_NAME
+                                                },
+                                            )
+                                        {
+                                            static_signature.params.pop();
+                                            static_args.pop();
+                                        }
                                         instructions.push(oomir::Instruction::InvokeStatic {
                                             class_name,
                                             method_name: static_method_name,
@@ -2588,6 +2683,11 @@ pub(super) fn convert_basic_block<'tcx>(
                                             })
                                             .to_string();
                                         let mut virtual_method_signature = method_signature;
+                                        let virtual_method_name = if declared_method_name == "eq" {
+                                            "eq".to_string()
+                                        } else {
+                                            method_name
+                                        };
                                         if declared_method_name == "eq" {
                                             if let Some((_name, self_ty)) =
                                                 virtual_method_signature.params.get_mut(0)
@@ -2603,7 +2703,7 @@ pub(super) fn convert_basic_block<'tcx>(
 
                                         instructions.push(oomir::Instruction::InvokeVirtual {
                                             class_name,
-                                            method_name,
+                                            method_name: virtual_method_name,
                                             method_ty: virtual_method_signature,
                                             args: method_args,
                                             dest: effective_dest,
@@ -3076,45 +3176,10 @@ pub(super) fn convert_basic_block<'tcx>(
                                     oomir::SLICE_VIEW_CLASS
                                 };
                                 let (backing, offset) = if is_str {
-                                    let data_ty =
-                                        data.get_type().expect("raw str data pointer is typed");
-                                    let backing_name = format!("{label}_raw_str_backing");
-                                    instructions.push(oomir::Instruction::InvokeVirtual {
-                                        dest: Some(backing_name.clone()),
-                                        class_name: oomir::POINTER_CLASS.to_string(),
-                                        method_name: "sliceBackingArray".to_string(),
-                                        method_ty: oomir::Signature {
-                                            params: vec![("self".to_string(), data_ty.clone())],
-                                            ret: Box::new(oomir::Type::Class(
-                                                "java/lang/Object".to_string(),
-                                            )),
-                                            is_static: false,
-                                        },
-                                        args: Vec::new(),
-                                        operand: data.clone(),
-                                    });
-                                    let offset_name = format!("{label}_raw_str_offset");
-                                    instructions.push(oomir::Instruction::InvokeVirtual {
-                                        dest: Some(offset_name.clone()),
-                                        class_name: oomir::POINTER_CLASS.to_string(),
-                                        method_name: "sliceElementOffset".to_string(),
-                                        method_ty: oomir::Signature {
-                                            params: vec![("self".to_string(), data_ty)],
-                                            ret: Box::new(oomir::Type::I32),
-                                            is_static: false,
-                                        },
-                                        args: Vec::new(),
-                                        operand: data,
-                                    });
-                                    (
-                                        oomir::Operand::Variable {
-                                            name: backing_name,
-                                            ty: oomir::Type::Class("java/lang/Object".to_string()),
-                                        },
-                                        oomir::Operand::Variable {
-                                            name: offset_name,
-                                            ty: oomir::Type::I32,
-                                        },
+                                    super::place::emit_pointer_slice_parts(
+                                        data,
+                                        &format!("{label}_raw_str"),
+                                        &mut instructions,
                                     )
                                 } else {
                                     (data, oomir::Operand::Constant(oomir::Constant::I32(0)))

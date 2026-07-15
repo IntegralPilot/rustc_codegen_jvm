@@ -41,7 +41,13 @@ use rustc_session::{
     config::{CrateType, OutputFilenames},
 };
 use rustc_span::def_id::{DefId, LOCAL_CRATE};
-use std::{any::Any, ffi::OsString, io::Write, path::Path, process::Command};
+use std::{
+    any::Any,
+    ffi::OsString,
+    io::Write,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 mod instrumentation;
 mod lower1;
@@ -91,7 +97,13 @@ fn emit_library_sidecar_jar(
         return;
     }
 
-    let Some(linker) = sess.opts.cg.linker.as_ref() else {
+    let linker = sess.opts.cg.linker.clone().or_else(|| {
+        sess.target
+            .linker
+            .as_ref()
+            .map(|linker| PathBuf::from(linker.as_ref()))
+    });
+    let Some(linker) = linker else {
         panic!("cannot emit JVM library sidecar jar: no linker was configured");
     };
 
@@ -137,7 +149,7 @@ fn emit_library_sidecar_jar(
 
     let mut response_argument = OsString::from("@");
     response_argument.push(&response_path);
-    let output = Command::new(linker).arg(response_argument).output();
+    let output = Command::new(&linker).arg(response_argument).output();
     let _ = std::fs::remove_file(&response_path);
 
     let output = output.unwrap_or_else(|e| {
@@ -191,6 +203,7 @@ fn place_or_insert_mono_function<'tcx>(
 ) {
     if let Some(assoc_item) = tcx.opt_associated_item(instance.def_id()) {
         if assoc_item.trait_container(tcx).is_none() {
+            let fallback_function = oomir_function.clone();
             let container_id = assoc_item.container_id(tcx);
             let container_ty = tcx
                 .type_of(container_id)
@@ -272,11 +285,16 @@ fn place_or_insert_mono_function<'tcx>(
                             class_name, name.method_name
                         )
                     );
+                    oomir_function = fallback_function;
                 }
             }
         }
     }
 
+    // Any function that was not attached to a generated JVM class is emitted on
+    // its owner module class. JVM module methods are static, so a Rust method's
+    // receiver must remain an explicit descriptor parameter in this fallback.
+    oomir_function.signature.is_static = true;
     oomir_module.insert_function(oomir_function);
 }
 

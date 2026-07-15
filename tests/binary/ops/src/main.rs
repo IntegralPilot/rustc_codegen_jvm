@@ -1,5 +1,10 @@
+#![no_std]
+#![feature(lang_items)]
+#![allow(internal_features)]
 #![feature(f16)]
 #![feature(f128)]
+
+include!("../../../support/test_prelude.rs");
 
 macro_rules! test_comparisons {
     ($type:ty, $a:expr, $b:expr, $c:expr, $d:expr, $zero:expr, $nzero:expr) => {

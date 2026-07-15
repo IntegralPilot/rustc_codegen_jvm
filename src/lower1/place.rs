@@ -236,6 +236,54 @@ pub fn emit_slice_view(
     slice_type
 }
 
+/// Extracts the canonical JVM array and element offset from a Rust data
+/// pointer before it is wrapped in a `SliceView` or `Utf8View`.
+pub fn emit_pointer_slice_parts(
+    data: Operand,
+    dest_prefix: &str,
+    instructions: &mut Vec<Instruction>,
+) -> (Operand, Operand) {
+    let data_ty = data
+        .get_type()
+        .expect("slice data pointer must have an OOMIR type");
+    let backing_name = format!("{dest_prefix}_backing");
+    instructions.push(Instruction::InvokeVirtual {
+        dest: Some(backing_name.clone()),
+        class_name: oomir::POINTER_CLASS.to_string(),
+        method_name: "sliceBackingArray".to_string(),
+        method_ty: oomir::Signature {
+            params: vec![("self".to_string(), data_ty.clone())],
+            ret: Box::new(oomir::Type::Class("java/lang/Object".to_string())),
+            is_static: false,
+        },
+        args: Vec::new(),
+        operand: data.clone(),
+    });
+    let offset_name = format!("{dest_prefix}_offset");
+    instructions.push(Instruction::InvokeVirtual {
+        dest: Some(offset_name.clone()),
+        class_name: oomir::POINTER_CLASS.to_string(),
+        method_name: "sliceElementOffset".to_string(),
+        method_ty: oomir::Signature {
+            params: vec![("self".to_string(), data_ty)],
+            ret: Box::new(oomir::Type::I32),
+            is_static: false,
+        },
+        args: Vec::new(),
+        operand: data,
+    });
+    (
+        Operand::Variable {
+            name: backing_name,
+            ty: oomir::Type::Class("java/lang/Object".to_string()),
+        },
+        Operand::Variable {
+            name: offset_name,
+            ty: oomir::Type::I32,
+        },
+    )
+}
+
 pub fn place_to_string<'tcx>(place: &Place<'tcx>, _tcx: TyCtxt<'tcx>) -> String {
     // Base variable name (e.g., "_1")
     format!("_{}", place.local.index()) // Start with base local "_N"

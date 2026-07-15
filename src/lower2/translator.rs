@@ -918,17 +918,65 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     && actual_ty != *ty
                     && actual_ty.to_jvm_descriptor() != ty.to_jvm_descriptor()
                 {
-                    let casts = get_cast_instructions(
-                        &self.oomir_func.name,
-                        &actual_ty,
-                        ty,
-                        self.constant_pool,
-                    )?;
-                    self.jvm_instructions.extend(casts);
+                    if !self.adapt_loaded_utf8_view(&actual_ty, ty)? {
+                        let casts = get_cast_instructions(
+                            &self.oomir_func.name,
+                            &actual_ty,
+                            ty,
+                            self.constant_pool,
+                        )?;
+                        self.jvm_instructions.extend(casts);
+                    }
                 }
             }
         }
         Ok(())
+    }
+
+    /// Converts between the distinct JVM carriers used for Rust `str` and
+    /// `[u8]`. Optimised MIR can expose a temporary with one carrier while its
+    /// Rust-level operand has the other type (for example `char::encode_utf8`).
+    fn adapt_loaded_utf8_view(
+        &mut self,
+        actual_ty: &oomir::Type,
+        expected_ty: &oomir::Type,
+    ) -> Result<bool, jvm::Error> {
+        // Rust's optimised UTF-8 construction can expose `[MaybeUninit<u8>]`
+        // as the intermediate slice type, so the element's OOMIR spelling is
+        // not necessarily plain `u8` even though the view is byte-backed.
+        let (method_name, descriptor) = if matches!(actual_ty, oomir::Type::Slice(_))
+            && matches!(expected_ty, oomir::Type::Str)
+        {
+            (
+                "fromSlice",
+                format!(
+                    "(L{};)L{};",
+                    oomir::SLICE_VIEW_CLASS,
+                    oomir::UTF8_VIEW_CLASS
+                ),
+            )
+        } else if matches!(actual_ty, oomir::Type::Str)
+            && matches!(expected_ty, oomir::Type::Slice(_))
+        {
+            (
+                "asSlice",
+                format!(
+                    "(L{};)L{};",
+                    oomir::UTF8_VIEW_CLASS,
+                    oomir::SLICE_VIEW_CLASS
+                ),
+            )
+        } else {
+            return Ok(false);
+        };
+
+        let class = self.constant_pool.add_class(oomir::UTF8_VIEW_CLASS)?;
+        let method = self
+            .constant_pool
+            .add_method_ref(class, method_name, descriptor)?;
+        self.jvm_instructions
+            .push(Instruction::Invokestatic(method));
+        Ok(true)
     }
 
     fn load_operand_as(
@@ -1043,6 +1091,9 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         if actual_ty != *expected_ty
             && actual_ty.to_jvm_descriptor() != expected_ty.to_jvm_descriptor()
         {
+            if self.adapt_loaded_utf8_view(&actual_ty, expected_ty)? {
+                return Ok(());
+            }
             let cast_instructions = get_cast_instructions(
                 &self.oomir_func.name,
                 &actual_ty,
@@ -1524,7 +1575,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         left: bool,
     ) -> Result<(), jvm::Error> {
         let value_type = get_operand_type(op1);
-        let shift_type = get_operand_type(op2);
         let width = match value_type {
             Type::I8 | Type::U8 => 8,
             Type::I16 | Type::U16 => 16,
@@ -1542,10 +1592,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             self.jvm_instructions.push(Instruction::Iand);
         }
 
-        self.load_operand(op2)?;
-        if matches!(shift_type, Type::I64 | Type::U64) {
-            self.jvm_instructions.push(Instruction::L2i);
-        }
+        self.load_jvm_int_operand(op2)?;
         self.jvm_instructions
             .push(get_int_const_instr(self.constant_pool, width - 1));
         self.jvm_instructions.push(Instruction::Iand);
@@ -1567,6 +1614,17 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         self.load_operand(operand)?;
         if matches!(ty, Type::I64 | Type::U64) {
             self.jvm_instructions.push(Instruction::L2i);
+        } else if matches!(ty, Type::Class(ref class_name) if class_name == I128_CLASS || class_name == U128_CLASS)
+        {
+            let Type::Class(class_name) = ty else {
+                unreachable!()
+            };
+            let class = self.constant_pool.add_class(&class_name)?;
+            let method = self
+                .constant_pool
+                .add_method_ref(class, "intValue", "()I")?;
+            self.jvm_instructions
+                .push(Instruction::Invokevirtual(method));
         }
         Ok(())
     }
@@ -3964,13 +4022,15 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     && stored_ty != *ty
                     && stored_ty.to_jvm_descriptor() != ty.to_jvm_descriptor()
                 {
-                    let casts = get_cast_instructions(
-                        &self.oomir_func.name,
-                        &stored_ty,
-                        ty,
-                        self.constant_pool,
-                    )?;
-                    self.jvm_instructions.extend(casts);
+                    if !self.adapt_loaded_utf8_view(&stored_ty, ty)? {
+                        let casts = get_cast_instructions(
+                            &self.oomir_func.name,
+                            &stored_ty,
+                            ty,
+                            self.constant_pool,
+                        )?;
+                        self.jvm_instructions.extend(casts);
+                    }
                 }
             }
             oomir::Operand::Constant(c) => {
@@ -4038,6 +4098,9 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         if actual_ty != *expected_ty
             && actual_ty.to_jvm_descriptor() != expected_ty.to_jvm_descriptor()
         {
+            if self.adapt_loaded_utf8_view(&actual_ty, expected_ty)? {
+                return Ok(());
+            }
             self.jvm_instructions.extend(get_cast_instructions(
                 &self.oomir_func.name,
                 &actual_ty,

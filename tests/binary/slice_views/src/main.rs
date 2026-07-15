@@ -1,3 +1,9 @@
+#![no_std]
+#![feature(lang_items)]
+#![allow(internal_features)]
+
+include!("../../../support/test_prelude.rs");
+
 fn sum(values: &[i32]) -> i32 {
     let mut total = 0;
     let mut index = 0;

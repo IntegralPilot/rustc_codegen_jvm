@@ -1,3 +1,9 @@
+#![no_std]
+#![feature(lang_items)]
+#![allow(internal_features)]
+
+include!("../../../support/test_prelude.rs");
+
 // A struct representing a simple counter with a name (using a static string slice)
 struct NamedCounter {
     name: &'static str,

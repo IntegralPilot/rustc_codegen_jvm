@@ -6,9 +6,9 @@ version = 4
 name = "generic_reuse"
 version = "0.1.0"
 dependencies = [
- "provider",
+ "generic_reuse_provider",
 ]
 
 [[package]]
-name = "provider"
+name = "generic_reuse_provider"
 version = "0.1.0"

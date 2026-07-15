@@ -2,18 +2,7 @@
 #![feature(lang_items)]
 #![allow(internal_features)]
 
-#[panic_handler]
-fn panic(_: &core::panic::PanicInfo<'_>) -> ! {
-    // The test's assertions are expected to hold. Keep the core-only panic
-    // handler allocation-free while still lowering to an unreachable terminator.
-    unsafe { core::hint::unreachable_unchecked() }
-}
-
-#[lang = "start"]
-fn start<T>(main: fn() -> T, _: isize, _: *const *const u8, _: u8) -> isize {
-    main();
-    0
-}
+include!("../../../support/test_prelude.rs");
 
 fn collatz(n: u32) -> u32 {
     if n == 1 {

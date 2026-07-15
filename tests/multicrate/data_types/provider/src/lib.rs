@@ -1,3 +1,5 @@
+#![no_std]
+
 #[derive(Clone, Copy)]
 pub struct Point {
     pub x: i32,

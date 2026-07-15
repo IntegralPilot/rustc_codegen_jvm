@@ -1,3 +1,9 @@
+#![no_std]
+#![feature(lang_items)]
+#![allow(internal_features)]
+
+include!("../../../support/test_prelude.rs");
+
 fn main() {
     let point = provider::Point::new(7, 11);
     assert!(point.x == 7);
