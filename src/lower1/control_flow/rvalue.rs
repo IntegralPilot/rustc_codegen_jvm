@@ -4,7 +4,7 @@ use rustc_middle::{
         BinOp, Body, BorrowKind as MirBorrowKind, CastKind, Operand as MirOperand, Place,
         ProjectionElem, Rvalue, UnOp,
     },
-    ty::{EarlyBinder, Instance, TyCtxt, TyKind, TypingEnv, adjustment::PointerCoercion},
+    ty::{EarlyBinder, Instance, Ty, TyCtxt, TyKind, TypingEnv, adjustment::PointerCoercion},
 };
 use std::collections::{HashMap, HashSet};
 
@@ -85,10 +85,18 @@ fn struct_tail_unsize_target_class<'tcx>(
     tcx: TyCtxt<'tcx>,
     instance: Instance<'tcx>,
 ) -> Option<String> {
-    let source_pointee = EarlyBinder::bind(tcx, pointer_pointee_ty(source_pointer_ty))
+    let (source_pointee, target_pointee) =
+        match (source_pointer_ty.kind(), target_pointer_ty.kind()) {
+            (
+                TyKind::Ref(_, source, _) | TyKind::RawPtr(source, _),
+                TyKind::Ref(_, target, _) | TyKind::RawPtr(target, _),
+            ) => (*source, *target),
+            _ => return None,
+        };
+    let source_pointee = EarlyBinder::bind(tcx, source_pointee)
         .instantiate(tcx, instance.args)
         .skip_norm_wip();
-    let target_pointee = EarlyBinder::bind(tcx, pointer_pointee_ty(target_pointer_ty))
+    let target_pointee = EarlyBinder::bind(tcx, target_pointee)
         .instantiate(tcx, instance.args)
         .skip_norm_wip();
     let typing_env = TypingEnv::fully_monomorphized();
@@ -130,6 +138,263 @@ fn struct_tail_unsize_target_class<'tcx>(
         }
         _ => None,
     }
+}
+
+fn normalize_unsize_ty<'tcx>(
+    ty: Ty<'tcx>,
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
+) -> Ty<'tcx> {
+    let instantiated = EarlyBinder::bind(tcx, ty)
+        .instantiate(tcx, instance.args)
+        .skip_norm_wip();
+    tcx.try_normalize_erasing_regions(
+        TypingEnv::fully_monomorphized(),
+        rustc_middle::ty::Unnormalized::new_wip(instantiated),
+    )
+    .unwrap_or(instantiated)
+}
+
+fn emit_raw_array_pointer_unsize<'tcx>(
+    source_ty: Ty<'tcx>,
+    target_ty: Ty<'tcx>,
+    source: oomir::Operand,
+    dest: &str,
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
+    data_types: &mut HashMap<String, oomir::DataType>,
+    instructions: &mut Vec<oomir::Instruction>,
+) -> Option<oomir::Operand> {
+    // NonNull's field is a pattern-refined raw pointer. Pattern types retain
+    // the raw pointer's runtime representation and unsizing behavior.
+    let source_pointer_ty = match source_ty.kind() {
+        TyKind::Pat(inner, _) => normalize_unsize_ty(*inner, tcx, instance),
+        _ => source_ty,
+    };
+    let target_pointer_ty = match target_ty.kind() {
+        TyKind::Pat(inner, _) => normalize_unsize_ty(*inner, tcx, instance),
+        _ => target_ty,
+    };
+    let (source_pointee, target_pointee) =
+        match (source_pointer_ty.kind(), target_pointer_ty.kind()) {
+            (TyKind::RawPtr(source, _), TyKind::RawPtr(target, _)) => (*source, *target),
+            _ => return None,
+        };
+    let source_pointee = normalize_unsize_ty(source_pointee, tcx, instance);
+    let target_pointee = normalize_unsize_ty(target_pointee, tcx, instance);
+    let (TyKind::Array(source_element, length), TyKind::Slice(target_element)) =
+        (source_pointee.kind(), target_pointee.kind())
+    else {
+        return None;
+    };
+    let source_element = normalize_unsize_ty(*source_element, tcx, instance);
+    let target_element = normalize_unsize_ty(*target_element, tcx, instance);
+    if source_element != target_element {
+        return None;
+    }
+
+    let source_oomir_ty = ty_to_oomir_type(source_ty, tcx, data_types, instance);
+    let target_oomir_ty = ty_to_oomir_type(target_ty, tcx, data_types, instance);
+    if !matches!(source_oomir_ty, oomir::Type::Pointer(_))
+        || !matches!(target_oomir_ty, oomir::Type::Slice(_))
+    {
+        return None;
+    }
+
+    let element_oomir_ty = ty_to_oomir_type(target_element, tcx, data_types, instance);
+    let element_pointer_ty = oomir::Type::Pointer(Box::new(element_oomir_ty));
+    let element_pointer = format!("{dest}_element_pointer");
+    instructions.push(oomir::Instruction::InvokeStatic {
+        dest: Some(element_pointer.clone()),
+        class_name: oomir::POINTER_CLASS.to_string(),
+        method_name: "retype".to_string(),
+        method_ty: oomir::Signature {
+            params: vec![
+                ("pointer".to_string(), source_oomir_ty),
+                ("view_size".to_string(), oomir::Type::I32),
+                ("view_codec".to_string(), oomir::Type::java_string()),
+            ],
+            ret: Box::new(element_pointer_ty.clone()),
+            is_static: true,
+        },
+        args: vec![
+            source,
+            rust_layout_size_operand(target_element, tcx, instance),
+            super::super::types::pointer_memory_codec_operand(
+                target_element,
+                tcx,
+                data_types,
+                instance,
+            ),
+        ],
+    });
+
+    let length = EarlyBinder::bind(tcx, *length)
+        .instantiate(tcx, instance.args)
+        .skip_norm_wip()
+        .try_to_target_usize(tcx)?;
+    let slice_object = format!("{dest}_slice_object");
+    instructions.push(oomir::Instruction::ConstructObject {
+        dest: slice_object.clone(),
+        class_name: oomir::SLICE_VIEW_CLASS.to_string(),
+        args: vec![
+            (
+                oomir::Operand::Variable {
+                    name: element_pointer,
+                    ty: element_pointer_ty,
+                },
+                oomir::Type::Class("java/lang/Object".to_string()),
+            ),
+            (
+                oomir::Operand::Constant(oomir::Constant::I32(0)),
+                oomir::Type::I32,
+            ),
+            (
+                oomir::Operand::Constant(oomir::Constant::I32(i32::try_from(length).ok()?)),
+                oomir::Type::I32,
+            ),
+        ],
+    });
+    instructions.push(oomir::Instruction::Cast {
+        dest: dest.to_string(),
+        op: oomir::Operand::Variable {
+            name: slice_object,
+            ty: oomir::Type::Class(oomir::SLICE_VIEW_CLASS.to_string()),
+        },
+        ty: target_oomir_ty.clone(),
+    });
+    Some(oomir::Operand::Variable {
+        name: dest.to_string(),
+        ty: target_oomir_ty,
+    })
+}
+
+fn emit_unsize_value<'tcx>(
+    source_ty: Ty<'tcx>,
+    target_ty: Ty<'tcx>,
+    source: oomir::Operand,
+    dest: &str,
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
+    data_types: &mut HashMap<String, oomir::DataType>,
+    instructions: &mut Vec<oomir::Instruction>,
+) -> Option<oomir::Operand> {
+    let checkpoint = instructions.len();
+    let source_ty = normalize_unsize_ty(source_ty, tcx, instance);
+    let target_ty = normalize_unsize_ty(target_ty, tcx, instance);
+    let source_oomir_ty = ty_to_oomir_type(source_ty, tcx, data_types, instance);
+    let target_oomir_ty = ty_to_oomir_type(target_ty, tcx, data_types, instance);
+
+    let result = if source_oomir_ty == target_oomir_ty {
+        instructions.push(oomir::Instruction::Move {
+            dest: dest.to_string(),
+            src: source,
+        });
+        Some(oomir::Operand::Variable {
+            name: dest.to_string(),
+            ty: target_oomir_ty,
+        })
+    } else if let (TyKind::Adt(source_def, source_args), TyKind::Adt(target_def, target_args)) =
+        (source_ty.kind(), target_ty.kind())
+        && source_def.did() == target_def.did()
+        && source_def.is_struct()
+        && super::super::types::should_define_named_data_type(tcx, source_def.did())
+        && let (oomir::Type::Class(source_class), oomir::Type::Class(target_class)) =
+            (&source_oomir_ty, &target_oomir_ty)
+    {
+        let mut constructor_args = Vec::new();
+        let mut valid = true;
+        for (field_index, field) in source_def.variant(0usize.into()).fields.iter().enumerate() {
+            let source_field_ty =
+                normalize_unsize_ty(field.ty(tcx, source_args).skip_norm_wip(), tcx, instance);
+            let target_field_ty =
+                normalize_unsize_ty(field.ty(tcx, target_args).skip_norm_wip(), tcx, instance);
+            let target_field_oomir_ty =
+                ty_to_oomir_type(target_field_ty, tcx, data_types, instance);
+            if !target_field_oomir_ty.has_jvm_value() {
+                continue;
+            }
+
+            let target_is_zst = tcx
+                .layout_of(TypingEnv::fully_monomorphized().as_query_input(target_field_ty))
+                .is_ok_and(|layout| layout.size.bytes() == 0);
+            let field_value = if target_is_zst {
+                super::super::value_repr::materialize_implicit_zst(
+                    target_field_ty,
+                    &format!("{dest}_field_{field_index}_zst"),
+                    tcx,
+                    instance,
+                    data_types,
+                    instructions,
+                )
+            } else {
+                let source_field_oomir_ty =
+                    ty_to_oomir_type(source_field_ty, tcx, data_types, instance);
+                if !source_field_oomir_ty.has_jvm_value() {
+                    None
+                } else {
+                    let source_field_name = format!("{dest}_field_{field_index}_source");
+                    instructions.push(oomir::Instruction::GetField {
+                        dest: source_field_name.clone(),
+                        object: source.clone(),
+                        field_name: field.ident(tcx).to_string(),
+                        field_ty: source_field_oomir_ty.clone(),
+                        owner_class: source_class.clone(),
+                    });
+                    let source_field = oomir::Operand::Variable {
+                        name: source_field_name,
+                        ty: source_field_oomir_ty,
+                    };
+                    if source_field_ty == target_field_ty {
+                        Some(source_field)
+                    } else {
+                        emit_unsize_value(
+                            source_field_ty,
+                            target_field_ty,
+                            source_field,
+                            &format!("{dest}_field_{field_index}_unsized"),
+                            tcx,
+                            instance,
+                            data_types,
+                            instructions,
+                        )
+                    }
+                }
+            };
+            let Some(field_value) = field_value else {
+                valid = false;
+                break;
+            };
+            constructor_args.push((field_value, target_field_oomir_ty));
+        }
+        valid.then(|| {
+            instructions.push(oomir::Instruction::ConstructObject {
+                dest: dest.to_string(),
+                class_name: target_class.clone(),
+                args: constructor_args,
+            });
+            oomir::Operand::Variable {
+                name: dest.to_string(),
+                ty: target_oomir_ty.clone(),
+            }
+        })
+    } else {
+        emit_raw_array_pointer_unsize(
+            source_ty,
+            target_ty,
+            source,
+            dest,
+            tcx,
+            instance,
+            data_types,
+            instructions,
+        )
+    };
+
+    if result.is_none() {
+        instructions.truncate(checkpoint);
+    }
+    result
 }
 
 fn emit_pointer_factory(
@@ -2790,6 +3055,23 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                                 ty: oomir_target_type.clone(),
                             },
                         });
+                    } else if matches!(
+                        cast_kind,
+                        CastKind::PointerCoercion(PointerCoercion::Unsize, _)
+                    ) && matches!(source_mir_ty.kind(), TyKind::Adt(..))
+                        && emit_unsize_value(
+                            source_mir_ty,
+                            *target_mir_ty,
+                            oomir_operand.clone(),
+                            &temp_cast_var,
+                            tcx,
+                            instance,
+                            data_types,
+                            &mut instructions,
+                        )
+                        .is_some()
+                    {
+                        // The recursive helper emitted the complete target wrapper.
                     } else if matches!(
                         cast_kind,
                         CastKind::PointerCoercion(PointerCoercion::Unsize, _)

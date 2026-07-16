@@ -140,7 +140,7 @@ def cargo_build_command(manifest: Path, release: bool, jobs: int) -> list[str]:
         "--target",
         str(TARGET_SPEC),
         "-Zjson-target-spec",
-        "-Zbuild-std=core,compiler_builtins",
+        "-Zbuild-std=core,compiler_builtins,alloc",
         "--target-dir",
         str(TEST_TARGET_DIR),
         "--config",

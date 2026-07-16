@@ -259,7 +259,7 @@ pub fn read_scalar_int_constant<'tcx>(
                     ));
                 }
             };
-            return Ok(scalar_int_to_oomir_constant(scalar_int, carrier_ty));
+            return scalar_int_to_oomir_constant(tcx, scalar_int, carrier_ty);
         }
 
         let adt_name = match ty_to_oomir_type(ty, tcx, oomir_data_types, instance) {
@@ -322,7 +322,7 @@ pub fn read_scalar_int_constant<'tcx>(
         });
     }
 
-    Ok(scalar_int_to_oomir_constant(scalar_int, ty))
+    scalar_int_to_oomir_constant(tcx, scalar_int, ty)
 }
 
 pub fn read_zero_sized_constant<'tcx>(
@@ -706,7 +706,6 @@ fn read_str_from_fat_pointer<'tcx>(
     offset: Size,
 ) -> Result<oomir::Constant, String> {
     let pointer_size = tcx.data_layout.pointer_size();
-    let data_ptr = read_pointer_from_memory(tcx, allocation, offset)?;
     let len_range = AllocRange {
         start: offset + pointer_size,
         size: pointer_size,
@@ -723,6 +722,11 @@ fn read_str_from_fat_pointer<'tcx>(
             ));
         }
     };
+    if len == 0 {
+        return Ok(oomir::Constant::Str(String::new()));
+    }
+
+    let data_ptr = read_pointer_from_memory(tcx, allocation, offset)?;
 
     let (provenance, data_offset) = data_ptr.into_raw_parts();
     let alloc_id = provenance.get_alloc_id().ok_or_else(|| {
@@ -751,7 +755,6 @@ fn read_slice_from_fat_pointer<'tcx>(
     instance: Instance<'tcx>,
 ) -> Result<oomir::Constant, String> {
     let pointer_size = tcx.data_layout.pointer_size();
-    let data_ptr = read_pointer_from_memory(tcx, allocation, offset)?;
     let len_scalar = allocation
         .read_scalar(
             &tcx.data_layout,
@@ -771,6 +774,22 @@ fn read_slice_from_fat_pointer<'tcx>(
             ));
         }
     };
+    if len == 0 {
+        let TyKind::Slice(element_ty) = slice_ty.kind() else {
+            return Err(format!("Expected slice type, found {slice_ty:?}"));
+        };
+        return Ok(oomir::Constant::Slice(
+            Box::new(ty_to_oomir_type(
+                *element_ty,
+                tcx,
+                oomir_data_types,
+                instance,
+            )),
+            Vec::new(),
+        ));
+    }
+
+    let data_ptr = read_pointer_from_memory(tcx, allocation, offset)?;
 
     let (provenance, data_offset) = data_ptr.into_raw_parts();
     let alloc_id = provenance.get_alloc_id().ok_or_else(|| {
@@ -1632,7 +1651,11 @@ fn handle_constant_enum<'tcx>(
 }
 
 /// Converts a Rust MIR Scalar::Int into the appropriate OOMIR constant.
-pub fn scalar_int_to_oomir_constant(scalar_int: ScalarInt, ty: Ty<'_>) -> oomir::Constant {
+pub fn scalar_int_to_oomir_constant<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    scalar_int: ScalarInt,
+    ty: Ty<'tcx>,
+) -> Result<oomir::Constant, String> {
     let bits = scalar_int.to_bits(scalar_int.size());
     let bit_width = scalar_int.size().bits() as u32;
     let signed = if bit_width == 128 {
@@ -1641,7 +1664,7 @@ pub fn scalar_int_to_oomir_constant(scalar_int: ScalarInt, ty: Ty<'_>) -> oomir:
         ((bits << (128 - bit_width)) as i128) >> (128 - bit_width)
     };
 
-    match ty.kind() {
+    let constant = match ty.kind() {
         TyKind::Int(int_ty) => match int_ty {
             IntTy::I8 => oomir::Constant::I8(signed as i8),
             IntTy::I16 => oomir::Constant::I16(signed as i16),
@@ -1690,10 +1713,26 @@ pub fn scalar_int_to_oomir_constant(scalar_int: ScalarInt, ty: Ty<'_>) -> oomir:
             }
         },
         TyKind::Str => oomir::Constant::Str(scalar_int.to_u64().to_string()),
-        TyKind::Ref(_, inner_ty, _) => {
-            scalar_int_to_oomir_constant(scalar_int.to_u64().into(), *inner_ty)
+        TyKind::RawPtr(pointee, _) | TyKind::Ref(_, pointee, _) => {
+            let layout = tcx
+                .layout_of(TypingEnv::fully_monomorphized().as_query_input(*pointee))
+                .map_err(|error| {
+                    format!("Could not determine pointee layout for {ty:?}: {error:?}")
+                })?;
+            oomir::Constant::Instance {
+                class_name: oomir::POINTER_CLASS.to_string(),
+                fields: HashMap::new(),
+                params: vec![
+                    oomir::Constant::U64(scalar_int.to_target_usize(tcx) as u64),
+                    oomir::Constant::I32(
+                        i32::try_from(layout.size.bytes())
+                            .map_err(|_| format!("Pointee layout for {ty:?} exceeds JVM limits"))?,
+                    ),
+                ],
+            }
         }
-        TyKind::Pat(base_ty, _) => scalar_int_to_oomir_constant(scalar_int, *base_ty),
-        _ => panic!("Unsupported type for ScalarInt conversion: {:?}", ty),
-    }
+        TyKind::Pat(base_ty, _) => return scalar_int_to_oomir_constant(tcx, scalar_int, *base_ty),
+        _ => return Err(format!("Unsupported type for ScalarInt conversion: {ty:?}")),
+    };
+    Ok(constant)
 }

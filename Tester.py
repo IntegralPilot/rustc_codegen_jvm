@@ -265,7 +265,7 @@ def main() -> int:
     print(f"|- Parallelism: {workers} test worker(s), {per_build_jobs} Cargo job(s) each")
     if cache_invalidated:
         print("|- Compiler inputs changed; reset the shared test cache")
-    print("|- Building shared core/compiler_builtins cache once...")
+    print("|- Building shared core/alloc/compiler_builtins cache once...")
     prime = prime_core(args.release)
     if prime.returncode != 0:
         print(prime.stdout)

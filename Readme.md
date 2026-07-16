@@ -50,7 +50,7 @@ Future visions for the project include it being able to help you leverage the JV
 
 ## Demos
 
-These examples live in `tests/binary`, are compiled with upstream Rust `core` to JVM bytecode, and are verified on every CI run as part of the integration test suite. Use `Instrument.py` to inspect compilation timings.
+These examples live in `tests/binary`, are compiled with upstream Rust `core` and `alloc` to JVM bytecode, and are verified on every CI run as part of the integration test suite. Use `Instrument.py` to inspect compilation timings.
 
 | Example | Demonstrates |
 |---|---|
@@ -84,7 +84,7 @@ These examples live in `tests/binary`, are compiled with upstream Rust `core` to
 - **Outputs** executable, self-contained `.jar` generation for binary crates.
 - **Testing** with integration coverage across debug and release modes for all of the above.
 
-Every test crate is compiled from scratch for `jvm-unknown-unknown` alongside upstream Rust `core` and `compiler_builtins`.
+Every test crate is compiled from scratch for `jvm-unknown-unknown` alongside upstream Rust `core`, `alloc`, `compiler_builtins`.
 
 The [runtime](runtime/) contains JVM runtime support such as pointer and 128-bit-number carriers and is automatically integrated into generated jars.
 

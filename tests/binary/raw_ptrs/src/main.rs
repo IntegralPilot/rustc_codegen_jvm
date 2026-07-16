@@ -1,7 +1,7 @@
 #![no_std]
 #![feature(lang_items)]
 #![allow(internal_features)]
-#![feature(f16, f128, ptr_metadata, set_ptr_value)]
+#![feature(f16, f128, ptr_internals, ptr_metadata, set_ptr_value)]
 
 include!("../../../support/test_prelude.rs");
 
@@ -1245,6 +1245,20 @@ fn sized_to_unsized_coercion() {
     assert!(data[2] == 999);
 }
 
+fn pointer_wrapper_unsized_coercions() {
+    use core::ptr::{NonNull, Unique};
+
+    let mut data = [10_u8, 20, 30, 40];
+    let non_null_array = unsafe { NonNull::new_unchecked(&mut data as *mut [u8; 4]) };
+    let non_null_slice: NonNull<[u8]> = non_null_array;
+    assert!(core::ptr::metadata(non_null_slice.as_ptr()) == 4);
+
+    let mut empty = [];
+    let unique_array = unsafe { Unique::new_unchecked(&mut empty as *mut [u8; 0]) };
+    let unique_slice: Unique<[u8]> = unique_array;
+    assert!(core::ptr::metadata(unique_slice.as_ptr()) == 0);
+}
+
 #[repr(C)]
 #[derive(Copy, Clone)]
 struct SegmentA {
@@ -1322,5 +1336,6 @@ fn main() {
     multidimensional_pointer_flat_map();
     packed_unaligned_fields();
     sized_to_unsized_coercion();
+    pointer_wrapper_unsized_coercions();
     nested_union_reinterpretation();
 }
