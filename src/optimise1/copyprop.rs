@@ -368,6 +368,7 @@ fn rewrite_instruction_uses(instruction: &mut Instruction, aliases: &AliasMap) {
         }
         Instruction::SourceLocation(_)
         | Instruction::LocalVariableScope(_)
+        | Instruction::CreateFunctionPointer { .. }
         | Instruction::Jump { .. }
         | Instruction::ThrowNewWithMessage { .. }
         | Instruction::Label { .. } => {}
@@ -564,6 +565,7 @@ fn collect_instruction_uses(instruction: &Instruction, uses: &mut HashSet<String
         }
         Instruction::SourceLocation(_)
         | Instruction::LocalVariableScope(_)
+        | Instruction::CreateFunctionPointer { .. }
         | Instruction::Jump { .. }
         | Instruction::ThrowNewWithMessage { .. }
         | Instruction::Label { .. } => {}
@@ -608,6 +610,7 @@ fn instruction_defs(instruction: &Instruction) -> HashSet<String> {
         | Instruction::ArrayGet { dest, .. }
         | Instruction::Length { dest, .. }
         | Instruction::ConstructObject { dest, .. }
+        | Instruction::CreateFunctionPointer { dest, .. }
         | Instruction::GetField { dest, .. }
         | Instruction::Cast { dest, .. } => {
             defs.insert(dest.clone());

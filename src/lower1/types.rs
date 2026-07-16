@@ -102,6 +102,85 @@ pub fn ensure_fn_ptr_interface<'tcx>(
     interface_name
 }
 
+#[derive(Clone)]
+pub struct CallableTraitObjectAbi<'tcx> {
+    pub tuple_ty: Ty<'tcx>,
+    pub signature: oomir::Signature,
+    pub interface_name: String,
+}
+
+pub fn callable_trait_object_abi<'tcx>(
+    ty: Ty<'tcx>,
+    tcx: TyCtxt<'tcx>,
+    data_types: &mut HashMap<String, oomir::DataType>,
+    instance_context: rustc_middle::ty::Instance<'tcx>,
+) -> Option<CallableTraitObjectAbi<'tcx>> {
+    let dynamic_ty = match ty.kind() {
+        TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _) => *pointee,
+        _ => ty,
+    };
+    let TyKind::Dynamic(predicates, _) = dynamic_ty.kind() else {
+        return None;
+    };
+    let principal = predicates.principal()?.skip_binder();
+    let lang_items = tcx.lang_items();
+    if ![
+        lang_items.fn_trait(),
+        lang_items.fn_mut_trait(),
+        lang_items.fn_once_trait(),
+    ]
+    .contains(&Some(principal.def_id))
+    {
+        return None;
+    }
+
+    let tuple_ty = principal.args.iter().find_map(|arg| arg.as_type())?;
+    let output_ty = predicates.iter().find_map(|predicate| {
+        let ExistentialPredicate::Projection(projection) = predicate.skip_binder() else {
+            return None;
+        };
+        (tcx.item_name(projection.def_id).as_str() == "Output")
+            .then(|| projection.term.into_arg().as_type())
+            .flatten()
+    })?;
+
+    let TyKind::Tuple(tuple_elements) = tuple_ty.kind() else {
+        return None;
+    };
+    let params = tuple_elements
+        .iter()
+        .enumerate()
+        .filter_map(|(index, element_ty)| {
+            let element_ty = EarlyBinder::bind(tcx, element_ty)
+                .instantiate(tcx, instance_context.args)
+                .skip_norm_wip();
+            let oomir_ty = ty_to_oomir_type(element_ty, tcx, data_types, instance_context);
+            oomir_ty
+                .has_jvm_value()
+                .then(|| (format!("arg{index}"), oomir_ty))
+        })
+        .collect();
+    let output_ty = EarlyBinder::bind(tcx, output_ty)
+        .instantiate(tcx, instance_context.args)
+        .skip_norm_wip();
+    let signature = oomir::Signature {
+        params,
+        ret: Box::new(ty_to_oomir_type(
+            output_ty,
+            tcx,
+            data_types,
+            instance_context,
+        )),
+        is_static: true,
+    };
+    let interface_name = ensure_fn_ptr_interface(&signature, data_types, tcx, instance_context);
+    Some(CallableTraitObjectAbi {
+        tuple_ty,
+        signature,
+        interface_name,
+    })
+}
+
 fn byte_array_type() -> oomir::Type {
     oomir::Type::Array(Box::new(oomir::Type::I8))
 }
@@ -3937,6 +4016,11 @@ pub fn ty_to_oomir_type<'tcx>(
             oomir::Type::Void
         }
         rustc_middle::ty::TyKind::Dynamic(bound_preds, _region) => {
+            if let Some(callable_abi) =
+                callable_trait_object_abi(resolved_ty, tcx, data_types, instance_context)
+            {
+                return oomir::Type::Interface(callable_abi.interface_name);
+            }
             let needs_specialized_interface =
                 bound_preds
                     .iter()

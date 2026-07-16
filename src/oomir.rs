@@ -420,6 +420,16 @@ pub enum Instruction {
         args: Vec<Operand>,         // Arguments to the function
         signature: Signature,       // Function pointer signature
     },
+    /// Creates a stateless JVM functional-interface instance through
+    /// `LambdaMetafactory`. The implementation target must have the same
+    /// flattened JVM descriptor as the SAM signature.
+    CreateFunctionPointer {
+        dest: String,
+        interface_name: String,
+        signature: Signature,
+        target_class_name: String,
+        target_method_name: String,
+    },
     InvokeInterface {
         class_name: String,   // JVM interface name (e.g., MyTrait)
         method_name: String,  // Name of the method to call

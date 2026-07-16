@@ -231,7 +231,6 @@ impl InternedConstantPool {
         })
     }
 
-    #[allow(dead_code)]
     pub(super) fn add_method_handle(
         &mut self,
         reference_kind: ReferenceKind,
@@ -243,7 +242,6 @@ impl InternedConstantPool {
         })
     }
 
-    #[allow(dead_code)]
     pub(super) fn add_method_type<S: AsRef<str>>(&mut self, descriptor: S) -> jvm::Result<u16> {
         let descriptor_index = self.add_utf8(descriptor)?;
         self.add(Constant::MethodType(descriptor_index))
@@ -263,7 +261,6 @@ impl InternedConstantPool {
         })
     }
 
-    #[allow(dead_code)]
     pub(super) fn add_invoke_dynamic<N: AsRef<str>, D: AsRef<str>>(
         &mut self,
         bootstrap_method_attr_index: u16,

@@ -13,7 +13,7 @@ use translator::FunctionTranslator;
 
 use self::jvm::{
     ClassAccessFlags, ClassFile, FieldAccessFlags, MethodAccessFlags, Version,
-    attributes::{Attribute, Instruction, MaxStack},
+    attributes::{Attribute, BootstrapMethod, Instruction, MaxStack},
 };
 use constant_pool::{InternedConstantPool, verify_no_duplicate_constants};
 use consts::load_constant;
@@ -307,6 +307,7 @@ pub fn oomir_to_jvm_bytecode(
         let code_attribute_name_index = main_cp.add_utf8("Code")?;
 
         let mut methods: Vec<jvm::Method> = Vec::new();
+        let mut bootstrap_methods: Vec<BootstrapMethod> = Vec::new();
         let mut fields = Vec::new();
         let mut has_constructor = false;
 
@@ -353,6 +354,7 @@ pub fn oomir_to_jvm_bytecode(
             let translator = FunctionTranslator::new(
                 function,
                 &mut main_cp, // Use the main class's constant pool
+                &mut bootstrap_methods,
                 module,
                 true,
                 None, // No owner class for free functions
@@ -432,7 +434,7 @@ pub fn oomir_to_jvm_bytecode(
         }
 
         // Add SourceFile attribute
-        let attributes = if let Some(source_file_name) = source_file_name {
+        let mut attributes = if let Some(source_file_name) = source_file_name {
             vec![Attribute::SourceFile {
                 name_index: main_cp.add_utf8("SourceFile")?,
                 source_file_index: main_cp.add_utf8(source_file_name)?,
@@ -440,6 +442,12 @@ pub fn oomir_to_jvm_bytecode(
         } else {
             Vec::new()
         };
+        if !bootstrap_methods.is_empty() {
+            attributes.push(Attribute::BootstrapMethods {
+                name_index: main_cp.add_utf8("BootstrapMethods")?,
+                methods: bootstrap_methods,
+            });
+        }
 
         let class_file = ClassFile {
             code_source_url: None,

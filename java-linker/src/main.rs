@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use regex::Regex;
-use ristretto_classfile::attributes::{Attribute, Instruction, StackFrame, VerificationType};
+use ristretto_classfile::attributes::{
+    Attribute, BootstrapMethod, Instruction, StackFrame, VerificationType,
+};
 use ristretto_classfile::{ClassFile, Constant, ConstantPool, MethodAccessFlags};
 use tempfile::tempdir;
 use zip::write::{SimpleFileOptions, ZipWriter};
@@ -29,6 +31,7 @@ fn import_constant(
     source: &ConstantPool,
     target: &mut ConstantPool,
     indexes: &mut HashMap<u16, u16>,
+    bootstrap_method_offset: u16,
 ) -> io::Result<u16> {
     if let Some(index) = indexes.get(&source_index) {
         return Ok(*index);
@@ -39,67 +42,169 @@ fn import_constant(
         .map_err(|error| constant_pool_error("invalid incoming constant-pool reference", error))?
         .clone();
     let imported = match constant {
-        Constant::Class(index) => Constant::Class(import_constant(index, source, target, indexes)?),
-        Constant::String(index) => {
-            Constant::String(import_constant(index, source, target, indexes)?)
-        }
-        Constant::MethodType(index) => {
-            Constant::MethodType(import_constant(index, source, target, indexes)?)
-        }
-        Constant::Module(index) => {
-            Constant::Module(import_constant(index, source, target, indexes)?)
-        }
-        Constant::Package(index) => {
-            Constant::Package(import_constant(index, source, target, indexes)?)
-        }
+        Constant::Class(index) => Constant::Class(import_constant(
+            index,
+            source,
+            target,
+            indexes,
+            bootstrap_method_offset,
+        )?),
+        Constant::String(index) => Constant::String(import_constant(
+            index,
+            source,
+            target,
+            indexes,
+            bootstrap_method_offset,
+        )?),
+        Constant::MethodType(index) => Constant::MethodType(import_constant(
+            index,
+            source,
+            target,
+            indexes,
+            bootstrap_method_offset,
+        )?),
+        Constant::Module(index) => Constant::Module(import_constant(
+            index,
+            source,
+            target,
+            indexes,
+            bootstrap_method_offset,
+        )?),
+        Constant::Package(index) => Constant::Package(import_constant(
+            index,
+            source,
+            target,
+            indexes,
+            bootstrap_method_offset,
+        )?),
         Constant::FieldRef {
             class_index,
             name_and_type_index,
         } => Constant::FieldRef {
-            class_index: import_constant(class_index, source, target, indexes)?,
-            name_and_type_index: import_constant(name_and_type_index, source, target, indexes)?,
+            class_index: import_constant(
+                class_index,
+                source,
+                target,
+                indexes,
+                bootstrap_method_offset,
+            )?,
+            name_and_type_index: import_constant(
+                name_and_type_index,
+                source,
+                target,
+                indexes,
+                bootstrap_method_offset,
+            )?,
         },
         Constant::MethodRef {
             class_index,
             name_and_type_index,
         } => Constant::MethodRef {
-            class_index: import_constant(class_index, source, target, indexes)?,
-            name_and_type_index: import_constant(name_and_type_index, source, target, indexes)?,
+            class_index: import_constant(
+                class_index,
+                source,
+                target,
+                indexes,
+                bootstrap_method_offset,
+            )?,
+            name_and_type_index: import_constant(
+                name_and_type_index,
+                source,
+                target,
+                indexes,
+                bootstrap_method_offset,
+            )?,
         },
         Constant::InterfaceMethodRef {
             class_index,
             name_and_type_index,
         } => Constant::InterfaceMethodRef {
-            class_index: import_constant(class_index, source, target, indexes)?,
-            name_and_type_index: import_constant(name_and_type_index, source, target, indexes)?,
+            class_index: import_constant(
+                class_index,
+                source,
+                target,
+                indexes,
+                bootstrap_method_offset,
+            )?,
+            name_and_type_index: import_constant(
+                name_and_type_index,
+                source,
+                target,
+                indexes,
+                bootstrap_method_offset,
+            )?,
         },
         Constant::NameAndType {
             name_index,
             descriptor_index,
         } => Constant::NameAndType {
-            name_index: import_constant(name_index, source, target, indexes)?,
-            descriptor_index: import_constant(descriptor_index, source, target, indexes)?,
+            name_index: import_constant(
+                name_index,
+                source,
+                target,
+                indexes,
+                bootstrap_method_offset,
+            )?,
+            descriptor_index: import_constant(
+                descriptor_index,
+                source,
+                target,
+                indexes,
+                bootstrap_method_offset,
+            )?,
         },
         Constant::MethodHandle {
             reference_kind,
             reference_index,
         } => Constant::MethodHandle {
             reference_kind,
-            reference_index: import_constant(reference_index, source, target, indexes)?,
+            reference_index: import_constant(
+                reference_index,
+                source,
+                target,
+                indexes,
+                bootstrap_method_offset,
+            )?,
         },
         Constant::Dynamic {
             bootstrap_method_attr_index,
             name_and_type_index,
         } => Constant::Dynamic {
-            bootstrap_method_attr_index,
-            name_and_type_index: import_constant(name_and_type_index, source, target, indexes)?,
+            bootstrap_method_attr_index: bootstrap_method_attr_index
+                .checked_add(bootstrap_method_offset)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "merged bootstrap-method index exceeds the JVM limit",
+                    )
+                })?,
+            name_and_type_index: import_constant(
+                name_and_type_index,
+                source,
+                target,
+                indexes,
+                bootstrap_method_offset,
+            )?,
         },
         Constant::InvokeDynamic {
             bootstrap_method_attr_index,
             name_and_type_index,
         } => Constant::InvokeDynamic {
-            bootstrap_method_attr_index,
-            name_and_type_index: import_constant(name_and_type_index, source, target, indexes)?,
+            bootstrap_method_attr_index: bootstrap_method_attr_index
+                .checked_add(bootstrap_method_offset)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "merged bootstrap-method index exceeds the JVM limit",
+                    )
+                })?,
+            name_and_type_index: import_constant(
+                name_and_type_index,
+                source,
+                target,
+                indexes,
+                bootstrap_method_offset,
+            )?,
         },
         primitive => primitive,
     };
@@ -126,6 +231,7 @@ fn import_constant(
 fn import_constant_pool(
     source: &ConstantPool,
     target: &mut ConstantPool,
+    bootstrap_method_offset: u16,
 ) -> io::Result<HashMap<u16, u16>> {
     let mut indexes = HashMap::new();
     for raw_index in 1..=source.len() {
@@ -136,7 +242,7 @@ fn import_constant_pool(
             )
         })?;
         if source.try_get(index).is_ok() {
-            import_constant(index, source, target, &mut indexes)?;
+            import_constant(index, source, target, &mut indexes, bootstrap_method_offset)?;
         }
     }
     Ok(indexes)
@@ -424,7 +530,65 @@ fn merge_class_data(base_data: &[u8], incoming_data: &[u8]) -> io::Result<Vec<u8
         return Ok(base_data.to_vec());
     }
 
-    let constant_indexes = import_constant_pool(&incoming.constant_pool, &mut base.constant_pool)?;
+    let base_bootstrap_count = base
+        .attributes
+        .iter()
+        .find_map(|attribute| match attribute {
+            Attribute::BootstrapMethods { methods, .. } => Some(methods.len()),
+            _ => None,
+        })
+        .unwrap_or(0);
+    let bootstrap_method_offset = u16::try_from(base_bootstrap_count).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "base class has too many bootstrap methods",
+        )
+    })?;
+    let incoming_bootstrap_methods = incoming.attributes.iter().find_map(|attribute| {
+        let Attribute::BootstrapMethods {
+            name_index,
+            methods,
+        } = attribute
+        else {
+            return None;
+        };
+        Some((*name_index, methods.clone()))
+    });
+
+    let constant_indexes = import_constant_pool(
+        &incoming.constant_pool,
+        &mut base.constant_pool,
+        bootstrap_method_offset,
+    )?;
+
+    if let Some((name_index, mut methods)) = incoming_bootstrap_methods {
+        for BootstrapMethod {
+            bootstrap_method_ref,
+            arguments,
+        } in &mut methods
+        {
+            *bootstrap_method_ref =
+                remapped_constant_index(*bootstrap_method_ref, &constant_indexes)?;
+            for argument in arguments {
+                *argument = remapped_constant_index(*argument, &constant_indexes)?;
+            }
+        }
+        if let Some(Attribute::BootstrapMethods {
+            methods: base_methods,
+            ..
+        }) = base
+            .attributes
+            .iter_mut()
+            .find(|attribute| matches!(attribute, Attribute::BootstrapMethods { .. }))
+        {
+            base_methods.extend(methods);
+        } else {
+            base.attributes.push(Attribute::BootstrapMethods {
+                name_index: remapped_constant_index(name_index, &constant_indexes)?,
+                methods,
+            });
+        }
+    }
 
     for index in missing_method_indexes {
         let mut method = incoming.methods[index].clone();
@@ -1382,11 +1546,14 @@ mod tests {
         merge_input_jars, method_identity, msvc_output_path, parse_response_lines,
         remap_local_variable_ranges,
     };
-    use ristretto_classfile::attributes::{Attribute, Instruction, LocalVariableTable};
-    use ristretto_classfile::{
-        ClassAccessFlags, ClassFile, ConstantPool, Method, MethodAccessFlags, Version,
+    use ristretto_classfile::attributes::{
+        Attribute, BootstrapMethod, Instruction, LocalVariableTable,
     };
-    use std::{fs::File, io::Read, io::Write};
+    use ristretto_classfile::{
+        ClassAccessFlags, ClassFile, Constant, ConstantPool, Method, MethodAccessFlags,
+        ReferenceKind, Version,
+    };
+    use std::{collections::HashSet, fs::File, io::Read, io::Write};
     use tempfile::tempdir;
     use zip::{ZipArchive, write::SimpleFileOptions, write::ZipWriter};
 
@@ -1409,6 +1576,67 @@ mod tests {
                 name_index,
                 descriptor_index,
                 attributes: Vec::new(),
+            }],
+            ..Default::default()
+        };
+        let mut bytes = Vec::new();
+        class_file.to_bytes(&mut bytes).unwrap();
+        bytes
+    }
+
+    fn abstract_class_with_lambda_bootstrap(method_name: &str) -> Vec<u8> {
+        let mut constant_pool = ConstantPool::default();
+        let this_class = constant_pool.add_class("test/Generic").unwrap();
+        let super_class = constant_pool.add_class("java/lang/Object").unwrap();
+        let name_index = constant_pool.add_utf8(method_name).unwrap();
+        let descriptor_index = constant_pool.add_utf8("()V").unwrap();
+        let metafactory_class = constant_pool
+            .add_class("java/lang/invoke/LambdaMetafactory")
+            .unwrap();
+        let metafactory = constant_pool
+            .add_method_ref(
+                metafactory_class,
+                "metafactory",
+                "(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/invoke/MethodType;Ljava/lang/invoke/MethodType;Ljava/lang/invoke/MethodHandle;Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/CallSite;",
+            )
+            .unwrap();
+        let metafactory_handle = constant_pool
+            .add_method_handle(ReferenceKind::InvokeStatic, metafactory)
+            .unwrap();
+        let sam_type = constant_pool.add_method_type("()V").unwrap();
+        let target_class = constant_pool
+            .add_class(format!("test/Target_{method_name}"))
+            .unwrap();
+        let target_method = constant_pool
+            .add_method_ref(target_class, "run", "()V")
+            .unwrap();
+        let target_handle = constant_pool
+            .add_method_handle(ReferenceKind::InvokeStatic, target_method)
+            .unwrap();
+        constant_pool
+            .add_invoke_dynamic(0, "run", "()Ljava/lang/Runnable;")
+            .unwrap();
+        let bootstrap_name = constant_pool.add_utf8("BootstrapMethods").unwrap();
+        let class_file = ClassFile {
+            version: Version::Java8 { minor: 0 },
+            constant_pool,
+            access_flags: ClassAccessFlags::PUBLIC
+                | ClassAccessFlags::ABSTRACT
+                | ClassAccessFlags::SUPER,
+            this_class,
+            super_class,
+            methods: vec![Method {
+                access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::ABSTRACT,
+                name_index,
+                descriptor_index,
+                attributes: Vec::new(),
+            }],
+            attributes: vec![Attribute::BootstrapMethods {
+                name_index: bootstrap_name,
+                methods: vec![BootstrapMethod {
+                    bootstrap_method_ref: metafactory_handle,
+                    arguments: vec![sam_type, target_handle, sam_type],
+                }],
             }],
             ..Default::default()
         };
@@ -1522,6 +1750,38 @@ mod tests {
             first_constant_count + 1,
             "merging should reuse every shared class, descriptor, and attribute constant"
         );
+    }
+
+    #[test]
+    fn merges_and_reindexes_lambda_bootstrap_methods() {
+        let first = abstract_class_with_lambda_bootstrap("first");
+        let second = abstract_class_with_lambda_bootstrap("second");
+        let merged = merge_class_data(&first, &second).unwrap();
+        let class_file = class_file_from_data(&merged).unwrap();
+        let bootstrap_methods = class_file
+            .attributes
+            .iter()
+            .find_map(|attribute| match attribute {
+                Attribute::BootstrapMethods { methods, .. } => Some(methods),
+                _ => None,
+            })
+            .expect("merged BootstrapMethods attribute");
+        assert_eq!(bootstrap_methods.len(), 2);
+
+        let mut bootstrap_indexes = HashSet::new();
+        for raw_index in 1..=class_file.constant_pool.len() {
+            let Ok(index) = u16::try_from(raw_index) else {
+                continue;
+            };
+            if let Ok(Constant::InvokeDynamic {
+                bootstrap_method_attr_index,
+                ..
+            }) = class_file.constant_pool.try_get(index)
+            {
+                bootstrap_indexes.insert(*bootstrap_method_attr_index);
+            }
+        }
+        assert_eq!(bootstrap_indexes, HashSet::from([0, 1]));
     }
 
     #[test]

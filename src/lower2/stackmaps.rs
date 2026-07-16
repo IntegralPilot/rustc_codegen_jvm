@@ -821,17 +821,20 @@ fn transfer_instruction(
         }
         I::Invokevirtual(method_ref)
         | I::Invokestatic(method_ref)
-        | I::Invokespecial(method_ref)
-        | I::Invokedynamic(method_ref) => {
+        | I::Invokespecial(method_ref) => {
             let method = method_ref_info(constant_pool, *method_ref, false)?;
             apply_invoke(
                 &mut state,
                 &method,
-                matches!(instruction, I::Invokestatic(_) | I::Invokedynamic(_)),
+                matches!(instruction, I::Invokestatic(_)),
                 matches!(instruction, I::Invokespecial(_)),
                 context,
                 instruction_index,
             )?;
+        }
+        I::Invokedynamic(invoke_dynamic_ref) => {
+            let method = invoke_dynamic_info(constant_pool, *invoke_dynamic_ref)?;
+            apply_invoke(&mut state, &method, true, false, context, instruction_index)?;
         }
         I::Invokeinterface(method_ref, _) => {
             let method = method_ref_info(constant_pool, *method_ref, true)?;
@@ -1519,6 +1522,31 @@ fn method_ref_info(
         class_name,
         method_name,
         descriptor,
+    })
+}
+
+fn invoke_dynamic_info(
+    constant_pool: &ConstantPool,
+    invoke_dynamic_ref: u16,
+) -> jvm::Result<MethodRefInfo> {
+    let Constant::InvokeDynamic {
+        name_and_type_index,
+        ..
+    } = constant_pool.try_get(invoke_dynamic_ref)?
+    else {
+        return Err(jvm::Error::VerificationError {
+            context: "invokedynamic stack-map transfer".to_string(),
+            message: format!(
+                "constant-pool entry #{invoke_dynamic_ref} is not an InvokeDynamic constant"
+            ),
+        });
+    };
+    let (name_index, descriptor_index) =
+        constant_pool.try_get_name_and_type(*name_and_type_index)?;
+    Ok(MethodRefInfo {
+        class_name: "java/lang/Object".to_string(),
+        method_name: constant_pool.try_get_utf8(*name_index)?.to_string(),
+        descriptor: constant_pool.try_get_utf8(*descriptor_index)?.to_string(),
     })
 }
 

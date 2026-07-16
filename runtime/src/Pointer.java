@@ -149,7 +149,8 @@ public final class Pointer {
                 || value instanceof Character
                 || value instanceof String
                 || valueClass.isEnum()
-                || valueClass.getName().startsWith("org.rustlang.runtime.")) {
+                || valueClass.getName().startsWith("org.rustlang.runtime.")
+                || isRustFunctionPointer(valueClass)) {
             return value;
         }
 
@@ -187,6 +188,18 @@ public final class Pointer {
         } catch (ReflectiveOperationException error) {
             throw new IllegalStateException("could not copy managed Rust value", error);
         }
+    }
+
+    private static boolean isRustFunctionPointer(Class<?> valueClass) {
+        for (Class<?> implementedInterface : valueClass.getInterfaces()) {
+            if (implementedInterface.getName().startsWith("org.rustlang.runtime.FnPtr_")) {
+                // Function-pointer carriers are immutable callable identities. This
+                // also covers the hidden classes produced by LambdaMetafactory,
+                // which intentionally expose no public value constructor.
+                return true;
+            }
+        }
+        return false;
     }
 
     private static Object defaultValue(Class<?> type) {

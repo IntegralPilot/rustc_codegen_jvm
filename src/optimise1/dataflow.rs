@@ -1320,6 +1320,11 @@ pub fn process_block_instructions(
                 }
             }
 
+            Instruction::CreateFunctionPointer { dest, .. } => {
+                current_state.remove(dest);
+                keep_original_instruction = true;
+            }
+
             Instruction::SourceLocation(_)
             | Instruction::LocalVariableScope(_)
             | Instruction::ThrowNewWithMessage { .. }
@@ -1383,6 +1388,7 @@ fn instruction_destination(instruction: &Instruction) -> Option<&str> {
         | Instruction::ArrayGet { dest, .. }
         | Instruction::Length { dest, .. }
         | Instruction::ConstructObject { dest, .. }
+        | Instruction::CreateFunctionPointer { dest, .. }
         | Instruction::GetField { dest, .. }
         | Instruction::Cast { dest, .. } => Some(dest),
         Instruction::CallIndirect { dest, .. }

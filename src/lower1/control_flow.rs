@@ -1461,7 +1461,65 @@ pub(super) fn convert_basic_block<'tcx>(
                                 func_instance,
                             );
 
-                            if let rustc_middle::ty::TyKind::Dynamic(preds, ..) =
+                            if let Some(callable_abi) = super::types::callable_trait_object_abi(
+                                receiver_mir_ty,
+                                tcx,
+                                data_types,
+                                instance,
+                            ) {
+                                let mut flattened_args = Vec::new();
+                                if !callable_abi.signature.params.is_empty() {
+                                    let tuple_operand = method_args
+                                        .first()
+                                        .cloned()
+                                        .expect("Fn trait calls carry an argument tuple");
+                                    let tuple_oomir_ty = tuple_operand
+                                        .get_type()
+                                        .expect("Fn trait argument tuple is typed");
+                                    let tuple_class = tuple_oomir_ty
+                                        .get_class_name()
+                                        .expect("non-unit Fn argument tuple is a JVM class")
+                                        .to_string();
+                                    let fields = match data_types.get(&tuple_class) {
+                                        Some(oomir::DataType::Class { fields, .. }) => {
+                                            fields.clone()
+                                        }
+                                        _ => panic!(
+                                            "Fn argument tuple class {tuple_class} was not defined"
+                                        ),
+                                    };
+                                    for (field_index, (field_name, field_ty)) in
+                                        fields.into_iter().enumerate()
+                                    {
+                                        if !field_ty.has_jvm_value() {
+                                            continue;
+                                        }
+                                        let field_dest =
+                                            format!("{label}_callable_arg_{field_index}");
+                                        instructions.push(oomir::Instruction::GetField {
+                                            dest: field_dest.clone(),
+                                            object: tuple_operand.clone(),
+                                            field_name,
+                                            field_ty: field_ty.clone(),
+                                            owner_class: tuple_class.clone(),
+                                        });
+                                        flattened_args.push(oomir::Operand::Variable {
+                                            name: field_dest,
+                                            ty: field_ty,
+                                        });
+                                    }
+                                }
+                                instructions.push(oomir::Instruction::InvokeInterface {
+                                    class_name: callable_abi.interface_name,
+                                    method_name: "call".to_string(),
+                                    // This descriptor contains only the flattened Java
+                                    // arguments; the receiver is carried separately.
+                                    method_ty: callable_abi.signature,
+                                    args: flattened_args,
+                                    dest: effective_dest,
+                                    operand: receiver_operand,
+                                });
+                            } else if let rustc_middle::ty::TyKind::Dynamic(preds, ..) =
                                 receiver_mir_ty.kind()
                             {
                                 let principal = preds.principal().unwrap().skip_binder();

@@ -11,7 +11,7 @@ use crate::oomir::{self, Type};
 
 use super::jvm::{
     self,
-    attributes::{ArrayType, Instruction, LookupSwitch, TableSwitch},
+    attributes::{ArrayType, BootstrapMethod, Instruction, LookupSwitch, TableSwitch},
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::convert::TryInto;
@@ -24,6 +24,7 @@ pub struct FunctionTranslator<'a, 'cp> {
     module: &'a oomir::Module,
     oomir_func: &'a oomir::Function,
     constant_pool: &'cp mut InternedConstantPool,
+    bootstrap_methods: &'cp mut Vec<BootstrapMethod>,
 
     local_var_map: HashMap<String, u16>, // OOMIR var name -> JVM local index
     local_var_types: HashMap<String, oomir::Type>, // OOMIR var name -> OOMIR Type
@@ -61,6 +62,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
     pub fn new(
         oomir_func: &'a oomir::Function,
         constant_pool: &'cp mut InternedConstantPool,
+        bootstrap_methods: &'cp mut Vec<BootstrapMethod>,
         module: &'a oomir::Module,
         is_static: bool,
         owner_class_name: Option<&str>,
@@ -69,6 +71,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             oomir_func,
             module,
             constant_pool,
+            bootstrap_methods,
             local_var_map: HashMap::new(),
             local_var_types: HashMap::new(),
             typed_local_var_map: HashMap::new(),
@@ -3253,6 +3256,67 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                         _ => {}
                     }
                 }
+            }
+            OI::CreateFunctionPointer {
+                dest,
+                interface_name,
+                signature,
+                target_class_name,
+                target_method_name,
+            } => {
+                const METAFACTORY_DESCRIPTOR: &str = concat!(
+                    "(Ljava/lang/invoke/MethodHandles$Lookup;",
+                    "Ljava/lang/String;",
+                    "Ljava/lang/invoke/MethodType;",
+                    "Ljava/lang/invoke/MethodType;",
+                    "Ljava/lang/invoke/MethodHandle;",
+                    "Ljava/lang/invoke/MethodType;)",
+                    "Ljava/lang/invoke/CallSite;"
+                );
+                let sam_descriptor = signature.to_jvm_descriptor_with_explicit_params();
+                let metafactory_class = self
+                    .constant_pool
+                    .add_class("java/lang/invoke/LambdaMetafactory")?;
+                let metafactory_ref = self.constant_pool.add_method_ref(
+                    metafactory_class,
+                    "metafactory",
+                    METAFACTORY_DESCRIPTOR,
+                )?;
+                let metafactory_handle = self
+                    .constant_pool
+                    .add_method_handle(jvm::ReferenceKind::InvokeStatic, metafactory_ref)?;
+                let sam_method_type = self.constant_pool.add_method_type(&sam_descriptor)?;
+                let target_class = self.constant_pool.add_class(target_class_name)?;
+                let target_method = self.constant_pool.add_method_ref(
+                    target_class,
+                    target_method_name,
+                    &sam_descriptor,
+                )?;
+                let target_handle = self
+                    .constant_pool
+                    .add_method_handle(jvm::ReferenceKind::InvokeStatic, target_method)?;
+                let instantiated_method_type =
+                    self.constant_pool.add_method_type(&sam_descriptor)?;
+                let bootstrap_index =
+                    u16::try_from(self.bootstrap_methods.len()).map_err(|_| {
+                        jvm::Error::VerificationError {
+                            context: format!("Function {}", self.oomir_func.name),
+                            message: "too many invokedynamic bootstrap methods".to_string(),
+                        }
+                    })?;
+                self.bootstrap_methods.push(BootstrapMethod {
+                    bootstrap_method_ref: metafactory_handle,
+                    arguments: vec![sam_method_type, target_handle, instantiated_method_type],
+                });
+                let call_site_descriptor = format!("()L{interface_name};");
+                let invoke_dynamic = self.constant_pool.add_invoke_dynamic(
+                    bootstrap_index,
+                    "call",
+                    call_site_descriptor,
+                )?;
+                self.jvm_instructions
+                    .push(JI::Invokedynamic(invoke_dynamic));
+                self.store_result(dest, &oomir::Type::Interface(interface_name.clone()))?;
             }
             OI::Move { dest, src } => {
                 let value_type = match src {

@@ -1245,6 +1245,319 @@ pub(crate) fn ensure_closure_fn_pointer_adapter_class<'tcx>(
     class_name
 }
 
+fn ensure_non_capturing_closure_fn_pointer_bridge<'tcx>(
+    data_types: &mut HashMap<String, oomir::DataType>,
+    closure_instance: Instance<'tcx>,
+    signature: &oomir::Signature,
+    tcx: TyCtxt<'tcx>,
+    instance_context: Instance<'tcx>,
+) -> (String, String) {
+    let closure_ty = closure_instance.ty(tcx, TypingEnv::fully_monomorphized());
+    let TyKind::Closure(_, closure_args) = closure_ty.kind() else {
+        panic!("function-pointer bridge received non-closure {closure_instance:?}");
+    };
+    assert!(
+        closure_args.as_closure().upvar_tys().is_empty(),
+        "only non-capturing closures can become function pointers"
+    );
+    let oomir::Type::Class(closure_class) =
+        ty_to_oomir_type(closure_ty, tcx, data_types, instance_context)
+    else {
+        panic!("closure type did not lower to a JVM class");
+    };
+    let method_name = "_fn_ptr_call".to_string();
+    let already_defined = matches!(
+        data_types.get(&closure_class),
+        Some(oomir::DataType::Class { methods, .. }) if methods.contains_key(&method_name)
+    );
+    if already_defined {
+        return (closure_class, method_name);
+    }
+
+    // Optimised MIR can remove the standalone closure mono item when its only
+    // use is this coercion. Keep the implementation alongside the bridge in
+    // the closure's existing class so the LambdaMetafactory target never
+    // depends on that separate reachability decision.
+    let implementation_method_name = "_fn_ptr_impl".to_string();
+    let implementation_already_defined = matches!(
+        data_types.get(&closure_class),
+        Some(oomir::DataType::Class { methods, .. })
+            if methods.contains_key(&implementation_method_name)
+    );
+    if !implementation_already_defined {
+        let mut closure_mir = tcx.instance_mir(closure_instance.def).clone();
+        let implementation = super::super::mir_to_oomir(
+            tcx,
+            closure_instance,
+            &mut closure_mir,
+            Some(super::super::naming::FnNameData {
+                class_to_call_on: Some(closure_class.clone()),
+                method_name: implementation_method_name.clone(),
+            }),
+            true,
+            data_types,
+        );
+        let Some(oomir::DataType::Class { methods, .. }) = data_types.get_mut(&closure_class)
+        else {
+            panic!("closure class disappeared while adding its function-pointer implementation");
+        };
+        methods.insert(
+            implementation_method_name.clone(),
+            DataTypeMethod::Function(implementation),
+        );
+    }
+
+    let closure_sig = closure_args.as_closure().sig();
+    let tuple_ty = *closure_sig
+        .inputs()
+        .skip_binder()
+        .first()
+        .expect("closure call ABI always has a tuple argument");
+    let tuple_oomir_ty = ty_to_oomir_type(tuple_ty, tcx, data_types, instance_context);
+    let mut instructions = Vec::new();
+    let closure_args = if tuple_oomir_ty.has_jvm_value() {
+        let tuple_dest = "_closure_args".to_string();
+        instructions.push(oomir::Instruction::ConstructObject {
+            dest: tuple_dest.clone(),
+            class_name: tuple_oomir_ty
+                .get_class_name()
+                .expect("non-unit closure tuple is represented by a JVM class")
+                .to_string(),
+            args: signature
+                .params
+                .iter()
+                .enumerate()
+                .map(|(index, (_, ty))| {
+                    (
+                        oomir::Operand::Variable {
+                            name: format!("_{}", index + 1),
+                            ty: ty.clone(),
+                        },
+                        ty.clone(),
+                    )
+                })
+                .collect(),
+        });
+        vec![oomir::Operand::Variable {
+            name: tuple_dest,
+            ty: tuple_oomir_ty.clone(),
+        }]
+    } else {
+        Vec::new()
+    };
+    let call_dest = signature.ret.has_jvm_value().then(|| "_ret".to_string());
+    instructions.push(oomir::Instruction::InvokeStatic {
+        dest: call_dest.clone(),
+        class_name: closure_class.clone(),
+        method_name: implementation_method_name,
+        method_ty: oomir::Signature {
+            params: tuple_oomir_ty
+                .has_jvm_value()
+                .then(|| ("args".to_string(), tuple_oomir_ty))
+                .into_iter()
+                .collect(),
+            ret: signature.ret.clone(),
+            is_static: true,
+        },
+        args: closure_args,
+    });
+    instructions.push(oomir::Instruction::Return {
+        operand: call_dest.map(|name| oomir::Operand::Variable {
+            name,
+            ty: signature.ret.as_ref().clone(),
+        }),
+    });
+    let bridge = DataTypeMethod::Function(oomir::Function {
+        name: method_name.clone(),
+        owner_class: None,
+        signature: signature.clone(),
+        debug_variables: Vec::new(),
+        body: oomir::CodeBlock {
+            entry: "bb0".to_string(),
+            basic_blocks: HashMap::from([(
+                "bb0".to_string(),
+                oomir::BasicBlock {
+                    label: "bb0".to_string(),
+                    instructions,
+                },
+            )]),
+        },
+    });
+    let Some(oomir::DataType::Class { methods, .. }) = data_types.get_mut(&closure_class) else {
+        panic!("closure class disappeared while adding its function-pointer bridge");
+    };
+    methods.insert(method_name.clone(), bridge);
+    (closure_class, method_name)
+}
+
+/// Makes a concrete Rust closure directly implement the primitive-specialized
+/// JVM SAM used by `dyn Fn*`.  The bridge rebuilds Rust's tuple call argument
+/// and, for a capturing closure, supplies the address-like environment carrier
+/// expected by the lowered closure body.
+fn ensure_closure_callable_bridge<'tcx>(
+    closure_ty: rustc_middle::ty::Ty<'tcx>,
+    callable_abi: &super::super::types::CallableTraitObjectAbi<'tcx>,
+    data_types: &mut HashMap<String, oomir::DataType>,
+    tcx: TyCtxt<'tcx>,
+    instance_context: Instance<'tcx>,
+) -> bool {
+    let closure_ty = match closure_ty.kind() {
+        TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _) => *pointee,
+        _ => closure_ty,
+    };
+    let TyKind::Closure(def_id, closure_args) = closure_ty.kind() else {
+        return false;
+    };
+    let closure_instance = Instance::new_raw(*def_id, closure_args);
+    let oomir::Type::Class(closure_class) =
+        ty_to_oomir_type(closure_ty, tcx, data_types, instance_context)
+    else {
+        return false;
+    };
+
+    let tuple_oomir_ty = ty_to_oomir_type(callable_abi.tuple_ty, tcx, data_types, instance_context);
+    let mut instructions = Vec::new();
+    let tuple_dest = "_closure_args".to_string();
+    let tuple_call_arg = if tuple_oomir_ty.has_jvm_value() {
+        let tuple_class = tuple_oomir_ty
+            .get_class_name()
+            .expect("non-unit closure argument tuple is represented by a JVM class")
+            .to_string();
+        let tuple_args = callable_abi
+            .signature
+            .params
+            .iter()
+            .enumerate()
+            .map(|(index, (_, ty))| {
+                (
+                    oomir::Operand::Variable {
+                        name: format!("_{}", index + 2),
+                        ty: ty.clone(),
+                    },
+                    ty.clone(),
+                )
+            })
+            .collect();
+        instructions.push(oomir::Instruction::ConstructObject {
+            dest: tuple_dest.clone(),
+            class_name: tuple_class,
+            args: tuple_args,
+        });
+        Some(oomir::Operand::Variable {
+            name: tuple_dest,
+            ty: tuple_oomir_ty.clone(),
+        })
+    } else {
+        None
+    };
+
+    let has_captures = closure_args
+        .as_closure()
+        .upvar_tys()
+        .iter()
+        .next()
+        .is_some();
+    let mut closure_params = Vec::new();
+    let mut closure_call_args = Vec::new();
+    if has_captures {
+        let environment_ty =
+            oomir::Type::Pointer(Box::new(oomir::Type::Class(closure_class.clone())));
+        let environment_dest = "_closure_environment".to_string();
+        instructions.push(oomir::Instruction::InvokeStatic {
+            dest: Some(environment_dest.clone()),
+            class_name: oomir::POINTER_CLASS.to_string(),
+            method_name: "cell".to_string(),
+            method_ty: oomir::Signature {
+                params: vec![(
+                    "value".to_string(),
+                    oomir::Type::Class("java/lang/Object".to_string()),
+                )],
+                ret: Box::new(environment_ty.clone()),
+                is_static: true,
+            },
+            args: vec![oomir::Operand::Variable {
+                name: "_1".to_string(),
+                ty: oomir::Type::Class(closure_class.clone()),
+            }],
+        });
+        closure_params.push(("closure_env".to_string(), environment_ty.clone()));
+        closure_call_args.push(oomir::Operand::Variable {
+            name: environment_dest,
+            ty: environment_ty,
+        });
+    }
+    if let Some(tuple_call_arg) = tuple_call_arg {
+        closure_params.push(("args".to_string(), tuple_oomir_ty));
+        closure_call_args.push(tuple_call_arg);
+    }
+
+    let call_dest = callable_abi
+        .signature
+        .ret
+        .has_jvm_value()
+        .then(|| "_ret".to_string());
+    instructions.push(oomir::Instruction::InvokeStatic {
+        dest: call_dest.clone(),
+        class_name: super::super::naming::mono_owner_class(tcx, closure_instance),
+        method_name: super::super::generate_closure_function_name(tcx, closure_instance),
+        method_ty: oomir::Signature {
+            params: closure_params,
+            ret: callable_abi.signature.ret.clone(),
+            is_static: true,
+        },
+        args: closure_call_args,
+    });
+    instructions.push(oomir::Instruction::Return {
+        operand: call_dest.map(|name| oomir::Operand::Variable {
+            name,
+            ty: callable_abi.signature.ret.as_ref().clone(),
+        }),
+    });
+
+    let mut method_params = vec![(
+        "self".to_string(),
+        oomir::Type::Class(closure_class.clone()),
+    )];
+    method_params.extend(callable_abi.signature.params.iter().cloned());
+    let call_method = DataTypeMethod::Function(oomir::Function {
+        name: "call".to_string(),
+        owner_class: None,
+        debug_variables: Vec::new(),
+        signature: oomir::Signature {
+            params: method_params,
+            ret: callable_abi.signature.ret.clone(),
+            is_static: false,
+        },
+        body: oomir::CodeBlock {
+            entry: "bb0".to_string(),
+            basic_blocks: HashMap::from([(
+                "bb0".to_string(),
+                oomir::BasicBlock {
+                    label: "bb0".to_string(),
+                    instructions,
+                },
+            )]),
+        },
+    });
+
+    let Some(oomir::DataType::Class {
+        methods,
+        interfaces,
+        ..
+    }) = data_types.get_mut(&closure_class)
+    else {
+        return false;
+    };
+    methods.entry("call".to_string()).or_insert(call_method);
+    if !interfaces
+        .iter()
+        .any(|name| name == &callable_abi.interface_name)
+    {
+        interfaces.push(callable_abi.interface_name.clone());
+    }
+    true
+}
+
 fn ensure_erased_receiver_fn_pointer_bridge<'tcx>(
     data_types: &mut HashMap<String, oomir::DataType>,
     source_signature: &oomir::Signature,
@@ -1831,18 +2144,20 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                         fn_ptr_signature_from_ty(*target_mir_ty, tcx, data_types, instance);
                     let interface_name =
                         ensure_fn_ptr_interface(&signature, data_types, tcx, instance);
-                    let adapter_class = ensure_closure_fn_pointer_adapter_class(
-                        data_types,
-                        closure_instance,
-                        &signature,
-                        &interface_name,
-                        tcx,
-                        instance,
-                    );
-                    instructions.push(oomir::Instruction::ConstructObject {
+                    let (target_class_name, target_method_name) =
+                        ensure_non_capturing_closure_fn_pointer_bridge(
+                            data_types,
+                            closure_instance,
+                            &signature,
+                            tcx,
+                            instance,
+                        );
+                    instructions.push(oomir::Instruction::CreateFunctionPointer {
                         dest: temp_cast_var.clone(),
-                        class_name: adapter_class,
-                        args: Vec::new(),
+                        interface_name: interface_name.clone(),
+                        signature,
+                        target_class_name,
+                        target_method_name,
                     });
                     result_operand = oomir::Operand::Variable {
                         name: temp_cast_var,
@@ -1883,27 +2198,39 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                             )
                         );
                     }
-                    let adapter_class = ensure_fn_pointer_adapter_class(
-                        data_types,
-                        callable_target.as_ref(),
-                        &signature,
-                        &interface_name,
-                        tcx,
-                        instance,
-                    );
-                    breadcrumbs::log!(
-                        breadcrumbs::LogLevel::Info,
-                        "mir-lowering",
-                        format!(
-                            "Info: Reifying FnDef to FnPtr: '{}' -> '{}' as '{}'",
-                            source_mir_ty, fn_name.method_name, adapter_class
-                        )
-                    );
-                    instructions.push(oomir::Instruction::ConstructObject {
-                        dest: temp_cast_var.clone(),
-                        class_name: adapter_class,
-                        args: Vec::new(),
-                    });
+                    if let Some(FnPointerTarget::Static(target)) = &callable_target
+                        && let Some(target_class_name) = &target.class_to_call_on
+                    {
+                        instructions.push(oomir::Instruction::CreateFunctionPointer {
+                            dest: temp_cast_var.clone(),
+                            interface_name: interface_name.clone(),
+                            signature,
+                            target_class_name: target_class_name.clone(),
+                            target_method_name: target.method_name.clone(),
+                        });
+                    } else {
+                        let adapter_class = ensure_fn_pointer_adapter_class(
+                            data_types,
+                            callable_target.as_ref(),
+                            &signature,
+                            &interface_name,
+                            tcx,
+                            instance,
+                        );
+                        breadcrumbs::log!(
+                            breadcrumbs::LogLevel::Info,
+                            "mir-lowering",
+                            format!(
+                                "Info: Reifying FnDef to FnPtr: '{}' -> '{}' as '{}'",
+                                source_mir_ty, fn_name.method_name, adapter_class
+                            )
+                        );
+                        instructions.push(oomir::Instruction::ConstructObject {
+                            dest: temp_cast_var.clone(),
+                            class_name: adapter_class,
+                            args: Vec::new(),
+                        });
+                    }
                     result_operand = oomir::Operand::Variable {
                         name: temp_cast_var,
                         ty: oomir::Type::Interface(interface_name),
@@ -2123,11 +2450,32 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                         );
                     }
 
-                    let trait_object_adapter = if matches!(
+                    let callable_closure_bridge = matches!(
                         cast_kind,
                         CastKind::PointerCoercion(PointerCoercion::Unsize, _)
-                    ) && let oomir::Type::Interface(interface_name) =
-                        &oomir_target_type
+                    )
+                        && super::super::types::callable_trait_object_abi(
+                            *target_mir_ty,
+                            tcx,
+                            data_types,
+                            instance,
+                        )
+                        .is_some_and(|callable_abi| {
+                            ensure_closure_callable_bridge(
+                                source_mir_ty,
+                                &callable_abi,
+                                data_types,
+                                tcx,
+                                instance,
+                            )
+                        });
+
+                    let trait_object_adapter = if !callable_closure_bridge
+                        && matches!(
+                            cast_kind,
+                            CastKind::PointerCoercion(PointerCoercion::Unsize, _)
+                        )
+                        && let oomir::Type::Interface(interface_name) = &oomir_target_type
                         && (carrier_needs_trait_object_adapter(&oomir_source_type, data_types)
                             || interface_name
                                 .rsplit('/')
@@ -2181,7 +2529,13 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                             None
                         });
 
-                    if let Some(adapter_class) = trait_object_adapter {
+                    if callable_closure_bridge {
+                        instructions.push(oomir::Instruction::Cast {
+                            op: oomir_operand,
+                            ty: oomir_target_type.clone(),
+                            dest: temp_cast_var.clone(),
+                        });
+                    } else if let Some(adapter_class) = trait_object_adapter {
                         instructions.push(oomir::Instruction::ConstructObject {
                             dest: temp_cast_var.clone(),
                             class_name: adapter_class,

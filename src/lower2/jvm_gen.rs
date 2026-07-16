@@ -11,7 +11,9 @@ use crate::oomir::{self, AdtHelperKind, DataTypeMethod, Signature, Type};
 
 use super::jvm::{
     self, BaseType, ClassAccessFlags, ClassFile, FieldAccessFlags, MethodAccessFlags, Version,
-    attributes::{Attribute, InnerClass, Instruction, MaxStack, NestedClassAccessFlags},
+    attributes::{
+        Attribute, BootstrapMethod, InnerClass, Instruction, MaxStack, NestedClassAccessFlags,
+    },
 };
 use std::collections::{HashMap, HashSet};
 
@@ -1263,6 +1265,7 @@ pub(super) fn create_data_type_classfile_for_class(
     };
     let mut jvm_methods = vec![constructor];
     let mut class_attributes = Vec::new();
+    let mut bootstrap_methods: Vec<BootstrapMethod> = Vec::new();
 
     // Check for jvm_methods
     for (method_name, method) in methods.iter() {
@@ -1314,6 +1317,7 @@ pub(super) fn create_data_type_classfile_for_class(
                 let translator = FunctionTranslator::new(
                     function,
                     &mut cp,
+                    &mut bootstrap_methods,
                     module,
                     function.signature.is_static,
                     owner_class,
@@ -1684,6 +1688,12 @@ pub(super) fn create_data_type_classfile_for_class(
         class_attributes.push(Attribute::SourceFile {
             name_index: cp.add_utf8("SourceFile")?,
             source_file_index: cp.add_utf8(source_file_name)?,
+        });
+    }
+    if !bootstrap_methods.is_empty() {
+        class_attributes.push(Attribute::BootstrapMethods {
+            name_index: cp.add_utf8("BootstrapMethods")?,
+            methods: bootstrap_methods,
         });
     }
 
