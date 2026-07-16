@@ -1,8 +1,13 @@
 use rustc_middle::ty::{GenericArgsRef, Instance, TyCtxt};
 use rustc_session::config::CrateType;
 use rustc_span::def_id::{CrateNum, DefId};
+use rustc_span::sym;
 
-const RUNTIME_CRATES: &[&str] = &["core"];
+const RUNTIME_CRATES: &[rustc_span::Symbol] = &[sym::core];
+
+fn is_runtime_crate_name(crate_name: rustc_span::Symbol) -> bool {
+    RUNTIME_CRATES.contains(&crate_name)
+}
 
 pub fn uses_compiled_core(tcx: TyCtxt<'_>) -> bool {
     tcx.sess.target.llvm_target.as_ref() == "jvm-unknown-unknown"
@@ -18,7 +23,7 @@ pub fn compiles_external_core_instances(tcx: TyCtxt<'_>) -> bool {
 
 pub fn is_runtime_crate<'tcx>(tcx: TyCtxt<'tcx>, krate: CrateNum) -> bool {
     let crate_name = tcx.crate_name(krate);
-    crate_name.as_str() == "core"
+    crate_name == sym::core
         || tcx
             .used_crate_source(krate)
             .paths()
@@ -34,21 +39,21 @@ pub fn path_segment(raw: &str) -> String {
 }
 
 pub fn crate_root<'tcx>(tcx: TyCtxt<'tcx>, krate: CrateNum) -> String {
-    let crate_name = tcx.crate_name(krate).to_string();
-    if RUNTIME_CRATES.contains(&crate_name.as_str()) {
-        format!("org/rustlang/{}", jvm_identifier(&crate_name))
+    let crate_name = tcx.crate_name(krate);
+    if is_runtime_crate_name(crate_name) {
+        format!("org/rustlang/{}", jvm_identifier(crate_name.as_str()))
     } else {
-        jvm_identifier(&crate_name)
+        jvm_identifier(crate_name.as_str())
     }
 }
 
 pub fn crate_module_class<'tcx>(tcx: TyCtxt<'tcx>, krate: CrateNum) -> String {
     let root = crate_root(tcx, krate);
-    let crate_name = tcx.crate_name(krate).to_string();
-    if RUNTIME_CRATES.contains(&crate_name.as_str()) {
+    let crate_name = tcx.crate_name(krate);
+    if is_runtime_crate_name(crate_name) {
         root
     } else {
-        format!("{root}/{}", jvm_identifier(&crate_name))
+        format!("{root}/{}", jvm_identifier(crate_name.as_str()))
     }
 }
 
@@ -106,7 +111,7 @@ pub fn closure_class_for_args<'tcx>(
 }
 
 pub fn owner_class_for_function<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> String {
-    let crate_name = tcx.crate_name(def_id.krate).to_string();
+    let crate_name = tcx.crate_name(def_id.krate);
     let root = crate_root(tcx, def_id.krate);
     let mut segments = def_path_segments(tcx, def_id);
     if !segments.is_empty() {
@@ -114,7 +119,7 @@ pub fn owner_class_for_function<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> Strin
     }
 
     if segments.is_empty() {
-        if RUNTIME_CRATES.contains(&crate_name.as_str()) {
+        if is_runtime_crate_name(crate_name) {
             root
         } else {
             crate_module_class(tcx, def_id.krate)

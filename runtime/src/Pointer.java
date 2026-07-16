@@ -21,6 +21,7 @@ public final class Pointer {
     private static final String UNSIGNED_BIG_INTEGER_CODEC = "@unsigned-big-integer";
     private static final String F128_CODEC = "@f128";
     private static final String STRUCTURAL_VIEW_CODEC_PREFIX = "@structural-view:";
+    private static final String SLICE_VIEW_CLASS_NAME = "org.rustlang.runtime.SliceView";
     private static final AtomicLong NEXT_ADDRESS = new AtomicLong(0x1_0000_0000L);
     private static final Map<Object, Long> ALLOCATION_BASES = new WeakHashMap<>();
     private static final Map<Object, Integer> ALLOCATION_ELEMENT_SIZES = new WeakHashMap<>();
@@ -35,6 +36,10 @@ public final class Pointer {
             new WeakHashMap<>();
     private static final Map<Object, Map<String, WeakReference<FieldCell>>> FIELD_CELLS =
             new WeakHashMap<>();
+
+    private static boolean isSliceViewType(Class<?> type) {
+        return type != null && SLICE_VIEW_CLASS_NAME.equals(type.getName());
+    }
 
     /**
      * Keeps the distinct JVM carriers for a Rust struct-tail unsizing coercion
@@ -287,14 +292,12 @@ public final class Pointer {
                                 || value instanceof Character))) {
             return value;
         }
-        if (targetType.getName().equals("org.rustlang.runtime.SliceView")
-                && value.getClass().isArray()) {
+        if (isSliceViewType(targetType) && value.getClass().isArray()) {
             Constructor<?> constructor = targetType.getConstructor(
                     Object.class, int.class, int.class);
             return constructor.newInstance(value, 0, Array.getLength(value));
         }
-        if (targetType.isArray()
-                && value.getClass().getName().equals("org.rustlang.runtime.SliceView")) {
+        if (targetType.isArray() && isSliceViewType(value.getClass())) {
             return sliceBackingForArray(value, targetType);
         }
         return constructStructuralView(value, targetType);
@@ -348,8 +351,7 @@ public final class Pointer {
                 if (sourceValue != null && targetValue != null
                         && !targetField.getType().isInstance(sourceValue)
                         && !targetField.getType().isArray()
-                        && !targetField.getType().getName()
-                                .equals("org.rustlang.runtime.SliceView")) {
+                        && !isSliceViewType(targetField.getType())) {
                     copyStructuralFields(sourceValue, targetValue);
                     adapted = targetValue;
                 } else {
@@ -444,7 +446,7 @@ public final class Pointer {
             return -1;
         }
         try {
-            if (value.getClass().getName().equals("org.rustlang.runtime.SliceView")) {
+            if (isSliceViewType(value.getClass())) {
                 return Integer.toUnsignedLong(
                         instanceField(value.getClass(), "length").getInt(value));
             }
@@ -685,7 +687,7 @@ public final class Pointer {
 
         Pointer data = byte_offset(fieldOffset).retype(elementSize, elementCodecClassName);
         try {
-            Class<?> sliceView = Class.forName("org.rustlang.runtime.SliceView");
+            Class<?> sliceView = Class.forName(SLICE_VIEW_CLASS_NAME);
             return sliceView
                     .getConstructor(Object.class, int.class, int.class)
                     .newInstance(data, 0, Math.toIntExact(metadata()));
@@ -1215,25 +1217,6 @@ public final class Pointer {
 
     public static Pointer with_addr(Pointer pointer, int address) {
         return pointer.with_addr(Integer.toUnsignedLong(address));
-    }
-
-    public static Pointer map_addr(Pointer pointer, Object mapper) {
-        try {
-            Method call = null;
-            for (Method method : mapper.getClass().getMethods()) {
-                if (method.getName().equals("call") && method.getParameterTypes().length == 1) {
-                    call = method;
-                    break;
-                }
-            }
-            if (call == null) {
-                throw new NoSuchMethodException("Rust map_addr closure has no call method");
-            }
-            Object mapped = call.invoke(mapper, Long.valueOf(pointer.address()));
-            return pointer.with_addr(((Number) mapped).longValue());
-        } catch (ReflectiveOperationException error) {
-            throw new IllegalStateException("could not invoke Rust map_addr closure", error);
-        }
     }
 
     public static Pointer wrapping_add(Pointer pointer, long elementCount) {

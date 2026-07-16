@@ -382,6 +382,11 @@ fn ratio(a: u128, b: u128) -> f64 {
     a as f64 / b as f64
 }
 
+#[inline(never)]
+fn read(pointer: *const i32) -> i32 {
+    unsafe { *pointer + 1 }
+}
+
 fn main() {
     runtime_integer_ops();
     runtime_float_ops();
@@ -701,6 +706,8 @@ fn main() {
 
     // Float arithmetic on big-int derived values.
     assert!(ratio(84, 2) == 42.0);
+    let user_read_value = 41;
+    assert!(read(&user_read_value) == 42, "user function named read");
     let x: u128 = 7;
     let y = x as f64 * 6.0;
     assert!(y == 42.0);

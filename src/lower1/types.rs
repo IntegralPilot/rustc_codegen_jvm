@@ -8,7 +8,7 @@ use rustc_middle::ty::{
     AdtDef, EarlyBinder, ExistentialPredicate, FloatTy, GenericArgsRef, IntTy, Ty, TyCtxt, TyKind,
     TypeVisitableExt, TypingEnv, UintTy,
 };
-use rustc_span::def_id::DefId;
+use rustc_span::{def_id::DefId, sym};
 use std::collections::HashMap;
 
 pub const UNION_BYTES_FIELD: &str = "_bytes";
@@ -139,7 +139,7 @@ pub fn callable_trait_object_abi<'tcx>(
         let ExistentialPredicate::Projection(projection) = predicate.skip_binder() else {
             return None;
         };
-        (tcx.item_name(projection.def_id).as_str() == "Output")
+        (tcx.lang_items().fn_once_output() == Some(projection.def_id))
             .then(|| projection.term.into_arg().as_type())
             .flatten()
     })?;
@@ -396,12 +396,13 @@ fn int_constant_for_type(value: i64, ty: &oomir::Type) -> oomir::Constant {
 }
 
 pub fn should_define_named_data_type<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> bool {
-    def_id.is_local() || tcx.crate_name(def_id.krate).as_str() == "core"
+    def_id.is_local() || tcx.crate_name(def_id.krate) == sym::core
 }
 
 fn add_enum_helper_methods(
     methods: &mut HashMap<String, DataTypeMethod>,
     variants_info: Vec<(String, Vec<oomir::Type>)>,
+    is_option: bool,
 ) {
     methods
         .entry("getVariantIdx".to_string())
@@ -414,30 +415,16 @@ fn add_enum_helper_methods(
             },
         });
 
-    if variants_info.len() == 2 {
-        let mut none_variant_idx = 1u32;
-        let mut some_variant_idx = 0u32;
-        for (idx, (name, _)) in variants_info.iter().enumerate() {
-            if name == "None" {
-                none_variant_idx = idx as u32;
-            } else if name == "Some" {
-                some_variant_idx = idx as u32;
-            }
-        }
-
+    if is_option {
         methods
             .entry("is_none".to_string())
             .or_insert(DataTypeMethod::AdtHelperMethod {
-                kind: oomir::AdtHelperKind::IsVariant {
-                    variant_idx: none_variant_idx,
-                },
+                kind: oomir::AdtHelperKind::IsVariant { variant_idx: 0 },
             });
         methods
             .entry("is_some".to_string())
             .or_insert(DataTypeMethod::AdtHelperMethod {
-                kind: oomir::AdtHelperKind::IsVariant {
-                    variant_idx: some_variant_idx,
-                },
+                kind: oomir::AdtHelperKind::IsVariant { variant_idx: 1 },
             });
     }
 }
@@ -682,7 +669,11 @@ fn ensure_enum_data_types<'tcx>(
         .collect();
 
     if let Some(oomir::DataType::Class { methods, .. }) = data_types.get_mut(base_enum_name) {
-        add_enum_helper_methods(methods, variants_info.clone());
+        add_enum_helper_methods(
+            methods,
+            variants_info.clone(),
+            tcx.is_lang_item(adt_def.did(), rustc_hir::LangItem::Option),
+        );
         methods
             .entry(ENUM_DROP_FIELDS_METHOD.to_string())
             .or_insert(DataTypeMethod::SimpleConstantReturn(

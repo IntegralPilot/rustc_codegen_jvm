@@ -1611,7 +1611,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                         || matches!(
                                             receiver_value_ty.kind(),
                                             TyKind::Adt(adt_def, _)
-                                                if tcx.def_path_str(adt_def.did()).ends_with("::NonNull")
+                                                if tcx.is_diagnostic_item(sym::NonNull, adt_def.did())
                                         )
                                 };
                                 let declared_method_name = item.name().as_str().to_string();
@@ -3135,6 +3135,32 @@ pub(super) fn convert_basic_block<'tcx>(
                                 src: oomir::Operand::Constant(oomir::Constant::Boolean(false)),
                             });
                         } else if is_compiler_intrinsic
+                            && intrinsic_name == "arith_offset"
+                            && oomir_operands.len() == 2
+                        {
+                            let pointer_ty = oomir_operands[0]
+                                .get_type()
+                                .expect("arith_offset pointer operand is typed");
+                            if !matches!(pointer_ty, oomir::Type::Pointer(_)) {
+                                panic!(
+                                    "arith_offset requires a pointer operand, found {pointer_ty:?}"
+                                );
+                            }
+                            instructions.push(oomir::Instruction::InvokeStatic {
+                                dest: effective_dest.clone(),
+                                class_name: oomir::POINTER_CLASS.to_string(),
+                                method_name: "offset".to_string(),
+                                method_ty: oomir::Signature {
+                                    params: vec![
+                                        ("pointer".to_string(), pointer_ty.clone()),
+                                        ("count".to_string(), oomir::Type::I64),
+                                    ],
+                                    ret: Box::new(oomir_output_type.clone()),
+                                    is_static: true,
+                                },
+                                args: vec![oomir_operands[0].clone(), oomir_operands[1].clone()],
+                            });
+                        } else if is_compiler_intrinsic
                             && matches!(
                                 intrinsic_name.as_str(),
                                 "saturating_add" | "saturating_sub"
@@ -3182,6 +3208,76 @@ pub(super) fn convert_basic_block<'tcx>(
                                     is_static: true,
                                 },
                                 args: oomir_operands.clone(),
+                            });
+                        } else if is_compiler_intrinsic
+                            && matches!(
+                                intrinsic_name.as_str(),
+                                "ptr_offset_from" | "ptr_offset_from_unsigned"
+                            )
+                            && oomir_operands.len() == 2
+                        {
+                            let left_ty = oomir_operands[0]
+                                .get_type()
+                                .expect("ptr_offset_from left operand is typed");
+                            let right_ty = oomir_operands[1]
+                                .get_type()
+                                .expect("ptr_offset_from right operand is typed");
+                            if !matches!(left_ty, oomir::Type::Pointer(_))
+                                || !matches!(right_ty, oomir::Type::Pointer(_))
+                            {
+                                panic!(
+                                    "ptr_offset_from requires pointer operands, found {left_ty:?} and {right_ty:?}"
+                                );
+                            }
+                            instructions.push(oomir::Instruction::InvokeStatic {
+                                dest: effective_dest.clone(),
+                                class_name: oomir::POINTER_CLASS.to_string(),
+                                method_name: "offset_from".to_string(),
+                                method_ty: oomir::Signature {
+                                    params: vec![
+                                        ("left".to_string(), left_ty),
+                                        ("right".to_string(), right_ty),
+                                    ],
+                                    ret: Box::new(oomir_output_type.clone()),
+                                    is_static: true,
+                                },
+                                args: vec![oomir_operands[0].clone(), oomir_operands[1].clone()],
+                            });
+                        } else if is_compiler_intrinsic
+                            && intrinsic_name == "compare_bytes"
+                            && oomir_operands.len() == 3
+                        {
+                            let left_ty = oomir_operands[0]
+                                .get_type()
+                                .expect("compare_bytes left operand is typed");
+                            let right_ty = oomir_operands[1]
+                                .get_type()
+                                .expect("compare_bytes right operand is typed");
+                            if !matches!(left_ty, oomir::Type::Pointer(_))
+                                || !matches!(right_ty, oomir::Type::Pointer(_))
+                            {
+                                panic!(
+                                    "compare_bytes requires pointer operands, found {left_ty:?} and {right_ty:?}"
+                                );
+                            }
+                            instructions.push(oomir::Instruction::InvokeStatic {
+                                dest: effective_dest.clone(),
+                                class_name: oomir::POINTER_CLASS.to_string(),
+                                method_name: "compareBytes".to_string(),
+                                method_ty: oomir::Signature {
+                                    params: vec![
+                                        ("left".to_string(), left_ty),
+                                        ("right".to_string(), right_ty),
+                                        ("length".to_string(), oomir::Type::U64),
+                                    ],
+                                    ret: Box::new(oomir::Type::I32),
+                                    is_static: true,
+                                },
+                                args: vec![
+                                    oomir_operands[0].clone(),
+                                    oomir_operands[1].clone(),
+                                    oomir_operands[2].clone(),
+                                ],
                             });
                         } else if intrinsic_name == "raw_eq"
                             && is_compiler_intrinsic

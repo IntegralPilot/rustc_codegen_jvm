@@ -3821,24 +3821,12 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                                     },
                                 );
 
-                                // Add is_none/is_some for two-variant enums (like Option)
-                                if adt_def.variants().len() == 2 {
-                                    // Find the actual variant indices by name
-                                    let mut none_variant_idx = 1u32;
-                                    let mut some_variant_idx = 0u32;
-                                    for (idx, v) in adt_def.variants().iter().enumerate() {
-                                        let name = v.name.to_string();
-                                        if name == "None" {
-                                            none_variant_idx = idx as u32;
-                                        } else if name == "Some" {
-                                            some_variant_idx = idx as u32;
-                                        }
-                                    }
+                                if tcx.is_lang_item(adt_def.did(), rustc_hir::LangItem::Option) {
                                     methods.insert(
                                         "is_none".to_string(),
                                         DataTypeMethod::AdtHelperMethod {
                                             kind: oomir::AdtHelperKind::IsVariant {
-                                                variant_idx: none_variant_idx,
+                                                variant_idx: 0,
                                             },
                                         },
                                     );
@@ -3846,7 +3834,7 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                                         "is_some".to_string(),
                                         DataTypeMethod::AdtHelperMethod {
                                             kind: oomir::AdtHelperKind::IsVariant {
-                                                variant_idx: some_variant_idx,
+                                                variant_idx: 1,
                                             },
                                         },
                                     );
@@ -3877,24 +3865,14 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                                             },
                                         );
                                     }
-                                    if adt_def.variants().len() == 2 {
-                                        // Find the actual variant indices by name
-                                        let mut none_variant_idx = 1u32;
-                                        let mut some_variant_idx = 0u32;
-                                        for (idx, v) in adt_def.variants().iter().enumerate() {
-                                            let name = v.name.to_string();
-                                            if name == "None" {
-                                                none_variant_idx = idx as u32;
-                                            } else if name == "Some" {
-                                                some_variant_idx = idx as u32;
-                                            }
-                                        }
+                                    if tcx.is_lang_item(adt_def.did(), rustc_hir::LangItem::Option)
+                                    {
                                         if !methods.contains_key("is_none") {
                                             methods.insert(
                                                 "is_none".to_string(),
                                                 DataTypeMethod::AdtHelperMethod {
                                                     kind: oomir::AdtHelperKind::IsVariant {
-                                                        variant_idx: none_variant_idx,
+                                                        variant_idx: 0,
                                                     },
                                                 },
                                             );
@@ -3904,7 +3882,7 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                                                 "is_some".to_string(),
                                                 DataTypeMethod::AdtHelperMethod {
                                                     kind: oomir::AdtHelperKind::IsVariant {
-                                                        variant_idx: some_variant_idx,
+                                                        variant_idx: 1,
                                                     },
                                                 },
                                             );
