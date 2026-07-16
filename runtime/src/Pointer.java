@@ -4,6 +4,7 @@ import java.lang.ref.WeakReference;
 import java.lang.reflect.Array;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.math.BigInteger;
@@ -83,6 +84,44 @@ public final class Pointer {
             }
         } catch (IllegalAccessException error) {
             throw new IllegalStateException("could not overwrite managed Rust value", error);
+        }
+    }
+
+    /** Runs generated Rust element drop glue over a dynamically sized slice. */
+    public static void dropSlice(Object slice, String ownerClassName, String methodName) {
+        if (slice == null) {
+            return;
+        }
+        try {
+            Class<?> sliceClass = slice.getClass();
+            Object array = instanceField(sliceClass, "array").get(slice);
+            int offset = instanceField(sliceClass, "offset").getInt(slice);
+            int length = instanceField(sliceClass, "length").getInt(slice);
+            Pointer data = array instanceof Pointer
+                    ? ((Pointer) array).sliceElementView().add(offset)
+                    : null;
+            if (data == null && (array == null || !array.getClass().isArray())) {
+                throw new IllegalArgumentException("Rust slice drop requires array-backed storage");
+            }
+            Method drop = Class.forName(ownerClassName.replace('/', '.'))
+                    .getMethod(methodName, Pointer.class);
+            for (int index = 0; index < length; index++) {
+                Pointer element = data == null
+                        ? Pointer.cell(Array.get(array, offset + index))
+                        : data.add(index);
+                drop.invoke(null, element);
+            }
+        } catch (InvocationTargetException error) {
+            Throwable cause = error.getCause();
+            if (cause instanceof RuntimeException) {
+                throw (RuntimeException) cause;
+            }
+            if (cause instanceof Error) {
+                throw (Error) cause;
+            }
+            throw new IllegalStateException("Rust slice element drop failed", cause);
+        } catch (ReflectiveOperationException error) {
+            throw new IllegalStateException("could not invoke Rust slice element drop glue", error);
         }
     }
 
@@ -588,6 +627,58 @@ public final class Pointer {
             }
         }
         return new Pointer(cell, size, 0, size, codecClassName);
+    }
+
+    private Object compatibleStructView(String ownerClassName) {
+        try {
+            Class<?> ownerClass = Class.forName(ownerClassName.replace('/', '.'));
+            Object candidate = getObjectAs(ownerClassName);
+            return ownerClass.isInstance(candidate) ? candidate : null;
+        } catch (ClassNotFoundException error) {
+            throw new IllegalArgumentException(
+                    "unknown Rust aggregate class " + ownerClassName, error);
+        }
+    }
+
+    public Pointer projectStructField(
+            String ownerClassName,
+            String fieldName,
+            int fieldOffset,
+            int fieldSize,
+            String fieldCodecClassName) {
+        Object owner = compatibleStructView(ownerClassName);
+        if (owner != null
+                && fieldCodecClassName != null
+                && !isBuiltInCodec(fieldCodecClassName)) {
+            return field(owner, fieldName, fieldSize, fieldCodecClassName);
+        }
+        return byte_offset(fieldOffset).retype(fieldSize, fieldCodecClassName);
+    }
+
+    public Object projectStructSliceField(
+            String ownerClassName,
+            String fieldName,
+            int fieldOffset,
+            int elementSize,
+            String elementCodecClassName) {
+        Object owner = compatibleStructView(ownerClassName);
+        if (owner != null) {
+            try {
+                return instanceField(owner.getClass(), fieldName).get(owner);
+            } catch (ReflectiveOperationException error) {
+                throw new IllegalStateException("could not read Rust DST slice field", error);
+            }
+        }
+
+        Pointer data = byte_offset(fieldOffset).retype(elementSize, elementCodecClassName);
+        try {
+            Class<?> sliceView = Class.forName("org.rustlang.runtime.SliceView");
+            return sliceView
+                    .getConstructor(Object.class, int.class, int.class)
+                    .newInstance(data, 0, Math.toIntExact(metadata()));
+        } catch (ReflectiveOperationException error) {
+            throw new IllegalStateException("could not construct Rust DST slice view", error);
+        }
     }
 
     public static Pointer array(
@@ -1378,7 +1469,13 @@ public final class Pointer {
     private Object readElement(int elementIndex) {
         if (allocation instanceof Cell) {
             if (elementIndex != 0) {
-                throw new IndexOutOfBoundsException("pointer arithmetic escaped scalar storage");
+                throw new IndexOutOfBoundsException(
+                        "pointer arithmetic escaped scalar storage: element=" + elementIndex
+                                + ", byte_offset=" + byteOffset
+                                + ", allocation_element_size=" + allocationElementSize
+                                + ", view_size=" + viewSize
+                                + ", allocation_codec=" + allocationCodecClassName
+                                + ", view_codec=" + viewCodecClassName);
             }
             return ((Cell) allocation).value;
         }
@@ -1595,6 +1692,47 @@ public final class Pointer {
         Object value = readAlignedElement();
         StructuralViewState state = structuralViewState(value, false);
         return state == null ? value : state.activate(value.getClass());
+    }
+
+    public Object receiverObject() {
+        Object receiver = getObject();
+        while (receiver instanceof Pointer) {
+            Object next = ((Pointer) receiver).getObject();
+            if (next == receiver) {
+                throw new IllegalStateException("cyclic Rust receiver pointer");
+            }
+            receiver = next;
+        }
+        return receiver;
+    }
+
+    public Object getObjectAs(String targetClassName) {
+        if (targetClassName == null || targetClassName.isEmpty()) {
+            return getObject();
+        }
+        Object value;
+        StructuralViewState state;
+        if (isStructuralViewCodec(viewCodecClassName)) {
+            value = structuralSourceObject(structuralViewDescriptor());
+            state = structuralViewState(value, true);
+        } else {
+            value = getObject();
+            if (value == null) {
+                return null;
+            }
+            state = structuralViewState(value, false);
+            if (state == null) {
+                return value;
+            }
+        }
+        try {
+            Class<?> targetClass = Class.forName(
+                    targetClassName.replace('/', '.'), true, value.getClass().getClassLoader());
+            return state.activate(targetClass);
+        } catch (ClassNotFoundException error) {
+            throw new IllegalStateException(
+                    "could not load requested Rust structural view " + targetClassName, error);
+        }
     }
 
     private boolean isDirectAllocationView() {
@@ -1838,8 +1976,12 @@ public final class Pointer {
 
     private static Pointer slicePointer(Object backing, int index) {
         return backing instanceof Pointer
-                ? ((Pointer) backing).sliceStorageView().add(index)
+                ? ((Pointer) backing).sliceElementView().add(index)
                 : null;
+    }
+
+    private Pointer sliceElementView() {
+        return viewSize == 0 && viewCodecClassName == null ? sliceStorageView() : this;
     }
 
     private Pointer sliceStorageView() {

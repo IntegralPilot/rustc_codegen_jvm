@@ -65,6 +65,26 @@ public final class I128 extends Number implements Comparable<I128> {
         return new I128(high - other.high - borrow, low - other.low);
     }
 
+    public I128 saturatingAdd(I128 other) {
+        I128 result = add(other);
+        if (((high ^ result.high) & (other.high ^ result.high)) < 0) {
+            return high < 0
+                    ? new I128(Long.MIN_VALUE, 0L)
+                    : new I128(Long.MAX_VALUE, -1L);
+        }
+        return result;
+    }
+
+    public I128 saturatingSubtract(I128 other) {
+        I128 result = subtract(other);
+        if (((high ^ other.high) & (high ^ result.high)) < 0) {
+            return high < 0
+                    ? new I128(Long.MIN_VALUE, 0L)
+                    : new I128(Long.MAX_VALUE, -1L);
+        }
+        return result;
+    }
+
     public I128 multiply(I128 other) {
         U128 bits = new U128(high, low).multiply(new U128(other.high, other.low));
         return new I128(bits.high, bits.low);

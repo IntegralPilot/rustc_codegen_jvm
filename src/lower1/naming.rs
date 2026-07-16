@@ -3,7 +3,7 @@
 use super::{jvm_names, types::ty_to_oomir_type};
 use rustc_hir::{LangItem, def::DefKind};
 use rustc_middle::ty::{GenericArg, Instance, TyCtxt, TypeVisitableExt};
-use rustc_span::sym;
+use rustc_span::{def_id::LOCAL_CRATE, sym};
 use std::collections::HashMap;
 
 const MAX_MONO_FN_NAME_LEN: usize = 128;
@@ -20,6 +20,31 @@ pub struct JvmStaticImport {
     pub class_name: String,
     pub method_name: String,
     pub descriptor: String,
+}
+
+pub fn mono_owner_class<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> String {
+    let def_id = instance.def_id();
+    if !def_id.is_local()
+        && jvm_names::is_runtime_crate(tcx, def_id.krate)
+        && jvm_names::compiles_external_core_instances(tcx)
+        && tcx.generics_of(def_id).requires_monomorphization(tcx)
+        && !instance.args.has_param()
+        && !instance.args.has_escaping_bound_vars()
+        && instance.upstream_monomorphization(tcx).is_none()
+    {
+        jvm_names::crate_module_class(tcx, LOCAL_CRATE)
+    } else if let Some(trait_def_id) = tcx
+        .opt_associated_item(def_id)
+        .and_then(|item| item.trait_container(tcx))
+    {
+        // A Java interface carries its dynamically dispatched method, but
+        // monomorphized Rust default bodies are static functions. Put those
+        // bodies beside the trait in its module rather than generating a
+        // second class file for the interface name.
+        jvm_names::owner_class_for_function(tcx, trait_def_id)
+    } else {
+        jvm_names::owner_class_for_function(tcx, def_id)
+    }
 }
 
 pub fn parse_jvm_link_name(link_name: &str) -> Result<Option<JvmStaticImport>, String> {
@@ -193,7 +218,7 @@ pub fn mono_fn_name_from_instance<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'t
         };
     }
 
-    let class = Some(jvm_names::owner_class_for_function(tcx, instance.def_id()));
+    let class = Some(mono_owner_class(tcx, instance));
 
     // Use only the last path segment as the method base (so "core::panicking::panic" -> "panic")
     let mut safe_base = jvm_names::method_for_function(tcx, instance.def_id());
@@ -216,7 +241,7 @@ pub fn mono_fn_name_from_instance<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'t
             &format!(
                 "{}_nonconcrete_{}",
                 safe_base,
-                super::types::stable_instance_key(tcx, instance.def_id(), instance.args)
+                super::types::stable_normalized_instance_key(tcx, instance.def_id(), instance.args,)
             ),
             10,
         );
@@ -256,7 +281,7 @@ pub fn mono_fn_name_from_instance<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'t
         readable_base
     } else {
         let instance_hash = super::types::short_hash(
-            &super::types::stable_instance_key(tcx, instance.def_id(), instance.args),
+            &super::types::stable_normalized_instance_key(tcx, instance.def_id(), instance.args),
             10,
         );
         format!("{readable_base}__{instance_hash}")
@@ -279,7 +304,7 @@ pub fn mono_fn_name_from_instance<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'t
         descriptor_str.push_str(&ty.to_jvm_descriptor());
         descriptor_str.push('_');
     }
-    descriptor_str.push_str(&super::types::stable_instance_key(
+    descriptor_str.push_str(&super::types::stable_normalized_instance_key(
         tcx,
         instance.def_id(),
         instance.args,

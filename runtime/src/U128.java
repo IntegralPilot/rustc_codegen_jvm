@@ -67,6 +67,15 @@ public final class U128 extends Number implements Comparable<U128> {
         return new U128(high - other.high - borrow, low - other.low);
     }
 
+    public U128 saturatingAdd(U128 other) {
+        U128 result = add(other);
+        return result.compareTo(this) < 0 ? new U128(-1L, -1L) : result;
+    }
+
+    public U128 saturatingSubtract(U128 other) {
+        return compareTo(other) < 0 ? new U128(0L, 0L) : subtract(other);
+    }
+
     private static long unsignedMultiplyHigh(long left, long right) {
         long mask = 0xffff_ffffL;
         long leftLow = left & mask;

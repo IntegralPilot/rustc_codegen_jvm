@@ -1,5 +1,12 @@
 Compiled from "main.rs"
 
+public static boolean is_val_statically_known_bool__4436523f7e(boolean);
+LineNumberTable:
+line 2672: 0
+LocalVariableTable:
+Start Length Slot Name Signature
+0 2 0 _arg Z
+
 public static int exercise_variable_names(int, long);
 LineNumberTable:
 line 9: 0
@@ -37,6 +44,66 @@ Start Length Slot Name Signature
 0 8 1 arg1 J
 0 8 3 arg2 Lorg/rustlang/runtime/Pointer;
 0 8 4 arg3 B
+
+public static org.rustlang.core.result.Result_Tuple__Error fmt__3331fb409b_Str__f28ef4a4a8(org.rustlang.runtime.Pointer, org.rustlang.runtime.Pointer);
+LineNumberTable:
+line 2872: 0
+LocalVariableTable:
+Start Length Slot Name Signature
+0 12 0 self Lorg/rustlang/runtime/Pointer;
+0 12 1 f Lorg/rustlang/runtime/Pointer;
+
+public static org.rustlang.core.result.Result_Tuple__Error spec_write_fmt__62ac4e9cd9_PanicBuffer__4279852ae3(org.rustlang.runtime.Pointer, org.rustlang.core.fmt.Arguments);
+LineNumberTable:
+line 877: 0
+line 878: 7
+line 877: 8
+line 878: 9
+line 887: 16
+line 634: 23
+line 430: 29
+line 898: 41
+line 238: 45
+line 240: 61
+line 882: 64
+line 883: 73
+line 120: 80
+line 181: 95
+line 880: 99
+line 634: 107
+line 880: 108
+line 634: 109
+line 430: 115
+line 898: 126
+line 235: 130
+line 236: 142
+LocalVariableTable:
+Start Length Slot Name Signature
+0 159 0 self Lorg/rustlang/runtime/Pointer;
+0 159 1 args Lorg/rustlang/core/fmt/Arguments;
+142 17 29 s Lorg/rustlang/runtime/Utf8View;
+
+public static org.rustlang.core.result.Result_Tuple__Error write_char__e38b5012f4_PanicBuffer__1c8dbdce5c(org.rustlang.runtime.Pointer, int);
+LineNumberTable:
+line 185: 0
+line 186: 9
+line 732: 90
+line 213: 95
+line 186: 99
+line 187: 110
+LocalVariableTable:
+Start Length Slot Name Signature
+0 111 0 self Lorg/rustlang/runtime/Pointer;
+0 111 1 c I
+
+public static org.rustlang.core.result.Result_Tuple__Error write_fmt__8bcf6eaa37_PanicBuffer__61a242a131(org.rustlang.runtime.Pointer, org.rustlang.core.fmt.Arguments);
+LineNumberTable:
+line 243: 0
+line 244: 11
+LocalVariableTable:
+Start Length Slot Name Signature
+0 12 0 self Lorg/rustlang/runtime/Pointer;
+0 12 1 args Lorg/rustlang/core/fmt/Arguments;
 
 public static void main(java.lang.String[]);
 LineNumberTable:

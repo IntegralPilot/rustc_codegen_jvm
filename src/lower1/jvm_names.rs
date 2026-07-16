@@ -68,7 +68,10 @@ pub fn closure_class_for_args<'tcx>(
     args: GenericArgsRef<'tcx>,
 ) -> String {
     let base = path_segment(&super::types::stable_def_path(tcx, def_id));
-    let hash = super::types::short_hash(&super::types::stable_instance_key(tcx, def_id, args), 10);
+    let hash = super::types::short_hash(
+        &super::types::stable_normalized_instance_key(tcx, def_id, args),
+        10,
+    );
     format!("{}/{}_{}", crate_root(tcx, def_id.krate), base, hash)
 }
 

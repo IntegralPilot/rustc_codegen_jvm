@@ -183,10 +183,7 @@ fn mono_item_name<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> lower1::
 
     if matches!(instance_ty.kind(), TyKind::Closure(..)) {
         return lower1::naming::FnNameData {
-            class_to_call_on: Some(lower1::jvm_names::crate_module_class(
-                tcx,
-                instance.def_id().krate,
-            )),
+            class_to_call_on: Some(lower1::naming::mono_owner_class(tcx, instance)),
             method_name: lower1::generate_closure_function_name(tcx, instance),
         };
     }
@@ -204,6 +201,21 @@ fn place_or_insert_mono_function<'tcx>(
     if let Some(assoc_item) = tcx.opt_associated_item(instance.def_id()) {
         if assoc_item.trait_container(tcx).is_none() {
             let fallback_function = oomir_function.clone();
+            let has_enum_reference_receiver = assoc_item.is_method()
+                && tcx
+                    .fn_sig(instance.def_id())
+                    .instantiate(tcx, instance.args)
+                    .skip_binder()
+                    .inputs()
+                    .first()
+                    .is_some_and(|receiver| {
+                        matches!(
+                            receiver.kind(),
+                            TyKind::Ref(_, pointee, _)
+                                if matches!(pointee.kind(), TyKind::Adt(adt_def, _)
+                                    if adt_def.is_enum())
+                        )
+                    });
             let container_id = assoc_item.container_id(tcx);
             let container_ty = tcx
                 .type_of(container_id)
@@ -216,7 +228,7 @@ fn place_or_insert_mono_function<'tcx>(
                 instance,
             );
 
-            if let Type::Class(class_name) = self_oomir_ty {
+            if !has_enum_reference_receiver && let Type::Class(class_name) = self_oomir_ty {
                 let can_extend_compiled_core_class = lower1::jvm_names::uses_compiled_core(tcx)
                     && (instance.def_id().is_local()
                         || lower1::jvm_names::compiles_external_core_instances(tcx));
@@ -360,7 +372,6 @@ fn lower_mono_function<'tcx>(
         true,
         &mut oomir_module.data_types,
     );
-
     place_or_insert_mono_function(tcx, instance, &name, oomir_function, oomir_module);
 }
 

@@ -4,8 +4,8 @@ use rustc_middle::mir::interpret::{
 };
 use rustc_middle::ty::layout::TyAndLayout;
 use rustc_middle::ty::{
-    AdtDef, FloatTy, GenericArgsRef, Instance, InstanceKind, IntTy, PseudoCanonicalInput,
-    ScalarInt, ShimKind, Ty, TyCtxt, TyKind, TypingEnv, UintTy,
+    AdtDef, EarlyBinder, FloatTy, GenericArgsRef, Instance, InstanceKind, IntTy,
+    PseudoCanonicalInput, ScalarInt, ShimKind, Ty, TyCtxt, TyKind, TypingEnv, UintTy,
 };
 use std::collections::HashMap;
 
@@ -159,7 +159,23 @@ pub fn read_scalar_int_constant<'tcx>(
     oomir_data_types: &mut HashMap<String, oomir::DataType>,
     instance: Instance<'tcx>,
 ) -> Result<oomir::Constant, String> {
-    if let TyKind::RawPtr(pointee, _) = ty.kind() {
+    let ty = EarlyBinder::bind(tcx, ty)
+        .instantiate(tcx, instance.args)
+        .skip_norm_wip();
+    if tcx
+        .layout_of(TypingEnv::fully_monomorphized().as_query_input(ty))
+        .map(|layout| layout.is_zst())
+        .unwrap_or(false)
+    {
+        return read_zero_sized_constant(tcx, ty, oomir_data_types, instance);
+    }
+
+    if let TyKind::RawPtr(pointee, _) | TyKind::Ref(_, pointee, _) = ty.kind()
+        && matches!(
+            ty_to_oomir_type(ty, tcx, oomir_data_types, instance),
+            oomir::Type::Pointer(_)
+        )
+    {
         let layout = tcx
             .layout_of(TypingEnv::fully_monomorphized().as_query_input(*pointee))
             .map_err(|error| format!("Could not determine pointee layout for {ty:?}: {error:?}"))?;
@@ -173,6 +189,54 @@ pub fn read_scalar_int_constant<'tcx>(
                         .map_err(|_| format!("Pointee layout for {ty:?} exceeds JVM limits"))?,
                 ),
             ],
+        });
+    }
+
+    if let TyKind::Closure(_, closure_args) = ty.kind() {
+        let class_name = match ty_to_oomir_type(ty, tcx, oomir_data_types, instance) {
+            oomir::Type::Class(class_name) => class_name,
+            other => {
+                return Err(format!(
+                    "Scalar closure {ty:?} did not map to a JVM class: {other:?}"
+                ));
+            }
+        };
+        let mut fields = HashMap::new();
+        let mut params = Vec::new();
+        let mut non_zst_captures = 0usize;
+        for (index, capture_ty) in closure_args.as_closure().upvar_tys().iter().enumerate() {
+            let capture_ty = EarlyBinder::bind(tcx, capture_ty)
+                .instantiate(tcx, instance.args)
+                .skip_norm_wip();
+            let capture_layout = tcx
+                .layout_of(TypingEnv::fully_monomorphized().as_query_input(capture_ty))
+                .map_err(|error| {
+                    format!(
+                        "Could not determine closure capture layout for {capture_ty:?}: {error:?}"
+                    )
+                })?;
+            let capture_jvm_ty = ty_to_oomir_type(capture_ty, tcx, oomir_data_types, instance);
+            if !capture_jvm_ty.has_jvm_value() {
+                continue;
+            }
+            let capture = if capture_layout.is_zst() {
+                read_zero_sized_constant(tcx, capture_ty, oomir_data_types, instance)?
+            } else {
+                non_zst_captures += 1;
+                read_scalar_int_constant(tcx, scalar_int, capture_ty, oomir_data_types, instance)?
+            };
+            fields.insert(format!("arg{index}"), capture.clone());
+            params.push(capture);
+        }
+        if non_zst_captures != 1 {
+            return Err(format!(
+                "Scalar closure {ty:?} has {non_zst_captures} non-ZST captures, expected exactly one"
+            ));
+        }
+        return Ok(oomir::Constant::Instance {
+            class_name,
+            fields,
+            params,
         });
     }
 
@@ -259,6 +323,172 @@ pub fn read_scalar_int_constant<'tcx>(
     }
 
     Ok(scalar_int_to_oomir_constant(scalar_int, ty))
+}
+
+pub fn read_zero_sized_constant<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    ty: Ty<'tcx>,
+    oomir_data_types: &mut HashMap<String, oomir::DataType>,
+    instance: Instance<'tcx>,
+) -> Result<oomir::Constant, String> {
+    let ty = EarlyBinder::bind(tcx, ty)
+        .instantiate(tcx, instance.args)
+        .skip_norm_wip();
+    let layout = tcx
+        .layout_of(TypingEnv::fully_monomorphized().as_query_input(ty))
+        .map_err(|error| format!("Could not determine ZST layout for {ty:?}: {error:?}"))?;
+    if !layout.is_zst() {
+        return Err(format!("Type {ty:?} is not zero-sized"));
+    }
+
+    let oomir_ty = ty_to_oomir_type(ty, tcx, oomir_data_types, instance);
+    if !oomir_ty.has_jvm_value() {
+        return Ok(oomir::Constant::Unit);
+    }
+
+    let make_instance = |class_name: String, named_values: Vec<(String, oomir::Constant)>| {
+        let fields = named_values.iter().cloned().collect::<HashMap<_, _>>();
+        let params = named_values.into_iter().map(|(_, value)| value).collect();
+        oomir::Constant::Instance {
+            class_name,
+            fields,
+            params,
+        }
+    };
+
+    match ty.kind() {
+        TyKind::FnDef(..) => {
+            let oomir::Type::Class(class_name) = oomir_ty else {
+                return Err(format!("ZST function item {ty:?} did not map to a class"));
+            };
+            Ok(make_instance(class_name, Vec::new()))
+        }
+        TyKind::Closure(_, closure_args) => {
+            let oomir::Type::Class(class_name) = oomir_ty else {
+                return Err(format!("ZST closure {ty:?} did not map to a class"));
+            };
+            let mut values = Vec::new();
+            for (index, capture_ty) in closure_args.as_closure().upvar_tys().iter().enumerate() {
+                let capture_ty = EarlyBinder::bind(tcx, capture_ty)
+                    .instantiate(tcx, instance.args)
+                    .skip_norm_wip();
+                let capture_jvm_ty = ty_to_oomir_type(capture_ty, tcx, oomir_data_types, instance);
+                if capture_jvm_ty.has_jvm_value() {
+                    values.push((
+                        format!("arg{index}"),
+                        read_zero_sized_constant(tcx, capture_ty, oomir_data_types, instance)?,
+                    ));
+                }
+            }
+            Ok(make_instance(class_name, values))
+        }
+        TyKind::Adt(adt_def, substs) if adt_def.is_struct() => {
+            let oomir::Type::Class(class_name) = oomir_ty else {
+                return Err(format!("ZST struct {ty:?} did not map to a class"));
+            };
+            let mut values = Vec::new();
+            for field in &adt_def.variant(VariantIdx::from_usize(0)).fields {
+                let field_ty = EarlyBinder::bind(tcx, field.ty(tcx, substs).skip_norm_wip())
+                    .instantiate(tcx, instance.args)
+                    .skip_norm_wip();
+                let field_jvm_ty = ty_to_oomir_type(field_ty, tcx, oomir_data_types, instance);
+                if field_jvm_ty.has_jvm_value() {
+                    values.push((
+                        field.ident(tcx).to_string(),
+                        read_zero_sized_constant(tcx, field_ty, oomir_data_types, instance)?,
+                    ));
+                }
+            }
+            Ok(make_instance(class_name, values))
+        }
+        TyKind::Adt(adt_def, substs) if adt_def.is_union() => {
+            let class_name =
+                ensure_union_data_type(adt_def, substs, tcx, oomir_data_types, instance);
+            let bytes = oomir::Constant::Array(Box::new(oomir::Type::I8), Vec::new());
+            let objects = oomir::Constant::Array(
+                Box::new(oomir::Type::Class("java/lang/Object".to_string())),
+                vec![oomir::Constant::Null(oomir::Type::Class(
+                    "java/lang/Object".to_string(),
+                ))],
+            );
+            Ok(oomir::Constant::Instance {
+                class_name,
+                fields: HashMap::from([
+                    (UNION_BYTES_FIELD.to_string(), bytes.clone()),
+                    (UNION_OBJECTS_FIELD.to_string(), objects.clone()),
+                ]),
+                params: vec![bytes, objects],
+            })
+        }
+        TyKind::Adt(adt_def, substs) if adt_def.is_enum() => {
+            let Variants::Single { index } = layout.variants else {
+                return Err(format!(
+                    "ZST enum {ty:?} does not have one known active variant"
+                ));
+            };
+            let oomir::Type::Class(base_class) = oomir_ty else {
+                return Err(format!("ZST enum {ty:?} did not map to a class"));
+            };
+            let variant = adt_def.variant(index);
+            let class_name = format!(
+                "{}${}",
+                base_class,
+                jvm_names::member_name(&variant.name.to_string())
+            );
+            let mut values = Vec::new();
+            let mut jvm_index = 0usize;
+            for field in &variant.fields {
+                let field_ty = EarlyBinder::bind(tcx, field.ty(tcx, substs).skip_norm_wip())
+                    .instantiate(tcx, instance.args)
+                    .skip_norm_wip();
+                let field_jvm_ty = ty_to_oomir_type(field_ty, tcx, oomir_data_types, instance);
+                if field_jvm_ty.has_jvm_value() {
+                    values.push((
+                        format!("field{jvm_index}"),
+                        read_zero_sized_constant(tcx, field_ty, oomir_data_types, instance)?,
+                    ));
+                    jvm_index += 1;
+                }
+            }
+            Ok(make_instance(class_name, values))
+        }
+        TyKind::Tuple(elements) => {
+            let element_tys = elements.iter().collect::<Vec<_>>();
+            if element_tys.is_empty() {
+                return Ok(oomir::Constant::Unit);
+            }
+            let oomir::Type::Class(class_name) = oomir_ty else {
+                return Err(format!("ZST tuple {ty:?} did not map to a class"));
+            };
+            let mut values = Vec::new();
+            for (index, element_ty) in element_tys.into_iter().enumerate() {
+                let element_jvm_ty = ty_to_oomir_type(element_ty, tcx, oomir_data_types, instance);
+                if element_jvm_ty.has_jvm_value() {
+                    values.push((
+                        format!("field{index}"),
+                        read_zero_sized_constant(tcx, element_ty, oomir_data_types, instance)?,
+                    ));
+                }
+            }
+            Ok(make_instance(class_name, values))
+        }
+        TyKind::Array(element_ty, length) => {
+            let length = length
+                .try_to_target_usize(tcx)
+                .ok_or_else(|| format!("ZST array length is not concrete for {ty:?}"))?;
+            let element_jvm_ty = ty_to_oomir_type(*element_ty, tcx, oomir_data_types, instance);
+            let mut elements = Vec::with_capacity(length as usize);
+            for _ in 0..length {
+                elements.push(if element_jvm_ty.has_jvm_value() {
+                    read_zero_sized_constant(tcx, *element_ty, oomir_data_types, instance)?
+                } else {
+                    oomir::Constant::Unit
+                });
+            }
+            Ok(oomir::Constant::Array(Box::new(element_jvm_ty), elements))
+        }
+        _ => Err(format!("Unsupported nominal ZST constant type: {ty:?}")),
+    }
 }
 
 pub fn read_pointer_constant<'tcx>(

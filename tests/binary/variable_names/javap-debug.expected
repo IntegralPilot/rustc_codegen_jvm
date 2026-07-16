@@ -10,24 +10,36 @@ line 13: 42
 line 14: 72
 line 12: 102
 line 16: 105
-line 17: 136
-line 16: 137
-line 17: 139
-line 18: 147
-line 17: 149
+line 17: 137
+line 16: 138
+line 17: 140
+line 18: 148
+line 17: 150
 LocalVariableTable:
 Start Length Slot Name Signature
-0 132 0 first I
-147 2 0 first I
-0 155 1 wide J
-29 118 7 doubled I
-149 6 7 doubled I
-32 115 8 total I
-149 6 8 total I
-35 112 9 index I
-149 6 9 index I
-139 8 25 first I
-149 6 25 first I
+0 133 0 first I
+148 2 0 first I
+0 156 1 wide J
+29 119 7 doubled I
+150 6 7 doubled I
+32 116 8 total I
+150 6 8 total I
+35 113 9 index I
+150 6 9 index I
+140 8 25 first I
+150 6 25 first I
+
+public static long addr__ea382b1844_Unit__fd5bde3efd(org.rustlang.runtime.Pointer);
+LineNumberTable:
+line 159: 0
+line 160: 9
+LocalVariableTable:
+Start Length Slot Name Signature
+0 10 0 self Lorg/rustlang/runtime/Pointer;
+
+public static long size_of_u8__f6efc92cb8();
+LineNumberTable:
+line 383: 0
 
 public static long start_Unit__e8fbf9352b(org.rustlang.runtime.FnPtr_09edc617f6bf6664, long, org.rustlang.runtime.Pointer, byte);
 LineNumberTable:
@@ -39,6 +51,96 @@ Start Length Slot Name Signature
 0 8 1 arg1 J
 0 8 3 arg2 Lorg/rustlang/runtime/Pointer;
 0 8 4 arg3 B
+
+public static org.rustlang.core.result.Result_Tuple__Error spec_write_fmt__62ac4e9cd9_PanicBuffer__4279852ae3(org.rustlang.runtime.Pointer, org.rustlang.core.fmt.Arguments);
+LineNumberTable:
+line 234: 0
+line 235: 13
+line 234: 14
+line 235: 15
+line 234: 44
+line 235: 54
+line 236: 63
+line 240: 76
+line 238: 78
+LocalVariableTable:
+Start Length Slot Name Signature
+0 112 0 self Lorg/rustlang/runtime/Pointer;
+0 112 1 args Lorg/rustlang/core/fmt/Arguments;
+63 13 9 s Lorg/rustlang/runtime/Utf8View;
+
+public static org.rustlang.core.result.Result_Tuple__Error write_char__e38b5012f4_PanicBuffer__1c8dbdce5c(org.rustlang.runtime.Pointer, int);
+LineNumberTable:
+line 185: 0
+line 186: 9
+line 187: 107
+LocalVariableTable:
+Start Length Slot Name Signature
+0 108 0 self Lorg/rustlang/runtime/Pointer;
+0 108 1 c I
+
+public static org.rustlang.core.result.Result_Tuple__Error write_fmt__8bcf6eaa37_PanicBuffer__61a242a131(org.rustlang.runtime.Pointer, org.rustlang.core.fmt.Arguments);
+LineNumberTable:
+line 243: 0
+line 244: 11
+LocalVariableTable:
+Start Length Slot Name Signature
+0 12 0 self Lorg/rustlang/runtime/Pointer;
+0 12 1 args Lorg/rustlang/core/fmt/Arguments;
+
+public static org.rustlang.runtime.Pointer add__3e533e90b4_u8__a67f74dc06(org.rustlang.runtime.Pointer, long, org.rustlang.runtime.Pointer);
+LineNumberTable:
+line 77: 0
+line 964: 6
+line 966: 14
+line 78: 17
+line 971: 27
+line 972: 32
+LocalVariableTable:
+Start Length Slot Name Signature
+0 33 0 self Lorg/rustlang/runtime/Pointer;
+0 33 1 count J
+
+public static org.rustlang.runtime.Pointer as_mut_ptr__ffa8c214a5_u8__c66380cace(org.rustlang.runtime.SliceView);
+LineNumberTable:
+line 761: 0
+line 762: 14
+LocalVariableTable:
+Start Length Slot Name Signature
+0 15 0 self Lorg/rustlang/runtime/SliceView;
+
+public static org.rustlang.runtime.Pointer cast__7fa34c252a_Unit_Unit__055884396d(org.rustlang.runtime.Pointer);
+LineNumberTable:
+line 49: 0
+line 50: 6
+LocalVariableTable:
+Start Length Slot Name Signature
+0 7 0 self Lorg/rustlang/runtime/Pointer;
+
+public static org.rustlang.runtime.SliceView get_offset_len_noubcheck_u8__aa3ed11200(org.rustlang.runtime.SliceView, long, long);
+LineNumberTable:
+line 88: 0
+line 90: 14
+line 88: 15
+line 90: 17
+line 91: 23
+line 92: 38
+LocalVariableTable:
+Start Length Slot Name Signature
+38 1 0 ptr Lorg/rustlang/runtime/SliceView;
+0 39 1 offset J
+0 39 3 len J
+17 6 7 ptr Lorg/rustlang/runtime/Pointer;
+23 15 9 ptr Lorg/rustlang/runtime/Pointer;
+
+public static org.rustlang.runtime.SliceView index__2abf71c3d9_u8_RangeTo_usize__6934750479(org.rustlang.runtime.SliceView, org.rustlang.core.ops.range.RangeTo_usize, org.rustlang.runtime.Pointer);
+LineNumberTable:
+line 19: 0
+line 20: 6
+LocalVariableTable:
+Start Length Slot Name Signature
+0 7 0 self Lorg/rustlang/runtime/SliceView;
+0 7 1 index Lorg/rustlang/core/ops/range/RangeTo_usize;
 
 public static void main(java.lang.String[]);
 LineNumberTable:

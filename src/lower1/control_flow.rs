@@ -218,7 +218,7 @@ pub(super) fn emit_rust_drop_value<'tcx>(
 
     match rust_ty.kind() {
         TyKind::Adt(adt_def, substs) if adt_def.is_struct() => {
-            if !adt_def.did().is_local() {
+            if !super::types::should_define_named_data_type(tcx, adt_def.did()) {
                 // Standard-library/JVM-backed containers are represented by
                 // managed carriers (for example Rust String -> JVM String).
                 // Their native Rust field layout is not the JVM object layout.
@@ -355,6 +355,37 @@ pub(super) fn emit_rust_drop_value<'tcx>(
                     instructions,
                 );
             }
+        }
+        TyKind::Slice(element_ty) => {
+            if !element_ty.needs_drop(tcx, TypingEnv::fully_monomorphized()) {
+                return;
+            }
+            let drop_instance = Instance::resolve_drop_glue(tcx, *element_ty);
+            let target = super::naming::mono_fn_name_from_instance(tcx, drop_instance);
+            instructions.push(oomir::Instruction::InvokeStatic {
+                class_name: oomir::POINTER_CLASS.to_string(),
+                method_name: "dropSlice".to_string(),
+                method_ty: oomir::Signature {
+                    params: vec![
+                        (
+                            "slice".to_string(),
+                            oomir::Type::Class("java/lang/Object".to_string()),
+                        ),
+                        ("owner".to_string(), oomir::Type::java_string()),
+                        ("method".to_string(), oomir::Type::java_string()),
+                    ],
+                    ret: Box::new(oomir::Type::Void),
+                    is_static: true,
+                },
+                args: vec![
+                    value,
+                    oomir::Operand::Constant(oomir::Constant::String(
+                        target.class_to_call_on.expect("drop glue has a JVM owner"),
+                    )),
+                    oomir::Operand::Constant(oomir::Constant::String(target.method_name)),
+                ],
+                dest: None,
+            });
         }
         // Rust unions require ManuallyDrop fields. Enums use a virtual helper
         // generated on every variant so the active payload is destroyed without
@@ -520,6 +551,23 @@ fn emit_mutable_borrow_writeback<'tcx>(
         // redundant and could overwrite the field with the enclosing object.
         return instructions;
     }
+    if let Some((rustc_middle::mir::ProjectionElem::Field(_, _), base_projection)) =
+        original_place.projection.split_last()
+    {
+        let base_place = Place {
+            local: original_place.local,
+            projection: tcx.mk_place_elems(base_projection),
+        };
+        let base_ty = EarlyBinder::bind(tcx, base_place.ty(&mir.local_decls, tcx).ty)
+            .instantiate(tcx, instance.args)
+            .skip_norm_wip();
+        if matches!(
+            base_ty.kind(),
+            TyKind::Adt(adt_def, _) if adt_def.is_struct() || adt_def.is_enum()
+        ) {
+            return instructions;
+        }
+    }
     if !element_ty.has_jvm_value() {
         return instructions;
     }
@@ -649,6 +697,68 @@ fn requires_compiled_static_dispatch(ty: &oomir::Type) -> bool {
             ty,
             oomir::Type::Array(_) | oomir::Type::Slice(_) | oomir::Type::Str
         )
+}
+
+fn emit_raw_eq_pointer<'tcx>(
+    operand: oomir::Operand,
+    compared_ty: Ty<'tcx>,
+    temp_name: &str,
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
+    data_types: &mut HashMap<String, oomir::DataType>,
+    instructions: &mut Vec<oomir::Instruction>,
+) -> oomir::Operand {
+    if matches!(operand.get_type(), Some(oomir::Type::Pointer(_))) {
+        return operand;
+    }
+
+    let element_ty = match compared_ty.kind() {
+        TyKind::Array(element, _) | TyKind::Slice(element) => *element,
+        TyKind::Str => tcx.types.u8,
+        other => panic!("raw_eq received a non-pointer JVM carrier for {other:?}"),
+    };
+    assert!(
+        matches!(
+            operand.get_type(),
+            Some(oomir::Type::Slice(_) | oomir::Type::Str)
+        ),
+        "raw_eq slice conversion received unexpected carrier {:?}",
+        operand.get_type()
+    );
+    let element_oomir_ty = super::types::ty_to_oomir_type(element_ty, tcx, data_types, instance);
+    let pointer_ty = oomir::Type::Pointer(Box::new(element_oomir_ty));
+    instructions.push(oomir::Instruction::InvokeStatic {
+        dest: Some(temp_name.to_string()),
+        class_name: oomir::POINTER_CLASS.to_string(),
+        method_name: "fromSlice".to_string(),
+        method_ty: oomir::Signature {
+            params: vec![
+                (
+                    "slice".to_string(),
+                    oomir::Type::Class("java/lang/Object".to_string()),
+                ),
+                ("element_size".to_string(), oomir::Type::I32),
+                ("codec".to_string(), oomir::Type::java_string()),
+            ],
+            ret: Box::new(pointer_ty.clone()),
+            is_static: true,
+        },
+        args: vec![
+            operand,
+            oomir::Operand::Constant(oomir::Constant::I32(
+                i32::try_from(
+                    super::types::layout_size_bytes(tcx, element_ty)
+                        .expect("raw_eq element has a concrete layout"),
+                )
+                .expect("raw_eq element layout exceeds JVM address space"),
+            )),
+            super::types::pointer_memory_codec_operand(element_ty, tcx, data_types, instance),
+        ],
+    });
+    oomir::Operand::Variable {
+        name: temp_name.to_string(),
+        ty: pointer_ty,
+    }
 }
 
 fn comparison_value_type<'tcx>(mut ty: oomir::Type, mut mir_ty: Ty<'tcx>) -> oomir::Type {
@@ -1292,16 +1402,31 @@ pub(super) fn convert_basic_block<'tcx>(
                     } else if let InstanceKind::Shim(ShimKind::DropGlue(_, drop_ty)) =
                         func_instance.def
                     {
-                        if let Some(drop_ty) = drop_ty {
+                        if let Some(drop_ty) = drop_ty
+                            && drop_ty.needs_drop(tcx, TypingEnv::fully_monomorphized())
+                        {
                             let drop_oomir_ty =
                                 super::types::ty_to_oomir_type(drop_ty, tcx, data_types, instance);
-                            let value_name = format!("{label}_drop_glue_value");
-                            let value = super::place::emit_pointer_read(
-                                oomir_operands[0].clone(),
-                                &drop_oomir_ty,
-                                &value_name,
-                                &mut instructions,
-                            );
+                            let pointer = oomir_operands[0].clone();
+                            let value = if matches!(drop_ty.kind(), TyKind::Slice(_)) {
+                                match pointer {
+                                    oomir::Operand::Variable { name, .. } => {
+                                        oomir::Operand::Variable {
+                                            name,
+                                            ty: drop_oomir_ty.clone(),
+                                        }
+                                    }
+                                    other => other,
+                                }
+                            } else {
+                                let value_name = format!("{label}_drop_glue_value");
+                                super::place::emit_pointer_read(
+                                    pointer,
+                                    &drop_oomir_ty,
+                                    &value_name,
+                                    &mut instructions,
+                                )
+                            };
                             emit_rust_drop_value(
                                 drop_ty,
                                 value,
@@ -1379,6 +1504,46 @@ pub(super) fn convert_basic_block<'tcx>(
                                     EarlyBinder::bind(tcx, receiver_mir_ty)
                                         .instantiate(tcx, instance.args)
                                         .skip_norm_wip();
+                                let receiver_self_mir_ty = match resolved_receiver_mir_ty.kind() {
+                                    TyKind::Ref(_, pointee, _) => *pointee,
+                                    _ => resolved_receiver_mir_ty,
+                                };
+                                let mut receiver_value_mir_ty = receiver_self_mir_ty;
+                                while let TyKind::Ref(_, pointee, _) = receiver_value_mir_ty.kind()
+                                {
+                                    receiver_value_mir_ty = *pointee;
+                                }
+                                let has_enum_reference_receiver = matches!(
+                                    resolved_receiver_mir_ty.kind(),
+                                    TyKind::Ref(_, pointee, _)
+                                        if matches!(pointee.kind(), TyKind::Adt(adt_def, _)
+                                            if adt_def.is_enum())
+                                );
+                                let method_has_own_generic_params = !tcx
+                                    .generics_of(func_instance.def_id())
+                                    .own_params
+                                    .is_empty();
+                                // The class behind a reference implements
+                                // methods for its pointee, not blanket Rust
+                                // impls whose `Self` is the reference itself
+                                // when that pointee has no generated instance
+                                // methods (notably closures and function items).
+                                let receiver_self_requires_static_dispatch =
+                                    has_enum_reference_receiver
+                                        || matches!(
+                                            receiver_value_mir_ty.kind(),
+                                            TyKind::Closure(..)
+                                                | TyKind::FnDef(..)
+                                                | TyKind::FnPtr(..)
+                                        )
+                                        || matches!(
+                                            receiver_self_mir_ty.kind(),
+                                            TyKind::Ref(..) if method_has_own_generic_params
+                                        )
+                                        || matches!(
+                                            receiver_self_mir_ty.kind(),
+                                            TyKind::RawPtr(..) | TyKind::FnPtr(..)
+                                        );
                                 let pointer_api_receiver = {
                                     let receiver_value_ty = match resolved_receiver_mir_ty.kind() {
                                         TyKind::Ref(_, pointee, _) => *pointee,
@@ -2338,9 +2503,9 @@ pub(super) fn convert_basic_block<'tcx>(
                                                     .insert(0, explicit_method_args[0].clone());
                                             }
                                             instructions.push(oomir::Instruction::InvokeStatic {
-                                                class_name: super::jvm_names::crate_module_class(
+                                                class_name: super::naming::mono_owner_class(
                                                     tcx,
-                                                    closure_instance.def_id().krate,
+                                                    closure_instance,
                                                 ),
                                                 method_name: super::generate_closure_function_name(
                                                     tcx,
@@ -2428,7 +2593,16 @@ pub(super) fn convert_basic_block<'tcx>(
                                         dest: effective_dest,
                                     });
                                 } else if let Some(interface_name) = use_interface {
-                                    if requires_compiled_static_dispatch(&dispatch_receiver_ty) {
+                                    let concrete_provided_trait_method = trait_container.is_some()
+                                        && item.defaultness(tcx).has_value()
+                                        && !matches!(
+                                            dispatch_receiver_ty,
+                                            oomir::Type::Interface(_)
+                                        );
+                                    if concrete_provided_trait_method
+                                        || receiver_self_requires_static_dispatch
+                                        || requires_compiled_static_dispatch(&dispatch_receiver_ty)
+                                    {
                                         let target = super::naming::mono_fn_name_from_instance(
                                             tcx,
                                             func_instance,
@@ -2587,7 +2761,9 @@ pub(super) fn convert_basic_block<'tcx>(
                                         _ => None,
                                     };
                                     let static_target = runtime_static_target.or_else(|| {
-                                        requires_compiled_static_dispatch(&class_type).then(|| {
+                                        (receiver_self_requires_static_dispatch
+                                            || requires_compiled_static_dispatch(&class_type))
+                                        .then(|| {
                                             let target = super::naming::mono_fn_name_from_instance(
                                                 tcx,
                                                 func_instance,
@@ -2888,6 +3064,135 @@ pub(super) fn convert_basic_block<'tcx>(
                             // panic or do nothing, and reaching the invalid case would make the
                             // following unsafe operation UB. Valid monomorphizations therefore
                             // require no JVM instruction.
+                        } else if is_compiler_intrinsic
+                            && intrinsic_name.as_str() == "is_val_statically_known"
+                            && let Some(dest) = effective_dest.clone()
+                        {
+                            // This intrinsic is explicitly nondeterministic: callers must be
+                            // correct for either result. Returning false is its conservative
+                            // runtime implementation when this backend has not proved the
+                            // operand to be a compile-time constant.
+                            instructions.push(oomir::Instruction::Move {
+                                dest,
+                                src: oomir::Operand::Constant(oomir::Constant::Boolean(false)),
+                            });
+                        } else if is_compiler_intrinsic
+                            && matches!(
+                                intrinsic_name.as_str(),
+                                "saturating_add" | "saturating_sub"
+                            )
+                            && let Some(dest) = effective_dest.clone()
+                        {
+                            let operation = if intrinsic_name == "saturating_add" {
+                                "Add"
+                            } else {
+                                "Sub"
+                            };
+                            let suffix = match &oomir_output_type {
+                                oomir::Type::I8 => "I8",
+                                oomir::Type::U8 => "U8",
+                                oomir::Type::I16 => "I16",
+                                oomir::Type::U16 => "U16",
+                                oomir::Type::I32 => "I32",
+                                oomir::Type::U32 => "U32",
+                                oomir::Type::I64 => "I64",
+                                oomir::Type::U64 => "U64",
+                                oomir::Type::Class(class_name)
+                                    if class_name == crate::lower2::I128_CLASS =>
+                                {
+                                    "I128"
+                                }
+                                oomir::Type::Class(class_name)
+                                    if class_name == crate::lower2::U128_CLASS =>
+                                {
+                                    "U128"
+                                }
+                                ref other => {
+                                    panic!("unsupported saturating intrinsic carrier {other:?}")
+                                }
+                            };
+                            instructions.push(oomir::Instruction::InvokeStatic {
+                                dest: Some(dest),
+                                class_name: "org/rustlang/runtime/Numbers".to_string(),
+                                method_name: format!("saturating{operation}{suffix}"),
+                                method_ty: oomir::Signature {
+                                    params: vec![
+                                        ("left".to_string(), oomir_output_type.clone()),
+                                        ("right".to_string(), oomir_output_type.clone()),
+                                    ],
+                                    ret: Box::new(oomir_output_type.clone()),
+                                    is_static: true,
+                                },
+                                args: oomir_operands.clone(),
+                            });
+                        } else if intrinsic_name == "raw_eq"
+                            && is_compiler_intrinsic
+                            && let Some(dest) = effective_dest.clone()
+                        {
+                            let compared_ty = func_instance
+                                .args
+                                .types()
+                                .next()
+                                .expect("raw_eq has a compared type argument");
+                            let byte_count = super::types::layout_size_bytes(tcx, compared_ty)
+                                .expect("raw_eq type has a concrete layout");
+                            if byte_count == 0 {
+                                instructions.push(oomir::Instruction::Move {
+                                    dest,
+                                    src: oomir::Operand::Constant(oomir::Constant::Boolean(true)),
+                                });
+                            } else {
+                                let left = emit_raw_eq_pointer(
+                                    oomir_operands[0].clone(),
+                                    compared_ty,
+                                    &format!("{label}_raw_eq_left"),
+                                    tcx,
+                                    instance,
+                                    data_types,
+                                    &mut instructions,
+                                );
+                                let right = emit_raw_eq_pointer(
+                                    oomir_operands[1].clone(),
+                                    compared_ty,
+                                    &format!("{label}_raw_eq_right"),
+                                    tcx,
+                                    instance,
+                                    data_types,
+                                    &mut instructions,
+                                );
+                                let comparison = format!("{label}_raw_eq_comparison");
+                                let pointer_ty =
+                                    left.get_type().expect("raw_eq pointer operand is typed");
+                                instructions.push(oomir::Instruction::InvokeStatic {
+                                    dest: Some(comparison.clone()),
+                                    class_name: oomir::POINTER_CLASS.to_string(),
+                                    method_name: "compareBytes".to_string(),
+                                    method_ty: oomir::Signature {
+                                        params: vec![
+                                            ("left".to_string(), pointer_ty.clone()),
+                                            ("right".to_string(), pointer_ty),
+                                            ("length".to_string(), oomir::Type::U64),
+                                        ],
+                                        ret: Box::new(oomir::Type::I32),
+                                        is_static: true,
+                                    },
+                                    args: vec![
+                                        left,
+                                        right,
+                                        oomir::Operand::Constant(oomir::Constant::U64(
+                                            byte_count as u64,
+                                        )),
+                                    ],
+                                });
+                                instructions.push(oomir::Instruction::Eq {
+                                    dest,
+                                    op1: oomir::Operand::Variable {
+                                        name: comparison,
+                                        ty: oomir::Type::I32,
+                                    },
+                                    op2: oomir::Operand::Constant(oomir::Constant::I32(0)),
+                                });
+                            }
                         } else if intrinsic_name.as_str() == "caller_location"
                             && is_compiler_intrinsic
                             && let Some(dest) = effective_dest.clone()
@@ -3112,25 +3417,44 @@ pub(super) fn convert_basic_block<'tcx>(
                                 .types()
                                 .next()
                                 .expect("drop_in_place has a pointee type argument");
-                            let pointee_oomir_ty = super::types::ty_to_oomir_type(
-                                pointee_ty, tcx, data_types, instance,
-                            );
-                            let value_name = format!("{label}_drop_in_place_value");
-                            let value = super::place::emit_pointer_read(
-                                oomir_operands[0].clone(),
-                                &pointee_oomir_ty,
-                                &value_name,
-                                &mut instructions,
-                            );
-                            emit_rust_drop_value(
-                                pointee_ty,
-                                value,
-                                &format!("{label}_drop_in_place"),
-                                tcx,
-                                instance,
-                                data_types,
-                                &mut instructions,
-                            );
+                            if pointee_ty.needs_drop(tcx, TypingEnv::fully_monomorphized()) {
+                                let pointee_oomir_ty = super::types::ty_to_oomir_type(
+                                    pointee_ty, tcx, data_types, instance,
+                                );
+                                let pointer = oomir_operands[0].clone();
+                                let value = if !matches!(pointee_ty.kind(), TyKind::Slice(_))
+                                    && matches!(pointer.get_type(), Some(oomir::Type::Pointer(_)))
+                                {
+                                    let value_name = format!("{label}_drop_in_place_value");
+                                    super::place::emit_pointer_read(
+                                        pointer,
+                                        &pointee_oomir_ty,
+                                        &value_name,
+                                        &mut instructions,
+                                    )
+                                } else {
+                                    // Fat slice references are already carried
+                                    // as SliceView values rather than Pointer.
+                                    match pointer {
+                                        oomir::Operand::Variable { name, .. } => {
+                                            oomir::Operand::Variable {
+                                                name,
+                                                ty: pointee_oomir_ty.clone(),
+                                            }
+                                        }
+                                        other => other,
+                                    }
+                                };
+                                emit_rust_drop_value(
+                                    pointee_ty,
+                                    value,
+                                    &format!("{label}_drop_in_place"),
+                                    tcx,
+                                    instance,
+                                    data_types,
+                                    &mut instructions,
+                                );
+                            }
                         } else if (is_diagnostic_item(sym::ptr_from_ref)
                             || intrinsic_name.as_str() == "from_mut")
                             && is_core_ptr
@@ -3816,10 +4140,7 @@ pub(super) fn convert_basic_block<'tcx>(
                             );
                             let (class_name, function) = if is_closure_call {
                                 (
-                                    super::jvm_names::crate_module_class(
-                                        tcx,
-                                        func_instance.def_id().krate,
-                                    ),
+                                    super::naming::mono_owner_class(tcx, func_instance),
                                     super::generate_closure_function_name(tcx, func_instance),
                                 )
                             } else {

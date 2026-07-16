@@ -1037,12 +1037,13 @@ fn union_aggregate_layout<'tcx>(
 
     let mut fields = Vec::new();
     for (rust_ty, jvm_name, offset) in raw_fields {
-        if layout_size_bytes(tcx, rust_ty)? == 0 {
+        let jvm_ty = ty_to_oomir_type(rust_ty, tcx, data_types, instance_context);
+        if !jvm_ty.has_jvm_value() {
             continue;
         }
         fields.push(UnionAggregateField {
             rust_ty,
-            jvm_ty: ty_to_oomir_type(rust_ty, tcx, data_types, instance_context),
+            jvm_ty,
             jvm_name,
             offset,
         });
@@ -1180,7 +1181,8 @@ fn union_enum_variant_layout<'tcx>(
     for (field_index, field) in variant.fields.iter().enumerate() {
         let rust_ty =
             resolve_union_ty(tcx, field.ty(tcx, substs).skip_norm_wip(), instance_context)?;
-        if layout_size_bytes(tcx, rust_ty)? == 0 {
+        let jvm_ty = ty_to_oomir_type(rust_ty, tcx, data_types, instance_context);
+        if !jvm_ty.has_jvm_value() {
             continue;
         }
         let offset = match &layout.variants {
@@ -1192,7 +1194,7 @@ fn union_enum_variant_layout<'tcx>(
         };
         fields.push(UnionAggregateField {
             rust_ty,
-            jvm_ty: ty_to_oomir_type(rust_ty, tcx, data_types, instance_context),
+            jvm_ty,
             jvm_name: format!("field{jvm_field_index}"),
             offset,
         });
@@ -1771,6 +1773,9 @@ fn emit_ty_to_union_bytes<'tcx>(
     temp_counter: &mut usize,
 ) -> Result<(), String> {
     let ty = resolve_union_ty(tcx, ty, instance_context)?;
+    if layout_size_bytes(tcx, ty)? == 0 {
+        return Ok(());
+    }
     if is_direct_union_scalar(ty) {
         return emit_scalar_to_union_bytes(
             ty,
@@ -1932,12 +1937,6 @@ fn emit_ty_to_union_bytes<'tcx>(
                 .ok_or_else(|| format!("array length is not concrete for {:?}", ty))?
                 as usize;
             let element_size = layout_size_bytes(tcx, *element_ty)?;
-            if element_size == 0 {
-                return Err(format!(
-                    "zero-sized array elements are unsupported in union field {:?}",
-                    ty
-                ));
-            }
             let element_oomir_ty = ty_to_oomir_type(*element_ty, tcx, data_types, instance_context);
 
             for index in 0..length {
@@ -2298,6 +2297,21 @@ fn emit_ty_from_union_bytes<'tcx>(
     temp_counter: &mut usize,
 ) -> Result<oomir::Operand, String> {
     let ty = resolve_union_ty(tcx, ty, instance_context)?;
+    if layout_size_bytes(tcx, ty)? == 0 {
+        let jvm_ty = ty_to_oomir_type(ty, tcx, data_types, instance_context);
+        if !jvm_ty.has_jvm_value() {
+            return Ok(oomir::Operand::Constant(oomir::Constant::Unit));
+        }
+        return super::value_repr::materialize_implicit_zst(
+            ty,
+            &next_union_temp("union_zst_value", temp_counter),
+            tcx,
+            instance_context,
+            data_types,
+            instructions,
+        )
+        .ok_or_else(|| format!("cannot materialize zero-sized value {ty:?} from Rust storage"));
+    }
     if is_direct_union_scalar(ty) {
         return emit_scalar_from_union_bytes(
             ty,
@@ -2322,6 +2336,83 @@ fn emit_ty_from_union_bytes<'tcx>(
             instructions,
             temp_counter,
         ),
+        TyKind::Ref(_, inner, _)
+            if let TyKind::Array(element, length) = inner.kind()
+                && matches!(
+                    ty_to_oomir_type(ty, tcx, data_types, instance_context),
+                    oomir::Type::Slice(_)
+                ) =>
+        {
+            let length = length
+                .try_to_target_usize(tcx)
+                .ok_or_else(|| format!("array length is not concrete for {inner:?}"))?;
+            let element_oomir_ty = ty_to_oomir_type(*element, tcx, data_types, instance_context);
+            let slice_ty = oomir::Type::Slice(Box::new(element_oomir_ty.clone()));
+            let pointer_ty = oomir::Type::Pointer(Box::new(element_oomir_ty));
+            let address = emit_bits_from_union_bytes(
+                oomir::Type::U64,
+                layout_size_bytes(tcx, ty)?,
+                storage,
+                base_offset,
+                instructions,
+                temp_counter,
+            );
+            let pointer_dest = next_union_temp("union_array_reference_pointer", temp_counter);
+            instructions.push(oomir::Instruction::InvokeStatic {
+                dest: Some(pointer_dest.clone()),
+                class_name: oomir::POINTER_CLASS.to_string(),
+                method_name: "fromAddress".to_string(),
+                method_ty: oomir::Signature {
+                    params: vec![
+                        ("address".to_string(), oomir::Type::U64),
+                        ("view_size".to_string(), oomir::Type::I32),
+                        ("view_codec".to_string(), oomir::Type::java_string()),
+                    ],
+                    ret: Box::new(pointer_ty.clone()),
+                    is_static: true,
+                },
+                args: vec![
+                    address,
+                    oomir::Operand::Constant(oomir::Constant::I32(
+                        i32::try_from(layout_size_bytes(tcx, *element)?)
+                            .map_err(|_| "array element layout exceeds JVM address space")?,
+                    )),
+                    pointer_memory_codec_operand(*element, tcx, data_types, instance_context),
+                ],
+            });
+            let object_dest = next_union_temp("union_array_reference_view", temp_counter);
+            instructions.push(oomir::Instruction::ConstructObject {
+                dest: object_dest.clone(),
+                class_name: oomir::SLICE_VIEW_CLASS.to_string(),
+                args: vec![
+                    (
+                        operand_var(pointer_dest, pointer_ty),
+                        oomir::Type::Class("java/lang/Object".to_string()),
+                    ),
+                    (
+                        oomir::Operand::Constant(oomir::Constant::I32(0)),
+                        oomir::Type::I32,
+                    ),
+                    (
+                        oomir::Operand::Constant(oomir::Constant::I32(
+                            i32::try_from(length)
+                                .map_err(|_| "array length exceeds JVM address space")?,
+                        )),
+                        oomir::Type::I32,
+                    ),
+                ],
+            });
+            let slice_dest = next_union_temp("union_array_reference_slice", temp_counter);
+            instructions.push(oomir::Instruction::Cast {
+                op: operand_var(
+                    object_dest,
+                    oomir::Type::Class(oomir::SLICE_VIEW_CLASS.to_string()),
+                ),
+                ty: slice_ty.clone(),
+                dest: slice_dest.clone(),
+            });
+            Ok(operand_var(slice_dest, slice_ty))
+        }
         TyKind::RawPtr(pointee, _) | TyKind::Ref(_, pointee, _)
             if matches!(
                 ty_to_oomir_type(ty, tcx, data_types, instance_context),
@@ -2396,12 +2487,6 @@ fn emit_ty_from_union_bytes<'tcx>(
                 .ok_or_else(|| format!("array length is not concrete for {:?}", ty))?
                 as usize;
             let element_size = layout_size_bytes(tcx, *element_ty)?;
-            if element_size == 0 {
-                return Err(format!(
-                    "zero-sized array elements are unsupported in union field {:?}",
-                    ty
-                ));
-            }
             let element_oomir_ty = ty_to_oomir_type(*element_ty, tcx, data_types, instance_context);
             let array_ty = oomir::Type::Array(Box::new(element_oomir_ty.clone()));
             let array_dest = next_union_temp("union_array_value", temp_counter);
@@ -2577,6 +2662,12 @@ fn exact_bytes_supported<'tcx>(
     instance_context: rustc_middle::ty::Instance<'tcx>,
 ) -> Result<(), String> {
     let ty = resolve_union_ty(tcx, ty, instance_context)?;
+    // ZSTs contribute no bits to an enclosing layout. Their nominal JVM
+    // carriers are reconstructed when decoding, so every materializable ZST is
+    // safe to traverse without requiring a byte codec of its own.
+    if layout_size_bytes(tcx, ty)? == 0 {
+        return Ok(());
+    }
     match ty.kind() {
         TyKind::Bool
         | TyKind::Char
@@ -2596,11 +2687,6 @@ fn exact_bytes_supported<'tcx>(
             length
                 .try_to_target_usize(tcx)
                 .ok_or_else(|| format!("array length is not concrete for {ty:?}"))?;
-            if layout_size_bytes(tcx, *element)? == 0 {
-                return Err(format!(
-                    "zero-sized array elements are not yet supported in exact-layout storage: {ty:?}"
-                ));
-            }
             exact_bytes_supported(*element, tcx, instance_context)
         }
         TyKind::Adt(adt_def, substs)
@@ -2825,7 +2911,7 @@ pub(super) fn ensure_pointer_memory_codec<'tcx>(
 
     let size = layout_size_bytes(tcx, ty)?;
     let value_ty = ty_to_oomir_type(ty, tcx, data_types, instance_context);
-    if size == 0 || !value_ty.has_jvm_value() {
+    if !value_ty.has_jvm_value() {
         return Ok(None);
     }
     let identity = format!("{ty:?}:{}:{size}", value_ty.to_jvm_descriptor());
@@ -3122,7 +3208,7 @@ fn union_from_function<'tcx>(
         }
         Err(err) => {
             breadcrumbs::log!(
-                breadcrumbs::LogLevel::Warn,
+                breadcrumbs::LogLevel::Info,
                 "type-mapping",
                 format!(
                     "Union constructor helper for {}.{} is unsupported: {}",
@@ -3212,7 +3298,7 @@ fn union_getter_function<'tcx>(
         }
         Err(err) => {
             breadcrumbs::log!(
-                breadcrumbs::LogLevel::Warn,
+                breadcrumbs::LogLevel::Info,
                 "type-mapping",
                 format!(
                     "Union getter helper for {}.{} is unsupported: {}",
@@ -3284,7 +3370,7 @@ fn union_setter_function<'tcx>(
         }
         Err(err) => {
             breadcrumbs::log!(
-                breadcrumbs::LogLevel::Warn,
+                breadcrumbs::LogLevel::Info,
                 "type-mapping",
                 format!(
                     "Union setter helper for {}.{} is unsupported: {}",
@@ -3913,6 +3999,20 @@ pub fn stable_instance_key<'tcx>(
         .to_string()
 }
 
+pub fn stable_normalized_instance_key<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: DefId,
+    args: GenericArgsRef<'tcx>,
+) -> String {
+    let args = tcx
+        .try_normalize_erasing_regions(
+            TypingEnv::fully_monomorphized(),
+            rustc_middle::ty::Unnormalized::new_wip(args),
+        )
+        .unwrap_or(args);
+    stable_instance_key(tcx, def_id, args)
+}
+
 // Maximum length for a readable tuple name (including the "Tuple_" prefix).
 // If the human-readable name exceeds this, we fall back to the hashed name.
 const MAX_TUPLE_NAME_LEN: usize = 64;
@@ -3998,10 +4098,63 @@ pub fn readable_rust_type_name<'tcx>(
             "{}Slice",
             readable_rust_type_name(*inner, tcx, data_types, instance_context)
         ),
+        TyKind::Tuple(elements) => format!(
+            "Tuple_{}",
+            elements
+                .iter()
+                .map(|element| readable_rust_type_name(element, tcx, data_types, instance_context,))
+                .collect::<Vec<_>>()
+                .join("_")
+        ),
+        TyKind::Adt(adt_def, substs) if !substs.is_empty() => {
+            let base = adt_base_jvm_name(adt_def, tcx)
+                .rsplit('/')
+                .next()
+                .unwrap_or("Adt")
+                .to_string();
+            let args = substs
+                .iter()
+                .filter_map(|arg| {
+                    if let Some(arg_ty) = arg.as_type() {
+                        Some(readable_rust_type_name(
+                            arg_ty,
+                            tcx,
+                            data_types,
+                            instance_context,
+                        ))
+                    } else {
+                        arg.as_const().map(|constant| {
+                            readable_rust_const_name(constant, tcx, instance_context)
+                        })
+                    }
+                })
+                .collect::<Vec<_>>();
+            if args.is_empty() {
+                base
+            } else {
+                format!("{}_{}", base, args.join("_"))
+            }
+        }
         TyKind::Int(IntTy::Isize) => "isize".to_string(),
         TyKind::Uint(UintTy::Usize) => "usize".to_string(),
         _ => readable_oomir_type_name(&ty_to_oomir_type(ty, tcx, data_types, instance_context)),
     }
+}
+
+fn readable_rust_const_name<'tcx>(
+    constant: rustc_middle::ty::Const<'tcx>,
+    tcx: TyCtxt<'tcx>,
+    instance_context: rustc_middle::ty::Instance<'tcx>,
+) -> String {
+    let instantiated = EarlyBinder::bind(tcx, constant).instantiate(tcx, instance_context.args);
+    let constant = tcx
+        .try_normalize_erasing_regions(TypingEnv::fully_monomorphized(), instantiated)
+        .unwrap_or_else(|_| instantiated.skip_norm_wip());
+
+    constant
+        .try_to_target_usize(tcx)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| with_no_trimmed_paths!(format!("{constant:?}")))
 }
 
 // Sanitize token so it contains only ASCII alphanumeric characters and underscores.
@@ -4032,8 +4185,12 @@ pub fn generate_adt_jvm_class_name<'tcx>(
         if let Some(arg_ty) = arg.as_type() {
             let token = readable_rust_type_name(arg_ty, tcx, data_types, instance_context);
             generic_tokens.push(sanitize_name_token(&token));
+        } else if let Some(constant) = arg.as_const() {
+            let token = readable_rust_const_name(constant, tcx, instance_context);
+            generic_tokens.push(sanitize_name_token(&token));
         } else {
-            generic_tokens.push("_".to_string());
+            // Regions are erased and therefore do not participate in JVM
+            // specialization identity.
         }
     }
 
@@ -4061,10 +4218,18 @@ pub fn generate_adt_jvm_class_name<'tcx>(
         name_parts.push_str("_");
         for arg in substs.iter() {
             if let Some(arg_ty) = arg.as_type() {
-                let oomir_ty = ty_to_oomir_type(arg_ty, tcx, data_types, instance_context);
-                name_parts.push_str(&oomir_ty.to_jvm_descriptor());
-                name_parts.push_str("_");
+                name_parts.push_str(&readable_rust_type_name(
+                    arg_ty,
+                    tcx,
+                    data_types,
+                    instance_context,
+                ));
+            } else if let Some(constant) = arg.as_const() {
+                name_parts.push_str(&readable_rust_const_name(constant, tcx, instance_context));
+            } else {
+                continue;
             }
+            name_parts.push('_');
         }
         let hash = short_hash(&name_parts, 10);
         let hashed_last = format!("{}_{}", last_segment, hash);
@@ -4095,11 +4260,7 @@ pub fn generate_tuple_jvm_class_name<'tcx>(
         tokens.push(sanitize_name_token(&token));
     }
 
-    let readable_name = jvm_names::synthetic_class_for_instance(
-        tcx,
-        instance_context,
-        format!("Tuple_{}", tokens.join("_")),
-    );
+    let readable_name = format!("org/rustlang/core/Tuple_{}", tokens.join("_"));
 
     // If the readable name is within bounds, use it. Otherwise fall back to a hash
     if readable_name.len() <= MAX_TUPLE_NAME_LEN {
@@ -4115,7 +4276,7 @@ pub fn generate_tuple_jvm_class_name<'tcx>(
         }
         // with a length of 10, the chance of a collision is tiny
         let hash = short_hash(&name_parts, 10);
-        jvm_names::synthetic_class_for_instance(tcx, instance_context, format!("Tuple_{}", hash))
+        format!("org/rustlang/core/Tuple_{}", hash)
     }
 }
 

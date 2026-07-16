@@ -379,7 +379,23 @@ pub fn load_constant(
             }
             let constructor_params = params
                 .iter()
-                .filter(|param| Type::from_constant(param).has_jvm_value())
+                .filter_map(|param| {
+                    let ty = Type::from_constant(param);
+                    if !ty.has_jvm_value() {
+                        return None;
+                    }
+                    let declared_ty = match ty {
+                        Type::Class(class_name) if class_name.contains('$') => Type::Class(
+                            class_name
+                                .split_once('$')
+                                .map(|(base, _)| base)
+                                .unwrap_or(&class_name)
+                                .to_string(),
+                        ),
+                        other => other,
+                    };
+                    Some((param, declared_ty))
+                })
                 .collect::<Vec<_>>();
 
             // 2. Determine constructor signature descriptor.
@@ -387,7 +403,7 @@ pub fn load_constant(
                 "({})V",
                 constructor_params
                     .iter()
-                    .map(|const_val| Type::from_constant(const_val).to_jvm_descriptor())
+                    .map(|(_, ty)| ty.to_jvm_descriptor())
                     .collect::<String>()
             );
 
@@ -406,7 +422,7 @@ pub fn load_constant(
             instructions_to_add.push(JI::Dup); // Stack: [uninitialized_ref, uninitialized_ref]
 
             // c. Load constructor parameters onto the stack IN ORDER
-            for param_const in constructor_params {
+            for (param_const, _) in constructor_params {
                 // Recursively load the constant value for the parameter.
                 // Append the instructions directly to our temporary list.
                 load_constant(&mut instructions_to_add, cp, param_const)?;

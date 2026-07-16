@@ -143,6 +143,83 @@ public final class Numbers {
         return ((long) (value - 0x1.0p63)) ^ Long.MIN_VALUE;
     }
 
+    public static byte saturatingAddI8(byte left, byte right) {
+        return (byte) Math.max(Byte.MIN_VALUE, Math.min(Byte.MAX_VALUE, left + right));
+    }
+    public static byte saturatingSubI8(byte left, byte right) {
+        return (byte) Math.max(Byte.MIN_VALUE, Math.min(Byte.MAX_VALUE, left - right));
+    }
+    public static byte saturatingAddU8(byte left, byte right) {
+        return (byte) Math.min(0xff, (left & 0xff) + (right & 0xff));
+    }
+    public static byte saturatingSubU8(byte left, byte right) {
+        return (byte) Math.max(0, (left & 0xff) - (right & 0xff));
+    }
+
+    public static short saturatingAddI16(short left, short right) {
+        return (short) Math.max(Short.MIN_VALUE, Math.min(Short.MAX_VALUE, left + right));
+    }
+    public static short saturatingSubI16(short left, short right) {
+        return (short) Math.max(Short.MIN_VALUE, Math.min(Short.MAX_VALUE, left - right));
+    }
+    public static char saturatingAddU16(char left, char right) {
+        return (char) Math.min(0xffff, left + right);
+    }
+    public static char saturatingSubU16(char left, char right) {
+        return (char) Math.max(0, left - right);
+    }
+
+    public static int saturatingAddI32(int left, int right) {
+        long result = (long) left + right;
+        return (int) Math.max(Integer.MIN_VALUE, Math.min(Integer.MAX_VALUE, result));
+    }
+    public static int saturatingSubI32(int left, int right) {
+        long result = (long) left - right;
+        return (int) Math.max(Integer.MIN_VALUE, Math.min(Integer.MAX_VALUE, result));
+    }
+    public static int saturatingAddU32(int left, int right) {
+        long result = Integer.toUnsignedLong(left) + Integer.toUnsignedLong(right);
+        return result > 0xffff_ffffL ? -1 : (int) result;
+    }
+    public static int saturatingSubU32(int left, int right) {
+        return Integer.compareUnsigned(left, right) < 0 ? 0 : left - right;
+    }
+
+    public static long saturatingAddI64(long left, long right) {
+        long result = left + right;
+        if (((left ^ result) & (right ^ result)) < 0) {
+            return left < 0 ? Long.MIN_VALUE : Long.MAX_VALUE;
+        }
+        return result;
+    }
+    public static long saturatingSubI64(long left, long right) {
+        long result = left - right;
+        if (((left ^ right) & (left ^ result)) < 0) {
+            return left < 0 ? Long.MIN_VALUE : Long.MAX_VALUE;
+        }
+        return result;
+    }
+    public static long saturatingAddU64(long left, long right) {
+        long result = left + right;
+        return Long.compareUnsigned(result, left) < 0 ? -1L : result;
+    }
+    public static long saturatingSubU64(long left, long right) {
+        return Long.compareUnsigned(left, right) < 0 ? 0L : left - right;
+    }
+
+    public static I128 saturatingAddI128(I128 left, I128 right) {
+        return left.saturatingAdd(right);
+    }
+    public static I128 saturatingSubI128(I128 left, I128 right) {
+        return left.saturatingSubtract(right);
+    }
+    public static U128 saturatingAddU128(U128 left, U128 right) {
+        return left.saturatingAdd(right);
+    }
+    public static U128 saturatingSubU128(U128 left, U128 right) {
+        return left.saturatingSubtract(right);
+    }
+
     public static byte f32ToI8(float value) { return f64ToI8(value); }
     public static byte f64ToI8(double value) {
         if (Double.isNaN(value)) return 0;

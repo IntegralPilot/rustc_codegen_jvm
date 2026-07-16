@@ -1135,6 +1135,13 @@ fn append_field_equality_check(
             instructions.push(Instruction::Invokestatic(equals_ref));
             append_boolean_false_check(instructions, false_fixups);
         }
+        Type::Pointer(_) => {
+            let pointer_idx = cp.add_class(oomir::POINTER_CLASS)?;
+            let descriptor = format!("(L{};)Z", oomir::POINTER_CLASS,);
+            let equals_ref = cp.add_method_ref(pointer_idx, "sameAddress", descriptor)?;
+            instructions.push(Instruction::Invokevirtual(equals_ref));
+            append_boolean_false_check(instructions, false_fixups);
+        }
         Type::Class(class_name) if has_generated_eq(module, class_name) => {
             let class_idx = cp.add_class(class_name)?;
             let eq_desc = format!("(L{};)Z", class_name);
@@ -1197,7 +1204,7 @@ pub(super) fn create_data_type_classfile_for_class(
         .collect::<std::collections::BTreeSet<_>>();
     if source_files.len() > 1 {
         breadcrumbs::log!(
-            breadcrumbs::LogLevel::Warn,
+            breadcrumbs::LogLevel::Info,
             "bytecode-gen",
             format!(
                 "JVM class {class_name_jvm} contains Rust methods from multiple files: {source_files:?}"

@@ -3719,9 +3719,28 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 // 4. Emit 'dup' instruction
                 self.jvm_instructions.push(JI::Dup); // Stack: [uninitialized_ref, uninitialized_ref]
 
+                let copies_rust_value_fields = !class_name.starts_with("java/")
+                    && !class_name.starts_with("org/rustlang/runtime/");
                 for (arg, arg_ty) in args {
                     if arg_ty.has_jvm_value() {
                         self.load_operand_as(arg, arg_ty)?;
+                        if copies_rust_value_fields
+                            && matches!(arg_ty, oomir::Type::Class(_) | oomir::Type::Array(_))
+                        {
+                            let pointer_class =
+                                self.constant_pool.add_class(oomir::POINTER_CLASS)?;
+                            let copy_value = self.constant_pool.add_method_ref(
+                                pointer_class,
+                                "copyManagedValue",
+                                "(Ljava/lang/Object;)Ljava/lang/Object;",
+                            )?;
+                            self.jvm_instructions.push(JI::Invokestatic(copy_value));
+                            if let Some(internal_name) = arg_ty.to_jvm_internal_name() {
+                                let expected_class =
+                                    self.constant_pool.add_class(&internal_name)?;
+                                self.jvm_instructions.push(JI::Checkcast(expected_class));
+                            }
+                        }
                     }
                 }
 
@@ -4023,12 +4042,13 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 } else if is_pointer && class_name != oomir::POINTER_CLASS && !is_this_receiver {
                     self.load_operand(operand)?;
                     let pointer_class = self.constant_pool.add_class(oomir::POINTER_CLASS)?;
-                    let get_object = self.constant_pool.add_method_ref(
+                    let receiver_object = self.constant_pool.add_method_ref(
                         pointer_class,
-                        "getObject",
+                        "receiverObject",
                         "()Ljava/lang/Object;",
                     )?;
-                    self.jvm_instructions.push(JI::Invokevirtual(get_object));
+                    self.jvm_instructions
+                        .push(JI::Invokevirtual(receiver_object));
                     let receiver_class = self.constant_pool.add_class(class_name)?;
                     self.jvm_instructions.push(JI::Checkcast(receiver_class));
                 } else if is_mutable_ref && !is_this_receiver {

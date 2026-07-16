@@ -8,8 +8,8 @@ use crate::oomir;
 use super::{
     jvm_names,
     types::{
-        adapt_simple_enum_operand, ensure_exact_transmute_helper, generate_adt_jvm_class_name,
-        generate_tuple_jvm_class_name, ty_to_oomir_type,
+        adapt_simple_enum_operand, ensure_exact_transmute_helper, ensure_union_data_type,
+        generate_adt_jvm_class_name, generate_tuple_jvm_class_name, ty_to_oomir_type,
     },
 };
 
@@ -192,6 +192,46 @@ pub(super) fn materialize_implicit_zst<'tcx>(
                 dest: dest.clone(),
                 class_name: class_name.clone(),
                 args,
+            });
+            Some(operand_var(dest, oomir::Type::Class(class_name)))
+        }
+        TyKind::Adt(adt_def, substs) if adt_def.is_union() => {
+            let class_name = ensure_union_data_type(adt_def, substs, tcx, data_types, instance);
+            let bytes = format!("{temp_prefix}_union_bytes");
+            let objects = format!("{temp_prefix}_union_objects");
+            instructions.push(oomir::Instruction::NewArray {
+                dest: bytes.clone(),
+                element_type: oomir::Type::I8,
+                size: oomir::Operand::Constant(oomir::Constant::I32(0)),
+            });
+            instructions.push(oomir::Instruction::NewArray {
+                dest: objects.clone(),
+                element_type: oomir::Type::Class("java/lang/Object".to_string()),
+                // Keep one identity slot for the runtime's uniform union
+                // representation even though a ZST has no addressable bytes.
+                size: oomir::Operand::Constant(oomir::Constant::I32(1)),
+            });
+            let dest = format!("{temp_prefix}_union_value");
+            instructions.push(oomir::Instruction::ConstructObject {
+                dest: dest.clone(),
+                class_name: class_name.clone(),
+                args: vec![
+                    (
+                        operand_var(bytes, oomir::Type::Array(Box::new(oomir::Type::I8))),
+                        oomir::Type::Array(Box::new(oomir::Type::I8)),
+                    ),
+                    (
+                        operand_var(
+                            objects,
+                            oomir::Type::Array(Box::new(oomir::Type::Class(
+                                "java/lang/Object".to_string(),
+                            ))),
+                        ),
+                        oomir::Type::Array(Box::new(oomir::Type::Class(
+                            "java/lang/Object".to_string(),
+                        ))),
+                    ),
+                ],
             });
             Some(operand_var(dest, oomir::Type::Class(class_name)))
         }
@@ -382,6 +422,20 @@ fn mutable_reference_chain_contains(source: &oomir::Type, target: &oomir::Type) 
     false
 }
 
+fn reference_chain_contains(outer: &oomir::Type, candidate: &oomir::Type) -> bool {
+    let mut current = outer;
+    while let oomir::Type::MutableReference(inner)
+    | oomir::Type::Reference(inner)
+    | oomir::Type::Pointer(inner) = current
+    {
+        if inner.as_ref() == candidate {
+            return true;
+        }
+        current = inner;
+    }
+    false
+}
+
 fn unwrap_mutable_references(
     mut source: oomir::Operand,
     target_jvm_ty: &oomir::Type,
@@ -418,6 +472,14 @@ fn adapt_mutable_reference_carrier<'tcx>(
     instructions: &mut Vec<oomir::Instruction>,
 ) -> oomir::Operand {
     if source.get_type().as_ref() == Some(target_jvm_ty) {
+        return source;
+    }
+    if source.get_type().as_ref().is_some_and(|source_ty| {
+        matches!(
+            source_ty,
+            oomir::Type::MutableReference(_) | oomir::Type::Reference(_) | oomir::Type::Pointer(_)
+        ) && reference_chain_contains(target_jvm_ty, source_ty)
+    }) {
         return source;
     }
 

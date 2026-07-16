@@ -2,9 +2,9 @@ use super::{
     jvm_names,
     operand::convert_operand,
     types::{
-        adapt_simple_enum_operand, get_field_name_from_index, pointer_view_codec_operand,
-        should_define_named_data_type, ty_to_oomir_type, union_getter_method_name,
-        union_setter_method_name,
+        adapt_simple_enum_operand, generate_adt_jvm_class_name, get_field_name_from_index,
+        pointer_view_codec_operand, should_define_named_data_type, ty_to_oomir_type,
+        union_getter_method_name, union_setter_method_name,
     },
 };
 use crate::oomir::{self, DataTypeMethod, Instruction, Operand};
@@ -59,7 +59,14 @@ pub(crate) fn emit_pointer_read(
     let pointer_ty = pointer
         .get_type()
         .expect("a pointer read requires a typed operand");
-    let (method_name, runtime_ret_ty) = pointer_getter_for_type(pointee_ty);
+    let (mut method_name, runtime_ret_ty) = pointer_getter_for_type(pointee_ty);
+    let requested_class = match pointee_ty {
+        oomir::Type::Class(class_name) => Some(class_name.clone()),
+        _ => None,
+    };
+    if requested_class.is_some() {
+        method_name = "getObjectAs";
+    }
     let runtime_dest = if runtime_ret_ty == *pointee_ty {
         dest.to_string()
     } else {
@@ -70,11 +77,20 @@ pub(crate) fn emit_pointer_read(
         class_name: oomir::POINTER_CLASS.to_string(),
         method_name: method_name.to_string(),
         method_ty: oomir::Signature {
-            params: vec![("self".to_string(), pointer_ty)],
+            params: vec![("self".to_string(), pointer_ty)]
+                .into_iter()
+                .chain(
+                    requested_class
+                        .is_some()
+                        .then_some(("target_class".to_string(), oomir::Type::java_string())),
+                )
+                .collect(),
             ret: Box::new(runtime_ret_ty.clone()),
             is_static: false,
         },
-        args: Vec::new(),
+        args: requested_class
+            .map(|class_name| vec![Operand::Constant(oomir::Constant::String(class_name))])
+            .unwrap_or_default(),
         operand: pointer,
     });
     if runtime_ret_ty != *pointee_ty {
@@ -299,7 +315,10 @@ pub(crate) fn local_cell_name(local: Local) -> String {
 pub(crate) fn local_uses_stable_cell(local: Local, mir: &Body<'_>) -> bool {
     if local.index() > 0
         && local.index() <= mir.arg_count
-        && matches!(mir.local_decls[local].ty.kind(), TyKind::Ref(..) | TyKind::RawPtr(..))
+        && matches!(
+            mir.local_decls[local].ty.kind(),
+            TyKind::Ref(..) | TyKind::RawPtr(..)
+        )
     {
         // Incoming references and raw pointers already are stable addresses.
         // Wrapping their local slot in another cell turns an ordinary reborrow
@@ -461,52 +480,6 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
                 let has_slice_tail = matches!(current_type, oomir::Type::Pointer(_))
                     && has_slice_or_str_struct_tail(tcx, base_rust_ty);
                 if has_slice_tail {
-                    let oomir::Type::Pointer(base_pointee) = &current_type else {
-                        unreachable!();
-                    };
-                    let base_pointee = base_pointee.as_ref().clone();
-                    let oomir::Type::Class(owner_class) = &base_pointee else {
-                        panic!("slice-tailed Rust struct did not map to a JVM class");
-                    };
-                    let owner_class = owner_class.clone();
-                    let owner_name = format!("{current_var}_dst_owner");
-                    let owner = emit_pointer_read(
-                        Operand::Variable {
-                            name: current_var.clone(),
-                            ty: current_type.clone(),
-                        },
-                        &base_pointee,
-                        &owner_name,
-                        &mut instructions,
-                    );
-                    let field_name = field_name_for_projection(
-                        &owner_class,
-                        field_index.index(),
-                        base_rust_ty,
-                        tcx,
-                        data_types,
-                    )
-                    .unwrap_or_else(|error| panic!("Error getting DST field name: {error}"));
-                    current_type = ty_to_oomir_type(
-                        EarlyBinder::bind(tcx, field_ty)
-                            .instantiate(tcx, instance.args)
-                            .skip_norm_wip(),
-                        tcx,
-                        data_types,
-                        instance,
-                    );
-                    let next_var = format!("{current_var}_{}", field_index.index());
-                    instructions.push(Instruction::GetField {
-                        dest: next_var.clone(),
-                        object: owner,
-                        field_name,
-                        field_ty: current_type.clone(),
-                        owner_class,
-                    });
-                    current_var = next_var;
-                    continue;
-                }
-                if has_slice_tail {
                     let layout = tcx
                         .layout_of(
                             TypingEnv::fully_monomorphized().as_query_input(base_rust_ty),
@@ -522,55 +495,51 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
                         .skip_norm_wip();
                     let base_pointer_name = current_var.clone();
                     let base_pointer_ty = current_type.clone();
-                    let offset_pointer_name = format!("{current_var}_field_pointer");
-                    instructions.push(Instruction::InvokeStatic {
-                        dest: Some(offset_pointer_name.clone()),
-                        class_name: oomir::POINTER_CLASS.to_string(),
-                        method_name: "byte_offset".to_string(),
-                        method_ty: oomir::Signature {
-                            params: vec![
-                                ("pointer".to_string(), base_pointer_ty.clone()),
-                                ("byte_count".to_string(), oomir::Type::I32),
-                            ],
-                            ret: Box::new(base_pointer_ty.clone()),
-                            is_static: true,
-                        },
-                        args: vec![
-                            Operand::Variable {
-                                name: base_pointer_name.clone(),
-                                ty: base_pointer_ty.clone(),
-                            },
-                            Operand::Constant(oomir::Constant::I32(
-                                i32::try_from(field_offset)
-                                    .expect("DST field offset exceeds the JVM address space"),
-                            )),
-                        ],
-                    });
+                    let oomir::Type::Pointer(base_pointee_ty) = &base_pointer_ty else {
+                        unreachable!();
+                    };
+                    let oomir::Type::Class(owner_class) = base_pointee_ty.as_ref() else {
+                        panic!("slice-tailed Rust struct did not map to a JVM class");
+                    };
+                    let owner_class = owner_class.clone();
+                    let field_name = field_name_for_projection(
+                        &owner_class,
+                        field_index.index(),
+                        base_rust_ty,
+                        tcx,
+                        data_types,
+                    )
+                    .unwrap_or_else(|error| panic!("Error getting DST field name: {error}"));
+                    let field_offset = Operand::Constant(oomir::Constant::I32(
+                        i32::try_from(field_offset)
+                            .expect("DST field offset exceeds the JVM address space"),
+                    ));
 
                     if let TyKind::Slice(element_rust_ty) = field_rust_ty.kind() {
                         let element_oomir_ty =
                             ty_to_oomir_type(*element_rust_ty, tcx, data_types, instance);
-                        let element_pointer_ty =
-                            oomir::Type::Pointer(Box::new(element_oomir_ty.clone()));
-                        let data_pointer_name = format!("{current_var}_slice_data");
-                        instructions.push(Instruction::InvokeStatic {
-                            dest: Some(data_pointer_name.clone()),
+                        current_type = oomir::Type::Slice(Box::new(element_oomir_ty));
+                        let object_name = format!("{current_var}_slice_object");
+                        instructions.push(Instruction::InvokeVirtual {
+                            dest: Some(object_name.clone()),
                             class_name: oomir::POINTER_CLASS.to_string(),
-                            method_name: "retype".to_string(),
+                            method_name: "projectStructSliceField".to_string(),
                             method_ty: oomir::Signature {
                                 params: vec![
-                                    ("pointer".to_string(), base_pointer_ty.clone()),
-                                    ("view_size".to_string(), oomir::Type::I32),
-                                    ("view_codec".to_string(), oomir::Type::java_string()),
+                                    ("self".to_string(), base_pointer_ty.clone()),
+                                    ("owner_class".to_string(), oomir::Type::java_string()),
+                                    ("field_name".to_string(), oomir::Type::java_string()),
+                                    ("field_offset".to_string(), oomir::Type::I32),
+                                    ("element_size".to_string(), oomir::Type::I32),
+                                    ("element_codec".to_string(), oomir::Type::java_string()),
                                 ],
-                                ret: Box::new(element_pointer_ty.clone()),
-                                is_static: true,
+                                ret: Box::new(oomir::Type::Class("java/lang/Object".to_string())),
+                                is_static: false,
                             },
                             args: vec![
-                                Operand::Variable {
-                                    name: offset_pointer_name,
-                                    ty: base_pointer_ty.clone(),
-                                },
+                                Operand::Constant(oomir::Constant::String(owner_class)),
+                                Operand::Constant(oomir::Constant::String(field_name)),
+                                field_offset,
                                 Operand::Constant(oomir::Constant::I32(
                                     i32::try_from(
                                         super::types::layout_size_bytes(tcx, *element_rust_ty)
@@ -585,61 +554,17 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
                                     instance,
                                 ),
                             ],
-                        });
-                        let metadata_name = format!("{current_var}_metadata");
-                        instructions.push(Instruction::InvokeVirtual {
-                            dest: Some(metadata_name.clone()),
-                            class_name: oomir::POINTER_CLASS.to_string(),
-                            method_name: "metadata".to_string(),
-                            method_ty: oomir::Signature {
-                                params: vec![("self".to_string(), base_pointer_ty.clone())],
-                                ret: Box::new(oomir::Type::U64),
-                                is_static: false,
-                            },
-                            args: Vec::new(),
                             operand: Operand::Variable {
                                 name: base_pointer_name,
                                 ty: base_pointer_ty,
                             },
                         });
-                        let metadata_i32_name = format!("{current_var}_metadata_i32");
-                        instructions.push(Instruction::Cast {
-                            dest: metadata_i32_name.clone(),
-                            op: Operand::Variable {
-                                name: metadata_name,
-                                ty: oomir::Type::U64,
-                            },
-                            ty: oomir::Type::I32,
-                        });
-                        let object_name = format!("{current_var}_slice_object");
-                        instructions.push(Instruction::ConstructObject {
-                            dest: object_name.clone(),
-                            class_name: oomir::SLICE_VIEW_CLASS.to_string(),
-                            args: vec![
-                                (
-                                    Operand::Variable {
-                                        name: data_pointer_name,
-                                        ty: element_pointer_ty,
-                                    },
-                                    oomir::Type::Class("java/lang/Object".to_string()),
-                                ),
-                                (Operand::Constant(oomir::Constant::I32(0)), oomir::Type::I32),
-                                (
-                                    Operand::Variable {
-                                        name: metadata_i32_name,
-                                        ty: oomir::Type::I32,
-                                    },
-                                    oomir::Type::I32,
-                                ),
-                            ],
-                        });
-                        current_type = oomir::Type::Slice(Box::new(element_oomir_ty));
                         let next_var = format!("{current_var}_{}", field_index.index());
                         instructions.push(Instruction::Cast {
                             dest: next_var.clone(),
                             op: Operand::Variable {
                                 name: object_name,
-                                ty: oomir::Type::Class(oomir::SLICE_VIEW_CLASS.to_string()),
+                                ty: oomir::Type::Class("java/lang/Object".to_string()),
                             },
                             ty: current_type.clone(),
                         });
@@ -648,24 +573,26 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
                         current_type = ty_to_oomir_type(field_rust_ty, tcx, data_types, instance);
                         let field_pointer_ty = oomir::Type::Pointer(Box::new(current_type.clone()));
                         let typed_pointer_name = format!("{current_var}_typed_field_pointer");
-                        instructions.push(Instruction::InvokeStatic {
+                        instructions.push(Instruction::InvokeVirtual {
                             dest: Some(typed_pointer_name.clone()),
                             class_name: oomir::POINTER_CLASS.to_string(),
-                            method_name: "retype".to_string(),
+                            method_name: "projectStructField".to_string(),
                             method_ty: oomir::Signature {
                                 params: vec![
-                                    ("pointer".to_string(), base_pointer_ty.clone()),
-                                    ("view_size".to_string(), oomir::Type::I32),
-                                    ("view_codec".to_string(), oomir::Type::java_string()),
+                                    ("self".to_string(), base_pointer_ty.clone()),
+                                    ("owner_class".to_string(), oomir::Type::java_string()),
+                                    ("field_name".to_string(), oomir::Type::java_string()),
+                                    ("field_offset".to_string(), oomir::Type::I32),
+                                    ("field_size".to_string(), oomir::Type::I32),
+                                    ("field_codec".to_string(), oomir::Type::java_string()),
                                 ],
                                 ret: Box::new(field_pointer_ty.clone()),
-                                is_static: true,
+                                is_static: false,
                             },
                             args: vec![
-                                Operand::Variable {
-                                    name: offset_pointer_name,
-                                    ty: base_pointer_ty,
-                                },
+                                Operand::Constant(oomir::Constant::String(owner_class)),
+                                Operand::Constant(oomir::Constant::String(field_name)),
+                                field_offset,
                                 Operand::Constant(oomir::Constant::I32(
                                     i32::try_from(
                                         super::types::layout_size_bytes(tcx, field_rust_ty)
@@ -680,6 +607,10 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
                                     instance,
                                 ),
                             ],
+                            operand: Operand::Variable {
+                                name: base_pointer_name,
+                                ty: base_pointer_ty,
+                            },
                         });
                         let next_var = format!("{current_var}_{}", field_index.index());
                         let value = emit_pointer_read(
@@ -993,27 +924,7 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
             ProjectionElem::Downcast(_, variant_idx) => {
                 // A downcast changes the *effective type* for subsequent projections.
 
-                // 1. Get the base enum OOMIR class name from the type *before* the downcast.
-                let base_enum_oomir_name = match &type_before_proj {
-                    oomir::Type::Class(name) => name.clone(),
-                    oomir::Type::Reference(inner)
-                        if matches!(inner.as_ref(), oomir::Type::Class(_)) =>
-                    {
-                        // If it's a reference to the enum, operate on the enum type itself
-                        if let oomir::Type::Class(name) = inner.as_ref() {
-                            // We should ideally verify this name corresponds to an enum base class in data_types
-                            name.clone()
-                        } else {
-                            unreachable!() // Caught by matches!
-                        }
-                    }
-                    _ => panic!(
-                        "Downcast applied to non-enum/non-ref-enum type: var '{}' has type {:?} before downcast. Place: {:?}",
-                        current_var, type_before_proj, place
-                    ),
-                };
-
-                // 2. Get the AdtDef of the enum to find the variant's actual name.
+                // 1. Get the AdtDef of the enum to find the variant's actual name.
                 //    We need the Rust Ty of the base enum *before* the downcast.
                 let base_place_proj_slice = &place.projection[..proj_index]; // Projections *before* this downcast
                 let base_place_for_downcast = Place {
@@ -1045,17 +956,24 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
                     );
                 }
 
-                // 3. Get the specific variant definition using the index.
+                // Derive the base from the canonical Rust ADT rather than the
+                // current lowered carrier. The latter may already be refined
+                // to a variant by an earlier projection, which would otherwise
+                // manufacture invalid names such as `$Break$Break`.
+                let base_enum_oomir_name =
+                    generate_adt_jvm_class_name(&adt_def, substs, tcx, data_types, instance);
+
+                // 2. Get the specific variant definition using the index.
                 let variant_def = adt_def.variant(variant_idx);
 
-                // 4. Construct the OOMIR variant class name
+                // 3. Construct the OOMIR variant class name
                 let variant_class_name = format!(
                     "{}${}",
                     base_enum_oomir_name, // Use OOMIR name already derived
                     jvm_names::member_name(&variant_def.name.to_string())
                 );
 
-                // 5. Update current_type directly to the OOMIR Class representing the variant.
+                // 4. Update current_type directly to the OOMIR Class representing the variant.
                 current_type = oomir::Type::Class(variant_class_name.clone());
 
                 // Verify this class exists in data_types
@@ -1242,47 +1160,6 @@ pub fn emit_instructions_to_set_value<'tcx>(
                 let base_rust_ty = EarlyBinder::bind(tcx, base_place.ty(&mir.local_decls, tcx).ty)
                     .instantiate(tcx, instance.args)
                     .skip_norm_wip();
-                if let oomir::Type::Pointer(base_pointee) = &base_oomir_type
-                    && has_slice_or_str_struct_tail(tcx, base_rust_ty)
-                {
-                    let oomir::Type::Class(owner_class) = base_pointee.as_ref() else {
-                        panic!("slice-tailed Rust struct did not map to a JVM class");
-                    };
-                    let owner_name = format!("{base_var_name}_dst_owner");
-                    let owner = emit_pointer_read(
-                        Operand::Variable {
-                            name: base_var_name,
-                            ty: base_oomir_type.clone(),
-                        },
-                        base_pointee,
-                        &owner_name,
-                        &mut instructions,
-                    );
-                    let field_name = field_name_for_projection(
-                        owner_class,
-                        field_index.index(),
-                        base_rust_ty,
-                        tcx,
-                        data_types,
-                    )
-                    .unwrap_or_else(|error| panic!("Error getting DST field name: {error}"));
-                    instructions.push(Instruction::SetField {
-                        object: owner
-                            .get_name()
-                            .expect("pointer-read DST owner uses a temporary")
-                            .to_string(),
-                        field_name,
-                        field_ty: ty_to_oomir_type(
-                            *field_mir_ty,
-                            tcx,
-                            data_types,
-                            instance,
-                        ),
-                        value: source_operand,
-                        owner_class: owner_class.clone(),
-                    });
-                    return instructions;
-                }
                 if matches!(base_oomir_type, oomir::Type::Pointer(_))
                     && has_slice_or_str_struct_tail(tcx, base_rust_ty)
                 {
@@ -1299,49 +1176,45 @@ pub fn emit_instructions_to_set_value<'tcx>(
                         .skip_norm_wip();
                     let field_oomir_ty = ty_to_oomir_type(field_rust_ty, tcx, data_types, instance);
                     let field_pointer_ty = oomir::Type::Pointer(Box::new(field_oomir_ty.clone()));
-                    let offset_pointer_name = format!("{base_var_name}_field_pointer");
-                    instructions.push(Instruction::InvokeStatic {
-                        dest: Some(offset_pointer_name.clone()),
+                    let oomir::Type::Pointer(base_pointee_ty) = &base_oomir_type else {
+                        unreachable!();
+                    };
+                    let oomir::Type::Class(owner_class) = base_pointee_ty.as_ref() else {
+                        panic!("slice-tailed Rust struct did not map to a JVM class");
+                    };
+                    let owner_class = owner_class.clone();
+                    let field_name = field_name_for_projection(
+                        &owner_class,
+                        field_index.index(),
+                        base_rust_ty,
+                        tcx,
+                        data_types,
+                    )
+                    .unwrap_or_else(|error| panic!("Error getting DST field name: {error}"));
+                    let typed_pointer_name = format!("{base_var_name}_typed_field_pointer");
+                    instructions.push(Instruction::InvokeVirtual {
+                        dest: Some(typed_pointer_name.clone()),
                         class_name: oomir::POINTER_CLASS.to_string(),
-                        method_name: "byte_offset".to_string(),
+                        method_name: "projectStructField".to_string(),
                         method_ty: oomir::Signature {
                             params: vec![
-                                ("pointer".to_string(), base_oomir_type.clone()),
-                                ("byte_count".to_string(), oomir::Type::I32),
+                                ("self".to_string(), base_oomir_type.clone()),
+                                ("owner_class".to_string(), oomir::Type::java_string()),
+                                ("field_name".to_string(), oomir::Type::java_string()),
+                                ("field_offset".to_string(), oomir::Type::I32),
+                                ("field_size".to_string(), oomir::Type::I32),
+                                ("field_codec".to_string(), oomir::Type::java_string()),
                             ],
-                            ret: Box::new(base_oomir_type.clone()),
-                            is_static: true,
+                            ret: Box::new(field_pointer_ty.clone()),
+                            is_static: false,
                         },
                         args: vec![
-                            Operand::Variable {
-                                name: base_var_name.clone(),
-                                ty: base_oomir_type.clone(),
-                            },
+                            Operand::Constant(oomir::Constant::String(owner_class)),
+                            Operand::Constant(oomir::Constant::String(field_name)),
                             Operand::Constant(oomir::Constant::I32(
                                 i32::try_from(field_offset)
                                     .expect("DST field offset exceeds the JVM address space"),
                             )),
-                        ],
-                    });
-                    let typed_pointer_name = format!("{base_var_name}_typed_field_pointer");
-                    instructions.push(Instruction::InvokeStatic {
-                        dest: Some(typed_pointer_name.clone()),
-                        class_name: oomir::POINTER_CLASS.to_string(),
-                        method_name: "retype".to_string(),
-                        method_ty: oomir::Signature {
-                            params: vec![
-                                ("pointer".to_string(), base_oomir_type.clone()),
-                                ("view_size".to_string(), oomir::Type::I32),
-                                ("view_codec".to_string(), oomir::Type::java_string()),
-                            ],
-                            ret: Box::new(field_pointer_ty.clone()),
-                            is_static: true,
-                        },
-                        args: vec![
-                            Operand::Variable {
-                                name: offset_pointer_name,
-                                ty: base_oomir_type,
-                            },
                             Operand::Constant(oomir::Constant::I32(
                                 i32::try_from(
                                     super::types::layout_size_bytes(tcx, field_rust_ty)
@@ -1351,6 +1224,10 @@ pub fn emit_instructions_to_set_value<'tcx>(
                             )),
                             pointer_view_codec_operand(field_rust_ty, tcx, data_types, instance),
                         ],
+                        operand: Operand::Variable {
+                            name: base_var_name,
+                            ty: base_oomir_type,
+                        },
                     });
                     emit_pointer_write(
                         Operand::Variable {

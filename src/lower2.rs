@@ -286,7 +286,7 @@ pub fn oomir_to_jvm_bytecode(
             .collect::<BTreeSet<_>>();
         if source_files.len() > 1 {
             breadcrumbs::log!(
-                breadcrumbs::LogLevel::Warn,
+                breadcrumbs::LogLevel::Info,
                 "bytecode-gen",
                 format!(
                     "JVM class {class_name_jvm} contains Rust functions from multiple files: {source_files:?}"
