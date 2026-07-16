@@ -3865,7 +3865,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
 
                 // 2.2 Load arguments according to the invoked descriptor. The
                 // first signature parameter is the implicit JVM receiver.
-                let explicit_params = method_ty.explicit_params();
+                let explicit_params = Self::explicit_instance_params(method_ty);
                 if args.len() != explicit_params.len() {
                     return Err(jvm::Error::VerificationError {
                         context: format!("Function {}", self.oomir_func.name),
@@ -4013,7 +4013,14 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                             && !self.oomir_func.signature.is_static
                 );
 
-                if is_pointer && class_name != oomir::POINTER_CLASS && !is_this_receiver {
+                if is_pointer && class_name == oomir::POINTER_CLASS && is_this_receiver {
+                    // MIR still treats an instance method's direct JVM `this`
+                    // as `&Self`. Pointer APIs therefore need a temporary cell;
+                    // Pointer.cell also recovers slice-tail metadata from DST
+                    // carriers so operations such as ptr::metadata remain valid.
+                    self.load_operand(operand)?;
+                    self.wrap_loaded_object_in_pointer_cell()?;
+                } else if is_pointer && class_name != oomir::POINTER_CLASS && !is_this_receiver {
                     self.load_operand(operand)?;
                     let pointer_class = self.constant_pool.add_class(oomir::POINTER_CLASS)?;
                     let get_object = self.constant_pool.add_method_ref(
@@ -4037,7 +4044,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
 
                 // 3. Load arguments onto the stack. Pointer.set has an erased
                 // Object boundary so primitive Rust carriers must be boxed.
-                let explicit_params = method_ty.explicit_params();
+                let explicit_params = Self::explicit_instance_params(method_ty);
                 if args.len() != explicit_params.len() {
                     return Err(jvm::Error::VerificationError {
                         context: format!("Function {}", self.oomir_func.name),
@@ -4134,6 +4141,12 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             }
         }
         Ok(())
+    }
+
+    /// Helper to load an operand specifically for a function call argument.
+    /// Handles Reference/MutableReference
+    fn explicit_instance_params(method_ty: &oomir::Signature) -> &[(String, oomir::Type)] {
+        method_ty.explicit_jvm_params()
     }
 
     fn load_call_argument(&mut self, operand: &oomir::Operand) -> Result<(), jvm::Error> {

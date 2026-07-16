@@ -14,7 +14,7 @@ use rustc_middle::{
 };
 use std::collections::HashMap;
 
-fn has_slice_or_str_struct_tail<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {
+pub(crate) fn has_slice_or_str_struct_tail<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {
     if !matches!(ty.kind(), TyKind::Adt(adt_def, _) if adt_def.is_struct()) {
         return false;
     }
@@ -297,6 +297,16 @@ pub(crate) fn local_cell_name(local: Local) -> String {
 /// locals live in a canonical Pointer cell so every alias observes subsequent
 /// direct and indirect writes without copy-in/copy-out bookkeeping.
 pub(crate) fn local_uses_stable_cell(local: Local, mir: &Body<'_>) -> bool {
+    if local.index() > 0
+        && local.index() <= mir.arg_count
+        && matches!(mir.local_decls[local].ty.kind(), TyKind::Ref(..) | TyKind::RawPtr(..))
+    {
+        // Incoming references and raw pointers already are stable addresses.
+        // Wrapping their local slot in another cell turns an ordinary reborrow
+        // into Pointer<Pointer<T>>; JVM instance receivers are especially
+        // sensitive because slot 0 contains the pointee object directly.
+        return false;
+    }
     mir.basic_blocks.iter().any(|block| {
         block.statements.iter().any(|statement| {
             let StatementKind::Assign(box (_, rvalue)) = &statement.kind else {
@@ -450,6 +460,52 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
 
                 let has_slice_tail = matches!(current_type, oomir::Type::Pointer(_))
                     && has_slice_or_str_struct_tail(tcx, base_rust_ty);
+                if has_slice_tail {
+                    let oomir::Type::Pointer(base_pointee) = &current_type else {
+                        unreachable!();
+                    };
+                    let base_pointee = base_pointee.as_ref().clone();
+                    let oomir::Type::Class(owner_class) = &base_pointee else {
+                        panic!("slice-tailed Rust struct did not map to a JVM class");
+                    };
+                    let owner_class = owner_class.clone();
+                    let owner_name = format!("{current_var}_dst_owner");
+                    let owner = emit_pointer_read(
+                        Operand::Variable {
+                            name: current_var.clone(),
+                            ty: current_type.clone(),
+                        },
+                        &base_pointee,
+                        &owner_name,
+                        &mut instructions,
+                    );
+                    let field_name = field_name_for_projection(
+                        &owner_class,
+                        field_index.index(),
+                        base_rust_ty,
+                        tcx,
+                        data_types,
+                    )
+                    .unwrap_or_else(|error| panic!("Error getting DST field name: {error}"));
+                    current_type = ty_to_oomir_type(
+                        EarlyBinder::bind(tcx, field_ty)
+                            .instantiate(tcx, instance.args)
+                            .skip_norm_wip(),
+                        tcx,
+                        data_types,
+                        instance,
+                    );
+                    let next_var = format!("{current_var}_{}", field_index.index());
+                    instructions.push(Instruction::GetField {
+                        dest: next_var.clone(),
+                        object: owner,
+                        field_name,
+                        field_ty: current_type.clone(),
+                        owner_class,
+                    });
+                    current_var = next_var;
+                    continue;
+                }
                 if has_slice_tail {
                     let layout = tcx
                         .layout_of(
@@ -1186,6 +1242,47 @@ pub fn emit_instructions_to_set_value<'tcx>(
                 let base_rust_ty = EarlyBinder::bind(tcx, base_place.ty(&mir.local_decls, tcx).ty)
                     .instantiate(tcx, instance.args)
                     .skip_norm_wip();
+                if let oomir::Type::Pointer(base_pointee) = &base_oomir_type
+                    && has_slice_or_str_struct_tail(tcx, base_rust_ty)
+                {
+                    let oomir::Type::Class(owner_class) = base_pointee.as_ref() else {
+                        panic!("slice-tailed Rust struct did not map to a JVM class");
+                    };
+                    let owner_name = format!("{base_var_name}_dst_owner");
+                    let owner = emit_pointer_read(
+                        Operand::Variable {
+                            name: base_var_name,
+                            ty: base_oomir_type.clone(),
+                        },
+                        base_pointee,
+                        &owner_name,
+                        &mut instructions,
+                    );
+                    let field_name = field_name_for_projection(
+                        owner_class,
+                        field_index.index(),
+                        base_rust_ty,
+                        tcx,
+                        data_types,
+                    )
+                    .unwrap_or_else(|error| panic!("Error getting DST field name: {error}"));
+                    instructions.push(Instruction::SetField {
+                        object: owner
+                            .get_name()
+                            .expect("pointer-read DST owner uses a temporary")
+                            .to_string(),
+                        field_name,
+                        field_ty: ty_to_oomir_type(
+                            *field_mir_ty,
+                            tcx,
+                            data_types,
+                            instance,
+                        ),
+                        value: source_operand,
+                        owner_class: owner_class.clone(),
+                    });
+                    return instructions;
+                }
                 if matches!(base_oomir_type, oomir::Type::Pointer(_))
                     && has_slice_or_str_struct_tail(tcx, base_rust_ty)
                 {

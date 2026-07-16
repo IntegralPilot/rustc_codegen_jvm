@@ -1157,6 +1157,10 @@ pub(super) fn convert_basic_block<'tcx>(
 
                 let destination_oomir_type =
                     super::place::get_place_type(destination, mir, tcx, instance, data_types);
+                let destination_pointer_pointee = match &destination_oomir_type {
+                    oomir::Type::Pointer(pointee) => Some(pointee.as_ref().clone()),
+                    _ => None,
+                };
                 let deferred_destination_store = !destination.projection.is_empty()
                     || super::place::local_uses_stable_cell(destination.local, mir);
                 let dest_var_name = destination_oomir_type.has_jvm_value().then(|| {
@@ -3910,11 +3914,11 @@ pub(super) fn convert_basic_block<'tcx>(
 
                 let destination_ty = destination.ty(&mir.local_decls, tcx).ty;
                 if destination.projection.is_empty()
-                    && let TyKind::Ref(_, referent_ty, mutability) = destination_ty.kind()
-                    && mutability.is_mut()
+                    && matches!(
+                        destination_ty.kind(),
+                        TyKind::Ref(_, _, mutability) if mutability.is_mut()
+                    )
                 {
-                    let destination_pointee =
-                        super::types::ty_to_oomir_type(*referent_ty, tcx, data_types, instance);
                     let aliases = args
                         .iter()
                         .filter_map(|arg| match &arg.node {
@@ -3926,16 +3930,13 @@ pub(super) fn convert_basic_block<'tcx>(
                             _ => None,
                         })
                         .collect::<Vec<_>>();
-                    // Only treat the returned reference as aliasing the argument's
-                    // borrowed place when it views that place at the *same* type.
-                    // Wrapper accessors such as `MaybeDangling::as_mut` or
-                    // `ManuallyDrop::deref_mut` return a reference to an inner
-                    // transparent-wrapper field whose pointee type is deeper than
-                    // the argument's; inheriting the argument's origin verbatim
-                    // would emit a write-back that reads the inner view under the
-                    // wrong (outer) type and fails at runtime with a ClassCastException.
+                    // A returned `&mut U` is only a plain reborrow of an input
+                    // `&mut T` when U and T are the same representation. Methods
+                    // such as `ManuallyDrop::deref_mut` return a pointer derived
+                    // from a field of `T`; that Pointer already carries the field
+                    // address and must not be copied back as though it were T.
                     if let [alias] = aliases.as_slice()
-                        && alias.pointee_type == destination_pointee
+                        && destination_pointer_pointee.as_ref() == Some(&alias.pointee_type)
                     {
                         mutable_borrow_arrays.insert(
                             destination.local,

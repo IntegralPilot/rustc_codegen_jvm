@@ -77,6 +77,62 @@ fn pointer_pointee_ty<'tcx>(pointer_ty: rustc_middle::ty::Ty<'tcx>) -> rustc_mid
     }
 }
 
+fn struct_tail_unsize_target_class<'tcx>(
+    source_pointer_ty: rustc_middle::ty::Ty<'tcx>,
+    target_pointer_ty: rustc_middle::ty::Ty<'tcx>,
+    source_oomir_ty: &oomir::Type,
+    target_oomir_ty: &oomir::Type,
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
+) -> Option<String> {
+    let source_pointee = EarlyBinder::bind(tcx, pointer_pointee_ty(source_pointer_ty))
+        .instantiate(tcx, instance.args)
+        .skip_norm_wip();
+    let target_pointee = EarlyBinder::bind(tcx, pointer_pointee_ty(target_pointer_ty))
+        .instantiate(tcx, instance.args)
+        .skip_norm_wip();
+    let typing_env = TypingEnv::fully_monomorphized();
+    let source_pointee = tcx
+        .try_normalize_erasing_regions(
+            typing_env,
+            rustc_middle::ty::Unnormalized::new_wip(source_pointee),
+        )
+        .ok()?;
+    let target_pointee = tcx
+        .try_normalize_erasing_regions(
+            typing_env,
+            rustc_middle::ty::Unnormalized::new_wip(target_pointee),
+        )
+        .ok()?;
+    let (TyKind::Adt(source_def, _), TyKind::Adt(target_def, _)) =
+        (source_pointee.kind(), target_pointee.kind())
+    else {
+        return None;
+    };
+    if source_def.did() != target_def.did() || !source_def.is_struct() {
+        return None;
+    }
+    let source_tail = tcx.struct_tail_for_codegen(source_pointee, typing_env);
+    let target_tail = tcx.struct_tail_for_codegen(target_pointee, typing_env);
+    if !matches!(source_tail.kind(), TyKind::Array(_, _))
+        || !matches!(target_tail.kind(), TyKind::Slice(_) | TyKind::Str)
+    {
+        return None;
+    }
+    match (source_oomir_ty, target_oomir_ty) {
+        (
+            oomir::Type::Pointer(source),
+            oomir::Type::Pointer(target),
+        ) if matches!(source.as_ref(), oomir::Type::Class(_)) => {
+            let oomir::Type::Class(target_class) = target.as_ref() else {
+                return None;
+            };
+            Some(target_class.clone())
+        }
+        _ => None,
+    }
+}
+
 fn emit_pointer_factory(
     method_name: &str,
     args: Vec<oomir::Operand>,
@@ -425,6 +481,80 @@ fn emit_pointer_to_place<'tcx>(
                 let base_rust_ty = EarlyBinder::bind(tcx, base_place.ty(&mir.local_decls, tcx).ty)
                     .instantiate(tcx, instance.args)
                     .skip_norm_wip();
+                let projects_direct_instance_self = base_place.local.index() == 1
+                    && matches!(base_place.projection.as_ref(), [ProjectionElem::Deref])
+                    && tcx
+                        .opt_associated_item(instance.def_id())
+                        .is_some_and(|item| item.is_method());
+                if (super::super::place::has_slice_or_str_struct_tail(tcx, base_rust_ty)
+                    || projects_direct_instance_self)
+                    && matches!(pointer_ty, oomir::Type::Pointer(_))
+                {
+                    let base_oomir_ty = ty_to_oomir_type(base_rust_ty, tcx, data_types, instance);
+                    let oomir::Type::Class(_) = &base_oomir_ty else {
+                        panic!("slice-tailed Rust struct did not map to a JVM class");
+                    };
+                    let TyKind::Adt(adt_def, _) = base_rust_ty.kind() else {
+                        unreachable!("slice-tailed aggregate must be an ADT");
+                    };
+                    let field_name = adt_def
+                        .variant(0usize.into())
+                        .fields[*field_index]
+                        .ident(tcx)
+                        .to_string();
+                    let base_pointer_ty = oomir::Type::Pointer(Box::new(base_oomir_ty.clone()));
+                    let base_pointer = emit_pointer_to_place(
+                        &base_place,
+                        &base_pointer_ty,
+                        &format!("{temp_prefix}_dst_field_base"),
+                        tcx,
+                        instance,
+                        mir,
+                        data_types,
+                        instructions,
+                    );
+                    let base_value_name = format!("{temp_prefix}_dst_field_owner");
+                    let base_value = emit_pointer_read(
+                        base_pointer,
+                        &base_oomir_ty,
+                        &base_value_name,
+                        instructions,
+                    );
+                    let result_name = format!("{temp_prefix}_dst_field_pointer");
+                    instructions.push(oomir::Instruction::InvokeStatic {
+                        dest: Some(result_name.clone()),
+                        class_name: oomir::POINTER_CLASS.to_string(),
+                        method_name: "field".to_string(),
+                        method_ty: oomir::Signature {
+                            params: vec![
+                                (
+                                    "owner".to_string(),
+                                    oomir::Type::Class("java/lang/Object".to_string()),
+                                ),
+                                ("field_name".to_string(), oomir::Type::java_string()),
+                                ("size".to_string(), oomir::Type::I32),
+                                ("codec".to_string(), oomir::Type::java_string()),
+                            ],
+                            ret: Box::new(pointer_ty.clone()),
+                            is_static: true,
+                        },
+                        args: vec![
+                            base_value,
+                            oomir::Operand::Constant(oomir::Constant::String(field_name)),
+                            rust_layout_size_operand(field_rust_ty, tcx, instance),
+                            super::super::types::pointer_memory_codec_operand(
+                                field_rust_ty,
+                                tcx,
+                                data_types,
+                                instance,
+                            ),
+                        ],
+                    });
+                    return oomir::Operand::Variable {
+                        name: result_name,
+                        ty: pointer_ty.clone(),
+                    };
+                }
                 let is_aggregate = matches!(base_rust_ty.kind(), TyKind::Tuple(_))
                     || matches!(
                         base_rust_ty.kind(),
@@ -2104,6 +2234,36 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                                 name: data_pointer,
                                 ty: oomir_target_type.clone(),
                             },
+                        });
+                    } else if matches!(
+                        cast_kind,
+                        CastKind::PointerCoercion(PointerCoercion::Unsize, _)
+                    ) && let Some(target_class) = struct_tail_unsize_target_class(
+                        source_mir_ty,
+                        *target_mir_ty,
+                        &oomir_source_type,
+                        &oomir_target_type,
+                        tcx,
+                        instance,
+                    ) {
+                        instructions.push(oomir::Instruction::InvokeStatic {
+                            dest: Some(temp_cast_var.clone()),
+                            class_name: oomir::POINTER_CLASS.to_string(),
+                            method_name: "unsizeStruct".to_string(),
+                            method_ty: oomir::Signature {
+                                params: vec![
+                                    ("pointer".to_string(), oomir_source_type.clone()),
+                                    ("view_size".to_string(), oomir::Type::I32),
+                                    ("target_class".to_string(), oomir::Type::java_string()),
+                                ],
+                                ret: Box::new(oomir_target_type.clone()),
+                                is_static: true,
+                            },
+                            args: vec![
+                                oomir_operand,
+                                pointer_view_size_operand(*target_mir_ty, tcx, instance),
+                                oomir::Operand::Constant(oomir::Constant::String(target_class)),
+                            ],
                         });
                     } else if matches!(oomir_source_type, oomir::Type::Pointer(_))
                         && matches!(oomir_target_type, oomir::Type::Pointer(_))

@@ -19,6 +19,7 @@ public final class Pointer {
     private static final String SIGNED_BIG_INTEGER_CODEC = "@signed-big-integer";
     private static final String UNSIGNED_BIG_INTEGER_CODEC = "@unsigned-big-integer";
     private static final String F128_CODEC = "@f128";
+    private static final String STRUCTURAL_VIEW_CODEC_PREFIX = "@structural-view:";
     private static final AtomicLong NEXT_ADDRESS = new AtomicLong(0x1_0000_0000L);
     private static final Map<Object, Long> ALLOCATION_BASES = new WeakHashMap<>();
     private static final Map<Object, Integer> ALLOCATION_ELEMENT_SIZES = new WeakHashMap<>();
@@ -29,6 +30,38 @@ public final class Pointer {
     private static final Map<Object, Long> MANAGED_OBJECT_ADDRESSES = new IdentityHashMap<>();
     private static final Map<Long, WeakReference<Object>> MANAGED_OBJECTS = new HashMap<>();
     private static final Map<String, Pointer> TRAIT_METADATA_MARKERS = new HashMap<>();
+    private static final Map<Object, Map<Long, StructuralViewState>> STRUCTURAL_VIEWS =
+            new WeakHashMap<>();
+    private static final Map<Object, Map<String, WeakReference<FieldCell>>> FIELD_CELLS =
+            new WeakHashMap<>();
+
+    /**
+     * Keeps the distinct JVM carriers for a Rust struct-tail unsizing coercion
+     * coherent. Rust guarantees exclusive access through a mutable borrow, so
+     * synchronizing when execution changes carrier is sufficient even though
+     * mutations happen directly on the generated public fields.
+     */
+    private static final class StructuralViewState {
+        private final Map<Class<?>, Object> views = new HashMap<>();
+        private Object active;
+
+        private StructuralViewState(Object source) {
+            views.put(source.getClass(), source);
+            active = source;
+        }
+
+        private Object activate(Class<?> targetClass) {
+            Object target = views.get(targetClass);
+            if (target == null) {
+                target = constructStructuralView(active, targetClass);
+                views.put(targetClass, target);
+            } else if (target != active) {
+                copyStructuralFields(active, target);
+            }
+            active = target;
+            return target;
+        }
+    }
 
     /**
      * Implements a whole-value assignment through an instance method's
@@ -148,11 +181,267 @@ public final class Pointer {
         throw new IllegalArgumentException("unknown primitive type " + type.getName());
     }
 
+    private static boolean isStructuralViewCodec(String codecClassName) {
+        return codecClassName != null
+                && codecClassName.startsWith(STRUCTURAL_VIEW_CODEC_PREFIX);
+    }
+
+    private static Field instanceField(Class<?> owner, String name)
+            throws NoSuchFieldException {
+        Field field = owner.getField(name);
+        if (Modifier.isStatic(field.getModifiers())) {
+            throw new NoSuchFieldException(owner.getName() + "." + name + " is static");
+        }
+        return field;
+    }
+
+    private static Object sliceBackingForArray(Object slice, Class<?> targetArrayType)
+            throws ReflectiveOperationException {
+        Class<?> sliceClass = slice.getClass();
+        Object backing = instanceField(sliceClass, "array").get(slice);
+        int offset = instanceField(sliceClass, "offset").getInt(slice);
+        int length = instanceField(sliceClass, "length").getInt(slice);
+        if (backing instanceof Pointer) {
+            backing = ((Pointer) backing).backingArray();
+        }
+        if (backing == null || !backing.getClass().isArray()) {
+            throw new IllegalArgumentException("slice-tail view is not backed by an array");
+        }
+        if (!targetArrayType.getComponentType().isAssignableFrom(
+                backing.getClass().getComponentType())
+                && targetArrayType.getComponentType()
+                        != backing.getClass().getComponentType()) {
+            throw new IllegalArgumentException(
+                    "slice-tail backing has incompatible array component type");
+        }
+        if (offset == 0 && length == Array.getLength(backing)
+                && targetArrayType.isInstance(backing)) {
+            return backing;
+        }
+        Object result = Array.newInstance(targetArrayType.getComponentType(), length);
+        System.arraycopy(backing, offset, result, 0, length);
+        return result;
+    }
+
+    private static Object adaptStructuralField(Object value, Class<?> targetType)
+            throws ReflectiveOperationException {
+        if (value == null) {
+            return defaultValue(targetType);
+        }
+        if (targetType.isInstance(value)
+                || (targetType.isPrimitive()
+                        && (value instanceof Number
+                                || value instanceof Boolean
+                                || value instanceof Character))) {
+            return value;
+        }
+        if (targetType.getName().equals("org.rustlang.runtime.SliceView")
+                && value.getClass().isArray()) {
+            Constructor<?> constructor = targetType.getConstructor(
+                    Object.class, int.class, int.class);
+            return constructor.newInstance(value, 0, Array.getLength(value));
+        }
+        if (targetType.isArray()
+                && value.getClass().getName().equals("org.rustlang.runtime.SliceView")) {
+            return sliceBackingForArray(value, targetType);
+        }
+        return constructStructuralView(value, targetType);
+    }
+
+    private static Constructor<?> structuralConstructor(Class<?> targetClass, int fieldCount) {
+        for (Constructor<?> constructor : targetClass.getConstructors()) {
+            if (constructor.getParameterCount() == fieldCount) {
+                return constructor;
+            }
+        }
+        throw new IllegalArgumentException(
+                "no generated Rust value constructor for " + targetClass.getName());
+    }
+
+    private static Object constructStructuralView(Object source, Class<?> targetClass) {
+        try {
+            Field[] targetFields = java.util.Arrays.stream(targetClass.getFields())
+                    .filter(field -> !Modifier.isStatic(field.getModifiers()))
+                    .toArray(Field[]::new);
+            Constructor<?> constructor = structuralConstructor(targetClass, targetFields.length);
+            Object[] args = new Object[constructor.getParameterCount()];
+            java.lang.reflect.Parameter[] parameters = constructor.getParameters();
+            for (int index = 0; index < parameters.length; index++) {
+                String fieldName = parameters[index].isNamePresent()
+                        ? parameters[index].getName()
+                        : targetFields[index].getName();
+                Field sourceField = instanceField(source.getClass(), fieldName);
+                args[index] = adaptStructuralField(
+                        sourceField.get(source), parameters[index].getType());
+            }
+            return constructor.newInstance(args);
+        } catch (ReflectiveOperationException error) {
+            throw new IllegalStateException(
+                    "could not construct structural Rust view "
+                            + source.getClass().getName() + " -> " + targetClass.getName(),
+                    error);
+        }
+    }
+
+    private static void copyStructuralFields(Object source, Object target) {
+        try {
+            for (Field targetField : target.getClass().getFields()) {
+                if (Modifier.isStatic(targetField.getModifiers())) {
+                    continue;
+                }
+                Field sourceField = instanceField(source.getClass(), targetField.getName());
+                Object sourceValue = sourceField.get(source);
+                Object targetValue = targetField.get(target);
+                Object adapted;
+                if (sourceValue != null && targetValue != null
+                        && !targetField.getType().isInstance(sourceValue)
+                        && !targetField.getType().isArray()
+                        && !targetField.getType().getName()
+                                .equals("org.rustlang.runtime.SliceView")) {
+                    copyStructuralFields(sourceValue, targetValue);
+                    adapted = targetValue;
+                } else {
+                    adapted = adaptStructuralField(sourceValue, targetField.getType());
+                }
+                targetField.set(target, adapted);
+            }
+        } catch (ReflectiveOperationException error) {
+            throw new IllegalStateException(
+                    "could not synchronize structural Rust view "
+                            + source.getClass().getName() + " -> " + target.getClass().getName(),
+                    error);
+        }
+    }
+
+    private StructuralViewState structuralViewState(Object source, boolean create) {
+        synchronized (STRUCTURAL_VIEWS) {
+            Map<Long, StructuralViewState> allocationViews = STRUCTURAL_VIEWS.get(allocation);
+            if (allocationViews == null) {
+                if (!create) {
+                    return null;
+                }
+                allocationViews = new HashMap<>();
+                STRUCTURAL_VIEWS.put(allocation, allocationViews);
+            }
+            StructuralViewState state = allocationViews.get(byteOffset);
+            if (state == null && create) {
+                state = new StructuralViewState(source);
+                allocationViews.put(byteOffset, state);
+            }
+            return state;
+        }
+    }
+
+    private void clearStructuralViewState() {
+        synchronized (STRUCTURAL_VIEWS) {
+            Map<Long, StructuralViewState> allocationViews = STRUCTURAL_VIEWS.get(allocation);
+            if (allocationViews != null) {
+                allocationViews.remove(byteOffset);
+                if (allocationViews.isEmpty()) {
+                    STRUCTURAL_VIEWS.remove(allocation);
+                }
+            }
+        }
+    }
+
+    private String[] structuralViewDescriptor() {
+        String descriptor = viewCodecClassName.substring(STRUCTURAL_VIEW_CODEC_PREFIX.length());
+        String[] parts = descriptor.split("\n", 3);
+        if (parts.length != 3) {
+            throw new IllegalStateException("invalid structural Rust view descriptor");
+        }
+        return parts;
+    }
+
+    private Object structuralSourceObject(String[] descriptor) {
+        int sourceViewSize;
+        try {
+            sourceViewSize = Integer.parseInt(descriptor[1]);
+        } catch (NumberFormatException error) {
+            throw new IllegalStateException("invalid structural Rust source view size", error);
+        }
+        String sourceCodec = descriptor[2].isEmpty() ? null : descriptor[2];
+        return new Pointer(
+                        allocation,
+                        allocationElementSize,
+                        byteOffset,
+                        sourceViewSize,
+                        allocationCodecClassName,
+                        sourceCodec,
+                        exposedAddress)
+                .withMetadata(metadata)
+                .getObject();
+    }
+
+    private Object structuralViewObject() {
+        String[] descriptor = structuralViewDescriptor();
+        String targetClassName = descriptor[0].replace('/', '.');
+        Object source = structuralSourceObject(descriptor);
+        try {
+            ClassLoader loader = source.getClass().getClassLoader();
+            Class<?> targetClass = Class.forName(targetClassName, true, loader);
+            return structuralViewState(source, true).activate(targetClass);
+        } catch (ClassNotFoundException error) {
+            throw new IllegalStateException(
+                    "could not load structural Rust view " + targetClassName, error);
+        }
+    }
+
+    private static long inferredStructuralMetadata(Object value) {
+        if (value == null) {
+            return -1;
+        }
+        try {
+            if (value.getClass().getName().equals("org.rustlang.runtime.SliceView")) {
+                return Integer.toUnsignedLong(
+                        instanceField(value.getClass(), "length").getInt(value));
+            }
+            for (Field field : value.getClass().getFields()) {
+                if (Modifier.isStatic(field.getModifiers()) || field.getType().isPrimitive()) {
+                    continue;
+                }
+                long metadata = inferredStructuralMetadata(field.get(value));
+                if (metadata >= 0) {
+                    return metadata;
+                }
+            }
+            return -1;
+        } catch (ReflectiveOperationException error) {
+            throw new IllegalStateException("could not inspect Rust structural metadata", error);
+        }
+    }
+
     private static final class Cell {
         private Object value;
 
         private Cell(Object value) {
             this.value = value;
+        }
+    }
+
+    private static final class FieldCell {
+        private final Object owner;
+        private final Field field;
+
+        private FieldCell(Object owner, Field field) {
+            this.owner = owner;
+            this.field = field;
+        }
+
+        private Object get() {
+            try {
+                return field.get(owner);
+            } catch (IllegalAccessException error) {
+                throw new IllegalStateException("could not read Rust field pointer", error);
+            }
+        }
+
+        private void set(Object value) {
+            try {
+                field.set(owner, value);
+            } catch (IllegalAccessException error) {
+                throw new IllegalStateException("could not write Rust field pointer", error);
+            }
         }
     }
 
@@ -270,7 +559,35 @@ public final class Pointer {
     }
 
     public static Pointer cell(Object value) {
-        return cell(value, inferredCarrierSize(value));
+        Pointer pointer = cell(value, inferredCarrierSize(value));
+        long metadata = inferredStructuralMetadata(value);
+        return metadata < 0 ? pointer : pointer.withMetadata(metadata);
+    }
+
+    /** Returns a stable, write-through pointer to a generated Rust value field. */
+    public static Pointer field(
+            Object owner, String fieldName, int size, String codecClassName) {
+        if (owner == null) {
+            throw new NullPointerException("Rust field pointer requires an owner");
+        }
+        FieldCell cell;
+        synchronized (FIELD_CELLS) {
+            Map<String, WeakReference<FieldCell>> fields = FIELD_CELLS.computeIfAbsent(
+                    owner, ignored -> new HashMap<>());
+            WeakReference<FieldCell> reference = fields.get(fieldName);
+            cell = reference == null ? null : reference.get();
+            if (cell == null) {
+                try {
+                    cell = new FieldCell(owner, instanceField(owner.getClass(), fieldName));
+                } catch (NoSuchFieldException error) {
+                    throw new IllegalArgumentException(
+                            "unknown Rust field " + owner.getClass().getName() + "." + fieldName,
+                            error);
+                }
+                fields.put(fieldName, new WeakReference<>(cell));
+            }
+        }
+        return new Pointer(cell, size, 0, size, codecClassName);
     }
 
     public static Pointer array(
@@ -530,6 +847,24 @@ public final class Pointer {
     public static Pointer retype(
             Pointer pointer, int newViewSize, String newViewCodecClassName) {
         return pointer.retype(newViewSize, newViewCodecClassName);
+    }
+
+    /** Creates a coherent JVM carrier view for a Rust struct-tail unsizing coercion. */
+    public static Pointer unsizeStruct(
+            Pointer pointer, int newViewSize, String targetClassName) {
+        if (pointer == null) {
+            throw new NullPointerException("cannot unsize a null Pointer carrier");
+        }
+        if (targetClassName == null || targetClassName.isEmpty()) {
+            throw new IllegalArgumentException("struct-tail view requires a target class");
+        }
+        String sourceCodec = pointer.viewCodecClassName == null
+                ? ""
+                : pointer.viewCodecClassName;
+        return pointer.retype(
+                newViewSize,
+                STRUCTURAL_VIEW_CODEC_PREFIX
+                        + targetClassName + "\n" + pointer.viewSize + "\n" + sourceCodec);
     }
 
     public static Pointer restoreAllocationView(Pointer pointer) {
@@ -1040,6 +1375,22 @@ public final class Pointer {
         }
     }
 
+    private Object readElement(int elementIndex) {
+        if (allocation instanceof Cell) {
+            if (elementIndex != 0) {
+                throw new IndexOutOfBoundsException("pointer arithmetic escaped scalar storage");
+            }
+            return ((Cell) allocation).value;
+        }
+        if (allocation instanceof FieldCell) {
+            if (elementIndex != 0) {
+                throw new IndexOutOfBoundsException("pointer arithmetic escaped field storage");
+            }
+            return ((FieldCell) allocation).get();
+        }
+        return Array.get(allocation, elementIndex);
+    }
+
     private Object readAlignedElement() {
         if (allocation == null) {
             throw new NullPointerException("attempted to dereference a null Rust pointer");
@@ -1056,13 +1407,7 @@ public final class Pointer {
             throw new IllegalStateException("object dereference is not aligned to its allocation element");
         }
         int elementIndex = Math.toIntExact(byteOffset / allocationElementSize);
-        if (allocation instanceof Cell) {
-            if (elementIndex != 0) {
-                throw new IndexOutOfBoundsException("pointer arithmetic escaped scalar storage");
-            }
-            return ((Cell) allocation).value;
-        }
-        return Array.get(allocation, elementIndex);
+        return readElement(elementIndex);
     }
 
     private long loadUnsigned(int byteCount) {
@@ -1086,14 +1431,7 @@ public final class Pointer {
         int elementIndex = Math.toIntExact(Math.floorDiv(absoluteByteOffset, allocationElementSize));
         int withinElement = (int) Math.floorMod(absoluteByteOffset, allocationElementSize);
         Object value;
-        if (allocation instanceof Cell) {
-            if (elementIndex != 0) {
-                throw new IndexOutOfBoundsException("pointer arithmetic escaped scalar storage");
-            }
-            value = ((Cell) allocation).value;
-        } else {
-            value = Array.get(allocation, elementIndex);
-        }
+        value = readElement(elementIndex);
         if (value instanceof BigInteger) {
             return bigIntegerByte((BigInteger) value, withinElement) & 0xff;
         }
@@ -1137,14 +1475,7 @@ public final class Pointer {
         int elementIndex = Math.toIntExact(Math.floorDiv(absoluteByteOffset, allocationElementSize));
         int withinElement = (int) Math.floorMod(absoluteByteOffset, allocationElementSize);
         Object current;
-        if (allocation instanceof Cell) {
-            if (elementIndex != 0) {
-                throw new IndexOutOfBoundsException("pointer arithmetic escaped scalar storage");
-            }
-            current = ((Cell) allocation).value;
-        } else {
-            current = Array.get(allocation, elementIndex);
-        }
+        current = readElement(elementIndex);
         if (current instanceof BigInteger) {
             BigInteger updated = replaceBigIntegerByte(
                     (BigInteger) current,
@@ -1251,6 +1582,9 @@ public final class Pointer {
         if (F128_CODEC.equals(viewCodecClassName) && !isDirectAllocationView()) {
             return F128.fromBits(bigIntegerFromPointerBytes(viewSize, false));
         }
+        if (isStructuralViewCodec(viewCodecClassName)) {
+            return structuralViewObject();
+        }
         if (viewCodecClassName != null && !isDirectAllocationView()) {
             byte[] image = new byte[viewSize];
             for (int index = 0; index < viewSize; index++) {
@@ -1258,7 +1592,9 @@ public final class Pointer {
             }
             return decodeAggregate(viewCodecClassName, image);
         }
-        return readAlignedElement();
+        Object value = readAlignedElement();
+        StructuralViewState state = structuralViewState(value, false);
+        return state == null ? value : state.activate(value.getClass());
     }
 
     private boolean isDirectAllocationView() {
@@ -1321,11 +1657,17 @@ public final class Pointer {
             throw new IndexOutOfBoundsException("pointer arithmetic escaped zero-sized storage");
         }
 
+
+        if (isStructuralViewCodec(viewCodecClassName)) {
+            Object target = structuralViewObject();
+            overwriteManagedObject(target, value);
+            return;
+        }
+
         if (isDirectAllocationView()) {
+            clearStructuralViewState();
             int elementIndex = Math.toIntExact(byteOffset / allocationElementSize);
-            Object current = allocation instanceof Cell
-                    ? ((Cell) allocation).value
-                    : Array.get(allocation, elementIndex);
+            Object current = readElement(elementIndex);
             writeElement(
                     elementIndex,
                     convertDirectValue(current, value, allocationElementSize));
@@ -1622,9 +1964,7 @@ public final class Pointer {
             long absoluteOffset = byteOffset + consumed;
             int elementIndex = Math.toIntExact(Math.floorDiv(absoluteOffset, allocationElementSize));
             int withinElement = (int) Math.floorMod(absoluteOffset, allocationElementSize);
-            Object current = allocation instanceof Cell
-                    ? ((Cell) allocation).value
-                    : Array.get(allocation, elementIndex);
+            Object current = readElement(elementIndex);
             byte[] image = encodeAggregate(allocationCodecClassName, current);
             int chunk = Math.min(source.length - consumed, image.length - withinElement);
             System.arraycopy(source, consumed, image, withinElement, chunk);
@@ -1641,6 +1981,13 @@ public final class Pointer {
                 throw new IndexOutOfBoundsException("pointer arithmetic escaped scalar storage");
             }
             ((Cell) allocation).value = value;
+            return;
+        }
+        if (allocation instanceof FieldCell) {
+            if (elementIndex != 0) {
+                throw new IndexOutOfBoundsException("pointer arithmetic escaped field storage");
+            }
+            ((FieldCell) allocation).set(value);
             return;
         }
         Array.set(allocation, elementIndex, value);

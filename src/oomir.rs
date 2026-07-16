@@ -198,6 +198,24 @@ pub struct Signature {
 }
 
 impl Signature {
+    /// Whether the first OOMIR parameter is represented by the JVM's implicit
+    /// receiver slot rather than appearing in the method descriptor.
+    pub fn has_implicit_jvm_receiver(&self) -> bool {
+        !self.is_static
+            && self
+                .params
+                .first()
+                .is_some_and(|(_, ty)| ty.is_jvm_reference_type())
+    }
+
+    pub fn explicit_jvm_params(&self) -> &[(String, Type)] {
+        if self.has_implicit_jvm_receiver() {
+            &self.params[1..]
+        } else {
+            &self.params
+        }
+    }
+
     fn write_jvm_params(&self, result: &mut String, params: &[(String, Type)]) {
         for (_param_name, param_type) in params {
             if param_type.has_jvm_value() {
@@ -254,54 +272,17 @@ impl Signature {
 
         (params_changed, return_changed)
     }
-
-    /// Whether `params[0]` is an implicit instance receiver (`self`).
-    ///
-    /// A JVM `this` receiver is always a reference type and is left implicit in
-    /// method descriptors, so it must be stripped before a descriptor string or
-    /// an explicit-argument count is computed. This is the single source of
-    /// truth for that decision — callers must not re-implement the type test,
-    /// or the descriptor, argument count, and parameter-name metadata drift out
-    /// of sync (which manifests as JVM verification errors / ClassCastExceptions).
-    pub fn has_self_receiver(&self) -> bool {
-        !self.is_static
-            && self.params.first().is_some_and(|(_, ty)| {
-                matches!(
-                    ty,
-                    Type::Class(_)
-                        | Type::Interface(_)
-                        | Type::Pointer(_)
-                        | Type::MutableReference(_)
-                        | Type::Slice(_)
-                        | Type::Str
-                        | Type::Reference(_)
-                )
-            })
-    }
-
-    /// The explicit parameters: every parameter after an implicit `self`
-    /// receiver, or all parameters for a static method / free function.
-    pub fn explicit_params(&self) -> &[(String, Type)] {
-        if self.has_self_receiver() {
-            &self.params[1..]
-        } else {
-            &self.params
-        }
-    }
 }
 
 // impl Display for Signature, to make it so we can get the signature as a string suitable for the JVM bytecode, i.e. (I)V etc.
-impl fmt::Display for Signature {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "(")?;
-        // The JVM receiver is implicit in invokevirtual/invokeinterface, so an
-        // instance method's `self` is dropped by `explicit_params`.
-        for (_param_name, param_ty) in self.explicit_params() {
-            if param_ty.has_jvm_value() {
-                write!(f, "{}", param_ty.to_jvm_descriptor())?;
-            }
-        }
-        write!(f, "){}", self.ret.to_jvm_return_descriptor())
+impl Signature {
+    pub fn to_string(&self) -> String {
+        let mut result = String::new();
+        result.push('(');
+        self.write_jvm_params(&mut result, self.explicit_jvm_params());
+        result.push(')');
+        result.push_str(&self.ret.to_jvm_return_descriptor());
+        result
     }
 }
 
@@ -1125,5 +1106,17 @@ impl Type {
             Type::Pointer(inner) => inner.get_class_name(),
             _ => None,
         }
+    }
+}
+
+impl fmt::Display for Signature {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "(")?;
+        for (_param_name, param_ty) in self.explicit_jvm_params() {
+            if param_ty.has_jvm_value() {
+                write!(f, "{}", param_ty.to_jvm_descriptor())?;
+            }
+        }
+        write!(f, "){}", self.ret.to_jvm_return_descriptor())
     }
 }
