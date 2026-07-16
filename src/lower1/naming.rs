@@ -2,12 +2,14 @@
 
 use super::jvm_names;
 use rustc_hir::{LangItem, def::DefKind};
+use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 use rustc_middle::ty::{GenericArg, Instance, TyCtxt, TypeVisitableExt};
 use rustc_span::{def_id::LOCAL_CRATE, sym};
 use std::collections::HashMap;
 
 const MAX_MONO_FN_NAME_LEN: usize = 128;
 const WEAK_LANG_ITEMS_CLASS: &str = "org/rustlang/runtime/WeakLangItems";
+const GLOBAL_LINK_SYMBOLS_PACKAGE: &str = "org/rustlang/runtime/symbols";
 
 #[derive(Debug, Clone)]
 pub struct FnNameData {
@@ -106,6 +108,35 @@ pub fn jvm_static_import_from_instance<'tcx>(
         );
     }
     Ok(import)
+}
+
+fn global_link_symbol_from_instance<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
+) -> Option<String> {
+    let attrs = tcx.codegen_fn_attrs(instance.def_id());
+    let symbol_name = attrs.symbol_name.or_else(|| {
+        attrs
+            .flags
+            .intersects(
+                CodegenFnAttrFlags::NO_MANGLE | CodegenFnAttrFlags::RUSTC_STD_INTERNAL_SYMBOL,
+            )
+            .then(|| tcx.item_name(instance.def_id()))
+    })?;
+    if symbol_name.as_str().starts_with("jvm:") {
+        return None;
+    }
+    Some(jvm_names::member_name(symbol_name.as_str()))
+}
+
+pub fn global_link_symbol_class(symbol_name: &str) -> String {
+    format!("{GLOBAL_LINK_SYMBOLS_PACKAGE}/{symbol_name}")
+}
+
+pub fn is_global_link_symbol_class(class_name: &str) -> bool {
+    class_name
+        .strip_prefix(GLOBAL_LINK_SYMBOLS_PACKAGE)
+        .is_some_and(|suffix| suffix.starts_with('/') && suffix.len() > 1)
 }
 
 pub fn associated_method_name_from_instance<'tcx>(
@@ -216,6 +247,13 @@ pub fn mono_fn_name_from_instance<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'t
         };
     }
 
+    if let Some(method_name) = global_link_symbol_from_instance(tcx, instance) {
+        return FnNameData {
+            class_to_call_on: Some(global_link_symbol_class(&method_name)),
+            method_name,
+        };
+    }
+
     let class = Some(mono_owner_class(tcx, instance));
 
     let mut safe_base = jvm_names::method_for_function(tcx, instance.def_id());
@@ -299,11 +337,11 @@ mod tests {
     use super::{JvmStaticImport, jvm_names, parse_jvm_link_name};
 
     #[test]
-    fn generated_jvm_identifiers_collapse_underscore_runs() {
-        assert_eq!(jvm_names::member_name("many___parts"), "many_parts");
+    fn generated_jvm_identifiers_preserve_rust_underscores() {
+        assert_eq!(jvm_names::member_name("many___parts"), "many___parts");
         assert_eq!(
             jvm_names::member_name("__compiler_builtin"),
-            "_compiler_builtin"
+            "__compiler_builtin"
         );
         assert_eq!(jvm_names::member_name("part::<item>"), "part_item");
     }

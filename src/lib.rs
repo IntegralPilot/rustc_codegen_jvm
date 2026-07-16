@@ -11,6 +11,7 @@
 //! MIR -> OOMIR -> JVM Bytecode.
 
 extern crate rustc_abi;
+extern crate rustc_ast;
 extern crate rustc_codegen_ssa;
 extern crate rustc_data_structures;
 extern crate rustc_driver;
@@ -198,7 +199,11 @@ fn place_or_insert_mono_function<'tcx>(
     mut oomir_function: oomir::Function,
     oomir_module: &mut oomir::Module,
 ) {
-    if let Some(assoc_item) = tcx.opt_associated_item(instance.def_id()) {
+    let has_global_linkage = name
+        .class_to_call_on
+        .as_deref()
+        .is_some_and(lower1::naming::is_global_link_symbol_class);
+    if !has_global_linkage && let Some(assoc_item) = tcx.opt_associated_item(instance.def_id()) {
         if assoc_item.trait_container(tcx).is_none() {
             let fallback_function = oomir_function.clone();
             let has_enum_reference_receiver = assoc_item.is_method()
@@ -308,6 +313,36 @@ fn place_or_insert_mono_function<'tcx>(
     // receiver must remain an explicit descriptor parameter in this fallback.
     oomir_function.signature.is_static = true;
     oomir_module.insert_function(oomir_function);
+}
+
+fn emit_allocator_shim_guard(tcx: TyCtxt<'_>, oomir_module: &mut oomir::Module) {
+    if rustc_codegen_ssa::base::allocator_kind_for_codegen(tcx).is_none() {
+        return;
+    }
+
+    let entry = "entry".to_string();
+    let symbol_name =
+        lower1::jvm_names::member_name(rustc_ast::expand::allocator::NO_ALLOC_SHIM_IS_UNSTABLE);
+    oomir_module.insert_function(oomir::Function {
+        owner_class: Some(lower1::naming::global_link_symbol_class(&symbol_name)),
+        name: symbol_name,
+        signature: oomir::Signature {
+            params: Vec::new(),
+            ret: Box::new(oomir::Type::Void),
+            is_static: true,
+        },
+        debug_variables: Vec::new(),
+        body: oomir::CodeBlock {
+            entry: entry.clone(),
+            basic_blocks: HashMap::from([(
+                entry.clone(),
+                oomir::BasicBlock {
+                    label: entry,
+                    instructions: vec![oomir::Instruction::Return { operand: None }],
+                },
+            )]),
+        },
+    });
 }
 
 fn lower_mono_function<'tcx>(
@@ -650,6 +685,7 @@ impl CodegenBackend for MyBackend {
             let mut lowered_instances = HashSet::new();
             lower_public_library_exports(tcx, &mut oomir_module, &mut lowered_instances);
             lower_mono_items(tcx, &mut oomir_module, &mut lowered_instances);
+            emit_allocator_shim_guard(tcx, &mut oomir_module);
 
             breadcrumbs::log!(
                 breadcrumbs::LogLevel::Info,
@@ -756,13 +792,12 @@ impl CodegenBackend for MyBackend {
             // Iterate over each (file_name, bytecode) pair in the map.
             for (name, bytecode) in bytecode_map.into_iter() {
                 let cgu_name = name.replace('/', "_");
+                // The filesystem object name must remain crate-specific. Multiple
+                // crates may emit complementary definitions for the same JVM class,
+                // and Cargo can compile and archive those crates concurrently. The
+                // canonical JVM name is stored inside the classfile and recovered by
+                // the JVM linker; it does not need to be repeated in the path.
                 let file_path = outputs.temp_path_ext_for_cgu("class", &cgu_name);
-
-                // extract the directory from the file path
-                let dir = file_path.parent().unwrap();
-
-                // make the actual file path by adding {name}.class to the directory
-                let file_path = dir.join(format!("{}.class", name));
                 if let Some(parent) = file_path.parent() {
                     std::fs::create_dir_all(parent).unwrap_or_else(|e| {
                         panic!(

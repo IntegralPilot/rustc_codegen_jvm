@@ -4420,7 +4420,7 @@ pub fn sanitize_name_token(s: &str) -> String {
     let mut token = String::with_capacity(s.len());
     let mut previous_was_separator = false;
     for ch in s.chars() {
-        if ch.is_ascii_alphanumeric() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
             token.push(ch);
             previous_was_separator = false;
         } else if !previous_was_separator && !token.is_empty() {
@@ -4638,11 +4638,11 @@ mod tests {
     use super::sanitize_name_token;
 
     #[test]
-    fn generated_name_tokens_have_no_duplicate_or_trailing_separators() {
+    fn generated_name_tokens_preserve_rust_underscores() {
         assert_eq!(sanitize_name_token("Tuple_"), "Tuple");
         assert_eq!(
-            sanitize_name_token("Result<Tuple_::Error>"),
-            "Result_Tuple_Error"
+            sanitize_name_token("Result<Type__Name::Error>"),
+            "Result_Type__Name_Error"
         );
         assert_eq!(sanitize_name_token("___"), "Type");
     }

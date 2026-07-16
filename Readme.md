@@ -64,6 +64,7 @@ These examples live in `tests/binary`, are compiled with upstream Rust `core` an
 | **[Function pointers](tests/binary/fn_pointers/src/main.rs)** | Function pointers as values, fields, parameters, returns, and generic members |
 | **[Raw pointers](tests/binary/raw_ptrs/src/main.rs)** | Stable pointer identity, dereferencing, casts, arithmetic, nested pointers and lots more! |
 | **[Unions](tests/binary/unions/src/main.rs)** | `unsafe` union handling, running on the JVM |
+| **[Alloc](tests/binary/alloc/src/main.rs)** | using the compiled `alloc` crate - `Vec` etc. |
 
 ## Features
 
@@ -180,9 +181,9 @@ Create a Rust project like normal.
 
 Then, copy the `config.toml` at the root of this project (generated after running the build as detailed above) into `.cargo/config.toml` of your Rust project.
 
-JVM crates currently need to be `#![no_std]`, because we can compile upstream `core`, but `std` would require changes to upstream which can only be made once the integration of the JVM target upstream begins. 
+JVM crates currently need to be `#![no_std]`, because we can compile upstream `core` and `alloc`, but `std` would require changes to upstream which can only be made once the integration of the JVM target upstream begins. 
 
-A reusable prelude has been created to deal with this. Simply prepend this to your `main.rs`, and then write the rest of the crate (including a `main` function) like you normally would (without calling any APIs that are in `std` but not `core`).
+A reusable prelude has been created to deal with this. Simply prepend this to your `main.rs`, and then write the rest of the crate (including a `main` function) like you normally would (without calling any APIs that are in `std` but not `core` or `alloc`). It includes a panic handler and allocator which work on JVM.
 
 ```rust
 #![no_std]

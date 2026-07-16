@@ -1,9 +1,8 @@
 use rustc_middle::ty::{GenericArgsRef, Instance, TyCtxt};
-use rustc_session::config::CrateType;
-use rustc_span::def_id::{CrateNum, DefId};
+use rustc_span::def_id::{CrateNum, DefId, LOCAL_CRATE};
 use rustc_span::sym;
 
-const RUNTIME_CRATES: &[rustc_span::Symbol] = &[sym::core];
+const RUNTIME_CRATES: &[rustc_span::Symbol] = &[sym::core, sym::alloc];
 
 fn is_runtime_crate_name(crate_name: rustc_span::Symbol) -> bool {
     RUNTIME_CRATES.contains(&crate_name)
@@ -14,11 +13,7 @@ pub fn uses_compiled_core(tcx: TyCtxt<'_>) -> bool {
 }
 
 pub fn compiles_external_core_instances(tcx: TyCtxt<'_>) -> bool {
-    uses_compiled_core(tcx)
-        && tcx
-            .crate_types()
-            .iter()
-            .any(|crate_type| matches!(crate_type, CrateType::Executable))
+    uses_compiled_core(tcx) && tcx.crate_name(LOCAL_CRATE) != sym::core
 }
 
 pub fn is_runtime_crate<'tcx>(tcx: TyCtxt<'tcx>, krate: CrateNum) -> bool {
@@ -205,14 +200,9 @@ fn jvm_identifier(raw: &str) -> String {
     let mut previous_was_separator = false;
 
     for ch in raw.chars() {
-        if ch.is_ascii_alphanumeric() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
             out.push(ch);
             previous_was_separator = false;
-        } else if ch == '_' && out.is_empty() {
-            if !previous_was_separator {
-                out.push('_');
-                previous_was_separator = true;
-            }
         } else if !previous_was_separator && !out.is_empty() {
             out.push('_');
             previous_was_separator = true;

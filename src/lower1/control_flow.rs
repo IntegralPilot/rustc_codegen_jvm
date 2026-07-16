@@ -3123,6 +3123,72 @@ pub(super) fn convert_basic_block<'tcx>(
                             // following unsafe operation UB. Valid monomorphizations therefore
                             // require no JVM instruction.
                         } else if is_compiler_intrinsic
+                            && intrinsic_name == "ctpop"
+                            && let Some(dest) = effective_dest.clone()
+                        {
+                            let operand = oomir_operands
+                                .first()
+                                .cloned()
+                                .expect("ctpop has an integer operand");
+                            let operand_ty = operand
+                                .get_type()
+                                .expect("ctpop integer operand has a JVM type");
+                            let (method_name, parameter_ty, call_args) = match operand_ty {
+                                oomir::Type::I8 | oomir::Type::U8 => (
+                                    "bitCount32",
+                                    oomir::Type::I32,
+                                    vec![
+                                        operand,
+                                        oomir::Operand::Constant(oomir::Constant::I32(8)),
+                                    ],
+                                ),
+                                oomir::Type::I16 | oomir::Type::U16 => (
+                                    "bitCount32",
+                                    oomir::Type::I32,
+                                    vec![
+                                        operand,
+                                        oomir::Operand::Constant(oomir::Constant::I32(16)),
+                                    ],
+                                ),
+                                oomir::Type::I32 | oomir::Type::U32 => (
+                                    "bitCount32",
+                                    oomir::Type::I32,
+                                    vec![
+                                        operand,
+                                        oomir::Operand::Constant(oomir::Constant::I32(32)),
+                                    ],
+                                ),
+                                oomir::Type::I64 | oomir::Type::U64 => {
+                                    ("bitCount64", oomir::Type::I64, vec![operand])
+                                }
+                                oomir::Type::Class(ref class_name)
+                                    if class_name == crate::lower2::I128_CLASS =>
+                                {
+                                    ("bitCountI128", operand_ty.clone(), vec![operand])
+                                }
+                                oomir::Type::Class(ref class_name)
+                                    if class_name == crate::lower2::U128_CLASS =>
+                                {
+                                    ("bitCountU128", operand_ty.clone(), vec![operand])
+                                }
+                                other => panic!("unsupported ctpop integer carrier {other:?}"),
+                            };
+                            let mut params = vec![("value".to_string(), parameter_ty)];
+                            if call_args.len() == 2 {
+                                params.push(("bit_width".to_string(), oomir::Type::I32));
+                            }
+                            instructions.push(oomir::Instruction::InvokeStatic {
+                                dest: Some(dest),
+                                class_name: "org/rustlang/runtime/Numbers".to_string(),
+                                method_name: method_name.to_string(),
+                                method_ty: oomir::Signature {
+                                    params,
+                                    ret: Box::new(oomir::Type::U32),
+                                    is_static: true,
+                                },
+                                args: call_args,
+                            });
+                        } else if is_compiler_intrinsic
                             && intrinsic_name.as_str() == "is_val_statically_known"
                             && let Some(dest) = effective_dest.clone()
                         {
@@ -4307,6 +4373,47 @@ pub(super) fn convert_basic_block<'tcx>(
                                     fn_name_data.method_name,
                                 )
                             };
+                            if super::naming::is_global_link_symbol_class(&class_name) {
+                                for (index, input_ty) in fn_inputs.iter().enumerate() {
+                                    let TyKind::Adt(adt_def, _) = input_ty.kind() else {
+                                        continue;
+                                    };
+                                    if !tcx.is_diagnostic_item(sym::NonNull, adt_def.did()) {
+                                        continue;
+                                    }
+                                    let Some(operand) = oomir_operands.get(index).cloned() else {
+                                        continue;
+                                    };
+                                    let Some(oomir::Type::Class(wrapper_class)) =
+                                        operand.get_type()
+                                    else {
+                                        continue;
+                                    };
+                                    let pointer_ty = match data_types.get(&wrapper_class) {
+                                        Some(oomir::DataType::Class { fields, .. }) => fields
+                                            .iter()
+                                            .find(|(field_name, _)| field_name == "pointer")
+                                            .map(|(_, field_ty)| field_ty.clone())
+                                            .expect("NonNull carrier has a pointer field"),
+                                        _ => panic!(
+                                            "NonNull carrier class {wrapper_class} was not generated"
+                                        ),
+                                    };
+                                    let unwrapped = format!("{label}_global_abi_arg_{index}");
+                                    instructions.push(oomir::Instruction::GetField {
+                                        dest: unwrapped.clone(),
+                                        object: operand,
+                                        field_name: "pointer".to_string(),
+                                        field_ty: pointer_ty.clone(),
+                                        owner_class: wrapper_class,
+                                    });
+                                    oomir_operands[index] = oomir::Operand::Variable {
+                                        name: unwrapped,
+                                        ty: pointer_ty.clone(),
+                                    };
+                                    method_signature.params[index].1 = pointer_ty;
+                                }
+                            }
                             let call_args = if is_closure_call && !oomir_operands.is_empty() {
                                 if closure_has_captures {
                                     oomir_operands.clone()

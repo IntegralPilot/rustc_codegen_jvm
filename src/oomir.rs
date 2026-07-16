@@ -828,7 +828,7 @@ impl Type {
             let mut result = String::with_capacity(raw.len());
             let mut separator = false;
             for ch in raw.chars() {
-                if ch.is_ascii_alphanumeric() {
+                if ch.is_ascii_alphanumeric() || ch == '_' {
                     result.push(ch);
                     separator = false;
                 } else if !separator && !result.is_empty() {

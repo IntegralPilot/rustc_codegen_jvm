@@ -1,6 +1,48 @@
 const PANIC_BUFFER_CAPACITY: usize = 256;
 const TRUNCATION_MARKER: &[u8] = b"... <panic message truncated>";
 
+struct JvmAllocator;
+
+unsafe extern "C" {
+    #[link_name = "jvm:static:org/rustlang/runtime/Pointer:allocateBytes:(JJ)Lorg/rustlang/runtime/Pointer;"]
+    fn allocate_bytes(size: usize, alignment: usize) -> *mut u8;
+
+    #[link_name = "jvm:static:org/rustlang/runtime/Pointer:reallocateBytes:(Lorg/rustlang/runtime/Pointer;JJJ)Lorg/rustlang/runtime/Pointer;"]
+    fn reallocate_bytes(
+        pointer: *mut u8,
+        old_size: usize,
+        alignment: usize,
+        new_size: usize,
+    ) -> *mut u8;
+}
+
+unsafe impl core::alloc::GlobalAlloc for JvmAllocator {
+    unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
+        unsafe { allocate_bytes(layout.size(), layout.align()) }
+    }
+
+    unsafe fn dealloc(&self, _pointer: *mut u8, _layout: core::alloc::Layout) {
+        // Dropping the last Pointer carrier releases the JVM byte array to GC.
+    }
+
+    unsafe fn realloc(
+        &self,
+        pointer: *mut u8,
+        layout: core::alloc::Layout,
+        new_size: usize,
+    ) -> *mut u8 {
+        unsafe { reallocate_bytes(pointer, layout.size(), layout.align(), new_size) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: core::alloc::Layout) -> *mut u8 {
+        // JVM arrays are zero-initialized.
+        unsafe { allocate_bytes(layout.size(), layout.align()) }
+    }
+}
+
+#[global_allocator]
+static GLOBAL_ALLOCATOR: JvmAllocator = JvmAllocator;
+
 struct PanicBuffer<'a> {
     bytes: &'a mut [u8],
     len: usize,

@@ -720,6 +720,41 @@ public final class Pointer {
         return array(array, elementOffset, inferredArrayElementSize(array));
     }
 
+    public static Pointer allocateBytes(long byteCount, long alignment) {
+        int size = checkedArrayLength(byteCount);
+        int checkedAlignment = checkedAlignment(alignment);
+        byte[] bytes = new byte[size];
+        synchronized (ALLOCATION_BASES) {
+            ALLOCATION_ALIGNMENTS.put(bytes, checkedAlignment);
+        }
+        return new Pointer(bytes, 1, 0, 1, null);
+    }
+
+    public static Pointer reallocateBytes(
+            Pointer source,
+            long oldByteCount,
+            long alignment,
+            long newByteCount) {
+        if (source == null) {
+            throw new NullPointerException("Rust realloc requires a non-null pointer");
+        }
+        int oldSize = checkedArrayLength(oldByteCount);
+        int newSize = checkedArrayLength(newByteCount);
+        Pointer destination = allocateBytes(newSize, alignment);
+        copy(source, destination, Math.min(oldSize, newSize));
+        return destination;
+    }
+
+    private static int checkedAlignment(long alignment) {
+        if (alignment <= 0
+                || alignment > Integer.MAX_VALUE
+                || (alignment & (alignment - 1L)) != 0) {
+            throw new IllegalArgumentException(
+                    "Rust allocation alignment must be a positive power of two");
+        }
+        return (int) alignment;
+    }
+
     public static Pointer fromSlice(
             Object sliceView,
             int elementSize,

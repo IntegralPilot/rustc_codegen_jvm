@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use rustc_abi::{VariantIdx, Variants};
+use rustc_abi::{TagEncoding, VariantIdx, Variants};
 use rustc_middle::ty::{EarlyBinder, Instance, Ty, TyCtxt, TyKind, TypingEnv};
 
 use crate::oomir;
@@ -72,6 +72,79 @@ fn representation<'tcx>(
 
 fn operand_var(name: String, ty: oomir::Type) -> oomir::Operand {
     oomir::Operand::Variable { name, ty }
+}
+
+fn integer_constant_bits(constant: &oomir::Constant) -> Option<u128> {
+    match constant {
+        oomir::Constant::I8(value) => Some(*value as u8 as u128),
+        oomir::Constant::U8(value) => Some((*value).into()),
+        oomir::Constant::I16(value) => Some(*value as u16 as u128),
+        oomir::Constant::U16(value) => Some((*value).into()),
+        oomir::Constant::I32(value) => Some(*value as u32 as u128),
+        oomir::Constant::U32(value) => Some((*value).into()),
+        oomir::Constant::I64(value) => Some(*value as u64 as u128),
+        oomir::Constant::U64(value) => Some((*value).into()),
+        oomir::Constant::Boolean(value) => Some(u128::from(*value)),
+        oomir::Constant::Char(value) => Some(u128::from(*value as u32)),
+        _ => None,
+    }
+}
+
+fn materialize_direct_fieldless_enum_constant<'tcx>(
+    source: &oomir::Operand,
+    target_rust_ty: Ty<'tcx>,
+    temp_prefix: &str,
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
+    data_types: &mut HashMap<String, oomir::DataType>,
+    instructions: &mut Vec<oomir::Instruction>,
+) -> Option<oomir::Operand> {
+    let oomir::Operand::Constant(constant) = source else {
+        return None;
+    };
+    let bits = integer_constant_bits(constant)?;
+    let TyKind::Adt(adt_def, _) = target_rust_ty.kind() else {
+        return None;
+    };
+    if !adt_def.is_enum()
+        || adt_def
+            .variants()
+            .iter()
+            .any(|variant| !variant.fields.is_empty())
+    {
+        return None;
+    }
+    let layout = tcx
+        .layout_of(TypingEnv::fully_monomorphized().as_query_input(target_rust_ty))
+        .ok()?;
+    let Variants::Multiple {
+        tag,
+        tag_encoding: TagEncoding::Direct,
+        ..
+    } = layout.variants
+    else {
+        return None;
+    };
+    let bit_width = tag.size(&tcx.data_layout).bits();
+    let mask = if bit_width == 128 {
+        u128::MAX
+    } else {
+        (1_u128 << bit_width) - 1
+    };
+    let variant = adt_def
+        .discriminants(tcx)
+        .find_map(|(variant, discriminant)| {
+            ((discriminant.val & mask) == (bits & mask)).then_some(variant)
+        })?;
+    construct_fieldless_enum_variant(
+        target_rust_ty,
+        variant,
+        temp_prefix,
+        tcx,
+        instance,
+        data_types,
+        instructions,
+    )
 }
 
 pub(super) fn construct_fieldless_enum_variant<'tcx>(
@@ -695,6 +768,17 @@ pub(super) fn adapt_operand_to_rust_type<'tcx>(
     );
     if source.get_type().as_ref() == Some(&target_jvm_ty) {
         return source;
+    }
+    if let Some(value) = materialize_direct_fieldless_enum_constant(
+        &source,
+        target_rust_ty,
+        temp_prefix,
+        tcx,
+        instance,
+        data_types,
+        instructions,
+    ) {
+        return value;
     }
     if !source
         .get_type()

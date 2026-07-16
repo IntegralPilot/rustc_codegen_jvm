@@ -20,6 +20,24 @@ public final class Numbers {
     public static char f16ToBits(short value) { return (char) value; }
     public static short f16FromBits(char value) { return (short) value; }
 
+    public static int bitCount32(int value, int bitWidth) {
+        if (bitWidth <= 0 || bitWidth > 32) {
+            throw new IllegalArgumentException("invalid integer bit width: " + bitWidth);
+        }
+        int mask = bitWidth == 32 ? -1 : (1 << bitWidth) - 1;
+        return Integer.bitCount(value & mask);
+    }
+
+    public static int bitCount64(long value) { return Long.bitCount(value); }
+
+    public static int bitCountI128(I128 value) {
+        return Long.bitCount(value.high) + Long.bitCount(value.low);
+    }
+
+    public static int bitCountU128(U128 value) {
+        return Long.bitCount(value.high) + Long.bitCount(value.low);
+    }
+
     public static float f16ToF32(short value) {
         int half = value & 0xffff;
         int sign = (half & 0x8000) << 16;
