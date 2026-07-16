@@ -411,7 +411,7 @@ pub(super) fn emit_rust_drop_value<'tcx>(
             if super::types::should_define_named_data_type(tcx, adt_def.did()) {
                 instructions.push(oomir::Instruction::InvokeVirtual {
                     class_name,
-                    method_name: "__rust_drop_fields".to_string(),
+                    method_name: "_rust_drop_fields".to_string(),
                     method_ty: oomir::Signature {
                         params: vec![("self".to_string(), oomir_ty)],
                         ret: Box::new(oomir::Type::Void),

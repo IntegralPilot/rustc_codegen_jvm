@@ -1,6 +1,6 @@
 //! Naming helpers for functions and monomorphized instances
 
-use super::{jvm_names, types::ty_to_oomir_type};
+use super::jvm_names;
 use rustc_hir::{LangItem, def::DefKind};
 use rustc_middle::ty::{GenericArg, Instance, TyCtxt, TypeVisitableExt};
 use rustc_span::{def_id::LOCAL_CRATE, sym};
@@ -32,7 +32,14 @@ pub fn mono_owner_class<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> St
         && !instance.args.has_escaping_bound_vars()
         && instance.upstream_monomorphization(tcx).is_none()
     {
-        jvm_names::crate_module_class(tcx, LOCAL_CRATE)
+        let instance_key =
+            super::types::stable_normalized_instance_key(tcx, instance.def_id(), instance.args);
+        let bucket = super::types::short_hash(&instance_key, 1);
+        format!(
+            "{}/mono/MonoBucket_{}",
+            jvm_names::crate_root(tcx, LOCAL_CRATE),
+            bucket
+        )
     } else if let Some(trait_def_id) = tcx
         .opt_associated_item(def_id)
         .and_then(|item| item.trait_container(tcx))
@@ -168,35 +175,26 @@ fn associated_specialization_name<'tcx>(
     args: &[GenericArg<'tcx>],
 ) -> String {
     let method = jvm_names::method_for_function(tcx, canonical_def_id);
-    let definition_hash =
-        super::types::short_hash(&format!("{:?}", tcx.def_path_hash(canonical_def_id)), 10);
-    let safe_base = format!("{method}__{definition_hash}");
     let mut data_types = HashMap::new();
     let mut generic_tokens = Vec::new();
-    let mut specialization_parts = Vec::new();
     for arg in args {
-        if let Some(ty) = arg.as_type() {
-            let oomir_ty = ty_to_oomir_type(ty, tcx, &mut data_types, instance);
-            let token = super::types::readable_oomir_type_name(&oomir_ty);
+        if let Some(token) =
+            super::types::readable_rust_generic_arg_name(*arg, tcx, &mut data_types, instance)
+        {
             generic_tokens.push(super::types::sanitize_name_token(&token));
-            specialization_parts.push(format!("type:{token}"));
-        } else if let Some(constant) = arg.as_const() {
-            specialization_parts.push(format!("const:{constant:?}"));
         }
     }
-    let readable_base = if generic_tokens.is_empty() {
-        safe_base.clone()
-    } else {
-        format!("{}_{}", safe_base, generic_tokens.join("_"))
-    };
-    let specialization_key = specialization_parts.join(";");
-    let specialization_hash = super::types::short_hash(&specialization_key, 10);
-
-    if readable_base.len() + specialization_hash.len() + 2 <= MAX_MONO_FN_NAME_LEN {
-        format!("{readable_base}__{specialization_hash}")
-    } else {
-        format!("{safe_base}__{specialization_hash}")
-    }
+    let identity = format!(
+        "{}:{}",
+        super::types::stable_def_path(tcx, canonical_def_id),
+        super::types::stable_normalized_instance_key(tcx, instance.def_id(), instance.args)
+    );
+    crate::stable_hash::readable_or_hashed_name(
+        &method,
+        &generic_tokens.join("_"),
+        &identity,
+        MAX_MONO_FN_NAME_LEN,
+    )
 }
 
 /// Generate a JVM-safe function name for a (possibly monomorphized) function instance.
@@ -220,22 +218,7 @@ pub fn mono_fn_name_from_instance<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'t
 
     let class = Some(mono_owner_class(tcx, instance));
 
-    // Use only the last path segment as the method base (so "core::panicking::panic" -> "panic")
     let mut safe_base = jvm_names::method_for_function(tcx, instance.def_id());
-    let parent_def_kind = tcx.def_kind(tcx.parent(instance.def_id()));
-    if tcx.opt_associated_item(instance.def_id()).is_some()
-        || matches!(
-            parent_def_kind,
-            DefKind::Fn | DefKind::AssocFn | DefKind::Closure
-        )
-    {
-        let definition_hash =
-            super::types::short_hash(&super::types::stable_def_path(tcx, instance.def_id()), 10);
-        safe_base = format!("{safe_base}__{definition_hash}");
-    }
-    // We need a local map for the type conversion, similar to the original function
-    let mut data_types = HashMap::new();
-
     if instance.args.has_param() || instance.args.has_escaping_bound_vars() {
         let hash = super::types::short_hash(
             &format!(
@@ -247,81 +230,83 @@ pub fn mono_fn_name_from_instance<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'t
         );
         return FnNameData {
             class_to_call_on: class,
-            method_name: format!("{}__{}", safe_base, hash),
+            method_name: format!("{}_{}", safe_base, hash),
         };
+    }
+    let mut data_types = HashMap::new();
+    if let Some(item) = tcx.opt_associated_item(instance.def_id()) {
+        if let Some(trait_def_id) = item.trait_container(tcx) {
+            safe_base = format!(
+                "{}_{}",
+                jvm_names::method_for_function(tcx, trait_def_id),
+                safe_base
+            );
+        } else if let Some(impl_def_id) = item.impl_container(tcx) {
+            let self_ty = tcx
+                .type_of(impl_def_id)
+                .instantiate(tcx, instance.args)
+                .skip_norm_wip();
+            let self_token = super::types::readable_rust_generic_arg_name(
+                self_ty.into(),
+                tcx,
+                &mut data_types,
+                instance,
+            )
+            .map(|token| super::types::sanitize_name_token(&token))
+            .unwrap_or_else(|| "Self".to_string());
+            let trait_prefix = tcx.impl_opt_trait_ref(impl_def_id).map(|trait_ref| {
+                jvm_names::method_for_function(tcx, trait_ref.skip_binder().def_id)
+            });
+            safe_base = if let Some(trait_prefix) = trait_prefix {
+                format!("{trait_prefix}_{self_token}_{safe_base}")
+            } else {
+                format!("{self_token}_{safe_base}")
+            };
+        }
+    } else if matches!(
+        tcx.def_kind(tcx.parent(instance.def_id())),
+        DefKind::Fn | DefKind::AssocFn | DefKind::Closure
+    ) {
+        safe_base = jvm_names::disambiguated_def_path_token(tcx, instance.def_id());
     }
 
     let mut generic_tokens = Vec::new();
-    let mut oomir_args = Vec::new();
 
-    // 1. Collect generics and build readable tokens
+    // Collect type and const generics. Regions are erased by the JVM ABI.
     for arg in instance.args.iter() {
-        if let Some(ty) = arg.as_type() {
-            // Convert to OOMIR type
-            let oomir_ty = ty_to_oomir_type(ty, tcx, &mut data_types, instance);
-
-            // Generate readable token (e.g., "i32", "MyStruct")
-            let token = super::types::readable_oomir_type_name(&oomir_ty);
+        if let Some(token) =
+            super::types::readable_rust_generic_arg_name(arg, tcx, &mut data_types, instance)
+        {
             generic_tokens.push(super::types::sanitize_name_token(&token));
-
-            // Keep the OOMIR type in case we need to fallback to descriptor hashing
-            oomir_args.push(oomir_ty);
         }
     }
 
-    // 2. Construct the readable name. Rust instances can differ only in const
-    // arguments, which are not present in `generic_tokens`, so include a hash of
-    // the complete instance arguments whenever this is a generic instance.
-    let readable_base = if generic_tokens.is_empty() {
-        safe_base.clone()
-    } else {
-        format!("{}_{}", safe_base, generic_tokens.join("_"))
-    };
-    let readable_name = if instance.args.is_empty() {
-        readable_base
-    } else {
-        let instance_hash = super::types::short_hash(
-            &super::types::stable_normalized_instance_key(tcx, instance.def_id(), instance.args),
-            10,
-        );
-        format!("{readable_base}__{instance_hash}")
-    };
-
-    // 3. Check length limit. If it fits, return the readable version.
-    if readable_name.len() <= MAX_MONO_FN_NAME_LEN {
-        return FnNameData {
-            class_to_call_on: class,
-            method_name: readable_name,
-        };
-    }
-
-    // 4. Fallback: Name is too long, generate hash from descriptors
-    let mut descriptor_str = String::new();
-    descriptor_str.push_str(&safe_base);
-    descriptor_str.push('_'); // Separator for hash generation context
-
-    for ty in oomir_args {
-        descriptor_str.push_str(&ty.to_jvm_descriptor());
-        descriptor_str.push('_');
-    }
-    descriptor_str.push_str(&super::types::stable_normalized_instance_key(
-        tcx,
-        instance.def_id(),
-        instance.args,
-    ));
-
-    let hash = super::types::short_hash(&descriptor_str, 10);
-
-    // Use double underscore for hash separation to distinguish from readable parts
+    let identity =
+        super::types::stable_normalized_instance_key(tcx, instance.def_id(), instance.args);
     FnNameData {
         class_to_call_on: class,
-        method_name: format!("{}__{}", safe_base, hash),
+        method_name: crate::stable_hash::readable_or_hashed_name(
+            &safe_base,
+            &generic_tokens.join("_"),
+            &identity,
+            MAX_MONO_FN_NAME_LEN,
+        ),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{JvmStaticImport, parse_jvm_link_name};
+    use super::{JvmStaticImport, jvm_names, parse_jvm_link_name};
+
+    #[test]
+    fn generated_jvm_identifiers_collapse_underscore_runs() {
+        assert_eq!(jvm_names::member_name("many___parts"), "many_parts");
+        assert_eq!(
+            jvm_names::member_name("__compiler_builtin"),
+            "_compiler_builtin"
+        );
+        assert_eq!(jvm_names::member_name("part::<item>"), "part_item");
+    }
 
     #[test]
     fn parses_static_jvm_import() {

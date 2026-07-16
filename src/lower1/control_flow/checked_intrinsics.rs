@@ -9,8 +9,8 @@ pub fn get_intrinsic_function_name(
     ty_suffix: &str,
     result_struct_name: &str,
 ) -> String {
-    let hash = crate::stable_hash::short_hash(result_struct_name, 8);
-    format!("__oomir_checked_{operation}_{ty_suffix}_{hash}")
+    let result_token = crate::lower1::types::sanitize_name_token(result_struct_name);
+    format!("_oomir_checked_{operation}_{ty_suffix}_{result_token}")
 }
 
 fn variable(name: &str, ty: &Type) -> Operand {

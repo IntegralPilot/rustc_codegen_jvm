@@ -5,7 +5,7 @@ use rustc_middle::ty::{Instance, Ty, TyCtxt, TyKind, VtblEntry};
 use super::super::{
     jvm_names,
     naming::mono_fn_name_from_instance,
-    types::{short_hash, ty_to_oomir_type},
+    types::{readable_rust_type_name, sanitize_name_token, ty_to_oomir_type},
 };
 use crate::oomir;
 
@@ -66,11 +66,20 @@ pub(super) fn ensure_trait_object_adapter_class<'tcx>(
         tcx.instantiate_bound_regions_with_erased(principal.with_self_ty(tcx, concrete_ty));
 
     let identity = format!("{trait_ref:?}:{}", carrier_ty.to_jvm_descriptor());
-    let class_name = jvm_names::synthetic_class_for_instance(
+    let concrete_token = sanitize_name_token(&readable_rust_type_name(
+        concrete_ty,
         tcx,
+        data_types,
         instance_context,
-        format!("TraitObjectCarrier_{}", short_hash(&identity, 12)),
+    ));
+    let interface_token = interface_name.rsplit('/').next().unwrap_or(interface_name);
+    let local_name = crate::stable_hash::readable_or_hashed_name(
+        "TraitObjectCarrier",
+        &format!("{concrete_token}_as_{interface_token}"),
+        &identity,
+        180,
     );
+    let class_name = jvm_names::synthetic_class_for_instance(tcx, instance_context, local_name);
     if data_types.contains_key(&class_name) {
         return Ok(class_name);
     }
@@ -133,18 +142,41 @@ pub(super) fn ensure_trait_object_adapter_class<'tcx>(
                 }),
         );
         let call_dest = return_ty.has_jvm_value().then(|| "_ret".to_string());
-        let instructions = vec![
-            oomir::Instruction::GetField {
-                dest: payload_name,
-                object: oomir::Operand::Variable {
-                    name: "_1".to_string(),
-                    ty: oomir::Type::Class(class_name.clone()),
-                },
-                field_name: "value".to_string(),
-                field_ty: carrier_ty.clone(),
-                owner_class: class_name.clone(),
+        let get_payload = oomir::Instruction::GetField {
+            dest: payload_name,
+            object: oomir::Operand::Variable {
+                name: "_1".to_string(),
+                ty: oomir::Type::Class(class_name.clone()),
             },
-            oomir::Instruction::InvokeStatic {
+            field_name: "value".to_string(),
+            field_ty: carrier_ty.clone(),
+            owner_class: class_name.clone(),
+        };
+        let call = match target_receiver_ty {
+            oomir::Type::Pointer(inner) | oomir::Type::Reference(inner)
+                if matches!(inner.as_ref(), oomir::Type::Class(_)) =>
+            {
+                let oomir::Type::Class(receiver_class) = inner.as_ref() else {
+                    unreachable!()
+                };
+                let mut method_ty = target_signature.clone();
+                method_ty.is_static = false;
+                oomir::Instruction::InvokeVirtual {
+                    dest: call_dest.clone(),
+                    class_name: receiver_class.clone(),
+                    method_name: super::super::naming::associated_method_name_from_instance(
+                        tcx,
+                        *target_instance,
+                    ),
+                    method_ty,
+                    args: call_args.into_iter().skip(1).collect(),
+                    operand: oomir::Operand::Variable {
+                        name: "_trait_object_payload".to_string(),
+                        ty: carrier_ty.clone(),
+                    },
+                }
+            }
+            _ => oomir::Instruction::InvokeStatic {
                 dest: call_dest.clone(),
                 class_name: target_name
                     .class_to_call_on
@@ -153,6 +185,10 @@ pub(super) fn ensure_trait_object_adapter_class<'tcx>(
                 method_ty: target_signature,
                 args: call_args,
             },
+        };
+        let instructions = vec![
+            get_payload,
+            call,
             oomir::Instruction::Return {
                 operand: call_dest.map(|name| oomir::Operand::Variable {
                     name,

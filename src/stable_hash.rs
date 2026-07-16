@@ -14,3 +14,23 @@ pub(crate) fn short_hash(input: &str, length: usize) -> String {
 
     format!("{hash:016x}")[..length].to_string()
 }
+
+/// Prefer a readable generated identifier and retain a hash only as the
+/// bounded fallback for identities that would exceed the JVM-friendly limit.
+pub(crate) fn readable_or_hashed_name(
+    prefix: &str,
+    readable_suffix: &str,
+    identity: &str,
+    max_len: usize,
+) -> String {
+    let readable = if readable_suffix.is_empty() {
+        prefix.to_string()
+    } else {
+        format!("{prefix}_{readable_suffix}")
+    };
+    if readable.len() <= max_len {
+        readable
+    } else {
+        format!("{prefix}_{}", short_hash(identity, 10))
+    }
+}

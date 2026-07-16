@@ -62,17 +62,47 @@ pub fn class_for_def_id<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> String {
     segments.join("/")
 }
 
+pub fn disambiguated_def_path_token(tcx: TyCtxt<'_>, def_id: DefId) -> String {
+    tcx.def_path(def_id)
+        .data
+        .iter()
+        .map(|component| jvm_identifier(component.as_sym(true).as_str()))
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join("_")
+}
+
 pub fn closure_class_for_args<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: DefId,
     args: GenericArgsRef<'tcx>,
+    instance_context: Instance<'tcx>,
 ) -> String {
-    let base = path_segment(&super::types::stable_def_path(tcx, def_id));
-    let hash = super::types::short_hash(
-        &super::types::stable_normalized_instance_key(tcx, def_id, args),
-        10,
-    );
-    format!("{}/{}_{}", crate_root(tcx, def_id.krate), base, hash)
+    let base = disambiguated_def_path_token(tcx, def_id);
+    let mut data_types = std::collections::HashMap::new();
+    let generic_tokens = args
+        .as_closure()
+        .parent_args()
+        .iter()
+        .copied()
+        .filter_map(|arg| {
+            super::types::readable_rust_generic_arg_name(
+                arg,
+                tcx,
+                &mut data_types,
+                instance_context,
+            )
+            .map(|token| super::types::sanitize_name_token(&token))
+        })
+        .collect::<Vec<_>>();
+    let suffix = if generic_tokens.is_empty() {
+        base
+    } else {
+        format!("{base}_{}", generic_tokens.join("_"))
+    };
+    let identity = super::types::stable_instance_key(tcx, def_id, args);
+    let name = crate::stable_hash::readable_or_hashed_name("Closure", &suffix, &identity, 160);
+    format!("{}/{}", crate_root(tcx, def_id.krate), name)
 }
 
 pub fn owner_class_for_function<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> String {
@@ -170,9 +200,14 @@ fn jvm_identifier(raw: &str) -> String {
     let mut previous_was_separator = false;
 
     for ch in raw.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '_' {
+        if ch.is_ascii_alphanumeric() {
             out.push(ch);
             previous_was_separator = false;
+        } else if ch == '_' && out.is_empty() {
+            if !previous_was_separator {
+                out.push('_');
+                previous_was_separator = true;
+            }
         } else if !previous_was_separator && !out.is_empty() {
             out.push('_');
             previous_was_separator = true;

@@ -1460,7 +1460,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             return Ok(true);
         }
 
-        let is_pointer_read = function_name.starts_with("read__")
+        let is_pointer_read = (function_name == "read" || function_name.starts_with("read_"))
             && args.len() == 1
             && matches!(get_operand_type(&args[0]), oomir::Type::Pointer(_));
         if is_pointer_read {
@@ -1479,7 +1479,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             return Ok(true);
         }
 
-        let is_pointer_write = function_name.starts_with("write__")
+        let is_pointer_write = (function_name == "write" || function_name.starts_with("write_"))
             && args.len() == 2
             && matches!(get_operand_type(&args[0]), oomir::Type::Pointer(_));
         if is_pointer_write {

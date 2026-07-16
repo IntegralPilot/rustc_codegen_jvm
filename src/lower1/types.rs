@@ -11,15 +11,15 @@ use rustc_middle::ty::{
 use rustc_span::def_id::DefId;
 use std::collections::HashMap;
 
-pub const UNION_BYTES_FIELD: &str = "__bytes";
-pub const UNION_OBJECTS_FIELD: &str = "__objects";
+pub const UNION_BYTES_FIELD: &str = "_bytes";
+pub const UNION_OBJECTS_FIELD: &str = "_objects";
 pub const MANAGED_OBJECT_POINTER_VIEW_CODEC: &str = "@managed-object";
 pub const RAW_POINTER_VIEW_CODEC: &str = "@raw-pointer";
-pub(super) const ENUM_UNION_DISCRIMINANT_METHOD: &str = "__unionDiscriminant";
-const ENUM_FROM_UNION_DISCRIMINANT_METHOD: &str = "__fromUnionDiscriminant";
-const ENUM_WRITE_UNION_STORAGE_METHOD: &str = "__writeUnionStorage";
-const ENUM_READ_UNION_STORAGE_METHOD: &str = "__readUnionStorage";
-const ENUM_DROP_FIELDS_METHOD: &str = "__rust_drop_fields";
+pub(super) const ENUM_UNION_DISCRIMINANT_METHOD: &str = "_unionDiscriminant";
+const ENUM_FROM_UNION_DISCRIMINANT_METHOD: &str = "_fromUnionDiscriminant";
+const ENUM_WRITE_UNION_STORAGE_METHOD: &str = "_writeUnionStorage";
+const ENUM_READ_UNION_STORAGE_METHOD: &str = "_readUnionStorage";
+const ENUM_DROP_FIELDS_METHOD: &str = "_rust_drop_fields";
 
 pub fn union_from_method_name(field_name: &str) -> String {
     format!("from_{}", jvm_names::member_name(field_name))
@@ -2752,11 +2752,24 @@ pub(super) fn ensure_exact_transmute_helper<'tcx>(
         source_oomir_ty.to_jvm_descriptor(),
         target_oomir_ty.to_jvm_descriptor()
     );
-    let class_name = jvm_names::synthetic_class_for_instance(
-        tcx,
-        instance_context,
-        format!("ExactTransmute_{}", short_hash(&identity, 12)),
+    let readable = format!(
+        "{}_to_{}",
+        sanitize_name_token(&readable_rust_type_name(
+            source_ty,
+            tcx,
+            data_types,
+            instance_context,
+        )),
+        sanitize_name_token(&readable_rust_type_name(
+            target_ty,
+            tcx,
+            data_types,
+            instance_context,
+        ))
     );
+    let local_name =
+        crate::stable_hash::readable_or_hashed_name("ExactTransmute", &readable, &identity, 180);
+    let class_name = jvm_names::synthetic_class_for_instance(tcx, instance_context, local_name);
     let helper = ExactTransmuteHelper {
         class_name: class_name.clone(),
         method_name: method_name.clone(),
@@ -2915,11 +2928,19 @@ pub(super) fn ensure_pointer_memory_codec<'tcx>(
         return Ok(None);
     }
     let identity = format!("{ty:?}:{}:{size}", value_ty.to_jvm_descriptor());
-    let class_name = jvm_names::synthetic_class_for_instance(
-        tcx,
-        instance_context,
-        format!("PointerCodec_{}", short_hash(&identity, 12)),
+    let readable = format!(
+        "{}_{}bytes",
+        sanitize_name_token(&readable_rust_type_name(
+            ty,
+            tcx,
+            data_types,
+            instance_context,
+        )),
+        size
     );
+    let local_name =
+        crate::stable_hash::readable_or_hashed_name("PointerCodec", &readable, &identity, 180);
+    let class_name = jvm_names::synthetic_class_for_instance(tcx, instance_context, local_name);
     if matches!(
         data_types.get(&class_name),
         Some(oomir::DataType::Class { methods, .. })
@@ -3529,7 +3550,69 @@ pub fn ensure_union_data_type<'tcx>(
     union_class
 }
 
-/// Converts a Rust MIR type (`Ty`) to an OOMIR type (`oomir::Type`).
+fn normalize_open_abi_type<'tcx>(
+    ty: Ty<'tcx>,
+    tcx: TyCtxt<'tcx>,
+    instance_context: rustc_middle::ty::Instance<'tcx>,
+) -> Ty<'tcx> {
+    let instantiated = EarlyBinder::bind(tcx, ty)
+        .instantiate(tcx, instance_context.args)
+        .skip_norm_wip();
+    tcx.try_normalize_erasing_regions(
+        TypingEnv::fully_monomorphized(),
+        rustc_middle::ty::Unnormalized::new_wip(instantiated),
+    )
+    .unwrap_or(instantiated)
+}
+
+pub fn has_open_jvm_abi_type<'tcx>(
+    ty: Ty<'tcx>,
+    tcx: TyCtxt<'tcx>,
+    instance_context: rustc_middle::ty::Instance<'tcx>,
+) -> bool {
+    let resolved = normalize_open_abi_type(ty, tcx, instance_context);
+    resolved.has_param()
+        || resolved.has_non_region_bound_vars()
+        || matches!(resolved.kind(), TyKind::Alias(..))
+}
+
+fn append_dynamic_generic_arg_key<'tcx>(
+    key: &mut String,
+    arg: rustc_middle::ty::GenericArg<'tcx>,
+    tcx: TyCtxt<'tcx>,
+    data_types: &mut HashMap<String, oomir::DataType>,
+    instance_context: rustc_middle::ty::Instance<'tcx>,
+) -> Option<String> {
+    let token = readable_rust_generic_arg_name(arg, tcx, data_types, instance_context)?;
+    key.push_str(if arg.as_type().is_some() {
+        "type="
+    } else {
+        "const="
+    });
+    key.push_str(&token);
+    key.push(';');
+    Some(token)
+}
+
+pub fn ty_to_erased_oomir_type<'tcx>(
+    ty: Ty<'tcx>,
+    tcx: TyCtxt<'tcx>,
+    data_types: &mut HashMap<String, oomir::DataType>,
+    instance_context: rustc_middle::ty::Instance<'tcx>,
+) -> oomir::Type {
+    let resolved = normalize_open_abi_type(ty, tcx, instance_context);
+
+    if resolved.has_param()
+        || resolved.has_non_region_bound_vars()
+        || matches!(resolved.kind(), TyKind::Alias(..))
+    {
+        oomir::Type::Class("java/lang/Object".to_string())
+    } else {
+        ty_to_oomir_type(resolved, tcx, data_types, instance_context)
+    }
+}
+
+/// Converts a fully monomorphized Rust MIR type (`Ty`) to an OOMIR type.
 pub fn ty_to_oomir_type<'tcx>(
     ty: Ty<'tcx>,
     tcx: TyCtxt<'tcx>,
@@ -3854,13 +3937,94 @@ pub fn ty_to_oomir_type<'tcx>(
             oomir::Type::Void
         }
         rustc_middle::ty::TyKind::Dynamic(bound_preds, _region) => {
+            let needs_specialized_interface =
+                bound_preds
+                    .iter()
+                    .any(|predicate| match predicate.skip_binder() {
+                        ExistentialPredicate::Projection(_) => true,
+                        ExistentialPredicate::Trait(trait_ref) => trait_ref
+                            .args
+                            .iter()
+                            .any(|arg| arg.as_type().is_some() || arg.as_const().is_some()),
+                        ExistentialPredicate::AutoTrait(_) => false,
+                    });
+            let dynamic_name = needs_specialized_interface.then(|| {
+                let mut dynamic_key = String::new();
+                let mut readable_parts = Vec::new();
+                for predicate in bound_preds.iter() {
+                    match predicate.skip_binder() {
+                        ExistentialPredicate::Trait(trait_ref) => {
+                            dynamic_key.push_str("trait=");
+                            dynamic_key.push_str(&stable_def_path(tcx, trait_ref.def_id));
+                            dynamic_key.push('[');
+                            for arg in trait_ref.args.iter() {
+                                if let Some(token) = append_dynamic_generic_arg_key(
+                                    &mut dynamic_key,
+                                    arg,
+                                    tcx,
+                                    data_types,
+                                    instance_context,
+                                ) {
+                                    readable_parts.push(sanitize_name_token(&token));
+                                }
+                            }
+                            dynamic_key.push_str("];");
+                        }
+                        ExistentialPredicate::Projection(projection) => {
+                            dynamic_key.push_str("projection=");
+                            dynamic_key.push_str(&stable_def_path(tcx, projection.def_id));
+                            dynamic_key.push('[');
+                            for arg in projection.args.iter() {
+                                if let Some(token) = append_dynamic_generic_arg_key(
+                                    &mut dynamic_key,
+                                    arg,
+                                    tcx,
+                                    data_types,
+                                    instance_context,
+                                ) {
+                                    readable_parts.push(sanitize_name_token(&token));
+                                }
+                            }
+                            dynamic_key.push_str("]=");
+                            if let Some(term) = readable_rust_generic_arg_name(
+                                projection.term.into_arg(),
+                                tcx,
+                                data_types,
+                                instance_context,
+                            ) {
+                                dynamic_key.push_str(&term);
+                                readable_parts.push(format!(
+                                    "{}_{}",
+                                    sanitize_name_token(tcx.item_name(projection.def_id).as_str()),
+                                    sanitize_name_token(&term)
+                                ));
+                            }
+                            dynamic_key.push(';');
+                        }
+                        // Auto traits have no methods or JVM descriptor impact.
+                        ExistentialPredicate::AutoTrait(_) => {}
+                    }
+                }
+                (dynamic_key, readable_parts.join("_"))
+            });
             // bound_preds is a collection of `Binder<ExistentialPredicate<'tcx>>` entries.
             // Iterate and resolve trait predicates into OOMIR interface types.
             let mut resolved_types: Vec<oomir::Type> = Vec::new();
             for binder in bound_preds.iter() {
                 match binder.skip_binder() {
                     ExistentialPredicate::Trait(trait_ref) => {
-                        let safe_name = jvm_names::class_for_def_id(tcx, trait_ref.def_id);
+                        let base_name = jvm_names::class_for_def_id(tcx, trait_ref.def_id);
+                        let safe_name = if let Some((dynamic_key, readable_suffix)) = &dynamic_name
+                        {
+                            crate::stable_hash::readable_or_hashed_name(
+                                &format!("{base_name}_Dyn"),
+                                readable_suffix,
+                                dynamic_key,
+                                180,
+                            )
+                        } else {
+                            base_name
+                        };
                         if should_define_named_data_type(tcx, trait_ref.def_id) {
                             data_types.entry(safe_name.clone()).or_insert_with(|| {
                                 oomir::DataType::Interface {
@@ -3894,11 +4058,12 @@ pub fn ty_to_oomir_type<'tcx>(
                 .cloned()
                 .unwrap_or(oomir::Type::Class("java/lang/Object".to_string()))
         }
-        rustc_middle::ty::TyKind::Param(param_ty) => {
-            oomir::Type::Class(jvm_names::member_name(param_ty.name.as_str()))
-        }
+        rustc_middle::ty::TyKind::Param(param_ty) => panic!(
+            "unresolved generic parameter `{}` reached monomorphic JVM type lowering for {ty:?} in {instance_context:?}",
+            param_ty.name
+        ),
         rustc_middle::ty::TyKind::Closure(def_id, args) => {
-            let safe_name = jvm_names::closure_class_for_args(tcx, *def_id, args);
+            let safe_name = jvm_names::closure_class_for_args(tcx, *def_id, args, instance_context);
 
             // Define the closure class struct if not already present
             if !data_types.contains_key(&safe_name) {
@@ -3954,12 +4119,9 @@ pub fn ty_to_oomir_type<'tcx>(
             }
             oomir::Type::Class(safe_name)
         }
-        rustc_middle::ty::TyKind::Alias(_, _alias_ty) => {
-            // This handles associated types and projections (like Self::Output)
-            // that couldn't be normalized because we are in a generic context.
-            // We map them to java/lang/Object, effectively erasing them.
-            oomir::Type::Class("java/lang/Object".to_string())
-        }
+        rustc_middle::ty::TyKind::Alias(_, alias_ty) => panic!(
+            "unresolved type alias/projection {alias_ty:?} reached monomorphic JVM type lowering for {ty:?} in {instance_context:?}"
+        ),
         _ => {
             breadcrumbs::log!(
                 breadcrumbs::LogLevel::Warn,
@@ -4013,9 +4175,10 @@ pub fn stable_normalized_instance_key<'tcx>(
     stable_instance_key(tcx, def_id, args)
 }
 
-// Maximum length for a readable tuple name (including the "Tuple_" prefix).
-// If the human-readable name exceeds this, we fall back to the hashed name.
-const MAX_TUPLE_NAME_LEN: usize = 64;
+// Keep ordinary nested generic/tuple names readable for Java callers. Hashing
+// is only a last-resort guard against unwieldy class-file names, consistent
+// with the other generated-name families.
+const MAX_TUPLE_NAME_LEN: usize = 180;
 
 // Produce a compact, human readable token for an OOMIR type to use in tuple class names.
 pub fn readable_oomir_type_name(t: &oomir::Type) -> String {
@@ -4098,6 +4261,7 @@ pub fn readable_rust_type_name<'tcx>(
             "{}Slice",
             readable_rust_type_name(*inner, tcx, data_types, instance_context)
         ),
+        TyKind::Tuple(elements) if elements.is_empty() => "Unit".to_string(),
         TyKind::Tuple(elements) => format!(
             "Tuple_{}",
             elements
@@ -4157,11 +4321,46 @@ fn readable_rust_const_name<'tcx>(
         .unwrap_or_else(|| with_no_trimmed_paths!(format!("{constant:?}")))
 }
 
+pub fn readable_rust_generic_arg_name<'tcx>(
+    arg: rustc_middle::ty::GenericArg<'tcx>,
+    tcx: TyCtxt<'tcx>,
+    data_types: &mut HashMap<String, oomir::DataType>,
+    instance_context: rustc_middle::ty::Instance<'tcx>,
+) -> Option<String> {
+    if let Some(arg_ty) = arg.as_type() {
+        Some(readable_rust_type_name(
+            arg_ty,
+            tcx,
+            data_types,
+            instance_context,
+        ))
+    } else {
+        arg.as_const()
+            .map(|constant| readable_rust_const_name(constant, tcx, instance_context))
+    }
+}
+
 // Sanitize token so it contains only ASCII alphanumeric characters and underscores.
 pub fn sanitize_name_token(s: &str) -> String {
-    s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect()
+    let mut token = String::with_capacity(s.len());
+    let mut previous_was_separator = false;
+    for ch in s.chars() {
+        if ch.is_ascii_alphanumeric() {
+            token.push(ch);
+            previous_was_separator = false;
+        } else if !previous_was_separator && !token.is_empty() {
+            token.push('_');
+            previous_was_separator = true;
+        }
+    }
+    while token.ends_with('_') {
+        token.pop();
+    }
+    if token.is_empty() {
+        "Type".to_string()
+    } else {
+        token
+    }
 }
 
 fn adt_base_jvm_name<'tcx>(adt_def: &AdtDef<'tcx>, tcx: TyCtxt<'tcx>) -> String {
@@ -4357,4 +4556,19 @@ pub fn get_field_name_from_index(
                 owner_class_name
             )),
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_name_token;
+
+    #[test]
+    fn generated_name_tokens_have_no_duplicate_or_trailing_separators() {
+        assert_eq!(sanitize_name_token("Tuple_"), "Tuple");
+        assert_eq!(
+            sanitize_name_token("Result<Tuple_::Error>"),
+            "Result_Tuple_Error"
+        );
+        assert_eq!(sanitize_name_token("___"), "Type");
+    }
 }

@@ -6,6 +6,20 @@
 
 use core::ops::{Add, Mul};
 
+pub trait DynValue {
+    type Item;
+
+    fn next(&mut self) -> Self::Item;
+}
+
+pub fn pull_i32(value: &mut dyn DynValue<Item = i32>) -> i32 {
+    value.next()
+}
+
+pub fn pull_i64(value: &mut dyn DynValue<Item = i64>) -> i64 {
+    value.next()
+}
+
 pub struct Holder<T> {
     value: T,
 }

@@ -18,7 +18,7 @@ It should be noted that this project is still in an early-to-mid stage of develo
 
 ### Interop is deeper and more ergonomic than FFI or bridge solutions
 
-Rust enums, generics, function pointers, unions and other supported constructs map directly onto JVM classes and interfaces (see [Interop Model](#interop-model)). Because of this, `rustc_codegen_jvm` can achieve a level of ergonomic interop with Java that comparable native solutions can't easily. For example, you can make a Java class that implements a Rust trait and pass it as a `&dyn Trait` object to Rust functions, because traits just become normal Java interfaces, where this would be (to my knowledge) quite hard, with bridge and FFI solutions.
+Rust enums, generics, function pointers, unions and other supported constructs map directly onto JVM classes and interfaces (see [Interop Model](#interop-model)). Because of this, `rustc_codegen_jvm` can achieve a level of ergonomic interop with Java that comparable native solutions can't easily. For example, you can make a Java class that implements a Rust trait and pass it as a `&dyn Trait` object to Rust functions ([test and demo of this](tests/integration/trait_implementors/Main.java)), because traits just become normal Java interfaces, where this would be (to my knowledge) quite hard, with bridge and FFI solutions.
 
 ### It's fast for debugging, a known problem with native Rust
 

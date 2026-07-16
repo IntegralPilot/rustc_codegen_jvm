@@ -460,13 +460,25 @@ fn trait_interface_methods<'tcx>(
         let mir_sig = tcx.type_of(def_id).skip_binder().fn_sig(tcx);
         let params_ty = mir_sig.inputs();
         let return_ty = mir_sig.output();
+        let explicit_inputs = params_ty.skip_binder();
+        let output = return_ty.skip_binder();
         let instance = Instance::new_raw(
             def_id,
             rustc_middle::ty::GenericArgs::identity_for_item(tcx, def_id),
         );
-
-        let params_inputs = params_ty.skip_binder();
-        let params_oomir: Vec<(String, oomir::Type)> = params_inputs
+        let has_open_abi_type = |ty: rustc_middle::ty::Ty<'tcx>| {
+            lower1::types::has_open_jvm_abi_type(ty, tcx, instance)
+        };
+        if explicit_inputs
+            .iter()
+            .skip(1)
+            .copied()
+            .any(has_open_abi_type)
+            || has_open_abi_type(output)
+        {
+            continue;
+        }
+        let params_oomir: Vec<(String, oomir::Type)> = explicit_inputs
             .iter()
             .enumerate()
             .filter_map(|(i, ty)| {
@@ -475,13 +487,13 @@ fn trait_interface_methods<'tcx>(
                 } else {
                     let param_name = format!("arg{}", i);
                     let oomir_type =
-                        lower1::types::ty_to_oomir_type(*ty, tcx, data_types, instance);
+                        lower1::types::ty_to_erased_oomir_type(*ty, tcx, data_types, instance);
                     Some((param_name, oomir_type))
                 }
             })
             .collect();
         let return_oomir_ty =
-            lower1::types::ty_to_oomir_type(return_ty.skip_binder(), tcx, data_types, instance);
+            lower1::types::ty_to_erased_oomir_type(output, tcx, data_types, instance);
 
         let mut signature = oomir::Signature {
             params: params_oomir,
@@ -511,10 +523,15 @@ fn is_lowerable_java_public_function(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
         return false;
     }
 
-    if let Some(assoc_item) = tcx.opt_associated_item(def_id)
-        && assoc_item.trait_container(tcx).is_some()
-    {
-        return false;
+    if let Some(assoc_item) = tcx.opt_associated_item(def_id) {
+        if assoc_item.trait_container(tcx).is_some() {
+            return false;
+        }
+        if tcx.crate_name(LOCAL_CRATE) == rustc_span::sym::core
+            && assoc_item.impl_container(tcx).is_some()
+        {
+            return false;
+        }
     }
 
     def_id.is_local()
@@ -551,6 +568,9 @@ fn materialize_java_public_data_type<'tcx>(
 ) {
     match tcx.def_kind(def_id) {
         DefKind::Struct | DefKind::Enum | DefKind::Union => {
+            if !tcx.generics_of(def_id).own_params.is_empty() {
+                return;
+            }
             let item_ty = tcx.type_of(def_id).instantiate_identity().skip_norm_wip();
             let instance_context =
                 Instance::new_raw(def_id, GenericArgs::identity_for_item(tcx, def_id));

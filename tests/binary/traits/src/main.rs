@@ -44,6 +44,48 @@ trait PrimitiveTraitObject {
     fn doubled(&self) -> i32;
 }
 
+trait DynSource {
+    type Item;
+
+    fn next_value(&mut self) -> Option<Self::Item>;
+}
+
+struct I32Source {
+    next: i32,
+}
+
+impl DynSource for I32Source {
+    type Item = i32;
+
+    fn next_value(&mut self) -> Option<Self::Item> {
+        let value = self.next;
+        self.next += 1;
+        Some(value)
+    }
+}
+
+struct I64Source {
+    next: i64,
+}
+
+impl DynSource for I64Source {
+    type Item = i64;
+
+    fn next_value(&mut self) -> Option<Self::Item> {
+        let value = self.next;
+        self.next += 2;
+        Some(value)
+    }
+}
+
+fn next_i32(source: &mut dyn DynSource<Item = i32>) -> i32 {
+    source.next_value().unwrap()
+}
+
+fn next_i64(source: &mut dyn DynSource<Item = i64>) -> i64 {
+    source.next_value().unwrap()
+}
+
 impl PrimitiveTraitObject for i32 {
     fn doubled(&self) -> i32 {
         *self * 2
@@ -188,6 +230,13 @@ fn main() {
     let primitive_object: &dyn PrimitiveTraitObject = &primitive;
     assert!(primitive_object.doubled() == 42);
     assert!(use_primitive_trait_object(&primitive) == 42);
+
+    let mut i32_source = I32Source { next: 7 };
+    assert!(next_i32(&mut i32_source) == 7);
+    assert!(next_i32(&mut i32_source) == 8);
+    let mut i64_source = I64Source { next: 100 };
+    assert!(next_i64(&mut i64_source) == 100);
+    assert!(next_i64(&mut i64_source) == 102);
 
     let mut adder = SimpleAdder { current_total: 10 };
 

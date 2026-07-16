@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use regex::Regex;
 use ristretto_classfile::attributes::{Attribute, Instruction, StackFrame, VerificationType};
-use ristretto_classfile::{ClassFile, Constant, MethodAccessFlags};
+use ristretto_classfile::{ClassFile, Constant, ConstantPool, MethodAccessFlags};
 use tempfile::tempdir;
 use zip::write::{SimpleFileOptions, ZipWriter};
 use zip::{CompressionMethod, ZipArchive};
@@ -20,90 +20,163 @@ struct ClassInfo {
     data: Vec<u8>,
 }
 
-fn shifted_constant_index(index: u16, offset: u16) -> io::Result<u16> {
-    index.checked_add(offset).ok_or_else(|| {
+fn constant_pool_error(context: &str, error: impl std::fmt::Display) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, format!("{context}: {error}"))
+}
+
+fn import_constant(
+    source_index: u16,
+    source: &ConstantPool,
+    target: &mut ConstantPool,
+    indexes: &mut HashMap<u16, u16>,
+) -> io::Result<u16> {
+    if let Some(index) = indexes.get(&source_index) {
+        return Ok(*index);
+    }
+
+    let constant = source
+        .try_get(source_index)
+        .map_err(|error| constant_pool_error("invalid incoming constant-pool reference", error))?
+        .clone();
+    let imported = match constant {
+        Constant::Class(index) => Constant::Class(import_constant(index, source, target, indexes)?),
+        Constant::String(index) => {
+            Constant::String(import_constant(index, source, target, indexes)?)
+        }
+        Constant::MethodType(index) => {
+            Constant::MethodType(import_constant(index, source, target, indexes)?)
+        }
+        Constant::Module(index) => {
+            Constant::Module(import_constant(index, source, target, indexes)?)
+        }
+        Constant::Package(index) => {
+            Constant::Package(import_constant(index, source, target, indexes)?)
+        }
+        Constant::FieldRef {
+            class_index,
+            name_and_type_index,
+        } => Constant::FieldRef {
+            class_index: import_constant(class_index, source, target, indexes)?,
+            name_and_type_index: import_constant(name_and_type_index, source, target, indexes)?,
+        },
+        Constant::MethodRef {
+            class_index,
+            name_and_type_index,
+        } => Constant::MethodRef {
+            class_index: import_constant(class_index, source, target, indexes)?,
+            name_and_type_index: import_constant(name_and_type_index, source, target, indexes)?,
+        },
+        Constant::InterfaceMethodRef {
+            class_index,
+            name_and_type_index,
+        } => Constant::InterfaceMethodRef {
+            class_index: import_constant(class_index, source, target, indexes)?,
+            name_and_type_index: import_constant(name_and_type_index, source, target, indexes)?,
+        },
+        Constant::NameAndType {
+            name_index,
+            descriptor_index,
+        } => Constant::NameAndType {
+            name_index: import_constant(name_index, source, target, indexes)?,
+            descriptor_index: import_constant(descriptor_index, source, target, indexes)?,
+        },
+        Constant::MethodHandle {
+            reference_kind,
+            reference_index,
+        } => Constant::MethodHandle {
+            reference_kind,
+            reference_index: import_constant(reference_index, source, target, indexes)?,
+        },
+        Constant::Dynamic {
+            bootstrap_method_attr_index,
+            name_and_type_index,
+        } => Constant::Dynamic {
+            bootstrap_method_attr_index,
+            name_and_type_index: import_constant(name_and_type_index, source, target, indexes)?,
+        },
+        Constant::InvokeDynamic {
+            bootstrap_method_attr_index,
+            name_and_type_index,
+        } => Constant::InvokeDynamic {
+            bootstrap_method_attr_index,
+            name_and_type_index: import_constant(name_and_type_index, source, target, indexes)?,
+        },
+        primitive => primitive,
+    };
+
+    let existing = (1..=target.len()).find_map(|raw_index| {
+        let index = u16::try_from(raw_index).ok()?;
+        target
+            .try_get(index)
+            .ok()
+            .filter(|candidate| *candidate == &imported)
+            .map(|_| index)
+    });
+    let target_index = if let Some(index) = existing {
+        index
+    } else {
+        target
+            .add(imported)
+            .map_err(|error| constant_pool_error("merged JVM constant pool is full", error))?
+    };
+    indexes.insert(source_index, target_index);
+    Ok(target_index)
+}
+
+fn import_constant_pool(
+    source: &ConstantPool,
+    target: &mut ConstantPool,
+) -> io::Result<HashMap<u16, u16>> {
+    let mut indexes = HashMap::new();
+    for raw_index in 1..=source.len() {
+        let index = u16::try_from(raw_index).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "incoming JVM constant pool exceeds the index limit",
+            )
+        })?;
+        if source.try_get(index).is_ok() {
+            import_constant(index, source, target, &mut indexes)?;
+        }
+    }
+    Ok(indexes)
+}
+
+fn remapped_constant_index(index: u16, indexes: &HashMap<u16, u16>) -> io::Result<u16> {
+    indexes.get(&index).copied().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
-            "merged JVM class exceeds the constant-pool index limit",
+            format!("missing imported constant-pool index for #{index}"),
         )
     })
 }
 
-fn remap_constant(mut constant: Constant, offset: u16) -> io::Result<Constant> {
-    match &mut constant {
-        Constant::Class(index)
-        | Constant::String(index)
-        | Constant::MethodType(index)
-        | Constant::Module(index)
-        | Constant::Package(index) => *index = shifted_constant_index(*index, offset)?,
-        Constant::FieldRef {
-            class_index,
-            name_and_type_index,
-        }
-        | Constant::MethodRef {
-            class_index,
-            name_and_type_index,
-        }
-        | Constant::InterfaceMethodRef {
-            class_index,
-            name_and_type_index,
-        } => {
-            *class_index = shifted_constant_index(*class_index, offset)?;
-            *name_and_type_index = shifted_constant_index(*name_and_type_index, offset)?;
-        }
-        Constant::NameAndType {
-            name_index,
-            descriptor_index,
-        } => {
-            *name_index = shifted_constant_index(*name_index, offset)?;
-            *descriptor_index = shifted_constant_index(*descriptor_index, offset)?;
-        }
-        Constant::MethodHandle {
-            reference_index, ..
-        } => *reference_index = shifted_constant_index(*reference_index, offset)?,
-        Constant::Dynamic {
-            name_and_type_index,
-            ..
-        }
-        | Constant::InvokeDynamic {
-            name_and_type_index,
-            ..
-        } => *name_and_type_index = shifted_constant_index(*name_and_type_index, offset)?,
-        Constant::Utf8(_)
-        | Constant::Integer(_)
-        | Constant::Float(_)
-        | Constant::Long(_)
-        | Constant::Double(_) => {}
-    }
-    Ok(constant)
-}
-
 fn remap_verification_type(
     verification_type: &mut VerificationType,
-    offset: u16,
+    indexes: &HashMap<u16, u16>,
 ) -> io::Result<()> {
     if let VerificationType::Object { cpool_index } = verification_type {
-        *cpool_index = shifted_constant_index(*cpool_index, offset)?;
+        *cpool_index = remapped_constant_index(*cpool_index, indexes)?;
     }
     Ok(())
 }
 
-fn remap_stack_frame(frame: &mut StackFrame, offset: u16) -> io::Result<()> {
+fn remap_stack_frame(frame: &mut StackFrame, indexes: &HashMap<u16, u16>) -> io::Result<()> {
     match frame {
         StackFrame::SameLocals1StackItemFrame { stack, .. }
         | StackFrame::SameLocals1StackItemFrameExtended { stack, .. } => {
             for item in stack {
-                remap_verification_type(item, offset)?;
+                remap_verification_type(item, indexes)?;
             }
         }
         StackFrame::AppendFrame { locals, .. } => {
             for item in locals {
-                remap_verification_type(item, offset)?;
+                remap_verification_type(item, indexes)?;
             }
         }
         StackFrame::FullFrame { locals, stack, .. } => {
             for item in locals.iter_mut().chain(stack.iter_mut()) {
-                remap_verification_type(item, offset)?;
+                remap_verification_type(item, indexes)?;
             }
         }
         StackFrame::SameFrame { .. }
@@ -113,10 +186,10 @@ fn remap_stack_frame(frame: &mut StackFrame, offset: u16) -> io::Result<()> {
     Ok(())
 }
 
-fn remap_instruction(instruction: &mut Instruction, offset: u16) -> io::Result<()> {
+fn remap_instruction(instruction: &mut Instruction, indexes: &HashMap<u16, u16>) -> io::Result<()> {
     match instruction {
         Instruction::Ldc(index) => {
-            let shifted = shifted_constant_index(u16::from(*index), offset)?;
+            let shifted = remapped_constant_index(u16::from(*index), indexes)?;
             if let Ok(short_index) = u8::try_from(shifted) {
                 *index = short_index;
             } else {
@@ -136,9 +209,9 @@ fn remap_instruction(instruction: &mut Instruction, offset: u16) -> io::Result<(
         | Instruction::New(index)
         | Instruction::Anewarray(index)
         | Instruction::Checkcast(index)
-        | Instruction::Instanceof(index) => *index = shifted_constant_index(*index, offset)?,
+        | Instruction::Instanceof(index) => *index = remapped_constant_index(*index, indexes)?,
         Instruction::Invokeinterface(index, _) | Instruction::Multianewarray(index, _) => {
-            *index = shifted_constant_index(*index, offset)?;
+            *index = remapped_constant_index(*index, indexes)?;
         }
         _ => {}
     }
@@ -194,12 +267,15 @@ fn remap_local_variable_ranges(
     for attribute in attributes {
         if let Attribute::LocalVariableTable { variables, .. } = attribute {
             for variable in variables {
-                let old_end = variable.start_pc.checked_add(variable.length).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "local-variable bytecode range overflows u16",
-                    )
-                })?;
+                let old_end = variable
+                    .start_pc
+                    .checked_add(variable.length)
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "local-variable bytecode range overflows u16",
+                        )
+                    })?;
                 let new_start = remap_code_offset(variable.start_pc, old_offsets, new_offsets)?;
                 let new_end = remap_code_offset(old_end, old_offsets, new_offsets)?;
                 variable.start_pc = new_start;
@@ -215,7 +291,7 @@ fn remap_local_variable_ranges(
     Ok(())
 }
 
-fn remap_attribute(attribute: &mut Attribute, offset: u16) -> io::Result<()> {
+fn remap_attribute(attribute: &mut Attribute, indexes: &HashMap<u16, u16>) -> io::Result<()> {
     match attribute {
         Attribute::Code {
             name_index,
@@ -224,68 +300,68 @@ fn remap_attribute(attribute: &mut Attribute, offset: u16) -> io::Result<()> {
             attributes,
             ..
         } => {
-            *name_index = shifted_constant_index(*name_index, offset)?;
+            *name_index = remapped_constant_index(*name_index, indexes)?;
             let old_byte_offsets = instruction_byte_offsets(code)?;
             for instruction in code.iter_mut() {
-                remap_instruction(instruction, offset)?;
+                remap_instruction(instruction, indexes)?;
             }
             let new_byte_offsets = instruction_byte_offsets(code)?;
             remap_local_variable_ranges(attributes, &old_byte_offsets, &new_byte_offsets)?;
             for exception in exception_table {
                 if exception.catch_type != 0 {
-                    exception.catch_type = shifted_constant_index(exception.catch_type, offset)?;
+                    exception.catch_type = remapped_constant_index(exception.catch_type, indexes)?;
                 }
             }
             for nested in attributes {
-                remap_attribute(nested, offset)?;
+                remap_attribute(nested, indexes)?;
             }
         }
         Attribute::StackMapTable { name_index, frames } => {
-            *name_index = shifted_constant_index(*name_index, offset)?;
+            *name_index = remapped_constant_index(*name_index, indexes)?;
             for frame in frames {
-                remap_stack_frame(frame, offset)?;
+                remap_stack_frame(frame, indexes)?;
             }
         }
         Attribute::Exceptions {
             name_index,
             exception_indexes,
         } => {
-            *name_index = shifted_constant_index(*name_index, offset)?;
+            *name_index = remapped_constant_index(*name_index, indexes)?;
             for index in exception_indexes {
-                *index = shifted_constant_index(*index, offset)?;
+                *index = remapped_constant_index(*index, indexes)?;
             }
         }
         Attribute::Signature {
             name_index,
             signature_index,
         } => {
-            *name_index = shifted_constant_index(*name_index, offset)?;
-            *signature_index = shifted_constant_index(*signature_index, offset)?;
+            *name_index = remapped_constant_index(*name_index, indexes)?;
+            *signature_index = remapped_constant_index(*signature_index, indexes)?;
         }
         Attribute::LineNumberTable { name_index, .. }
         | Attribute::Synthetic { name_index }
         | Attribute::Deprecated { name_index } => {
-            *name_index = shifted_constant_index(*name_index, offset)?;
+            *name_index = remapped_constant_index(*name_index, indexes)?;
         }
         Attribute::LocalVariableTable {
             name_index,
             variables,
         } => {
-            *name_index = shifted_constant_index(*name_index, offset)?;
+            *name_index = remapped_constant_index(*name_index, indexes)?;
             for variable in variables {
-                variable.name_index = shifted_constant_index(variable.name_index, offset)?;
+                variable.name_index = remapped_constant_index(variable.name_index, indexes)?;
                 variable.descriptor_index =
-                    shifted_constant_index(variable.descriptor_index, offset)?;
+                    remapped_constant_index(variable.descriptor_index, indexes)?;
             }
         }
         Attribute::MethodParameters {
             name_index,
             parameters,
         } => {
-            *name_index = shifted_constant_index(*name_index, offset)?;
+            *name_index = remapped_constant_index(*name_index, indexes)?;
             for parameter in parameters {
                 if parameter.name_index != 0 {
-                    parameter.name_index = shifted_constant_index(parameter.name_index, offset)?;
+                    parameter.name_index = remapped_constant_index(parameter.name_index, indexes)?;
                 }
             }
         }
@@ -348,23 +424,15 @@ fn merge_class_data(base_data: &[u8], incoming_data: &[u8]) -> io::Result<Vec<u8
         return Ok(base_data.to_vec());
     }
 
-    let offset = u16::try_from(base.constant_pool.len()).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "base JVM class constant pool exceeds the index limit",
-        )
-    })?;
-    for constant in &incoming.constant_pool {
-        base.constant_pool
-            .push(remap_constant(constant.clone(), offset)?);
-    }
+    let constant_indexes = import_constant_pool(&incoming.constant_pool, &mut base.constant_pool)?;
 
     for index in missing_method_indexes {
         let mut method = incoming.methods[index].clone();
-        method.name_index = shifted_constant_index(method.name_index, offset)?;
-        method.descriptor_index = shifted_constant_index(method.descriptor_index, offset)?;
+        method.name_index = remapped_constant_index(method.name_index, &constant_indexes)?;
+        method.descriptor_index =
+            remapped_constant_index(method.descriptor_index, &constant_indexes)?;
         for attribute in &mut method.attributes {
-            remap_attribute(attribute, offset)?;
+            remap_attribute(attribute, &constant_indexes)?;
         }
         base.methods.push(method);
     }
@@ -1375,9 +1443,8 @@ mod tests {
     fn remaps_local_variable_ranges_when_ldc_widens() {
         let old_offsets = instruction_byte_offsets(&[Instruction::Ldc(1), Instruction::Return])
             .expect("old bytecode offsets");
-        let new_offsets =
-            instruction_byte_offsets(&[Instruction::Ldc_w(256), Instruction::Return])
-                .expect("new bytecode offsets");
+        let new_offsets = instruction_byte_offsets(&[Instruction::Ldc_w(256), Instruction::Return])
+            .expect("new bytecode offsets");
         let mut attributes = vec![Attribute::LocalVariableTable {
             name_index: 1,
             variables: vec![LocalVariableTable {
@@ -1436,6 +1503,7 @@ mod tests {
     fn merges_complementary_generic_class_methods() {
         let first = abstract_class_with_method("first");
         let second = abstract_class_with_method("second");
+        let first_constant_count = class_file_from_data(&first).unwrap().constant_pool.len();
         let merged = merge_class_data(&first, &second).unwrap();
         let class_file = class_file_from_data(&merged).unwrap();
         let methods: Vec<_> = (0..class_file.methods.len())
@@ -1448,6 +1516,11 @@ mod tests {
                 ("first".into(), "()V".into()),
                 ("second".into(), "()V".into())
             ]
+        );
+        assert_eq!(
+            class_file.constant_pool.len(),
+            first_constant_count + 1,
+            "merging should reuse every shared class, descriptor, and attribute constant"
         );
     }
 
@@ -1465,7 +1538,11 @@ mod tests {
 
         let mut archive = ZipArchive::new(File::open(output).unwrap()).unwrap();
         let mut contents = Vec::new();
-        archive.by_name(entry).unwrap().read_to_end(&mut contents).unwrap();
+        archive
+            .by_name(entry)
+            .unwrap()
+            .read_to_end(&mut contents)
+            .unwrap();
         assert_eq!(contents, b"compiled");
     }
 }

@@ -20,8 +20,8 @@ use super::{
             ENUM_UNION_DISCRIMINANT_METHOD, adapt_simple_enum_operand,
             ensure_exact_transmute_helper, ensure_fn_ptr_interface, ensure_union_data_type,
             enum_union_discriminant_supported, fn_ptr_signature_from_ty,
-            generate_adt_jvm_class_name, short_hash, should_define_named_data_type,
-            ty_to_oomir_type, union_from_method_name,
+            generate_adt_jvm_class_name, should_define_named_data_type, ty_to_oomir_type,
+            union_from_method_name,
         },
     },
     checked_ops::{
@@ -935,16 +935,16 @@ pub(crate) fn ensure_fn_pointer_adapter_class<'tcx>(
     let target_name = target_function
         .map(FnPointerTarget::display_name)
         .unwrap_or_else(|| "unsupported".to_string());
-    let hash = short_hash(&format!("{target_name}:{descriptor}"), 10);
-    let base_name: String = jvm_names::path_segment(&target_name)
-        .chars()
-        .take(80)
-        .collect();
-    let class_name = jvm_names::synthetic_class_for_instance(
-        tcx,
-        instance,
-        format!("FnPtrImpl_{base_name}_{hash}"),
+    let identity = format!("{target_name}:{descriptor}");
+    let base_name = jvm_names::path_segment(&target_name);
+    let interface_token = interface_name.rsplit('/').next().unwrap_or(interface_name);
+    let local_name = crate::stable_hash::readable_or_hashed_name(
+        "FnPtrImpl",
+        &format!("{base_name}_{interface_token}"),
+        &identity,
+        180,
     );
+    let class_name = jvm_names::synthetic_class_for_instance(tcx, instance, local_name);
 
     let mut method_params = Vec::with_capacity(signature.params.len() + 1);
     method_params.push(("self".to_string(), oomir::Type::Class(class_name.clone())));
@@ -1119,16 +1119,16 @@ pub(crate) fn ensure_closure_fn_pointer_adapter_class<'tcx>(
     let target_method = super::super::generate_closure_function_name(tcx, closure_instance);
     let descriptor = signature.to_jvm_descriptor_with_explicit_params();
     let target_name = format!("{target_owner}::{target_method}");
-    let hash = short_hash(&format!("{target_name}:{descriptor}"), 10);
-    let base_name: String = jvm_names::path_segment(&target_method)
-        .chars()
-        .take(80)
-        .collect();
-    let class_name = jvm_names::synthetic_class_for_instance(
-        tcx,
-        instance_context,
-        format!("ClosureFnPtrImpl_{base_name}_{hash}"),
+    let identity = format!("{target_name}:{descriptor}");
+    let base_name = jvm_names::path_segment(&target_method);
+    let interface_token = interface_name.rsplit('/').next().unwrap_or(interface_name);
+    let local_name = crate::stable_hash::readable_or_hashed_name(
+        "ClosureFnPtrImpl",
+        &format!("{base_name}_{interface_token}"),
+        &identity,
+        180,
     );
+    let class_name = jvm_names::synthetic_class_for_instance(tcx, instance_context, local_name);
 
     let mut method_params = Vec::with_capacity(signature.params.len() + 1);
     method_params.push(("self".to_string(), oomir::Type::Class(class_name.clone())));
@@ -1312,12 +1312,18 @@ fn ensure_erased_receiver_fn_pointer_bridge<'tcx>(
 
     let source_descriptor = source_signature.to_jvm_descriptor_with_explicit_params();
     let target_descriptor = target_signature.to_jvm_descriptor_with_explicit_params();
-    let hash = short_hash(&format!("{source_descriptor}->{target_descriptor}"), 12);
-    let class_name = jvm_names::synthetic_class_for_instance(
-        tcx,
-        instance,
-        format!("FnPtrErasedReceiverBridge_{hash}"),
+    let identity = format!("{source_descriptor}->{target_descriptor}");
+    let local_name = crate::stable_hash::readable_or_hashed_name(
+        "FnPtrErasedReceiverBridge",
+        &format!(
+            "{}_to_{}",
+            source_signature.fn_ptr_interface_name(),
+            target_signature.fn_ptr_interface_name()
+        ),
+        &identity,
+        180,
     );
+    let class_name = jvm_names::synthetic_class_for_instance(tcx, instance, local_name);
     if data_types.contains_key(&class_name) {
         return Ok(class_name);
     }
@@ -2120,11 +2126,13 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                     let trait_object_adapter = if matches!(
                         cast_kind,
                         CastKind::PointerCoercion(PointerCoercion::Unsize, _)
-                    ) && carrier_needs_trait_object_adapter(
-                        &oomir_source_type,
-                        data_types,
                     ) && let oomir::Type::Interface(interface_name) =
                         &oomir_target_type
+                        && (carrier_needs_trait_object_adapter(&oomir_source_type, data_types)
+                            || interface_name
+                                .rsplit('/')
+                                .next()
+                                .is_some_and(|name| name.contains("_Dyn_")))
                     {
                         match ensure_trait_object_adapter_class(
                             source_mir_ty,

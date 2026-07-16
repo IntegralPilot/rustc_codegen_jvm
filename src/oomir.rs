@@ -235,7 +235,18 @@ impl Signature {
 
     pub fn fn_ptr_interface_name(&self) -> String {
         let descriptor = self.to_jvm_descriptor_with_explicit_params();
-        format!("FnPtr_{}", crate::stable_hash::short_hash(&descriptor, 16))
+        let params = self
+            .explicit_jvm_params()
+            .iter()
+            .filter_map(|(_, ty)| ty.has_jvm_value().then(|| ty.jvm_abi_name_token()))
+            .collect::<Vec<_>>();
+        let params = if params.is_empty() {
+            "no_args".to_string()
+        } else {
+            params.join("_")
+        };
+        let readable = format!("{params}_to_{}", self.ret.jvm_abi_name_token());
+        crate::stable_hash::readable_or_hashed_name("FnPtr", &readable, &descriptor, 180)
     }
 
     pub fn fn_ptr_interface_method_signature(&self) -> Signature {
@@ -801,6 +812,52 @@ pub fn is_non_null_class_name(class_name: &str) -> bool {
 }
 
 impl Type {
+    /// A readable, descriptor-stable token for generated JVM ABI helper names.
+    pub fn jvm_abi_name_token(&self) -> String {
+        fn identifier(raw: &str) -> String {
+            let mut result = String::with_capacity(raw.len());
+            let mut separator = false;
+            for ch in raw.chars() {
+                if ch.is_ascii_alphanumeric() {
+                    result.push(ch);
+                    separator = false;
+                } else if !separator && !result.is_empty() {
+                    result.push('_');
+                    separator = true;
+                }
+            }
+            while result.ends_with('_') {
+                result.pop();
+            }
+            if result.is_empty() {
+                "Object".to_string()
+            } else {
+                result
+            }
+        }
+
+        match self {
+            Type::Void | Type::Unit => "void".to_string(),
+            Type::Boolean => "boolean".to_string(),
+            Type::I8 | Type::U8 => "byte".to_string(),
+            Type::I16 => "short".to_string(),
+            Type::Char | Type::U16 => "char".to_string(),
+            Type::I32 | Type::U32 => "int".to_string(),
+            Type::I64 | Type::U64 => "long".to_string(),
+            Type::F16 => "binary16".to_string(),
+            Type::F32 => "float".to_string(),
+            Type::F64 => "double".to_string(),
+            Type::Pointer(_) => "Pointer".to_string(),
+            Type::MutableReference(inner) | Type::Array(inner) => {
+                format!("Array_{}", inner.jvm_abi_name_token())
+            }
+            Type::Reference(inner) => inner.jvm_abi_name_token(),
+            Type::Slice(_) => "SliceView".to_string(),
+            Type::Str => "Utf8View".to_string(),
+            Type::Class(name) | Type::Interface(name) => identifier(name),
+        }
+    }
+
     /// The JVM's own immutable string class, used only for JVM ABI values.
     pub fn java_string() -> Self {
         Self::Class(JAVA_STRING_CLASS.to_string())

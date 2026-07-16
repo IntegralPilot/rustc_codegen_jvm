@@ -116,7 +116,7 @@ fn create_constant_factory(
     };
 
     let return_type = oomir::Type::from_constant(&prepared);
-    let method_name = format!("__constant_factory_{}", *next_factory);
+    let method_name = format!("_constant_factory_{}", *next_factory);
     *next_factory += 1;
     let descriptor = format!("(){}", return_type.to_jvm_descriptor());
     let mut instructions = Vec::new();
