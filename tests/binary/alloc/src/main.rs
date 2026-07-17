@@ -2,8 +2,6 @@
 #![feature(lang_items)]
 #![allow(internal_features)]
 
-extern crate alloc;
-
 include!("../../../support/test_prelude.rs");
 
 use alloc::alloc::{alloc_zeroed, dealloc, realloc};

@@ -1,6 +1,6 @@
 STDOUT:STDERR:Exception in thread "main" java.lang.RuntimeException: Rust panic: panicked at src/main.rs:9:5:
 This is a formatted panic message: 42
 	at org.rustlang.runtime.PanicSupport.raise(PanicSupport.java:18)
-	at org.rustlang.runtime.WeakLangItems.rust_begin_unwind(test_prelude.rs:139)
+	at org.rustlang.runtime.WeakLangItems.rust_begin_unwind(test_prelude.rs:65)
 	at org.rustlang.core.panicking.panic_fmt(panicking.rs:80)
 	at panic.panic.main(main.rs:9)
