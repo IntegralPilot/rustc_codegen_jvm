@@ -11,6 +11,7 @@ import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.MethodType;
 import java.math.BigInteger;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.IdentityHashMap;
 import java.util.Map;
@@ -39,10 +40,20 @@ public final class Pointer {
             new WeakHashMap<>();
     private static final Map<Object, Map<Long, MemoryViewState>> MEMORY_VIEWS =
             new WeakHashMap<>();
+    private static final Map<Object, MemoryViewOrigin> MEMORY_VIEW_ORIGINS =
+            new WeakHashMap<>();
     private static final ThreadLocal<Integer> MEMORY_VIEW_WRITEBACK_DEPTH =
             ThreadLocal.withInitial(() -> 0);
     private static final Map<Object, Map<String, WeakReference<FieldCell>>> FIELD_CELLS =
             new WeakHashMap<>();
+    private static final int ATOMIC_STRIPE_COUNT = 64;
+    private static final int ATOMIC_RELAXED = 0;
+    private static final int ATOMIC_RELEASE = 1;
+    private static final int ATOMIC_ACQUIRE = 2;
+    private static final int ATOMIC_ACQ_REL = 3;
+    private static final int ATOMIC_SEQ_CST = 4;
+    private static final Object[] ATOMIC_STRIPES = createAtomicStripes();
+    private static final Object ATOMIC_SEQUENCE_LOCK = new Object();
 
     private static boolean isSliceViewType(Class<?> type) {
         return type != null && SLICE_VIEW_CLASS_NAME.equals(type.getName());
@@ -86,11 +97,33 @@ public final class Pointer {
         private final int size;
         private final String codecClassName;
         private final Object value;
+        private byte[] originalImage;
 
-        private MemoryViewState(int size, String codecClassName, Object value) {
+        private MemoryViewState(
+                int size, String codecClassName, Object value, byte[] originalImage) {
             this.size = size;
             this.codecClassName = codecClassName;
             this.value = value;
+            this.originalImage = originalImage;
+        }
+    }
+
+    /** Original byte-addressable storage for a decoded aggregate receiver. */
+    private static final class MemoryViewOrigin {
+        private final WeakReference<Object> allocation;
+        private final int allocationElementSize;
+        private final long byteOffset;
+        private final int viewSize;
+        private final String allocationCodecClassName;
+        private final long metadata;
+
+        private MemoryViewOrigin(Pointer pointer) {
+            allocation = new WeakReference<>(pointer.allocation);
+            allocationElementSize = pointer.allocationElementSize;
+            byteOffset = pointer.byteOffset;
+            viewSize = pointer.viewSize;
+            allocationCodecClassName = pointer.allocationCodecClassName;
+            metadata = pointer.metadata;
         }
     }
 
@@ -567,6 +600,9 @@ public final class Pointer {
                 throw new IllegalStateException("Rust aggregate codec returned "
                         + image.length + " bytes, expected " + state.size);
             }
+            if (Arrays.equals(image, state.originalImage)) {
+                return;
+            }
             new Pointer(
                     allocation,
                     allocationElementSize,
@@ -575,6 +611,7 @@ public final class Pointer {
                     allocationCodecClassName,
                     allocationCodecClassName,
                     exposedAddress).storeRange(image);
+            state.originalImage = image;
         } finally {
             MEMORY_VIEW_WRITEBACK_DEPTH.set(previousDepth);
         }
@@ -649,16 +686,25 @@ public final class Pointer {
     }
 
     private Object decodedMemoryView() {
+        synchronized (atomicStripe(this)) {
+            return decodedMemoryViewLocked();
+        }
+    }
+
+    private Object decodedMemoryViewLocked() {
         synchronized (MEMORY_VIEWS) {
             Map<Long, MemoryViewState> views = MEMORY_VIEWS.get(allocation);
             MemoryViewState cached = views == null ? null : views.get(byteOffset);
             if (cached != null
                     && cached.size == viewSize
                     && cached.codecClassName.equals(viewCodecClassName)) {
+                boundMemoryViewState = cached;
                 Object transparent = transparentManagedView(cached.value.getClass());
                 if (transparent != null) {
+                    registerMemoryViewOrigin(transparent);
                     return transparent;
                 }
+                registerMemoryViewOrigin(cached.value);
                 return cached.value;
             }
         }
@@ -671,14 +717,27 @@ public final class Pointer {
         Object decoded = decodeAggregate(viewCodecClassName, image);
         Object transparent = transparentManagedView(decoded.getClass());
         if (transparent != null) {
+            registerMemoryViewOrigin(transparent);
             return transparent;
         }
+        MemoryViewState state =
+                new MemoryViewState(viewSize, viewCodecClassName, decoded, image);
         synchronized (MEMORY_VIEWS) {
             MEMORY_VIEWS.computeIfAbsent(allocation, ignored -> new HashMap<>())
-                    .put(byteOffset, new MemoryViewState(
-                            viewSize, viewCodecClassName, decoded));
+                    .put(byteOffset, state);
         }
+        boundMemoryViewState = state;
+        registerMemoryViewOrigin(decoded);
         return decoded;
+    }
+
+    private void registerMemoryViewOrigin(Object value) {
+        if (value == null || allocation == null) {
+            return;
+        }
+        synchronized (MEMORY_VIEW_ORIGINS) {
+            MEMORY_VIEW_ORIGINS.put(value, new MemoryViewOrigin(this));
+        }
     }
 
     /** Commits direct field mutations made through the current decoded view. */
@@ -686,11 +745,18 @@ public final class Pointer {
         if (allocation == null || viewCodecClassName == null) {
             return;
         }
+        synchronized (atomicStripe(this)) {
+            commitMemoryViewLocked();
+        }
+    }
+
+    private void commitMemoryViewLocked() {
         MemoryViewState state;
         synchronized (MEMORY_VIEWS) {
             Map<Long, MemoryViewState> views = MEMORY_VIEWS.get(allocation);
             state = views == null ? null : views.get(byteOffset);
             if (state == null
+                    || state != boundMemoryViewState
                     || state.size != viewSize
                     || !state.codecClassName.equals(viewCodecClassName)) {
                 return;
@@ -703,8 +769,11 @@ public final class Pointer {
         // This object is still the live Rust receiver, so keep it authoritative
         // for references derived from the call that just completed.
         synchronized (MEMORY_VIEWS) {
-            MEMORY_VIEWS.computeIfAbsent(allocation, ignored -> new HashMap<>())
-                    .put(byteOffset, state);
+            Map<Long, MemoryViewState> views =
+                    MEMORY_VIEWS.computeIfAbsent(allocation, ignored -> new HashMap<>());
+            if (!views.containsKey(byteOffset)) {
+                views.put(byteOffset, state);
+            }
         }
     }
 
@@ -908,6 +977,7 @@ public final class Pointer {
     private final String allocationCodecClassName;
     private final String viewCodecClassName;
     private final long exposedAddress;
+    private MemoryViewState boundMemoryViewState;
     private long metadata = -1;
     private int zeroSizedSourceViewSize = -1;
     private String zeroSizedSourceViewCodecClassName;
@@ -991,6 +1061,24 @@ public final class Pointer {
             int alignment) {
         if (alignment <= 0 || (alignment & (alignment - 1)) != 0) {
             throw new IllegalArgumentException("Rust allocation alignment must be a power of two");
+        }
+        MemoryViewOrigin origin;
+        synchronized (MEMORY_VIEW_ORIGINS) {
+            origin = MEMORY_VIEW_ORIGINS.get(value);
+        }
+        if (origin != null && origin.viewSize == size) {
+            Object allocation = origin.allocation.get();
+            if (allocation != null) {
+                return new Pointer(
+                                allocation,
+                                origin.allocationElementSize,
+                                origin.byteOffset,
+                                size,
+                                origin.allocationCodecClassName,
+                                codecClassName,
+                                -1)
+                        .withMetadata(origin.metadata);
+            }
         }
         ReceiverCell cell = new ReceiverCell(value);
         synchronized (ALLOCATION_BASES) {
@@ -2169,6 +2257,275 @@ public final class Pointer {
         long mask = 0xffL << (withinElement * 8);
         bits = (bits & ~mask) | (((long) value & 0xffL) << (withinElement * 8));
         writeElement(elementIndex, carrierFromBits(current, bits, allocationElementSize));
+    }
+
+    private static int checkedAtomicByteCount(int byteCount) {
+        if (byteCount != 1 && byteCount != 2 && byteCount != 4 && byteCount != 8) {
+            throw new IllegalArgumentException(
+                    "Rust atomic scalar must occupy 1, 2, 4, or 8 bytes, found " + byteCount);
+        }
+        return byteCount;
+    }
+
+    private static int checkedAtomicOrdering(int ordering) {
+        if (ordering < ATOMIC_RELAXED || ordering > ATOMIC_SEQ_CST) {
+            throw new IllegalArgumentException("unknown Rust atomic ordering " + ordering);
+        }
+        return ordering;
+    }
+
+    private static Object[] createAtomicStripes() {
+        Object[] stripes = new Object[ATOMIC_STRIPE_COUNT];
+        for (int index = 0; index < stripes.length; index++) {
+            stripes[index] = new Object();
+        }
+        return stripes;
+    }
+
+    /**
+     * Maps every alias of a Rust atomic location to the same monitor without
+     * assigning an exposed address or allocating during the operation. Hash
+     * collisions only serialize unrelated atomics and therefore remain safe.
+     */
+    private static Object atomicStripe(Pointer pointer) {
+        return ATOMIC_STRIPES[atomicStripeIndex(pointer)];
+    }
+
+    private static int atomicStripeIndex(Pointer pointer) {
+        long key;
+        if (pointer.allocation == null) {
+            key = pointer.exposedAddress;
+        } else {
+            key = ((long) System.identityHashCode(pointer.allocation) << 32)
+                    ^ pointer.byteOffset;
+        }
+        key ^= key >>> 33;
+        key *= 0xff51afd7ed558ccdL;
+        key ^= key >>> 33;
+        key *= 0xc4ceb9fe1a85ec53L;
+        key ^= key >>> 33;
+        return ((int) key) & (ATOMIC_STRIPES.length - 1);
+    }
+
+    private static boolean isSequentiallyConsistent(int ordering) {
+        return checkedAtomicOrdering(ordering) == ATOMIC_SEQ_CST;
+    }
+
+    /**
+     * A full portable Java 8 fence. Taking every stripe in a stable order
+     * connects the fence to atomic activity on every represented Rust
+     * location while avoiding deadlock between concurrent fences.
+     */
+    private static void atomicFenceStripes(int index) {
+        if (index == ATOMIC_STRIPES.length) {
+            return;
+        }
+        synchronized (ATOMIC_STRIPES[index]) {
+            atomicFenceStripes(index + 1);
+        }
+    }
+
+    private static long atomicMask(int byteCount) {
+        return byteCount == 8 ? -1L : (1L << (byteCount * 8)) - 1L;
+    }
+
+    private static long truncateAtomic(long value, int byteCount) {
+        return value & atomicMask(byteCount);
+    }
+
+    private static long signExtendAtomic(long value, int byteCount) {
+        int shift = 64 - byteCount * 8;
+        return (value << shift) >> shift;
+    }
+
+    private static void atomicStoreLocked(Pointer pointer, long value, int byteCount) {
+        pointer.prepareMemoryWrite(pointer.byteOffset, byteCount);
+        pointer.storeBytes(truncateAtomic(value, byteCount), byteCount);
+    }
+
+    private static long atomicLoadStriped(Pointer pointer, int byteCount) {
+        synchronized (atomicStripe(pointer)) {
+            return truncateAtomic(pointer.loadUnsigned(byteCount), byteCount);
+        }
+    }
+
+    public static long atomicLoad(Pointer pointer, int byteCount, int ordering) {
+        checkedAtomicByteCount(byteCount);
+        if (isSequentiallyConsistent(ordering)) {
+            synchronized (ATOMIC_SEQUENCE_LOCK) {
+                return atomicLoadStriped(pointer, byteCount);
+            }
+        }
+        return atomicLoadStriped(pointer, byteCount);
+    }
+
+    private static void atomicStoreStriped(Pointer pointer, long value, int byteCount) {
+        synchronized (atomicStripe(pointer)) {
+            atomicStoreLocked(pointer, value, byteCount);
+        }
+    }
+
+    public static void atomicStore(Pointer pointer, long value, int byteCount, int ordering) {
+        checkedAtomicByteCount(byteCount);
+        if (isSequentiallyConsistent(ordering)) {
+            synchronized (ATOMIC_SEQUENCE_LOCK) {
+                atomicStoreStriped(pointer, value, byteCount);
+            }
+            return;
+        }
+        atomicStoreStriped(pointer, value, byteCount);
+    }
+
+    private static long atomicRmwStriped(
+            Pointer pointer, long operand, int byteCount, int operation) {
+        synchronized (atomicStripe(pointer)) {
+            long oldValue = truncateAtomic(pointer.loadUnsigned(byteCount), byteCount);
+            long right = truncateAtomic(operand, byteCount);
+            long newValue;
+            switch (operation) {
+                case 0:
+                    newValue = right;
+                    break;
+                case 1:
+                    newValue = oldValue + right;
+                    break;
+                case 2:
+                    newValue = oldValue - right;
+                    break;
+                case 3:
+                    newValue = oldValue & right;
+                    break;
+                case 4:
+                    newValue = ~(oldValue & right);
+                    break;
+                case 5:
+                    newValue = oldValue | right;
+                    break;
+                case 6:
+                    newValue = oldValue ^ right;
+                    break;
+                case 7:
+                    newValue = signExtendAtomic(oldValue, byteCount)
+                                    >= signExtendAtomic(right, byteCount)
+                            ? oldValue
+                            : right;
+                    break;
+                case 8:
+                    newValue = signExtendAtomic(oldValue, byteCount)
+                                    <= signExtendAtomic(right, byteCount)
+                            ? oldValue
+                            : right;
+                    break;
+                case 9:
+                    newValue = Long.compareUnsigned(oldValue, right) >= 0 ? oldValue : right;
+                    break;
+                case 10:
+                    newValue = Long.compareUnsigned(oldValue, right) <= 0 ? oldValue : right;
+                    break;
+                default:
+                    throw new IllegalArgumentException("unknown Rust atomic operation " + operation);
+            }
+            atomicStoreLocked(pointer, newValue, byteCount);
+            return oldValue;
+        }
+    }
+
+    private static long atomicRmw(
+            Pointer pointer, long operand, int byteCount, int operation, int ordering) {
+        checkedAtomicByteCount(byteCount);
+        if (isSequentiallyConsistent(ordering)) {
+            synchronized (ATOMIC_SEQUENCE_LOCK) {
+                return atomicRmwStriped(pointer, operand, byteCount, operation);
+            }
+        }
+        return atomicRmwStriped(pointer, operand, byteCount, operation);
+    }
+
+    public static long atomicExchange(
+            Pointer pointer, long value, int byteCount, int ordering) {
+        return atomicRmw(pointer, value, byteCount, 0, ordering);
+    }
+
+    public static long atomicAdd(Pointer pointer, long value, int byteCount, int ordering) {
+        return atomicRmw(pointer, value, byteCount, 1, ordering);
+    }
+
+    public static long atomicSubtract(
+            Pointer pointer, long value, int byteCount, int ordering) {
+        return atomicRmw(pointer, value, byteCount, 2, ordering);
+    }
+
+    public static long atomicAnd(Pointer pointer, long value, int byteCount, int ordering) {
+        return atomicRmw(pointer, value, byteCount, 3, ordering);
+    }
+
+    public static long atomicNand(Pointer pointer, long value, int byteCount, int ordering) {
+        return atomicRmw(pointer, value, byteCount, 4, ordering);
+    }
+
+    public static long atomicOr(Pointer pointer, long value, int byteCount, int ordering) {
+        return atomicRmw(pointer, value, byteCount, 5, ordering);
+    }
+
+    public static long atomicXor(Pointer pointer, long value, int byteCount, int ordering) {
+        return atomicRmw(pointer, value, byteCount, 6, ordering);
+    }
+
+    public static long atomicMax(Pointer pointer, long value, int byteCount, int ordering) {
+        return atomicRmw(pointer, value, byteCount, 7, ordering);
+    }
+
+    public static long atomicMin(Pointer pointer, long value, int byteCount, int ordering) {
+        return atomicRmw(pointer, value, byteCount, 8, ordering);
+    }
+
+    public static long atomicUnsignedMax(
+            Pointer pointer, long value, int byteCount, int ordering) {
+        return atomicRmw(pointer, value, byteCount, 9, ordering);
+    }
+
+    public static long atomicUnsignedMin(
+            Pointer pointer, long value, int byteCount, int ordering) {
+        return atomicRmw(pointer, value, byteCount, 10, ordering);
+    }
+
+    private static long atomicCompareExchangeStriped(
+            Pointer pointer, long expected, long value, int byteCount) {
+        synchronized (atomicStripe(pointer)) {
+            long oldValue = truncateAtomic(pointer.loadUnsigned(byteCount), byteCount);
+            if (oldValue == truncateAtomic(expected, byteCount)) {
+                atomicStoreLocked(pointer, value, byteCount);
+            }
+            return oldValue;
+        }
+    }
+
+    public static long atomicCompareExchange(
+            Pointer pointer,
+            long expected,
+            long value,
+            int byteCount,
+            int successOrdering,
+            int failureOrdering) {
+        checkedAtomicByteCount(byteCount);
+        boolean sequentiallyConsistent = isSequentiallyConsistent(successOrdering)
+                | isSequentiallyConsistent(failureOrdering);
+        if (sequentiallyConsistent) {
+            synchronized (ATOMIC_SEQUENCE_LOCK) {
+                return atomicCompareExchangeStriped(pointer, expected, value, byteCount);
+            }
+        }
+        return atomicCompareExchangeStriped(pointer, expected, value, byteCount);
+    }
+
+    public static void atomicFence(int ordering) {
+        if (isSequentiallyConsistent(ordering)) {
+            synchronized (ATOMIC_SEQUENCE_LOCK) {
+                atomicFenceStripes(0);
+            }
+        } else {
+            atomicFenceStripes(0);
+        }
     }
 
     public boolean getBoolean() {

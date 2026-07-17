@@ -4771,40 +4771,52 @@ pub fn generate_adt_jvm_class_name<'tcx>(
     jvm_name_full
 }
 
-/// Generates a JVM class name for a tuple type based on its element types.
-/// The name is derived from the hash of the element types to ensure uniqueness.
-/// The hash is truncated to a specified length to avoid excessively long names.
+/// Generates a readable JVM class name for a tuple type. Rust types that share
+/// the same JVM field carriers (such as `usize` and `u64`) deliberately reuse a
+/// tuple class. A qualified stable hash is added only when the readable name is
+/// already occupied by an ABI-incompatible tuple, such as two unrelated enums
+/// both named `Ordering`.
 pub fn generate_tuple_jvm_class_name<'tcx>(
     element_tys: &[Ty<'tcx>],
     tcx: TyCtxt<'tcx>,
     data_types: &mut HashMap<String, oomir::DataType>, // Needed for recursive calls
     instance_context: rustc_middle::ty::Instance<'tcx>,
 ) -> String {
-    // First attempt: build a human-readable name like `Tuple_i32_String`
+    // First attempt: build a human-readable name like `Tuple_i32_String`.
     let mut tokens: Vec<String> = Vec::new();
+    let mut oomir_element_types = Vec::new();
     for ty in element_tys {
         let oomir_ty = ty_to_oomir_type(*ty, tcx, data_types, instance_context);
         let token = readable_oomir_type_name(&oomir_ty);
         tokens.push(sanitize_name_token(&token));
+        oomir_element_types.push(oomir_ty);
     }
 
     let readable_name = format!("org/rustlang/core/Tuple_{}", tokens.join("_"));
+    let has_incompatible_collision = match data_types.get(&readable_name) {
+        Some(oomir::DataType::Class { fields, .. }) => fields
+            .iter()
+            .map(|(_, field_ty)| field_ty)
+            .ne(oomir_element_types.iter()),
+        Some(_) => true,
+        None => false,
+    };
 
-    // If the readable name is within bounds, use it. Otherwise fall back to a hash
-    if readable_name.len() <= MAX_TUPLE_NAME_LEN {
-        readable_name
+    if readable_name.len() <= MAX_TUPLE_NAME_LEN && !has_incompatible_collision {
+        return readable_name;
+    }
+
+    let identity = element_tys
+        .iter()
+        .map(|ty| readable_rust_type_name(*ty, tcx, data_types, instance_context))
+        .collect::<Vec<_>>()
+        .join("_");
+    let hash = short_hash(&identity, 10);
+    let disambiguated = format!("{readable_name}_{hash}");
+    if disambiguated.len() <= MAX_TUPLE_NAME_LEN {
+        disambiguated
     } else {
-        // build hashed name using JVM descriptors (previous behaviour)
-        let mut name_parts = String::new();
-        for ty in element_tys {
-            // convert to oomir type
-            let ty = ty_to_oomir_type(*ty, tcx, data_types, instance_context);
-            name_parts.push_str(&ty.to_jvm_descriptor());
-            name_parts.push_str("_");
-        }
-        // with a length of 10, the chance of a collision is tiny
-        let hash = short_hash(&name_parts, 10);
-        format!("org/rustlang/core/Tuple_{}", hash)
+        format!("org/rustlang/core/Tuple_{hash}")
     }
 }
 

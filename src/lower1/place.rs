@@ -511,13 +511,30 @@ fn field_name_from_rust_ty<'tcx>(
     }
 }
 
-fn field_name_for_projection<'tcx>(
+pub(super) fn field_name_for_projection<'tcx>(
     owner_class_name: &str,
     field_index: usize,
     base_rust_ty: Ty<'tcx>,
     tcx: TyCtxt<'tcx>,
     data_types: &HashMap<String, oomir::DataType>,
 ) -> Result<String, String> {
+    let named_source_field = match base_rust_ty.kind() {
+        TyKind::Ref(_, inner_ty, _) => match inner_ty.kind() {
+            TyKind::Tuple(_) => field_name_from_rust_ty(*inner_ty, field_index, tcx),
+            TyKind::Adt(adt_def, _) if adt_def.is_struct() => {
+                field_name_from_rust_ty(*inner_ty, field_index, tcx)
+            }
+            _ => None,
+        },
+        TyKind::Tuple(_) => field_name_from_rust_ty(base_rust_ty, field_index, tcx),
+        TyKind::Adt(adt_def, _) if adt_def.is_struct() => {
+            field_name_from_rust_ty(base_rust_ty, field_index, tcx)
+        }
+        _ => None,
+    };
+    if named_source_field.is_some() {
+        return Ok(named_source_field.expect("checked above"));
+    }
     get_field_name_from_index(owner_class_name, field_index, data_types).or_else(|original_error| {
         field_name_from_rust_ty(base_rust_ty, field_index, tcx).ok_or(original_error)
     })

@@ -66,7 +66,7 @@ Here are a few selected more complex demos:
 
 | Example | Demonstrates |
 |---|---|
-| **[Alloc](tests/binary/alloc/src/main.rs)** | Using the compiled `alloc` crate in complex ways - binary trees, heaps, linked lists, vectors, strings and more! |
+| **[Alloc](tests/binary/alloc/src/main.rs)** | Using the compiled `alloc` crate in complex ways - binary trees, heaps, linked lists, vectors, strings, Arc/atomics and more! |
 | **[Raw pointers](tests/binary/raw_ptrs/src/main.rs)** | Stable pointer identity, dereferencing, casts, arithmetic, nested pointers and lots more! |
 | **[Unions](tests/binary/unions/src/main.rs)** | `unsafe` union handling, including nesting and reinterpretation |
 | **[Enums](tests/binary/enums/src/main.rs)** / **[Structs](tests/binary/structs/src/main.rs)** | Nested data structures - tuples, arrays, slices |
@@ -91,9 +91,10 @@ Here are a few selected more complex demos:
 - **Control flow:** `if`/`else`, `match`, `for`, `while`, and `loop`.
 - **Data structures** including arrays, slices, structs, tuples, and enums (both C-like and Rust-style).
 - **Functions & closures:** calls, recursion, function pointers (as values, parameters, return types, and in generics), and closure capture.
+- **Generics** with monomorphisation, including generic functions, structs, enums, and traits and const generics.
 - **OOP constructs** such as `impl` blocks for ADTs, including `self`, `&self`, and `&mut self`.
 - **Traits** and dynamic dispatch via `&dyn Trait`.
-- **Memory management:** shared and mutable references, raw pointers, stable address identity, dereferencing, typed pointer arithmetic, null pointers, pointer casts, etc.
+- **Memory management:** shared and mutable references, raw pointers, stable address identity, dereferencing, typed pointer arithmetic, null pointers, pointer casts, atomics etc.
 - **Unions** support primitive values, references, tuples, structs, fixed-size arrays, and fieldless or data-carrying enums, including recursively nested combinations of these types.
 - **Transmute** between everything supported by unions (uses the same inner machinery)
 - **Outputs** executable, self-contained `.jar` generation for binary crates.

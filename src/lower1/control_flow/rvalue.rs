@@ -6,6 +6,7 @@ use rustc_middle::{
     },
     ty::{EarlyBinder, Instance, Ty, TyCtxt, TyKind, TypingEnv, adjustment::PointerCoercion},
 };
+use rustc_span::sym;
 use std::collections::{HashMap, HashSet};
 
 use super::{
@@ -785,16 +786,22 @@ fn emit_pointer_to_place<'tcx>(
                 let base_rust_ty = EarlyBinder::bind(tcx, base_place.ty(&mir.local_decls, tcx).ty)
                     .instantiate(tcx, instance.args)
                     .skip_norm_wip();
-                // Most aggregate fields must be projected from the base Pointer so
-                // they retain the allocation and byte offset of the complete Rust
-                // value. Only a direct JVM method receiver has no Pointer carrier
-                // from which to project, so that case needs a reflective
-                // write-through field cell.
+                // Project aggregate fields from the base Pointer so they retain
+                // the allocation and byte offset of the complete Rust value.
+                // Ordinary direct JVM receivers use write-through field cells.
+                // Atomic<T>, identified semantically by its diagnostic item,
+                // must preserve its decoded byte-storage origin so aliases use
+                // the same physical atomic location and lock stripe.
                 let projects_direct_instance_self = base_place.local.index() == 1
                     && matches!(base_place.projection.as_ref(), [ProjectionElem::Deref])
                     && tcx
                         .opt_associated_item(instance.def_id())
                         .is_some_and(|item| item.is_method());
+                let is_atomic_receiver = matches!(
+                    base_rust_ty.kind(),
+                    TyKind::Adt(adt_def, _)
+                        if tcx.is_diagnostic_item(sym::Atomic, adt_def.did())
+                );
                 let use_managed_field = matches!(
                     base_rust_ty.kind(),
                     TyKind::Adt(adt_def, _) if adt_def.is_struct() || adt_def.is_enum()
@@ -805,9 +812,11 @@ fn emit_pointer_to_place<'tcx>(
                     let base_oomir_ty = get_place_type(&base_place, mir, tcx, instance, data_types);
                     match &base_oomir_ty {
                         oomir::Type::Class(owner_class) => {
-                            super::super::types::get_field_name_from_index(
+                            super::super::place::field_name_for_projection(
                                 owner_class,
                                 field_index.index(),
+                                base_rust_ty,
+                                tcx,
                                 data_types,
                             )
                             .ok()
@@ -831,7 +840,7 @@ fn emit_pointer_to_place<'tcx>(
                         instructions,
                     );
                     if matches!(base_rust_ty.kind(), TyKind::Adt(adt_def, _) if adt_def.is_struct())
-                        && !projects_direct_instance_self
+                        && (!projects_direct_instance_self || is_atomic_receiver)
                     {
                         let base_layout = tcx
                             .layout_of(

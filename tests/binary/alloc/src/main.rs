@@ -10,11 +10,13 @@ use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet, BinaryHeap, LinkedList, VecDeque};
 use alloc::format;
 use alloc::rc::{Rc, Weak};
+use alloc::sync::{Arc, Weak as ArcWeak};
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::alloc::Layout;
 use core::cell::RefCell;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 static mut DROP_COUNTER: usize = 0;
 
@@ -82,6 +84,47 @@ struct TreeNode {
     parent: RefCell<Weak<TreeNode>>,
 }
 
+struct ArcWorkerContext {
+    relaxed_counter: Arc<AtomicUsize>,
+    sequential_counter: Arc<AtomicUsize>,
+    iterations: usize,
+}
+
+unsafe extern "C" {
+    #[link_name = "jvm:static:org/rustlang/runtime/ThreadSupport:runStaticPointerWorkers:(Lorg/rustlang/runtime/Pointer;JLorg/rustlang/runtime/Pointer;JLorg/rustlang/runtime/Pointer;I)V"]
+    fn run_static_pointer_workers(
+        owner: *const u8,
+        owner_length: usize,
+        method: *const u8,
+        method_length: usize,
+        context: *const ArcWorkerContext,
+        worker_count: i32,
+    );
+}
+
+#[inline(never)]
+pub extern "C" fn arc_concurrent_worker(context: *const ArcWorkerContext) {
+    let context = unsafe { &*context };
+    for _ in 0..context.iterations {
+        let relaxed = Arc::clone(&context.relaxed_counter);
+        let sequential = Arc::clone(&context.sequential_counter);
+
+        relaxed.fetch_add(1, Ordering::Relaxed);
+        sequential.fetch_add(2, Ordering::SeqCst);
+
+        let weak = Arc::downgrade(&relaxed);
+        let upgraded = weak.upgrade();
+        assert!(upgraded.is_some());
+        let upgraded = upgraded.unwrap();
+        assert!(Arc::ptr_eq(&relaxed, &upgraded));
+
+        drop(upgraded);
+        drop(weak);
+        drop(sequential);
+        drop(relaxed);
+    }
+}
+
 fn main() {
     test_vec_basic();
     test_zst_allocations();
@@ -105,6 +148,16 @@ fn main() {
     test_closures_as_trait_objects();
     test_nested_collections();
     test_sort_and_dedup_custom();
+
+    test_overaligned_allocations();
+    test_btree_stress_and_merging();
+    test_drain_partial_drop();
+    test_arc_basics();
+    test_arc_concurrent_clone_drop();
+    test_zst_collection_behavior();
+    test_manual_realloc_shrink();
+    test_vec_from_raw_parts();
+    test_layout_computations();
 }
 
 fn test_vec_basic() {
@@ -596,4 +649,244 @@ fn test_sort_and_dedup_custom() {
 
     let position = nums.binary_search(&5);
     assert!(position.is_ok());
+}
+
+
+fn test_overaligned_allocations() {
+    let alignments = [128, 256, 512, 1024, 2048, 4096];
+    for &align in &alignments {
+        let layout = Layout::from_size_align(64, align).unwrap();
+        unsafe {
+            let ptr = alloc_zeroed(layout);
+            assert!(!ptr.is_null());
+            assert!((ptr as usize) & (layout.align() - 1) == 0);
+
+            *ptr = 0xAA;
+            *ptr.add(layout.size() - 1) = 0xBB;
+
+            assert!(*ptr == 0xAA);
+            assert!(*ptr.add(layout.size() - 1) == 0xBB);
+
+            dealloc(ptr, layout);
+        }
+    }
+}
+
+fn test_btree_stress_and_merging() {
+    let mut map = BTreeMap::new();
+
+    for i in 0..300 {
+        map.insert(i, DropTracker { _val: i as u32 });
+    }
+    assert!(map.len() == 300);
+
+    for i in (0..300).step_by(2) {
+        let removed = map.remove(&i);
+        assert!(removed.is_some());
+    }
+    assert!(map.len() == 150);
+
+    for i in 0..300 {
+        if i % 2 == 0 {
+            assert!(map.get(&i).is_none());
+        } else {
+            assert!(map.get(&i).is_some());
+        }
+    }
+
+    map.clear();
+    assert!(map.is_empty());
+}
+
+fn test_drain_partial_drop() {
+    unsafe {
+        DROP_COUNTER = 0;
+    }
+
+    {
+        let mut v = Vec::new();
+        for i in 0..12 {
+            v.push(DropTracker { _val: i });
+        }
+
+        let mut drain = v.drain(2..10);
+
+        let first = drain.next();
+        let second = drain.next();
+        assert!(first.is_some());
+        assert!(second.is_some());
+
+        drop(first);
+        drop(second);
+        assert!(unsafe { DROP_COUNTER } == 2);
+
+    }
+
+    assert!(unsafe { DROP_COUNTER } == 12);
+}
+
+fn test_arc_basics() {
+    let root_val = Arc::new(999_u32);
+    let weak_ref: ArcWeak<u32> = Arc::downgrade(&root_val);
+
+    assert!(Arc::strong_count(&root_val) == 1);
+    assert!(weak_ref.upgrade().is_some());
+
+    let second_arc = Arc::clone(&root_val);
+    assert!(Arc::strong_count(&root_val) == 2);
+    assert!(Arc::weak_count(&root_val) == 1);
+
+    drop(root_val);
+    assert!(Arc::strong_count(&second_arc) == 1);
+    assert!(weak_ref.upgrade().is_some());
+
+    drop(second_arc);
+    assert!(weak_ref.upgrade().is_none());
+
+    let mut copy_on_write = Arc::new(vec![1_u32, 2, 3]);
+    let original = Arc::clone(&copy_on_write);
+    assert!(Arc::get_mut(&mut copy_on_write).is_none());
+    Arc::make_mut(&mut copy_on_write).push(4);
+    assert!(original.as_slice() == [1, 2, 3]);
+    assert!(copy_on_write.as_slice() == [1, 2, 3, 4]);
+    assert!(!Arc::ptr_eq(&copy_on_write, &original));
+    drop(original);
+
+    match Arc::try_unwrap(copy_on_write) {
+        Ok(values) => assert!(values == vec![1, 2, 3, 4]),
+        Err(_) => panic!("unique Arc should unwrap"),
+    }
+}
+
+fn test_arc_concurrent_clone_drop() {
+    const WORKERS: usize = 8;
+    const ITERATIONS: usize = 2;
+
+    let context = ArcWorkerContext {
+        relaxed_counter: Arc::new(AtomicUsize::new(0)),
+        sequential_counter: Arc::new(AtomicUsize::new(0)),
+        iterations: ITERATIONS,
+    };
+
+    let owner = b"alloc_test.alloc_test";
+    let method = b"arc_concurrent_worker";
+    // Keep the reflectively invoked worker as a concrete codegen item and
+    // establish a single-threaded baseline before the concurrent phase.
+    arc_concurrent_worker(&context);
+    unsafe {
+        run_static_pointer_workers(
+            owner.as_ptr(),
+            owner.len(),
+            method.as_ptr(),
+            method.len(),
+            &context,
+            WORKERS as i32,
+        );
+    }
+
+    assert!(
+        context.relaxed_counter.load(Ordering::Acquire) == (WORKERS + 1) * ITERATIONS
+    );
+    assert!(
+        context.sequential_counter.load(Ordering::SeqCst) == (WORKERS + 1) * ITERATIONS * 2
+    );
+    assert!(Arc::strong_count(&context.relaxed_counter) == 1);
+    assert!(Arc::strong_count(&context.sequential_counter) == 1);
+    assert!(Arc::weak_count(&context.relaxed_counter) == 0);
+    assert!(Arc::weak_count(&context.sequential_counter) == 0);
+
+    let relaxed_weak = Arc::downgrade(&context.relaxed_counter);
+    let sequential_weak = Arc::downgrade(&context.sequential_counter);
+    drop(context);
+    assert!(relaxed_weak.upgrade().is_none());
+    assert!(sequential_weak.upgrade().is_none());
+}
+
+fn test_zst_collection_behavior() {
+    let mut zst_deque: VecDeque<()> = VecDeque::new();
+    for _ in 0..100 {
+        zst_deque.push_back(());
+        zst_deque.push_front(());
+    }
+    assert!(zst_deque.len() == 200);
+    for _ in 0..100 {
+        assert!(zst_deque.pop_back().is_some());
+        assert!(zst_deque.pop_front().is_some());
+    }
+    assert!(zst_deque.is_empty());
+
+    let mut zst_map: BTreeMap<(), DropTracker> = BTreeMap::new();
+    unsafe { DROP_COUNTER = 0; }
+    zst_map.insert((), DropTracker { _val: 1234 });
+
+    let displaced = zst_map.insert((), DropTracker { _val: 5678 });
+    assert!(displaced.is_some());
+    drop(displaced);
+    assert!(unsafe { DROP_COUNTER } == 1);
+
+    drop(zst_map);
+    assert!(unsafe { DROP_COUNTER } == 2);
+}
+
+fn test_manual_realloc_shrink() {
+    let layout_large = Layout::from_size_align(2048, 16).unwrap();
+    let layout_small = Layout::from_size_align(64, 16).unwrap();
+
+    unsafe {
+        let ptr = alloc_zeroed(layout_large);
+        assert!(!ptr.is_null());
+
+        for offset in (0..2048).step_by(16) {
+            *ptr.add(offset) = (offset % 256) as u8;
+        }
+
+        let ptr_shunk = realloc(ptr, layout_large, layout_small.size());
+        assert!(!ptr_shunk.is_null());
+        assert!((ptr_shunk as usize) & (layout_small.align() - 1) == 0);
+
+        for offset in (0..64).step_by(16) {
+            assert!(*ptr_shunk.add(offset) == (offset % 256) as u8);
+        }
+
+        dealloc(ptr_shunk, layout_small);
+    }
+}
+
+fn test_vec_from_raw_parts() {
+    unsafe {
+        DROP_COUNTER = 0;
+    }
+
+    {
+        let mut original = Vec::new();
+        for i in 0..8 {
+            original.push(DropTracker { _val: i });
+        }
+
+        let ptr = original.as_mut_ptr();
+        let len = original.len();
+        let cap = original.capacity();
+
+        core::mem::forget(original);
+
+        let reconstructed = unsafe { Vec::from_raw_parts(ptr, len, cap) };
+        assert!(reconstructed.len() == 8);
+        assert!(reconstructed.capacity() == cap);
+    }
+
+    assert!(unsafe { DROP_COUNTER } == 8);
+}
+
+fn test_layout_computations() {
+    let base_layout = Layout::new::<u64>();
+    let offset_layout = Layout::new::<u8>();
+
+    let (extended, offset) = base_layout.extend(offset_layout).unwrap();
+    assert!(extended.size() == 9);
+    assert!(extended.align() == 8);
+    assert!(offset == 8);
+
+    let array_layout = Layout::array::<u32>(16).unwrap();
+    assert!(array_layout.size() == 64);
+    assert!(array_layout.align() == 4);
 }
