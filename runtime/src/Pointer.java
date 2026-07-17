@@ -507,6 +507,8 @@ public final class Pointer {
         private final int viewSize;
         private final String viewCodecClassName;
         private final long metadata;
+        private final int zeroSizedSourceViewSize;
+        private final String zeroSizedSourceViewCodecClassName;
 
         private ExposedTarget(
                 Object allocation,
@@ -515,7 +517,9 @@ public final class Pointer {
                 String codecClassName,
                 int viewSize,
                 String viewCodecClassName,
-                long metadata) {
+                long metadata,
+                int zeroSizedSourceViewSize,
+                String zeroSizedSourceViewCodecClassName) {
             this.allocation = new WeakReference<>(allocation);
             this.allocationElementSize = allocationElementSize;
             this.byteOffset = byteOffset;
@@ -523,6 +527,8 @@ public final class Pointer {
             this.viewSize = viewSize;
             this.viewCodecClassName = viewCodecClassName;
             this.metadata = metadata;
+            this.zeroSizedSourceViewSize = zeroSizedSourceViewSize;
+            this.zeroSizedSourceViewCodecClassName = zeroSizedSourceViewCodecClassName;
         }
     }
 
@@ -917,7 +923,7 @@ public final class Pointer {
             if (target != null) {
                 Object allocation = target.allocation.get();
                 if (allocation != null) {
-                    return new Pointer(
+                    Pointer pointer = new Pointer(
                             allocation,
                             target.allocationElementSize,
                             target.byteOffset,
@@ -925,11 +931,19 @@ public final class Pointer {
                             target.codecClassName,
                             target.viewCodecClassName,
                             -1).withMetadata(target.metadata);
+                    pointer.zeroSizedSourceViewSize = target.zeroSizedSourceViewSize;
+                    pointer.zeroSizedSourceViewCodecClassName =
+                            target.zeroSizedSourceViewCodecClassName;
+                    return pointer;
                 }
                 EXPOSED_ADDRESSES.remove(address);
             }
         }
         return fromAddress(address, 1);
+    }
+
+    public static Pointer fromErasedAddress(long address) {
+        return pointerObjectFromAddress(address).retype(0);
     }
 
     public static Pointer fromAddress(long address) {
@@ -1481,7 +1495,9 @@ public final class Pointer {
                             allocationCodecClassName,
                             viewSize,
                             viewCodecClassName,
-                            metadata));
+                            metadata,
+                            zeroSizedSourceViewSize,
+                            zeroSizedSourceViewCodecClassName));
             return address;
         }
     }

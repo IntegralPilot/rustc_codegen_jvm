@@ -219,9 +219,8 @@ pub(super) fn emit_rust_drop_value<'tcx>(
     match rust_ty.kind() {
         TyKind::Adt(adt_def, substs) if adt_def.is_struct() => {
             if !super::types::should_define_named_data_type(tcx, adt_def.did()) {
-                // Standard-library/JVM-backed containers are represented by
-                // managed carriers (for example Rust String -> JVM String).
-                // Their native Rust field layout is not the JVM object layout.
+                // JVM-backed foreign containers use managed carriers whose
+                // native Rust field layout is not the JVM object layout.
                 return;
             }
             if adt_def.destructor(tcx).is_some() {
@@ -3110,6 +3109,8 @@ pub(super) fn convert_basic_block<'tcx>(
                         let is_size_of_val = (is_compiler_intrinsic
                             && intrinsic_name.as_str() == "size_of_val")
                             || has_diagnostic_item("mem_size_of_val");
+                        let is_align_of_val =
+                            is_compiler_intrinsic && intrinsic_name.as_str() == "align_of_val";
                         if is_compiler_intrinsic
                             && matches!(
                                 intrinsic_name.as_str(),
@@ -3516,6 +3517,32 @@ pub(super) fn convert_basic_block<'tcx>(
                                     });
                                 }
                             }
+                        } else if is_align_of_val && let Some(dest) = effective_dest.clone() {
+                            let measured_ty = func_instance
+                                .args
+                                .types()
+                                .next()
+                                .expect("align_of_val intrinsic has a type argument");
+                            let alignment = match measured_ty.kind() {
+                                TyKind::Slice(element_ty) => {
+                                    super::types::layout_align_bytes(tcx, *element_ty)
+                                }
+                                TyKind::Str => Ok(1),
+                                _ => super::types::layout_align_bytes(tcx, measured_ty),
+                            }
+                            .unwrap_or_else(|error| {
+                                panic!(
+                                    "could not determine align_of_val layout for {measured_ty:?}: {error}"
+                                )
+                            });
+                            instructions.push(oomir::Instruction::Move {
+                                dest,
+                                src: oomir::Operand::Constant(oomir::Constant::I32(
+                                    i32::try_from(alignment).expect(
+                                        "align_of_val result exceeds the JVM address space",
+                                    ),
+                                )),
+                            });
                         } else if intrinsic_name.as_str() == "type_id_eq"
                             && is_compiler_intrinsic
                             && oomir_operands.len() == 2
@@ -3910,7 +3937,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                 instructions.push(oomir::Instruction::InvokeStatic {
                                     dest: effective_dest.clone(),
                                     class_name: oomir::POINTER_CLASS.to_string(),
-                                    method_name: "restoreAllocationView".to_string(),
+                                    method_name: "restoreErasedView".to_string(),
                                     method_ty: oomir::Signature {
                                         params: vec![("pointer".to_string(), source_ty)],
                                         ret: method_signature.ret.clone(),

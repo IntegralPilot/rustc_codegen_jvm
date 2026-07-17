@@ -396,7 +396,7 @@ fn int_constant_for_type(value: i64, ty: &oomir::Type) -> oomir::Constant {
 }
 
 pub fn should_define_named_data_type<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> bool {
-    def_id.is_local() || tcx.crate_name(def_id.krate) == sym::core
+    def_id.is_local() || matches!(tcx.crate_name(def_id.krate), sym::core | sym::alloc)
 }
 
 fn add_enum_helper_methods(
@@ -2490,6 +2490,7 @@ fn emit_ty_from_union_bytes<'tcx>(
             ) =>
         {
             let pointer_ty = ty_to_oomir_type(ty, tcx, data_types, instance_context);
+            let is_erased_trait_object = matches!(pointee.kind(), TyKind::Dynamic(..));
             let bits = emit_bits_from_union_bytes(
                 oomir::Type::I64,
                 layout_size_bytes(tcx, ty)?,
@@ -2502,24 +2503,36 @@ fn emit_ty_from_union_bytes<'tcx>(
             instructions.push(oomir::Instruction::InvokeStatic {
                 dest: Some(pointer_dest.clone()),
                 class_name: oomir::POINTER_CLASS.to_string(),
-                method_name: "fromAddress".to_string(),
+                method_name: if is_erased_trait_object {
+                    "fromErasedAddress".to_string()
+                } else {
+                    "fromAddress".to_string()
+                },
                 method_ty: oomir::Signature {
-                    params: vec![
-                        ("address".to_string(), oomir::Type::U64),
-                        ("view_size".to_string(), oomir::Type::I32),
-                        ("view_codec".to_string(), oomir::Type::java_string()),
-                    ],
+                    params: if is_erased_trait_object {
+                        vec![("address".to_string(), oomir::Type::U64)]
+                    } else {
+                        vec![
+                            ("address".to_string(), oomir::Type::U64),
+                            ("view_size".to_string(), oomir::Type::I32),
+                            ("view_codec".to_string(), oomir::Type::java_string()),
+                        ]
+                    },
                     ret: Box::new(pointer_ty.clone()),
                     is_static: true,
                 },
-                args: vec![
-                    bits,
-                    oomir::Operand::Constant(oomir::Constant::I32(
-                        i32::try_from(layout_size_bytes(tcx, *pointee)?)
-                            .map_err(|_| "pointer pointee layout exceeds JVM address space")?,
-                    )),
-                    pointer_view_codec_operand(*pointee, tcx, data_types, instance_context),
-                ],
+                args: if is_erased_trait_object {
+                    vec![bits]
+                } else {
+                    vec![
+                        bits,
+                        oomir::Operand::Constant(oomir::Constant::I32(
+                            i32::try_from(layout_size_bytes(tcx, *pointee)?)
+                                .map_err(|_| "pointer pointee layout exceeds JVM address space")?,
+                        )),
+                        pointer_view_codec_operand(*pointee, tcx, data_types, instance_context),
+                    ]
+                },
             });
             Ok(operand_var(pointer_dest, pointer_ty))
         }

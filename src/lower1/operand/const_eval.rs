@@ -262,16 +262,6 @@ pub fn read_scalar_int_constant<'tcx>(
             return scalar_int_to_oomir_constant(tcx, scalar_int, carrier_ty);
         }
 
-        let adt_name = match ty_to_oomir_type(ty, tcx, oomir_data_types, instance) {
-            oomir::Type::Class(class_name) => class_name,
-            other => {
-                return Err(format!(
-                    "Expected class type for scalar ADT constant {:?}, got {:?}",
-                    ty, other
-                ));
-            }
-        };
-
         let variant = adt_def
             .variants()
             .iter()
@@ -299,7 +289,6 @@ pub fn read_scalar_int_constant<'tcx>(
         }
 
         let field_def = non_zst_fields[0];
-        let field_name = field_def.ident(tcx).name.to_string();
         let unnormalized_field_ty = field_def.ty(tcx, substs);
         let field_ty = tcx
             .try_normalize_erasing_regions(TypingEnv::fully_monomorphized(), unnormalized_field_ty)
@@ -311,15 +300,14 @@ pub fn read_scalar_int_constant<'tcx>(
                     error
                 )
             })?;
-        let inner_constant =
-            read_scalar_int_constant(tcx, scalar_int, field_ty, oomir_data_types, instance)?;
-        let mut fields = HashMap::new();
-        fields.insert(field_name, inner_constant.clone());
-        return Ok(oomir::Constant::Instance {
-            class_name: adt_name,
-            fields,
-            params: vec![inner_constant],
-        });
+        // A scalar ADT is carried using the bits of its one non-ZST field.
+        // Keep that physical carrier here and let value-representation
+        // adaptation reconstruct the nominal JVM object at the use site.
+        // Constructing the wrapper eagerly is incorrect when its field has a
+        // nominal JVM representation of its own (for example `Alignment`,
+        // which is transparent over `AlignmentEnum`): the physical integer
+        // bits are not a valid argument to the generated object constructor.
+        return read_scalar_int_constant(tcx, scalar_int, field_ty, oomir_data_types, instance);
     }
 
     scalar_int_to_oomir_constant(tcx, scalar_int, ty)

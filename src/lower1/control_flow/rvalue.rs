@@ -182,6 +182,34 @@ fn emit_raw_array_pointer_unsize<'tcx>(
         };
     let source_pointee = normalize_unsize_ty(source_pointee, tcx, instance);
     let target_pointee = normalize_unsize_ty(target_pointee, tcx, instance);
+    let source_oomir_ty = ty_to_oomir_type(source_ty, tcx, data_types, instance);
+    let target_oomir_ty = ty_to_oomir_type(target_ty, tcx, data_types, instance);
+
+    if matches!(target_pointee.kind(), TyKind::Dynamic(..))
+        && matches!(source_oomir_ty, oomir::Type::Pointer(_))
+        && matches!(target_oomir_ty, oomir::Type::Pointer(_))
+    {
+        instructions.push(oomir::Instruction::InvokeVirtual {
+            dest: Some(dest.to_string()),
+            class_name: oomir::POINTER_CLASS.to_string(),
+            method_name: "retype".to_string(),
+            method_ty: oomir::Signature {
+                params: vec![
+                    ("self".to_string(), source_oomir_ty),
+                    ("view_size".to_string(), oomir::Type::I32),
+                ],
+                ret: Box::new(target_oomir_ty.clone()),
+                is_static: false,
+            },
+            args: vec![oomir::Operand::Constant(oomir::Constant::I32(0))],
+            operand: source,
+        });
+        return Some(oomir::Operand::Variable {
+            name: dest.to_string(),
+            ty: target_oomir_ty,
+        });
+    }
+
     let (TyKind::Array(source_element, length), TyKind::Slice(target_element)) =
         (source_pointee.kind(), target_pointee.kind())
     else {
@@ -193,8 +221,6 @@ fn emit_raw_array_pointer_unsize<'tcx>(
         return None;
     }
 
-    let source_oomir_ty = ty_to_oomir_type(source_ty, tcx, data_types, instance);
-    let target_oomir_ty = ty_to_oomir_type(target_ty, tcx, data_types, instance);
     if !matches!(source_oomir_ty, oomir::Type::Pointer(_))
         || !matches!(target_oomir_ty, oomir::Type::Slice(_))
     {
@@ -3109,9 +3135,20 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                             pointer_pointee_ty(*target_mir_ty).kind(),
                             TyKind::Dynamic(_, _)
                         ) {
-                            instructions.push(oomir::Instruction::Move {
-                                dest: temp_cast_var.clone(),
-                                src: oomir_operand,
+                            instructions.push(oomir::Instruction::InvokeVirtual {
+                                dest: Some(temp_cast_var.clone()),
+                                class_name: oomir::POINTER_CLASS.to_string(),
+                                method_name: "retype".to_string(),
+                                method_ty: oomir::Signature {
+                                    params: vec![
+                                        ("self".to_string(), oomir_source_type),
+                                        ("view_size".to_string(), oomir::Type::I32),
+                                    ],
+                                    ret: Box::new(oomir_target_type.clone()),
+                                    is_static: false,
+                                },
+                                args: vec![oomir::Operand::Constant(oomir::Constant::I32(0))],
+                                operand: oomir_operand,
                             });
                             return (
                                 instructions,
@@ -3822,7 +3859,7 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                             value_operand,
                             element_mir_ty,
                             &element_oomir_type,
-                            &temp_aggregate_var,
+                            &format!("{temp_aggregate_var}_field_{i}"),
                             tcx,
                             instance,
                             data_types,
@@ -3925,7 +3962,7 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                             value_operand,
                             mir_operand.ty(&mir.local_decls, tcx),
                             &field_ty,
-                            &temp_aggregate_var,
+                            &format!("{temp_aggregate_var}_field_{i}"),
                             tcx,
                             instance,
                             data_types,
@@ -4011,7 +4048,9 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                         }
 
                         let mut constructor_args = Vec::new();
-                        for (field_def, mir_operand) in variant.fields.iter().zip(operands.iter()) {
+                        for (field_index, (field_def, mir_operand)) in
+                            variant.fields.iter().zip(operands.iter()).enumerate()
+                        {
                             let field_mir_ty = field_def.ty(tcx, substs).skip_norm_wip();
                             let field_oomir_type =
                                 ty_to_oomir_type(field_mir_ty, tcx, data_types, instance);
@@ -4030,7 +4069,7 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                                 value_operand,
                                 field_mir_ty,
                                 &field_oomir_type,
-                                &temp_aggregate_var,
+                                &format!("{temp_aggregate_var}_field_{field_index}"),
                                 tcx,
                                 instance,
                                 data_types,
@@ -4232,7 +4271,7 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                                 value_operand,
                                 field_mir_ty,
                                 &field_oomir_type,
-                                &temp_aggregate_var,
+                                &format!("{temp_aggregate_var}_field_{i}"),
                                 tcx,
                                 instance,
                                 data_types,
@@ -4354,7 +4393,7 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                         instructions.push(oomir::Instruction::InvokeStatic {
                             dest: Some(temp_aggregate_var.clone()),
                             class_name: oomir::POINTER_CLASS.to_string(),
-                            method_name: "restoreAllocationView".to_string(),
+                            method_name: "restoreErasedView".to_string(),
                             method_ty: oomir::Signature {
                                 params: vec![("pointer".to_string(), data_ty)],
                                 ret: Box::new(aggregate_oomir_type.clone()),
