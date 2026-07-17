@@ -506,6 +506,20 @@ fn method_identity(class_file: &ClassFile, method_index: usize) -> io::Result<(S
     Ok((name.clone(), descriptor.clone()))
 }
 
+fn interface_name(class_file: &ClassFile, interface_index: usize) -> io::Result<String> {
+    let constant_index = *class_file.interfaces.get(interface_index).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("missing interface at index {interface_index}"),
+        )
+    })?;
+    class_file
+        .constant_pool
+        .try_get_class(constant_index)
+        .cloned()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
+}
+
 fn merge_class_data(base_data: &[u8], incoming_data: &[u8]) -> io::Result<Vec<u8>> {
     let mut base = class_file_from_data(base_data)?;
     let incoming = class_file_from_data(incoming_data)?;
@@ -526,7 +540,19 @@ fn merge_class_data(base_data: &[u8], incoming_data: &[u8]) -> io::Result<Vec<u8
             missing_method_indexes.push(index);
         }
     }
-    if missing_method_indexes.is_empty() {
+
+    let mut existing_interfaces = HashSet::new();
+    for index in 0..base.interfaces.len() {
+        existing_interfaces.insert(interface_name(&base, index)?);
+    }
+    let mut missing_interface_indexes = Vec::new();
+    for index in 0..incoming.interfaces.len() {
+        if !existing_interfaces.contains(&interface_name(&incoming, index)?) {
+            missing_interface_indexes.push(index);
+        }
+    }
+
+    if missing_method_indexes.is_empty() && missing_interface_indexes.is_empty() {
         return Ok(base_data.to_vec());
     }
 
@@ -560,6 +586,13 @@ fn merge_class_data(base_data: &[u8], incoming_data: &[u8]) -> io::Result<Vec<u8
         &mut base.constant_pool,
         bootstrap_method_offset,
     )?;
+
+    for index in missing_interface_indexes {
+        base.interfaces.push(remapped_constant_index(
+            incoming.interfaces[index],
+            &constant_indexes,
+        )?);
+    }
 
     if let Some((name_index, mut methods)) = incoming_bootstrap_methods {
         for BootstrapMethod {
@@ -1272,13 +1305,16 @@ fn class_info_from_class_data(mut data: Vec<u8>, fallback_name: String) -> Class
         data.truncate(cursor.position() as usize);
     }
 
-    let jar_entry_name = class_file
-        .and_then(|class_file| {
-            class_file
-                .class_name()
-                .ok()
-                .map(|class_name| format!("{class_name}.class"))
+    let jar_entry_name = class_name_from_header(&data)
+        .or_else(|| {
+            class_file.and_then(|class_file| {
+                class_file
+                    .class_name()
+                    .ok()
+                    .map(|class_name| class_name.to_string())
+            })
         })
+        .map(|class_name| format!("{class_name}.class"))
         .unwrap_or(fallback_name);
 
     ClassInfo {
@@ -1287,13 +1323,104 @@ fn class_info_from_class_data(mut data: Vec<u8>, fallback_name: String) -> Class
     }
 }
 
+fn class_name_from_header(data: &[u8]) -> Option<String> {
+    fn read_u8(data: &[u8], offset: &mut usize) -> Option<u8> {
+        let value = *data.get(*offset)?;
+        *offset += 1;
+        Some(value)
+    }
+
+    fn read_u16(data: &[u8], offset: &mut usize) -> Option<u16> {
+        let bytes: [u8; 2] = data.get(*offset..*offset + 2)?.try_into().ok()?;
+        *offset += 2;
+        Some(u16::from_be_bytes(bytes))
+    }
+
+    fn skip(data: &[u8], offset: &mut usize, count: usize) -> Option<()> {
+        data.get(*offset..*offset + count)?;
+        *offset += count;
+        Some(())
+    }
+
+    #[derive(Clone)]
+    enum HeaderConstant {
+        Other,
+        Utf8(String),
+        Class(u16),
+    }
+
+    if data.get(..4)? != b"\xca\xfe\xba\xbe" {
+        return None;
+    }
+    let mut offset = 4;
+    skip(data, &mut offset, 4)?; // minor_version and major_version
+    let constant_pool_count = usize::from(read_u16(data, &mut offset)?);
+    let mut constants = vec![HeaderConstant::Other; constant_pool_count];
+    let mut index = 1usize;
+    while index < constant_pool_count {
+        let tag = read_u8(data, &mut offset)?;
+        constants[index] = match tag {
+            1 => {
+                let length = usize::from(read_u16(data, &mut offset)?);
+                let bytes = data.get(offset..offset + length)?;
+                offset += length;
+                HeaderConstant::Utf8(std::str::from_utf8(bytes).ok()?.to_string())
+            }
+            7 => HeaderConstant::Class(read_u16(data, &mut offset)?),
+            3 | 4 => {
+                skip(data, &mut offset, 4)?;
+                HeaderConstant::Other
+            }
+            5 | 6 => {
+                skip(data, &mut offset, 8)?;
+                // Long and double constants occupy two constant-pool slots.
+                index += 1;
+                HeaderConstant::Other
+            }
+            8 | 16 | 19 | 20 => {
+                skip(data, &mut offset, 2)?;
+                HeaderConstant::Other
+            }
+            9 | 10 | 11 | 12 | 17 | 18 => {
+                skip(data, &mut offset, 4)?;
+                HeaderConstant::Other
+            }
+            15 => {
+                skip(data, &mut offset, 3)?;
+                HeaderConstant::Other
+            }
+            _ => return None,
+        };
+        index += 1;
+    }
+
+    skip(data, &mut offset, 2)?; // access_flags
+    let this_class = usize::from(read_u16(data, &mut offset)?);
+    let HeaderConstant::Class(name_index) = constants.get(this_class)? else {
+        return None;
+    };
+    let HeaderConstant::Utf8(name) = constants.get(usize::from(*name_index))? else {
+        return None;
+    };
+    Some(name.clone())
+}
+
 fn try_class_info_from_class_data(mut data: Vec<u8>, fallback_name: String) -> Option<ClassInfo> {
+    let header_class_name = class_name_from_header(&data);
     let mut cursor = Cursor::new(data.clone());
-    let class_file = ClassFile::from_bytes(&mut cursor).ok()?;
-    data.truncate(cursor.position() as usize);
-    let jar_entry_name = class_file
-        .class_name()
-        .ok()
+    let class_file = ClassFile::from_bytes(&mut cursor).ok();
+    if class_file.is_some() {
+        data.truncate(cursor.position() as usize);
+    }
+    let jar_entry_name = header_class_name
+        .or_else(|| {
+            class_file.and_then(|class_file| {
+            class_file
+                .class_name()
+                .ok()
+                    .map(|class_name| class_name.to_string())
+            })
+        })
         .map(|class_name| format!("{class_name}.class"))
         .unwrap_or(fallback_name);
 
@@ -1542,9 +1669,9 @@ fn create_manifest_content(main_class_name: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        class_file_from_data, instruction_byte_offsets, jar_output_path, merge_class_data,
-        merge_input_jars, method_identity, msvc_output_path, parse_response_lines,
-        remap_local_variable_ranges,
+        class_file_from_data, instruction_byte_offsets, interface_name, jar_output_path,
+        merge_class_data, merge_input_jars, method_identity, msvc_output_path,
+        parse_response_lines, remap_local_variable_ranges,
     };
     use ristretto_classfile::attributes::{
         Attribute, BootstrapMethod, Instruction, LocalVariableTable,
@@ -1558,9 +1685,19 @@ mod tests {
     use zip::{ZipArchive, write::SimpleFileOptions, write::ZipWriter};
 
     fn abstract_class_with_method(method_name: &str) -> Vec<u8> {
+        abstract_class_with_method_and_interface(method_name, None)
+    }
+
+    fn abstract_class_with_method_and_interface(
+        method_name: &str,
+        interface_name: Option<&str>,
+    ) -> Vec<u8> {
         let mut constant_pool = ConstantPool::default();
         let this_class = constant_pool.add_class("test/Generic").unwrap();
         let super_class = constant_pool.add_class("java/lang/Object").unwrap();
+        let interfaces = interface_name
+            .map(|name| vec![constant_pool.add_class(name).unwrap()])
+            .unwrap_or_default();
         let name_index = constant_pool.add_utf8(method_name).unwrap();
         let descriptor_index = constant_pool.add_utf8("()V").unwrap();
         let class_file = ClassFile {
@@ -1571,6 +1708,7 @@ mod tests {
                 | ClassAccessFlags::SUPER,
             this_class,
             super_class,
+            interfaces,
             methods: vec![Method {
                 access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::ABSTRACT,
                 name_index,
@@ -1750,6 +1888,20 @@ mod tests {
             first_constant_count + 1,
             "merging should reuse every shared class, descriptor, and attribute constant"
         );
+    }
+
+    #[test]
+    fn merges_complementary_implemented_interfaces() {
+        let first = abstract_class_with_method_and_interface("same", Some("test/First"));
+        let second = abstract_class_with_method_and_interface("same", Some("test/Second"));
+        let merged = merge_class_data(&first, &second).unwrap();
+        let class_file = class_file_from_data(&merged).unwrap();
+        let interfaces: Vec<_> = (0..class_file.interfaces.len())
+            .map(|index| interface_name(&class_file, index).unwrap())
+            .collect();
+
+        assert_eq!(interfaces, ["test/First", "test/Second"]);
+        assert_eq!(class_file.methods.len(), 1);
     }
 
     #[test]

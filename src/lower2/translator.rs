@@ -604,7 +604,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 .insert(block_label.clone(), start_instr_index);
 
             // Translate instructions in the block
-            for instr in &block.instructions {
+            for (instruction_index, instr) in block.instructions.iter().enumerate() {
                 if let oomir::Instruction::SourceLocation(location) = instr {
                     self.current_source_location = Some(location.clone());
                     continue;
@@ -613,7 +613,15 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     self.current_active_variables.clone_from(variables);
                     continue;
                 }
-                self.translate_instruction(instr)?;
+                self.translate_instruction(instr).map_err(|error| {
+                    jvm::Error::VerificationError {
+                        context: format!(
+                            "Function {}, block {}, OOMIR instruction {}",
+                            self.oomir_func.name, block_label, instruction_index
+                        ),
+                        message: format!("Failed to translate {instr:?}: {error:?}"),
+                    }
+                })?;
                 self.jvm_metadata.resize(
                     self.jvm_instructions.len(),
                     optimise2::BytecodeMetadata {
@@ -714,6 +722,14 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         self.jvm_instructions = optimised.instructions;
         self.jvm_metadata = optimised.metadata;
         self.max_locals_used = optimised.max_locals;
+
+        if stackmaps::move_zero_branch_target(
+            &mut self.jvm_instructions,
+            &format!("Function {}", self.oomir_func.name),
+        )? {
+            self.jvm_metadata
+                .insert(0, optimise2::BytecodeMetadata::default());
+        }
 
         self.widen_branches()
             .map_err(|error| jvm::Error::VerificationError {
@@ -1173,19 +1189,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             && matches!(operand, oomir::Operand::Variable { name, .. }
                 if self.direct_this_aliases.contains(name))
         {
-            let oomir::Operand::Variable { name, .. } = operand else {
-                unreachable!()
-            };
-            // A direct alias of JVM `this` contains the object itself even
-            // when MIR types it as `&Self`. Loading it through the operand's
-            // pointer type would insert an invalid Pointer checkcast before we
-            // have had a chance to construct the pointer cell.
-            let index = self.get_local_index(name)?;
-            self.jvm_instructions.push(get_load_instruction(
-                &oomir::Type::Class("java/lang/Object".to_string()),
-                index,
-            )?);
-            return self.wrap_loaded_object_in_pointer_cell();
+            return self.load_jvm_receiver_as_pointer(operand, expected_ty);
         }
         if matches!(actual_ty, oomir::Type::Slice(_))
             && matches!(expected_ty, oomir::Type::Pointer(_))
@@ -1332,6 +1336,62 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             &format!("(Ljava/lang/Object;)L{};", oomir::POINTER_CLASS),
         )?;
         self.jvm_instructions.push(Instruction::Invokestatic(cell));
+        Ok(())
+    }
+
+    fn load_materialized_receiver_pointer(&mut self) -> Result<bool, jvm::Error> {
+        let Some(index) = self
+            .local_var_map
+            .get(oomir::INSTANCE_RECEIVER_POINTER_LOCAL)
+            .copied()
+        else {
+            return Ok(false);
+        };
+        self.jvm_instructions.push(get_load_instruction(
+            &oomir::Type::Pointer(Box::new(oomir::Type::Class("java/lang/Object".to_string()))),
+            index,
+        )?);
+        Ok(true)
+    }
+
+    fn pointer_depth(ty: &oomir::Type) -> usize {
+        match ty {
+            oomir::Type::Pointer(inner) => 1 + Self::pointer_depth(inner),
+            _ => 0,
+        }
+    }
+
+    fn load_jvm_receiver_as_pointer(
+        &mut self,
+        operand: &oomir::Operand,
+        expected_ty: &oomir::Type,
+    ) -> Result<(), jvm::Error> {
+        let expected_depth = Self::pointer_depth(expected_ty);
+        let declared_depth = Self::pointer_depth(&get_operand_type(operand));
+        let mut loaded_depth = declared_depth.max(1);
+
+        if !self.load_materialized_receiver_pointer()? {
+            let oomir::Operand::Variable { name, .. } = operand else {
+                unreachable!("a JVM receiver alias must be a variable")
+            };
+            // Slot 0 contains the JVM object even when MIR types `_1` as a
+            // Rust pointer. Construct its first reference layer explicitly.
+            let index = self.get_local_index(name)?;
+            self.jvm_instructions.push(get_load_instruction(
+                &oomir::Type::Class("java/lang/Object".to_string()),
+                index,
+            )?);
+            self.wrap_loaded_object_in_pointer_cell()?;
+            loaded_depth = 1;
+        }
+
+        // A method on `Self = &mut T` receives `&Self`, i.e. `&&mut T`.
+        // Retain every reference layer instead of collapsing all receiver
+        // pointers to the one canonical cell.
+        while loaded_depth < expected_depth {
+            self.wrap_loaded_object_in_pointer_cell()?;
+            loaded_depth += 1;
+        }
         Ok(())
     }
 
@@ -3312,6 +3372,38 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 };
                 self.jvm_instructions.push(store_instr); // Stack: []
             }
+            OI::ArrayFill {
+                array,
+                value,
+                copy_value,
+            } => {
+                let array_type = self.get_local_type(array)?.clone();
+                if !matches!(array_type, oomir::Type::Array(_)) {
+                    return Err(jvm::Error::VerificationError {
+                        context: format!("Function {}", self.oomir_func.name),
+                        message: format!(
+                            "Variable '{array}' used in ArrayFill is not an array, found {array_type:?}"
+                        ),
+                    });
+                }
+                self.load_operand(&oomir::Operand::Variable {
+                    name: array.clone(),
+                    ty: array_type,
+                })?;
+                self.load_operand_as(value, &oomir::Type::Class("java/lang/Object".to_string()))?;
+                self.jvm_instructions.push(if *copy_value {
+                    JI::Iconst_1
+                } else {
+                    JI::Iconst_0
+                });
+                let pointer_class = self.constant_pool.add_class(oomir::POINTER_CLASS)?;
+                let fill_array = self.constant_pool.add_method_ref(
+                    pointer_class,
+                    "fillArray",
+                    "(Ljava/lang/Object;Ljava/lang/Object;Z)V",
+                )?;
+                self.jvm_instructions.push(JI::Invokestatic(fill_array));
+            }
             OI::ArrayGet { dest, array, index } => {
                 if let oomir::Type::Slice(element_type) = get_operand_type(array) {
                     let view_class = self.constant_pool.add_class(oomir::SLICE_VIEW_CLASS)?;
@@ -3700,11 +3792,21 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 }
             }
             OI::Cast { op, ty, dest } => {
+                let preserves_receiver_identity =
+                    matches!(
+                        op,
+                        OO::Variable { name, .. } if self.direct_this_aliases.contains(name)
+                    ) && matches!(ty, oomir::Type::Class(_) | oomir::Type::Interface(_));
                 self.load_operand_as(op, ty)?;
 
                 // 4. Store the casted value into the destination variable
                 //    The type for storage is the new type (ty)
                 self.store_result(dest, ty)?; // Stack: []
+                if preserves_receiver_identity {
+                    self.direct_this_aliases.insert(dest.clone());
+                } else {
+                    self.direct_this_aliases.remove(dest);
+                }
             }
 
             OI::InvokeInterface {
@@ -3845,6 +3947,10 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 };
                 self.load_operand(&actual_self)?;
                 self.store_result(dest, &method_ty.ret)?;
+                // The dereferenced receiver is still the same JVM object.
+                // Preserve that provenance so a subsequent reborrow reuses
+                // the write-through receiver cell instead of detaching `this`.
+                self.direct_this_aliases.insert(dest.clone());
             }
             OI::InvokeVirtual {
                 dest,
@@ -3856,11 +3962,32 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             } => {
                 // 1. Add Method reference to constant pool
                 let class_index = self.constant_pool.add_class(class_name)?;
-                let method_ref_index = self.constant_pool.add_method_ref(
-                    class_index,
-                    method_name,
-                    &method_ty.to_string(),
-                )?;
+                // A few generic forwarding bodies are emitted before their
+                // receiver has been fully erased, and can therefore retain an
+                // InvokeVirtual node whose resolved owner is an interface.
+                // The class-file opcode and constant-pool entry must follow
+                // the resolved JVM owner, not that provisional OOMIR spelling.
+                let is_interface_owner = matches!(
+                    self.module.data_types.get(class_name),
+                    Some(oomir::DataType::Interface { .. })
+                ) || matches!(
+                    operand.get_type(),
+                    Some(oomir::Type::Interface(interface_name))
+                        if interface_name == *class_name
+                );
+                let method_ref_index = if is_interface_owner {
+                    self.constant_pool.add_interface_method_ref(
+                        class_index,
+                        method_name,
+                        &method_ty.to_string(),
+                    )?
+                } else {
+                    self.constant_pool.add_method_ref(
+                        class_index,
+                        method_name,
+                        &method_ty.to_string(),
+                    )?
+                };
 
                 // 2. Load the object reference (self) onto the stack
                 // Legacy MutableReference carriers are represented as single-element arrays,
@@ -3881,8 +4008,10 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     // as `&Self`. Pointer APIs therefore need a temporary cell;
                     // Pointer.cell also recovers slice-tail metadata from DST
                     // carriers so operations such as ptr::metadata remain valid.
-                    self.load_operand(operand)?;
-                    self.wrap_loaded_object_in_pointer_cell()?;
+                    if !self.load_materialized_receiver_pointer()? {
+                        self.load_operand(operand)?;
+                        self.wrap_loaded_object_in_pointer_cell()?;
+                    }
                 } else if is_pointer && class_name != oomir::POINTER_CLASS && !is_this_receiver {
                     self.load_operand(operand)?;
                     let pointer_class = self.constant_pool.add_class(oomir::POINTER_CLASS)?;
@@ -3932,9 +4061,15 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     }
                 }
 
-                // 4. Emit 'invokevirtual' instruction
-                self.jvm_instructions
-                    .push(JI::Invokevirtual(method_ref_index)); // Stack: [result]
+                // 4. Emit the invocation matching the resolved owner kind.
+                if is_interface_owner {
+                    let count = self.invokeinterface_count(args)?;
+                    self.jvm_instructions
+                        .push(JI::Invokeinterface(method_ref_index, count));
+                } else {
+                    self.jvm_instructions
+                        .push(JI::Invokevirtual(method_ref_index));
+                }
                 // Note: The result type is determined by the method signature
 
                 // 5. Handle the return value
@@ -3949,6 +4084,52 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                         _ => {}
                     }
                 }
+
+                let receiver_was_overwritten = matches!(
+                    (operand.get_name(), dest.as_deref()),
+                    (Some(receiver), Some(result)) if receiver == result
+                );
+                if is_pointer
+                    && class_name != oomir::POINTER_CLASS
+                    && !is_this_receiver
+                    && !receiver_was_overwritten
+                {
+                    // A decoded aggregate receiver is a live view over Rust
+                    // memory. JVM instance methods mutate its public fields
+                    // directly, so commit those mutations before the pointer
+                    // escapes or its temporary carrier becomes unreachable.
+                    self.load_operand(operand)?;
+                    let pointer_class = self.constant_pool.add_class(oomir::POINTER_CLASS)?;
+                    let commit = self.constant_pool.add_method_ref(
+                        pointer_class,
+                        "commitMemoryView",
+                        "()V",
+                    )?;
+                    self.jvm_instructions.push(JI::Invokevirtual(commit));
+                }
+            }
+            OI::InvokeStatic {
+                dest: Some(dest),
+                class_name,
+                method_name,
+                method_ty,
+                args,
+            } if class_name == oomir::POINTER_CLASS
+                && matches!(method_name.as_str(), "cell" | "cellAligned")
+                && matches!(args.first(), Some(OO::Variable { name, .. })
+                    if self.direct_this_aliases.contains(name))
+                && self
+                    .local_var_map
+                    .contains_key(oomir::INSTANCE_RECEIVER_POINTER_LOCAL) =>
+            {
+                // Taking the address of a JVM instance receiver must reuse the
+                // write-through receiver cell installed at method entry.
+                // Creating an ordinary cell here would detach whole-value
+                // writes (for example MaybeUninit::as_mut_ptr) from `this`.
+                // Preserve additional reference layers for reborrows such as
+                // `&Self` where `Self = &mut T`.
+                self.load_jvm_receiver_as_pointer(&args[0], &method_ty.ret)?;
+                self.store_result(dest, &method_ty.ret)?;
             }
             OI::InvokeStatic {
                 dest,
@@ -4027,11 +4208,21 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                         // call block can be translated before the block that stores its
                         // argument. Reserve the typed JVM slot now; the later store will
                         // resolve to the same mapping.
-                        let stored_ty = self
+                        let mut stored_ty = self
                             .local_var_types
                             .get(var_name)
                             .cloned()
                             .unwrap_or_else(|| ty.clone());
+                        // OOMIR block layout is not dominance order. A
+                        // no-value assignment in another block can therefore
+                        // be observed before this value-carrying use (release
+                        // MIR does this when a temporary slot is reused after
+                        // an inlined unit expression). Reserve the slot using
+                        // the operand's concrete type instead of attempting to
+                        // load the stale void placeholder.
+                        if !stored_ty.has_jvm_value() && ty.has_jvm_value() {
+                            stored_ty = ty.clone();
+                        }
                         let index = self.get_or_assign_local(var_name, &stored_ty);
                         (index, stored_ty)
                     };
@@ -4087,8 +4278,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             && matches!(operand, oomir::Operand::Variable { name, .. }
                 if self.direct_this_aliases.contains(name))
         {
-            self.load_call_argument(operand)?;
-            return self.wrap_loaded_object_in_pointer_cell();
+            return self.load_jvm_receiver_as_pointer(operand, expected_ty);
         }
         if matches!(actual_ty, oomir::Type::Slice(_))
             && matches!(expected_ty, oomir::Type::Pointer(_))

@@ -350,6 +350,10 @@ fn rewrite_instruction_uses(instruction: &mut Instruction, aliases: &AliasMap) {
             rewrite_operand(index, aliases);
             rewrite_operand(value, aliases);
         }
+        Instruction::ArrayFill { array, value, .. } => {
+            rewrite_variable_name(array, aliases);
+            rewrite_operand(value, aliases);
+        }
         Instruction::ArrayGet { array, index, .. } => {
             rewrite_operand(array, aliases);
             rewrite_operand(index, aliases);
@@ -547,6 +551,10 @@ fn collect_instruction_uses(instruction: &Instruction, uses: &mut HashSet<String
             collect_operand_use(index, uses);
             collect_operand_use(value, uses);
         }
+        Instruction::ArrayFill { array, value, .. } => {
+            uses.insert(array.clone());
+            collect_operand_use(value, uses);
+        }
         Instruction::ArrayGet { array, index, .. } => {
             collect_operand_use(array, uses);
             collect_operand_use(index, uses);
@@ -631,6 +639,7 @@ fn instruction_defs(instruction: &Instruction) -> HashSet<String> {
         | Instruction::ThrowNewWithMessage { .. }
         | Instruction::Switch { .. }
         | Instruction::ArrayStore { .. }
+        | Instruction::ArrayFill { .. }
         | Instruction::SetField { .. }
         | Instruction::Label { .. } => {}
     }

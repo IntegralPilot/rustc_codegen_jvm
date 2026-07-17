@@ -28,7 +28,10 @@ macro_rules! test_comparisons_float {
         assert!($a >= $b, concat!(stringify!($type), ": a >= b"));
         assert!($d < $a, concat!(stringify!($type), ": d < a"));
         assert!($zero == $nzero, concat!(stringify!($type), ": 0.0 == -0.0"));
-        assert!(!$nan.eq(&$nan), concat!(stringify!($type), ": !(nan == nan)"));
+        assert!(
+            !$nan.eq(&$nan),
+            concat!(stringify!($type), ": !(nan == nan)")
+        );
         assert!($nan != $nan, concat!(stringify!($type), ": nan != nan"));
     };
 }
@@ -92,63 +95,171 @@ opaque_integer!(opaque_i128, i128);
 opaque_integer!(opaque_u128, u128);
 
 #[inline(never)]
-fn opaque_f16(value: f16) -> f16 { value }
+fn opaque_f16(value: f16) -> f16 {
+    value
+}
 
 #[inline(never)]
-fn opaque_f32(value: f32) -> f32 { value }
+fn opaque_f32(value: f32) -> f32 {
+    value
+}
 
 #[inline(never)]
-fn opaque_f64(value: f64) -> f64 { value }
+fn opaque_f64(value: f64) -> f64 {
+    value
+}
 
 fn runtime_integer_ops() {
-    assert!(opaque_u8(u8::MAX).wrapping_add(opaque_u8(1)) == 0, "u8 wrapping add");
-    assert!(opaque_u8(0).wrapping_sub(opaque_u8(1)) == u8::MAX, "u8 wrapping sub");
-    assert!(opaque_u8(200).wrapping_mul(opaque_u8(2)) == 144, "u8 wrapping mul");
+    assert!(
+        opaque_u8(u8::MAX).wrapping_add(opaque_u8(1)) == 0,
+        "u8 wrapping add"
+    );
+    assert!(
+        opaque_u8(0).wrapping_sub(opaque_u8(1)) == u8::MAX,
+        "u8 wrapping sub"
+    );
+    assert!(
+        opaque_u8(200).wrapping_mul(opaque_u8(2)) == 144,
+        "u8 wrapping mul"
+    );
     assert!(opaque_u8(250) / opaque_u8(3) == 83, "u8 division");
     assert!(opaque_u8(250) % opaque_u8(3) == 1, "u8 remainder");
     assert!((opaque_u8(1) << opaque_u32(7)) == 128, "u8 shift left");
-    assert!((opaque_u8(128) >> opaque_u32(7)) == 1, "u8 logical shift right");
+    assert!(
+        (opaque_u8(128) >> opaque_u32(7)) == 1,
+        "u8 logical shift right"
+    );
     assert!(!opaque_u8(0) == u8::MAX, "u8 not");
     assert!(opaque_u8(u8::MAX) > opaque_u8(1), "u8 unsigned ordering");
 
-    assert!(opaque_i8(i8::MAX).wrapping_add(opaque_i8(1)) == i8::MIN, "i8 wrapping add");
-    assert!(opaque_i8(i8::MIN).wrapping_sub(opaque_i8(1)) == i8::MAX, "i8 wrapping sub");
-    assert!(opaque_i8(100).wrapping_mul(opaque_i8(3)) == 44, "i8 wrapping mul");
+    assert!(
+        opaque_i8(i8::MAX).wrapping_add(opaque_i8(1)) == i8::MIN,
+        "i8 wrapping add"
+    );
+    assert!(
+        opaque_i8(i8::MIN).wrapping_sub(opaque_i8(1)) == i8::MAX,
+        "i8 wrapping sub"
+    );
+    assert!(
+        opaque_i8(100).wrapping_mul(opaque_i8(3)) == 44,
+        "i8 wrapping mul"
+    );
     assert!(opaque_i8(-100) / opaque_i8(3) == -33, "i8 division");
     assert!(opaque_i8(-100) % opaque_i8(3) == -1, "i8 remainder");
-    assert!((opaque_i8(-128) >> opaque_u32(7)) == -1, "i8 arithmetic shift right");
+    assert!(
+        (opaque_i8(-128) >> opaque_u32(7)) == -1,
+        "i8 arithmetic shift right"
+    );
 
-    assert!(opaque_u16(u16::MAX).wrapping_add(opaque_u16(1)) == 0, "u16 wrapping add");
-    assert!(opaque_u16(50_000).wrapping_mul(opaque_u16(2)) == 34_464, "u16 wrapping mul");
-    assert!(opaque_u16(u16::MAX) / opaque_u16(257) == 255, "u16 division");
-    assert!(opaque_u16(u16::MAX) > opaque_u16(1), "u16 unsigned ordering");
-    assert!(opaque_i16(i16::MAX).wrapping_add(opaque_i16(1)) == i16::MIN, "i16 wrapping add");
-    assert!(opaque_i16(-30_000) / opaque_i16(7) == -4_285, "i16 division");
+    assert!(
+        opaque_u16(u16::MAX).wrapping_add(opaque_u16(1)) == 0,
+        "u16 wrapping add"
+    );
+    assert!(
+        opaque_u16(50_000).wrapping_mul(opaque_u16(2)) == 34_464,
+        "u16 wrapping mul"
+    );
+    assert!(
+        opaque_u16(u16::MAX) / opaque_u16(257) == 255,
+        "u16 division"
+    );
+    assert!(
+        opaque_u16(u16::MAX) > opaque_u16(1),
+        "u16 unsigned ordering"
+    );
+    assert!(
+        opaque_i16(i16::MAX).wrapping_add(opaque_i16(1)) == i16::MIN,
+        "i16 wrapping add"
+    );
+    assert!(
+        opaque_i16(-30_000) / opaque_i16(7) == -4_285,
+        "i16 division"
+    );
     assert!(opaque_i16(-30_000) % opaque_i16(7) == -5, "i16 remainder");
 
-    assert!(opaque_u32(u32::MAX).wrapping_add(opaque_u32(1)) == 0, "u32 wrapping add");
-    assert!(opaque_u32(0).wrapping_sub(opaque_u32(1)) == u32::MAX, "u32 wrapping sub");
-    assert!(opaque_u32(0x8000_0000) / opaque_u32(2) == 0x4000_0000, "u32 unsigned division");
-    assert!(opaque_u32(u32::MAX) % opaque_u32(10) == 5, "u32 unsigned remainder");
-    assert!(opaque_u32(u32::MAX) > opaque_u32(i32::MAX as u32), "u32 unsigned ordering");
-    assert!((opaque_u32(0x8000_0000) >> opaque_u32(31)) == 1, "u32 logical shift right");
-    assert!(opaque_i32(i32::MAX).wrapping_add(opaque_i32(1)) == i32::MIN, "i32 wrapping add");
-    assert!(opaque_i32(i32::MIN) / opaque_i32(2) == -1_073_741_824, "i32 division");
+    assert!(
+        opaque_u32(u32::MAX).wrapping_add(opaque_u32(1)) == 0,
+        "u32 wrapping add"
+    );
+    assert!(
+        opaque_u32(0).wrapping_sub(opaque_u32(1)) == u32::MAX,
+        "u32 wrapping sub"
+    );
+    assert!(
+        opaque_u32(0x8000_0000) / opaque_u32(2) == 0x4000_0000,
+        "u32 unsigned division"
+    );
+    assert!(
+        opaque_u32(u32::MAX) % opaque_u32(10) == 5,
+        "u32 unsigned remainder"
+    );
+    assert!(
+        opaque_u32(u32::MAX) > opaque_u32(i32::MAX as u32),
+        "u32 unsigned ordering"
+    );
+    assert!(
+        (opaque_u32(0x8000_0000) >> opaque_u32(31)) == 1,
+        "u32 logical shift right"
+    );
+    assert!(
+        opaque_i32(i32::MAX).wrapping_add(opaque_i32(1)) == i32::MIN,
+        "i32 wrapping add"
+    );
+    assert!(
+        opaque_i32(i32::MIN) / opaque_i32(2) == -1_073_741_824,
+        "i32 division"
+    );
 
-    assert!(opaque_u64(u64::MAX).wrapping_add(opaque_u64(1)) == 0, "u64 wrapping add");
-    assert!(opaque_u64(0).wrapping_sub(opaque_u64(1)) == u64::MAX, "u64 wrapping sub");
-    assert!(opaque_u64(1u64 << 63) / opaque_u64(2) == 1u64 << 62, "u64 unsigned division");
-    assert!(opaque_u64(u64::MAX) % opaque_u64(10) == 5, "u64 unsigned remainder");
-    assert!(opaque_u64(u64::MAX) > opaque_u64(i64::MAX as u64), "u64 unsigned ordering");
-    assert!((opaque_u64(1u64 << 63) >> opaque_u32(63)) == 1, "u64 logical shift right");
-    assert!(opaque_i64(i64::MAX).wrapping_add(opaque_i64(1)) == i64::MIN, "i64 wrapping add");
+    assert!(
+        opaque_u64(u64::MAX).wrapping_add(opaque_u64(1)) == 0,
+        "u64 wrapping add"
+    );
+    assert!(
+        opaque_u64(0).wrapping_sub(opaque_u64(1)) == u64::MAX,
+        "u64 wrapping sub"
+    );
+    assert!(
+        opaque_u64(1u64 << 63) / opaque_u64(2) == 1u64 << 62,
+        "u64 unsigned division"
+    );
+    assert!(
+        opaque_u64(u64::MAX) % opaque_u64(10) == 5,
+        "u64 unsigned remainder"
+    );
+    assert!(
+        opaque_u64(u64::MAX) > opaque_u64(i64::MAX as u64),
+        "u64 unsigned ordering"
+    );
+    assert!(
+        (opaque_u64(1u64 << 63) >> opaque_u32(63)) == 1,
+        "u64 logical shift right"
+    );
+    assert!(
+        opaque_i64(i64::MAX).wrapping_add(opaque_i64(1)) == i64::MIN,
+        "i64 wrapping add"
+    );
 
     let u128_high = opaque_u128((1u128 << 127) + 17);
-    assert!(u128_high > opaque_u128(i128::MAX as u128), "u128 unsigned ordering");
-    assert!(u128_high / opaque_u128(3) == ((1u128 << 127) + 17) / 3, "u128 division");
-    assert!(u128_high % opaque_u128(3) == ((1u128 << 127) + 17) % 3, "u128 remainder");
-    assert!(opaque_u128(u128::MAX).wrapping_add(opaque_u128(1)) == 0, "u128 wrapping add");
-    assert!(opaque_u128(1u128 << 100).wrapping_mul(opaque_u128(1u128 << 40)) == 0, "u128 wrapping mul");
+    assert!(
+        u128_high > opaque_u128(i128::MAX as u128),
+        "u128 unsigned ordering"
+    );
+    assert!(
+        u128_high / opaque_u128(3) == ((1u128 << 127) + 17) / 3,
+        "u128 division"
+    );
+    assert!(
+        u128_high % opaque_u128(3) == ((1u128 << 127) + 17) % 3,
+        "u128 remainder"
+    );
+    assert!(
+        opaque_u128(u128::MAX).wrapping_add(opaque_u128(1)) == 0,
+        "u128 wrapping add"
+    );
+    assert!(
+        opaque_u128(1u128 << 100).wrapping_mul(opaque_u128(1u128 << 40)) == 0,
+        "u128 wrapping mul"
+    );
     assert!(
         opaque_u128(0x1234_5678_9abc_def0_1357_9bdf_2468_ace0)
             .wrapping_mul(opaque_u128(0x0fed_cba9_8765_4321_1111_2222_3333_4444))
@@ -156,25 +267,107 @@ fn runtime_integer_ops() {
                 .wrapping_mul(0x0fed_cba9_8765_4321_1111_2222_3333_4444),
         "u128 full-limb wrapping mul"
     );
-    assert!((opaque_u128(1) << opaque_u32(100)) == 1u128 << 100, "u128 shift left");
+    assert!(
+        (opaque_u128(1) << opaque_u32(100)) == 1u128 << 100,
+        "u128 shift left"
+    );
     assert!((u128_high >> opaque_u32(127)) == 1, "u128 shift right");
     assert!(!opaque_u128(0) == u128::MAX, "u128 not");
 
-    assert!(opaque_i128(i128::MAX).wrapping_add(opaque_i128(1)) == i128::MIN, "i128 wrapping add");
-    assert!(opaque_i128(i128::MIN).wrapping_sub(opaque_i128(1)) == i128::MAX, "i128 wrapping sub");
-    assert!(opaque_i128(-((1i128 << 100) + 17)) / opaque_i128(3) == -((1i128 << 100) + 17) / 3, "i128 division");
-    assert!(opaque_i128(-((1i128 << 100) + 17)) % opaque_i128(3) == -((1i128 << 100) + 17) % 3, "i128 remainder");
-    assert!((opaque_i128(-1) >> opaque_u32(100)) == -1, "i128 arithmetic shift right");
+    assert!(
+        opaque_i128(i128::MAX).wrapping_add(opaque_i128(1)) == i128::MIN,
+        "i128 wrapping add"
+    );
+    assert!(
+        opaque_i128(i128::MIN).wrapping_sub(opaque_i128(1)) == i128::MAX,
+        "i128 wrapping sub"
+    );
+    assert!(
+        opaque_i128(-((1i128 << 100) + 17)) / opaque_i128(3) == -((1i128 << 100) + 17) / 3,
+        "i128 division"
+    );
+    assert!(
+        opaque_i128(-((1i128 << 100) + 17)) % opaque_i128(3) == -((1i128 << 100) + 17) % 3,
+        "i128 remainder"
+    );
+    assert!(
+        (opaque_i128(-1) >> opaque_u32(100)) == -1,
+        "i128 arithmetic shift right"
+    );
 
     let (wrapped_u8, overflow_u8) = opaque_u8(u8::MAX).overflowing_add(opaque_u8(1));
     assert!(wrapped_u8 == 0 && overflow_u8, "u8 overflowing add");
     let (wrapped_i128, overflow_i128) = opaque_i128(i128::MAX).overflowing_add(opaque_i128(1));
-    assert!(wrapped_i128 == i128::MIN && overflow_i128, "i128 overflowing add");
+    assert!(
+        wrapped_i128 == i128::MIN && overflow_i128,
+        "i128 overflowing add"
+    );
     let (wrapped_u128, overflow_u128) = opaque_u128(u128::MAX).overflowing_mul(opaque_u128(2));
-    assert!(wrapped_u128 == u128::MAX - 1 && overflow_u128, "u128 overflowing mul");
+    assert!(
+        wrapped_u128 == u128::MAX - 1 && overflow_u128,
+        "u128 overflowing mul"
+    );
     let (wrapped_i128_mul, overflow_i128_mul) =
         opaque_i128(i128::MAX).overflowing_mul(opaque_i128(2));
-    assert!(wrapped_i128_mul == -2 && overflow_i128_mul, "i128 overflowing mul");
+    assert!(
+        wrapped_i128_mul == -2 && overflow_i128_mul,
+        "i128 overflowing mul"
+    );
+}
+
+macro_rules! test_bit_counts {
+    ($opaque:ident, $type:ty) => {{
+        let value = $opaque(0x34 as $type);
+        assert!(
+            value.count_ones() == 3,
+            concat!(stringify!($type), " count ones")
+        );
+        assert!(
+            value.count_zeros() == <$type>::BITS - 3,
+            concat!(stringify!($type), " count zeros")
+        );
+        assert!(
+            value.leading_zeros() == <$type>::BITS - 6,
+            concat!(stringify!($type), " leading zeros")
+        );
+        assert!(
+            value.trailing_zeros() == 2,
+            concat!(stringify!($type), " trailing zeros")
+        );
+
+        let zero = $opaque(0 as $type);
+        assert!(
+            zero.leading_zeros() == <$type>::BITS,
+            concat!(stringify!($type), " zero leading zeros")
+        );
+        assert!(
+            zero.trailing_zeros() == <$type>::BITS,
+            concat!(stringify!($type), " zero trailing zeros")
+        );
+
+        let edge_ones = $opaque((!0 as $type) ^ (1 as $type));
+        assert!(
+            edge_ones.leading_ones() == <$type>::BITS - 1,
+            concat!(stringify!($type), " leading ones")
+        );
+        assert!(
+            edge_ones.trailing_zeros() == 1,
+            concat!(stringify!($type), " edge trailing zeros")
+        );
+    }};
+}
+
+fn runtime_bit_counts() {
+    test_bit_counts!(opaque_i8, i8);
+    test_bit_counts!(opaque_u8, u8);
+    test_bit_counts!(opaque_i16, i16);
+    test_bit_counts!(opaque_u16, u16);
+    test_bit_counts!(opaque_i32, i32);
+    test_bit_counts!(opaque_u32, u32);
+    test_bit_counts!(opaque_i64, i64);
+    test_bit_counts!(opaque_u64, u64);
+    test_bit_counts!(opaque_i128, i128);
+    test_bit_counts!(opaque_u128, u128);
 }
 
 fn runtime_float_ops() {
@@ -185,61 +378,135 @@ fn runtime_float_ops() {
     assert!(h1 * h2 == 30.0f16, "f16 mul");
     assert!(h1 / h2 == 10.0f16 / 3.0f16, "f16 div rounding");
     assert!(h1 % h2 == 1.0f16, "f16 remainder");
-    assert!((-opaque_f16(2.0f16)).to_bits() == (-2.0f16).to_bits(), "f16 negation bits");
-    assert!(opaque_f16(f16::from_bits(0x7e55)).to_bits() == 0x7e55, "f16 raw bits");
+    assert!(
+        (-opaque_f16(2.0f16)).to_bits() == (-2.0f16).to_bits(),
+        "f16 negation bits"
+    );
+    assert!(
+        opaque_f16(f16::from_bits(0x7e55)).to_bits() == 0x7e55,
+        "f16 raw bits"
+    );
 
     let f32_nan = opaque_f32(f32::NAN);
     let f64_nan = opaque_f64(f64::NAN);
     assert!(f32_nan != f32_nan, "runtime f32 NaN");
     assert!(f64_nan != f64_nan, "runtime f64 NaN");
-    assert!(opaque_f32(f32::INFINITY) + opaque_f32(f32::NEG_INFINITY) != 0.0, "runtime f32 infinity");
+    assert!(
+        opaque_f32(f32::INFINITY) + opaque_f32(f32::NEG_INFINITY) != 0.0,
+        "runtime f32 infinity"
+    );
 }
 
 fn runtime_casts() {
     assert!(opaque_i8(-1) as u8 == u8::MAX, "i8 to u8");
     assert!(opaque_u8(u8::MAX) as i8 == -1, "u8 to i8");
-    assert!(opaque_i16(-1) as u64 == u64::MAX, "i16 to u64 sign extension");
-    assert!(opaque_u16(u16::MAX) as u64 == 65_535, "u16 to u64 zero extension");
-    assert!(opaque_u32(u32::MAX) as u64 == 4_294_967_295, "u32 to u64 zero extension");
-    assert!(opaque_u64(u64::MAX) as u32 == u32::MAX, "u64 to u32 truncation");
-    assert!(opaque_i64(-1) as u128 == u128::MAX, "i64 to u128 sign extension");
-    assert!(opaque_u64(u64::MAX) as u128 == u64::MAX as u128, "u64 to u128 zero extension");
+    assert!(
+        opaque_i16(-1) as u64 == u64::MAX,
+        "i16 to u64 sign extension"
+    );
+    assert!(
+        opaque_u16(u16::MAX) as u64 == 65_535,
+        "u16 to u64 zero extension"
+    );
+    assert!(
+        opaque_u32(u32::MAX) as u64 == 4_294_967_295,
+        "u32 to u64 zero extension"
+    );
+    assert!(
+        opaque_u64(u64::MAX) as u32 == u32::MAX,
+        "u64 to u32 truncation"
+    );
+    assert!(
+        opaque_i64(-1) as u128 == u128::MAX,
+        "i64 to u128 sign extension"
+    );
+    assert!(
+        opaque_u64(u64::MAX) as u128 == u64::MAX as u128,
+        "u64 to u128 zero extension"
+    );
     assert!(opaque_i64(-1) as i128 == -1, "i64 to i128 sign extension");
-    assert!(opaque_u64(u64::MAX) as i128 == u64::MAX as i128, "u64 to i128 zero extension");
+    assert!(
+        opaque_u64(u64::MAX) as i128 == u64::MAX as i128,
+        "u64 to i128 zero extension"
+    );
     assert!(opaque_i128(-1) as u128 == u128::MAX, "i128 to u128 bits");
     assert!(opaque_u128(u128::MAX) as i128 == -1, "u128 to i128 bits");
-    assert!(opaque_u128((1u128 << 100) + 7) as u64 == 7, "u128 to u64 truncation");
+    assert!(
+        opaque_u128((1u128 << 100) + 7) as u64 == 7,
+        "u128 to u64 truncation"
+    );
 
     assert!(opaque_u32(u32::MAX) as f64 == 4_294_967_295.0, "u32 to f64");
     assert!(opaque_u64(u64::MAX) as f64 == u64::MAX as f64, "u64 to f64");
-    assert!(opaque_i128(-(1i128 << 100)) as f64 == -(1i128 << 100) as f64, "i128 to f64");
-    assert!(opaque_u128(1u128 << 127) as f64 == (1u128 << 127) as f64, "u128 to f64");
+    assert!(
+        opaque_i128(-(1i128 << 100)) as f64 == -(1i128 << 100) as f64,
+        "i128 to f64"
+    );
+    assert!(
+        opaque_u128(1u128 << 127) as f64 == (1u128 << 127) as f64,
+        "u128 to f64"
+    );
 
     assert!(opaque_f64(f64::NAN) as i32 == 0, "NaN to i32");
-    assert!(opaque_f64(f64::INFINITY) as i16 == i16::MAX, "infinity to i16 saturates");
-    assert!(opaque_f64(-1.0) as u64 == 0, "negative float to u64 saturates");
-    assert!(opaque_f64(18_446_744_073_709_551_616.0) as u64 == u64::MAX, "large float to u64 saturates");
-    assert!(opaque_f64(170_141_183_460_469_231_731_687_303_715_884_105_728.0) as i128 == i128::MAX, "large float to i128 saturates");
-    assert!(opaque_f64(-170_141_183_460_469_231_731_687_303_715_884_105_728.0) as i128 == i128::MIN, "small float to i128 saturates");
-    assert!(opaque_f64(340_282_366_920_938_463_463_374_607_431_768_211_456.0) as u128 == u128::MAX, "large float to u128 saturates");
-    assert!(opaque_f64(-10.0) as u128 == 0, "negative float to u128 saturates");
+    assert!(
+        opaque_f64(f64::INFINITY) as i16 == i16::MAX,
+        "infinity to i16 saturates"
+    );
+    assert!(
+        opaque_f64(-1.0) as u64 == 0,
+        "negative float to u64 saturates"
+    );
+    assert!(
+        opaque_f64(18_446_744_073_709_551_616.0) as u64 == u64::MAX,
+        "large float to u64 saturates"
+    );
+    assert!(
+        opaque_f64(170_141_183_460_469_231_731_687_303_715_884_105_728.0) as i128 == i128::MAX,
+        "large float to i128 saturates"
+    );
+    assert!(
+        opaque_f64(-170_141_183_460_469_231_731_687_303_715_884_105_728.0) as i128 == i128::MIN,
+        "small float to i128 saturates"
+    );
+    assert!(
+        opaque_f64(340_282_366_920_938_463_463_374_607_431_768_211_456.0) as u128 == u128::MAX,
+        "large float to u128 saturates"
+    );
+    assert!(
+        opaque_f64(-10.0) as u128 == 0,
+        "negative float to u128 saturates"
+    );
 
     assert!(opaque_f32(1.5) as f16 == 1.5f16, "f32 to f16");
     assert!(opaque_f64(1.5) as f16 == 1.5f16, "f64 to f16");
     assert!(opaque_f16(1.5f16) as f32 == 1.5, "f16 to f32");
     assert!(opaque_f16(65_504.0f16) as u32 == 65_504, "f16 to u32");
 
-    assert!(opaque_i128(-(1i128 << 100)) as f128 == -(1i128 << 100) as f128, "i128 to f128");
-    assert!(opaque_u128(u128::MAX) as f128 == u128::MAX as f128, "u128 to f128");
-    assert!(opaque_f64(1.25) as f128 == 1.25f128, "f64 to f128 exact widening");
-    assert!(opaque_f128(123.75f128) as i128 == 123, "f128 to i128 truncation");
-    assert!(opaque_f128(-1.0f128) as u128 == 0, "negative f128 to u128 saturates");
+    assert!(
+        opaque_i128(-(1i128 << 100)) as f128 == -(1i128 << 100) as f128,
+        "i128 to f128"
+    );
+    assert!(
+        opaque_u128(u128::MAX) as f128 == u128::MAX as f128,
+        "u128 to f128"
+    );
+    assert!(
+        opaque_f64(1.25) as f128 == 1.25f128,
+        "f64 to f128 exact widening"
+    );
+    assert!(
+        opaque_f128(123.75f128) as i128 == 123,
+        "f128 to i128 truncation"
+    );
+    assert!(
+        opaque_f128(-1.0f128) as u128 == 0,
+        "negative f128 to u128 saturates"
+    );
     assert!(opaque_f128(1.5f128) as f64 == 1.5, "f128 to f64");
     assert!(opaque_f128(1.5f128) as f16 == 1.5f16, "f128 to f16");
     let half_midpoint_bits = (0x3fffu128 << 112) | (1u128 << 101);
     let half_midpoint = opaque_f128(f128::from_bits(opaque_u128(half_midpoint_bits)));
-    let above_half_midpoint =
-        opaque_f128(f128::from_bits(opaque_u128(half_midpoint_bits + 1)));
+    let above_half_midpoint = opaque_f128(f128::from_bits(opaque_u128(half_midpoint_bits + 1)));
     assert!(half_midpoint as f16 == 1.0f16, "f128 to f16 ties to even");
     assert!(
         (above_half_midpoint as f16).to_bits() == 0x3c01,
@@ -252,8 +519,14 @@ fn runtime_pointer_width() {
     assert!(core::mem::size_of::<isize>() == 8, "isize is 64-bit");
     let value = 123u32;
     let address = (&value as *const u32) as usize;
-    assert!(address > u32::MAX as usize, "pointer address preserves high 32 bits");
-    assert!((address as u64) > u32::MAX as u64, "pointer to u64 preserves high bits");
+    assert!(
+        address > u32::MAX as usize,
+        "pointer address preserves high 32 bits"
+    );
+    assert!(
+        (address as u64) > u32::MAX as u64,
+        "pointer to u64 preserves high bits"
+    );
 }
 
 #[inline(never)]
@@ -332,7 +605,10 @@ fn forwarded_reference_ops() {
     // Cover the other JVM value representations used by primitive operators.
     let wide_a = opaque_i128(1_i128 << 100);
     let wide_b = opaque_i128(7);
-    assert!(&wide_a + &wide_b == (1_i128 << 100) + 7, "i128 reference add");
+    assert!(
+        &wide_a + &wide_b == (1_i128 << 100) + 7,
+        "i128 reference add"
+    );
 
     let float_a = opaque_f64(10.0);
     let float_b = opaque_f64(4.0);
@@ -350,7 +626,10 @@ fn forwarded_reference_ops() {
     // Reference comparisons compare pointees, not JVM pointer identity.
     let same_as_a = opaque_i32(20);
     assert!(&a == &same_as_a, "reference value equality");
-    assert!(!core::ptr::eq(&a, &same_as_a), "distinct reference identity");
+    assert!(
+        !core::ptr::eq(&a, &same_as_a),
+        "distinct reference identity"
+    );
     assert!(&a != &b, "reference inequality");
     assert!(&b < &a, "reference less than");
     assert!(&b <= &a, "reference less than or equal");
@@ -389,6 +668,7 @@ fn read(pointer: *const i32) -> i32 {
 
 fn main() {
     runtime_integer_ops();
+    runtime_bit_counts();
     runtime_float_ops();
     runtime_casts();
     runtime_pointer_width();
@@ -412,7 +692,16 @@ fn main() {
     test_comparisons!(i16, 5i16, 5i16, 10i16, -2i16, 0i16, 0i16);
 
     // f16 comparisons
-    test_comparisons_float!(f16, 5.0f16, 5.0f16, 10.5f16, -2.1f16, 0.0f16, -0.0f16, f16::NAN);
+    test_comparisons_float!(
+        f16,
+        5.0f16,
+        5.0f16,
+        10.5f16,
+        -2.1f16,
+        0.0f16,
+        -0.0f16,
+        f16::NAN
+    );
 
     // u32 comparisons
     test_comparisons!(u32, 5u32, 5u32, 10u32, 2u32, 0u32, 0u32);
@@ -421,19 +710,53 @@ fn main() {
     test_comparisons!(i32, 5i32, 5i32, 10i32, -2i32, 0i32, 0i32);
 
     // f32 comparisons
-    test_comparisons_float!(f32, 5.0f32, 5.0f32, 10.5f32, -2.1f32, 0.0f32, -0.0f32, f32::NAN);    
+    test_comparisons_float!(
+        f32,
+        5.0f32,
+        5.0f32,
+        10.5f32,
+        -2.1f32,
+        0.0f32,
+        -0.0f32,
+        f32::NAN
+    );
 
     // i64 comparisons
     test_comparisons!(i64, 500i64, 500i64, 1000i64, -200i64, 0i64, 0i64);
 
     // f64 comparisons
-    test_comparisons_float!(f64, 5.0f64, 5.0f64, 10.5f64, -2.1f64, 0.0f64, -0.0f64, f64::NAN);
+    test_comparisons_float!(
+        f64,
+        5.0f64,
+        5.0f64,
+        10.5f64,
+        -2.1f64,
+        0.0f64,
+        -0.0f64,
+        f64::NAN
+    );
 
     // u128 comparisons
-    test_comparisons!(u128, 5_000_000_000_000_000_000_000u128, 5_000_000_000_000_000_000_000u128, 10_000_000_000_000_000_000_000u128, 2u128, 0u128, 0u128);
+    test_comparisons!(
+        u128,
+        5_000_000_000_000_000_000_000u128,
+        5_000_000_000_000_000_000_000u128,
+        10_000_000_000_000_000_000_000u128,
+        2u128,
+        0u128,
+        0u128
+    );
 
     // i128 comparisons
-    test_comparisons!(i128, 5_000_000_000_000_000_000_000i128, 5_000_000_000_000_000_000_000i128, 10_000_000_000_000_000_000_000i128, -2i128, 0i128, 0i128);
+    test_comparisons!(
+        i128,
+        5_000_000_000_000_000_000_000i128,
+        5_000_000_000_000_000_000_000i128,
+        10_000_000_000_000_000_000_000i128,
+        -2i128,
+        0i128,
+        0i128
+    );
 
     // f128 comparisons
     test_comparisons_float!(
@@ -446,7 +769,7 @@ fn main() {
         opaque_f128(-0.0f128),
         opaque_f128(f128::NAN)
     );
-    
+
     // u8 binary operations
     test_binary_ops!(
         u8,
@@ -460,35 +783,29 @@ fn main() {
 
     // i8 binary operations
     test_binary_ops!(
-        i8,
-        -54i8, // 0b11001010
+        i8, -54i8, // 0b11001010
         -90i8, // 0b10100110
-        0i8,
-        -126i8, // a & b = 0b10000010
+        0i8, -126i8, // a & b = 0b10000010
         -18i8,  // a | b = 0b11101110
         108i8   // a ^ b = 0b01101100
     );
 
     // u16 binary operations
     test_binary_ops!(
-        u16,
-        0xACF0u16, // 1010110011110000
+        u16, 0xACF0u16, // 1010110011110000
         0x5A0Fu16, // 0101101000001111
-        0u16,
-        0x0800u16, // a & b
+        0u16, 0x0800u16, // a & b
         0xFEFFu16, // a | b
         0xF6FFu16  // a ^ b
     );
 
     // i16 binary operations
     test_binary_ops!(
-        i16,
-        -21264i16, // 0xACF0
+        i16, -21264i16, // 0xACF0
         23055i16,  // 0x5A0F
-        0i16,
-        2048i16,   // a & b = 0x0800
+        0i16, 2048i16,  // a & b = 0x0800
         -257i16,  // a | b = 0xFEFF
-        -2305i16   // a ^ b = 0xF6FF
+        -2305i16  // a ^ b = 0xF6FF
     );
 
     // u32 binary operations
@@ -546,7 +863,7 @@ fn main() {
         0x1DD9_9DD1_1DD9_9DD1_1DD9_9DD1_1DD9_9DD1u128
     );
 
-   // i128 binary operations
+    // i128 binary operations
     test_binary_ops!(
         i128,
         0x1234_5678_9ABC_DEF0_1234_5678_9ABC_DEF0i128,
@@ -562,67 +879,109 @@ fn main() {
 
     // i8 operations
     test_ops!(i8, 10i8, 5i8, 0i8, 15i8, 5i8, 50i8, 2i8);
-    
+
     // u16 operations
     test_ops!(u16, 10u16, 5u16, 0u16, 15u16, 5u16, 50u16, 2u16);
 
     // i16 operations
     test_ops!(i16, 10i16, 5i16, 0i16, 15i16, 5i16, 50i16, 2i16);
-    
+
     // f16 operations
-    test_ops!(f16, 10.0f16, 2.0f16, 0.0f16, 12.0f16, 8.0f16, 20.0f16, 5.0f16);
-    
+    test_ops!(
+        f16, 10.0f16, 2.0f16, 0.0f16, 12.0f16, 8.0f16, 20.0f16, 5.0f16
+    );
+
     // u32 operations
-    test_ops!(u32, 10000u32, 5000u32, 0u32, 15000u32, 5000u32, 50000000u32, 2u32);
-    
+    test_ops!(
+        u32,
+        10000u32,
+        5000u32,
+        0u32,
+        15000u32,
+        5000u32,
+        50000000u32,
+        2u32
+    );
+
     // i32 operations
-    test_ops!(i32, 10000i32, 5000i32, 0i32, 15000i32, 5000i32, 50000000i32, 2i32);
-    
+    test_ops!(
+        i32,
+        10000i32,
+        5000i32,
+        0i32,
+        15000i32,
+        5000i32,
+        50000000i32,
+        2i32
+    );
+
     // f32 operations
-    test_ops!(f32, 10.5f32, 2.5f32, 0.0f32, 13.0f32, 8.0f32, 26.25f32, 4.2f32);
-    
+    test_ops!(
+        f32, 10.5f32, 2.5f32, 0.0f32, 13.0f32, 8.0f32, 26.25f32, 4.2f32
+    );
+
     // u64 operations
-    test_ops!(u64, 1000000u64, 200000u64, 0u64, 1200000u64, 800000u64, 200000000000u64, 5u64);
-    
+    test_ops!(
+        u64,
+        1000000u64,
+        200000u64,
+        0u64,
+        1200000u64,
+        800000u64,
+        200000000000u64,
+        5u64
+    );
+
     // i64 operations
-    test_ops!(i64, 1000000i64, 200000i64, 0i64, 1200000i64, 800000i64, 200000000000i64, 5i64);
-    
+    test_ops!(
+        i64,
+        1000000i64,
+        200000i64,
+        0i64,
+        1200000i64,
+        800000i64,
+        200000000000i64,
+        5i64
+    );
+
     // f64 operations
-    test_ops!(f64, 10.5f64, 2.5f64, 0.0f64, 13.0f64, 8.0f64, 26.25f64, 4.2f64);
-    
+    test_ops!(
+        f64, 10.5f64, 2.5f64, 0.0f64, 13.0f64, 8.0f64, 26.25f64, 4.2f64
+    );
+
     // u128 operations
     test_ops!(
-        u128, 
-        1000000000000000000u128, 
-        200000000000000000u128, 
-        0u128, 
-        1200000000000000000u128, 
-        800000000000000000u128, 
-        200000000000000000000000000000000000u128, 
+        u128,
+        1000000000000000000u128,
+        200000000000000000u128,
+        0u128,
+        1200000000000000000u128,
+        800000000000000000u128,
+        200000000000000000000000000000000000u128,
         5u128
     );
 
     // i128 operations
     test_ops!(
-        i128, 
-        1000000000000000000i128, 
-        200000000000000000i128, 
-        0i128, 
-        1200000000000000000i128, 
-        800000000000000000i128, 
-        200000000000000000000000000000000000i128, 
+        i128,
+        1000000000000000000i128,
+        200000000000000000i128,
+        0i128,
+        1200000000000000000i128,
+        800000000000000000i128,
+        200000000000000000000000000000000000i128,
         5i128
     );
 
     // f128 operations
     test_ops!(
-        f128, 
+        f128,
         opaque_f128(10.0f128),
         opaque_f128(2.0f128),
         opaque_f128(0.0f128),
-        12.0f128, 
-        8.0f128, 
-        20.0f128, 
+        12.0f128,
+        8.0f128,
+        20.0f128,
         5.0f128
     );
 
@@ -633,7 +992,11 @@ fn main() {
     const F128_NAN_PAYLOAD: u128 = 0x7fff_8000_0000_0000_0000_0000_0000_1234;
 
     // Every category of binary128 value must survive a JVM round trip bit-for-bit.
-    assert_f128_bits!(opaque_f128(f128::from_bits(0)), 0, "f128 positive zero bits");
+    assert_f128_bits!(
+        opaque_f128(f128::from_bits(0)),
+        0,
+        "f128 positive zero bits"
+    );
     assert_f128_bits!(
         opaque_f128(f128::from_bits(F128_SIGN)),
         F128_SIGN,
@@ -680,11 +1043,21 @@ fn main() {
     assert!(5.5f128 % 2.0f128 == 1.5f128, "f128 remainder semantics");
 
     let positive_nan = opaque_f128(f128::from_bits(F128_NAN_PAYLOAD));
-    assert_f128_bits!(-positive_nan, F128_NAN_PAYLOAD ^ F128_SIGN, "f128 negation bits");
+    assert_f128_bits!(
+        -positive_nan,
+        F128_NAN_PAYLOAD ^ F128_SIGN,
+        "f128 negation bits"
+    );
     let invalid = opaque_f128(f128::INFINITY) + opaque_f128(f128::NEG_INFINITY);
-    assert!(invalid != invalid, "f128 infinity plus negative infinity is NaN");
+    assert!(
+        invalid != invalid,
+        "f128 infinity plus negative infinity is NaN"
+    );
     let zero_over_zero = opaque_f128(0.0f128) / opaque_f128(0.0f128);
-    assert!(zero_over_zero != zero_over_zero, "f128 zero divided by zero is NaN");
+    assert!(
+        zero_over_zero != zero_over_zero,
+        "f128 zero divided by zero is NaN"
+    );
 
     // Credit for tests from this point on: AnuthaDev
     // Widening casts out of 128-bit integer types.
@@ -736,15 +1109,27 @@ fn main() {
 
     let x: i32 = opaque_i32(-100);
     let y: f64 = x as f64;
-    assert!(y == -100.0, "i32 -> f64 negative: expected -100.0, got {}", y);
+    assert!(
+        y == -100.0,
+        "i32 -> f64 negative: expected -100.0, got {}",
+        y
+    );
 
     let x: i32 = opaque_i32(i32::MAX);
     let y: f64 = x as f64;
-    assert!(y == 2147483647.0, "i32 -> f64 max: expected 2147483647.0, got {}", y);
+    assert!(
+        y == 2147483647.0,
+        "i32 -> f64 max: expected 2147483647.0, got {}",
+        y
+    );
 
     let x: i32 = opaque_i32(i32::MIN);
     let y: f64 = x as f64;
-    assert!(y == -2147483648.0, "i32 -> f64 min: expected -2147483648.0, got {}", y);
+    assert!(
+        y == -2147483648.0,
+        "i32 -> f64 min: expected -2147483648.0, got {}",
+        y
+    );
 
     let x: i32 = opaque_i32(42);
     let y: f32 = x as f32;
@@ -768,13 +1153,25 @@ fn main() {
 
     const C2: i32 = -100;
     const CF2: f64 = C2 as f64;
-    assert!(CF2 == -100.0, "const i32 -> f64 negative: expected -100.0, got {}", CF2);
+    assert!(
+        CF2 == -100.0,
+        "const i32 -> f64 negative: expected -100.0, got {}",
+        CF2
+    );
 
     const C3: i32 = i32::MAX;
     const CF3: f64 = C3 as f64;
-    assert!(CF3 == 2147483647.0, "const i32 -> f64 max: expected 2147483647.0, got {}", CF3);
+    assert!(
+        CF3 == 2147483647.0,
+        "const i32 -> f64 max: expected 2147483647.0, got {}",
+        CF3
+    );
 
     const C4: i32 = i32::MIN;
     const CF4: f64 = C4 as f64;
-    assert!(CF4 == -2147483648.0, "const i32 -> f64 min: expected -2147483648.0, got {}", CF4);
+    assert!(
+        CF4 == -2147483648.0,
+        "const i32 -> f64 min: expected -2147483648.0, got {}",
+        CF4
+    );
 }

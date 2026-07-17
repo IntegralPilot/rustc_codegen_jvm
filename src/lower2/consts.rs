@@ -132,6 +132,19 @@ pub fn load_constant(
                 cp.add_method_ref(owner, method_name, &format!("(){}", ty.to_jvm_descriptor()))?;
             instructions_to_add.push(JI::Invokestatic(method));
         }
+        OC::PointerAddress {
+            address, view_size, ..
+        } => {
+            let pointer_class = cp.add_class(oomir::POINTER_CLASS)?;
+            let from_address = cp.add_method_ref(
+                pointer_class,
+                "fromAddress",
+                &format!("(JI)L{};", oomir::POINTER_CLASS),
+            )?;
+            instructions_to_add.push(get_long_const_instr(cp, *address as i64));
+            instructions_to_add.push(get_int_const_instr(cp, *view_size));
+            instructions_to_add.push(JI::Invokestatic(from_address));
+        }
         OC::I8(v) => instructions_to_add.push(get_int_const_instr(cp, *v as i32)),
         OC::U8(v) => instructions_to_add.push(get_int_const_instr(cp, i32::from(*v as i8))),
         OC::I16(v) => instructions_to_add.push(get_int_const_instr(cp, *v as i32)),

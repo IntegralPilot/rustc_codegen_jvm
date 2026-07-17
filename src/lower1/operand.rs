@@ -161,10 +161,19 @@ pub fn handle_const_value<'tcx>(
     data_types: &mut HashMap<String, oomir::DataType>,
     instance: Instance<'tcx>,
 ) -> oomir::Operand {
+    let instantiated_ty = EarlyBinder::bind(tcx, *ty)
+        .instantiate(tcx, instance.args)
+        .skip_norm_wip();
+    let ty = tcx
+        .try_normalize_erasing_regions(
+            TypingEnv::fully_monomorphized(),
+            rustc_middle::ty::Unnormalized::new_wip(instantiated_ty),
+        )
+        .unwrap_or(instantiated_ty);
     match const_val {
         ConstValue::Scalar(scalar) => match scalar {
             Scalar::Int(scalar_int) => match const_eval::read_scalar_int_constant(
-                tcx, scalar_int, *ty, data_types, instance,
+                tcx, scalar_int, ty, data_types, instance,
             ) {
                 Ok(oomir_const) => oomir::Operand::Constant(oomir_const),
                 Err(e) => {
@@ -180,7 +189,7 @@ pub fn handle_const_value<'tcx>(
                 }
             },
             Scalar::Ptr(pointer, _) => {
-                match const_eval::read_pointer_constant(tcx, pointer, *ty, data_types, instance) {
+                match const_eval::read_pointer_constant(tcx, pointer, ty, data_types, instance) {
                     Ok(oomir_const) => oomir::Operand::Constant(oomir_const),
                     Err(e) => {
                         breadcrumbs::log!(
@@ -197,7 +206,7 @@ pub fn handle_const_value<'tcx>(
             }
         },
         ConstValue::Slice { alloc_id, meta } => {
-            let pointee_ty = ty.builtin_deref(false).unwrap_or(*ty);
+            let pointee_ty = ty.builtin_deref(false).unwrap_or(ty);
             let tail_ty = tcx.struct_tail_for_codegen(pointee_ty, TypingEnv::fully_monomorphized());
 
             if !tail_ty.is_str() && !tail_ty.is_slice() {
@@ -237,7 +246,7 @@ pub fn handle_const_value<'tcx>(
                 "const-eval",
                 format!("Info: Encountered ZeroSized constant for type {:?}", ty)
             );
-            match const_eval::read_zero_sized_constant(tcx, *ty, data_types, instance) {
+            match const_eval::read_zero_sized_constant(tcx, ty, data_types, instance) {
                 Ok(constant) => oomir::Operand::Constant(constant),
                 Err(error) => {
                     breadcrumbs::log!(
@@ -266,7 +275,7 @@ pub fn handle_const_value<'tcx>(
                     match const_eval::read_constant_value_from_memory(
                         tcx, allocation,
                         offset, // The offset provided by ConstValue::Indirect
-                        *ty,    // The type of the constant we are reading
+                        ty,     // The type of the constant we are reading
                         data_types, instance,
                     ) {
                         Ok(oomir_const) => {

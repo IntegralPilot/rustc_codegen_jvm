@@ -179,16 +179,11 @@ pub fn read_scalar_int_constant<'tcx>(
         let layout = tcx
             .layout_of(TypingEnv::fully_monomorphized().as_query_input(*pointee))
             .map_err(|error| format!("Could not determine pointee layout for {ty:?}: {error:?}"))?;
-        return Ok(oomir::Constant::Instance {
-            class_name: oomir::POINTER_CLASS.to_string(),
-            fields: HashMap::new(),
-            params: vec![
-                oomir::Constant::U64(scalar_int.to_target_usize(tcx) as u64),
-                oomir::Constant::I32(
-                    i32::try_from(layout.size.bytes())
-                        .map_err(|_| format!("Pointee layout for {ty:?} exceeds JVM limits"))?,
-                ),
-            ],
+        return Ok(oomir::Constant::PointerAddress {
+            address: scalar_int.to_target_usize(tcx) as u64,
+            view_size: i32::try_from(layout.size.bytes())
+                .map_err(|_| format!("Pointee layout for {ty:?} exceeds JVM limits"))?,
+            pointee: Box::new(ty_to_oomir_type(*pointee, tcx, oomir_data_types, instance)),
         });
     }
 
@@ -495,10 +490,63 @@ pub fn read_pointer_constant<'tcx>(
             array_reference_to_slice(tcx, *inner_ty, value, oomir_data_types, instance)
         }
         TyKind::Ref(_, inner_ty, _) | TyKind::RawPtr(inner_ty, _) => {
-            read_pointee_constant(tcx, pointer, *inner_ty, oomir_data_types, instance)
+            let points_directly_to_static = pointer_references_static(tcx, pointer);
+            let value = read_pointee_constant(tcx, pointer, *inner_ty, oomir_data_types, instance)?;
+            if points_directly_to_static
+                || inner_ty.is_str()
+                || inner_ty.is_slice()
+                || matches!(inner_ty.kind(), TyKind::Dynamic(..))
+            {
+                Ok(value)
+            } else {
+                pointer_constant_for_pointee(tcx, *inner_ty, value, oomir_data_types, instance)
+            }
         }
         _ => read_pointee_constant(tcx, pointer, ty, oomir_data_types, instance),
     }
+}
+
+fn pointer_references_static(tcx: TyCtxt<'_>, pointer: Pointer<CtfeProvenance>) -> bool {
+    let (provenance, _) = pointer.into_raw_parts();
+    provenance
+        .get_alloc_id()
+        .is_some_and(|alloc_id| matches!(tcx.global_alloc(alloc_id), GlobalAlloc::Static(_)))
+}
+
+fn pointer_constant_for_pointee<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    pointee_ty: Ty<'tcx>,
+    value: oomir::Constant,
+    oomir_data_types: &mut HashMap<String, oomir::DataType>,
+    instance: Instance<'tcx>,
+) -> Result<oomir::Constant, String> {
+    let pointee_layout = tcx
+        .layout_of(TypingEnv::fully_monomorphized().as_query_input(pointee_ty))
+        .map_err(|error| format!("Could not determine constant reference layout: {error:?}"))?;
+    let codec = match pointer_memory_codec_operand(pointee_ty, tcx, oomir_data_types, instance) {
+        oomir::Operand::Constant(codec) => codec,
+        other => {
+            return Err(format!(
+                "Constant reference codec was not constant: {other:?}"
+            ));
+        }
+    };
+    Ok(oomir::Constant::Instance {
+        class_name: oomir::POINTER_CLASS.to_string(),
+        fields: HashMap::new(),
+        params: vec![
+            if oomir::Type::from_constant(&value).has_jvm_value() {
+                value
+            } else {
+                oomir::Constant::Null(oomir::Type::Class("java/lang/Object".to_string()))
+            },
+            oomir::Constant::I32(
+                i32::try_from(pointee_layout.size.bytes())
+                    .map_err(|_| "Constant reference pointee exceeds JVM limits".to_string())?,
+            ),
+            codec,
+        ],
+    })
 }
 
 fn read_function_pointer_constant<'tcx>(
@@ -1014,24 +1062,20 @@ pub fn read_constant_value_from_memory<'tcx>(
                                         "Could not determine pointee layout for {ty:?}: {error:?}"
                                     )
                                 })?;
-                            Ok(oomir::Constant::Instance {
-                                class_name: oomir::POINTER_CLASS.to_string(),
-                                fields: HashMap::new(),
+                            Ok(oomir::Constant::PointerAddress {
                                 // TypeId encodes its hash bytes in the offsets of
                                 // provenance-only pointers. At runtime those are
                                 // ordinary exposed-address pointer bits.
-                                params: vec![
-                                    oomir::Constant::U64(pointer_offset.bytes()),
-                                    oomir::Constant::I32(
-                                        i32::try_from(pointee_layout.size.bytes()).map_err(
-                                            |_| {
-                                                format!(
-                                                    "Pointee layout for {ty:?} exceeds JVM limits"
-                                                )
-                                            },
-                                        )?,
-                                    ),
-                                ],
+                                address: pointer_offset.bytes(),
+                                view_size: i32::try_from(pointee_layout.size.bytes()).map_err(
+                                    |_| format!("Pointee layout for {ty:?} exceeds JVM limits"),
+                                )?,
+                                pointee: Box::new(ty_to_oomir_type(
+                                    *inner_ty,
+                                    tcx,
+                                    oomir_data_types,
+                                    instance,
+                                )),
                             })
                         } else {
                             let value = read_pointee_constant(
@@ -1348,8 +1392,13 @@ fn handle_constant_enum<'tcx>(
                 )
             );
 
+            // Preserve provenance only when the niche can physically be a
+            // pointer. CTFE requires provenance reads to be exactly pointer
+            // sized, while ordinary direct tags are commonly just one byte.
+            let read_provenance = matches!(tag_encoding, TagEncoding::Niche { .. })
+                && tag_size == tcx.data_layout.pointer_size();
             let tag_scalar = allocation
-                .read_scalar(&tcx.data_layout, absolute_tag_range, false)
+                .read_scalar(&tcx.data_layout, absolute_tag_range, read_provenance)
                 .map_err(|e| format!("Failed to read enum tag/niche for {:?}: {:?}", enum_ty, e))?;
 
             breadcrumbs::log!(
@@ -1445,9 +1494,9 @@ fn handle_constant_enum<'tcx>(
                                     tag_size
                                 ));
                             }
-                            int.to_bits(tag_size)
+                            Some(int.to_bits(tag_size))
                         }
-                        Scalar::Ptr(ptr, _meta) => {
+                        Scalar::Ptr(_, _meta) => {
                             if tag_size != tcx.data_layout.pointer_size() {
                                 return Err(format!(
                                     "Niche pointer tag size mismatch for {:?}: pointer size is {:?}, but tag size is {:?}",
@@ -1456,28 +1505,37 @@ fn handle_constant_enum<'tcx>(
                                     tag_size
                                 ));
                             }
-                            ptr.into_raw_parts().1.bytes() as u128
+                            // A provenance-carrying CTFE pointer is a valid,
+                            // non-null pointer even when its allocation-relative
+                            // offset is zero. Its numeric runtime address is not
+                            // available during compilation, but it cannot encode
+                            // one of the invalid-pointer niche variants.
+                            None
                         }
                     };
                     breadcrumbs::log!(
                         breadcrumbs::LogLevel::Info,
                         "const-eval",
-                        format!("Debug: Read Niche value bits: {:#x}", read_value_bits)
+                        format!("Debug: Read Niche value bits: {:?}", read_value_bits)
                     );
 
-                    let tag_bits = tag_size.bits();
-                    let tag_mask = if tag_bits == 128 {
-                        u128::MAX
-                    } else {
-                        (1u128 << tag_bits) - 1
-                    };
-                    let relative = read_value_bits.wrapping_sub(*niche_start) & tag_mask;
-                    let first = niche_variants.start.as_u32();
-                    let relative_max = niche_variants.last.as_u32() - first;
-                    if relative <= u128::from(relative_max) {
-                        active_variant_idx = VariantIdx::from_u32(
-                            first + u32::try_from(relative).expect("bounded by relative_max"),
-                        );
+                    if let Some(read_value_bits) = read_value_bits {
+                        let tag_bits = tag_size.bits();
+                        let tag_mask = if tag_bits == 128 {
+                            u128::MAX
+                        } else {
+                            (1u128 << tag_bits) - 1
+                        };
+                        let relative = read_value_bits.wrapping_sub(*niche_start) & tag_mask;
+                        let first = niche_variants.start.as_u32();
+                        let relative_max = niche_variants.last.as_u32() - first;
+                        if relative <= u128::from(relative_max) {
+                            active_variant_idx = VariantIdx::from_u32(
+                                first + u32::try_from(relative).expect("bounded by relative_max"),
+                            );
+                        } else {
+                            active_variant_idx = *untagged_variant;
+                        }
                     } else {
                         active_variant_idx = *untagged_variant;
                     }
@@ -1701,23 +1759,10 @@ pub fn scalar_int_to_oomir_constant<'tcx>(
             }
         },
         TyKind::Str => oomir::Constant::Str(scalar_int.to_u64().to_string()),
-        TyKind::RawPtr(pointee, _) | TyKind::Ref(_, pointee, _) => {
-            let layout = tcx
-                .layout_of(TypingEnv::fully_monomorphized().as_query_input(*pointee))
-                .map_err(|error| {
-                    format!("Could not determine pointee layout for {ty:?}: {error:?}")
-                })?;
-            oomir::Constant::Instance {
-                class_name: oomir::POINTER_CLASS.to_string(),
-                fields: HashMap::new(),
-                params: vec![
-                    oomir::Constant::U64(scalar_int.to_target_usize(tcx) as u64),
-                    oomir::Constant::I32(
-                        i32::try_from(layout.size.bytes())
-                            .map_err(|_| format!("Pointee layout for {ty:?} exceeds JVM limits"))?,
-                    ),
-                ],
-            }
+        TyKind::RawPtr(..) | TyKind::Ref(..) => {
+            return Err(format!(
+                "Pointer scalar {ty:?} requires typed constant lowering context"
+            ));
         }
         TyKind::Pat(base_ty, _) => return scalar_int_to_oomir_constant(tcx, scalar_int, *base_ty),
         _ => return Err(format!("Unsupported type for ScalarInt conversion: {ty:?}")),

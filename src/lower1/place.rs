@@ -384,6 +384,115 @@ fn union_field_name<'tcx>(adt_def: AdtDef<'tcx>, field_index: usize, tcx: TyCtxt
         .to_string()
 }
 
+struct UnionWriteback {
+    class_name: String,
+    field_name: String,
+    receiver: Operand,
+    value_name: String,
+    value_ty: oomir::Type,
+}
+
+fn collect_union_writebacks<'tcx>(
+    base_place: &Place<'tcx>,
+    get_instructions: &[Instruction],
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
+    mir: &Body<'tcx>,
+    data_types: &mut HashMap<String, oomir::DataType>,
+) -> Vec<UnionWriteback> {
+    let mut writebacks = Vec::new();
+    let mut instruction_cursor = 0;
+
+    for (projection_index, projection) in base_place.projection.iter().enumerate() {
+        let ProjectionElem::Field(field_index, _) = projection else {
+            continue;
+        };
+        let union_base_place = projection_prefix_place(base_place, projection_index, tcx);
+        let union_base_ty = EarlyBinder::bind(tcx, union_base_place.ty(&mir.local_decls, tcx).ty)
+            .instantiate(tcx, instance.args)
+            .skip_norm_wip();
+        let Some((union_def, _)) = union_parts_from_ty(union_base_ty) else {
+            continue;
+        };
+        let class_name = match ty_to_oomir_type(union_base_ty, tcx, data_types, instance) {
+            oomir::Type::Class(name) => name,
+            oomir::Type::Reference(inner) => match inner.as_ref() {
+                oomir::Type::Class(name) => name.clone(),
+                other => panic!("Union field access through non-class reference: {other:?}"),
+            },
+            other => panic!("Union field access on non-class type: {other:?}"),
+        };
+        let field_name = union_field_name(union_def, field_index.index(), tcx);
+        let getter_name = union_getter_method_name(&field_name);
+
+        let Some((relative_index, getter)) = get_instructions[instruction_cursor..]
+            .iter()
+            .enumerate()
+            .find(|(_, instruction)| {
+                matches!(
+                    instruction,
+                    Instruction::InvokeVirtual {
+                        dest: Some(_),
+                        class_name: owner,
+                        method_name,
+                        ..
+                    } if owner == &class_name && method_name == &getter_name
+                )
+            })
+        else {
+            panic!(
+                "Could not locate generated getter for nested union field {}.{}",
+                class_name, field_name
+            );
+        };
+        instruction_cursor += relative_index + 1;
+        let Instruction::InvokeVirtual {
+            dest: Some(value_name),
+            method_ty,
+            operand,
+            ..
+        } = getter
+        else {
+            unreachable!();
+        };
+        writebacks.push(UnionWriteback {
+            class_name,
+            field_name,
+            receiver: operand.clone(),
+            value_name: value_name.clone(),
+            value_ty: method_ty.ret.as_ref().clone(),
+        });
+    }
+
+    writebacks
+}
+
+fn emit_union_writebacks(writebacks: &[UnionWriteback], instructions: &mut Vec<Instruction>) {
+    for writeback in writebacks.iter().rev() {
+        instructions.push(Instruction::InvokeVirtual {
+            dest: None,
+            class_name: writeback.class_name.clone(),
+            method_name: union_setter_method_name(&writeback.field_name),
+            method_ty: oomir::Signature {
+                params: vec![
+                    (
+                        "self".to_string(),
+                        oomir::Type::Class(writeback.class_name.clone()),
+                    ),
+                    ("value".to_string(), writeback.value_ty.clone()),
+                ],
+                ret: Box::new(oomir::Type::Void),
+                is_static: false,
+            },
+            args: vec![Operand::Variable {
+                name: writeback.value_name.clone(),
+                ty: writeback.value_ty.clone(),
+            }],
+            operand: writeback.receiver.clone(),
+        });
+    }
+}
+
 fn field_name_from_rust_ty<'tcx>(
     ty: Ty<'tcx>,
     field_index: usize,
@@ -1071,6 +1180,35 @@ pub fn get_place_type<'tcx>(
     instance: Instance<'tcx>,
     data_types: &mut HashMap<String, oomir::DataType>,
 ) -> oomir::Type {
+    if let Some(ProjectionElem::Downcast(_, variant_idx)) = place.projection.last() {
+        let prefix = &place.projection[..place.projection.len() - 1];
+        let base_place = Place {
+            local: place.local,
+            projection: tcx.mk_place_elems(prefix),
+        };
+        let base_ty = EarlyBinder::bind(tcx, base_place.ty(&mir.local_decls, tcx).ty)
+            .instantiate(tcx, instance.args)
+            .skip_norm_wip();
+        let (adt_def, substs) = match base_ty.kind() {
+            TyKind::Adt(adt_def, substs) => (*adt_def, *substs),
+            TyKind::Ref(_, inner, _) => match inner.kind() {
+                TyKind::Adt(adt_def, substs) => (*adt_def, *substs),
+                _ => return ty_to_oomir_type(base_ty, tcx, data_types, instance),
+            },
+            _ => return ty_to_oomir_type(base_ty, tcx, data_types, instance),
+        };
+        if adt_def.is_enum() {
+            let base_class =
+                generate_adt_jvm_class_name(&adt_def, substs, tcx, data_types, instance);
+            let variant = adt_def.variant(*variant_idx);
+            return oomir::Type::Class(format!(
+                "{}${}",
+                base_class,
+                jvm_names::member_name(&variant.name.to_string())
+            ));
+        }
+    }
+
     let place_ty = place.ty(&mir.local_decls, tcx);
     // Instantiate the type with the instance's generic arguments to get concrete types
     let instantiated_ty = rustc_middle::ty::EarlyBinder::bind(tcx, place_ty.ty)
@@ -1152,6 +1290,14 @@ pub fn emit_instructions_to_set_value<'tcx>(
         //    We use `get_on_own` which internally handles recursion if base_place itself is nested.
         let (base_var_name, get_base_instructions, base_oomir_type) =
             emit_instructions_to_get_on_own(&base_place, tcx, instance, mir, data_types);
+        let union_writebacks = collect_union_writebacks(
+            &base_place,
+            &get_base_instructions,
+            tcx,
+            instance,
+            mir,
+            data_types,
+        );
         instructions.extend(get_base_instructions); // Add instructions to get the base
 
         // 3. Generate the final store instruction based on the *last* projection.
@@ -1238,6 +1384,7 @@ pub fn emit_instructions_to_set_value<'tcx>(
                         source_operand,
                         &mut instructions,
                     );
+                    emit_union_writebacks(&union_writebacks, &mut instructions);
                     return instructions;
                 }
                 if let Some((adt_def, _substs)) = union_parts_from_ty(base_rust_ty) {
@@ -1293,6 +1440,7 @@ pub fn emit_instructions_to_set_value<'tcx>(
                             ty: base_oomir_type,
                         },
                     });
+                    emit_union_writebacks(&union_writebacks, &mut instructions);
                     return instructions;
                 }
 
@@ -1333,57 +1481,6 @@ pub fn emit_instructions_to_set_value<'tcx>(
                     value: source_operand, // The value we want to store
                     owner_class: owner_class_name,
                 });
-
-                if let Some((ProjectionElem::Field(union_field_index, _), union_base_projection)) =
-                    base_place.projection.split_last()
-                {
-                    let union_base_place = Place {
-                        local: base_place.local,
-                        projection: tcx.mk_place_elems(union_base_projection),
-                    };
-                    let union_base_rust_ty = union_base_place.ty(&mir.local_decls, tcx).ty;
-                    if let Some((union_def, _)) = union_parts_from_ty(union_base_rust_ty) {
-                        let union_class =
-                            match ty_to_oomir_type(union_base_rust_ty, tcx, data_types, instance) {
-                                oomir::Type::Class(name) => name,
-                                other => panic!(
-                                    "Nested union field assignment on non-class type: {other:?}"
-                                ),
-                            };
-                        let union_field_name =
-                            union_field_name(union_def, union_field_index.index(), tcx);
-                        let (union_var_name, union_get_instructions, union_oomir_type) =
-                            emit_instructions_to_get_on_own(
-                                &union_base_place,
-                                tcx,
-                                instance,
-                                mir,
-                                data_types,
-                            );
-                        instructions.extend(union_get_instructions);
-                        instructions.push(Instruction::InvokeVirtual {
-                            dest: None,
-                            class_name: union_class.clone(),
-                            method_name: union_setter_method_name(&union_field_name),
-                            method_ty: oomir::Signature {
-                                params: vec![
-                                    ("self".to_string(), oomir::Type::Class(union_class)),
-                                    ("value".to_string(), base_oomir_type.clone()),
-                                ],
-                                ret: Box::new(oomir::Type::Void),
-                                is_static: false,
-                            },
-                            args: vec![Operand::Variable {
-                                name: base_var_name,
-                                ty: base_oomir_type,
-                            }],
-                            operand: Operand::Variable {
-                                name: union_var_name,
-                                ty: union_oomir_type,
-                            },
-                        });
-                    }
-                }
             }
 
             ProjectionElem::Index(index_local) => {
@@ -1531,6 +1628,7 @@ pub fn emit_instructions_to_set_value<'tcx>(
                 );
             }
         }
+        emit_union_writebacks(&union_writebacks, &mut instructions);
     }
 
     instructions

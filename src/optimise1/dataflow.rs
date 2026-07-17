@@ -944,6 +944,29 @@ pub fn process_block_instructions(
                 };
                 keep_original_instruction = true;
             }
+            Instruction::ArrayFill {
+                array,
+                value,
+                copy_value,
+            } => {
+                let new_value =
+                    lookup_const(value, &current_state).map_or(value.clone(), Operand::Constant);
+
+                if current_state.contains_key(array) {
+                    pre_extra_instructions.push(Instruction::Move {
+                        dest: array.clone(),
+                        src: Operand::Constant(current_state.get(array).unwrap().clone()),
+                    });
+                    current_state.remove(array);
+                }
+
+                optimised_instruction = Instruction::ArrayFill {
+                    array: array.clone(),
+                    value: new_value,
+                    copy_value: *copy_value,
+                };
+                keep_original_instruction = true;
+            }
             Instruction::SetField { object, value, .. } => {
                 let new_value =
                     lookup_const(value, &current_state).map_or(value.clone(), Operand::Constant);
@@ -1403,6 +1426,7 @@ fn instruction_destination(instruction: &Instruction) -> Option<&str> {
         | Instruction::ThrowNewWithMessage { .. }
         | Instruction::Switch { .. }
         | Instruction::ArrayStore { .. }
+        | Instruction::ArrayFill { .. }
         | Instruction::SetField { .. }
         | Instruction::Label { .. } => None,
     }

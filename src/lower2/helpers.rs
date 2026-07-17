@@ -132,6 +132,9 @@ pub fn oomir_function_stack_floor(function: &oomir::Function) -> u16 {
                 oomir::Instruction::ArrayStore { index, value, .. } => {
                     floor = floor.max(operand_sequence_stack_floor([index, value], 1));
                 }
+                oomir::Instruction::ArrayFill { value, .. } => {
+                    floor = floor.max(1 + operand_load_stack_floor(value));
+                }
                 oomir::Instruction::ArrayGet { array, index, .. } => {
                     floor = floor.max(operand_sequence_stack_floor([array, index], 0));
                 }

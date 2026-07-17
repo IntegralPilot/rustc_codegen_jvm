@@ -28,14 +28,14 @@ use rustc_codegen_ssa::{
     CompiledModule, CompiledModules, CrateInfo, ModuleKind, traits::CodegenBackend,
 };
 use rustc_hir::def::DefKind;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use rustc_data_structures::unord::UnordMap;
 use rustc_metadata::EncodedMetadata;
 use rustc_middle::{
     dep_graph::{WorkProduct, WorkProductId},
     mono::MonoItem,
-    ty::{GenericArgs, Instance, InstanceKind, TyCtxt, TyKind},
+    ty::{EarlyBinder, GenericArgs, Instance, InstanceKind, TyCtxt, TyKind, TypingEnv},
 };
 use rustc_session::{
     Session,
@@ -192,6 +192,73 @@ fn mono_item_name<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> lower1::
     lower1::naming::mono_fn_name_from_instance(tcx, instance)
 }
 
+fn materialize_instance_receiver_pointer<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
+    receiver_ty: rustc_middle::ty::Ty<'tcx>,
+    receiver_class: &str,
+    function: &mut oomir::Function,
+    data_types: &mut HashMap<String, oomir::DataType>,
+) {
+    let Some((_, pointer_ty @ Type::Pointer(_))) = function.signature.params.first() else {
+        return;
+    };
+    let pointer_ty = pointer_ty.clone();
+    let size = lower1::types::layout_size_bytes(tcx, receiver_ty)
+        .unwrap_or_else(|error| panic!("could not determine instance receiver layout: {error}"));
+    let alignment = lower1::types::layout_align_bytes(tcx, receiver_ty)
+        .unwrap_or_else(|error| panic!("could not determine instance receiver alignment: {error}"));
+    let codec = lower1::types::pointer_memory_codec_operand(receiver_ty, tcx, data_types, instance);
+    let materialize = oomir::Instruction::InvokeStatic {
+        dest: Some(oomir::INSTANCE_RECEIVER_POINTER_LOCAL.to_string()),
+        class_name: oomir::POINTER_CLASS.to_string(),
+        method_name: "receiverCellAligned".to_string(),
+        method_ty: oomir::Signature {
+            params: vec![
+                (
+                    "value".to_string(),
+                    Type::Class("java/lang/Object".to_string()),
+                ),
+                ("size".to_string(), Type::I32),
+                ("codec".to_string(), Type::java_string()),
+                ("alignment".to_string(), Type::I32),
+            ],
+            ret: Box::new(pointer_ty),
+            is_static: true,
+        },
+        args: vec![
+            oomir::Operand::Variable {
+                name: "_1".to_string(),
+                ty: Type::Class(receiver_class.to_string()),
+            },
+            oomir::Operand::Constant(oomir::Constant::I32(
+                i32::try_from(size).expect("instance receiver exceeds the JVM address space"),
+            )),
+            codec,
+            oomir::Operand::Constant(oomir::Constant::I32(
+                i32::try_from(alignment)
+                    .expect("instance receiver alignment exceeds the JVM address space"),
+            )),
+        ],
+    };
+    let entry = function
+        .body
+        .basic_blocks
+        .get_mut(&function.body.entry)
+        .expect("OOMIR function has an entry block");
+    let insert_at = entry
+        .instructions
+        .iter()
+        .take_while(|instruction| {
+            matches!(
+                instruction,
+                oomir::Instruction::SourceLocation(_) | oomir::Instruction::LocalVariableScope(_)
+            )
+        })
+        .count();
+    entry.instructions.insert(insert_at, materialize);
+}
+
 fn place_or_insert_mono_function<'tcx>(
     tcx: TyCtxt<'tcx>,
     instance: Instance<'tcx>,
@@ -204,7 +271,9 @@ fn place_or_insert_mono_function<'tcx>(
         .as_deref()
         .is_some_and(lower1::naming::is_global_link_symbol_class);
     if !has_global_linkage && let Some(assoc_item) = tcx.opt_associated_item(instance.def_id()) {
-        if assoc_item.trait_container(tcx).is_none() {
+        let attachable_to_receiver_class = assoc_item.trait_container(tcx).is_none()
+            && (assoc_item.trait_item_def_id().is_none() || assoc_item.is_method());
+        if attachable_to_receiver_class {
             let fallback_function = oomir_function.clone();
             let has_enum_reference_receiver = assoc_item.is_method()
                 && tcx
@@ -267,50 +336,88 @@ fn place_or_insert_mono_function<'tcx>(
                             trait_name
                         });
 
+                    if assoc_item.is_method() {
+                        materialize_instance_receiver_pointer(
+                            tcx,
+                            instance,
+                            container_ty,
+                            &class_name,
+                            &mut oomir_function,
+                            &mut oomir_module.data_types,
+                        );
+                    }
+
+                    let mut has_instance_method = false;
                     if let Some(oomir::DataType::Class {
                         methods,
                         interfaces,
                         ..
                     }) = oomir_module.data_types.get_mut(&class_name)
                     {
+                        let trait_method_matches_existing = implemented_trait.is_some()
+                            && methods.get(&oomir_function.name).is_some_and(|method| {
+                                matches!(method,
+                                    oomir::DataTypeMethod::Function(existing)
+                                        if existing.signature.to_string()
+                                            == oomir_function.signature.to_string())
+                            });
                         if let Some(trait_name) = implemented_trait {
                             if !interfaces.contains(&trait_name) {
                                 interfaces.push(trait_name);
                             }
                         }
-                        methods.insert(
-                            oomir_function.name.clone(),
-                            oomir::DataTypeMethod::Function(oomir_function),
-                        );
+                        if trait_method_matches_existing {
+                            breadcrumbs::log!(
+                                breadcrumbs::LogLevel::Info,
+                                "mono-lowering",
+                                format!(
+                                    "Kept existing {}.{} for matching trait method; emitted {} as a static fallback",
+                                    class_name, oomir_function.name, name.method_name
+                                )
+                            );
+                            has_instance_method = true;
+                        } else {
+                            methods.insert(
+                                oomir_function.name.clone(),
+                                oomir::DataTypeMethod::Function(oomir_function.clone()),
+                            );
 
+                            breadcrumbs::log!(
+                                breadcrumbs::LogLevel::Info,
+                                "mono-lowering",
+                                format!(
+                                    "Placed mono item {} into class {}",
+                                    name.method_name, class_name
+                                )
+                            );
+                            // Rust can statically resolve an associated method
+                            // and name its monomorphized owner directly. Keep a
+                            // static copy under that canonical owner in addition
+                            // to the instance method used for JVM dispatch on the
+                            // concrete class.
+                            has_instance_method = true;
+                        }
+                    }
+
+                    if !has_instance_method {
                         breadcrumbs::log!(
                             breadcrumbs::LogLevel::Info,
                             "mono-lowering",
                             format!(
-                                "Placed mono item {} into class {}",
-                                name.method_name, class_name
+                                "Class {} not declared for mono method {}; keeping it as an owned static function",
+                                class_name, name.method_name
                             )
                         );
-                        return;
                     }
-
-                    breadcrumbs::log!(
-                        breadcrumbs::LogLevel::Info,
-                        "mono-lowering",
-                        format!(
-                            "Class {} not declared for mono method {}; keeping it as an owned static function",
-                            class_name, name.method_name
-                        )
-                    );
                     oomir_function = fallback_function;
                 }
             }
         }
     }
 
-    // Any function that was not attached to a generated JVM class is emitted on
-    // its owner module class. JVM module methods are static, so a Rust method's
-    // receiver must remain an explicit descriptor parameter in this fallback.
+    // Emit the canonical owner-module form used by statically resolved Rust
+    // calls. JVM module methods are static, so a Rust method's receiver must
+    // remain an explicit descriptor parameter in this form.
     oomir_function.signature.is_static = true;
     oomir_module.insert_function(oomir_function);
 }
@@ -375,7 +482,7 @@ fn lower_mono_function<'tcx>(
 
     if matches!(
         instance.def,
-        InstanceKind::Intrinsic(..) | InstanceKind::Virtual(..)
+        InstanceKind::Intrinsic(..) | InstanceKind::LlvmIntrinsic(..) | InstanceKind::Virtual(..)
     ) {
         breadcrumbs::log!(
             breadcrumbs::LogLevel::Warn,
@@ -399,7 +506,7 @@ fn lower_mono_function<'tcx>(
         )
     );
 
-    let oomir_function = lower1::mir_to_oomir(
+    let mut oomir_function = lower1::mir_to_oomir(
         tcx,
         instance,
         &mut mir,
@@ -407,6 +514,39 @@ fn lower_mono_function<'tcx>(
         true,
         &mut oomir_module.data_types,
     );
+    if tcx.is_intrinsic(instance.def_id(), rustc_span::sym::const_allocate) {
+        let result_ty = oomir_function.signature.ret.as_ref().clone();
+        let result = "__const_allocate_result".to_string();
+        let entry = "entry".to_string();
+        oomir_function.body = oomir::CodeBlock {
+            entry: entry.clone(),
+            basic_blocks: HashMap::from([(
+                entry.clone(),
+                oomir::BasicBlock {
+                    label: entry,
+                    instructions: vec![
+                        oomir::Instruction::InvokeStatic {
+                            dest: Some(result.clone()),
+                            class_name: oomir::POINTER_CLASS.to_string(),
+                            method_name: "nullPointer".to_string(),
+                            method_ty: oomir::Signature {
+                                params: vec![("view_size".to_string(), oomir::Type::I32)],
+                                ret: Box::new(result_ty.clone()),
+                                is_static: true,
+                            },
+                            args: vec![oomir::Operand::Constant(oomir::Constant::I32(1))],
+                        },
+                        oomir::Instruction::Return {
+                            operand: Some(oomir::Operand::Variable {
+                                name: result,
+                                ty: result_ty,
+                            }),
+                        },
+                    ],
+                },
+            )]),
+        };
+    }
     place_or_insert_mono_function(tcx, instance, &name, oomir_function, oomir_module);
 }
 
@@ -417,6 +557,7 @@ fn lower_mono_items<'tcx>(
 ) {
     let cgus = tcx.collect_and_partition_mono_items(());
     let mut seen = HashSet::new();
+    let mut functions = VecDeque::new();
 
     for cgu in cgus.codegen_units {
         for (mono_item, _data) in cgu.items_in_deterministic_order(tcx) {
@@ -426,7 +567,7 @@ fn lower_mono_items<'tcx>(
 
             match mono_item {
                 MonoItem::Fn(instance) => {
-                    lower_mono_function(tcx, instance, oomir_module, lowered_instances)
+                    functions.push_back(instance);
                 }
                 MonoItem::Static(def_id) => {
                     lower1::statics::lower_static(tcx, def_id, oomir_module).unwrap_or_else(
@@ -443,6 +584,68 @@ fn lower_mono_items<'tcx>(
             }
         }
     }
+
+    let mut queued = functions.iter().copied().collect::<HashSet<_>>();
+    while let Some(instance) = functions.pop_front() {
+        for callee in direct_mir_callees(tcx, instance) {
+            if !matches!(
+                callee.def,
+                InstanceKind::Intrinsic(_)
+                    | InstanceKind::LlvmIntrinsic(_)
+                    | InstanceKind::Virtual(..)
+            ) && queued.insert(callee)
+            {
+                functions.push_back(callee);
+            }
+        }
+        lower_mono_function(tcx, instance, oomir_module, lowered_instances);
+    }
+}
+
+fn direct_mir_callees<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> Vec<Instance<'tcx>> {
+    let has_callable_mir = match instance.def {
+        InstanceKind::Item(_) => tcx.is_mir_available(instance.def_id()),
+        InstanceKind::Shim(_) => true,
+        InstanceKind::Intrinsic(_) | InstanceKind::LlvmIntrinsic(_) | InstanceKind::Virtual(..) => {
+            false
+        }
+    };
+    if !has_callable_mir {
+        return Vec::new();
+    }
+
+    let mir = tcx.instance_mir(instance.def);
+    let typing_env = TypingEnv::post_analysis(tcx, mir.source.def_id());
+    mir.basic_blocks
+        .iter()
+        .filter_map(|block| {
+            let terminator = block.terminator();
+            let rustc_middle::mir::TerminatorKind::Call { func, .. } = &terminator.kind else {
+                return None;
+            };
+            let func_ty = EarlyBinder::bind(tcx, func.ty(mir, tcx))
+                .instantiate(tcx, instance.args)
+                .skip_norm_wip();
+            let TyKind::FnDef(def_id, args) = func_ty.kind() else {
+                return None;
+            };
+            let args = args.no_bound_vars()?;
+            let callee = Instance::expect_resolve(
+                tcx,
+                typing_env,
+                *def_id,
+                args,
+                terminator.source_info.span,
+            );
+            match callee.def {
+                InstanceKind::Item(_) => tcx.is_mir_available(callee.def_id()).then_some(callee),
+                InstanceKind::Shim(_) => Some(callee),
+                InstanceKind::Intrinsic(_)
+                | InstanceKind::LlvmIntrinsic(_)
+                | InstanceKind::Virtual(..) => None,
+            }
+        })
+        .collect()
 }
 
 fn ensure_trait_interface<'tcx>(

@@ -34,8 +34,9 @@ fn code_attribute_with_stack_maps(
         fixed_prefix_slots,
         &std::collections::BTreeSet::new(),
     )?;
-    let code = optimised.instructions;
+    let mut code = optimised.instructions;
     let max_locals = optimised.max_locals;
+    stackmaps::move_zero_branch_target(&mut code, context)?;
     let name_index = cp.add_utf8("Code")?;
     let attributes = stackmaps::build_stack_map_attributes(
         &code,
@@ -244,8 +245,12 @@ pub(super) fn create_slice_view_classfile() -> jvm::Result<Vec<u8>> {
         )?],
     };
 
-    let byte_array_class = cp.add_class("[B")?;
-    let to_array_ref = cp.add_method_ref(this_class, "toArray", "()Ljava/lang/Object;")?;
+    let pointer_class = cp.add_class(oomir::POINTER_CLASS)?;
+    let slice_to_byte_array = cp.add_method_ref(
+        pointer_class,
+        "sliceToByteArray",
+        "(Ljava/lang/Object;II)[B",
+    )?;
     let string_from_bytes =
         cp.add_method_ref(string_class, "<init>", "([BLjava/nio/charset/Charset;)V")?;
     let to_utf8_string_descriptor = format!("(L{};)Ljava/lang/String;", oomir::SLICE_VIEW_CLASS);
@@ -259,8 +264,12 @@ pub(super) fn create_slice_view_classfile() -> jvm::Result<Vec<u8>> {
             2,
             vec![
                 Instruction::Aload_0,
-                Instruction::Invokevirtual(to_array_ref),
-                Instruction::Checkcast(byte_array_class),
+                Instruction::Getfield(array_field),
+                Instruction::Aload_0,
+                Instruction::Getfield(offset_field),
+                Instruction::Aload_0,
+                Instruction::Getfield(length_field),
+                Instruction::Invokestatic(slice_to_byte_array),
                 Instruction::Astore_1,
                 Instruction::New(string_class),
                 Instruction::Dup,
@@ -402,7 +411,6 @@ pub(super) fn create_slice_view_classfile() -> jvm::Result<Vec<u8>> {
     // Byte slices may be backed either directly by a JVM byte array or by a
     // runtime Pointer carrying a codec (notably `[MaybeUninit<u8>]` during
     // optimised UTF-8 construction). Pointer.sliceGetI8 handles both forms.
-    let pointer_class = cp.add_class(oomir::POINTER_CLASS)?;
     let slice_get_i8 = cp.add_method_ref(pointer_class, "sliceGetI8", "(Ljava/lang/Object;I)B")?;
     let starts_with_i8 = jvm::Method {
         access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
@@ -672,7 +680,8 @@ pub(super) fn create_utf8_view_classfile() -> jvm::Result<Vec<u8>> {
         )?],
     };
 
-    let byte_array_class = cp.add_class("[B")?;
+    let pointer_class = cp.add_class(oomir::POINTER_CLASS)?;
+    let slice_get_i8 = cp.add_method_ref(pointer_class, "sliceGetI8", "(Ljava/lang/Object;I)B")?;
     let starts_with_descriptor = format!(
         "(L{};L{};)Z",
         oomir::UTF8_VIEW_CLASS,
@@ -691,30 +700,28 @@ pub(super) fn create_utf8_view_classfile() -> jvm::Result<Vec<u8>> {
                 Instruction::Getfield(length_field),
                 Instruction::Aload_0,
                 Instruction::Getfield(length_field),
-                Instruction::If_icmpgt(32),
+                Instruction::If_icmpgt(30),
                 Instruction::Iconst_0,
                 Instruction::Istore_2,
                 Instruction::Iload_2,
                 Instruction::Aload_1,
                 Instruction::Getfield(length_field),
-                Instruction::If_icmpge(30),
+                Instruction::If_icmpge(28),
                 Instruction::Aload_0,
                 Instruction::Getfield(array_field),
-                Instruction::Checkcast(byte_array_class),
                 Instruction::Aload_0,
                 Instruction::Getfield(offset_field),
                 Instruction::Iload_2,
                 Instruction::Iadd,
-                Instruction::Baload,
+                Instruction::Invokestatic(slice_get_i8),
                 Instruction::Aload_1,
                 Instruction::Getfield(array_field),
-                Instruction::Checkcast(byte_array_class),
                 Instruction::Aload_1,
                 Instruction::Getfield(offset_field),
                 Instruction::Iload_2,
                 Instruction::Iadd,
-                Instruction::Baload,
-                Instruction::If_icmpne(32),
+                Instruction::Invokestatic(slice_get_i8),
+                Instruction::If_icmpne(30),
                 Instruction::Iinc(2, 1),
                 Instruction::Goto(7),
                 Instruction::Iconst_1,

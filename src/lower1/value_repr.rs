@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use rustc_abi::{TagEncoding, VariantIdx, Variants};
+use rustc_abi::{BackendRepr, TagEncoding, VariantIdx, Variants};
 use rustc_middle::ty::{EarlyBinder, Instance, Ty, TyCtxt, TyKind, TypingEnv};
 
 use crate::oomir;
@@ -484,6 +484,85 @@ fn adapt_physical_scalar<'tcx>(
     Some(operand_var(dest, target_jvm_ty))
 }
 
+fn materialize_scalar_struct<'tcx>(
+    source: oomir::Operand,
+    target_rust_ty: Ty<'tcx>,
+    temp_prefix: &str,
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
+    data_types: &mut HashMap<String, oomir::DataType>,
+    instructions: &mut Vec<oomir::Instruction>,
+) -> Option<oomir::Operand> {
+    let TyKind::Adt(adt_def, substs) = target_rust_ty.kind() else {
+        return None;
+    };
+    if !adt_def.is_struct() {
+        return None;
+    }
+    let layout = tcx
+        .layout_of(TypingEnv::fully_monomorphized().as_query_input(target_rust_ty))
+        .ok()?;
+    if !matches!(layout.backend_repr, BackendRepr::Scalar(_)) {
+        return None;
+    }
+
+    let mut used_source = false;
+    let mut args = Vec::new();
+    for (field_index, field) in adt_def.variant(0usize.into()).fields.iter().enumerate() {
+        let field_rust_ty = resolved_ty(field.ty(tcx, substs).skip_norm_wip(), tcx, instance);
+        let field_jvm_ty = ty_to_oomir_type(field_rust_ty, tcx, data_types, instance);
+        if !field_jvm_ty.has_jvm_value() {
+            continue;
+        }
+        let field_layout = tcx
+            .layout_of(TypingEnv::fully_monomorphized().as_query_input(field_rust_ty))
+            .ok()?;
+        let field_value = if field_layout.is_zst() {
+            materialize_implicit_zst(
+                field_rust_ty,
+                &format!("{temp_prefix}_field_{field_index}"),
+                tcx,
+                instance,
+                data_types,
+                instructions,
+            )?
+        } else {
+            if used_source {
+                return None;
+            }
+            used_source = true;
+            adapt_operand_to_rust_type(
+                source.clone(),
+                field_rust_ty,
+                &format!("{temp_prefix}_field_{field_index}"),
+                tcx,
+                instance,
+                data_types,
+                instructions,
+            )
+        };
+        let field_value = cast_direct_operand(
+            field_value,
+            &field_jvm_ty,
+            &format!("{temp_prefix}_field_{field_index}"),
+            instructions,
+        );
+        args.push((field_value, field_jvm_ty));
+    }
+    if !used_source {
+        return None;
+    }
+
+    let class_name = generate_adt_jvm_class_name(adt_def, substs, tcx, data_types, instance);
+    let dest = format!("{temp_prefix}_struct_value");
+    instructions.push(oomir::Instruction::ConstructObject {
+        dest: dest.clone(),
+        class_name: class_name.clone(),
+        args,
+    });
+    Some(operand_var(dest, oomir::Type::Class(class_name)))
+}
+
 fn mutable_reference_chain_contains(source: &oomir::Type, target: &oomir::Type) -> bool {
     let mut current = source;
     while let oomir::Type::MutableReference(inner) = current {
@@ -597,7 +676,7 @@ fn adapt_mutable_reference_carrier<'tcx>(
                 )),
                 match target_rust_ty.kind() {
                     TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _) => {
-                        super::types::pointer_memory_codec_operand(
+                        super::types::pointer_view_codec_operand(
                             resolved_ty(*pointee, tcx, instance),
                             tcx,
                             data_types,
@@ -795,6 +874,17 @@ pub(super) fn adapt_operand_to_rust_type<'tcx>(
         return value;
     }
     if let Some(value) = adapt_physical_scalar(
+        source.clone(),
+        target_rust_ty,
+        temp_prefix,
+        tcx,
+        instance,
+        data_types,
+        instructions,
+    ) {
+        return value;
+    }
+    if let Some(value) = materialize_scalar_struct(
         source.clone(),
         target_rust_ty,
         temp_prefix,

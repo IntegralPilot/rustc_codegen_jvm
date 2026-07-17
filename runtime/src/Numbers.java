@@ -4,8 +4,9 @@ public final class Numbers {
     private Numbers() {}
 
     private static long objectInteger(Object value) {
+        if (value == null) return 0L;
         if (value instanceof Character) return ((Character) value).charValue();
-        if (value instanceof Pointer) return ((Pointer) value).address();
+        if (value instanceof Pointer) return Pointer.address((Pointer) value);
         return ((Number) value).longValue();
     }
 
@@ -36,6 +37,54 @@ public final class Numbers {
 
     public static int bitCountU128(U128 value) {
         return Long.bitCount(value.high) + Long.bitCount(value.low);
+    }
+
+    public static int leadingZeros32(int value, int bitWidth) {
+        if (bitWidth <= 0 || bitWidth > 32) {
+            throw new IllegalArgumentException("invalid integer bit width: " + bitWidth);
+        }
+        int mask = bitWidth == 32 ? -1 : (1 << bitWidth) - 1;
+        return Integer.numberOfLeadingZeros(value & mask) - (32 - bitWidth);
+    }
+
+    public static int leadingZeros64(long value) {
+        return Long.numberOfLeadingZeros(value);
+    }
+
+    public static int leadingZerosI128(I128 value) {
+        return value.high == 0
+                ? 64 + Long.numberOfLeadingZeros(value.low)
+                : Long.numberOfLeadingZeros(value.high);
+    }
+
+    public static int leadingZerosU128(U128 value) {
+        return value.high == 0
+                ? 64 + Long.numberOfLeadingZeros(value.low)
+                : Long.numberOfLeadingZeros(value.high);
+    }
+
+    public static int trailingZeros32(int value, int bitWidth) {
+        if (bitWidth <= 0 || bitWidth > 32) {
+            throw new IllegalArgumentException("invalid integer bit width: " + bitWidth);
+        }
+        int mask = bitWidth == 32 ? -1 : (1 << bitWidth) - 1;
+        return Math.min(Integer.numberOfTrailingZeros(value & mask), bitWidth);
+    }
+
+    public static int trailingZeros64(long value) {
+        return Long.numberOfTrailingZeros(value);
+    }
+
+    public static int trailingZerosI128(I128 value) {
+        return value.low == 0
+                ? 64 + Long.numberOfTrailingZeros(value.high)
+                : Long.numberOfTrailingZeros(value.low);
+    }
+
+    public static int trailingZerosU128(U128 value) {
+        return value.low == 0
+                ? 64 + Long.numberOfTrailingZeros(value.high)
+                : Long.numberOfTrailingZeros(value.low);
     }
 
     public static float f16ToF32(short value) {

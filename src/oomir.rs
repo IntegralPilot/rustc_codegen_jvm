@@ -15,6 +15,7 @@ pub const UTF8_VIEW_CLASS: &str = "org/rustlang/runtime/Utf8View";
 pub const POINTER_CLASS: &str = "org/rustlang/runtime/Pointer";
 pub const JAVA_STRING_CLASS: &str = "java/lang/String";
 pub const CALLER_LOCATION_PARAM_NAME: &str = "__caller_location";
+pub const INSTANCE_RECEIVER_POINTER_LOCAL: &str = "__instance_receiver_pointer";
 
 /// A Rust source position attached to generated code.
 ///
@@ -463,6 +464,11 @@ pub enum Instruction {
         value: Operand,
         copy_value: bool,
     },
+    ArrayFill {
+        array: String,
+        value: Operand,
+        copy_value: bool,
+    },
     ArrayGet {
         dest: String,
         array: Operand,
@@ -555,6 +561,14 @@ pub enum Constant {
         owner_class: String,
         method_name: String,
         ty: Type,
+    },
+    /// A provenance-free Rust pointer represented by its exposed address.
+    /// The pointee type keeps address-only constants from degenerating into an
+    /// ambiguous `Pointer<Unit>` carrier during representation adaptation.
+    PointerAddress {
+        address: u64,
+        view_size: i32,
+        pointee: Box<Type>,
     },
     /// A typed JVM null. The type is needed when null appears in a constructor
     /// argument list, because constructor descriptors are exact.
@@ -649,8 +663,18 @@ impl std::hash::Hash for Constant {
                 method_name.hash(state);
                 ty.hash(state);
             }
-            Constant::Null(ty) => {
+            Constant::PointerAddress {
+                address,
+                view_size,
+                pointee,
+            } => {
                 2.hash(state);
+                address.hash(state);
+                view_size.hash(state);
+                pointee.hash(state);
+            }
+            Constant::Null(ty) => {
+                3.hash(state);
                 ty.hash(state);
             }
             Constant::I8(i) => i.hash(state),
@@ -1020,6 +1044,7 @@ impl Type {
                 Type::Interface(interface_name.clone())
             }
             Constant::FactoryCall { ty, .. } => ty.clone(),
+            Constant::PointerAddress { pointee, .. } => Type::Pointer(pointee.clone()),
             Constant::Null(ty) => ty.clone(),
             Constant::I8(_) => Type::I8,
             Constant::U8(_) => Type::U8,
@@ -1040,6 +1065,18 @@ impl Type {
             Constant::Str(_) => Type::Str,
             Constant::String(_) => Type::java_string(),
             Constant::Class(name) => Type::Class(name.to_string()),
+            Constant::Instance {
+                class_name, params, ..
+            } if class_name == POINTER_CLASS => Type::Pointer(Box::new(if params.len() == 3 {
+                params
+                    .first()
+                    .map(Type::from_constant)
+                    .unwrap_or(Type::Unit)
+            } else {
+                // Address-only constructors carry no JVM pointee value from
+                // which to infer a more specific OOMIR type.
+                Type::Unit
+            })),
             Constant::Instance { class_name, .. } => Type::Class(class_name.to_string()),
         }
     }

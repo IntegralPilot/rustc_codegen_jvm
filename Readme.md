@@ -20,51 +20,65 @@ It should be noted that this project is still in an early-to-mid stage of develo
 
 Rust enums, generics, function pointers, unions and other supported constructs map directly onto JVM classes and interfaces (see [Interop Model](#interop-model)). Because of this, `rustc_codegen_jvm` can achieve a level of ergonomic interop with Java that comparable native solutions can't easily. For example, you can make a Java class that implements a Rust trait and pass it as a `&dyn Trait` object to Rust functions ([test and demo of this](tests/integration/trait_implementors/Main.java)), because traits just become normal Java interfaces, where this would be (to my knowledge) quite hard, with bridge and FFI solutions.
 
-### It's fast for debugging, a known problem with native Rust
+### Runs everywhere a JVM does, even on legacy systems
 
-Once the shared `core` artifacts are warm, compilation for most small test crates is fast, making the backend practical for rapid experimentation compared to native compilation. Due to the rich hot reload and debugging ecosystem of the JVM, my vision is that this project can in future make rapidly iterating on Rust code (which is a known drawback of Rust) fast and enjoyable. Though there is still lots of work to be done on both making this compiler faster, and making it easy for Rust code to tap into that ecosystem!
+Because the output is standard JVM bytecode rather than a native binary, your Rust code can compile to **legacy systems**, well beyond current native support. It works today on any OS with **JVM 8** support. With a planned future mode to disable `invokedynamic` (the only believed incompatible feature), it may even support **classfile version 45**, enabling compatibility with **JVM 1.0.2**. Minimum requirements:
+
+| Operating System       | Native Rust          | JVM 8 (Supported today)          | JVM 1.0.2 (Potential future)      |
+|------------------------|-------------------------------|----------------------------------|-----------------------------------|
+| **Windows**            | Windows 10                    | Windows Vista SP2 / 7 SP1        | Windows 95 / NT 3.5.1            |
+| **macOS**              | 10.12 Sierra                  | 10.8.3 Mountain Lion             | Classic Mac OS 7.5             |
+| **Linux**              | Kernel 3.2, glibc 2.17      | Kernel 2.6.28, glibc 2.9       | Kernel 1.2.13, predates glibc         |
+
+Additonally, compiling to JVM bytecode enables compiled code working where native FFI solutions (like Panama) are difficult or unavailable, including **sandboxed environments** like Minecraft mod loaders and **Android** (via DEX conversion).
+
 
 ### It can with help re-writing JVM projects in Rust
 
 So much of the modern internet runs on a JVM stack. If a company (or open-source project) wants to switch a project to native Rust for the runtime speed and energy benefits, they can't just do it overnight. `rustc_codegen_jvm`, with its rich interop, enables ergonomic gradual re-writing where the project can still target the JVM while increasing the share of Rust code, and decreasing the share of other code. Then, when the re-write is complete, the Rust code can compile to native to get the runtime speed boost, and the developers might continue using the JVM target for fast debugging/iteration or legacy compatibility purposes.
 
-### Code runs anywhere a JVM runs
+### It's fast for debugging, a known problem with native Rust
 
-Because the output is standard bytecode rather than a native binary, your Rust code can target environments where native FFI solutions like Panama are difficult or unavailable, including **sandboxed environments like Minecraft mod loaders** and **Android** (if you convert to DEX files).
+Once the shared `core` artifacts are warm, compilation for most small test crates is fast, making the backend practical for rapid experimentation compared to native compilation. Due to the rich hot reload and debugging ecosystem of the JVM, my vision is that this project can in future make rapidly iterating on Rust code (which is a known drawback of Rust) fast and enjoyable. Though there is still lots of work to be done on both making this compiler faster, and making it easy for Rust code to tap into that ecosystem!
 
-Future visions for the project include it being able to help you leverage the JVM's safety to debug undefined behaviour, like [Miri](https://github.com/rust-lang/miri/) but faster because of the JVM's JIT. Particually with raw pointers, in some cases of UB you will already get a nice Java exception with full traceback saying where it happened, but there is still a lot more to do in this area.
+Future visions for the project include it being able to help you leverage the JVM's safety to debug undefined behaviour, like [Miri](https://github.com/rust-lang/miri/) but faster because of the JVM's JIT. Particually with raw pointers, due to the translation layer, in some cases of UB you will already get a nice Java exception with full traceback saying where it happened, but there is still a lot more to do in this area.
 
 ## Table of Contents
 1. [Demos](#demos)
 2. [Features](#features)
 3. [How It Works](#how-it-works)
 4. [Interop Model](#interop-model)
-5. [Target Platforms](#target-platforms)
-6. [Prerequisites](#prerequisites)
-7. [Installation & Build](#installation--build)
-8. [Usage](#usage)
-9. [Running Tests](#running-tests)
-10. [Project Structure](#project-structure)
-11. [Contributing](#contributing)
-12. [License](#license)
+5. [Prerequisites](#prerequisites)
+6. [Installation & Build](#installation--build)
+7. [Usage](#usage)
+8. [Running Tests](#running-tests)
+9. [Project Structure](#project-structure)
+10. [Contributing](#contributing)
+11. [License](#license)
 
 ## Demos
 
-These examples live in `tests/binary`, are compiled with upstream Rust `core` and `alloc` to JVM bytecode, and are verified on every CI run as part of the integration test suite. Use `Instrument.py` to inspect compilation timings.
+These examples live in `tests/`, are compiled with upstream Rust `core` and `alloc` to JVM bytecode, and are verified on every CI run as part of the integration test suite. Use `Instrument.py` to inspect compilation timings.
+
+Here are a few selected more complex demos:
+
+### Self-contained Rust programs
 
 | Example | Demonstrates |
 |---|---|
-| **[RSA](tests/binary/rsa/src/main.rs)** | Encryption / decryption |
-| **[Binary search](tests/binary/binsearch/src/main.rs)** | Classic search algorithm |
-| **[Fibonacci](tests/binary/fibonacci/src/main.rs)** | Recursive sequence generation |
-| **[Collatz conjecture](tests/binary/collatz/src/main.rs)** | Iterative mathematical verification |
-| **[Large prime generator](tests/binary/primes/src/main.rs)** | Numeric computation at scale |
-| **[Enums](tests/binary/enums/src/main.rs)** / **[Structs](tests/binary/structs/src/main.rs)** | Nested data structures - tuples, arrays, slices |
-| **[Impl blocks](tests/binary/impl/src/main.rs)** / **[Traits](tests/binary/traits/src/main.rs)** | Trait implementations, including dynamic dispatch |
-| **[Function pointers](tests/binary/fn_pointers/src/main.rs)** | Function pointers as values, fields, parameters, returns, and generic members |
+| **[Alloc](tests/binary/alloc/src/main.rs)** | Using the compiled `alloc` crate in complex ways - binary trees, heaps, linked lists, vectors, strings and more! |
 | **[Raw pointers](tests/binary/raw_ptrs/src/main.rs)** | Stable pointer identity, dereferencing, casts, arithmetic, nested pointers and lots more! |
-| **[Unions](tests/binary/unions/src/main.rs)** | `unsafe` union handling, running on the JVM |
-| **[Alloc](tests/binary/alloc/src/main.rs)** | using the compiled `alloc` crate - `Vec` etc. |
+| **[Unions](tests/binary/unions/src/main.rs)** | `unsafe` union handling, including nesting and reinterpretation |
+| **[Enums](tests/binary/enums/src/main.rs)** / **[Structs](tests/binary/structs/src/main.rs)** | Nested data structures - tuples, arrays, slices |
+| **[Traits](tests/binary/traits/src/main.rs)** | Trait implementations, including dynamic dispatch |
+| **[Function pointers](tests/binary/fn_pointers/src/main.rs)** | Function pointers as values, fields, parameters, returns, and generic members |
+
+### Rust and Java interop
+
+| Example | Demonstrates |
+|---|---|
+| **[Lambda callbacks](tests/integration/lambda_callbacks/Main.java)** | Callback interop - including passing a standard Java lambda directly to a Rust function that expects a callback |
+| **[Trait implementors](tests/integration/trait_implementors/Main.java)** | Trait/dynamic interop, including a Java class implementing a Rust trait and being passed as a dynamic to a Rust function |
 
 ## Features
 
@@ -131,14 +145,6 @@ For supported constructs, there is no manual marshalling and no bindings layer t
 
 The generated classfiles also carry extra metadata so that IDEs like IntelliJ IDEA offer autocomplete, tooltips, and refactoring support for Rust-defined types directly from Java.
 
-## Target Platforms
-
-Because output is standard JVM bytecode rather than a native binary, `rustc_codegen_jvm` targets environments where native compilation isn't practical or allowed:
-
-- **Any JVM 8+**, including older or constrained runtimes without modern FFI features.
-- **Android**, by routing the `.class` output through an external DEX conversion pipeline.
-- **Sandboxed or embedded JVM environments**, such as Minecraft mod loaders, where loading native libraries is restricted or undesirable.
-
 ## Prerequisites
 
 - **Rust Nightly** with `rustc-dev`, `rust-src`, and `llvm-tools-preview` (the checked-in `rust-toolchain.toml` selects these automatically)
@@ -199,7 +205,7 @@ Then, build the project with cargo for `jvm-unknown-unknown`.
 cargo build \
   --target "/path/to/rustc_codegen_jvm/jvm-unknown-unknown.json" \
   -Zjson-target-spec \
-  -Zbuild-std=core,compiler_builtins
+  -Zbuild-std=core,alloc,compiler_builtins
 ```
 
 Add `--release` for an optimised build. The generated JAR is under the crate's `target/jvm-unknown-unknown/debug` or `target/jvm-unknown-unknown/release` directory and can be run with `java -jar`.

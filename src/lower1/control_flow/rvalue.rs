@@ -189,6 +189,20 @@ fn emit_raw_array_pointer_unsize<'tcx>(
         && matches!(source_oomir_ty, oomir::Type::Pointer(_))
         && matches!(target_oomir_ty, oomir::Type::Pointer(_))
     {
+        if let Some(callable_abi) = super::super::types::callable_trait_object_abi(
+            target_pointer_ty,
+            tcx,
+            data_types,
+            instance,
+        ) {
+            ensure_closure_callable_bridge(
+                source_pointee,
+                &callable_abi,
+                data_types,
+                tcx,
+                instance,
+            );
+        }
         instructions.push(oomir::Instruction::InvokeVirtual {
             dest: Some(dest.to_string()),
             class_name: oomir::POINTER_CLASS.to_string(),
@@ -246,7 +260,7 @@ fn emit_raw_array_pointer_unsize<'tcx>(
         args: vec![
             source,
             rust_layout_size_operand(target_element, tcx, instance),
-            super::super::types::pointer_memory_codec_operand(
+            super::super::types::pointer_view_codec_operand(
                 target_element,
                 tcx,
                 data_types,
@@ -619,7 +633,7 @@ fn emit_pointer_to_place<'tcx>(
                         },
                         oomir::Operand::Constant(oomir::Constant::I32(0)),
                         rust_layout_size_operand(element_ty, tcx, instance),
-                        super::super::types::pointer_memory_codec_operand(
+                        super::super::types::pointer_view_codec_operand(
                             element_ty, tcx, data_types, instance,
                         ),
                         pointer_ty,
@@ -642,7 +656,7 @@ fn emit_pointer_to_place<'tcx>(
                         },
                         args: vec![
                             rust_layout_size_operand(pointee_ty, tcx, instance),
-                            super::super::types::pointer_memory_codec_operand(
+                            super::super::types::pointer_view_codec_operand(
                                 pointee_ty, tcx, data_types, instance,
                             ),
                         ],
@@ -674,7 +688,7 @@ fn emit_pointer_to_place<'tcx>(
                         },
                         index,
                         rust_layout_size_operand(place.ty(&mir.local_decls, tcx).ty, tcx, instance),
-                        super::super::types::pointer_memory_codec_operand(
+                        super::super::types::pointer_view_codec_operand(
                             place.ty(&mir.local_decls, tcx).ty,
                             tcx,
                             data_types,
@@ -723,7 +737,7 @@ fn emit_pointer_to_place<'tcx>(
                         base_operand,
                         index,
                         rust_layout_size_operand(place.ty(&mir.local_decls, tcx).ty, tcx, instance),
-                        super::super::types::pointer_memory_codec_operand(
+                        super::super::types::pointer_view_codec_operand(
                             place.ty(&mir.local_decls, tcx).ty,
                             tcx,
                             data_types,
@@ -904,7 +918,7 @@ fn emit_pointer_to_place<'tcx>(
                             base_value,
                             oomir::Operand::Constant(oomir::Constant::String(field_name)),
                             rust_layout_size_operand(field_rust_ty, tcx, instance),
-                            super::super::types::pointer_memory_codec_operand(
+                            super::super::types::pointer_view_codec_operand(
                                 field_rust_ty,
                                 tcx,
                                 data_types,
@@ -1040,6 +1054,20 @@ fn reuse_pointer_to_place<'tcx>(
     mir: &Body<'tcx>,
     instructions: &mut Vec<oomir::Instruction>,
 ) -> Option<oomir::Operand> {
+    // A dereference is tied to the current value of its base pointer, not only
+    // to the syntactic MIR place.  Loop-carried raw pointers can be reassigned
+    // while an older borrow of `*pointer` is still available; reusing that
+    // borrow would retain the previous address.  Reborrowing through
+    // emit_pointer_to_place is allocation-free and preserves the current
+    // pointer's provenance, so always materialize dereferenced places afresh.
+    if place
+        .projection
+        .iter()
+        .any(|projection| matches!(projection, ProjectionElem::Deref))
+    {
+        return None;
+    }
+
     let oomir::Type::Pointer(target_inner) = pointer_ty else {
         return None;
     };
@@ -1062,6 +1090,38 @@ fn reuse_pointer_to_place<'tcx>(
         name: dest,
         ty: pointer_ty.clone(),
     })
+}
+
+/// Returns whether an operand already has the value supplied by a freshly
+/// allocated JVM array.  Rust repeat expressions occur in some very large
+/// core-library buffers, so emitting one store per element can exceed the JVM
+/// method-size limit even when every store only writes the array's default.
+fn is_jvm_array_default_value(value: &oomir::Operand, element_ty: &oomir::Type) -> bool {
+    if !element_ty.has_jvm_value() {
+        return true;
+    }
+
+    match (element_ty, value) {
+        (oomir::Type::I8, oomir::Operand::Constant(oomir::Constant::I8(0)))
+        | (oomir::Type::U8, oomir::Operand::Constant(oomir::Constant::U8(0)))
+        | (oomir::Type::I16, oomir::Operand::Constant(oomir::Constant::I16(0)))
+        | (oomir::Type::U16, oomir::Operand::Constant(oomir::Constant::U16(0)))
+        | (oomir::Type::F16, oomir::Operand::Constant(oomir::Constant::F16(0)))
+        | (oomir::Type::I32, oomir::Operand::Constant(oomir::Constant::I32(0)))
+        | (oomir::Type::U32, oomir::Operand::Constant(oomir::Constant::U32(0)))
+        | (oomir::Type::I64, oomir::Operand::Constant(oomir::Constant::I64(0)))
+        | (oomir::Type::U64, oomir::Operand::Constant(oomir::Constant::U64(0))) => true,
+        (oomir::Type::F32, oomir::Operand::Constant(oomir::Constant::F32(value))) => {
+            value.to_bits() == 0
+        }
+        (oomir::Type::F64, oomir::Operand::Constant(oomir::Constant::F64(value))) => {
+            value.to_bits() == 0
+        }
+        (oomir::Type::Boolean, oomir::Operand::Constant(oomir::Constant::Boolean(false)))
+        | (oomir::Type::Char, oomir::Operand::Constant(oomir::Constant::Char('\0'))) => true,
+        (ty, oomir::Operand::Constant(oomir::Constant::Null(_))) => ty.is_jvm_reference_type(),
+        _ => false,
+    }
 }
 
 fn adapt_value_for_field<'tcx>(
@@ -1692,6 +1752,15 @@ fn ensure_closure_callable_bridge<'tcx>(
     tcx: TyCtxt<'tcx>,
     instance_context: Instance<'tcx>,
 ) -> bool {
+    let instantiated = EarlyBinder::bind(tcx, closure_ty)
+        .instantiate(tcx, instance_context.args)
+        .skip_norm_wip();
+    let closure_ty = tcx
+        .try_normalize_erasing_regions(
+            TypingEnv::fully_monomorphized(),
+            rustc_middle::ty::Unnormalized::new_wip(instantiated),
+        )
+        .unwrap_or(instantiated);
     let closure_ty = match closure_ty.kind() {
         TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _) => *pointee,
         _ => closure_ty,
@@ -2143,12 +2212,10 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                     size: size_operand,
                 });
 
-                for i in 0..array_size {
-                    let index_operand = oomir::Operand::Constant(oomir::Constant::I32(i as i32));
-                    instructions.push(oomir::Instruction::ArrayStore {
+                if !is_jvm_array_default_value(&oomir_elem_op, &oomir_elem_type) {
+                    instructions.push(oomir::Instruction::ArrayFill {
                         array: temp_array_var.clone(),
-                        index: index_operand,
-                        value: oomir_elem_op.clone(),
+                        value: oomir_elem_op,
                         copy_value: true,
                     });
                 }
@@ -2680,17 +2747,16 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                             CastKind::Transmute | CastKind::PointerExposeProvenance
                         )
                     {
-                        instructions.push(oomir::Instruction::InvokeVirtual {
+                        instructions.push(oomir::Instruction::InvokeStatic {
                             dest: Some(temp_cast_var.clone()),
                             class_name: oomir::POINTER_CLASS.to_string(),
                             method_name: "address".to_string(),
                             method_ty: oomir::Signature {
-                                params: vec![("self".to_string(), oomir_source_type)],
+                                params: vec![("pointer".to_string(), oomir_source_type)],
                                 ret: Box::new(oomir::Type::U64),
-                                is_static: false,
+                                is_static: true,
                             },
-                            args: Vec::new(),
-                            operand: oomir_operand,
+                            args: vec![oomir_operand],
                         });
                         return (
                             instructions,
@@ -2741,20 +2807,24 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                         );
                     }
 
-                    let callable_closure_bridge = matches!(
+                    let callable_abi = matches!(
                         cast_kind,
                         CastKind::PointerCoercion(PointerCoercion::Unsize, _)
                     )
-                        && super::super::types::callable_trait_object_abi(
+                    .then(|| {
+                        super::super::types::callable_trait_object_abi(
                             *target_mir_ty,
                             tcx,
                             data_types,
                             instance,
                         )
-                        .is_some_and(|callable_abi| {
+                    })
+                    .flatten();
+                    let callable_closure_bridge =
+                        callable_abi.as_ref().is_some_and(|callable_abi| {
                             ensure_closure_callable_bridge(
                                 source_mir_ty,
-                                &callable_abi,
+                                callable_abi,
                                 data_types,
                                 tcx,
                                 instance,
@@ -2928,7 +2998,7 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                             args: vec![
                                 oomir_operand.clone(),
                                 rust_layout_size_operand(source_element, tcx, instance),
-                                super::super::types::pointer_memory_codec_operand(
+                                super::super::types::pointer_view_codec_operand(
                                     source_element,
                                     tcx,
                                     data_types,
@@ -3046,7 +3116,7 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                                     i32::try_from(source_element_size)
                                         .expect("fat pointer element exceeds JVM address space"),
                                 )),
-                                super::super::types::pointer_memory_codec_operand(
+                                super::super::types::pointer_view_codec_operand(
                                     source_pointee,
                                     tcx,
                                     data_types,
@@ -3263,7 +3333,7 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                                     args: vec![
                                         oomir_operand,
                                         rust_layout_size_operand(*element_rust_ty, tcx, instance),
-                                        super::super::types::pointer_memory_codec_operand(
+                                        super::super::types::pointer_view_codec_operand(
                                             *element_rust_ty,
                                             tcx,
                                             data_types,
@@ -4428,7 +4498,7 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                                             "raw pointer pointee exceeds JVM address space",
                                         ),
                                     )),
-                                    super::super::types::pointer_memory_codec_operand(
+                                    super::super::types::pointer_view_codec_operand(
                                         pointee_ty, tcx, data_types, instance,
                                     ),
                                 ],

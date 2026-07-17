@@ -115,6 +115,15 @@ pub fn callable_trait_object_abi<'tcx>(
     data_types: &mut HashMap<String, oomir::DataType>,
     instance_context: rustc_middle::ty::Instance<'tcx>,
 ) -> Option<CallableTraitObjectAbi<'tcx>> {
+    let instantiated = EarlyBinder::bind(tcx, ty)
+        .instantiate(tcx, instance_context.args)
+        .skip_norm_wip();
+    let ty = tcx
+        .try_normalize_erasing_regions(
+            TypingEnv::fully_monomorphized(),
+            rustc_middle::ty::Unnormalized::new_wip(instantiated),
+        )
+        .unwrap_or(instantiated);
     let dynamic_ty = match ty.kind() {
         TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _) => *pointee,
         _ => ty,
@@ -281,7 +290,7 @@ enum UnionEnumTag {
     },
 }
 
-pub(super) fn layout_size_bytes<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Result<usize, String> {
+pub(crate) fn layout_size_bytes<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Result<usize, String> {
     let ty = normalize_union_ty(tcx, ty)?;
     let layout = tcx
         .layout_of(TypingEnv::fully_monomorphized().as_query_input(ty))
@@ -289,7 +298,7 @@ pub(super) fn layout_size_bytes<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Result
     Ok(layout.size.bytes_usize())
 }
 
-pub(super) fn layout_align_bytes<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Result<usize, String> {
+pub(crate) fn layout_align_bytes<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Result<usize, String> {
     let ty = normalize_union_ty(tcx, ty)?;
     let layout = tcx
         .layout_of(TypingEnv::fully_monomorphized().as_query_input(ty))
@@ -761,16 +770,23 @@ fn ensure_enum_data_types<'tcx>(
             )),
         );
 
-        data_types.insert(
-            variant_class_name,
-            oomir::DataType::Class {
-                fields,
-                is_abstract: false,
-                methods,
-                super_class: Some(base_enum_name.to_string()),
-                interfaces: vec![],
-            },
-        );
+        let Some(oomir::DataType::Class {
+            fields: existing_fields,
+            is_abstract,
+            methods: existing_methods,
+            super_class,
+            ..
+        }) = data_types.get_mut(&variant_class_name)
+        else {
+            continue;
+        };
+        *existing_fields = fields;
+        *is_abstract = false;
+        *super_class = Some(base_enum_name.to_string());
+        // Resolving a variant's fields can recursively request this enum's
+        // memory codec. Preserve any codec methods installed on the placeholder
+        // while completing the concrete variant definition.
+        existing_methods.extend(methods);
     }
 }
 
@@ -1093,6 +1109,30 @@ fn union_aggregate_layout<'tcx>(
                             instance_context,
                         )?,
                         field.ident(tcx).to_string(),
+                        layout
+                            .fields
+                            .offset(FieldIdx::from_usize(index).into())
+                            .bytes_usize(),
+                    ))
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            (class_name, fields)
+        }
+        TyKind::Closure(_, closure_args) => {
+            let oomir::Type::Class(class_name) =
+                ty_to_oomir_type(ty, tcx, data_types, instance_context)
+            else {
+                return Err(format!("closure {ty:?} did not map to a JVM class"));
+            };
+            let fields = closure_args
+                .as_closure()
+                .upvar_tys()
+                .iter()
+                .enumerate()
+                .map(|(index, field_ty)| {
+                    Ok((
+                        resolve_union_ty(tcx, field_ty, instance_context)?,
+                        format!("arg{index}"),
                         layout
                             .fields
                             .offset(FieldIdx::from_usize(index).into())
@@ -1567,13 +1607,16 @@ fn ensure_enum_union_codec<'tcx>(
     data_types: &mut HashMap<String, oomir::DataType>,
     instance_context: rustc_middle::ty::Instance<'tcx>,
 ) -> Result<(), String> {
-    let already_defined = matches!(
-        data_types.get(enum_class),
-        Some(DataType::Class { methods, .. })
-            if methods.contains_key(ENUM_READ_UNION_STORAGE_METHOD)
-    );
-    if already_defined {
-        return Ok(());
+    if let Some(DataType::Class { methods, .. }) = data_types.get(enum_class) {
+        if methods.contains_key(ENUM_READ_UNION_STORAGE_METHOD) {
+            return Ok(());
+        }
+        if methods.contains_key(ENUM_WRITE_UNION_STORAGE_METHOD) {
+            // The writer is installed before recursively constructing variant
+            // codecs. Encountering it without the reader means this enum is
+            // already being generated through a recursive field.
+            return Ok(());
+        }
     }
 
     let base_writer = oomir::Function {
@@ -1594,35 +1637,47 @@ fn ensure_enum_union_codec<'tcx>(
         return Err(format!("enum JVM class {enum_class} was not defined"));
     }
 
-    let layout = tcx
-        .layout_of(TypingEnv::fully_monomorphized().as_query_input(enum_ty))
-        .map_err(|err| format!("could not get layout for {enum_ty:?}: {err:?}"))?;
-    let tag = union_enum_tag(&layout, tcx)?;
-    let mut writers = Vec::new();
-    for variant_index in 0..adt_def.variants().len() {
-        let variant_idx = VariantIdx::from_usize(variant_index);
-        writers.push(enum_variant_union_writer(
+    let generated = (|| {
+        let layout = tcx
+            .layout_of(TypingEnv::fully_monomorphized().as_query_input(enum_ty))
+            .map_err(|err| format!("could not get layout for {enum_ty:?}: {err:?}"))?;
+        let tag = union_enum_tag(&layout, tcx)?;
+        let mut writers = Vec::new();
+        for variant_index in 0..adt_def.variants().len() {
+            let variant_idx = VariantIdx::from_usize(variant_index);
+            writers.push(enum_variant_union_writer(
+                adt_def,
+                substs,
+                enum_class,
+                &layout,
+                &tag,
+                variant_idx,
+                tcx,
+                data_types,
+                instance_context,
+            )?);
+        }
+        let reader = enum_union_reader(
             adt_def,
             substs,
             enum_class,
             &layout,
             &tag,
-            variant_idx,
             tcx,
             data_types,
             instance_context,
-        )?);
-    }
-    let reader = enum_union_reader(
-        adt_def,
-        substs,
-        enum_class,
-        &layout,
-        &tag,
-        tcx,
-        data_types,
-        instance_context,
-    )?;
+        )?;
+        Ok::<_, String>((writers, reader))
+    })();
+    let (writers, reader) = match generated {
+        Ok(generated) => generated,
+        Err(error) => {
+            if let Some(DataType::Class { methods, .. }) = data_types.get_mut(enum_class) {
+                methods.remove(ENUM_WRITE_UNION_STORAGE_METHOD);
+            }
+            return Err(error);
+        }
+    };
 
     for (variant_class, writer) in writers {
         let Some(DataType::Class { methods, .. }) = data_types.get_mut(&variant_class) else {
@@ -1909,21 +1964,20 @@ fn emit_ty_to_union_bytes<'tcx>(
                         i32::try_from(element_size)
                             .map_err(|_| "array element layout exceeds JVM address space")?,
                     )),
-                    pointer_memory_codec_operand(*element, tcx, data_types, instance_context),
+                    pointer_view_codec_operand(*element, tcx, data_types, instance_context),
                 ],
             });
             let address_dest = next_union_temp("union_array_reference_address", temp_counter);
-            instructions.push(oomir::Instruction::InvokeVirtual {
+            instructions.push(oomir::Instruction::InvokeStatic {
                 dest: Some(address_dest.clone()),
                 class_name: oomir::POINTER_CLASS.to_string(),
                 method_name: "address".to_string(),
                 method_ty: oomir::Signature {
-                    params: vec![("self".to_string(), pointer_ty)],
+                    params: vec![("pointer".to_string(), pointer_ty)],
                     ret: Box::new(oomir::Type::U64),
-                    is_static: false,
+                    is_static: true,
                 },
-                args: Vec::new(),
-                operand: operand_var(
+                args: vec![operand_var(
                     pointer_dest,
                     oomir::Type::Pointer(Box::new(ty_to_oomir_type(
                         *element,
@@ -1931,7 +1985,7 @@ fn emit_ty_to_union_bytes<'tcx>(
                         data_types,
                         instance_context,
                     ))),
-                ),
+                )],
             });
             emit_bits_to_union_bytes(
                 operand_var(address_dest, oomir::Type::U64),
@@ -1943,7 +1997,7 @@ fn emit_ty_to_union_bytes<'tcx>(
                 temp_counter,
             )
         }
-        TyKind::RawPtr(_, _) | TyKind::Ref(_, _, _)
+        TyKind::RawPtr(pointee, _) | TyKind::Ref(_, pointee, _)
             if matches!(
                 ty_to_oomir_type(ty, tcx, data_types, instance_context),
                 oomir::Type::Pointer(_)
@@ -1951,17 +2005,20 @@ fn emit_ty_to_union_bytes<'tcx>(
         {
             let pointer_ty = ty_to_oomir_type(ty, tcx, data_types, instance_context);
             let address_dest = next_union_temp("union_pointer_address", temp_counter);
-            instructions.push(oomir::Instruction::InvokeVirtual {
+            instructions.push(oomir::Instruction::InvokeStatic {
                 dest: Some(address_dest.clone()),
                 class_name: oomir::POINTER_CLASS.to_string(),
-                method_name: "address".to_string(),
-                method_ty: oomir::Signature {
-                    params: vec![("self".to_string(), pointer_ty)],
-                    ret: Box::new(oomir::Type::U64),
-                    is_static: false,
+                method_name: if matches!(pointee.kind(), TyKind::Dynamic(..)) {
+                    "erasedAddress".to_string()
+                } else {
+                    "address".to_string()
                 },
-                args: Vec::new(),
-                operand: source,
+                method_ty: oomir::Signature {
+                    params: vec![("pointer".to_string(), pointer_ty)],
+                    ret: Box::new(oomir::Type::U64),
+                    is_static: true,
+                },
+                args: vec![source],
             });
             emit_bits_to_union_bytes(
                 operand_var(address_dest, oomir::Type::U64),
@@ -2001,33 +2058,35 @@ fn emit_ty_to_union_bytes<'tcx>(
             Ok(())
         }
         TyKind::Tuple(elements) if elements.is_empty() => Ok(()),
-        TyKind::Array(element_ty, length) => {
-            let length = length
-                .try_to_target_usize(tcx)
-                .ok_or_else(|| format!("array length is not concrete for {:?}", ty))?
-                as usize;
+        TyKind::Array(element_ty, _) => {
             let element_size = layout_size_bytes(tcx, *element_ty)?;
-            let element_oomir_ty = ty_to_oomir_type(*element_ty, tcx, data_types, instance_context);
-
-            for index in 0..length {
-                let element_dest = next_union_temp("union_array_element", temp_counter);
-                instructions.push(oomir::Instruction::ArrayGet {
-                    dest: element_dest.clone(),
-                    array: source.clone(),
-                    index: oomir::Operand::Constant(oomir::Constant::I32(index as i32)),
-                });
-                emit_ty_to_union_bytes(
-                    *element_ty,
-                    operand_var(element_dest, element_oomir_ty.clone()),
-                    storage,
-                    base_offset + index * element_size,
-                    tcx,
-                    data_types,
-                    instance_context,
-                    instructions,
-                    temp_counter,
-                )?;
-            }
+            let offset = storage.byte_index(base_offset, instructions, temp_counter);
+            instructions.push(oomir::Instruction::InvokeStatic {
+                dest: None,
+                class_name: oomir::POINTER_CLASS.to_string(),
+                method_name: "encodeArrayMemory".to_string(),
+                method_ty: oomir::Signature {
+                    params: vec![
+                        (
+                            "array".to_string(),
+                            oomir::Type::Class("java/lang/Object".to_string()),
+                        ),
+                        ("bytes".to_string(), byte_array_type()),
+                        ("offset".to_string(), oomir::Type::I32),
+                        ("element_size".to_string(), oomir::Type::I32),
+                        ("codec".to_string(), oomir::Type::java_string()),
+                    ],
+                    ret: Box::new(oomir::Type::Void),
+                    is_static: true,
+                },
+                args: vec![
+                    source,
+                    operand_var(storage.bytes_var.clone(), byte_array_type()),
+                    offset,
+                    oomir::Operand::Constant(oomir::Constant::I32(element_size as i32)),
+                    pointer_view_codec_operand(*element_ty, tcx, data_types, instance_context),
+                ],
+            });
             Ok(())
         }
         TyKind::Adt(adt_def, substs) if adt_def.is_enum() => {
@@ -2095,6 +2154,21 @@ fn emit_ty_to_union_bytes<'tcx>(
         TyKind::Tuple(elements) if !elements.is_empty() => {
             let aggregate = union_aggregate_layout(ty, tcx, data_types, instance_context)?
                 .expect("non-empty tuples have aggregate layouts");
+            emit_aggregate_to_union_bytes(
+                &aggregate,
+                source,
+                storage,
+                base_offset,
+                tcx,
+                data_types,
+                instance_context,
+                instructions,
+                temp_counter,
+            )
+        }
+        TyKind::Closure(_, _) => {
+            let aggregate = union_aggregate_layout(ty, tcx, data_types, instance_context)?
+                .expect("closures have aggregate layouts");
             emit_aggregate_to_union_bytes(
                 &aggregate,
                 source,
@@ -2447,7 +2521,7 @@ fn emit_ty_from_union_bytes<'tcx>(
                         i32::try_from(layout_size_bytes(tcx, *element)?)
                             .map_err(|_| "array element layout exceeds JVM address space")?,
                     )),
-                    pointer_memory_codec_operand(*element, tcx, data_types, instance_context),
+                    pointer_view_codec_operand(*element, tcx, data_types, instance_context),
                 ],
             });
             let object_dest = next_union_temp("union_array_reference_view", temp_counter);
@@ -2578,25 +2652,33 @@ fn emit_ty_from_union_bytes<'tcx>(
                 element_type: element_oomir_ty,
                 size: oomir::Operand::Constant(oomir::Constant::I32(length as i32)),
             });
-
-            for index in 0..length {
-                let element_value = emit_ty_from_union_bytes(
-                    *element_ty,
-                    storage,
-                    base_offset + index * element_size,
-                    tcx,
-                    data_types,
-                    instance_context,
-                    instructions,
-                    temp_counter,
-                )?;
-                instructions.push(oomir::Instruction::ArrayStore {
-                    array: array_dest.clone(),
-                    index: oomir::Operand::Constant(oomir::Constant::I32(index as i32)),
-                    value: element_value,
-                    copy_value: false,
-                });
-            }
+            let offset = storage.byte_index(base_offset, instructions, temp_counter);
+            instructions.push(oomir::Instruction::InvokeStatic {
+                dest: None,
+                class_name: oomir::POINTER_CLASS.to_string(),
+                method_name: "decodeArrayMemory".to_string(),
+                method_ty: oomir::Signature {
+                    params: vec![
+                        ("bytes".to_string(), byte_array_type()),
+                        ("offset".to_string(), oomir::Type::I32),
+                        (
+                            "array".to_string(),
+                            oomir::Type::Class("java/lang/Object".to_string()),
+                        ),
+                        ("element_size".to_string(), oomir::Type::I32),
+                        ("codec".to_string(), oomir::Type::java_string()),
+                    ],
+                    ret: Box::new(oomir::Type::Void),
+                    is_static: true,
+                },
+                args: vec![
+                    operand_var(storage.bytes_var.clone(), byte_array_type()),
+                    offset,
+                    operand_var(array_dest.clone(), array_ty.clone()),
+                    oomir::Operand::Constant(oomir::Constant::I32(element_size as i32)),
+                    pointer_view_codec_operand(*element_ty, tcx, data_types, instance_context),
+                ],
+            });
             Ok(operand_var(array_dest, array_ty))
         }
         TyKind::Adt(adt_def, substs) if adt_def.is_enum() => {
@@ -2691,6 +2773,20 @@ fn emit_ty_from_union_bytes<'tcx>(
                 temp_counter,
             )
         }
+        TyKind::Closure(_, _) => {
+            let aggregate = union_aggregate_layout(ty, tcx, data_types, instance_context)?
+                .expect("closures have aggregate layouts");
+            emit_aggregate_from_union_bytes(
+                &aggregate,
+                storage,
+                base_offset,
+                tcx,
+                data_types,
+                instance_context,
+                instructions,
+                temp_counter,
+            )
+        }
         TyKind::Adt(adt_def, _) if adt_def.is_struct() => {
             match union_aggregate_layout(ty, tcx, data_types, instance_context) {
                 Ok(Some(aggregate)) => emit_aggregate_from_union_bytes(
@@ -2766,6 +2862,11 @@ fn exact_bytes_supported<'tcx>(
         TyKind::Tuple(elements) => elements
             .iter()
             .try_for_each(|element| exact_bytes_supported(element, tcx, instance_context)),
+        TyKind::Closure(_, closure_args) => closure_args
+            .as_closure()
+            .upvar_tys()
+            .iter()
+            .try_for_each(|capture| exact_bytes_supported(capture, tcx, instance_context)),
         TyKind::Array(element, length) => {
             length
                 .try_to_target_usize(tcx)
@@ -2987,6 +3088,17 @@ pub(super) struct PointerMemoryCodec {
     pub class_name: String,
 }
 
+fn pointer_codec_class_name<'tcx>(ty: Ty<'tcx>, tcx: TyCtxt<'tcx>, local_name: &str) -> String {
+    let root = match ty.kind() {
+        TyKind::Adt(adt_def, _) => jvm_names::crate_root(tcx, adt_def.did().krate),
+        // Structural tuple/array types are language-level types. Give them the
+        // same stable owner regardless of the crate which instantiates them.
+        TyKind::Tuple(_) | TyKind::Array(_, _) => "org/rustlang/core".to_string(),
+        _ => jvm_names::crate_root(tcx, rustc_span::def_id::LOCAL_CRATE),
+    };
+    format!("{root}/{}", jvm_names::path_segment(local_name))
+}
+
 /// Generates an erased runtime codec for aggregate values placed in pointer
 /// storage. The codec deliberately reuses union/transmute's rustc-layout
 /// encoder so raw byte aliases and ordinary field access observe one value.
@@ -2999,7 +3111,11 @@ pub(super) fn ensure_pointer_memory_codec<'tcx>(
     let ty = resolve_union_ty(tcx, ty, instance_context)?;
     if !matches!(
         ty.kind(),
-        TyKind::Tuple(_) | TyKind::Array(_, _) | TyKind::Adt(_, _)
+        TyKind::Tuple(_)
+            | TyKind::Array(_, _)
+            | TyKind::Adt(_, _)
+            | TyKind::Closure(_, _)
+            | TyKind::FnDef(_, _)
     ) {
         return Ok(None);
     }
@@ -3013,7 +3129,7 @@ pub(super) fn ensure_pointer_memory_codec<'tcx>(
     let identity = format!("{ty:?}:{}:{size}", value_ty.to_jvm_descriptor());
     let readable = format!(
         "{}_{}bytes",
-        sanitize_name_token(&readable_rust_type_name(
+        sanitize_name_token(&readable_pointer_codec_type_name(
             ty,
             tcx,
             data_types,
@@ -3023,7 +3139,7 @@ pub(super) fn ensure_pointer_memory_codec<'tcx>(
     );
     let local_name =
         crate::stable_hash::readable_or_hashed_name("PointerCodec", &readable, &identity, 180);
-    let class_name = jvm_names::synthetic_class_for_instance(tcx, instance_context, local_name);
+    let class_name = pointer_codec_class_name(ty, tcx, &local_name);
     if matches!(
         data_types.get(&class_name),
         Some(oomir::DataType::Class { methods, .. })
@@ -3031,6 +3147,34 @@ pub(super) fn ensure_pointer_memory_codec<'tcx>(
     ) {
         return Ok(Some(PointerMemoryCodec { class_name }));
     }
+
+    if matches!(
+        data_types.get(&class_name),
+        Some(oomir::DataType::Class { methods, .. }) if methods.is_empty()
+    ) {
+        // Recursive pointees may refer back to this codec while its encode and
+        // decode bodies are still being constructed. The final class will own
+        // both methods once the outer generation completes.
+        return Ok(Some(PointerMemoryCodec { class_name }));
+    }
+    if matches!(
+        data_types.get(&class_name),
+        Some(oomir::DataType::Interface { .. })
+    ) {
+        return Err(format!(
+            "pointer codec helper name {class_name} is already an interface"
+        ));
+    }
+    data_types.insert(
+        class_name.clone(),
+        oomir::DataType::Class {
+            fields: Vec::new(),
+            is_abstract: false,
+            methods: HashMap::new(),
+            super_class: Some("java/lang/Object".to_string()),
+            interfaces: Vec::new(),
+        },
+    );
 
     let bytes_ty = byte_array_type();
 
@@ -3048,7 +3192,7 @@ pub(super) fn ensure_pointer_memory_codec<'tcx>(
     ];
     let encode_storage = JvmUnionStorage::at_start("_bytes", "_objects");
     let mut encode_counter = 0;
-    emit_ty_to_union_bytes(
+    if let Err(error) = emit_ty_to_union_bytes(
         ty,
         if value_ty.has_jvm_value() {
             operand_var("_1", value_ty.clone())
@@ -3062,7 +3206,10 @@ pub(super) fn ensure_pointer_memory_codec<'tcx>(
         instance_context,
         &mut encode_instructions,
         &mut encode_counter,
-    )?;
+    ) {
+        data_types.remove(&class_name);
+        return Err(error);
+    }
     encode_instructions.push(oomir::Instruction::Return {
         operand: Some(operand_var("_bytes", bytes_ty.clone())),
     });
@@ -3088,7 +3235,7 @@ pub(super) fn ensure_pointer_memory_codec<'tcx>(
     }];
     let decode_storage = JvmUnionStorage::at_start("_1", "_objects");
     let mut decode_counter = 0;
-    let decoded = emit_ty_from_union_bytes(
+    let decoded = match emit_ty_from_union_bytes(
         ty,
         &decode_storage,
         0,
@@ -3097,7 +3244,13 @@ pub(super) fn ensure_pointer_memory_codec<'tcx>(
         instance_context,
         &mut decode_instructions,
         &mut decode_counter,
-    )?;
+    ) {
+        Ok(decoded) => decoded,
+        Err(error) => {
+            data_types.remove(&class_name);
+            return Err(error);
+        }
+    };
     decode_instructions.push(oomir::Instruction::Return {
         operand: value_ty.has_jvm_value().then_some(decoded),
     });
@@ -3126,23 +3279,12 @@ pub(super) fn ensure_pointer_memory_codec<'tcx>(
                 "pointer codec helper name {class_name} is already an interface"
             ));
         }
-        None => {
-            data_types.insert(
-                class_name.clone(),
-                oomir::DataType::Class {
-                    fields: Vec::new(),
-                    is_abstract: false,
-                    methods,
-                    super_class: Some("java/lang/Object".to_string()),
-                    interfaces: Vec::new(),
-                },
-            );
-        }
+        None => unreachable!("pointer codec placeholder disappeared during generation"),
     }
     Ok(Some(PointerMemoryCodec { class_name }))
 }
 
-pub(super) fn pointer_memory_codec_operand<'tcx>(
+pub(crate) fn pointer_memory_codec_operand<'tcx>(
     ty: Ty<'tcx>,
     tcx: TyCtxt<'tcx>,
     data_types: &mut HashMap<String, oomir::DataType>,
@@ -3807,7 +3949,10 @@ pub fn ty_to_oomir_type<'tcx>(
                     }) = data_types.get_mut(&jvm_name_full)
                     {
                         *fields = oomir_fields;
-                        *existing_methods = methods;
+                        // Field type resolution can recursively enrich this
+                        // placeholder (for example with aggregate codecs).
+                        // Completing the class must not discard those methods.
+                        existing_methods.extend(methods);
                     }
                 } else if let Some(oomir::DataType::Class {
                     fields, methods, ..
@@ -4235,6 +4380,14 @@ pub fn stable_def_path(tcx: TyCtxt<'_>, def_id: DefId) -> String {
         .to_string()
 }
 
+fn readable_qualified_def_path(tcx: TyCtxt<'_>, def_id: DefId) -> String {
+    let class_name = jvm_names::class_for_def_id(tcx, def_id);
+    let canonical = class_name
+        .strip_prefix("org/rustlang/")
+        .unwrap_or(&class_name);
+    sanitize_name_token(&canonical.replace('/', "_"))
+}
+
 pub fn stable_instance_key<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: DefId,
@@ -4358,12 +4511,12 @@ pub fn readable_rust_type_name<'tcx>(
                 .collect::<Vec<_>>()
                 .join("_")
         ),
-        TyKind::Adt(adt_def, substs) if !substs.is_empty() => {
-            let base = adt_base_jvm_name(adt_def, tcx)
-                .rsplit('/')
-                .next()
-                .unwrap_or("Adt")
-                .to_string();
+        TyKind::Adt(adt_def, substs) => {
+            // Generic arguments participate in the generated class identity.
+            // Retain their qualified Rust path so unrelated types with the
+            // same final segment (such as slice::Iter and btree_set::Iter) do
+            // not erase to the same JVM class name.
+            let base = readable_qualified_def_path(tcx, adt_def.did());
             let args = substs
                 .iter()
                 .filter_map(|arg| {
@@ -4385,6 +4538,94 @@ pub fn readable_rust_type_name<'tcx>(
                 base
             } else {
                 format!("{}_{}", base, args.join("_"))
+            }
+        }
+        TyKind::Int(IntTy::Isize) => "isize".to_string(),
+        TyKind::Uint(UintTy::Usize) => "usize".to_string(),
+        _ => readable_oomir_type_name(&ty_to_oomir_type(ty, tcx, data_types, instance_context)),
+    }
+}
+
+fn readable_pointer_codec_type_name<'tcx>(
+    ty: Ty<'tcx>,
+    tcx: TyCtxt<'tcx>,
+    data_types: &mut HashMap<String, oomir::DataType>,
+    instance_context: rustc_middle::ty::Instance<'tcx>,
+) -> String {
+    let instantiated = EarlyBinder::bind(tcx, ty).instantiate(tcx, instance_context.args);
+    let ty = tcx
+        .try_normalize_erasing_regions(TypingEnv::fully_monomorphized(), instantiated)
+        .unwrap_or_else(|_| instantiated.skip_norm_wip());
+    match ty.kind() {
+        TyKind::Ref(_, inner, mutability) => format!(
+            "{}_to_{}",
+            if mutability.is_mut() { "MutRef" } else { "Ref" },
+            readable_pointer_codec_type_name(*inner, tcx, data_types, instance_context)
+        ),
+        TyKind::RawPtr(inner, mutability) => format!(
+            "{}_to_{}",
+            if mutability.is_mut() {
+                "MutPtr"
+            } else {
+                "ConstPtr"
+            },
+            readable_pointer_codec_type_name(*inner, tcx, data_types, instance_context)
+        ),
+        TyKind::Array(inner, length) => {
+            let length = length
+                .try_to_target_usize(tcx)
+                .map(|length| length.to_string())
+                .unwrap_or_else(|| "Unknown".to_string());
+            format!(
+                "Array{}_of_{}",
+                length,
+                readable_pointer_codec_type_name(*inner, tcx, data_types, instance_context)
+            )
+        }
+        TyKind::Slice(inner) => format!(
+            "Slice_of_{}",
+            readable_pointer_codec_type_name(*inner, tcx, data_types, instance_context)
+        ),
+        TyKind::Tuple(elements) if elements.is_empty() => "Unit".to_string(),
+        TyKind::Tuple(elements) => format!(
+            "Tuple_of_{}",
+            elements
+                .iter()
+                .map(|element| readable_pointer_codec_type_name(
+                    element,
+                    tcx,
+                    data_types,
+                    instance_context,
+                ))
+                .collect::<Vec<_>>()
+                .join("_and_")
+        ),
+        TyKind::Adt(adt_def, substs) => {
+            let base = readable_qualified_def_path(tcx, adt_def.did());
+            let args = substs
+                .iter()
+                .filter_map(|arg| {
+                    if let Some(arg_ty) = arg.as_type() {
+                        Some(readable_pointer_codec_type_name(
+                            arg_ty,
+                            tcx,
+                            data_types,
+                            instance_context,
+                        ))
+                    } else {
+                        arg.as_const().map(|constant| {
+                            format!(
+                                "Const_{}",
+                                readable_rust_const_name(constant, tcx, instance_context)
+                            )
+                        })
+                    }
+                })
+                .collect::<Vec<_>>();
+            if args.is_empty() {
+                base
+            } else {
+                format!("{}_of_{}", base, args.join("_and_"))
             }
         }
         TyKind::Int(IntTy::Isize) => "isize".to_string(),

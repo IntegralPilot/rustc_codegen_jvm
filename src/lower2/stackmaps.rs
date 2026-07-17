@@ -287,6 +287,61 @@ pub(super) fn build_stack_map_attributes(
     }
 }
 
+pub(super) fn move_zero_branch_target(
+    instructions: &mut Vec<Instruction>,
+    context: &str,
+) -> jvm::Result<bool> {
+    if !branch_targets(instructions).contains(&0) {
+        return Ok(false);
+    }
+
+    for instruction in instructions.iter_mut() {
+        match instruction {
+            Instruction::Ifeq(target)
+            | Instruction::Ifne(target)
+            | Instruction::Iflt(target)
+            | Instruction::Ifge(target)
+            | Instruction::Ifgt(target)
+            | Instruction::Ifle(target)
+            | Instruction::If_icmpeq(target)
+            | Instruction::If_icmpne(target)
+            | Instruction::If_icmplt(target)
+            | Instruction::If_icmpge(target)
+            | Instruction::If_icmpgt(target)
+            | Instruction::If_icmple(target)
+            | Instruction::If_acmpeq(target)
+            | Instruction::If_acmpne(target)
+            | Instruction::Goto(target)
+            | Instruction::Jsr(target)
+            | Instruction::Ifnull(target)
+            | Instruction::Ifnonnull(target) => {
+                *target = target
+                    .checked_add(1)
+                    .ok_or_else(|| jvm::Error::VerificationError {
+                        context: context.to_string(),
+                        message: "Branch target overflow while moving the zero-offset loop header"
+                            .to_string(),
+                    })?;
+            }
+            Instruction::Goto_w(target) | Instruction::Jsr_w(target) => {
+                *target = target
+                    .checked_add(1)
+                    .ok_or_else(|| jvm::Error::VerificationError {
+                        context: context.to_string(),
+                        message:
+                            "Wide branch target overflow while moving the zero-offset loop header"
+                                .to_string(),
+                    })?;
+            }
+            // Switch targets are relative to the switch instruction. Both the
+            // source and target move by one, so their deltas stay unchanged.
+            _ => {}
+        }
+    }
+    instructions.insert(0, Instruction::Nop);
+    Ok(true)
+}
+
 fn solve_frame_states(
     instructions: &[Instruction],
     initial_locals: &[FrameValue],
@@ -297,8 +352,6 @@ fn solve_frame_states(
 ) -> jvm::Result<Vec<Option<FrameState>>> {
     let mut states = vec![None; instructions.len()];
     states[0] = Some(FrameState::new(initial_locals.to_vec(), max_locals));
-    let live_locals = compute_live_locals(instructions, max_locals);
-
     let mut worklist = VecDeque::from([0usize]);
     while let Some(index) = worklist.pop_front() {
         let Some(input_state) = states[index].clone() else {
@@ -328,11 +381,7 @@ fn solve_frame_states(
                 continue;
             }
             let changed = match &mut states[target] {
-                Some(existing) => merge_state(
-                    existing,
-                    &successor_state,
-                    live_locals.get(target).map_or(&[][..], Vec::as_slice),
-                ),
+                Some(existing) => merge_state(existing, &successor_state),
                 slot @ None => {
                     *slot = Some(successor_state);
                     true
@@ -1041,18 +1090,14 @@ fn convert(
     Ok(())
 }
 
-fn merge_state(existing: &mut FrameState, incoming: &FrameState, live_locals: &[bool]) -> bool {
+fn merge_state(existing: &mut FrameState, incoming: &FrameState) -> bool {
     let mut changed = false;
 
     let local_len = existing.locals.len().max(incoming.locals.len());
     existing.locals.resize(local_len, FrameValue::Top);
     for index in 0..local_len {
         let incoming_value = incoming.locals.get(index).unwrap_or(&FrameValue::Top);
-        let merged = merge_local_value(
-            &existing.locals[index],
-            incoming_value,
-            live_locals.get(index).copied().unwrap_or(false),
-        );
+        let merged = merge_value(&existing.locals[index], incoming_value);
         if existing.locals[index] != merged {
             existing.locals[index] = merged;
             changed = true;
@@ -1073,16 +1118,6 @@ fn merge_state(existing: &mut FrameState, incoming: &FrameState, live_locals: &[
     }
 
     changed
-}
-
-fn merge_local_value(a: &FrameValue, b: &FrameValue, is_live: bool) -> FrameValue {
-    if a == b {
-        return a.clone();
-    }
-    match (a, b) {
-        (FrameValue::Top, value) | (value, FrameValue::Top) if is_live => value.clone(),
-        _ => merge_value(a, b),
-    }
 }
 
 fn merge_value(a: &FrameValue, b: &FrameValue) -> FrameValue {
@@ -1137,180 +1172,6 @@ fn nested_parent_class(class_name: &str) -> Option<&str> {
         None
     } else {
         Some(parent)
-    }
-}
-
-fn compute_live_locals(instructions: &[Instruction], max_locals: usize) -> Vec<Vec<bool>> {
-    let mut live = vec![vec![false; max_locals]; instructions.len()];
-    let mut changed = true;
-
-    while changed {
-        changed = false;
-
-        for index in (0..instructions.len()).rev() {
-            let mut next_live = vec![false; max_locals];
-            for successor in instruction_successors(index, &instructions[index], instructions.len())
-            {
-                if let Some(successor_live) = live.get(successor) {
-                    for (slot, is_live) in successor_live.iter().enumerate() {
-                        next_live[slot] |= *is_live;
-                    }
-                }
-            }
-
-            for (slot, width) in local_defs(&instructions[index]) {
-                for killed in usize::from(slot)..usize::from(slot).saturating_add(width) {
-                    if let Some(is_live) = next_live.get_mut(killed) {
-                        *is_live = false;
-                    }
-                }
-            }
-            for slot in local_uses(&instructions[index]) {
-                if let Some(is_live) = next_live.get_mut(usize::from(slot)) {
-                    *is_live = true;
-                }
-            }
-
-            if live[index] != next_live {
-                live[index] = next_live;
-                changed = true;
-            }
-        }
-    }
-
-    live
-}
-
-fn instruction_successors(
-    index: usize,
-    instruction: &Instruction,
-    instruction_count: usize,
-) -> Vec<usize> {
-    use Instruction as I;
-
-    let next = || {
-        if index + 1 < instruction_count {
-            vec![index + 1]
-        } else {
-            Vec::new()
-        }
-    };
-
-    match instruction {
-        I::Ifeq(target)
-        | I::Ifne(target)
-        | I::Iflt(target)
-        | I::Ifge(target)
-        | I::Ifgt(target)
-        | I::Ifle(target)
-        | I::If_icmpeq(target)
-        | I::If_icmpne(target)
-        | I::If_icmplt(target)
-        | I::If_icmpge(target)
-        | I::If_icmpgt(target)
-        | I::If_icmple(target)
-        | I::If_acmpeq(target)
-        | I::If_acmpne(target)
-        | I::Ifnull(target)
-        | I::Ifnonnull(target) => {
-            let mut successors = vec![usize::from(*target)];
-            successors.extend(next());
-            successors
-        }
-        I::Goto(target) => vec![usize::from(*target)],
-        I::Goto_w(target) if *target >= 0 => vec![*target as usize],
-        I::Tableswitch(table_switch) => {
-            let mut successors = Vec::with_capacity(table_switch.offsets.len() + 1);
-            if let Some(default) = relative_switch_target_opt(index, table_switch.default) {
-                successors.push(default);
-            }
-            for target in &table_switch.offsets {
-                if let Some(target) = relative_switch_target_opt(index, *target) {
-                    successors.push(target);
-                }
-            }
-            successors
-        }
-        I::Lookupswitch(lookup_switch) => {
-            let mut successors = Vec::with_capacity(lookup_switch.pairs.len() + 1);
-            if let Some(default) = relative_switch_target_opt(index, lookup_switch.default) {
-                successors.push(default);
-            }
-            for target in lookup_switch.pairs.values() {
-                if let Some(target) = relative_switch_target_opt(index, *target) {
-                    successors.push(target);
-                }
-            }
-            successors
-        }
-        I::Ireturn | I::Lreturn | I::Freturn | I::Dreturn | I::Areturn | I::Return | I::Athrow => {
-            Vec::new()
-        }
-        _ => next(),
-    }
-}
-
-fn local_uses(instruction: &Instruction) -> Vec<u16> {
-    match instruction {
-        Instruction::Iload(index)
-        | Instruction::Lload(index)
-        | Instruction::Fload(index)
-        | Instruction::Dload(index)
-        | Instruction::Aload(index)
-        | Instruction::Iinc(index, _) => vec![u16::from(*index)],
-        Instruction::Iload_0
-        | Instruction::Lload_0
-        | Instruction::Fload_0
-        | Instruction::Dload_0
-        | Instruction::Aload_0 => vec![0],
-        Instruction::Iload_1
-        | Instruction::Lload_1
-        | Instruction::Fload_1
-        | Instruction::Dload_1
-        | Instruction::Aload_1 => vec![1],
-        Instruction::Iload_2
-        | Instruction::Lload_2
-        | Instruction::Fload_2
-        | Instruction::Dload_2
-        | Instruction::Aload_2 => vec![2],
-        Instruction::Iload_3
-        | Instruction::Lload_3
-        | Instruction::Fload_3
-        | Instruction::Dload_3
-        | Instruction::Aload_3 => vec![3],
-        Instruction::Iload_w(index)
-        | Instruction::Lload_w(index)
-        | Instruction::Fload_w(index)
-        | Instruction::Dload_w(index)
-        | Instruction::Aload_w(index)
-        | Instruction::Iinc_w(index, _)
-        | Instruction::Ret_w(index) => vec![*index],
-        Instruction::Ret(index) => vec![u16::from(*index)],
-        _ => Vec::new(),
-    }
-}
-
-fn local_defs(instruction: &Instruction) -> Vec<(u16, usize)> {
-    match instruction {
-        Instruction::Istore(index)
-        | Instruction::Fstore(index)
-        | Instruction::Astore(index)
-        | Instruction::Iinc(index, _) => vec![(u16::from(*index), 1)],
-        Instruction::Lstore(index) | Instruction::Dstore(index) => vec![(u16::from(*index), 2)],
-        Instruction::Istore_0 | Instruction::Fstore_0 | Instruction::Astore_0 => vec![(0, 1)],
-        Instruction::Lstore_0 | Instruction::Dstore_0 => vec![(0, 2)],
-        Instruction::Istore_1 | Instruction::Fstore_1 | Instruction::Astore_1 => vec![(1, 1)],
-        Instruction::Lstore_1 | Instruction::Dstore_1 => vec![(1, 2)],
-        Instruction::Istore_2 | Instruction::Fstore_2 | Instruction::Astore_2 => vec![(2, 1)],
-        Instruction::Lstore_2 | Instruction::Dstore_2 => vec![(2, 2)],
-        Instruction::Istore_3 | Instruction::Fstore_3 | Instruction::Astore_3 => vec![(3, 1)],
-        Instruction::Lstore_3 | Instruction::Dstore_3 => vec![(3, 2)],
-        Instruction::Istore_w(index)
-        | Instruction::Fstore_w(index)
-        | Instruction::Astore_w(index)
-        | Instruction::Iinc_w(index, _) => vec![(*index, 1)],
-        Instruction::Lstore_w(index) | Instruction::Dstore_w(index) => vec![(*index, 2)],
-        _ => Vec::new(),
     }
 }
 
