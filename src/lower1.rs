@@ -11,8 +11,8 @@ use crate::oomir;
 use control_flow::convert_basic_block;
 use rustc_middle::{
     mir::{
-        BasicBlock, Body, Local, OUTERMOST_SOURCE_SCOPE, SourceScope, StatementKind,
-        VarDebugInfoContents,
+        BasicBlock, Body, Local, OUTERMOST_SOURCE_SCOPE, Place, ProjectionElem, SourceScope,
+        StatementKind, TerminatorKind, VarDebugInfoContents,
     },
     ty::{EarlyBinder, Instance, TyCtxt},
 };
@@ -199,6 +199,164 @@ fn available_pointer_locals_at_block_entries<'tcx>(
     }
 
     available
+}
+
+fn update_class_carrier_state(
+    place: &Place<'_>,
+    initialized: &mut HashSet<Local>,
+    needs_initial_carrier: Option<&mut HashSet<Local>>,
+) {
+    if place.projection.is_empty() {
+        initialized.insert(place.local);
+        return;
+    }
+
+    if matches!(place.projection.first(), Some(ProjectionElem::Field(..))) {
+        if let Some(needs_initial_carrier) = needs_initial_carrier
+            && !initialized.contains(&place.local)
+        {
+            needs_initial_carrier.insert(place.local);
+        }
+        initialized.insert(place.local);
+    }
+}
+
+fn transfer_class_carrier_state(mir: &Body<'_>, block: BasicBlock, state: &mut HashSet<Local>) {
+    let block_data = &mir.basic_blocks[block];
+    for statement in &block_data.statements {
+        match &statement.kind {
+            StatementKind::Assign(box (place, _)) => {
+                update_class_carrier_state(place, state, None);
+            }
+            StatementKind::StorageLive(local) | StatementKind::StorageDead(local) => {
+                state.remove(local);
+            }
+            _ => {}
+        }
+    }
+    if let TerminatorKind::Call { destination, .. } = &block_data.terminator().kind {
+        update_class_carrier_state(destination, state, None);
+    }
+}
+
+fn class_locals_needing_initial_carriers(mir: &Body<'_>) -> HashSet<Local> {
+    let entry = BasicBlock::from_usize(0);
+    let all_locals = mir.local_decls.indices().collect::<HashSet<_>>();
+    let argument_locals = (1..=mir.arg_count)
+        .map(Local::from_usize)
+        .collect::<HashSet<_>>();
+    let mut predecessors = HashMap::<BasicBlock, Vec<BasicBlock>>::new();
+    let mut reachable = HashSet::new();
+    let mut queue = VecDeque::from([entry]);
+
+    for (block, data) in mir.basic_blocks.iter_enumerated() {
+        for successor in data.terminator().successors() {
+            predecessors.entry(successor).or_default().push(block);
+        }
+    }
+    while let Some(block) = queue.pop_front() {
+        if !reachable.insert(block) {
+            continue;
+        }
+        queue.extend(mir.basic_blocks[block].terminator().successors());
+    }
+
+    let mut available = mir
+        .basic_blocks
+        .indices()
+        .map(|block| {
+            let initial = if block == entry {
+                argument_locals.clone()
+            } else if reachable.contains(&block) {
+                all_locals.clone()
+            } else {
+                HashSet::new()
+            };
+            (block, initial)
+        })
+        .collect::<HashMap<_, _>>();
+
+    loop {
+        let mut changed = false;
+        for block in mir.basic_blocks.indices().filter(|block| *block != entry) {
+            if !reachable.contains(&block) {
+                continue;
+            }
+            let incoming = predecessors
+                .get(&block)
+                .into_iter()
+                .flatten()
+                .filter(|predecessor| reachable.contains(predecessor))
+                .map(|predecessor| {
+                    let mut outgoing = available[predecessor].clone();
+                    transfer_class_carrier_state(mir, *predecessor, &mut outgoing);
+                    outgoing
+                })
+                .reduce(|left, right| left.intersection(&right).copied().collect())
+                .unwrap_or_default();
+            if available.get(&block) != Some(&incoming) {
+                available.insert(block, incoming);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let mut needs_initial_carrier = HashSet::new();
+    for block in mir.basic_blocks.indices() {
+        if !reachable.contains(&block) {
+            continue;
+        }
+        let mut state = available[&block].clone();
+        let block_data = &mir.basic_blocks[block];
+        for statement in &block_data.statements {
+            match &statement.kind {
+                StatementKind::Assign(box (place, _)) => {
+                    update_class_carrier_state(place, &mut state, Some(&mut needs_initial_carrier))
+                }
+                StatementKind::StorageLive(local) | StatementKind::StorageDead(local) => {
+                    state.remove(local);
+                }
+                _ => {}
+            }
+        }
+        if let TerminatorKind::Call { destination, .. } = &block_data.terminator().kind {
+            update_class_carrier_state(destination, &mut state, Some(&mut needs_initial_carrier));
+        }
+    }
+    needs_initial_carrier
+}
+
+fn jvm_default_operand(ty: &oomir::Type) -> oomir::Operand {
+    use oomir::{Constant, Operand, Type};
+
+    let constant = match ty {
+        Type::Unit | Type::Void => Constant::Unit,
+        Type::Boolean => Constant::Boolean(false),
+        Type::Char => Constant::Char('\0'),
+        Type::I8 => Constant::I8(0),
+        Type::U8 => Constant::U8(0),
+        Type::I16 => Constant::I16(0),
+        Type::U16 => Constant::U16(0),
+        Type::I32 => Constant::I32(0),
+        Type::U32 => Constant::U32(0),
+        Type::I64 => Constant::I64(0),
+        Type::U64 => Constant::U64(0),
+        Type::F16 => Constant::F16(0),
+        Type::F32 => Constant::F32(0.0),
+        Type::F64 => Constant::F64(0.0),
+        Type::Pointer(_)
+        | Type::MutableReference(_)
+        | Type::Reference(_)
+        | Type::Array(_)
+        | Type::Slice(_)
+        | Type::Str
+        | Type::Class(_)
+        | Type::Interface(_) => Constant::Null(ty.clone()),
+    };
+    Operand::Constant(constant)
 }
 
 /// Converts a MIR body into an OOMIR function and control-flow graph.
@@ -473,6 +631,43 @@ pub fn mir_to_oomir<'tcx>(
                 }
             }
         }
+    }
+
+    let mut carrier_locals = class_locals_needing_initial_carriers(&mir_cloned)
+        .into_iter()
+        .collect::<Vec<_>>();
+    carrier_locals.sort_by_key(|local| local.index());
+    for local in carrier_locals {
+        if place::local_uses_stable_cell(local, &mir_cloned) {
+            continue;
+        }
+        let oomir::Type::Class(class_name) = place::get_place_type(
+            &rustc_middle::mir::Place::from(local),
+            &mir_cloned,
+            tcx,
+            instance,
+            data_types,
+        ) else {
+            continue;
+        };
+        let Some(oomir::DataType::Class {
+            fields,
+            is_abstract: false,
+            ..
+        }) = data_types.get(&class_name)
+        else {
+            continue;
+        };
+        let constructor_args = fields
+            .iter()
+            .filter(|(_, field_ty)| field_ty.has_jvm_value())
+            .map(|(_, field_ty)| (jvm_default_operand(field_ty), field_ty.clone()))
+            .collect();
+        instrs.push(oomir::Instruction::ConstructObject {
+            dest: format!("_{}", local.index()),
+            class_name,
+            args: constructor_args,
+        });
     }
 
     for (local, _) in mir_cloned.local_decls.iter_enumerated() {

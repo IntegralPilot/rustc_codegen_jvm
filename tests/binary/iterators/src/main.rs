@@ -384,6 +384,31 @@ fn generator_and_transform_adapters() {
     assert!(result == 20 && inspected == 10);
 }
 
+fn cloned_generator_with_adapter_capture() {
+    let nibbles = b"4869";
+    let mut bytes = nibbles
+        .chunks_exact(2)
+        .map(|pair| match pair {
+            [high, low] => [high, low],
+            _ => unreachable!(),
+        })
+        .map(|[&high, &low]| {
+            let half = |nibble: u8| (nibble as char).to_digit(16).unwrap() as u8;
+            (half(high) << 4) | half(low)
+        });
+    let generated = core::iter::from_fn(move || bytes.next());
+    let mut cloned = generated.clone();
+
+    assert!(cloned.next() == Some(b'H'));
+    assert!(cloned.next() == Some(b'i'));
+    assert!(cloned.next().is_none());
+
+    let mut original = generated;
+    assert!(original.next() == Some(b'H'));
+    assert!(original.next() == Some(b'i'));
+    assert!(original.next().is_none());
+}
+
 fn double_ended_and_short_circuiting() {
     let mut range = 10..=20;
     assert!(range.next() == Some(10));
@@ -678,6 +703,7 @@ fn main() {
     stateful_adapters();
     slice_iterators();
     generator_and_transform_adapters();
+    cloned_generator_with_adapter_capture();
     double_ended_and_short_circuiting();
     drop_behavior();
     test_zip_edge_cases();
