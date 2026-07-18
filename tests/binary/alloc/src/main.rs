@@ -16,6 +16,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::alloc::Layout;
 use core::cell::RefCell;
+use core::ops::Bound::{Excluded, Included, Unbounded};
+use core::pin::Pin;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 static mut DROP_COUNTER: usize = 0;
@@ -84,6 +86,17 @@ struct TreeNode {
     parent: RefCell<Weak<TreeNode>>,
 }
 
+// Cyclic reference structures using standard library cyclic constructors
+struct CyclicRcNode {
+    id: usize,
+    weak_self: Weak<CyclicRcNode>,
+}
+
+struct CyclicArcNode {
+    id: usize,
+    weak_self: ArcWeak<CyclicArcNode>,
+}
+
 struct ArcWorkerContext {
     relaxed_counter: Arc<AtomicUsize>,
     sequential_counter: Arc<AtomicUsize>,
@@ -134,16 +147,26 @@ fn main() {
     test_manual_realloc();
 
     test_string_ops();
+    test_string_utf_conversions();
     test_vecdeque();
+    test_vecdeque_ring_wrapping();
     test_btreemap();
+    test_btreemap_range_queries();
+    test_btreemap_entry_complex();
     test_btreeset();
+    test_btreeset_symmetric_difference();
     test_binary_heap();
+    test_binary_heap_peek_mut();
     test_linked_list();
     test_rc_refcell_tree();
+    test_new_cyclic_structures();
     test_weak_refs();
     test_cow();
+    test_cow_mutability();
     test_recursive_box_list();
+    test_box_pin_dispatch();
     test_slice_and_vec_adapters();
+    test_vec_resize_and_leak();
     test_try_reserve();
     test_closures_as_trait_objects();
     test_nested_collections();
@@ -158,6 +181,7 @@ fn main() {
     test_manual_realloc_shrink();
     test_vec_from_raw_parts();
     test_layout_computations();
+    test_layout_failures_and_alignments();
 }
 
 fn test_vec_basic() {
@@ -219,7 +243,6 @@ fn test_dynamic_dispatch() {
     assert!(action.perform() == 42);
     assert!(action.name() == "concrete");
 
-    // Vec of trait objects, mixing concrete and closure-backed implementations.
     let actions: Vec<Box<dyn Action>> = vec![
         Box::new(ConcreteAction { factor: 1 }),
         Box::new(ConcreteAction { factor: 5 }),
@@ -308,6 +331,26 @@ fn test_string_ops() {
     assert!(joined == "a,b,c");
 }
 
+fn test_string_utf_conversions() {
+    let valid_utf8 = vec![0xF0, 0x9F, 0x92, 0x96];
+    let string_result = String::from_utf8(valid_utf8);
+    assert!(string_result.is_ok());
+    let s = string_result.unwrap();
+    assert!(s == "💖");
+
+    let invalid_utf8 = vec![0, 159, 146, 150];
+    let err_result = String::from_utf8(invalid_utf8);
+    assert!(err_result.is_err());
+
+    let lossy_str = String::from_utf8_lossy(&[0x61, 0xFF, 0x62]);
+    assert!(lossy_str == "a\u{FFFD}b");
+
+    let utf16_data = [0x0041, 0x0042, 0xd83d, 0xdc96];
+    let from_utf16 = String::from_utf16(&utf16_data);
+    assert!(from_utf16.is_ok());
+    assert!(from_utf16.unwrap() == "AB💖");
+}
+
 fn test_vecdeque() {
     let mut dq: VecDeque<i32> = VecDeque::new();
     for i in 0..10 {
@@ -335,20 +378,32 @@ fn test_vecdeque() {
     assert!(collected == vec![2, 3, 4, 0, 1]);
 }
 
+fn test_vecdeque_ring_wrapping() {
+    let mut dq: VecDeque<i32> = VecDeque::with_capacity(8);
+    for i in 0..6 {
+        dq.push_back(i);
+    }
+    for _ in 0..4 {
+        dq.pop_front();
+    }
+    for i in 6..12 {
+        dq.push_back(i);
+    }
+
+    let (left, right) = dq.as_slices();
+    assert!(!left.is_empty());
+    assert!(!right.is_empty());
+
+    let items: Vec<i32> = dq.iter().copied().collect();
+    assert!(items == vec![4, 5, 6, 7, 8, 9, 10, 11]);
+}
+
 fn test_btreemap() {
     let mut map: BTreeMap<i32, &'static str> = BTreeMap::new();
     map.insert(3, "three");
-    assert!(
-        map.len() == 1,
-        "unexpected length after first insert: {}",
-        map.len()
-    );
+    assert!(map.len() == 1);
     map.insert(1, "one");
-    assert!(
-        map.len() == 2,
-        "unexpected length after second insert: {}",
-        map.len()
-    );
+    assert!(map.len() == 2);
     map.insert(2, "two");
     assert!(map.len() == 3);
     assert!(map.get(&1) == Some(&"one"));
@@ -361,17 +416,10 @@ fn test_btreemap() {
     assert!(*key_iter.next().unwrap() == 3);
     assert!(key_iter.next().is_none());
 
-    // BTreeMap iterates in sorted key order.
     let keys: Vec<i32> = map.keys().copied().collect();
     assert!(keys.len() == 3);
     assert!(keys[0] == 1);
-    assert!(
-        keys[1] == 2,
-        "unexpected keys: [{}, {}, {}]",
-        keys[0],
-        keys[1],
-        keys[2]
-    );
+    assert!(keys[1] == 2);
     assert!(keys[2] == 3);
     assert!(keys == vec![1, 2, 3]);
 
@@ -386,6 +434,37 @@ fn test_btreemap() {
 
     *map.entry(1).or_insert("uno") = "ONE";
     assert!(map.get(&1) == Some(&"ONE"));
+}
+
+fn test_btreemap_range_queries() {
+    let mut map = BTreeMap::new();
+    for i in 0..10 {
+        map.insert(i, i * 10);
+    }
+
+    let subset: Vec<(&i32, &i32)> = map.range((Included(&3), Excluded(&7))).collect();
+    assert!(subset.len() == 4);
+    assert!(*subset[0].0 == 3);
+    assert!(*subset[3].0 == 6);
+
+    let unbound: Vec<(&i32, &i32)> = map.range((Excluded(&7), Unbounded)).collect();
+    assert!(unbound.len() == 2);
+    assert!(*unbound[0].0 == 8);
+    assert!(*unbound[1].0 == 9);
+}
+
+fn test_btreemap_entry_complex() {
+    let mut map: BTreeMap<String, Vec<i32>> = BTreeMap::new();
+
+    map.entry(String::from("key"))
+        .or_insert_with(Vec::new)
+        .push(100);
+
+    map.entry(String::from("key"))
+        .and_modify(|v| v.push(200))
+        .or_insert_with(Vec::new);
+
+    assert!(map.get("key").unwrap() == &vec![100, 200]);
 }
 
 fn test_btreeset() {
@@ -407,6 +486,14 @@ fn test_btreeset() {
     assert!(!set.contains(&9));
 }
 
+fn test_btreeset_symmetric_difference() {
+    let set_a: BTreeSet<i32> = [1, 2, 3].into_iter().collect();
+    let set_b: BTreeSet<i32> = [3, 4, 5].into_iter().collect();
+
+    let diff: Vec<i32> = set_a.symmetric_difference(&set_b).copied().collect();
+    assert!(diff == vec![1, 2, 4, 5]);
+}
+
 fn test_binary_heap() {
     let mut heap: BinaryHeap<i32> = BinaryHeap::new();
     for v in [5, 1, 8, 3, 9, 2] {
@@ -422,6 +509,22 @@ fn test_binary_heap() {
 
     let from_vec: BinaryHeap<i32> = vec![10, 20, 5].into_iter().collect();
     assert!(from_vec.into_sorted_vec() == vec![5, 10, 20]);
+}
+
+fn test_binary_heap_peek_mut() {
+    let mut heap = BinaryHeap::new();
+    heap.push(10);
+    heap.push(30);
+    heap.push(20);
+
+    if let Some(mut top) = heap.peek_mut() {
+        assert!(*top == 30);
+        *top = 5;
+    }
+
+    assert!(heap.pop() == Some(20));
+    assert!(heap.pop() == Some(10));
+    assert!(heap.pop() == Some(5));
 }
 
 fn test_linked_list() {
@@ -470,6 +573,26 @@ fn test_rc_refcell_tree() {
     assert!(root.children.borrow()[0].value == 2);
 }
 
+fn test_new_cyclic_structures() {
+    let cyclic_rc = Rc::new_cyclic(|weak_ptr| CyclicRcNode {
+        id: 101,
+        weak_self: weak_ptr.clone(),
+    });
+
+    let upgrade_rc = cyclic_rc.weak_self.upgrade();
+    assert!(upgrade_rc.is_some());
+    assert!(upgrade_rc.unwrap().id == 101);
+
+    let cyclic_arc = Arc::new_cyclic(|weak_ptr| CyclicArcNode {
+        id: 202,
+        weak_self: weak_ptr.clone(),
+    });
+
+    let upgrade_arc = cyclic_arc.weak_self.upgrade();
+    assert!(upgrade_arc.is_some());
+    assert!(upgrade_arc.unwrap().id == 202);
+}
+
 fn test_weak_refs() {
     let strong = Rc::new(42_i32);
     let weak: Weak<i32> = Rc::downgrade(&strong);
@@ -499,12 +622,26 @@ fn test_cow() {
     assert!(modified == "has_spaces_here");
 }
 
+fn test_cow_mutability() {
+    let mut val: Cow<'_, [i32]> = Cow::Borrowed(&[1, 2, 3]);
+    assert!(matches!(val, Cow::Borrowed(_)));
+
+    val.to_mut().push(4);
+    assert!(matches!(val, Cow::Owned(_)));
+    assert!(val.as_ref() == [1, 2, 3, 4]);
+}
+
 fn test_recursive_box_list() {
     let list = List::Cons(
         1,
         Box::new(List::Cons(2, Box::new(List::Cons(3, Box::new(List::Nil))))),
     );
     assert!(list.sum() == 6);
+}
+
+fn test_box_pin_dispatch() {
+    let pinned: Pin<Box<dyn Action>> = Box::pin(ConcreteAction { factor: 10 });
+    assert!(pinned.perform() == 20);
 }
 
 fn test_slice_and_vec_adapters() {
@@ -526,7 +663,7 @@ fn test_slice_and_vec_adapters() {
     assert!(v.len() == 3 + tail.len());
 
     let windows_sum: i32 = v.windows(2).map(|w| w[0] + w[1]).sum();
-    assert!(windows_sum >= 0 || windows_sum < 0); // just exercising windows()
+    assert!(windows_sum >= 0 || windows_sum < 0);
 
     let chunks: Vec<Vec<i32>> = v.chunks(2).map(|c| c.to_vec()).collect();
     assert!(!chunks.is_empty());
@@ -537,14 +674,30 @@ fn test_slice_and_vec_adapters() {
     v.dedup();
 }
 
+fn test_vec_resize_and_leak() {
+    let mut v = vec![10, 20, 30];
+    v.resize(5, 100);
+    assert!(v == vec![10, 20, 30, 100, 100]);
+
+    v.resize_with(2, || 0);
+    assert!(v == vec![10, 20]);
+
+    let leaked: &'static mut [i32] = Vec::leak(v);
+    assert!(leaked[0] == 10);
+    assert!(leaked[1] == 20);
+
+    unsafe {
+        let reconstructed = Vec::from_raw_parts(leaked.as_mut_ptr(), leaked.len(), leaked.len());
+        assert!(reconstructed.len() == 2);
+    }
+}
+
 fn test_try_reserve() {
     let mut v: Vec<u8> = Vec::new();
     let result = v.try_reserve(1024);
     assert!(result.is_ok());
     assert!(v.capacity() >= 1024);
 
-    // An absurdly large request should fail gracefully rather than abort,
-    // exercising the fallible allocation path.
     let huge = usize::MAX / 2;
     let failure = v.try_reserve(huge);
     assert!(failure.is_err());
@@ -588,10 +741,6 @@ fn test_nested_collections() {
     assert!(map_of_vecs[&0].len() == 4);
     assert!(map_of_vecs[&1].len() == 3);
     assert!(map_of_vecs[&2].len() == 3);
-    assert!(map_of_vecs[&0][0] == 0);
-    assert!(map_of_vecs[&0][1] == 3);
-    assert!(map_of_vecs[&0][2] == 6);
-    assert!(map_of_vecs[&0][3] == 9);
     assert!(map_of_vecs[&0] == vec![0, 3, 6, 9]);
 
     let boxed_slice: Box<[i32]> = vec![1, 2, 3, 4].into_boxed_slice();
@@ -629,7 +778,6 @@ fn test_sort_and_dedup_custom() {
     let keys: Vec<i32> = items.iter().map(|i| i.key).collect();
     assert!(keys == vec![1, 1, 2, 3]);
 
-    // Stable sort: the two key==1 items should retain original relative order.
     assert!(items[0].payload == 10);
     assert!(items[1].payload == 11);
 
@@ -650,7 +798,6 @@ fn test_sort_and_dedup_custom() {
     let position = nums.binary_search(&5);
     assert!(position.is_ok());
 }
-
 
 fn test_overaligned_allocations() {
     let alignments = [128, 256, 512, 1024, 2048, 4096];
@@ -719,7 +866,6 @@ fn test_drain_partial_drop() {
         drop(first);
         drop(second);
         assert!(unsafe { DROP_COUNTER } == 2);
-
     }
 
     assert!(unsafe { DROP_COUNTER } == 12);
@@ -770,8 +916,7 @@ fn test_arc_concurrent_clone_drop() {
 
     let owner = b"alloc_test.alloc_test";
     let method = b"arc_concurrent_worker";
-    // Keep the reflectively invoked worker as a concrete codegen item and
-    // establish a single-threaded baseline before the concurrent phase.
+
     arc_concurrent_worker(&context);
     unsafe {
         run_static_pointer_workers(
@@ -889,4 +1034,12 @@ fn test_layout_computations() {
     let array_layout = Layout::array::<u32>(16).unwrap();
     assert!(array_layout.size() == 64);
     assert!(array_layout.align() == 4);
+}
+
+fn test_layout_failures_and_alignments() {
+    let invalid_align = Layout::from_size_align(16, 15);
+    assert!(invalid_align.is_err());
+
+    let overflow_size = Layout::from_size_align(usize::MAX, 8);
+    assert!(overflow_size.is_err());
 }

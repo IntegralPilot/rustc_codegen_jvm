@@ -68,12 +68,13 @@ Here are a few selected more complex demos:
 
 | Example | Demonstrates |
 |---|---|
-| **[Alloc](tests/binary/alloc/src/main.rs)** | Using the compiled `alloc` crate in complex ways - binary trees, heaps, linked lists, vectors, strings, Arc/atomics and more! |
+| **[Alloc](tests/binary/alloc/src/main.rs)** | Using the compiled `alloc` crate in complex ways - binary trees, heaps, linked lists, vectors, strings, Arc/atomics and more! Also verifies drop/cleanup. |
 | **[Raw pointers](tests/binary/raw_ptrs/src/main.rs)** | Stable pointer identity, dereferencing, casts, arithmetic, nested pointers, fat-pointer and DST handling and lots more! |
 | **[Unions](tests/binary/unions/src/main.rs)** | `unsafe` union handling, including nesting and reinterpretation |
 | **[Enums](tests/binary/enums/src/main.rs)** / **[Structs](tests/binary/structs/src/main.rs)** | Nested data structures - tuples, arrays, slices |
 | **[Traits](tests/binary/traits/src/main.rs)** | Trait implementations, including dynamic dispatch |
 | **[Function pointers](tests/binary/fn_pointers/src/main.rs)** | Function pointers as values, fields, parameters, returns, and generic members |
+| **[Iterators](tests/binary/iterators/src/main.rs)** | Iterator combinators (including `map`, `zip`, `chain`, and `flatten`), double-ended/exact-size traversal, custom iterator implementations, and drop/cleanup behavior during iteration.  |
 
 ### Rust and Java interop
 

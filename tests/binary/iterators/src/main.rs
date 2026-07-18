@@ -4,6 +4,11 @@
 
 include!("../../../support/test_prelude.rs");
 
+use alloc::string::String;
+use alloc::vec;
+use alloc::vec::Vec;
+use core::ops::Bound::{Excluded, Included, Unbounded};
+
 #[derive(Clone, Copy)]
 struct Marker;
 
@@ -88,6 +93,41 @@ impl Iterator for Intermittent {
         }
     }
 }
+
+struct BidirectionalRange {
+    start: i32,
+    end: i32,
+}
+
+impl Iterator for BidirectionalRange {
+    type Item = i32;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.start < self.end {
+            let val = self.start;
+            self.start += 1;
+            Some(val)
+        } else {
+            None
+        }
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = if self.start < self.end { (self.end - self.start) as usize } else { 0 };
+        (remaining, Some(remaining))
+    }
+}
+
+impl DoubleEndedIterator for BidirectionalRange {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.start < self.end {
+            self.end -= 1;
+            Some(self.end)
+        } else {
+            None
+        }
+    }
+}
+
+impl ExactSizeIterator for BidirectionalRange {}
 
 fn array_iteration() {
     let mut sum = 0;
@@ -439,6 +479,195 @@ fn drop_behavior() {
     assert!(unsafe { DROP_TOTAL } == 3);
 }
 
+fn test_zip_edge_cases() {
+    let mut a = [1, 2, 3].into_iter();
+    let mut b = [10, 20, 30, 40].into_iter();
+    let mut zipped = a.by_ref().zip(b.by_ref());
+
+    assert!(zipped.size_hint() == (3, Some(3)));
+    assert!(zipped.next() == Some((1, 10)));
+    assert!(zipped.size_hint() == (2, Some(2)));
+
+    assert!(zipped.next_back() == Some((3, 30)));
+    assert!(zipped.next() == Some((2, 20)));
+    assert!(zipped.next().is_none());
+}
+
+fn test_chain_edge_cases() {
+    let mut chained = [1, 2].into_iter().chain([3, 4, 5].into_iter());
+    assert!(chained.size_hint() == (5, Some(5)));
+
+    assert!(chained.next() == Some(1));
+    assert!(chained.next_back() == Some(5));
+    assert!(chained.next_back() == Some(4));
+    assert!(chained.next() == Some(2));
+    assert!(chained.next_back() == Some(3));
+    assert!(chained.next().is_none());
+    assert!(chained.next_back().is_none());
+}
+
+fn test_peek_mut() {
+    let mut peekable = [10, 20, 30].into_iter().peekable();
+    if let Some(val) = peekable.peek_mut() {
+        assert!(*val == 10);
+        *val += 5;
+    }
+    assert!(peekable.next() == Some(15));
+    assert!(peekable.next() == Some(20));
+}
+
+fn test_unzip_and_partition() {
+    let pairs = vec![(1, 'a'), (2, 'b'), (3, 'c')];
+    let (nums, chars): (Vec<i32>, Vec<char>) = pairs.into_iter().unzip();
+    assert!(nums == vec![1, 2, 3]);
+    assert!(chars == vec!['a', 'b', 'c']);
+
+    let (even, odd): (Vec<i32>, Vec<i32>) = (1..10).partition(|&x| x % 2 == 0);
+    assert!(even == vec![2, 4, 6, 8]);
+    assert!(odd == vec![1, 3, 5, 7, 9]);
+}
+
+fn test_fused_iterator_guarantees() {
+    let mut raw = Intermittent { state: 0 };
+    assert!(raw.next() == Some(10));
+    assert!(raw.next().is_none());
+    assert!(raw.next() == Some(30));
+
+    let mut fused = Intermittent { state: 0 }.fuse();
+    assert!(fused.next() == Some(10));
+    assert!(fused.next().is_none());
+    assert!(fused.next().is_none());
+}
+
+fn test_char_and_str_iterators() {
+    let s = "a💖b";
+    let mut chars = s.chars();
+    assert!(chars.next() == Some('a'));
+    assert!(chars.next_back() == Some('b'));
+    assert!(chars.next() == Some('💖'));
+    assert!(chars.next().is_none());
+
+    let mut indices = s.char_indices();
+    assert!(indices.next() == Some((0, 'a')));
+    assert!(indices.next() == Some((1, '💖')));
+    assert!(indices.next() == Some((5, 'b')));
+    assert!(indices.next().is_none());
+}
+
+fn test_drop_propagation_in_adapters() {
+    unsafe { DROP_TOTAL = 0; }
+    {
+        let left = [DropToken(1), DropToken(2)];
+        let right = [DropToken(10), DropToken(20)];
+        let mut zipped = left.into_iter().zip(right.into_iter());
+
+        let first = zipped.next();
+        assert!(unsafe { DROP_TOTAL } == 0);
+
+        drop(first);
+        assert!(unsafe { DROP_TOTAL } == 11);
+    }
+    assert!(unsafe { DROP_TOTAL } == 33);
+
+    unsafe { DROP_TOTAL = 0; }
+    {
+        let left = [DropToken(1), DropToken(2)];
+        let right = [DropToken(4), DropToken(8)];
+        let mut chained = left.into_iter().chain(right.into_iter());
+        let val = chained.next();
+        drop(val);
+        assert!(unsafe { DROP_TOTAL } == 1);
+    }
+    assert!(unsafe { DROP_TOTAL } == 15);
+}
+
+fn test_by_ref_borrowing_scopes() {
+    let mut iter = 0..10;
+    let mut sub_ref = iter.by_ref().take(3);
+    assert!(sub_ref.next() == Some(0));
+    assert!(sub_ref.next() == Some(1));
+    assert!(sub_ref.next() == Some(2));
+    assert!(sub_ref.next().is_none());
+
+    assert!(iter.next() == Some(3));
+}
+
+fn test_step_by_mechanics() {
+    let mut steps = (0..10).step_by(3);
+    assert!(steps.size_hint() == (4, Some(4)));
+    assert!(steps.next() == Some(0));
+    assert!(steps.size_hint() == (3, Some(3)));
+    assert!(steps.next() == Some(3));
+    assert!(steps.next() == Some(6));
+    assert!(steps.next() == Some(9));
+    assert!(steps.next().is_none());
+}
+
+fn test_cloned_copied_semantics() {
+    let src = [CloneOnly(5), CloneOnly(15)];
+    let mut iter = src.iter().cloned();
+    assert!(iter.next().unwrap().0 == 5);
+    assert!(iter.next().unwrap().0 == 15);
+
+    let src_copy = [Marker, Marker];
+    let mut iter_copy = src_copy.iter().copied();
+    assert!(iter_copy.next().is_some());
+}
+
+fn test_custom_exact_size_double_ended() {
+    let mut range = BidirectionalRange { start: 10, end: 15 };
+    assert!(range.len() == 5);
+    assert!(range.next() == Some(10));
+    assert!(range.next_back() == Some(14));
+    assert!(range.len() == 3);
+    assert!(range.next_back() == Some(13));
+    assert!(range.next() == Some(11));
+    assert!(range.next() == Some(12));
+    assert!(range.next().is_none());
+    assert!(range.next_back().is_none());
+    assert!(range.len() == 0);
+}
+
+fn test_flatten_double_ended() {
+    let mut nested = [[1, 2], [3, 4]].into_iter().flatten();
+
+    // Flatten is DoubleEnded if both outer and inner iterators are DoubleEnded.
+    assert!(nested.next() == Some(1));
+    assert!(nested.next_back() == Some(4));
+    assert!(nested.next_back() == Some(3));
+    assert!(nested.next() == Some(2));
+    assert!(nested.next().is_none());
+    assert!(nested.next_back().is_none());
+}
+
+fn test_nested_size_hint_propagation() {
+    let a = [1, 2].into_iter();
+    let b = [3, 4, 5].into_iter();
+
+    let chained = a.chain(b);
+    assert!(chained.size_hint() == (5, Some(5)));
+
+    let filtered = chained.filter(|&x| x % 2 == 0);
+    assert!(filtered.size_hint() == (0, Some(5)));
+
+    let mapped = filtered.map(|x| x * 2);
+    assert!(mapped.size_hint() == (0, Some(5)));
+}
+
+fn test_partial_array_into_iter_drop() {
+    unsafe {
+        DROP_TOTAL = 0;
+    }
+    {
+        let mut iter = [DropToken(10), DropToken(20), DropToken(30)].into_iter();
+
+        let first = iter.next();
+        drop(first);
+        assert!(unsafe { DROP_TOTAL } == 10);
+    }
+    assert!(unsafe { DROP_TOTAL } == 60);
+}
+
 fn main() {
     array_iteration();
     borrowed_iteration();
@@ -451,4 +680,18 @@ fn main() {
     generator_and_transform_adapters();
     double_ended_and_short_circuiting();
     drop_behavior();
+    test_zip_edge_cases();
+    test_chain_edge_cases();
+    test_peek_mut();
+    test_unzip_and_partition();
+    test_fused_iterator_guarantees();
+    test_char_and_str_iterators();
+    test_drop_propagation_in_adapters();
+    test_by_ref_borrowing_scopes();
+    test_step_by_mechanics();
+    test_cloned_copied_semantics();
+    test_custom_exact_size_double_ended();
+    test_flatten_double_ended();
+    test_nested_size_hint_propagation();
+    test_partial_array_into_iter_drop();
 }
