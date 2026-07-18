@@ -35,7 +35,7 @@ Minimum requirements are as follows:
 
 Additionally, compiling directly to JVM bytecode avoids the deployment friction of native FFI layers (such as Project Panama) in environments where loading native shared libraries is restricted or unavailable. This makes the compiled bytecode highly portable across **sandboxed environments** (such as some Minecraft mod loaders) and **Android** platforms (via DEX conversion).
 
-### It can with help re-writing JVM projects in Rust
+### It can help with re-writing JVM projects in Rust
 
 So much of the modern internet runs on a JVM stack. If a company (or open-source project) wants to switch a project to native Rust for the runtime speed and energy benefits, they can't just do it overnight. `rustc_codegen_jvm`, with its rich interop, enables ergonomic gradual re-writing where the project can still target the JVM while increasing the share of Rust code, and decreasing the share of other code. Then, when the re-write is complete, the Rust code can compile to native to get the runtime speed boost, and the developers might continue using the JVM target for fast debugging/iteration or legacy compatibility purposes.
 

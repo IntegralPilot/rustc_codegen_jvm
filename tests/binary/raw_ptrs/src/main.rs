@@ -1676,6 +1676,115 @@ fn raw_doubly_linked_list_mutation() {
     }
 }
 
+fn fat_pointer_metadata_inequality() {
+    let array = [1_i32, 2, 3, 4];
+    let base_ptr = array.as_ptr();
+    
+    let slice_short: *const [i32] = core::ptr::slice_from_raw_parts(base_ptr, 2);
+    let slice_long: *const [i32] = core::ptr::slice_from_raw_parts(base_ptr, 4);
+    
+    assert_ne!(slice_short, slice_long);
+}
+
+fn zst_slice_metadata_and_queries() {
+    let zst_array = [ZeroSized, ZeroSized, ZeroSized];
+    let raw_slice: *const [ZeroSized] = &zst_array;
+
+    unsafe {
+        assert_eq!(core::ptr::metadata(raw_slice), 3);
+        assert_eq!(size_of_val_raw(raw_slice), 0);
+        assert_eq!(align_of_val_raw(raw_slice), 1);
+        
+        let fake_slice = core::ptr::slice_from_raw_parts(zst_array.as_ptr(), usize::MAX);
+        assert_eq!(size_of_val_raw(fake_slice), 0);
+    }
+}
+
+const CONST_ARRAY: [i32; 3] = [10, 20, 30];
+const CONST_PTR: *const i32 = CONST_ARRAY.as_ptr();
+
+const OFFSET_PTR: *const i32 = unsafe { CONST_PTR.add(2) };
+const PTR_ADDR_IS_NULL: bool = CONST_PTR.is_null();
+
+fn const_pointer_operations() {
+    unsafe {
+        assert_eq!(*OFFSET_PTR, 30);
+    }
+    assert!(!PTR_ADDR_IS_NULL);
+}
+
+#[derive(Copy, Clone, PartialEq, Debug)]
+#[repr(C)]
+struct VolatilePayload {
+    a: u8,
+    b: u16,
+    c: u32,
+}
+
+fn volatile_aggregate_operations() {
+    let mut storage = VolatilePayload { a: 100, b: 200, c: 300 };
+    let ptr = &mut storage as *mut VolatilePayload;
+    
+    unsafe {
+        let temp = ptr.read_volatile();
+        assert_eq!(temp.a, 100);
+        assert_eq!(temp.b, 200);
+        
+        ptr.write_volatile(VolatilePayload { a: 1, b: 2, c: 3 });
+    }
+    
+    assert_eq!(storage.a, 1);
+    assert_eq!(storage.b, 2);
+}
+
+trait Doubler {
+    fn double(&self) -> i32;
+}
+
+impl Doubler for Item {
+    fn double(&self) -> i32 {
+        self.value * 2
+    }
+}
+
+fn multi_trait_object_casting() {
+    let item = Item { value: 21 };
+    
+    let raw_inspector: *const dyn Inspector = &item;
+    let raw_doubler: *const dyn Doubler = &item;
+    
+    let data_inspector = raw_inspector.cast::<()>();
+    let data_doubler = raw_doubler.cast::<()>();
+    
+    assert_eq!(data_inspector, data_doubler);
+    
+    let metadata_inspector = core::ptr::metadata(raw_inspector);
+    let metadata_doubler = core::ptr::metadata(raw_doubler);
+    
+    assert_ne!(
+        unsafe { core::mem::transmute::<_, *const ()>(metadata_inspector) },
+        unsafe { core::mem::transmute::<_, *const ()>(metadata_doubler) }
+    );
+}
+
+fn atomic_pointer_manipulation() {
+    use core::sync::atomic::{AtomicPtr, Ordering};
+
+    let mut val_a = 42_i32;
+    let mut val_b = 84_i32;
+    
+    let atomic_ptr = AtomicPtr::new(&mut val_a as *mut i32);
+    
+    let loaded = atomic_ptr.load(Ordering::SeqCst);
+    unsafe { assert_eq!(*loaded, 42); }
+    
+    let exchanged = atomic_ptr.swap(&mut val_b as *mut i32, Ordering::SeqCst);
+    unsafe {
+        assert_eq!(*exchanged, 42);
+        assert_eq!(*atomic_ptr.load(Ordering::SeqCst), 84);
+    }
+}
+
 fn main() {
     basic_raw_pointer_round_trip();
     array_pointer_arithmetic();
@@ -1732,4 +1841,10 @@ fn main() {
     fat_pointer_equality();
     raw_dst_size_and_alignment_queries();
     raw_doubly_linked_list_mutation();
+    fat_pointer_metadata_inequality();
+    zst_slice_metadata_and_queries();
+    const_pointer_operations();
+    volatile_aggregate_operations();
+    multi_trait_object_casting();
+    atomic_pointer_manipulation();
 }
