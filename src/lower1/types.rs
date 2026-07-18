@@ -4455,6 +4455,63 @@ pub fn ty_to_oomir_type<'tcx>(
             }
             oomir::Type::Class(safe_name)
         }
+        rustc_middle::ty::TyKind::Coroutine(def_id, args) => {
+            let safe_name =
+                jvm_names::coroutine_class_for_args(tcx, *def_id, args, instance_context);
+
+            if data_types.contains_key(&safe_name) {
+                return oomir::Type::Class(safe_name);
+            }
+            // Install a recursion guard before lowering captured/saved types;
+            // a coroutine may retain another value whose type reaches back to
+            // this state machine.
+            data_types.insert(
+                safe_name.clone(),
+                oomir::DataType::Class {
+                    fields: vec![("__state".to_string(), oomir::Type::I32)],
+                    is_abstract: false,
+                    methods: HashMap::new(),
+                    super_class: Some("java/lang/Object".to_string()),
+                    interfaces: vec![],
+                },
+            );
+
+            // A coroutine is a state-machine object. Captures are prefix
+            // fields; locals live across suspension points are a separate,
+            // flattened field set shared by all state variants.
+            let mut fields = args
+                .as_coroutine()
+                .upvar_tys()
+                .iter()
+                .enumerate()
+                .filter_map(|(index, upvar_ty)| {
+                    let field_ty = ty_to_oomir_type(upvar_ty, tcx, data_types, instance_context);
+                    field_ty
+                        .has_jvm_value()
+                        .then_some((format!("arg{index}"), field_ty))
+                })
+                .collect::<Vec<_>>();
+            fields.push(("__state".to_string(), oomir::Type::I32));
+            if let Ok(layout) = tcx.coroutine_layout(*def_id, args) {
+                for (saved_local, saved_ty) in layout.field_tys.iter_enumerated() {
+                    let saved_ty = EarlyBinder::bind(tcx, saved_ty.ty)
+                        .instantiate(tcx, args)
+                        .skip_norm_wip();
+                    let field_ty = ty_to_oomir_type(saved_ty, tcx, data_types, instance_context);
+                    if field_ty.has_jvm_value() {
+                        fields.push((format!("state{}", saved_local.as_usize()), field_ty));
+                    }
+                }
+            }
+            if let Some(oomir::DataType::Class {
+                fields: existing_fields,
+                ..
+            }) = data_types.get_mut(&safe_name)
+            {
+                *existing_fields = fields;
+            }
+            oomir::Type::Class(safe_name)
+        }
         rustc_middle::ty::TyKind::FnPtr(_, _) => {
             let signature =
                 fn_ptr_signature_from_ty(resolved_ty, tcx, data_types, instance_context);

@@ -14,8 +14,8 @@ use super::{
         jvm_names,
         operand::{convert_operand, get_placeholder_operand},
         place::{
-            emit_instructions_to_get_on_own, emit_pointer_read, emit_pointer_slice_parts,
-            emit_slice_view, get_place_type, place_to_string,
+            coroutine_saved_field_name, emit_instructions_to_get_on_own, emit_pointer_read,
+            emit_pointer_slice_parts, emit_slice_view, get_place_type, place_to_string,
         },
         types::{
             ENUM_UNION_DISCRIMINANT_METHOD, adapt_simple_enum_operand,
@@ -810,25 +810,44 @@ fn emit_pointer_to_place<'tcx>(
                     TyKind::Adt(adt_def, _)
                         if tcx.is_diagnostic_item(sym::Atomic, adt_def.did())
                 );
-                let use_managed_field = matches!(
+                let use_managed_field = (matches!(
                     base_rust_ty.kind(),
                     TyKind::Adt(adt_def, _) if adt_def.is_struct() || adt_def.is_enum()
-                ) && matches!(pointer_ty, oomir::Type::Pointer(_));
+                ) || matches!(base_rust_ty.kind(), TyKind::Coroutine(..)))
+                    && matches!(pointer_ty, oomir::Type::Pointer(_));
                 let managed_field = if use_managed_field {
                     // For an enum downcast the place carrier is the concrete
                     // variant class, while the Rust type remains the base ADT.
                     let base_oomir_ty = get_place_type(&base_place, mir, tcx, instance, data_types);
                     match &base_oomir_ty {
                         oomir::Type::Class(owner_class) => {
-                            super::super::place::field_name_for_projection(
-                                owner_class,
-                                field_index.index(),
-                                base_rust_ty,
-                                tcx,
-                                data_types,
-                            )
-                            .ok()
-                            .map(|field_name| (base_oomir_ty, field_name))
+                            let coroutine_variant =
+                                base_place.projection.iter().rev().find_map(|projection| {
+                                    match projection {
+                                        ProjectionElem::Downcast(_, variant) => Some(variant),
+                                        _ => None,
+                                    }
+                                });
+                            coroutine_variant
+                                .and_then(|variant| {
+                                    coroutine_saved_field_name(
+                                        base_rust_ty,
+                                        variant,
+                                        field_index.index(),
+                                        tcx,
+                                    )
+                                })
+                                .or_else(|| {
+                                    super::super::place::field_name_for_projection(
+                                        owner_class,
+                                        field_index.index(),
+                                        base_rust_ty,
+                                        tcx,
+                                        data_types,
+                                    )
+                                    .ok()
+                                })
+                                .map(|field_name| (base_oomir_ty, field_name))
                         }
                         _ => None,
                     }
@@ -1139,6 +1158,28 @@ fn is_jvm_array_default_value(value: &oomir::Operand, element_ty: &oomir::Type) 
         (ty, oomir::Operand::Constant(oomir::Constant::Null(_))) => ty.is_jvm_reference_type(),
         _ => false,
     }
+}
+
+fn jvm_default_value(ty: &oomir::Type) -> oomir::Operand {
+    let constant = match ty {
+        oomir::Type::Boolean => oomir::Constant::Boolean(false),
+        oomir::Type::Char => oomir::Constant::Char('\0'),
+        oomir::Type::I8 => oomir::Constant::I8(0),
+        oomir::Type::U8 => oomir::Constant::U8(0),
+        oomir::Type::I16 => oomir::Constant::I16(0),
+        oomir::Type::U16 => oomir::Constant::U16(0),
+        oomir::Type::F16 => oomir::Constant::F16(0),
+        oomir::Type::I32 => oomir::Constant::I32(0),
+        oomir::Type::U32 => oomir::Constant::U32(0),
+        oomir::Type::I64 => oomir::Constant::I64(0),
+        oomir::Type::U64 => oomir::Constant::U64(0),
+        oomir::Type::F32 => oomir::Constant::F32(0.0),
+        oomir::Type::F64 => oomir::Constant::F64(0.0),
+        oomir::Type::Unit | oomir::Type::Void => oomir::Constant::Unit,
+        ty if ty.is_jvm_reference_type() => oomir::Constant::Null(ty.clone()),
+        other => panic!("no JVM default value for {other:?}"),
+    };
+    oomir::Operand::Constant(constant)
 }
 
 fn adapt_value_for_field<'tcx>(
@@ -3952,8 +3993,14 @@ pub(super) fn convert_rvalue_to_operand<'a>(
             // Get the type from the original destination place
             let aggregate_oomir_type =
                 get_place_type(original_dest_place, mir, tcx, instance, data_types);
+            let aggregate_has_jvm_value = aggregate_oomir_type.has_jvm_value();
 
             match kind {
+                rustc_middle::mir::AggregateKind::Tuple if !aggregate_has_jvm_value => {
+                    // Coroutine MIR represents unit yields and returns as empty
+                    // tuple aggregates, which have no JVM value or constructor.
+                    debug_assert!(operands.is_empty());
+                }
                 rustc_middle::mir::AggregateKind::Tuple => {
                     let tuple_class_name = match &aggregate_oomir_type {
                         oomir::Type::Class(name) => name.clone(),
@@ -4103,6 +4150,56 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                     instructions.push(oomir::Instruction::ConstructObject {
                         dest: temp_aggregate_var.clone(),
                         class_name: closure_class_name.clone(),
+                        args: constructor_args,
+                    });
+                }
+                rustc_middle::mir::AggregateKind::Coroutine(_, _) => {
+                    let coroutine_class_name = match &aggregate_oomir_type {
+                        oomir::Type::Class(name) => name.clone(),
+                        _ => panic!("Coroutine aggregate type error"),
+                    };
+                    let coroutine_fields = match data_types.get(&coroutine_class_name) {
+                        Some(oomir::DataType::Class { fields, .. }) => fields.clone(),
+                        _ => Vec::new(),
+                    };
+                    let mut constructor_args = Vec::with_capacity(coroutine_fields.len());
+                    for (field_name, field_ty) in &coroutine_fields {
+                        let capture_index = field_name
+                            .strip_prefix("arg")
+                            .and_then(|index| index.parse::<usize>().ok());
+                        if let Some((capture_index, mir_operand)) =
+                            capture_index.and_then(|index| {
+                                operands
+                                    .get(FieldIdx::from_usize(index))
+                                    .map(|op| (index, op))
+                            })
+                        {
+                            let value = convert_operand(
+                                mir_operand,
+                                tcx,
+                                instance,
+                                mir,
+                                data_types,
+                                &mut instructions,
+                            );
+                            let value = adapt_value_for_field(
+                                value,
+                                mir_operand.ty(&mir.local_decls, tcx),
+                                field_ty,
+                                &format!("{temp_aggregate_var}_field_{capture_index}"),
+                                tcx,
+                                instance,
+                                data_types,
+                                &mut instructions,
+                            );
+                            constructor_args.push((value, field_ty.clone()));
+                        } else {
+                            constructor_args.push((jvm_default_value(field_ty), field_ty.clone()));
+                        }
+                    }
+                    instructions.push(oomir::Instruction::ConstructObject {
+                        dest: temp_aggregate_var.clone(),
+                        class_name: coroutine_class_name,
                         args: constructor_args,
                     });
                 }
@@ -4637,9 +4734,13 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                 }
             }
 
-            result_operand = oomir::Operand::Variable {
-                name: temp_aggregate_var,
-                ty: aggregate_oomir_type,
+            result_operand = if aggregate_has_jvm_value {
+                oomir::Operand::Variable {
+                    name: temp_aggregate_var,
+                    ty: aggregate_oomir_type,
+                }
+            } else {
+                oomir::Operand::Constant(oomir::Constant::Unit)
             };
         }
         Rvalue::RawPtr(kind, place) => {
@@ -4742,7 +4843,42 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                 ),
             };
 
-            let place_mir_ty = place.ty(&mir.local_decls, tcx).ty;
+            let place_mir_ty =
+                normalize_unsize_ty(place.ty(&mir.local_decls, tcx).ty, tcx, instance);
+            if matches!(place_mir_ty.kind(), TyKind::Coroutine(..)) {
+                instructions.push(oomir::Instruction::GetField {
+                    dest: temp_discriminant_var.clone(),
+                    object: oomir::Operand::Variable {
+                        name: actual_value_var_name,
+                        ty: actual_value_oomir_type,
+                    },
+                    field_name: "__state".to_string(),
+                    field_ty: oomir::Type::I32,
+                    owner_class: place_class_name,
+                });
+                let result_ty = get_place_type(original_dest_place, mir, tcx, instance, data_types);
+                if result_ty == oomir::Type::I32 {
+                    result_operand = oomir::Operand::Variable {
+                        name: temp_discriminant_var,
+                        ty: oomir::Type::I32,
+                    };
+                } else {
+                    let cast_dest = generate_temp_var_name(&base_temp_name);
+                    instructions.push(oomir::Instruction::Cast {
+                        op: oomir::Operand::Variable {
+                            name: temp_discriminant_var,
+                            ty: oomir::Type::I32,
+                        },
+                        ty: result_ty.clone(),
+                        dest: cast_dest.clone(),
+                    });
+                    result_operand = oomir::Operand::Variable {
+                        name: cast_dest,
+                        ty: result_ty,
+                    };
+                }
+                return (instructions, result_operand);
+            }
             let use_numeric_discriminant = match place_mir_ty.kind() {
                 TyKind::Adt(adt_def, _) if adt_def.is_enum() => {
                     enum_union_discriminant_supported(adt_def, tcx)

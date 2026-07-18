@@ -100,6 +100,7 @@ Here are a few selected more complex demos:
 - **Memory management:** shared and mutable references, raw pointers, stable address identity, dereferencing, typed pointer arithmetic, null pointers, pointer casts, atomics, fat-pointer and DST handling etc.
 - **Unions** support primitive values, references, tuples, structs, fixed-size arrays, and fieldless or data-carrying enums, including recursively nested combinations of these types.
 - **Transmute** between everything supported by unions (uses the same inner machinery)
+- **Coroutines:** support for basic state machines, including yield and resume operations, preservation of local variables across suspension points, move and reference captures, and handling of zero-sized types.
 - **Outputs** executable, self-contained `.jar` generation for binary crates.
 - **Testing** with integration coverage across debug and release modes for all of the above.
 

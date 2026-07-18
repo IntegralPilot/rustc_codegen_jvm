@@ -391,20 +391,29 @@ pub fn mir_to_oomir<'tcx>(
         .type_of(instance.def_id())
         .instantiate(tcx, instance.args)
         .skip_norm_wip();
-    let (params_ty, return_ty) = match instance_ty.kind() {
+    let (params_ty, return_ty): (Vec<_>, _) = match instance_ty.kind() {
         TyKind::Closure(_def_id, args) => {
             let sig = args.as_closure().sig();
-            (sig.inputs(), sig.output())
+            (
+                sig.inputs().skip_binder().iter().copied().collect(),
+                sig.output().skip_binder(),
+            )
         }
         TyKind::FnDef(_def_id, _args) => {
             // For FnDef, compute the signature from the instantiated item type
-            let mir_sig = instance_ty.fn_sig(tcx);
-            (mir_sig.inputs(), mir_sig.output())
+            let sig = instance_ty.fn_sig(tcx);
+            (
+                sig.inputs().skip_binder().iter().copied().collect(),
+                sig.output().skip_binder(),
+            )
         }
         _ => {
-            // Regular function pointer or other callable types
-            let mir_sig = instance_ty.fn_sig(tcx);
-            (mir_sig.inputs(), mir_sig.output())
+            // Compiler-generated callable bodies such as coroutines have no
+            // `FnSig`; their MIR argument locals and return place define the ABI.
+            let params = (1..=mir.arg_count)
+                .map(|index| mir.local_decls[Local::from_usize(index)].ty)
+                .collect();
+            (params, mir.local_decls[Local::from_usize(0)].ty)
         }
     };
 
@@ -414,7 +423,6 @@ pub fn mir_to_oomir<'tcx>(
     );
 
     let mut params_oomir: Vec<(String, oomir::Type)> = params_ty
-        .skip_binder()
         .iter()
         .enumerate()
         .map(|(i, ty)| {
@@ -458,8 +466,7 @@ pub fn mir_to_oomir<'tcx>(
         ));
     }
 
-    let return_oomir_ty: oomir::Type =
-        ty_to_oomir_type(return_ty.skip_binder(), tcx, data_types, instance);
+    let return_oomir_ty: oomir::Type = ty_to_oomir_type(return_ty, tcx, data_types, instance);
 
     let mut signature = oomir::Signature {
         params: params_oomir,

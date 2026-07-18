@@ -1616,8 +1616,26 @@ pub(super) fn convert_basic_block<'tcx>(
                 place,
                 variant_index,
             } => {
-                let enum_ty = place.ty(&mir.local_decls, tcx).ty;
-                if let Some(value) = super::value_repr::construct_fieldless_enum_variant(
+                let enum_ty = EarlyBinder::bind(tcx, place.ty(&mir.local_decls, tcx).ty)
+                    .instantiate(tcx, instance.args)
+                    .skip_norm_wip();
+                if matches!(enum_ty.kind(), TyKind::Coroutine(..)) {
+                    let (object_name, object_instructions, object_ty) =
+                        emit_instructions_to_get_on_own(place, tcx, instance, mir, data_types);
+                    instructions.extend(object_instructions);
+                    let oomir::Type::Class(owner_class) = object_ty else {
+                        panic!("coroutine discriminant target is not a JVM class");
+                    };
+                    instructions.push(oomir::Instruction::SetField {
+                        object: object_name,
+                        field_name: "__state".to_string(),
+                        field_ty: oomir::Type::I32,
+                        value: oomir::Operand::Constant(oomir::Constant::I32(
+                            variant_index.as_u32() as i32,
+                        )),
+                        owner_class,
+                    });
+                } else if let Some(value) = super::value_repr::construct_fieldless_enum_variant(
                     enum_ty,
                     *variant_index,
                     &format!("{}_variant", super::place::place_to_string(place, tcx)),
@@ -1809,9 +1827,29 @@ pub(super) fn convert_basic_block<'tcx>(
                                 sig.output().skip_binder(),
                             )
                         }
-                        _ => {
+                        TyKind::FnDef(..) | TyKind::FnPtr(..) => {
                             let sig = instance_ty.fn_sig(tcx).skip_binder();
                             (sig.inputs().to_vec(), sig.output())
+                        }
+                        _ => {
+                            // Compiler-generated callable bodies have no `FnSig`;
+                            // their MIR argument locals and return place define the ABI.
+                            let body = tcx.instance_mir(func_instance.def);
+                            let inputs = (1..=body.arg_count)
+                                .map(|index| {
+                                    EarlyBinder::bind(
+                                        tcx,
+                                        body.local_decls[Local::from_usize(index)].ty,
+                                    )
+                                    .instantiate(tcx, func_instance.args)
+                                    .skip_norm_wip()
+                                })
+                                .collect();
+                            let output =
+                                EarlyBinder::bind(tcx, body.local_decls[Local::from_usize(0)].ty)
+                                    .instantiate(tcx, func_instance.args)
+                                    .skip_norm_wip();
+                            (inputs, output)
                         }
                     };
 

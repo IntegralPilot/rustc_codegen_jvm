@@ -105,6 +105,39 @@ pub fn closure_class_for_args<'tcx>(
     format!("{}/{}", crate_root(tcx, def_id.krate), name)
 }
 
+pub fn coroutine_class_for_args<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: DefId,
+    args: GenericArgsRef<'tcx>,
+    instance_context: Instance<'tcx>,
+) -> String {
+    let base = disambiguated_def_path_token(tcx, def_id);
+    let mut data_types = std::collections::HashMap::new();
+    let generic_tokens = args
+        .as_coroutine()
+        .parent_args()
+        .iter()
+        .copied()
+        .filter_map(|arg| {
+            super::types::readable_rust_generic_arg_name(
+                arg,
+                tcx,
+                &mut data_types,
+                instance_context,
+            )
+            .map(|token| super::types::sanitize_name_token(&token))
+        })
+        .collect::<Vec<_>>();
+    let suffix = if generic_tokens.is_empty() {
+        base
+    } else {
+        format!("{base}_{}", generic_tokens.join("_"))
+    };
+    let identity = super::types::stable_instance_key(tcx, def_id, args);
+    let name = crate::stable_hash::readable_or_hashed_name("Coroutine", &suffix, &identity, 160);
+    format!("{}/{}", crate_root(tcx, def_id.krate), name)
+}
+
 pub fn owner_class_for_function<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> String {
     let crate_name = tcx.crate_name(def_id.krate);
     let root = crate_root(tcx, def_id.krate);

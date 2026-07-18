@@ -507,8 +507,30 @@ fn field_name_from_rust_ty<'tcx>(
             .get(rustc_abi::FieldIdx::from_usize(field_index))
             .map(|field| field.ident(tcx).to_string()),
         TyKind::Adt(adt_def, _) if adt_def.is_enum() => Some(format!("field{}", field_index)),
+        TyKind::Coroutine(_, _) => Some(format!("arg{}", field_index)),
         _ => None,
     }
+}
+
+pub(super) fn coroutine_saved_field_name<'tcx>(
+    ty: Ty<'tcx>,
+    variant_index: rustc_abi::VariantIdx,
+    field_index: usize,
+    tcx: TyCtxt<'tcx>,
+) -> Option<String> {
+    let ty = match ty.kind() {
+        TyKind::Ref(_, inner, _) => *inner,
+        _ => ty,
+    };
+    let TyKind::Coroutine(def_id, args) = ty.kind() else {
+        return None;
+    };
+    let layout = tcx.coroutine_layout(*def_id, args).ok()?;
+    let saved_local = *layout
+        .variant_fields
+        .get(variant_index)?
+        .get(rustc_abi::FieldIdx::from_usize(field_index))?;
+    Some(format!("state{}", saved_local.as_usize()))
 }
 
 pub(super) fn field_name_for_projection<'tcx>(
@@ -557,6 +579,7 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
     let mut current_var = place_to_string(&current_place, tcx);
     let mut current_type = get_place_type(&current_place, mir, tcx, instance, data_types);
     let mut instructions = vec![];
+    let mut coroutine_variant = None;
     if local_uses_stable_cell(place.local, mir) {
         let pointee_type = current_type.clone();
         let value_name = format!("{}_value", local_cell_name(place.local));
@@ -814,16 +837,24 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
                     ),
                 };
 
-                let field_name = match field_name_for_projection(
-                    &owner_class_name,
-                    field_index.index(),
-                    base_rust_ty,
-                    tcx,
-                    data_types,
-                ) {
+                let field_name = match coroutine_variant
+                    .and_then(|variant| {
+                        coroutine_saved_field_name(base_rust_ty, variant, field_index.index(), tcx)
+                    })
+                    .map(Ok)
+                    .unwrap_or_else(|| {
+                        field_name_for_projection(
+                            &owner_class_name,
+                            field_index.index(),
+                            base_rust_ty,
+                            tcx,
+                            data_types,
+                        )
+                    }) {
                     Ok(name) => name,
                     Err(e) => panic!("Error getting field name: {}", e),
                 };
+                coroutine_variant = None;
 
                 // Create a temporary name for the result of this field access.
                 let next_var = format!("{}_{}", current_var, field_index.index());
@@ -1058,6 +1089,24 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
                     projection: tcx.mk_place_elems(base_place_proj_slice),
                 };
                 let base_rust_ty = base_place_for_downcast.ty(&mir.local_decls, tcx).ty;
+                let base_rust_ty = EarlyBinder::bind(tcx, base_rust_ty)
+                    .instantiate(tcx, instance.args)
+                    .skip_norm_wip();
+
+                let coroutine_ty = match base_rust_ty.kind() {
+                    TyKind::Coroutine(..) => Some(base_rust_ty),
+                    TyKind::Ref(_, inner, _) if matches!(inner.kind(), TyKind::Coroutine(..)) => {
+                        Some(*inner)
+                    }
+                    _ => None,
+                };
+                if coroutine_ty.is_some() {
+                    // Coroutine variants occupy one mutable state-machine
+                    // object. The downcast only selects how the following
+                    // field index is interpreted; no JVM cast is required.
+                    coroutine_variant = Some(variant_idx);
+                    continue;
+                }
 
                 let (adt_def, substs) = match base_rust_ty.kind() {
                     TyKind::Adt(adt, s) => (*adt, s),
@@ -1206,6 +1255,9 @@ pub fn get_place_type<'tcx>(
         let base_ty = EarlyBinder::bind(tcx, base_place.ty(&mir.local_decls, tcx).ty)
             .instantiate(tcx, instance.args)
             .skip_norm_wip();
+        if matches!(base_ty.kind(), TyKind::Coroutine(..)) {
+            return ty_to_oomir_type(base_ty, tcx, data_types, instance);
+        }
         let (adt_def, substs) = match base_ty.kind() {
             TyKind::Adt(adt_def, substs) => (*adt_def, *substs),
             TyKind::Ref(_, inner, _) => match inner.kind() {
@@ -1479,13 +1531,29 @@ pub fn emit_instructions_to_set_value<'tcx>(
                     ),
                 };
 
-                let field_name = match field_name_for_projection(
-                    &owner_class_name,
-                    field_index.index(),
-                    base_rust_ty,
-                    tcx,
-                    data_types,
-                ) {
+                let coroutine_variant =
+                    base_place
+                        .projection
+                        .iter()
+                        .rev()
+                        .find_map(|projection| match projection {
+                            ProjectionElem::Downcast(_, variant) => Some(variant),
+                            _ => None,
+                        });
+                let field_name = match coroutine_variant
+                    .and_then(|variant| {
+                        coroutine_saved_field_name(base_rust_ty, variant, field_index.index(), tcx)
+                    })
+                    .map(Ok)
+                    .unwrap_or_else(|| {
+                        field_name_for_projection(
+                            &owner_class_name,
+                            field_index.index(),
+                            base_rust_ty,
+                            tcx,
+                            data_types,
+                        )
+                    }) {
                     Ok(name) => name,
                     Err(e) => panic!("Error getting field name for SetField: {}", e),
                 };
