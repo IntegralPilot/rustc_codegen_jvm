@@ -625,8 +625,16 @@ fn emit_pointer_to_place<'tcx>(
                 if matches!(base_ty, oomir::Type::Slice(_))
                     && matches!(pointer_ty, oomir::Type::Pointer(_))
                 {
-                    let pointee_ty = place.ty(&mir.local_decls, tcx).ty;
-                    let element_ty = pointee_ty.sequence_element_type(tcx);
+                    // Resolve generic projections through the monomorphized instance;
+                    // querying an unresolved parameter's element type can ICE rustc.
+                    let pointee_ty =
+                        normalize_unsize_ty(place.ty(&mir.local_decls, tcx).ty, tcx, instance);
+                    let element_ty = match pointee_ty.kind() {
+                        TyKind::Array(element, _) | TyKind::Slice(element) => *element,
+                        other => panic!(
+                            "slice-backed dereference resolved to non-sequence pointee {other:?}"
+                        ),
+                    };
                     let element_pointer = emit_array_pointer(
                         oomir::Operand::Variable {
                             name: base_name,

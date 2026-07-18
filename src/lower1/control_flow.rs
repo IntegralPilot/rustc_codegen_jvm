@@ -578,9 +578,10 @@ pub(super) fn emit_rust_drop_value<'tcx>(
     data_types: &mut HashMap<String, oomir::DataType>,
     instructions: &mut Vec<oomir::Instruction>,
 ) {
-    let rust_ty = EarlyBinder::bind(tcx, rust_ty)
-        .instantiate(tcx, instance.args)
-        .skip_norm_wip();
+    let instantiated = EarlyBinder::bind(tcx, rust_ty).instantiate(tcx, instance.args);
+    let rust_ty = tcx
+        .try_normalize_erasing_regions(TypingEnv::fully_monomorphized(), instantiated)
+        .unwrap_or_else(|_| instantiated.skip_norm_wip());
     let oomir_ty = super::types::ty_to_oomir_type(rust_ty, tcx, data_types, instance);
     if !oomir_ty.has_jvm_value() {
         let Some(materialized) = super::value_repr::materialize_implicit_zst(
@@ -1188,7 +1189,7 @@ fn requires_compiled_static_dispatch(ty: &oomir::Type) -> bool {
     {
         return requires_compiled_static_dispatch(inner);
     }
-    matches!(ty, oomir::Type::Unit)
+    matches!(ty, oomir::Type::Unit | oomir::Type::Void)
         || ty.is_jvm_primitive_like()
         || matches!(
             ty,
@@ -2221,16 +2222,23 @@ pub(super) fn convert_basic_block<'tcx>(
                                     dispatch_receiver_ty.clone(),
                                     resolved_receiver_mir_ty,
                                 );
+                                let comparison_rhs_ty = oomir_operands
+                                    .get(1)
+                                    .and_then(oomir::Operand::get_type)
+                                    .zip(fn_inputs.get(1).copied())
+                                    .map(|(ty, mir_ty)| comparison_value_type(ty, mir_ty));
                                 let direct_equality =
                                     matches!(declared_method_name.as_str(), "eq" | "ne")
                                         && supports_direct_equality(&comparison_value_ty)
+                                        && comparison_rhs_ty.as_ref() == Some(&comparison_value_ty)
                                         && oomir_operands.len() == 2;
-                                let direct_ordering = matches!(
-                                    declared_method_name.as_str(),
-                                    "lt" | "le" | "gt" | "ge"
-                                ) && supports_direct_ordering(
-                                    &comparison_value_ty,
-                                ) && oomir_operands.len() == 2;
+                                let direct_ordering =
+                                    matches!(
+                                        declared_method_name.as_str(),
+                                        "lt" | "le" | "gt" | "ge"
+                                    ) && supports_direct_ordering(&comparison_value_ty)
+                                        && comparison_rhs_ty.as_ref() == Some(&comparison_value_ty)
+                                        && oomir_operands.len() == 2;
 
                                 let direct_wrapping_integer_op = matches!(
                                     declared_method_name.as_str(),

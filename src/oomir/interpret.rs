@@ -213,7 +213,7 @@ pub fn cast_constant(c: Constant, ty: Type) -> Option<Constant> {
         },
 
         // Non-primitive identity casts (already handled at the top) or invalid casts
-        (_, Constant::String(_)) | (_, Constant::Class(_)) | (_, Constant::Array(_, _)) => {
+        (_, Constant::String(_)) | (_, Constant::Array(_, _)) => {
             if Type::from_constant(&c) == ty {
                 Some(c)
             } else {
@@ -403,14 +403,6 @@ fn compare_constants(op1: Constant, op2: Constant) -> Option<std::cmp::Ordering>
         (Constant::String(a), Constant::String(b)) => Some(a.cmp(&b)),
 
         // Complex types (basic equality was needed for recursion, maybe add cmp?)
-        (Constant::Class(a), Constant::Class(b)) => {
-            if a == b {
-                Some(std::cmp::Ordering::Equal)
-            } else {
-                None
-            }
-        } // Only equality makes sense
-
         (Constant::Array(ty1, elems1), Constant::Array(ty2, elems2)) => {
             if ty1 != ty2 || elems1.len() != elems2.len() {
                 // Decide if different types/lengths are comparable (e.g., Less/Greater) or just None

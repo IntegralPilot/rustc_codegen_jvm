@@ -589,13 +589,13 @@ pub enum Constant {
     Char(char),
     Str(String),
     String(String),
-    Class(String),
     // 0 = the type of elements, 1 = the elements as a vec of constants
     Array(Box<Type>, Vec<Constant>),
     Slice(Box<Type>, Vec<Constant>),
     SliceRef {
         backing: Box<Constant>,
         element_type: Box<Type>,
+        offset: u64,
         length: u64,
     },
     Instance {
@@ -692,7 +692,6 @@ impl std::hash::Hash for Constant {
             Constant::Char(c) => c.hash(state),
             Constant::Str(s) => s.hash(state),
             Constant::String(s) => s.hash(state),
-            Constant::Class(s) => s.hash(state),
             Constant::Array(ty, elements) => {
                 ty.hash(state);
                 elements.hash(state);
@@ -704,10 +703,12 @@ impl std::hash::Hash for Constant {
             Constant::SliceRef {
                 backing,
                 element_type,
+                offset,
                 length,
             } => {
                 backing.hash(state);
                 element_type.hash(state);
+                offset.hash(state);
                 length.hash(state);
             }
             Constant::Instance {
@@ -1064,7 +1065,6 @@ impl Type {
             Constant::Char(_) => Type::Char,
             Constant::Str(_) => Type::Str,
             Constant::String(_) => Type::java_string(),
-            Constant::Class(name) => Type::Class(name.to_string()),
             Constant::Instance {
                 class_name, params, ..
             } if class_name == POINTER_CLASS => Type::Pointer(Box::new(if params.len() == 3 {

@@ -37,6 +37,17 @@ pub fn read_slice_constant<'tcx>(
 ) -> Result<oomir::Constant, String> {
     let allocation = match tcx.global_alloc(alloc_id) {
         GlobalAlloc::Memory(allocation) => allocation.inner(),
+        GlobalAlloc::Static(def_id) => {
+            return read_slice_from_static(
+                tcx,
+                def_id,
+                Size::ZERO,
+                len,
+                pointee_ty,
+                oomir_data_types,
+                instance,
+            );
+        }
         other => {
             return Err(format!(
                 "slice data referred to non-memory allocation {:?}",
@@ -66,7 +77,14 @@ fn read_slice_backed_value<'tcx>(
     instance: Instance<'tcx>,
 ) -> Result<oomir::Constant, String> {
     match ty.kind() {
-        TyKind::Str => read_string_from_allocation(allocation, base_offset, Some(len as usize)),
+        TyKind::Str => read_string_from_allocation(
+            allocation,
+            base_offset,
+            Some(
+                usize::try_from(len)
+                    .map_err(|_| format!("string length {len} exceeds the host address space"))?,
+            ),
+        ),
         TyKind::Slice(element_ty) => {
             let element_layout = tcx
                 .layout_of(TypingEnv::fully_monomorphized().as_query_input(*element_ty))
@@ -77,12 +95,19 @@ fn read_slice_backed_value<'tcx>(
                     )
                 })?;
             let element_type = ty_to_oomir_type(*element_ty, tcx, oomir_data_types, instance);
-            let mut elements = Vec::with_capacity(len as usize);
+            if !element_type.has_jvm_value() {
+                return Ok(oomir::Constant::Slice(Box::new(element_type), Vec::new()));
+            }
+            let len = usize::try_from(len)
+                .ok()
+                .filter(|length| *length <= i32::MAX as usize)
+                .ok_or_else(|| format!("constant slice length {len} exceeds JVM limits"))?;
+            let mut elements = Vec::with_capacity(len);
 
             for index in 0..len {
                 let element_offset = element_layout
                     .size
-                    .checked_mul(index, &tcx.data_layout)
+                    .checked_mul(index as u64, &tcx.data_layout)
                     .ok_or_else(|| format!("slice offset overflow at element {}", index))?;
                 elements.push(read_constant_value_from_memory(
                     tcx,
@@ -460,13 +485,21 @@ pub fn read_zero_sized_constant<'tcx>(
                 .try_to_target_usize(tcx)
                 .ok_or_else(|| format!("ZST array length is not concrete for {ty:?}"))?;
             let element_jvm_ty = ty_to_oomir_type(*element_ty, tcx, oomir_data_types, instance);
-            let mut elements = Vec::with_capacity(length as usize);
+            if !element_jvm_ty.has_jvm_value() {
+                return Ok(oomir::Constant::Array(Box::new(element_jvm_ty), Vec::new()));
+            }
+            let length = usize::try_from(length)
+                .ok()
+                .filter(|length| *length <= i32::MAX as usize)
+                .ok_or_else(|| format!("constant ZST array length {length} exceeds JVM limits"))?;
+            let mut elements = Vec::with_capacity(length);
             for _ in 0..length {
-                elements.push(if element_jvm_ty.has_jvm_value() {
-                    read_zero_sized_constant(tcx, *element_ty, oomir_data_types, instance)?
-                } else {
-                    oomir::Constant::Unit
-                });
+                elements.push(read_zero_sized_constant(
+                    tcx,
+                    *element_ty,
+                    oomir_data_types,
+                    instance,
+                )?);
             }
             Ok(oomir::Constant::Array(Box::new(element_jvm_ty), elements))
         }
@@ -652,7 +685,60 @@ fn array_reference_to_slice<'tcx>(
             oomir_data_types,
             instance,
         )),
+        offset: 0,
         length: count,
+    })
+}
+
+fn read_slice_from_static<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: rustc_span::def_id::DefId,
+    data_offset: Size,
+    len: u64,
+    slice_ty: Ty<'tcx>,
+    oomir_data_types: &mut HashMap<String, oomir::DataType>,
+    instance: Instance<'tcx>,
+) -> Result<oomir::Constant, String> {
+    let TyKind::Slice(element_ty) = slice_ty.kind() else {
+        return Err(format!(
+            "Named static-backed constant has unsupported slice type {slice_ty:?}"
+        ));
+    };
+    let element_layout = tcx
+        .layout_of(TypingEnv::fully_monomorphized().as_query_input(*element_ty))
+        .map_err(|error| format!("Could not determine static slice element layout: {error:?}"))?;
+    let element_size = element_layout.size.bytes();
+    if element_size == 0 {
+        if data_offset != Size::ZERO {
+            return Err("A zero-sized static slice had a nonzero data offset".to_string());
+        }
+    } else if data_offset.bytes() % element_size != 0 {
+        return Err(format!(
+            "Static slice byte offset {} is not aligned to its {}-byte element size",
+            data_offset.bytes(),
+            element_size
+        ));
+    }
+    let offset = if element_size == 0 {
+        0
+    } else {
+        data_offset.bytes() / element_size
+    };
+    Ok(oomir::Constant::SliceRef {
+        backing: Box::new(super::super::statics::static_ref_constant(
+            tcx,
+            def_id,
+            oomir_data_types,
+            instance,
+        )),
+        element_type: Box::new(ty_to_oomir_type(
+            *element_ty,
+            tcx,
+            oomir_data_types,
+            instance,
+        )),
+        offset,
+        length: len,
     })
 }
 
@@ -838,6 +924,15 @@ fn read_slice_from_fat_pointer<'tcx>(
         GlobalAlloc::Memory(const_alloc) => read_slice_backed_value(
             tcx,
             const_alloc.inner(),
+            data_offset,
+            len,
+            slice_ty,
+            oomir_data_types,
+            instance,
+        ),
+        GlobalAlloc::Static(def_id) => read_slice_from_static(
+            tcx,
+            def_id,
             data_offset,
             len,
             slice_ty,
@@ -1113,11 +1208,24 @@ pub fn read_constant_value_from_memory<'tcx>(
                 .layout_of(elem_pci)
                 .map_err(|_| "Couldn't get element layout.".to_string())?;
             let oomir_elem_type = ty_to_oomir_type(*elem_ty, tcx, oomir_data_types, instance);
+            if !oomir_elem_type.has_jvm_value() {
+                return Ok(oomir::Constant::Array(
+                    Box::new(oomir_elem_type),
+                    Vec::new(),
+                ));
+            }
 
-            let mut values = Vec::with_capacity(len as usize);
+            let len = usize::try_from(len)
+                .ok()
+                .filter(|length| *length <= i32::MAX as usize)
+                .ok_or_else(|| format!("constant array length {len} exceeds JVM limits"))?;
+            let mut values = Vec::with_capacity(len);
             for i in 0..len {
-                let elem_offset =
-                    offset + elem_layout.size.checked_mul(i, &tcx.data_layout).unwrap();
+                let elem_offset = offset
+                    + elem_layout
+                        .size
+                        .checked_mul(i as u64, &tcx.data_layout)
+                        .ok_or_else(|| format!("constant array offset overflow at element {i}"))?;
                 let elem_const = read_constant_value_from_memory(
                     tcx,
                     allocation,

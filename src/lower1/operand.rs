@@ -13,6 +13,47 @@ use std::collections::HashMap;
 
 pub(super) mod const_eval;
 
+fn default_operand_for_oomir_type(ty: &oomir::Type) -> oomir::Operand {
+    let constant = match ty {
+        oomir::Type::Boolean => oomir::Constant::Boolean(false),
+        oomir::Type::Char => oomir::Constant::Char('\0'),
+        oomir::Type::I8 => oomir::Constant::I8(0),
+        oomir::Type::U8 => oomir::Constant::U8(0),
+        oomir::Type::I16 => oomir::Constant::I16(0),
+        oomir::Type::U16 => oomir::Constant::U16(0),
+        oomir::Type::F16 => oomir::Constant::F16(0),
+        oomir::Type::I32 => oomir::Constant::I32(0),
+        oomir::Type::U32 => oomir::Constant::U32(0),
+        oomir::Type::I64 => oomir::Constant::I64(0),
+        oomir::Type::U64 => oomir::Constant::U64(0),
+        oomir::Type::F32 => oomir::Constant::F32(0.0),
+        oomir::Type::F64 => oomir::Constant::F64(0.0),
+        oomir::Type::Unit | oomir::Type::Void => oomir::Constant::Unit,
+        ty if ty.is_jvm_reference_type() => oomir::Constant::Null(ty.clone()),
+        other => panic!("no JVM default constant for {other:?}"),
+    };
+    oomir::Operand::Constant(constant)
+}
+
+fn default_operand_for_rust_type<'tcx>(
+    ty: Ty<'tcx>,
+    tcx: TyCtxt<'tcx>,
+    data_types: &mut HashMap<String, oomir::DataType>,
+    instance: Instance<'tcx>,
+) -> oomir::Operand {
+    let instantiated = EarlyBinder::bind(tcx, ty)
+        .instantiate(tcx, instance.args)
+        .skip_norm_wip();
+    let normalized = tcx
+        .try_normalize_erasing_regions(
+            TypingEnv::fully_monomorphized(),
+            rustc_middle::ty::Unnormalized::new_wip(instantiated),
+        )
+        .unwrap_or(instantiated);
+    let oomir_ty = super::types::ty_to_oomir_type(normalized, tcx, data_types, instance);
+    default_operand_for_oomir_type(&oomir_ty)
+}
+
 /// Convert a MIR operand to an OOMIR operand.
 pub fn convert_operand<'tcx>(
     mir_op: &MirOperand<'tcx>,
@@ -47,7 +88,7 @@ pub fn convert_operand<'tcx>(
                                     kind
                                 )
                             );
-                            oomir::Operand::Constant(oomir::Constant::I32(-1))
+                            default_operand_for_rust_type(const_ty, tcx, data_types, instance)
                         }
                     }
                 }
@@ -72,7 +113,7 @@ pub fn convert_operand<'tcx>(
                             "const-eval",
                             format!("Skipping evaluation of generic constant {:?}", uv)
                         );
-                        return oomir::Operand::Constant(oomir::Constant::I32(-2));
+                        return default_operand_for_rust_type(ty, tcx, data_types, instance);
                     }
 
                     // Create the parameter environment. reveal_all is usually okay for codegen.
@@ -116,7 +157,7 @@ pub fn convert_operand<'tcx>(
                                 )
                             );
                             // You might want to propagate this error or panic.
-                            oomir::Operand::Constant(oomir::Constant::I32(-1)) // Error placeholder
+                            default_operand_for_rust_type(ty, tcx, data_types, instance)
                         }
                         Err(ErrorHandled::TooGeneric(..)) => {
                             // The constant couldn't be evaluated because it depends on generic
@@ -130,7 +171,7 @@ pub fn convert_operand<'tcx>(
                                     uv, span
                                 )
                             );
-                            oomir::Operand::Constant(oomir::Constant::I32(-2)) // Placeholder for generic error
+                            default_operand_for_rust_type(ty, tcx, data_types, instance)
                         }
                     }
                 }
@@ -185,7 +226,7 @@ pub fn handle_const_value<'tcx>(
                             ty, e
                         )
                     );
-                    oomir::Operand::Constant(oomir::Constant::I32(-1))
+                    default_operand_for_rust_type(ty, tcx, data_types, instance)
                 }
             },
             Scalar::Ptr(pointer, _) => {
@@ -200,7 +241,7 @@ pub fn handle_const_value<'tcx>(
                                 ty, e
                             )
                         );
-                        oomir::Operand::Constant(oomir::Constant::I32(0))
+                        default_operand_for_rust_type(ty, tcx, data_types, instance)
                     }
                 }
             }
@@ -218,9 +259,7 @@ pub fn handle_const_value<'tcx>(
                         ty, tail_ty
                     )
                 );
-                return oomir::Operand::Constant(oomir::Constant::String(
-                    "UnsupportedSliceTail".to_string(),
-                ));
+                return default_operand_for_rust_type(ty, tcx, data_types, instance);
             }
 
             match const_eval::read_slice_constant(
@@ -236,7 +275,7 @@ pub fn handle_const_value<'tcx>(
                             ty, error
                         )
                     );
-                    oomir::Operand::Constant(oomir::Constant::String("SliceReadError".to_string()))
+                    default_operand_for_rust_type(ty, tcx, data_types, instance)
                 }
             }
         }
@@ -254,7 +293,7 @@ pub fn handle_const_value<'tcx>(
                         "const-eval",
                         format!("Failed to materialize ZST constant {ty:?}: {error}")
                     );
-                    oomir::Operand::Constant(oomir::Constant::Unit)
+                    default_operand_for_rust_type(ty, tcx, data_types, instance)
                 }
             }
         }
@@ -298,8 +337,7 @@ pub fn handle_const_value<'tcx>(
                                     ty, alloc_id, e
                                 )
                             );
-                            // Return an error placeholder, maybe distinct from other errors
-                            oomir::Operand::Constant(oomir::Constant::I64(-60))
+                            default_operand_for_rust_type(ty, tcx, data_types, instance)
                         }
                     }
                 }
@@ -313,7 +351,7 @@ pub fn handle_const_value<'tcx>(
                             other_alloc, alloc_id, ty
                         )
                     );
-                    oomir::Operand::Constant(oomir::Constant::I64(-61))
+                    default_operand_for_rust_type(ty, tcx, data_types, instance)
                 }
             }
         }
@@ -328,33 +366,16 @@ pub fn get_placeholder_operand<'tcx>(
     data_types: &mut HashMap<String, oomir::DataType>,
 ) -> oomir::Operand {
     let dest_oomir_type = get_place_type(dest_place, mir, tcx, instance, data_types);
-    if dest_oomir_type.is_jvm_reference_type() {
-        // Destination needs a reference, use Null placeholder
-        breadcrumbs::log!(
-            breadcrumbs::LogLevel::Info,
-            "const-eval",
-            format!(
-                "Info: Generating Object placeholder for unhandled assignment to reference type var '{}' ({:?})",
-                place_to_string(dest_place, tcx),
-                dest_oomir_type
-            )
-        );
-        oomir::Operand::Constant(oomir::Constant::Class(
-            "java/lang/Object".to_string(), // Use Object as a placeholder
-        ))
-    } else {
-        // Destination is likely a primitive, use I32(0) as placeholder
-        breadcrumbs::log!(
-            breadcrumbs::LogLevel::Info,
-            "const-eval",
-            format!(
-                "Info: Generating I32(0) placeholder for unhandled assignment to primitive type var '{}' ({:?})",
-                place_to_string(dest_place, tcx),
-                dest_oomir_type
-            )
-        );
-        oomir::Operand::Constant(oomir::Constant::I32(0))
-    }
+    breadcrumbs::log!(
+        breadcrumbs::LogLevel::Info,
+        "const-eval",
+        format!(
+            "Info: Generating a typed default placeholder for unhandled assignment to '{}' ({:?})",
+            place_to_string(dest_place, tcx),
+            dest_oomir_type
+        )
+    );
+    default_operand_for_oomir_type(&dest_oomir_type)
 }
 
 // For when you have an OOMIR Operand but just want the inner number it holds (only works for Consts)

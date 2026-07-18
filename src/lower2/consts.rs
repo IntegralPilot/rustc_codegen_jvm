@@ -181,14 +181,6 @@ pub fn load_constant(
         OC::Null(_) => {
             instructions_to_add.push(JI::Aconst_null);
         }
-        OC::Class(c) => {
-            let index = cp.add_class(c)?;
-            instructions_to_add.push(if let Ok(idx8) = u8::try_from(index) {
-                JI::Ldc(idx8)
-            } else {
-                JI::Ldc_w(index)
-            });
-        }
         OC::Slice(element_type, elements) => {
             let class_index = cp.add_class(oomir::SLICE_VIEW_CLASS)?;
             let constructor =
@@ -205,7 +197,10 @@ pub fn load_constant(
             instructions_to_add.push(JI::Invokespecial(constructor));
         }
         OC::SliceRef {
-            backing, length, ..
+            backing,
+            offset,
+            length,
+            ..
         } => {
             let class_index = cp.add_class(oomir::SLICE_VIEW_CLASS)?;
             let constructor =
@@ -213,8 +208,20 @@ pub fn load_constant(
             instructions_to_add.push(JI::New(class_index));
             instructions_to_add.push(JI::Dup);
             load_constant(&mut instructions_to_add, cp, backing)?;
-            instructions_to_add.push(JI::Iconst_0);
-            instructions_to_add.push(get_int_const_instr(cp, *length as i32));
+            instructions_to_add.push(get_int_const_instr(
+                cp,
+                i32::try_from(*offset).map_err(|_| jvm::Error::VerificationError {
+                    context: format!("Attempting to load constant {constant:?}"),
+                    message: "Constant slice offset exceeds the JVM address space".to_string(),
+                })?,
+            ));
+            instructions_to_add.push(get_int_const_instr(
+                cp,
+                i32::try_from(*length).map_err(|_| jvm::Error::VerificationError {
+                    context: format!("Attempting to load constant {constant:?}"),
+                    message: "Constant slice length exceeds the JVM address space".to_string(),
+                })?,
+            ));
             instructions_to_add.push(JI::Invokespecial(constructor));
         }
         OC::Array(elem_ty, elements) => {

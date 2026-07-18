@@ -88,6 +88,7 @@ fn create_constant_factory(
         oomir::Constant::SliceRef {
             backing,
             element_type,
+            offset,
             length,
         } => oomir::Constant::SliceRef {
             backing: Box::new(create_constant_factory(
@@ -98,6 +99,7 @@ fn create_constant_factory(
                 next_factory,
             )?),
             element_type: element_type.clone(),
+            offset: *offset,
             length: *length,
         },
         oomir::Constant::Instance {
