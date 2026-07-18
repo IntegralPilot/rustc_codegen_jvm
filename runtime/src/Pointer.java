@@ -21,6 +21,8 @@ import java.util.concurrent.atomic.AtomicLong;
 public final class Pointer {
     private static final String MANAGED_OBJECT_VIEW_CODEC = "@managed-object";
     private static final String RAW_POINTER_VIEW_CODEC = "@raw-pointer";
+    private static final String SLICE_POINTER_VIEW_CODEC_PREFIX = "@slice-pointer\n";
+    private static final String TRAIT_POINTER_VIEW_CODEC_PREFIX = "@trait-pointer\n";
     private static final String SIGNED_BIG_INTEGER_CODEC = "@signed-big-integer";
     private static final String UNSIGNED_BIG_INTEGER_CODEC = "@unsigned-big-integer";
     private static final String F128_CODEC = "@f128";
@@ -57,6 +59,15 @@ public final class Pointer {
 
     private static boolean isSliceViewType(Class<?> type) {
         return type != null && SLICE_VIEW_CLASS_NAME.equals(type.getName());
+    }
+
+    private static boolean isSliceViewCarrierType(Class<?> type) {
+        for (Class<?> current = type; current != null; current = current.getSuperclass()) {
+            if (SLICE_VIEW_CLASS_NAME.equals(current.getName())) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -298,6 +309,9 @@ public final class Pointer {
     }
 
     private static byte[] encodeMemoryValue(Object value, int size, String codec) {
+        if (isFatPointerCodec(codec)) {
+            return encodeFatPointer(value, size, codec);
+        }
         if (codec != null
                 && !MANAGED_OBJECT_VIEW_CODEC.equals(codec)
                 && !RAW_POINTER_VIEW_CODEC.equals(codec)
@@ -348,6 +362,9 @@ public final class Pointer {
 
     private static Object decodeMemoryValue(
             byte[] bytes, int offset, int size, String codec, Class<?> componentType) {
+        if (isFatPointerCodec(codec)) {
+            return decodeFatPointer(bytes, offset, size, codec);
+        }
         if (codec != null
                 && !MANAGED_OBJECT_VIEW_CODEC.equals(codec)
                 && !RAW_POINTER_VIEW_CODEC.equals(codec)
@@ -379,6 +396,132 @@ public final class Pointer {
             return pointerObjectFromAddress(bits);
         }
         return carrierFromBits(defaultValue(componentType), bits, size);
+    }
+
+    private static boolean isFatPointerCodec(String codec) {
+        return codec != null
+                && (codec.startsWith(SLICE_POINTER_VIEW_CODEC_PREFIX)
+                        || codec.startsWith(TRAIT_POINTER_VIEW_CODEC_PREFIX));
+    }
+
+    private static int fatPointerWordSize(int size) {
+        int wordSize = size / 2;
+        if (size % 2 != 0 || (wordSize != 4 && wordSize != 8)) {
+            throw new IllegalArgumentException(
+                    "Rust fat pointer must contain two 32- or 64-bit words, found " + size
+                            + " bytes");
+        }
+        return wordSize;
+    }
+
+    private static void writeMemoryWord(byte[] bytes, int offset, int size, long value) {
+        for (int index = 0; index < size; index++) {
+            bytes[offset + index] = (byte) (value >>> (index * 8));
+        }
+    }
+
+    private static long readMemoryWord(byte[] bytes, int offset, int size) {
+        long value = 0;
+        for (int index = 0; index < size; index++) {
+            value |= ((long) bytes[offset + index] & 0xffL) << (index * 8);
+        }
+        return value;
+    }
+
+    private static String[] slicePointerDescriptor(String codec) {
+        String descriptor = codec.substring(SLICE_POINTER_VIEW_CODEC_PREFIX.length());
+        // The element codec may itself be a structured fat-pointer codec, so
+        // only the carrier and element-size separators are structural here.
+        String[] parts = descriptor.split("\\n", 3);
+        if (parts.length != 3) {
+            throw new IllegalArgumentException("invalid Rust slice-pointer codec descriptor");
+        }
+        return parts;
+    }
+
+    private static int slicePointerElementSize(String[] descriptor) {
+        try {
+            int size = Integer.parseInt(descriptor[1]);
+            if (size < 0) {
+                throw new IllegalArgumentException("negative Rust slice element size");
+            }
+            return size;
+        } catch (NumberFormatException error) {
+            throw new IllegalArgumentException("invalid Rust slice element size", error);
+        }
+    }
+
+    private static byte[] encodeFatPointer(Object value, int size, String codec) {
+        int wordSize = fatPointerWordSize(size);
+        byte[] image = new byte[size];
+        if (value == null) {
+            return image;
+        }
+
+        long dataAddress;
+        long pointerMetadata;
+        if (codec.startsWith(SLICE_POINTER_VIEW_CODEC_PREFIX)) {
+            String[] descriptor = slicePointerDescriptor(codec);
+            int elementSize = slicePointerElementSize(descriptor);
+            String elementCodec = descriptor[2].isEmpty() ? null : descriptor[2];
+            Pointer data = fromSlice(value, elementSize, elementCodec);
+            dataAddress = data.address();
+            try {
+                pointerMetadata = Integer.toUnsignedLong(
+                        instanceField(value.getClass(), "length").getInt(value));
+            } catch (ReflectiveOperationException error) {
+                throw new IllegalArgumentException("invalid Rust slice fat pointer", error);
+            }
+        } else {
+            if (!(value instanceof Pointer)) {
+                throw new IllegalArgumentException(
+                        "Rust raw trait-object pointer requires a Pointer carrier");
+            }
+            Pointer pointer = (Pointer) value;
+            String metadataClass = codec.substring(TRAIT_POINTER_VIEW_CODEC_PREFIX.length());
+            dataAddress = erasedAddress(pointer);
+            pointerMetadata = traitMetadataMarker(pointer, metadataClass).address();
+        }
+
+        writeMemoryWord(image, 0, wordSize, dataAddress);
+        writeMemoryWord(image, wordSize, wordSize, pointerMetadata);
+        return image;
+    }
+
+    private static Object decodeFatPointer(
+            byte[] bytes, int offset, int size, String codec) {
+        int wordSize = fatPointerWordSize(size);
+        long dataAddress = readMemoryWord(bytes, offset, wordSize);
+        long pointerMetadata = readMemoryWord(bytes, offset + wordSize, wordSize);
+        if (codec.startsWith(TRAIT_POINTER_VIEW_CODEC_PREFIX)) {
+            return pointerObjectFromAddress(dataAddress);
+        }
+
+        String[] descriptor = slicePointerDescriptor(codec);
+        int elementSize = slicePointerElementSize(descriptor);
+        String elementCodec = descriptor[2].isEmpty() ? null : descriptor[2];
+        Pointer data = pointerObjectFromAddress(dataAddress).retype(elementSize, elementCodec);
+        try {
+            Class<?> viewClass = Class.forName(descriptor[0].replace('/', '.'));
+            return viewClass
+                    .getConstructor(Object.class, int.class, int.class)
+                    .newInstance(data, 0, Math.toIntExact(pointerMetadata));
+        } catch (ReflectiveOperationException error) {
+            throw new IllegalStateException("could not reconstruct Rust slice fat pointer", error);
+        }
+    }
+
+    /** Writes a JVM fat-pointer carrier using Rust's native two-word layout. */
+    public static void encodeFatPointerMemory(
+            Object value, byte[] bytes, int offset, int size, String codec) {
+        byte[] image = encodeFatPointer(value, size, codec);
+        System.arraycopy(image, 0, bytes, offset, size);
+    }
+
+    /** Reconstructs a JVM fat-pointer carrier from Rust's native two-word layout. */
+    public static Object decodeFatPointerMemory(
+            byte[] bytes, int offset, int size, String codec) {
+        return decodeFatPointer(bytes, offset, size, codec);
     }
 
     private static boolean isRustFunctionPointer(Class<?> valueClass) {
@@ -938,7 +1081,13 @@ public final class Pointer {
     }
 
     private static final class ExposedTarget {
-        private final WeakReference<Object> allocation;
+        // A JVM GC cannot see reachability through the numeric addresses that
+        // Rust stores in raw-pointer fields.  Once an allocation's address is
+        // exposed, retain its backing object conservatively so a later
+        // pointer decode cannot turn a still-live Rust pointer into a dangling
+        // JVM reference merely because no Pointer carrier was live at a GC
+        // safepoint.
+        private final Object allocation;
         private final int allocationElementSize;
         private final long byteOffset;
         private final String codecClassName;
@@ -958,7 +1107,7 @@ public final class Pointer {
                 long metadata,
                 int zeroSizedSourceViewSize,
                 String zeroSizedSourceViewCodecClassName) {
-            this.allocation = new WeakReference<>(allocation);
+            this.allocation = allocation;
             this.allocationElementSize = allocationElementSize;
             this.byteOffset = byteOffset;
             this.codecClassName = codecClassName;
@@ -978,6 +1127,7 @@ public final class Pointer {
     private final String viewCodecClassName;
     private final long exposedAddress;
     private MemoryViewState boundMemoryViewState;
+    private long erasedAddressToken = -1;
     private long metadata = -1;
     private int zeroSizedSourceViewSize = -1;
     private String zeroSizedSourceViewCodecClassName;
@@ -1249,9 +1399,32 @@ public final class Pointer {
                 return null;
             }
             copy(source, destination, Math.min(oldSize, newSize));
+            deallocateBytes(source);
             return destination;
         } catch (IllegalArgumentException | ArithmeticException | OutOfMemoryError failure) {
             return null;
+        }
+    }
+
+    /** Releases a byte allocation after Rust's allocator has ended its lifetime. */
+    public static void deallocateBytes(Pointer pointer) {
+        if (pointer == null || pointer.allocation == null) {
+            return;
+        }
+        Object allocation = pointer.allocation;
+        synchronized (ALLOCATION_BASES) {
+            ALLOCATION_BASES.remove(allocation);
+            ALLOCATION_ELEMENT_SIZES.remove(allocation);
+            ALLOCATION_ALIGNMENTS.remove(allocation);
+            ALLOCATION_CODECS.remove(allocation);
+            EXPOSED_ADDRESSES.entrySet().removeIf(
+                    entry -> entry.getValue().allocation == allocation);
+        }
+        synchronized (MEMORY_VIEWS) {
+            MEMORY_VIEWS.remove(allocation);
+        }
+        synchronized (STRUCTURAL_VIEWS) {
+            STRUCTURAL_VIEWS.remove(allocation);
         }
     }
 
@@ -1307,6 +1480,11 @@ public final class Pointer {
         try {
             Field arrayField = sliceView.getClass().getField("array");
             Object array = arrayField.get(sliceView);
+            if (array instanceof Pointer) {
+                Pointer pointer = (Pointer) array;
+                return fromSlice(
+                        sliceView, pointer.viewSize, pointer.viewCodecClassName);
+            }
             return fromSlice(sliceView, inferredArrayElementSize(array));
         } catch (ReflectiveOperationException error) {
             throw new IllegalArgumentException("invalid Rust slice view", error);
@@ -1344,7 +1522,7 @@ public final class Pointer {
         synchronized (ALLOCATION_BASES) {
             ExposedTarget target = EXPOSED_ADDRESSES.get(address);
             if (target != null) {
-                Object allocation = target.allocation.get();
+                Object allocation = target.allocation;
                 if (allocation != null) {
                     return new Pointer(
                             allocation,
@@ -1355,7 +1533,6 @@ public final class Pointer {
                             viewCodecClassName,
                             -1).withMetadata(target.metadata);
                 }
-                EXPOSED_ADDRESSES.remove(address);
             }
             for (Map.Entry<Object, Long> entry : ALLOCATION_BASES.entrySet()) {
                 Object allocation = entry.getKey();
@@ -1433,7 +1610,7 @@ public final class Pointer {
         synchronized (ALLOCATION_BASES) {
             ExposedTarget target = EXPOSED_ADDRESSES.get(address);
             if (target != null) {
-                Object allocation = target.allocation.get();
+                Object allocation = target.allocation;
                 if (allocation != null) {
                     Pointer pointer = new Pointer(
                             allocation,
@@ -1448,7 +1625,6 @@ public final class Pointer {
                             target.zeroSizedSourceViewCodecClassName;
                     return pointer;
                 }
-                EXPOSED_ADDRESSES.remove(address);
             }
         }
         return fromAddress(address, 1);
@@ -1549,6 +1725,14 @@ public final class Pointer {
         return pointer.retype(newViewSize, newViewCodecClassName);
     }
 
+    public static Pointer retypeWithMetadata(
+            Pointer pointer,
+            int newViewSize,
+            String newViewCodecClassName,
+            long metadata) {
+        return pointer.retype(newViewSize, newViewCodecClassName).withMetadata(metadata);
+    }
+
     /** Creates a coherent JVM carrier view for a Rust struct-tail unsizing coercion. */
     public static Pointer unsizeStruct(
             Pointer pointer, int newViewSize, String targetClassName) {
@@ -1605,6 +1789,30 @@ public final class Pointer {
             throw new IllegalStateException("pointer does not carry dynamically sized metadata");
         }
         return metadata;
+    }
+
+    /** Computes the dynamic layout size of a slice/str or a slice-tailed DST. */
+    public static long sizeOfSliceTailed(
+            Object value, long prefixSize, long elementSize, long alignment) {
+        if (prefixSize < 0 || elementSize < 0
+                || alignment <= 0 || (alignment & (alignment - 1)) != 0) {
+            throw new IllegalArgumentException("invalid Rust dynamically sized layout");
+        }
+        long length;
+        if (value instanceof Pointer) {
+            length = ((Pointer) value).metadata();
+        } else if (value != null && isSliceViewCarrierType(value.getClass())) {
+            try {
+                length = Integer.toUnsignedLong(
+                        instanceField(value.getClass(), "length").getInt(value));
+            } catch (ReflectiveOperationException error) {
+                throw new IllegalArgumentException("invalid Rust slice fat pointer", error);
+            }
+        } else {
+            throw new IllegalArgumentException("Rust DST value does not carry slice metadata");
+        }
+        long unalignedSize = Math.addExact(prefixSize, Math.multiplyExact(length, elementSize));
+        return Math.addExact(unalignedSize, alignment - 1) & -alignment;
     }
 
     public Pointer offset(long elementCount) {
@@ -1920,6 +2128,38 @@ public final class Pointer {
         return other != null && address() == other.address();
     }
 
+    /** Compares both words of a Rust slice/str fat pointer. */
+    public static boolean fatPointerEquals(Object left, Object right) {
+        if (left == right) {
+            return true;
+        }
+        if (left == null || right == null
+                || !isSliceViewCarrierType(left.getClass())
+                || !isSliceViewCarrierType(right.getClass())) {
+            return false;
+        }
+        try {
+            int leftLength = instanceField(left.getClass(), "length").getInt(left);
+            int rightLength = instanceField(right.getClass(), "length").getInt(right);
+            return leftLength == rightLength && fromSlice(left).sameAddress(fromSlice(right));
+        } catch (ReflectiveOperationException error) {
+            throw new IllegalArgumentException("invalid Rust fat pointer", error);
+        }
+    }
+
+    /** Compares only the data-address word of a Rust slice/str fat pointer. */
+    public static boolean fatPointerSameAddress(Object left, Object right) {
+        if (left == right) {
+            return true;
+        }
+        if (left == null || right == null
+                || !isSliceViewCarrierType(left.getClass())
+                || !isSliceViewCarrierType(right.getClass())) {
+            return false;
+        }
+        return fromSlice(left).sameAddress(fromSlice(right));
+    }
+
     public static boolean arraySameAddresses(Object left, Object right) {
         if (left == right) {
             return true;
@@ -2070,22 +2310,28 @@ public final class Pointer {
         if (pointer == null) {
             return 0L;
         }
-        pointer.address();
-        synchronized (ALLOCATION_BASES) {
-            long token = allocateAddress(16L, 16);
-            EXPOSED_ADDRESSES.put(
-                    token,
-                    new ExposedTarget(
-                            pointer.allocation,
-                            pointer.allocationElementSize,
-                            pointer.byteOffset,
-                            pointer.allocationCodecClassName,
-                            pointer.viewSize,
-                            pointer.viewCodecClassName,
-                            pointer.metadata,
-                            pointer.zeroSizedSourceViewSize,
-                            pointer.zeroSizedSourceViewCodecClassName));
-            return token;
+        synchronized (pointer) {
+            if (pointer.erasedAddressToken >= 0) {
+                return pointer.erasedAddressToken;
+            }
+            pointer.address();
+            synchronized (ALLOCATION_BASES) {
+                long token = allocateAddress(16L, 16);
+                EXPOSED_ADDRESSES.put(
+                        token,
+                        new ExposedTarget(
+                                pointer.allocation,
+                                pointer.allocationElementSize,
+                                pointer.byteOffset,
+                                pointer.allocationCodecClassName,
+                                pointer.viewSize,
+                                pointer.viewCodecClassName,
+                                pointer.metadata,
+                                pointer.zeroSizedSourceViewSize,
+                                pointer.zeroSizedSourceViewCodecClassName));
+                pointer.erasedAddressToken = token;
+                return token;
+            }
         }
     }
 
@@ -2182,6 +2428,11 @@ public final class Pointer {
         if (value instanceof F128) {
             return bigIntegerByte(((F128) value).toBits(), withinElement) & 0xff;
         }
+        if (isFatPointerCodec(allocationCodecClassName)) {
+            byte[] bytes = encodeFatPointer(
+                    value, allocationElementSize, allocationCodecClassName);
+            return bytes[withinElement] & 0xff;
+        }
         if (allocationCodecClassName != null
                 && !RAW_POINTER_VIEW_CODEC.equals(allocationCodecClassName)) {
             byte[] bytes = encodeAggregate(allocationCodecClassName, value);
@@ -2241,6 +2492,15 @@ public final class Pointer {
                     allocationElementSize,
                     false);
             writeElement(elementIndex, F128.fromBits(updated));
+            return;
+        }
+        if (isFatPointerCodec(allocationCodecClassName)) {
+            byte[] bytes = encodeFatPointer(
+                    current, allocationElementSize, allocationCodecClassName);
+            bytes[withinElement] = (byte) value;
+            writeElement(
+                    elementIndex,
+                    decodeFatPointer(bytes, 0, allocationElementSize, allocationCodecClassName));
             return;
         }
         if (allocationCodecClassName != null
@@ -2590,6 +2850,13 @@ public final class Pointer {
         if (F128_CODEC.equals(viewCodecClassName) && !isDirectAllocationView()) {
             return F128.fromBits(bigIntegerFromPointerBytes(viewSize, false));
         }
+        if (isFatPointerCodec(viewCodecClassName) && !isDirectAllocationView()) {
+            byte[] image = new byte[viewSize];
+            for (int index = 0; index < viewSize; index++) {
+                image[index] = (byte) loadByte(byteOffset + index);
+            }
+            return decodeFatPointer(image, 0, viewSize, viewCodecClassName);
+        }
         if (isStructuralViewCodec(viewCodecClassName)) {
             return structuralViewObject();
         }
@@ -2724,6 +2991,10 @@ public final class Pointer {
         }
 
         if (viewCodecClassName != null) {
+            if (isFatPointerCodec(viewCodecClassName)) {
+                storeRange(encodeFatPointer(value, viewSize, viewCodecClassName));
+                return;
+            }
             if (MANAGED_OBJECT_VIEW_CODEC.equals(viewCodecClassName)) {
                 long address = managedObjectAddress(value);
                 byte[] image = new byte[viewSize];
@@ -3215,7 +3486,8 @@ public final class Pointer {
     private static boolean isBuiltInCodec(String codec) {
         return isBigIntegerCodec(codec)
                 || F128_CODEC.equals(codec)
-                || RAW_POINTER_VIEW_CODEC.equals(codec);
+                || RAW_POINTER_VIEW_CODEC.equals(codec)
+                || isFatPointerCodec(codec);
     }
 
     private static long valueBits(Object value, int size) {

@@ -1,7 +1,7 @@
 #![no_std]
 #![feature(lang_items)]
-#![allow(internal_features)]
-#![feature(f16, f128, ptr_internals, ptr_metadata, set_ptr_value)]
+#![allow(internal_features, dead_code)]
+#![feature(f16, f128, ptr_internals, ptr_metadata, set_ptr_value, layout_for_ptr)]
 
 include!("../../../support/test_prelude.rs");
 
@@ -1045,7 +1045,9 @@ fn custom_dst_projections() {
 #[inline(never)]
 unsafe fn aliasing_test(ref_val: &mut i32, raw_ptr: *mut i32) {
     *ref_val = 10;
-    *raw_ptr = 20;
+    unsafe {
+        *raw_ptr = 20;
+    }
     assert_eq!(*ref_val, 20);
 }
 
@@ -1082,7 +1084,7 @@ fn pass_slice_pointer(ptr: *const [i32]) -> *const [i32] {
 }
 
 fn fat_pointer_abi_boundaries() {
-    let mut item = Item { value: 1234 };
+    let item = Item { value: 1234 };
     let raw_trait: *const dyn Inspector = &item;
 
     let returned_trait = pass_trait_object(raw_trait);
@@ -1095,7 +1097,7 @@ fn fat_pointer_abi_boundaries() {
     let raw_slice: *const [i32] = &array;
     let returned_slice = pass_slice_pointer(raw_slice);
     unsafe {
-        assert_eq!((&(*returned_slice)).len(), 4);
+        assert_eq!(core::ptr::metadata(returned_slice), 4);
         assert_eq!((*returned_slice)[3], 40);
     }
 }
@@ -1130,7 +1132,7 @@ struct MixedStruct {
 }
 
 fn zst_and_padding_offsets() {
-    let mut data = MixedStruct {
+    let data = MixedStruct {
         first: 0x1122,
         empty_middle: Empty,
         second: 0x55667788,
@@ -1138,7 +1140,6 @@ fn zst_and_padding_offsets() {
         third: 0x99AABBCCDDEEFF00,
     };
 
-    let base = &mut data as *mut MixedStruct;
     unsafe {
         let first_ptr = core::ptr::addr_of!(data.first);
         let second_ptr = core::ptr::addr_of!(data.second);
@@ -1296,6 +1297,385 @@ fn nested_union_reinterpretation() {
     }
 }
 
+#[repr(C)]
+struct SliceRepr<T> {
+    data: *mut T,
+    len: usize,
+}
+
+fn slice_fat_pointer_manipulation() {
+    let mut array = [10_i16, 20, 30, 40];
+    let slice_ptr: *mut [i16] = &mut array[..];
+
+    let repr_ptr = &slice_ptr as *const *mut [i16] as *const SliceRepr<i16>;
+    unsafe {
+        assert_eq!((*repr_ptr).len, 4);
+        assert_eq!(*(*repr_ptr).data.add(2), 30);
+
+        let custom_repr = SliceRepr {
+            data: array.as_mut_ptr().add(1),
+            len: 2,
+        };
+        let custom_slice_ptr = *(&custom_repr as *const SliceRepr<i16> as *const *mut [i16]);
+        assert_eq!(core::ptr::metadata(custom_slice_ptr), 2);
+        assert_eq!((*custom_slice_ptr)[0], 20);
+        assert_eq!((*custom_slice_ptr)[1], 30);
+    }
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct TraitRepr {
+    data: *const (),
+    vtable: *const (),
+}
+
+fn trait_fat_pointer_manipulation() {
+    let item_a = Item { value: 100 };
+    let item_b = Item { value: 200 };
+
+    let ptr_a: *const dyn Inspector = &item_a;
+    let ptr_b: *const dyn Inspector = &item_b;
+
+    let repr_a = unsafe { *( &ptr_a as *const *const dyn Inspector as *const TraitRepr ) };
+    let repr_b = unsafe { *( &ptr_b as *const *const dyn Inspector as *const TraitRepr ) };
+
+    assert_eq!(repr_a.vtable, repr_b.vtable);
+
+    let swapped_repr = TraitRepr {
+        data: repr_b.data,
+        vtable: repr_a.vtable,
+    };
+
+    let swapped_ptr = unsafe { *( &swapped_repr as *const TraitRepr as *const *const dyn Inspector ) };
+    unsafe {
+        assert_eq!((*swapped_ptr).inspect(), 200);
+    }
+}
+
+union ComplexUnion {
+    empty: (),
+    active_drop: core::mem::ManuallyDrop<DropAmount>,
+    container: core::mem::ManuallyDrop<DropContainer>,
+}
+
+fn complex_union_raw_drops() {
+    let before = unsafe { *core::ptr::addr_of!(DROP_COUNT) };
+
+    let mut unval = ComplexUnion { empty: () };
+    let ptr = &mut unval as *mut ComplexUnion;
+
+    unsafe {
+        let container_ptr = core::ptr::addr_of_mut!((*ptr).container).cast::<DropContainer>();
+        container_ptr.write(DropContainer {
+            first: DropAmount { amount: 10 },
+            second: DropAmount { amount: 20 },
+        });
+
+        assert_eq!((*container_ptr).first.amount, 10);
+        assert_eq!((*container_ptr).second.amount, 20);
+
+        core::ptr::drop_in_place(container_ptr);
+    }
+
+    let after = unsafe { *core::ptr::addr_of!(DROP_COUNT) };
+    assert_eq!(after, before + 30);
+}
+
+#[repr(align(64))]
+struct AlignedBox<T> {
+    inner: T,
+}
+
+struct DeepNode {
+    value: i32,
+    next: *mut AlignedBox<DeepNode>,
+}
+
+fn deep_pointer_indirection_and_alignment() {
+    let mut node_c = AlignedBox {
+        inner: DeepNode { value: 3, next: core::ptr::null_mut() }
+    };
+    let mut node_b = AlignedBox {
+        inner: DeepNode { value: 2, next: &mut node_c as *mut AlignedBox<DeepNode> }
+    };
+    let mut node_a = AlignedBox {
+        inner: DeepNode { value: 1, next: &mut node_b as *mut AlignedBox<DeepNode> }
+    };
+
+    let start = &mut node_a as *mut AlignedBox<DeepNode>;
+
+    assert_eq!(start as usize % 64, 0);
+    unsafe {
+        assert_eq!((*start).inner.value, 1);
+        let next_b = (*start).inner.next;
+        assert_eq!(next_b as usize % 64, 0);
+        assert_eq!((*next_b).inner.value, 2);
+
+        let next_c = (*next_b).inner.next;
+        assert_eq!(next_c as usize % 64, 0);
+        assert_eq!((*next_c).inner.value, 3);
+
+        (*next_c).inner.value = 42;
+    }
+    assert_eq!(node_c.inner.value, 42);
+}
+
+fn extreme_wrapping_pointer_arithmetic() {
+    let array = [1_u8, 2, 3, 4];
+    let ptr = array.as_ptr();
+
+    let offset = usize::MAX;
+    let wrapped_ptr = ptr.wrapping_add(offset);
+    assert_eq!(wrapped_ptr.wrapping_add(1), ptr);
+
+    let wrapped_forward = ptr.wrapping_sub(usize::MAX);
+    unsafe {
+        assert_eq!(*wrapped_forward, 2);
+    }
+}
+
+#[repr(C)]
+struct ComplexDst {
+    pre_header: u8,
+    header_u32: u32,
+    padding_indicator: u16,
+    flexible_array: [u32],
+}
+
+fn complex_dst_pointer_projections() {
+    #[repr(C, align(4))]
+    struct Storage {
+        pre_header: u8,
+        _pad1: [u8; 3],
+        header_u32: u32,
+        padding_indicator: u16,
+        _pad2: [u8; 2],
+        elements: [u32; 3],
+    }
+
+    let mut storage = Storage {
+        pre_header: 0xAB,
+        _pad1: [0; 3],
+        header_u32: 0x11223344,
+        padding_indicator: 0x99AA,
+        _pad2: [0; 2],
+        elements: [100, 200, 300],
+    };
+
+    let raw_bytes = &mut storage as *mut Storage as *mut u8;
+    let dst_ptr = core::ptr::from_raw_parts_mut::<ComplexDst>(raw_bytes.cast::<()>(), 3);
+
+    unsafe {
+        assert_eq!((*dst_ptr).pre_header, 0xAB);
+        assert_eq!((*dst_ptr).header_u32, 0x11223344);
+        assert_eq!((*dst_ptr).padding_indicator, 0x99AA);
+        assert_eq!(core::ptr::metadata(dst_ptr), 3);
+        assert_eq!((*dst_ptr).flexible_array[0], 100);
+        assert_eq!((*dst_ptr).flexible_array[1], 200);
+        assert_eq!((*dst_ptr).flexible_array[2], 300);
+
+        (*dst_ptr).flexible_array[1] = 999;
+    }
+    assert_eq!(storage.elements[1], 999);
+}
+
+fn nested_niche_layouts() {
+    use core::ptr::NonNull;
+
+    type NicheResult = Result<NonNull<i32>, ()>;
+    assert_eq!(
+        core::mem::size_of::<NicheResult>(),
+        core::mem::size_of::<*mut i32>()
+    );
+
+    let res_err: NicheResult = Err(());
+    let raw_err = unsafe { core::mem::transmute::<NicheResult, *mut i32>(res_err) };
+    assert!(raw_err.is_null());
+
+    let mut value = 42_i32;
+    let non_null = NonNull::new(&mut value as *mut i32).unwrap();
+    let res_ok: NicheResult = Ok(non_null);
+    let raw_ok = unsafe { core::mem::transmute::<NicheResult, *mut i32>(res_ok) };
+    assert_eq!(raw_ok, &mut value as *mut i32);
+}
+
+#[repr(C)]
+struct GenericZstHolder<T> {
+    header: u8,
+    zst_field: ZeroSized,
+    payload: T,
+    zst_end: ZeroSized,
+}
+
+fn generic_zst_offsets_and_arithmetic() {
+    let mut holder = GenericZstHolder {
+        header: 42,
+        zst_field: ZeroSized,
+        payload: 0x11223344_u32,
+        zst_end: ZeroSized,
+    };
+
+    let base = &mut holder as *mut GenericZstHolder<u32>;
+    unsafe {
+        let header_ptr = core::ptr::addr_of_mut!((*base).header);
+        let zst_ptr = core::ptr::addr_of_mut!((*base).zst_field);
+        let payload_ptr = core::ptr::addr_of_mut!((*base).payload);
+        let zst_end_ptr = core::ptr::addr_of_mut!((*base).zst_end);
+
+        assert_eq!(payload_ptr as usize - header_ptr as usize, 4);
+
+        assert!(zst_ptr as usize >= header_ptr as usize);
+        assert!(zst_end_ptr as usize >= payload_ptr as usize);
+
+        let zst_slice = core::slice::from_raw_parts(zst_ptr, 10);
+        assert_eq!(zst_slice.len(), 10);
+        assert_eq!(&zst_slice[0] as *const ZeroSized, &zst_slice[9] as *const ZeroSized);
+    }
+}
+
+fn pointer_via_float_reinterpretation() {
+    let mut value = 777_i32;
+    let ptr = &mut value as *mut i32;
+    let ptr_bits = ptr as usize;
+
+    #[cfg(target_pointer_width = "64")]
+    {
+        let float_val = f64::from_bits(ptr_bits as u64);
+        let restored_bits = float_val.to_bits() as usize;
+        let restored_ptr = restored_bits as *mut i32;
+        unsafe {
+            assert_eq!(*restored_ptr, 777);
+        }
+    }
+    #[cfg(target_pointer_width = "32")]
+    {
+        let float_val = f32::from_bits(ptr_bits as u32);
+        let restored_bits = float_val.to_bits() as usize;
+        let restored_ptr = restored_bits as *mut i32;
+        unsafe {
+            assert_eq!(*restored_ptr, 777);
+        }
+    }
+}
+
+fn raw_ring_buffer_shift() {
+    let mut buffer = [10_i32, 20, 30, 40, 50];
+    let ptr = buffer.as_mut_ptr();
+
+    unsafe {
+        let first = ptr.read();
+        core::ptr::copy(ptr.add(1), ptr, 4);
+        ptr.add(4).write(first);
+    }
+
+    assert_eq!(buffer, [20, 30, 40, 50, 10]);
+}
+
+fn volatile_byte_by_byte_copy() {
+    let source = [0x11_u8, 0x22, 0x33, 0x44];
+    let mut dest = [0_u8; 4];
+
+    let src_ptr = source.as_ptr();
+    let dest_ptr = dest.as_mut_ptr();
+
+    for i in 0..4 {
+        unsafe {
+            let val = src_ptr.add(i).read_volatile();
+            dest_ptr.add(i).write_volatile(val);
+        }
+    }
+    assert_eq!(dest, source);
+}
+
+use core::mem::{size_of_val_raw, align_of_val_raw};
+
+fn fat_pointer_equality() {
+    let array = [1_i32, 2, 3, 4];
+    let ptr1: *const [i32] = &array[0..2];
+    let ptr2: *const [i32] = &array[0..3];
+
+    assert_ne!(ptr1, ptr2);
+
+    let ptr3: *const [i32] = &array[0..2];
+    assert_eq!(ptr1, ptr3);
+
+    let item = Item { value: 42 };
+    let trait_ptr1: *const dyn Inspector = &item;
+    let trait_ptr2: *const dyn Inspector = &item;
+    assert_eq!(trait_ptr1, trait_ptr2);
+}
+
+fn raw_dst_size_and_alignment_queries() {
+    #[repr(C, align(8))]
+    struct Storage {
+        pre_header: u8,
+        _pad1: [u8; 7],
+        header_u32: u32,
+        padding_indicator: u16,
+        _pad2: [u8; 2],
+        elements: [u32; 3],
+    }
+
+    let mut storage = Storage {
+        pre_header: 0xAB,
+        _pad1: [0; 7],
+        header_u32: 0x11223344,
+        padding_indicator: 0x99AA,
+        _pad2: [0; 2],
+        elements: [100, 200, 300],
+    };
+
+    let raw_bytes = &mut storage as *mut Storage as *mut u8;
+    let dst_ptr = core::ptr::from_raw_parts::<ComplexDst>(raw_bytes.cast::<()>(), 3);
+
+    unsafe {
+        assert_eq!(size_of_val_raw(dst_ptr), 24);
+        assert_eq!(align_of_val_raw(dst_ptr), 4);
+    }
+}
+
+struct CyclicNode {
+    val: i32,
+    prev: *mut CyclicNode,
+    next: *mut CyclicNode,
+}
+
+fn raw_doubly_linked_list_mutation() {
+    let mut first = CyclicNode { val: 1, prev: core::ptr::null_mut(), next: core::ptr::null_mut() };
+    let mut second = CyclicNode { val: 2, prev: core::ptr::null_mut(), next: core::ptr::null_mut() };
+    let mut third = CyclicNode { val: 3, prev: core::ptr::null_mut(), next: core::ptr::null_mut() };
+
+    let p1 = &mut first as *mut CyclicNode;
+    let p2 = &mut second as *mut CyclicNode;
+    let p3 = &mut third as *mut CyclicNode;
+
+    unsafe {
+        (*p1).next = p2;
+        (*p2).prev = p1;
+        (*p2).next = p3;
+        (*p3).prev = p2;
+
+        let mut curr = p1;
+        while !curr.is_null() {
+            (*curr).val += 10;
+            curr = (*curr).next;
+        }
+
+        assert_eq!(first.val, 11);
+        assert_eq!(second.val, 12);
+        assert_eq!(third.val, 13);
+
+        let mut curr_back = p3;
+        let mut sum = 0;
+        while !curr_back.is_null() {
+            sum += (*curr_back).val;
+            curr_back = (*curr_back).prev;
+        }
+        assert_eq!(sum, 36);
+    }
+}
+
 fn main() {
     basic_raw_pointer_round_trip();
     array_pointer_arithmetic();
@@ -1338,4 +1718,18 @@ fn main() {
     sized_to_unsized_coercion();
     pointer_wrapper_unsized_coercions();
     nested_union_reinterpretation();
+    slice_fat_pointer_manipulation();
+    trait_fat_pointer_manipulation();
+    complex_union_raw_drops();
+    deep_pointer_indirection_and_alignment();
+    extreme_wrapping_pointer_arithmetic();
+    complex_dst_pointer_projections();
+    nested_niche_layouts();
+    generic_zst_offsets_and_arithmetic();
+    pointer_via_float_reinterpretation();
+    raw_ring_buffer_shift();
+    volatile_byte_by_byte_copy();
+    fat_pointer_equality();
+    raw_dst_size_and_alignment_queries();
+    raw_doubly_linked_list_mutation();
 }

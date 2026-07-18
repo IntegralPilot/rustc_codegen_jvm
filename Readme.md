@@ -22,16 +22,18 @@ Rust enums, generics, function pointers, unions and other supported constructs m
 
 ### Runs everywhere a JVM does, even on legacy systems
 
-Because the output is standard JVM bytecode rather than a native binary, your Rust code can compile to **legacy systems**, well beyond current native support. It works today on any OS with **JVM 8** support. With a planned future mode to disable `invokedynamic` (the only believed incompatible feature), it may even support **classfile version 45**, enabling compatibility with **JVM 1.0.2**. Minimum requirements:
+Because the compiler targets standard JVM bytecode rather than native machine code, the compiled output can run on platforms far outside the reach of modern native Rust. Right now, it supports any environment with **JVM 8** compatibility. With a planned legacy support mode to bypass `invokedynamic` (enabling compilation down to **Classfile version 46**), the compiler could target legacy platforms down to **JVM 1.2**.
 
-| Operating System       | Native Rust          | JVM 8 (Supported today)          | JVM 1.0.2 (Potential future)      |
-|------------------------|-------------------------------|----------------------------------|-----------------------------------|
-| **Windows**            | Windows 10                    | Windows Vista SP2 / 7 SP1        | Windows 95 / NT 3.5.1            |
-| **macOS**              | 10.12 Sierra                  | 10.8.3 Mountain Lion             | Classic Mac OS 7.5             |
-| **Linux**              | Kernel 3.2, glibc 2.17      | Kernel 2.6.28, glibc 2.9       | Kernel 1.2.13, predates glibc         |
+Minimum requirements are as follows:
 
-Additonally, compiling to JVM bytecode enables compiled code working where native FFI solutions (like Panama) are difficult or unavailable, including **sandboxed environments** like Minecraft mod loaders and **Android** (via DEX conversion).
+| Operating System | Native Rust | JVM 8 (supported today) | JVM 1.2 (potential future support) |
+| :--- | :--- | :--- | :--- |
+| **Windows** | Windows 10 | Windows Vista SP2 / 7 SP1 | Windows 95 / NT 4.0 |
+| **macOS** | 10.12 Sierra | 10.8.3 Mountain Lion | Classic Mac OS 8 (via MRJ) |
+| **Linux** | Kernel 3.2, glibc 2.17 | Kernel 2.6.28, glibc 2.9+ | Kernel 2.0.x, libc5 (via Blackdown port) |
+| **Solaris** | Solaris 11.4 | Solaris 10 | Solaris 2.5.1 |
 
+Additionally, compiling directly to JVM bytecode avoids the deployment friction of native FFI layers (such as Project Panama) in environments where loading native shared libraries is restricted or unavailable. This makes the compiled bytecode highly portable across **sandboxed environments** (such as some Minecraft mod loaders) and **Android** platforms (via DEX conversion).
 
 ### It can with help re-writing JVM projects in Rust
 
@@ -67,7 +69,7 @@ Here are a few selected more complex demos:
 | Example | Demonstrates |
 |---|---|
 | **[Alloc](tests/binary/alloc/src/main.rs)** | Using the compiled `alloc` crate in complex ways - binary trees, heaps, linked lists, vectors, strings, Arc/atomics and more! |
-| **[Raw pointers](tests/binary/raw_ptrs/src/main.rs)** | Stable pointer identity, dereferencing, casts, arithmetic, nested pointers and lots more! |
+| **[Raw pointers](tests/binary/raw_ptrs/src/main.rs)** | Stable pointer identity, dereferencing, casts, arithmetic, nested pointers, fat-pointer and DST handling and lots more! |
 | **[Unions](tests/binary/unions/src/main.rs)** | `unsafe` union handling, including nesting and reinterpretation |
 | **[Enums](tests/binary/enums/src/main.rs)** / **[Structs](tests/binary/structs/src/main.rs)** | Nested data structures - tuples, arrays, slices |
 | **[Traits](tests/binary/traits/src/main.rs)** | Trait implementations, including dynamic dispatch |
@@ -94,7 +96,7 @@ Here are a few selected more complex demos:
 - **Generics** with monomorphisation, including generic functions, structs, enums, and traits and const generics.
 - **OOP constructs** such as `impl` blocks for ADTs, including `self`, `&self`, and `&mut self`.
 - **Traits** and dynamic dispatch via `&dyn Trait`.
-- **Memory management:** shared and mutable references, raw pointers, stable address identity, dereferencing, typed pointer arithmetic, null pointers, pointer casts, atomics etc.
+- **Memory management:** shared and mutable references, raw pointers, stable address identity, dereferencing, typed pointer arithmetic, null pointers, pointer casts, atomics, fat-pointer and DST handling etc.
 - **Unions** support primitive values, references, tuples, structs, fixed-size arrays, and fieldless or data-carrying enums, including recursively nested combinations of these types.
 - **Transmute** between everything supported by unions (uses the same inner machinery)
 - **Outputs** executable, self-contained `.jar` generation for binary crates.

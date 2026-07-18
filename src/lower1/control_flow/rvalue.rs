@@ -3550,6 +3550,49 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                         operand: oomir_op1,
                     });
                 }
+                BinOp::Eq | BinOp::Ne
+                    if matches!(
+                        oomir_op1.get_type(),
+                        Some(oomir::Type::Slice(_) | oomir::Type::Str)
+                    ) =>
+                {
+                    instructions.push(oomir::Instruction::InvokeStatic {
+                        dest: Some(temp_binop_var.clone()),
+                        class_name: oomir::POINTER_CLASS.to_string(),
+                        method_name: "fatPointerEquals".to_string(),
+                        method_ty: oomir::Signature {
+                            params: vec![
+                                (
+                                    "left".to_string(),
+                                    oomir::Type::Class("java/lang/Object".to_string()),
+                                ),
+                                (
+                                    "right".to_string(),
+                                    oomir::Type::Class("java/lang/Object".to_string()),
+                                ),
+                            ],
+                            ret: Box::new(oomir::Type::Boolean),
+                            is_static: true,
+                        },
+                        args: vec![oomir_op1, oomir_op2],
+                    });
+                    if matches!(bin_op, BinOp::Ne) {
+                        let equality_name = temp_binop_var.clone();
+                        let not_name = format!("{temp_binop_var}_not");
+                        instructions.push(oomir::Instruction::Not {
+                            dest: not_name.clone(),
+                            src: oomir::Operand::Variable {
+                                name: equality_name,
+                                ty: oomir::Type::Boolean,
+                            },
+                        });
+                        result_operand = oomir::Operand::Variable {
+                            name: not_name,
+                            ty: oomir::Type::Boolean,
+                        };
+                        return (instructions, result_operand);
+                    }
+                }
                 BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
                     if matches!(oomir_op1.get_type(), Some(oomir::Type::Pointer(_))) =>
                 {
@@ -4463,6 +4506,50 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                                 (backing, oomir::Type::Class("java/lang/Object".to_string())),
                                 (offset, oomir::Type::I32),
                                 (metadata, oomir::Type::I32),
+                            ],
+                        });
+                    } else if {
+                        let tail = tcx
+                            .struct_tail_for_codegen(pointee_ty, TypingEnv::fully_monomorphized());
+                        tail.is_slice() || tail.is_str()
+                    } {
+                        let data_ty = data
+                            .get_type()
+                            .expect("slice-tailed raw pointer data pointer is typed");
+                        let metadata = convert_operand(
+                            &operands[FieldIdx::from_usize(1)],
+                            tcx,
+                            instance,
+                            mir,
+                            data_types,
+                            &mut instructions,
+                        );
+                        let pointee_size = super::super::types::layout_size_bytes(tcx, pointee_ty)
+                            .expect("slice-tailed raw pointer has a static prefix layout");
+                        instructions.push(oomir::Instruction::InvokeStatic {
+                            dest: Some(temp_aggregate_var.clone()),
+                            class_name: oomir::POINTER_CLASS.to_string(),
+                            method_name: "retypeWithMetadata".to_string(),
+                            method_ty: oomir::Signature {
+                                params: vec![
+                                    ("pointer".to_string(), data_ty),
+                                    ("view_size".to_string(), oomir::Type::I32),
+                                    ("view_codec".to_string(), oomir::Type::java_string()),
+                                    ("metadata".to_string(), oomir::Type::U64),
+                                ],
+                                ret: Box::new(aggregate_oomir_type.clone()),
+                                is_static: true,
+                            },
+                            args: vec![
+                                data,
+                                oomir::Operand::Constant(oomir::Constant::I32(
+                                    i32::try_from(pointee_size)
+                                        .expect("raw DST prefix exceeds JVM address space"),
+                                )),
+                                super::super::types::pointer_view_codec_operand(
+                                    pointee_ty, tcx, data_types, instance,
+                                ),
+                                metadata,
                             ],
                         });
                     } else if matches!(pointee_ty.kind(), TyKind::Dynamic(_, _)) {

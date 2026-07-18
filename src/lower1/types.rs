@@ -15,6 +15,8 @@ pub const UNION_BYTES_FIELD: &str = "_bytes";
 pub const UNION_OBJECTS_FIELD: &str = "_objects";
 pub const MANAGED_OBJECT_POINTER_VIEW_CODEC: &str = "@managed-object";
 pub const RAW_POINTER_VIEW_CODEC: &str = "@raw-pointer";
+const SLICE_POINTER_VIEW_CODEC_PREFIX: &str = "@slice-pointer\n";
+const TRAIT_POINTER_VIEW_CODEC_PREFIX: &str = "@trait-pointer\n";
 pub(super) const ENUM_UNION_DISCRIMINANT_METHOD: &str = "_unionDiscriminant";
 const ENUM_FROM_UNION_DISCRIMINANT_METHOD: &str = "_fromUnionDiscriminant";
 const ENUM_WRITE_UNION_STORAGE_METHOD: &str = "_writeUnionStorage";
@@ -1914,6 +1916,39 @@ fn emit_ty_to_union_bytes<'tcx>(
             temp_counter,
         );
     }
+    if let Some(codec) = fat_pointer_codec_operand(ty, tcx, data_types, instance_context) {
+        let offset = storage.byte_index(base_offset, instructions, temp_counter);
+        instructions.push(oomir::Instruction::InvokeStatic {
+            dest: None,
+            class_name: oomir::POINTER_CLASS.to_string(),
+            method_name: "encodeFatPointerMemory".to_string(),
+            method_ty: oomir::Signature {
+                params: vec![
+                    (
+                        "value".to_string(),
+                        oomir::Type::Class("java/lang/Object".to_string()),
+                    ),
+                    ("bytes".to_string(), byte_array_type()),
+                    ("offset".to_string(), oomir::Type::I32),
+                    ("size".to_string(), oomir::Type::I32),
+                    ("codec".to_string(), oomir::Type::java_string()),
+                ],
+                ret: Box::new(oomir::Type::Void),
+                is_static: true,
+            },
+            args: vec![
+                source,
+                operand_var(storage.bytes_var.clone(), byte_array_type()),
+                offset,
+                oomir::Operand::Constant(oomir::Constant::I32(
+                    i32::try_from(layout_size_bytes(tcx, ty)?)
+                        .map_err(|_| "fat-pointer layout exceeds JVM address space")?,
+                )),
+                codec,
+            ],
+        });
+        return Ok(());
+    }
 
     match ty.kind() {
         TyKind::Pat(inner, _) => emit_ty_to_union_bytes(
@@ -2467,6 +2502,45 @@ fn emit_ty_from_union_bytes<'tcx>(
             instructions,
             temp_counter,
         );
+    }
+    if let Some(codec) = fat_pointer_codec_operand(ty, tcx, data_types, instance_context) {
+        let jvm_ty = ty_to_oomir_type(ty, tcx, data_types, instance_context);
+        let offset = storage.byte_index(base_offset, instructions, temp_counter);
+        let object_dest = next_union_temp("union_fat_pointer_object", temp_counter);
+        instructions.push(oomir::Instruction::InvokeStatic {
+            dest: Some(object_dest.clone()),
+            class_name: oomir::POINTER_CLASS.to_string(),
+            method_name: "decodeFatPointerMemory".to_string(),
+            method_ty: oomir::Signature {
+                params: vec![
+                    ("bytes".to_string(), byte_array_type()),
+                    ("offset".to_string(), oomir::Type::I32),
+                    ("size".to_string(), oomir::Type::I32),
+                    ("codec".to_string(), oomir::Type::java_string()),
+                ],
+                ret: Box::new(oomir::Type::Class("java/lang/Object".to_string())),
+                is_static: true,
+            },
+            args: vec![
+                operand_var(storage.bytes_var.clone(), byte_array_type()),
+                offset,
+                oomir::Operand::Constant(oomir::Constant::I32(
+                    i32::try_from(layout_size_bytes(tcx, ty)?)
+                        .map_err(|_| "fat-pointer layout exceeds JVM address space")?,
+                )),
+                codec,
+            ],
+        });
+        let typed_dest = next_union_temp("union_fat_pointer", temp_counter);
+        instructions.push(oomir::Instruction::Cast {
+            op: operand_var(
+                object_dest,
+                oomir::Type::Class("java/lang/Object".to_string()),
+            ),
+            ty: jvm_ty.clone(),
+            dest: typed_dest.clone(),
+        });
+        return Ok(operand_var(typed_dest, jvm_ty));
     }
 
     match ty.kind() {
@@ -3290,6 +3364,9 @@ pub(crate) fn pointer_memory_codec_operand<'tcx>(
     data_types: &mut HashMap<String, oomir::DataType>,
     instance_context: rustc_middle::ty::Instance<'tcx>,
 ) -> oomir::Operand {
+    if let Some(codec) = fat_pointer_codec_operand(ty, tcx, data_types, instance_context) {
+        return codec;
+    }
     if let Some(codec) = pointer_builtin_codec_operand(ty, tcx, instance_context) {
         return codec;
     }
@@ -3317,6 +3394,9 @@ pub(super) fn pointer_view_codec_operand<'tcx>(
     data_types: &mut HashMap<String, oomir::DataType>,
     instance_context: rustc_middle::ty::Instance<'tcx>,
 ) -> oomir::Operand {
+    if let Some(codec) = fat_pointer_codec_operand(ty, tcx, data_types, instance_context) {
+        return codec;
+    }
     if let Some(codec) = pointer_builtin_codec_operand(ty, tcx, instance_context) {
         return codec;
     }
@@ -3343,6 +3423,56 @@ pub(super) fn pointer_view_codec_operand<'tcx>(
             }
         }
     }
+}
+
+/// Describes Rust fat pointers that use JVM reference carriers at ordinary
+/// call boundaries but still need their native two-word representation when
+/// stored in or reinterpreted as byte-addressable memory.
+fn fat_pointer_codec_operand<'tcx>(
+    ty: Ty<'tcx>,
+    tcx: TyCtxt<'tcx>,
+    data_types: &mut HashMap<String, oomir::DataType>,
+    instance_context: rustc_middle::ty::Instance<'tcx>,
+) -> Option<oomir::Operand> {
+    let ty = resolve_union_ty(tcx, ty, instance_context).ok()?;
+    let pointee = match ty.kind() {
+        TyKind::RawPtr(pointee, _) | TyKind::Ref(_, pointee, _) => *pointee,
+        _ => return None,
+    };
+
+    let descriptor = if pointee.is_slice() {
+        let element = pointee.sequence_element_type(tcx);
+        let element_size = layout_size_bytes(tcx, element).ok()?;
+        let element_codec = pointer_view_codec_operand(element, tcx, data_types, instance_context);
+        let element_codec = match element_codec {
+            oomir::Operand::Constant(oomir::Constant::String(codec)) => codec,
+            oomir::Operand::Constant(oomir::Constant::Null(_)) => String::new(),
+            other => panic!("fat-pointer element codec must be constant, found {other:?}"),
+        };
+        format!(
+            "{SLICE_POINTER_VIEW_CODEC_PREFIX}{}\n{element_size}\n{element_codec}",
+            oomir::SLICE_VIEW_CLASS
+        )
+    } else if pointee.is_str() {
+        format!(
+            "{SLICE_POINTER_VIEW_CODEC_PREFIX}{}\n1\n",
+            oomir::UTF8_VIEW_CLASS
+        )
+    } else if matches!(ty.kind(), TyKind::RawPtr(_, _))
+        && matches!(pointee.kind(), TyKind::Dynamic(..))
+    {
+        let interface = ty_to_oomir_type(pointee, tcx, data_types, instance_context)
+            .get_class_name()
+            .expect("trait-object pointee must map to a JVM interface")
+            .to_string();
+        format!("{TRAIT_POINTER_VIEW_CODEC_PREFIX}{interface}")
+    } else {
+        return None;
+    };
+
+    Some(oomir::Operand::Constant(oomir::Constant::String(
+        descriptor,
+    )))
 }
 
 fn pointer_builtin_codec_operand<'tcx>(

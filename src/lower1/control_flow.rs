@@ -4209,55 +4209,79 @@ pub(super) fn convert_basic_block<'tcx>(
                                 .types()
                                 .next()
                                 .expect("size_of_val intrinsic has a type argument");
-                            match measured_ty.kind() {
-                                TyKind::Slice(element_ty) => {
-                                    let element_size =
-                                        super::types::layout_size_bytes(tcx, *element_ty)
-                                            .unwrap_or_else(|error| {
-                                                panic!(
-                                                    "could not determine size_of_val slice element layout: {error}"
-                                                )
-                                            });
-                                    let length_name = format!("{label}_size_of_val_length");
-                                    instructions.push(oomir::Instruction::Length {
-                                        dest: length_name.clone(),
-                                        array: oomir_operands[0].clone(),
+                            let tail = tcx.struct_tail_for_codegen(
+                                measured_ty,
+                                TypingEnv::fully_monomorphized(),
+                            );
+                            let tail_element = match tail.kind() {
+                                TyKind::Slice(element_ty) => Some(*element_ty),
+                                TyKind::Str => Some(tcx.types.u8),
+                                _ => None,
+                            };
+                            if let Some(element_ty) = tail_element {
+                                let layout = tcx
+                                    .layout_of(
+                                        TypingEnv::fully_monomorphized()
+                                            .as_query_input(measured_ty),
+                                    )
+                                    .unwrap_or_else(|error| {
+                                        panic!(
+                                            "could not determine size_of_val DST layout for {measured_ty:?}: {error:?}"
+                                        )
                                     });
-                                    instructions.push(oomir::Instruction::Mul {
-                                        dest,
-                                        op1: oomir::Operand::Variable {
-                                            name: length_name,
-                                            ty: oomir::Type::I32,
-                                        },
-                                        op2: oomir::Operand::Constant(oomir::Constant::I32(
-                                            i32::try_from(element_size).expect(
-                                                "slice element exceeds the JVM address space",
-                                            ),
-                                        )),
-                                    });
-                                }
-                                TyKind::Str => {
-                                    instructions.push(oomir::Instruction::Length {
-                                        dest,
-                                        array: oomir_operands[0].clone(),
-                                    });
-                                }
-                                _ => {
-                                    let size = super::types::layout_size_bytes(tcx, measured_ty)
+                                let element_size =
+                                    super::types::layout_size_bytes(tcx, element_ty)
                                         .unwrap_or_else(|error| {
                                             panic!(
-                                                "could not determine size_of_val layout: {error}"
+                                                "could not determine size_of_val tail element layout: {error}"
                                             )
                                         });
-                                    instructions.push(oomir::Instruction::Move {
-                                        dest,
-                                        src: oomir::Operand::Constant(oomir::Constant::I32(
-                                            i32::try_from(size).expect(
-                                                "size_of_val result exceeds the JVM address space",
+                                let alignment = layout.align.abi.bytes().max(
+                                    super::types::layout_align_bytes(tcx, element_ty)
+                                        .expect("DST tail element has an alignment")
+                                        as u64,
+                                );
+                                instructions.push(oomir::Instruction::InvokeStatic {
+                                    dest: Some(dest),
+                                    class_name: oomir::POINTER_CLASS.to_string(),
+                                    method_name: "sizeOfSliceTailed".to_string(),
+                                    method_ty: oomir::Signature {
+                                        params: vec![
+                                            (
+                                                "value".to_string(),
+                                                oomir::Type::Class("java/lang/Object".to_string()),
                                             ),
+                                            ("prefix_size".to_string(), oomir::Type::U64),
+                                            ("element_size".to_string(), oomir::Type::U64),
+                                            ("alignment".to_string(), oomir::Type::U64),
+                                        ],
+                                        ret: Box::new(oomir_output_type.clone()),
+                                        is_static: true,
+                                    },
+                                    args: vec![
+                                        oomir_operands[0].clone(),
+                                        oomir::Operand::Constant(oomir::Constant::U64(
+                                            layout.size.bytes(),
                                         )),
+                                        oomir::Operand::Constant(oomir::Constant::U64(
+                                            element_size as u64,
+                                        )),
+                                        oomir::Operand::Constant(oomir::Constant::U64(alignment)),
+                                    ],
+                                });
+                            } else {
+                                let size = super::types::layout_size_bytes(tcx, measured_ty)
+                                    .unwrap_or_else(|error| {
+                                        panic!("could not determine size_of_val layout: {error}")
                                     });
-                                }
+                                instructions.push(oomir::Instruction::Move {
+                                    dest,
+                                    src: oomir::Operand::Constant(oomir::Constant::I32(
+                                        i32::try_from(size).expect(
+                                            "size_of_val result exceeds the JVM address space",
+                                        ),
+                                    )),
+                                });
                             }
                         } else if is_align_of_val && let Some(dest) = effective_dest.clone() {
                             let measured_ty = func_instance
@@ -4465,21 +4489,48 @@ pub(super) fn convert_basic_block<'tcx>(
                             let second_ty = oomir_operands[1]
                                 .get_type()
                                 .expect("pointer equality operand is typed");
-                            instructions.push(oomir::Instruction::InvokeVirtual {
-                                class_name: oomir::POINTER_CLASS.to_string(),
-                                method_name: "sameAddress".to_string(),
-                                method_ty: oomir::Signature {
-                                    params: vec![
-                                        ("self".to_string(), first_ty),
-                                        ("other".to_string(), second_ty),
-                                    ],
-                                    ret: Box::new(oomir::Type::Boolean),
-                                    is_static: false,
-                                },
-                                args: vec![oomir_operands[1].clone()],
-                                dest: effective_dest.clone(),
-                                operand: oomir_operands[0].clone(),
-                            });
+                            if matches!(first_ty, oomir::Type::Slice(_) | oomir::Type::Str) {
+                                instructions.push(oomir::Instruction::InvokeStatic {
+                                    class_name: oomir::POINTER_CLASS.to_string(),
+                                    method_name: if intrinsic_name.as_str() == "addr_eq" {
+                                        "fatPointerSameAddress".to_string()
+                                    } else {
+                                        "fatPointerEquals".to_string()
+                                    },
+                                    method_ty: oomir::Signature {
+                                        params: vec![
+                                            (
+                                                "left".to_string(),
+                                                oomir::Type::Class("java/lang/Object".to_string()),
+                                            ),
+                                            (
+                                                "right".to_string(),
+                                                oomir::Type::Class("java/lang/Object".to_string()),
+                                            ),
+                                        ],
+                                        ret: Box::new(oomir::Type::Boolean),
+                                        is_static: true,
+                                    },
+                                    args: oomir_operands[..2].to_vec(),
+                                    dest: effective_dest.clone(),
+                                });
+                            } else {
+                                instructions.push(oomir::Instruction::InvokeVirtual {
+                                    class_name: oomir::POINTER_CLASS.to_string(),
+                                    method_name: "sameAddress".to_string(),
+                                    method_ty: oomir::Signature {
+                                        params: vec![
+                                            ("self".to_string(), first_ty),
+                                            ("other".to_string(), second_ty),
+                                        ],
+                                        ret: Box::new(oomir::Type::Boolean),
+                                        is_static: false,
+                                    },
+                                    args: vec![oomir_operands[1].clone()],
+                                    dest: effective_dest.clone(),
+                                    operand: oomir_operands[0].clone(),
+                                });
+                            }
                         } else if matches!(intrinsic_name.as_str(), "dangling" | "dangling_mut")
                             && is_external_intrinsic
                             && matches!(fn_output.kind(), TyKind::RawPtr(_, _))
@@ -4688,6 +4739,11 @@ pub(super) fn convert_basic_block<'tcx>(
                                     args: vec![oomir_operands[0].clone()],
                                 });
                             } else {
+                                let tail = tcx.struct_tail_for_codegen(
+                                    pointee,
+                                    TypingEnv::fully_monomorphized(),
+                                );
+                                let carries_slice_metadata = tail.is_slice() || tail.is_str();
                                 let pointee_size = super::types::layout_size_bytes(tcx, pointee)
                                     .unwrap_or_else(|error| {
                                         panic!(
@@ -4697,27 +4753,49 @@ pub(super) fn convert_basic_block<'tcx>(
                                 instructions.push(oomir::Instruction::InvokeStatic {
                                     dest: effective_dest.clone(),
                                     class_name: oomir::POINTER_CLASS.to_string(),
-                                    method_name: "retype".to_string(),
+                                    method_name: if carries_slice_metadata {
+                                        "retypeWithMetadata".to_string()
+                                    } else {
+                                        "retype".to_string()
+                                    },
                                     method_ty: oomir::Signature {
-                                        params: vec![
-                                            ("pointer".to_string(), source_ty),
-                                            ("view_size".to_string(), oomir::Type::I32),
-                                            ("view_codec".to_string(), oomir::Type::java_string()),
-                                        ],
+                                        params: {
+                                            let mut params = vec![
+                                                ("pointer".to_string(), source_ty),
+                                                ("view_size".to_string(), oomir::Type::I32),
+                                                (
+                                                    "view_codec".to_string(),
+                                                    oomir::Type::java_string(),
+                                                ),
+                                            ];
+                                            if carries_slice_metadata {
+                                                params.push((
+                                                    "metadata".to_string(),
+                                                    oomir::Type::U64,
+                                                ));
+                                            }
+                                            params
+                                        },
                                         ret: method_signature.ret.clone(),
                                         is_static: true,
                                     },
-                                    args: vec![
-                                        oomir_operands[0].clone(),
-                                        oomir::Operand::Constant(oomir::Constant::I32(
+                                    args: {
+                                        let mut args = vec![
+                                            oomir_operands[0].clone(),
+                                            oomir::Operand::Constant(oomir::Constant::I32(
                                             i32::try_from(pointee_size).expect(
                                                 "from_raw_parts pointee exceeds JVM address space",
                                             ),
-                                        )),
-                                        super::types::pointer_view_codec_operand(
-                                            pointee, tcx, data_types, instance,
-                                        ),
-                                    ],
+                                            )),
+                                            super::types::pointer_view_codec_operand(
+                                                pointee, tcx, data_types, instance,
+                                            ),
+                                        ];
+                                        if carries_slice_metadata {
+                                            args.push(oomir_operands[1].clone());
+                                        }
+                                        args
+                                    },
                                 });
                             }
                         } else if (is_diagnostic_item(sym::ptr_null)

@@ -20,8 +20,8 @@ unsafe impl core::alloc::GlobalAlloc for JvmAllocator {
         unsafe { allocate_bytes(layout.size(), layout.align()) }
     }
 
-    unsafe fn dealloc(&self, _pointer: *mut u8, _layout: core::alloc::Layout) {
-        // Dropping the last Pointer carrier releases the JVM byte array to GC.
+    unsafe fn dealloc(&self, pointer: *mut u8, _layout: core::alloc::Layout) {
+        unsafe { deallocate_bytes(pointer) }
     }
 
     unsafe fn realloc(
@@ -70,4 +70,9 @@ fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
 fn start<T>(main: fn() -> T, _: isize, _: *const *const u8, _: u8) -> isize {
     main();
     0
+}
+
+unsafe extern "C" {
+    #[link_name = "jvm:static:org/rustlang/runtime/Pointer:deallocateBytes:(Lorg/rustlang/runtime/Pointer;)V"]
+    fn deallocate_bytes(pointer: *mut u8);
 }
