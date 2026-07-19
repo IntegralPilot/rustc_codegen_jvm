@@ -103,6 +103,24 @@ struct ArcWorkerContext {
     iterations: usize,
 }
 
+enum StoredCallback {
+    Unary(fn(i32) -> i32),
+    Empty,
+}
+
+struct CallbackEntry {
+    id: u64,
+    callback: StoredCallback,
+}
+
+fn add_three(value: i32) -> i32 {
+    value + 3
+}
+
+fn double(value: i32) -> i32 {
+    value * 2
+}
+
 unsafe extern "C" {
     #[link_name = "jvm:static:org/rustlang/runtime/ThreadSupport:runStaticPointerWorkers:(Lorg/rustlang/runtime/Pointer;JLorg/rustlang/runtime/Pointer;JLorg/rustlang/runtime/Pointer;I)V"]
     fn run_static_pointer_workers(
@@ -183,6 +201,31 @@ fn main() {
     test_layout_computations();
     test_layout_failures_and_alignments();
     test_array_from_mut();
+    test_vec_aggregate_with_function_pointer();
+}
+
+fn test_vec_aggregate_with_function_pointer() {
+    let mut entries = Vec::new();
+    entries.push(CallbackEntry {
+        id: 4,
+        callback: StoredCallback::Unary(add_three),
+    });
+    entries.push(CallbackEntry {
+        id: 9,
+        callback: StoredCallback::Empty,
+    });
+    entries.push(CallbackEntry {
+        id: 5,
+        callback: StoredCallback::Unary(double),
+    });
+
+    assert!(entries.len() == 3);
+    assert!(entries[0].id == 4);
+    assert!(matches!(entries[1].callback, StoredCallback::Empty));
+    match entries[2].callback {
+        StoredCallback::Unary(callback) => assert!(callback(entries[2].id as i32) == 10),
+        StoredCallback::Empty => panic!("stored callback was lost"),
+    }
 }
 
 fn test_vec_basic() {

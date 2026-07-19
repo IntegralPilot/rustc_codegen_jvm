@@ -1609,6 +1609,16 @@ fn ensure_enum_union_codec<'tcx>(
     data_types: &mut HashMap<String, oomir::DataType>,
     instance_context: rustc_middle::ty::Instance<'tcx>,
 ) -> Result<(), String> {
+    if !data_types.contains_key(enum_class) {
+        ensure_enum_data_types(
+            adt_def,
+            substs,
+            enum_class,
+            tcx,
+            data_types,
+            instance_context,
+        );
+    }
     if let Some(DataType::Class { methods, .. }) = data_types.get(enum_class) {
         if methods.contains_key(ENUM_READ_UNION_STORAGE_METHOD) {
             return Ok(());
@@ -2931,7 +2941,7 @@ fn exact_bytes_supported<'tcx>(
             UintTy::U8 | UintTy::U16 | UintTy::U32 | UintTy::U64 | UintTy::U128 | UintTy::Usize,
         )
         | TyKind::Float(FloatTy::F16 | FloatTy::F32 | FloatTy::F64 | FloatTy::F128) => Ok(()),
-        TyKind::RawPtr(_, _) | TyKind::Ref(_, _, _) => Ok(()),
+        TyKind::RawPtr(_, _) | TyKind::Ref(_, _, _) | TyKind::FnPtr(..) => Ok(()),
         TyKind::Pat(inner, _) => exact_bytes_supported(*inner, tcx, instance_context),
         TyKind::Tuple(elements) => elements
             .iter()

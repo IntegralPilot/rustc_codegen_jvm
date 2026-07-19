@@ -10,5 +10,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "data_types_kinds"
+version = "0.1.0"
+
+[[package]]
 name = "data_types_provider"
 version = "0.1.0"
+dependencies = [
+ "data_types_kinds",
+]

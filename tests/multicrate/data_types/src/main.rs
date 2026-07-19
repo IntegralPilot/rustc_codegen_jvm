@@ -46,4 +46,9 @@ fn main() {
     assert!(provider::union_low_byte(0x44332211) == 0x11);
     assert!(provider::closure_score(9) == 22);
     assert!(provider::fn_pointer_score(8) == 11);
+
+    let mut options = provider::Options::new();
+    options.add("h", "help", "", "show help", false, false);
+    options.add("o", "output", "FILE", "write output", true, true);
+    assert!(options.check());
 }
