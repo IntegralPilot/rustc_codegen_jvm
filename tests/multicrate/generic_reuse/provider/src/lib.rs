@@ -58,6 +58,16 @@ pub fn scaled_sum<T: Copy + Add<Output = T> + Mul<Output = T>>(a: T, b: T, k: T)
     scale(a) + scale(b)
 }
 
+// Keep this deliberately long enough to exercise the hashed fallback for a
+// generic closure class name. Distinct callback types must remain distinct
+// after that fallback rather than sharing one incompatible capture layout.
+pub fn invoke_callback_through_a_deliberately_long_generic_wrapper_that_exercises_hashed_closure_names_and_forces_the_fallback_path<
+    F: FnOnce(),
+>(callback: F) {
+    let wrapped = move || callback();
+    wrapped();
+}
+
 // The provider also instantiates scaled_sum::<i32>, so the same closure
 // instance exists in both crates and the linker must deduplicate it.
 pub fn provider_scaled() -> i32 {

@@ -7,8 +7,9 @@ include!("../../../support/test_prelude.rs");
 use alloc::vec;
 use alloc::vec::Vec;
 use provider::{
-    DynValue, GenericMethodOwner, Holder, ProviderConstructed, ProviderCounter, metadata,
-    provider_scaled, provider_score, pull_i32, pull_i64, scaled_sum,
+    DynValue, GenericMethodOwner, Holder, ProviderConstructed, ProviderCounter,
+    invoke_callback_through_a_deliberately_long_generic_wrapper_that_exercises_hashed_closure_names_and_forces_the_fallback_path,
+    metadata, provider_scaled, provider_score, pull_i32, pull_i64, scaled_sum,
 };
 
 struct LocalI32(i32);
@@ -60,6 +61,19 @@ fn main() {
     assert!(scaled_sum(2, 3, 4) == 20);
     assert!(scaled_sum(1.5_f64, 2.5_f64, 2.0_f64) == 8.0);
     assert!(scaled_sum(100_i64, 200_i64, 3_i64) == 900);
+
+    // The provider's inner closure is instantiated with two different
+    // downstream closure types whose readable class names exceed the limit.
+    let mut first = 0;
+    invoke_callback_through_a_deliberately_long_generic_wrapper_that_exercises_hashed_closure_names_and_forces_the_fallback_path(
+        || first = 11,
+    );
+    assert!(first == 11);
+    let mut second = 0;
+    invoke_callback_through_a_deliberately_long_generic_wrapper_that_exercises_hashed_closure_names_and_forces_the_fallback_path(
+        || second = 22,
+    );
+    assert!(second == 22);
 
     // The provider owns these trait-object function ABIs while the concrete
     // implementors and adapters live downstream. Both crates must derive the

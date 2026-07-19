@@ -31,6 +31,20 @@ pub(crate) fn readable_or_hashed_name(
     if readable.len() <= max_len {
         readable
     } else {
-        format!("{prefix}_{}", short_hash(identity, 10))
+        let complete_identity = format!("{identity}\0{readable_suffix}");
+        format!("{prefix}_{}", short_hash(&complete_identity, 10))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::readable_or_hashed_name;
+
+    #[test]
+    fn hashed_fallback_preserves_readable_specialization_identity() {
+        let first = readable_or_hashed_name("Closure", &"First".repeat(40), "shared", 160);
+        let second = readable_or_hashed_name("Closure", &"Second".repeat(40), "shared", 160);
+
+        assert_ne!(first, second);
     }
 }
