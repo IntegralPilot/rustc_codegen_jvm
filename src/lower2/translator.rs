@@ -3216,13 +3216,20 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     src,
                     OO::Variable { name, .. } if self.direct_this_aliases.contains(name)
                 );
-                if is_direct_this_alias {
-                    self.direct_this_aliases.insert(dest.clone());
-                } else {
+                if is_direct_this_alias && matches!(value_type, Type::Pointer(_)) {
+                    // A JVM receiver object cannot escape through a Rust pointer local.
+                    // Store the canonical write-through pointer materialized at entry.
                     self.direct_this_aliases.remove(dest);
+                    self.load_jvm_receiver_as_pointer(src, &value_type)?;
+                } else {
+                    if is_direct_this_alias {
+                        self.direct_this_aliases.insert(dest.clone());
+                    } else {
+                        self.direct_this_aliases.remove(dest);
+                    }
+                    self.load_operand(src)?;
                 }
 
-                self.load_operand(src)?;
                 self.store_result(dest, &value_type)?;
             }
             OI::NewArray {

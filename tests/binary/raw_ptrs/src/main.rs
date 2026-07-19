@@ -75,6 +75,13 @@ struct Pair {
     right: i32,
 }
 
+impl Pair {
+    #[inline(never)]
+    fn choose<'a>(&'a self, other: &'a Self, use_other: bool) -> &'a Self {
+        if use_other { other } else { self }
+    }
+}
+
 #[repr(C)]
 struct PackedWords {
     low: u16,
@@ -179,6 +186,11 @@ fn reference_identity() {
 
     assert!(first as *const i32 == second as *const i32);
     assert!(first as *const i32 == alias as *const i32);
+
+    let first_pair = Pair { left: 1, right: 2 };
+    let second_pair = Pair { left: 3, right: 4 };
+    assert!(first_pair.choose(&second_pair, false).right == 2);
+    assert!(first_pair.choose(&second_pair, true).left == 3);
     assert!(first as *const i32 != &equal_but_distinct as *const i32);
 
     let mut across_call = 30_i32;
