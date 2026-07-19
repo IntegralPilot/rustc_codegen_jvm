@@ -122,7 +122,7 @@ fn emit_atomic_value_from_bits<'tcx>(
             method_ty: oomir::Signature {
                 params: vec![
                     ("address".to_string(), oomir::Type::U64),
-                    ("view_size".to_string(), oomir::Type::I32),
+                    ("view_size".to_string(), oomir::Type::U64),
                     ("view_codec".to_string(), oomir::Type::java_string()),
                 ],
                 ret: Box::new(atomic_oomir_ty.clone()),
@@ -130,9 +130,8 @@ fn emit_atomic_value_from_bits<'tcx>(
             },
             args: vec![
                 bits,
-                oomir::Operand::Constant(oomir::Constant::I32(
-                    i32::try_from(view_size)
-                        .expect("atomic pointer target exceeds the JVM address space"),
+                oomir::Operand::Constant(oomir::Constant::U64(
+                    u64::try_from(view_size).expect("Rust atomic pointee layout exceeds u64"),
                 )),
                 super::types::pointer_view_codec_operand(*pointee, tcx, data_types, instance),
             ],
@@ -223,7 +222,7 @@ fn emit_atomic_intrinsic<'tcx>(
         panic!("could not determine atomic scalar size for {atomic_ty:?}: {error}")
     });
     let byte_count = oomir::Operand::Constant(oomir::Constant::I32(
-        i32::try_from(byte_count).expect("Rust atomic scalar exceeds the JVM address space"),
+        i32::try_from(byte_count).expect("Rust atomic scalar width exceeds i32"),
     ));
     let pointer = oomir_operands
         .first()
@@ -1017,22 +1016,22 @@ fn emit_mutable_borrow_writeback<'tcx>(
             method_ty: oomir::Signature {
                 params: vec![
                     ("self".to_string(), carrier.get_type().unwrap()),
-                    ("size".to_string(), oomir::Type::I32),
+                    ("size".to_string(), oomir::Type::U64),
                     ("codec".to_string(), oomir::Type::java_string()),
                 ],
                 ret: Box::new(storage_pointer_ty.clone()),
                 is_static: false,
             },
             args: vec![
-                oomir::Operand::Constant(oomir::Constant::I32(
-                    i32::try_from(
+                oomir::Operand::Constant(oomir::Constant::U64(
+                    u64::try_from(
                         super::types::layout_size_bytes(tcx, storage_rust_ty).unwrap_or_else(
                             |error| {
                                 panic!("could not determine pointer write-back layout: {error}")
                             },
                         ),
                     )
-                    .expect("pointer write-back layout exceeds the JVM runtime address space"),
+                    .expect("Rust pointer write-back layout exceeds u64"),
                 )),
                 super::types::pointer_view_codec_operand(
                     storage_rust_ty,
@@ -1114,22 +1113,22 @@ fn emit_pointer_origin_refreshes<'tcx>(
                 method_ty: oomir::Signature {
                     params: vec![
                         ("self".to_string(), carrier.get_type().unwrap()),
-                        ("size".to_string(), oomir::Type::I32),
+                        ("size".to_string(), oomir::Type::U64),
                         ("codec".to_string(), oomir::Type::java_string()),
                     ],
                     ret: Box::new(storage_pointer_ty.clone()),
                     is_static: false,
                 },
                 args: vec![
-                    oomir::Operand::Constant(oomir::Constant::I32(
-                        i32::try_from(
+                    oomir::Operand::Constant(oomir::Constant::U64(
+                        u64::try_from(
                             super::types::layout_size_bytes(tcx, updated_rust_ty).unwrap_or_else(
                                 |error| {
                                     panic!("could not determine pointer refresh layout: {error}")
                                 },
                             ),
                         )
-                        .expect("pointer refresh layout exceeds the JVM runtime address space"),
+                        .expect("Rust pointer refresh layout exceeds u64"),
                     )),
                     super::types::pointer_view_codec_operand(
                         updated_rust_ty,
@@ -1242,7 +1241,7 @@ fn emit_raw_eq_pointer<'tcx>(
                     "slice".to_string(),
                     oomir::Type::Class("java/lang/Object".to_string()),
                 ),
-                ("element_size".to_string(), oomir::Type::I32),
+                ("element_size".to_string(), oomir::Type::U64),
                 ("codec".to_string(), oomir::Type::java_string()),
             ],
             ret: Box::new(pointer_ty.clone()),
@@ -1250,12 +1249,12 @@ fn emit_raw_eq_pointer<'tcx>(
         },
         args: vec![
             operand,
-            oomir::Operand::Constant(oomir::Constant::I32(
-                i32::try_from(
+            oomir::Operand::Constant(oomir::Constant::U64(
+                u64::try_from(
                     super::types::layout_size_bytes(tcx, element_ty)
                         .expect("raw_eq element has a concrete layout"),
                 )
-                .expect("raw_eq element layout exceeds JVM address space"),
+                .expect("Rust raw_eq element layout exceeds u64"),
             )),
             super::types::pointer_view_codec_operand(element_ty, tcx, data_types, instance),
         ],
@@ -2574,7 +2573,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                                         "java/lang/Object".to_string(),
                                                     ),
                                                 ),
-                                                ("element_size".to_string(), oomir::Type::I32),
+                                                ("element_size".to_string(), oomir::Type::U64),
                                                 ("codec".to_string(), oomir::Type::java_string()),
                                             ],
                                             ret: Box::new(oomir_output_type.clone()),
@@ -2582,9 +2581,9 @@ pub(super) fn convert_basic_block<'tcx>(
                                         },
                                         args: vec![
                                             receiver_operand,
-                                            oomir::Operand::Constant(oomir::Constant::I32(
-                                                i32::try_from(source_element_size).expect(
-                                                    "fat pointer element exceeds JVM address space",
+                                            oomir::Operand::Constant(oomir::Constant::U64(
+                                                u64::try_from(source_element_size).expect(
+                                                    "Rust slice element layout exceeds u64",
                                                 ),
                                             )),
                                             super::types::pointer_view_codec_operand(
@@ -2605,15 +2604,15 @@ pub(super) fn convert_basic_block<'tcx>(
                                                     "self".to_string(),
                                                     oomir_output_type.clone(),
                                                 ),
-                                                ("view_size".to_string(), oomir::Type::I32),
+                                                ("view_size".to_string(), oomir::Type::U64),
                                                 ("view_codec".to_string(), oomir::Type::java_string()),
                                             ],
                                             ret: Box::new(oomir_output_type.clone()),
                                             is_static: false,
                                         },
                                         args: vec![
-                                            oomir::Operand::Constant(oomir::Constant::I32(
-                                                i32::try_from(
+                                            oomir::Operand::Constant(oomir::Constant::U64(
+                                                u64::try_from(
                                                     super::types::layout_size_bytes(
                                                         tcx,
                                                         target_pointee,
@@ -2622,9 +2621,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                                         "fat pointer cast target has a concrete layout",
                                                     ),
                                                 )
-                                                .expect(
-                                                    "fat pointer cast target exceeds JVM address space",
-                                                ),
+                                                .expect("Rust pointer target layout exceeds u64"),
                                             )),
                                             super::types::pointer_view_codec_operand(
                                                 target_pointee,
@@ -2775,17 +2772,16 @@ pub(super) fn convert_basic_block<'tcx>(
                                                     "pointer".to_string(),
                                                     dispatch_receiver_ty.clone(),
                                                 ),
-                                                ("alignment".to_string(), oomir::Type::I32),
+                                                ("alignment".to_string(), oomir::Type::U64),
                                             ],
                                             ret: Box::new(oomir::Type::Boolean),
                                             is_static: true,
                                         },
                                         args: vec![
                                             receiver_operand,
-                                            oomir::Operand::Constant(oomir::Constant::I32(
-                                                i32::try_from(alignment).expect(
-                                                    "pointer target alignment exceeds JVM integer",
-                                                ),
+                                            oomir::Operand::Constant(oomir::Constant::U64(
+                                                u64::try_from(alignment)
+                                                    .expect("Rust pointer alignment exceeds u64"),
                                             )),
                                         ],
                                         dest: effective_dest,
@@ -2821,7 +2817,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                                         "pointer".to_string(),
                                                         dispatch_receiver_ty.clone(),
                                                     ),
-                                                    ("view_size".to_string(), oomir::Type::I32),
+                                                    ("view_size".to_string(), oomir::Type::U64),
                                                     (
                                                         "view_codec".to_string(),
                                                         oomir::Type::java_string(),
@@ -2832,7 +2828,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                             },
                                             args: vec![
                                                 receiver_operand,
-                                                oomir::Operand::Constant(oomir::Constant::I32(0)),
+                                                oomir::Operand::Constant(oomir::Constant::U64(0)),
                                                 oomir::Operand::Constant(oomir::Constant::Null(
                                                     oomir::Type::java_string(),
                                                 )),
@@ -3469,7 +3465,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                                         "java/lang/Object".to_string(),
                                                     ),
                                                 ),
-                                                ("element_size".to_string(), oomir::Type::I32),
+                                                ("element_size".to_string(), oomir::Type::U64),
                                                 ("codec".to_string(), oomir::Type::java_string()),
                                             ];
                                             let receiver_value_ty = match receiver_mir_ty.kind() {
@@ -3492,9 +3488,9 @@ pub(super) fn convert_basic_block<'tcx>(
                                                 )
                                             });
                                             static_args.push(oomir::Operand::Constant(
-                                                oomir::Constant::I32(
-                                                    i32::try_from(element_size).expect(
-                                                        "slice element exceeds JVM address space",
+                                                oomir::Constant::U64(
+                                                    u64::try_from(element_size).expect(
+                                                        "Rust slice element layout exceeds u64",
                                                     ),
                                                 ),
                                             ));
@@ -3512,7 +3508,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                             }
                                             static_signature
                                                 .params
-                                                .push(("view_size".to_string(), oomir::Type::I32));
+                                                .push(("view_size".to_string(), oomir::Type::U64));
                                             static_signature.params.push((
                                                 "view_codec".to_string(),
                                                 oomir::Type::java_string(),
@@ -3537,12 +3533,13 @@ pub(super) fn convert_basic_block<'tcx>(
                                                     "could not determine pointer cast target size: {error}"
                                                 )
                                             });
-                                            static_args
-                                                .push(oomir::Operand::Constant(oomir::Constant::I32(
-                                                i32::try_from(target_size).expect(
-                                                    "pointer cast target exceeds JVM address space",
+                                            static_args.push(oomir::Operand::Constant(
+                                                oomir::Constant::U64(
+                                                    u64::try_from(target_size).expect(
+                                                        "Rust pointer target layout exceeds u64",
+                                                    ),
                                                 ),
-                                            )));
+                                            ));
                                             static_args.push(
                                                 super::types::pointer_view_codec_operand(
                                                     target_pointee,
@@ -3760,13 +3757,13 @@ pub(super) fn convert_basic_block<'tcx>(
                                 class_name: oomir::POINTER_CLASS.to_string(),
                                 method_name: "nullPointer".to_string(),
                                 method_ty: oomir::Signature {
-                                    params: vec![("view_size".to_string(), oomir::Type::I32)],
+                                    params: vec![("view_size".to_string(), oomir::Type::U64)],
                                     ret: Box::new(oomir_output_type.clone()),
                                     is_static: true,
                                 },
-                                args: vec![oomir::Operand::Constant(oomir::Constant::I32(
-                                    i32::try_from(pointer_size)
-                                        .expect("const_allocate pointee exceeds JVM address space"),
+                                args: vec![oomir::Operand::Constant(oomir::Constant::U64(
+                                    u64::try_from(pointer_size)
+                                        .expect("Rust allocation pointer layout exceeds u64"),
                                 ))],
                                 dest: effective_dest,
                             });
@@ -4244,10 +4241,7 @@ pub(super) fn convert_basic_block<'tcx>(
                             };
                             instructions.push(oomir::Instruction::Move {
                                 dest,
-                                src: oomir::Operand::Constant(oomir::Constant::I32(
-                                    i32::try_from(value)
-                                        .expect("Rust layout value exceeds the JVM usize carrier"),
-                                )),
+                                src: oomir::Operand::Constant(oomir::Constant::U64(value)),
                             });
                         } else if is_size_of_val && let Some(dest) = effective_dest.clone() {
                             let measured_ty = func_instance
@@ -4322,10 +4316,8 @@ pub(super) fn convert_basic_block<'tcx>(
                                     });
                                 instructions.push(oomir::Instruction::Move {
                                     dest,
-                                    src: oomir::Operand::Constant(oomir::Constant::I32(
-                                        i32::try_from(size).expect(
-                                            "size_of_val result exceeds the JVM address space",
-                                        ),
+                                    src: oomir::Operand::Constant(oomir::Constant::U64(
+                                        size as u64,
                                     )),
                                 });
                             }
@@ -4349,10 +4341,8 @@ pub(super) fn convert_basic_block<'tcx>(
                             });
                             instructions.push(oomir::Instruction::Move {
                                 dest,
-                                src: oomir::Operand::Constant(oomir::Constant::I32(
-                                    i32::try_from(alignment).expect(
-                                        "align_of_val result exceeds the JVM address space",
-                                    ),
+                                src: oomir::Operand::Constant(oomir::Constant::U64(
+                                    alignment as u64,
                                 )),
                             });
                         } else if intrinsic_name.as_str() == "type_id_eq"
@@ -4601,7 +4591,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                 method_ty: oomir::Signature {
                                     params: vec![
                                         ("address".to_string(), oomir::Type::U64),
-                                        ("view_size".to_string(), oomir::Type::I32),
+                                        ("view_size".to_string(), oomir::Type::U64),
                                     ],
                                     ret: method_signature.ret.clone(),
                                     is_static: true,
@@ -4610,9 +4600,9 @@ pub(super) fn convert_basic_block<'tcx>(
                                     oomir::Operand::Constant(oomir::Constant::U64(
                                         pointee_alignment as u64,
                                     )),
-                                    oomir::Operand::Constant(oomir::Constant::I32(
-                                        i32::try_from(pointee_size)
-                                            .expect("dangling pointer size exceeds JVM integer"),
+                                    oomir::Operand::Constant(oomir::Constant::U64(
+                                        u64::try_from(pointee_size)
+                                            .expect("Rust pointee layout exceeds u64"),
                                     )),
                                 ],
                             });
@@ -4808,7 +4798,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                         params: {
                                             let mut params = vec![
                                                 ("pointer".to_string(), source_ty),
-                                                ("view_size".to_string(), oomir::Type::I32),
+                                                ("view_size".to_string(), oomir::Type::U64),
                                                 (
                                                     "view_codec".to_string(),
                                                     oomir::Type::java_string(),
@@ -4828,10 +4818,10 @@ pub(super) fn convert_basic_block<'tcx>(
                                     args: {
                                         let mut args = vec![
                                             oomir_operands[0].clone(),
-                                            oomir::Operand::Constant(oomir::Constant::I32(
-                                            i32::try_from(pointee_size).expect(
-                                                "from_raw_parts pointee exceeds JVM address space",
-                                            ),
+                                            oomir::Operand::Constant(oomir::Constant::U64(
+                                                u64::try_from(pointee_size).expect(
+                                                    "Rust pointer target layout exceeds u64",
+                                                ),
                                             )),
                                             super::types::pointer_view_codec_operand(
                                                 pointee, tcx, data_types, instance,
@@ -4861,13 +4851,13 @@ pub(super) fn convert_basic_block<'tcx>(
                                 class_name: oomir::POINTER_CLASS.to_string(),
                                 method_name: "nullPointer".to_string(),
                                 method_ty: oomir::Signature {
-                                    params: vec![("view_size".to_string(), oomir::Type::I32)],
+                                    params: vec![("view_size".to_string(), oomir::Type::U64)],
                                     ret: method_signature.ret.clone(),
                                     is_static: true,
                                 },
-                                args: vec![oomir::Operand::Constant(oomir::Constant::I32(
-                                    i32::try_from(pointee_size)
-                                        .expect("null pointer target exceeds JVM address space"),
+                                args: vec![oomir::Operand::Constant(oomir::Constant::U64(
+                                    u64::try_from(pointee_size)
+                                        .expect("Rust null pointer target layout exceeds u64"),
                                 ))],
                             });
                         } else if (has_diagnostic_item("ptr_without_provenance")
@@ -4899,7 +4889,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                 method_ty: oomir::Signature {
                                     params: vec![
                                         ("address".to_string(), oomir::Type::U64),
-                                        ("view_size".to_string(), oomir::Type::I32),
+                                        ("view_size".to_string(), oomir::Type::U64),
                                         ("view_codec".to_string(), oomir::Type::java_string()),
                                     ],
                                     ret: method_signature.ret.clone(),
@@ -4907,10 +4897,9 @@ pub(super) fn convert_basic_block<'tcx>(
                                 },
                                 args: vec![
                                     oomir_operands[0].clone(),
-                                    oomir::Operand::Constant(oomir::Constant::I32(
-                                        i32::try_from(pointee_size).expect(
-                                            "provenance pointer target exceeds JVM address space",
-                                        ),
+                                    oomir::Operand::Constant(oomir::Constant::U64(
+                                        u64::try_from(pointee_size)
+                                            .expect("Rust pointee layout exceeds u64"),
                                     )),
                                     super::types::pointer_view_codec_operand(
                                         *pointee, tcx, data_types, instance,

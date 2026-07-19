@@ -182,6 +182,7 @@ fn main() {
     test_vec_from_raw_parts();
     test_layout_computations();
     test_layout_failures_and_alignments();
+    test_array_from_mut();
 }
 
 fn test_vec_basic() {
@@ -1042,4 +1043,11 @@ fn test_layout_failures_and_alignments() {
 
     let overflow_size = Layout::from_size_align(usize::MAX, 8);
     assert!(overflow_size.is_err());
+}
+
+fn test_array_from_mut() {
+    let mut value = String::from("Hello World");
+    let array: &mut [String; 1] = core::array::from_mut(&mut value);
+    array[0].push_str("!");
+    assert!(value == "Hello World!");
 }

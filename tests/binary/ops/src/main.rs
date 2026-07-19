@@ -515,8 +515,54 @@ fn runtime_casts() {
 }
 
 fn runtime_pointer_width() {
+    type Huge = [u8; 0x8000_0000];
+    const HIGH_ADDRESS: usize = 0x1_0000_0000;
+    const HUGE_POINTER: *const Huge = core::ptr::without_provenance(HIGH_ADDRESS);
+
     assert!(core::mem::size_of::<usize>() == 8, "usize is 64-bit");
     assert!(core::mem::size_of::<isize>() == 8, "isize is 64-bit");
+    assert!(
+        core::mem::size_of::<[u8; 0x8000_0000]>() == 0x8000_0000usize,
+        "size_of returns the full 64-bit usize value"
+    );
+    assert!(
+        core::mem::align_of::<[u8; 0x8000_0000]>() == 1usize,
+        "align_of returns usize"
+    );
+    let huge_pointee = core::ptr::without_provenance::<Huge>(HIGH_ADDRESS);
+    assert!(
+        huge_pointee.addr() == HIGH_ADDRESS,
+        "provenance-free pointers retain 64-bit addresses and pointee layouts"
+    );
+    assert!(
+        HUGE_POINTER.addr() == HIGH_ADDRESS,
+        "constant pointers retain 64-bit pointee layouts"
+    );
+    assert!(
+        core::ptr::null::<Huge>().addr() == 0,
+        "null pointers accept 64-bit pointee layouts"
+    );
+    assert!(
+        core::ptr::dangling::<Huge>().addr() == 1,
+        "dangling pointers accept 64-bit pointee layouts"
+    );
+    let cast = core::ptr::without_provenance::<u8>(HIGH_ADDRESS).cast::<Huge>();
+    assert!(
+        cast.addr() == HIGH_ADDRESS,
+        "pointer casts retain 64-bit pointee layouts"
+    );
+
+    #[repr(C)]
+    struct HugeFieldOffset {
+        prefix: Huge,
+        tail: u8,
+    }
+    let base = core::ptr::without_provenance::<HugeFieldOffset>(HIGH_ADDRESS);
+    let tail = unsafe { core::ptr::addr_of!((*base).tail) };
+    assert!(
+        tail.addr() == HIGH_ADDRESS + 0x8000_0000,
+        "struct field projection preserves 64-bit byte offsets"
+    );
     let value = 123u32;
     let address = (&value as *const u32) as usize;
     assert!(

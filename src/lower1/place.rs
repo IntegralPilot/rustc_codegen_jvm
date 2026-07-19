@@ -659,9 +659,8 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
                         data_types,
                     )
                     .unwrap_or_else(|error| panic!("Error getting DST field name: {error}"));
-                    let field_offset = Operand::Constant(oomir::Constant::I32(
-                        i32::try_from(field_offset)
-                            .expect("DST field offset exceeds the JVM address space"),
+                    let field_offset = Operand::Constant(oomir::Constant::U64(
+                        u64::try_from(field_offset).expect("Rust DST field offset exceeds u64"),
                     ));
 
                     if let TyKind::Slice(element_rust_ty) = field_rust_ty.kind() {
@@ -678,8 +677,8 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
                                     ("self".to_string(), base_pointer_ty.clone()),
                                     ("owner_class".to_string(), oomir::Type::java_string()),
                                     ("field_name".to_string(), oomir::Type::java_string()),
-                                    ("field_offset".to_string(), oomir::Type::I32),
-                                    ("element_size".to_string(), oomir::Type::I32),
+                                    ("field_offset".to_string(), oomir::Type::U64),
+                                    ("element_size".to_string(), oomir::Type::U64),
                                     ("element_codec".to_string(), oomir::Type::java_string()),
                                 ],
                                 ret: Box::new(oomir::Type::Class("java/lang/Object".to_string())),
@@ -689,12 +688,12 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
                                 Operand::Constant(oomir::Constant::String(owner_class)),
                                 Operand::Constant(oomir::Constant::String(field_name)),
                                 field_offset,
-                                Operand::Constant(oomir::Constant::I32(
-                                    i32::try_from(
+                                Operand::Constant(oomir::Constant::U64(
+                                    u64::try_from(
                                         super::types::layout_size_bytes(tcx, *element_rust_ty)
                                             .expect("slice tail element must have a layout"),
                                     )
-                                    .expect("slice tail element exceeds the JVM address space"),
+                                    .expect("Rust slice-tail element layout exceeds u64"),
                                 )),
                                 pointer_view_codec_operand(
                                     *element_rust_ty,
@@ -731,8 +730,8 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
                                     ("self".to_string(), base_pointer_ty.clone()),
                                     ("owner_class".to_string(), oomir::Type::java_string()),
                                     ("field_name".to_string(), oomir::Type::java_string()),
-                                    ("field_offset".to_string(), oomir::Type::I32),
-                                    ("field_size".to_string(), oomir::Type::I32),
+                                    ("field_offset".to_string(), oomir::Type::U64),
+                                    ("field_size".to_string(), oomir::Type::U64),
                                     ("field_codec".to_string(), oomir::Type::java_string()),
                                 ],
                                 ret: Box::new(field_pointer_ty.clone()),
@@ -742,12 +741,12 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
                                 Operand::Constant(oomir::Constant::String(owner_class)),
                                 Operand::Constant(oomir::Constant::String(field_name)),
                                 field_offset,
-                                Operand::Constant(oomir::Constant::I32(
-                                    i32::try_from(
+                                Operand::Constant(oomir::Constant::U64(
+                                    u64::try_from(
                                         super::types::layout_size_bytes(tcx, field_rust_ty)
                                             .expect("sized DST field must have a layout"),
                                     )
-                                    .expect("DST field exceeds the JVM address space"),
+                                    .expect("Rust DST field layout exceeds u64"),
                                 )),
                                 pointer_view_codec_operand(
                                     field_rust_ty,
@@ -1416,8 +1415,8 @@ pub fn emit_instructions_to_set_value<'tcx>(
                                 ("self".to_string(), base_oomir_type.clone()),
                                 ("owner_class".to_string(), oomir::Type::java_string()),
                                 ("field_name".to_string(), oomir::Type::java_string()),
-                                ("field_offset".to_string(), oomir::Type::I32),
-                                ("field_size".to_string(), oomir::Type::I32),
+                                ("field_offset".to_string(), oomir::Type::U64),
+                                ("field_size".to_string(), oomir::Type::U64),
                                 ("field_codec".to_string(), oomir::Type::java_string()),
                             ],
                             ret: Box::new(field_pointer_ty.clone()),
@@ -1426,16 +1425,16 @@ pub fn emit_instructions_to_set_value<'tcx>(
                         args: vec![
                             Operand::Constant(oomir::Constant::String(owner_class)),
                             Operand::Constant(oomir::Constant::String(field_name)),
-                            Operand::Constant(oomir::Constant::I32(
-                                i32::try_from(field_offset)
-                                    .expect("DST field offset exceeds the JVM address space"),
+                            Operand::Constant(oomir::Constant::U64(
+                                u64::try_from(field_offset)
+                                    .expect("Rust DST field offset exceeds u64"),
                             )),
-                            Operand::Constant(oomir::Constant::I32(
-                                i32::try_from(
+                            Operand::Constant(oomir::Constant::U64(
+                                u64::try_from(
                                     super::types::layout_size_bytes(tcx, field_rust_ty)
                                         .expect("sized DST field must have a layout"),
                                 )
-                                .expect("DST field exceeds the JVM address space"),
+                                .expect("Rust DST field layout exceeds u64"),
                             )),
                             pointer_view_codec_operand(field_rust_ty, tcx, data_types, instance),
                         ],

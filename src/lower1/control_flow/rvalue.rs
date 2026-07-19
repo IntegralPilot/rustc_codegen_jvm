@@ -53,8 +53,8 @@ fn rust_layout_size_operand<'tcx>(
     let size = super::super::types::layout_size_bytes(tcx, ty).unwrap_or_else(|error| {
         panic!("could not determine pointer layout size for {ty:?}: {error}")
     });
-    oomir::Operand::Constant(oomir::Constant::I32(
-        i32::try_from(size).expect("Rust pointee layout exceeds the JVM runtime address space"),
+    oomir::Operand::Constant(oomir::Constant::U64(
+        u64::try_from(size).expect("Rust layout size exceeds u64"),
     ))
 }
 
@@ -63,12 +63,19 @@ fn pointer_view_size_operand<'tcx>(
     tcx: TyCtxt<'tcx>,
     instance: Instance<'tcx>,
 ) -> oomir::Operand {
-    match pointer_ty.kind() {
-        TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _) => {
-            rust_layout_size_operand(*pointee, tcx, instance)
-        }
+    let pointee = match pointer_ty.kind() {
+        TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _) => *pointee,
         other => panic!("expected pointer/reference type, found {other:?}"),
-    }
+    };
+    let pointee = EarlyBinder::bind(tcx, pointee)
+        .instantiate(tcx, instance.args)
+        .skip_norm_wip();
+    let size = super::super::types::layout_size_bytes(tcx, pointee).unwrap_or_else(|error| {
+        panic!("could not determine pointer view size for {pointee:?}: {error}")
+    });
+    oomir::Operand::Constant(oomir::Constant::U64(
+        u64::try_from(size).expect("Rust pointer view layout exceeds u64"),
+    ))
 }
 
 fn pointer_pointee_ty<'tcx>(pointer_ty: rustc_middle::ty::Ty<'tcx>) -> rustc_middle::ty::Ty<'tcx> {
@@ -211,12 +218,12 @@ fn emit_raw_array_pointer_unsize<'tcx>(
             method_ty: oomir::Signature {
                 params: vec![
                     ("self".to_string(), source_oomir_ty),
-                    ("view_size".to_string(), oomir::Type::I32),
+                    ("view_size".to_string(), oomir::Type::U64),
                 ],
                 ret: Box::new(target_oomir_ty.clone()),
                 is_static: false,
             },
-            args: vec![oomir::Operand::Constant(oomir::Constant::I32(0))],
+            args: vec![oomir::Operand::Constant(oomir::Constant::U64(0))],
             operand: source,
         });
         return Some(oomir::Operand::Variable {
@@ -252,7 +259,7 @@ fn emit_raw_array_pointer_unsize<'tcx>(
         method_ty: oomir::Signature {
             params: vec![
                 ("pointer".to_string(), source_oomir_ty),
-                ("view_size".to_string(), oomir::Type::I32),
+                ("view_size".to_string(), oomir::Type::U64),
                 ("view_codec".to_string(), oomir::Type::java_string()),
             ],
             ret: Box::new(element_pointer_ty.clone()),
@@ -460,7 +467,7 @@ fn emit_pointer_factory(
                 oomir::Type::Class("java/lang/Object".to_string()),
             ),
             ("offset".to_string(), oomir::Type::I32),
-            ("element_size".to_string(), oomir::Type::I32),
+            ("element_size".to_string(), oomir::Type::U64),
             ("codec".to_string(), oomir::Type::java_string()),
         ],
         "nullPointer" => Vec::new(),
@@ -521,7 +528,7 @@ fn emit_array_pointer(
                         "slice".to_string(),
                         oomir::Type::Class("java/lang/Object".to_string()),
                     ),
-                    ("element_size".to_string(), oomir::Type::I32),
+                    ("element_size".to_string(), oomir::Type::U64),
                     ("codec".to_string(), oomir::Type::java_string()),
                 ],
                 ret: Box::new(pointer_ty.clone()),
@@ -657,7 +664,7 @@ fn emit_pointer_to_place<'tcx>(
                         method_ty: oomir::Signature {
                             params: vec![
                                 ("self".to_string(), pointer_ty.clone()),
-                                ("view_size".to_string(), oomir::Type::I32),
+                                ("view_size".to_string(), oomir::Type::U64),
                                 ("view_codec".to_string(), oomir::Type::java_string()),
                             ],
                             ret: Box::new(pointer_ty.clone()),
@@ -893,8 +900,8 @@ fn emit_pointer_to_place<'tcx>(
                                     ("self".to_string(), base_pointer_ty.clone()),
                                     ("owner_class".to_string(), oomir::Type::java_string()),
                                     ("field_name".to_string(), oomir::Type::java_string()),
-                                    ("field_offset".to_string(), oomir::Type::I32),
-                                    ("field_size".to_string(), oomir::Type::I32),
+                                    ("field_offset".to_string(), oomir::Type::U64),
+                                    ("field_size".to_string(), oomir::Type::U64),
                                     ("field_codec".to_string(), oomir::Type::java_string()),
                                 ],
                                 ret: Box::new(pointer_ty.clone()),
@@ -905,10 +912,9 @@ fn emit_pointer_to_place<'tcx>(
                                     owner_class.clone(),
                                 )),
                                 oomir::Operand::Constant(oomir::Constant::String(field_name)),
-                                oomir::Operand::Constant(oomir::Constant::I32(
-                                    i32::try_from(field_offset).expect(
-                                        "struct field offset exceeds the JVM address space",
-                                    ),
+                                oomir::Operand::Constant(oomir::Constant::U64(
+                                    u64::try_from(field_offset)
+                                        .expect("Rust struct field offset exceeds u64"),
                                 )),
                                 rust_layout_size_operand(field_rust_ty, tcx, instance),
                                 super::super::types::pointer_view_codec_operand(
@@ -944,7 +950,7 @@ fn emit_pointer_to_place<'tcx>(
                                     oomir::Type::Class("java/lang/Object".to_string()),
                                 ),
                                 ("field_name".to_string(), oomir::Type::java_string()),
-                                ("size".to_string(), oomir::Type::I32),
+                                ("size".to_string(), oomir::Type::U64),
                                 ("codec".to_string(), oomir::Type::java_string()),
                             ],
                             ret: Box::new(pointer_ty.clone()),
@@ -1002,16 +1008,16 @@ fn emit_pointer_to_place<'tcx>(
                         method_ty: oomir::Signature {
                             params: vec![
                                 ("pointer".to_string(), base_pointer_ty.clone()),
-                                ("byte_count".to_string(), oomir::Type::I32),
+                                ("byte_count".to_string(), oomir::Type::U64),
                             ],
                             ret: Box::new(base_pointer_ty.clone()),
                             is_static: true,
                         },
                         args: vec![
                             base_pointer,
-                            oomir::Operand::Constant(oomir::Constant::I32(
-                                i32::try_from(field_offset)
-                                    .expect("aggregate field offset exceeds JVM address space"),
+                            oomir::Operand::Constant(oomir::Constant::U64(
+                                u64::try_from(field_offset)
+                                    .expect("Rust aggregate field offset exceeds u64"),
                             )),
                         ],
                     });
@@ -1023,7 +1029,7 @@ fn emit_pointer_to_place<'tcx>(
                         method_ty: oomir::Signature {
                             params: vec![
                                 ("pointer".to_string(), base_pointer_ty),
-                                ("view_size".to_string(), oomir::Type::I32),
+                                ("view_size".to_string(), oomir::Type::U64),
                                 ("view_codec".to_string(), oomir::Type::java_string()),
                             ],
                             ret: Box::new(pointer_ty.clone()),
@@ -2839,7 +2845,7 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                             method_ty: oomir::Signature {
                                 params: vec![
                                     ("address".to_string(), oomir::Type::U64),
-                                    ("view_size".to_string(), oomir::Type::I32),
+                                    ("view_size".to_string(), oomir::Type::U64),
                                     ("view_codec".to_string(), oomir::Type::java_string()),
                                 ],
                                 ret: Box::new(oomir_target_type.clone()),
@@ -3047,7 +3053,7 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                                         "slice".to_string(),
                                         oomir::Type::Class("java/lang/Object".to_string()),
                                     ),
-                                    ("element_size".to_string(), oomir::Type::I32),
+                                    ("element_size".to_string(), oomir::Type::U64),
                                     ("codec".to_string(), oomir::Type::java_string()),
                                 ],
                                 ret: Box::new(source_pointer_ty.clone()),
@@ -3072,7 +3078,7 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                             method_ty: oomir::Signature {
                                 params: vec![
                                     ("self".to_string(), source_pointer_ty.clone()),
-                                    ("view_size".to_string(), oomir::Type::I32),
+                                    ("view_size".to_string(), oomir::Type::U64),
                                     ("view_codec".to_string(), oomir::Type::java_string()),
                                 ],
                                 ret: Box::new(target_pointer_ty.clone()),
@@ -3162,7 +3168,7 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                                         "slice".to_string(),
                                         oomir::Type::Class("java/lang/Object".to_string()),
                                     ),
-                                    ("element_size".to_string(), oomir::Type::I32),
+                                    ("element_size".to_string(), oomir::Type::U64),
                                     ("codec".to_string(), oomir::Type::java_string()),
                                 ],
                                 ret: Box::new(oomir_target_type.clone()),
@@ -3170,9 +3176,9 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                             },
                             args: vec![
                                 oomir_operand,
-                                oomir::Operand::Constant(oomir::Constant::I32(
-                                    i32::try_from(source_element_size)
-                                        .expect("fat pointer element exceeds JVM address space"),
+                                oomir::Operand::Constant(oomir::Constant::U64(
+                                    u64::try_from(source_element_size)
+                                        .expect("Rust slice element layout exceeds u64"),
                                 )),
                                 super::super::types::pointer_view_codec_operand(
                                     source_pointee,
@@ -3189,7 +3195,7 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                             method_ty: oomir::Signature {
                                 params: vec![
                                     ("self".to_string(), oomir_target_type.clone()),
-                                    ("view_size".to_string(), oomir::Type::I32),
+                                    ("view_size".to_string(), oomir::Type::U64),
                                     ("view_codec".to_string(), oomir::Type::java_string()),
                                 ],
                                 ret: Box::new(oomir_target_type.clone()),
@@ -3244,7 +3250,7 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                             method_ty: oomir::Signature {
                                 params: vec![
                                     ("pointer".to_string(), oomir_source_type.clone()),
-                                    ("view_size".to_string(), oomir::Type::I32),
+                                    ("view_size".to_string(), oomir::Type::U64),
                                     ("target_class".to_string(), oomir::Type::java_string()),
                                 ],
                                 ret: Box::new(oomir_target_type.clone()),
@@ -3270,12 +3276,12 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                                 method_ty: oomir::Signature {
                                     params: vec![
                                         ("self".to_string(), oomir_source_type),
-                                        ("view_size".to_string(), oomir::Type::I32),
+                                        ("view_size".to_string(), oomir::Type::U64),
                                     ],
                                     ret: Box::new(oomir_target_type.clone()),
                                     is_static: false,
                                 },
-                                args: vec![oomir::Operand::Constant(oomir::Constant::I32(0))],
+                                args: vec![oomir::Operand::Constant(oomir::Constant::U64(0))],
                                 operand: oomir_operand,
                             });
                             return (
@@ -3293,7 +3299,7 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                             method_ty: oomir::Signature {
                                 params: vec![
                                     ("self".to_string(), oomir_source_type.clone()),
-                                    ("view_size".to_string(), oomir::Type::I32),
+                                    ("view_size".to_string(), oomir::Type::U64),
                                     ("view_codec".to_string(), oomir::Type::java_string()),
                                 ],
                                 ret: Box::new(oomir_target_type.clone()),
@@ -3382,7 +3388,7 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                                     method_ty: oomir::Signature {
                                         params: vec![
                                             ("pointer".to_string(), oomir_source_type.clone()),
-                                            ("view_size".to_string(), oomir::Type::I32),
+                                            ("view_size".to_string(), oomir::Type::U64),
                                             ("view_codec".to_string(), oomir::Type::java_string()),
                                         ],
                                         ret: Box::new(element_pointer_ty.clone()),
@@ -4638,7 +4644,7 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                             method_ty: oomir::Signature {
                                 params: vec![
                                     ("pointer".to_string(), data_ty),
-                                    ("view_size".to_string(), oomir::Type::I32),
+                                    ("view_size".to_string(), oomir::Type::U64),
                                     ("view_codec".to_string(), oomir::Type::java_string()),
                                     ("metadata".to_string(), oomir::Type::U64),
                                 ],
@@ -4647,9 +4653,9 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                             },
                             args: vec![
                                 data,
-                                oomir::Operand::Constant(oomir::Constant::I32(
-                                    i32::try_from(pointee_size)
-                                        .expect("raw DST prefix exceeds JVM address space"),
+                                oomir::Operand::Constant(oomir::Constant::U64(
+                                    u64::try_from(pointee_size)
+                                        .expect("Rust raw DST prefix layout exceeds u64"),
                                 )),
                                 super::super::types::pointer_view_codec_operand(
                                     pointee_ty, tcx, data_types, instance,
@@ -4686,7 +4692,7 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                                 method_ty: oomir::Signature {
                                     params: vec![
                                         ("pointer".to_string(), data_ty),
-                                        ("view_size".to_string(), oomir::Type::I32),
+                                        ("view_size".to_string(), oomir::Type::U64),
                                         ("view_codec".to_string(), oomir::Type::java_string()),
                                     ],
                                     ret: Box::new(aggregate_oomir_type.clone()),
@@ -4694,10 +4700,9 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                                 },
                                 args: vec![
                                     data,
-                                    oomir::Operand::Constant(oomir::Constant::I32(
-                                        i32::try_from(pointee_size).expect(
-                                            "raw pointer pointee exceeds JVM address space",
-                                        ),
+                                    oomir::Operand::Constant(oomir::Constant::U64(
+                                        u64::try_from(pointee_size)
+                                            .expect("Rust raw pointer layout exceeds u64"),
                                     )),
                                     super::super::types::pointer_view_codec_operand(
                                         pointee_ty, tcx, data_types, instance,

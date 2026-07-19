@@ -206,8 +206,7 @@ pub fn read_scalar_int_constant<'tcx>(
             .map_err(|error| format!("Could not determine pointee layout for {ty:?}: {error:?}"))?;
         return Ok(oomir::Constant::PointerAddress {
             address: scalar_int.to_target_usize(tcx) as u64,
-            view_size: i32::try_from(layout.size.bytes())
-                .map_err(|_| format!("Pointee layout for {ty:?} exceeds JVM limits"))?,
+            view_size: layout.size.bytes(),
             pointee: Box::new(ty_to_oomir_type(*pointee, tcx, oomir_data_types, instance)),
         });
     }
@@ -1162,9 +1161,7 @@ pub fn read_constant_value_from_memory<'tcx>(
                                 // provenance-only pointers. At runtime those are
                                 // ordinary exposed-address pointer bits.
                                 address: pointer_offset.bytes(),
-                                view_size: i32::try_from(pointee_layout.size.bytes()).map_err(
-                                    |_| format!("Pointee layout for {ty:?} exceeds JVM limits"),
-                                )?,
+                                view_size: pointee_layout.size.bytes(),
                                 pointee: Box::new(ty_to_oomir_type(
                                     *inner_ty,
                                     tcx,

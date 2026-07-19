@@ -567,7 +567,7 @@ pub enum Constant {
     /// ambiguous `Pointer<Unit>` carrier during representation adaptation.
     PointerAddress {
         address: u64,
-        view_size: i32,
+        view_size: u64,
         pointee: Box<Type>,
     },
     /// A typed JVM null. The type is needed when null appears in a constructor

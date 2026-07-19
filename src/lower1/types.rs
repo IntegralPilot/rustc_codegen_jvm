@@ -1987,7 +1987,7 @@ fn emit_ty_to_union_bytes<'tcx>(
                             "slice".to_string(),
                             oomir::Type::Class("java/lang/Object".to_string()),
                         ),
-                        ("element_size".to_string(), oomir::Type::I32),
+                        ("element_size".to_string(), oomir::Type::U64),
                         ("codec".to_string(), oomir::Type::java_string()),
                     ],
                     ret: Box::new(pointer_ty.clone()),
@@ -1995,9 +1995,9 @@ fn emit_ty_to_union_bytes<'tcx>(
                 },
                 args: vec![
                     source,
-                    oomir::Operand::Constant(oomir::Constant::I32(
-                        i32::try_from(element_size)
-                            .map_err(|_| "array element layout exceeds JVM address space")?,
+                    oomir::Operand::Constant(oomir::Constant::U64(
+                        u64::try_from(element_size)
+                            .map_err(|_| "Rust array element layout exceeds u64")?,
                     )),
                     pointer_view_codec_operand(*element, tcx, data_types, instance_context),
                 ],
@@ -2583,7 +2583,7 @@ fn emit_ty_from_union_bytes<'tcx>(
                 method_ty: oomir::Signature {
                     params: vec![
                         ("address".to_string(), oomir::Type::U64),
-                        ("view_size".to_string(), oomir::Type::I32),
+                        ("view_size".to_string(), oomir::Type::U64),
                         ("view_codec".to_string(), oomir::Type::java_string()),
                     ],
                     ret: Box::new(pointer_ty.clone()),
@@ -2591,9 +2591,9 @@ fn emit_ty_from_union_bytes<'tcx>(
                 },
                 args: vec![
                     address,
-                    oomir::Operand::Constant(oomir::Constant::I32(
-                        i32::try_from(layout_size_bytes(tcx, *element)?)
-                            .map_err(|_| "array element layout exceeds JVM address space")?,
+                    oomir::Operand::Constant(oomir::Constant::U64(
+                        u64::try_from(layout_size_bytes(tcx, *element)?)
+                            .map_err(|_| "Rust array element layout exceeds u64")?,
                     )),
                     pointer_view_codec_operand(*element, tcx, data_types, instance_context),
                 ],
@@ -2662,7 +2662,7 @@ fn emit_ty_from_union_bytes<'tcx>(
                     } else {
                         vec![
                             ("address".to_string(), oomir::Type::U64),
-                            ("view_size".to_string(), oomir::Type::I32),
+                            ("view_size".to_string(), oomir::Type::U64),
                             ("view_codec".to_string(), oomir::Type::java_string()),
                         ]
                     },
@@ -2674,9 +2674,9 @@ fn emit_ty_from_union_bytes<'tcx>(
                 } else {
                     vec![
                         bits,
-                        oomir::Operand::Constant(oomir::Constant::I32(
-                            i32::try_from(layout_size_bytes(tcx, *pointee)?)
-                                .map_err(|_| "pointer pointee layout exceeds JVM address space")?,
+                        oomir::Operand::Constant(oomir::Constant::U64(
+                            u64::try_from(layout_size_bytes(tcx, *pointee)?)
+                                .map_err(|_| "Rust pointer pointee layout exceeds u64")?,
                         )),
                         pointer_view_codec_operand(*pointee, tcx, data_types, instance_context),
                     ]

@@ -530,11 +530,11 @@ fn lower_mono_function<'tcx>(
                             class_name: oomir::POINTER_CLASS.to_string(),
                             method_name: "nullPointer".to_string(),
                             method_ty: oomir::Signature {
-                                params: vec![("view_size".to_string(), oomir::Type::I32)],
+                                params: vec![("view_size".to_string(), oomir::Type::U64)],
                                 ret: Box::new(result_ty.clone()),
                                 is_static: true,
                             },
-                            args: vec![oomir::Operand::Constant(oomir::Constant::I32(1))],
+                            args: vec![oomir::Operand::Constant(oomir::Constant::U64(1))],
                         },
                         oomir::Instruction::Return {
                             operand: Some(oomir::Operand::Variable {

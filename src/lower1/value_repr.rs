@@ -649,7 +649,7 @@ fn adapt_mutable_reference_carrier<'tcx>(
                         "slice".to_string(),
                         oomir::Type::Class("java/lang/Object".to_string()),
                     ),
-                    ("element_size".to_string(), oomir::Type::I32),
+                    ("element_size".to_string(), oomir::Type::U64),
                     ("codec".to_string(), oomir::Type::java_string()),
                 ],
                 ret: Box::new(target_jvm_ty.clone()),
@@ -657,8 +657,8 @@ fn adapt_mutable_reference_carrier<'tcx>(
             },
             args: vec![
                 source,
-                oomir::Operand::Constant(oomir::Constant::I32(
-                    i32::try_from(
+                oomir::Operand::Constant(oomir::Constant::U64(
+                    u64::try_from(
                         match target_rust_ty.kind() {
                             TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _) => {
                                 super::types::layout_size_bytes(
@@ -672,7 +672,7 @@ fn adapt_mutable_reference_carrier<'tcx>(
                             panic!("could not determine slice pointer layout: {error}")
                         }),
                     )
-                    .expect("slice pointer layout exceeds the JVM runtime address space"),
+                    .expect("Rust slice pointer layout exceeds u64"),
                 )),
                 match target_rust_ty.kind() {
                     TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _) => {

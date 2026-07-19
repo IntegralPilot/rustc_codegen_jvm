@@ -1185,6 +1185,9 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         if !expected_ty.has_jvm_value() {
             return Ok(());
         }
+        if self.load_pointer_backed_slice_carrier(operand, expected_ty)? {
+            return Ok(());
+        }
         if matches!(expected_ty, oomir::Type::Pointer(_))
             && matches!(operand, oomir::Operand::Variable { name, .. }
                 if self.direct_this_aliases.contains(name))
@@ -1288,6 +1291,39 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             self.jvm_instructions.extend(cast_instructions);
         }
         Ok(())
+    }
+
+    /// Loads a slice-typed local whose optimized MIR storage is already its data pointer.
+    fn load_pointer_backed_slice_carrier(
+        &mut self,
+        operand: &oomir::Operand,
+        expected_ty: &oomir::Type,
+    ) -> Result<bool, jvm::Error> {
+        if expected_ty != &oomir::Type::Class("java/lang/Object".to_string())
+            || !matches!(get_operand_type(operand), oomir::Type::Slice(_))
+        {
+            return Ok(false);
+        }
+        let oomir::Operand::Variable { name, .. } = operand else {
+            return Ok(false);
+        };
+        let Some(index) = self.local_var_map.get(name).copied() else {
+            return Ok(false);
+        };
+        let is_pointer = self
+            .typed_local_var_map
+            .iter()
+            .any(|((typed_name, ty), typed_index)| {
+                typed_name == name && typed_index == &index && matches!(ty, oomir::Type::Pointer(_))
+            });
+        if !is_pointer {
+            return Ok(false);
+        }
+        self.jvm_instructions.push(get_load_instruction(
+            &oomir::Type::Pointer(Box::new(oomir::Type::Unit)),
+            index,
+        )?);
+        Ok(true)
     }
 
     fn dereference_loaded_pointer(&mut self, pointee_ty: &oomir::Type) -> Result<(), jvm::Error> {
@@ -3239,6 +3275,45 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 );
                 // 1. Get the type of the array variable to find the element type
                 let array_type = self.get_local_type(array)?.clone(); // Clone to avoid borrow issues
+                if let oomir::Type::Pointer(element_type) = &array_type {
+                    let pointer_operand = oomir::Operand::Variable {
+                        name: array.clone(),
+                        ty: array_type.clone(),
+                    };
+                    self.load_operand(&pointer_operand)?;
+                    self.load_jvm_int_operand(index)?;
+                    let pointer_class = self.constant_pool.add_class(oomir::POINTER_CLASS)?;
+                    let offset = self.constant_pool.add_method_ref(
+                        pointer_class,
+                        "offset",
+                        &format!("(I)L{};", oomir::POINTER_CLASS),
+                    )?;
+                    self.jvm_instructions.push(JI::Invokevirtual(offset));
+                    self.load_operand_as(
+                        value,
+                        &oomir::Type::Class("java/lang/Object".to_string()),
+                    )?;
+                    if *copy_value
+                        && matches!(
+                            element_type.as_ref(),
+                            oomir::Type::Class(_) | oomir::Type::Array(_)
+                        )
+                    {
+                        let copy_value = self.constant_pool.add_method_ref(
+                            pointer_class,
+                            "copyManagedValue",
+                            "(Ljava/lang/Object;)Ljava/lang/Object;",
+                        )?;
+                        self.jvm_instructions.push(JI::Invokestatic(copy_value));
+                    }
+                    let set = self.constant_pool.add_method_ref(
+                        pointer_class,
+                        "set",
+                        "(Ljava/lang/Object;)V",
+                    )?;
+                    self.jvm_instructions.push(JI::Invokevirtual(set));
+                    return Ok(());
+                }
                 // A freshly constructed view can still be recorded under its concrete
                 // runtime class even though the OOMIR operand carrying it has a semantic
                 // `Slice(T)` type.  Preserve slice stores in both cases.  For the concrete
@@ -3405,6 +3480,20 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 self.jvm_instructions.push(JI::Invokestatic(fill_array));
             }
             OI::ArrayGet { dest, array, index } => {
+                if let oomir::Type::Pointer(element_type) = get_operand_type(array) {
+                    self.load_operand(array)?;
+                    self.load_jvm_int_operand(index)?;
+                    let pointer_class = self.constant_pool.add_class(oomir::POINTER_CLASS)?;
+                    let offset = self.constant_pool.add_method_ref(
+                        pointer_class,
+                        "offset",
+                        &format!("(I)L{};", oomir::POINTER_CLASS),
+                    )?;
+                    self.jvm_instructions.push(JI::Invokevirtual(offset));
+                    self.dereference_loaded_pointer(&element_type)?;
+                    self.store_result(dest, &element_type)?;
+                    return Ok(());
+                }
                 if let oomir::Type::Slice(element_type) = get_operand_type(array) {
                     let view_class = self.constant_pool.add_class(oomir::SLICE_VIEW_CLASS)?;
                     let backing_field = self.constant_pool.add_field_ref(
@@ -4274,6 +4363,9 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         }
 
         let actual_ty = get_operand_type(operand);
+        if self.load_pointer_backed_slice_carrier(operand, expected_ty)? {
+            return Ok(());
+        }
         if matches!(expected_ty, oomir::Type::Pointer(_))
             && matches!(operand, oomir::Operand::Variable { name, .. }
                 if self.direct_this_aliases.contains(name))
