@@ -4068,6 +4068,29 @@ pub(super) fn convert_basic_block<'tcx>(
                         } else if is_compiler_intrinsic
                             && matches!(
                                 intrinsic_name.as_str(),
+                                "exact_div" | "unchecked_div" | "unchecked_rem"
+                            )
+                            && let Some(dest) = effective_dest.clone()
+                        {
+                            let [left, right] = oomir_operands.as_slice() else {
+                                panic!("{intrinsic_name} requires two operands")
+                            };
+                            if intrinsic_name == "unchecked_rem" {
+                                instructions.push(oomir::Instruction::Rem {
+                                    dest,
+                                    op1: left.clone(),
+                                    op2: right.clone(),
+                                });
+                            } else {
+                                instructions.push(oomir::Instruction::Div {
+                                    dest,
+                                    op1: left.clone(),
+                                    op2: right.clone(),
+                                });
+                            }
+                        } else if is_compiler_intrinsic
+                            && matches!(
+                                intrinsic_name.as_str(),
                                 "ptr_offset_from" | "ptr_offset_from_unsigned"
                             )
                             && oomir_operands.len() == 2

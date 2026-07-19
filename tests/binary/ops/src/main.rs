@@ -3,6 +3,7 @@
 #![allow(internal_features)]
 #![feature(f16)]
 #![feature(f128)]
+#![feature(core_intrinsics)]
 
 include!("../../../support/test_prelude.rs");
 
@@ -93,6 +94,8 @@ opaque_integer!(opaque_i64, i64);
 opaque_integer!(opaque_u64, u64);
 opaque_integer!(opaque_i128, i128);
 opaque_integer!(opaque_u128, u128);
+opaque_integer!(opaque_isize, isize);
+opaque_integer!(opaque_usize, usize);
 
 #[inline(never)]
 fn opaque_f16(value: f16) -> f16 {
@@ -313,6 +316,44 @@ fn runtime_integer_ops() {
         wrapped_i128_mul == -2 && overflow_i128_mul,
         "i128 overflowing mul"
     );
+}
+
+macro_rules! test_division_intrinsics {
+    ($opaque:ident, $type:ty, $exact:expr, $divisor:expr, $quotient:expr, $inexact:expr, $remainder:expr) => {{
+        let divisor = $opaque($divisor as $type);
+        unsafe {
+            assert!(
+                core::intrinsics::exact_div($opaque($exact as $type), divisor)
+                    == $quotient as $type,
+                concat!(stringify!($type), " exact_div")
+            );
+            assert!(
+                core::intrinsics::unchecked_div($opaque($inexact as $type), divisor)
+                    == ($inexact as $type) / ($divisor as $type),
+                concat!(stringify!($type), " unchecked_div")
+            );
+            assert!(
+                core::intrinsics::unchecked_rem($opaque($inexact as $type), divisor)
+                    == $remainder as $type,
+                concat!(stringify!($type), " unchecked_rem")
+            );
+        }
+    }};
+}
+
+fn runtime_division_intrinsics() {
+    test_division_intrinsics!(opaque_i8, i8, -120, 3, -40, -121, -1);
+    test_division_intrinsics!(opaque_u8, u8, 240, 3, 80, 241, 1);
+    test_division_intrinsics!(opaque_i16, i16, -30_000, 3, -10_000, -30_001, -1);
+    test_division_intrinsics!(opaque_u16, u16, 60_000, 3, 20_000, 60_001, 1);
+    test_division_intrinsics!(opaque_i32, i32, -1_200_000, 3, -400_000, -1_200_001, -1);
+    test_division_intrinsics!(opaque_u32, u32, 3_600_000_000, 3, 1_200_000_000, 3_600_000_001, 1);
+    test_division_intrinsics!(opaque_i64, i64, -6_000_000_000, 3, -2_000_000_000, -6_000_000_001, -1);
+    test_division_intrinsics!(opaque_u64, u64, 12_000_000_000, 3, 4_000_000_000, 12_000_000_001, 1);
+    test_division_intrinsics!(opaque_i128, i128, -(1_i128 << 100), 4, -(1_i128 << 98), -(1_i128 << 100) - 1, -1);
+    test_division_intrinsics!(opaque_u128, u128, 1_u128 << 127, 4, 1_u128 << 125, (1_u128 << 127) + 1, 1);
+    test_division_intrinsics!(opaque_isize, isize, -12_000, 3, -4_000, -12_001, -1);
+    test_division_intrinsics!(opaque_usize, usize, 12_000, 3, 4_000, 12_001, 1);
 }
 
 macro_rules! test_bit_counts {
@@ -714,6 +755,7 @@ fn read(pointer: *const i32) -> i32 {
 
 fn main() {
     runtime_integer_ops();
+    runtime_division_intrinsics();
     runtime_bit_counts();
     runtime_float_ops();
     runtime_casts();
