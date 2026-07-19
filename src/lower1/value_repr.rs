@@ -690,8 +690,50 @@ fn adapt_mutable_reference_carrier<'tcx>(
         return operand_var(dest, target_jvm_ty.clone());
     }
 
+    let target_pointer_ty = match target_rust_ty.kind() {
+        TyKind::Pat(inner, _) => resolved_ty(*inner, tcx, instance),
+        _ => target_rust_ty,
+    };
+    if let (Some(oomir::Type::Pointer(source_inner)), oomir::Type::Pointer(_)) =
+        (source.get_type(), target_jvm_ty)
+        && let TyKind::Ref(_, pointee_ty, _) | TyKind::RawPtr(pointee_ty, _) =
+            target_pointer_ty.kind()
+    {
+        let pointee_ty = resolved_ty(*pointee_ty, tcx, instance);
+        let source_ty = oomir::Type::Pointer(source_inner);
+        let dest = format!("{temp_prefix}_retyped_pointer");
+        instructions.push(oomir::Instruction::InvokeVirtual {
+            dest: Some(dest.clone()),
+            class_name: oomir::POINTER_CLASS.to_string(),
+            method_name: "retype".to_string(),
+            method_ty: oomir::Signature {
+                params: vec![
+                    ("self".to_string(), source_ty),
+                    ("view_size".to_string(), oomir::Type::U64),
+                    ("view_codec".to_string(), oomir::Type::java_string()),
+                ],
+                ret: Box::new(target_jvm_ty.clone()),
+                is_static: false,
+            },
+            args: vec![
+                oomir::Operand::Constant(oomir::Constant::U64(
+                    u64::try_from(
+                        super::types::layout_size_bytes(tcx, pointee_ty).unwrap_or_else(|error| {
+                            panic!("could not determine pointer view layout: {error}")
+                        }),
+                    )
+                    .expect("pointer view layout exceeds u64"),
+                )),
+                super::types::pointer_view_codec_operand(pointee_ty, tcx, data_types, instance),
+            ],
+            operand: source,
+        });
+        return operand_var(dest, target_jvm_ty.clone());
+    }
+
     if let oomir::Type::Pointer(target_inner) = target_jvm_ty
-        && let TyKind::Ref(_, pointee_ty, _) | TyKind::RawPtr(pointee_ty, _) = target_rust_ty.kind()
+        && let TyKind::Ref(_, pointee_ty, _) | TyKind::RawPtr(pointee_ty, _) =
+            target_pointer_ty.kind()
     {
         let mut pointee = adapt_operand_to_rust_type(
             source,
@@ -760,8 +802,13 @@ fn adapt_mutable_reference_carrier<'tcx>(
         return operand_var(dest, target_jvm_ty.clone());
     }
 
+    let target_is_scalar_struct = matches!(target_rust_ty.kind(), TyKind::Adt(adt_def, _) if adt_def.is_struct())
+        && tcx
+            .layout_of(TypingEnv::fully_monomorphized().as_query_input(target_rust_ty))
+            .is_ok_and(|layout| matches!(layout.backend_repr, BackendRepr::Scalar(_)));
     if let Some(oomir::Type::Pointer(inner)) = source.get_type()
         && !matches!(target_rust_ty.kind(), TyKind::RawPtr(..) | TyKind::Ref(..))
+        && !target_is_scalar_struct
     {
         return super::place::emit_pointer_read(
             source,

@@ -1718,11 +1718,41 @@ const CONST_PTR: *const i32 = CONST_ARRAY.as_ptr();
 const OFFSET_PTR: *const i32 = unsafe { CONST_PTR.add(2) };
 const PTR_ADDR_IS_NULL: bool = CONST_PTR.is_null();
 
+struct ConstMessage {
+    code: u32,
+}
+
+static CONST_MESSAGE: ConstMessage = ConstMessage { code: 42 };
+
+const CONST_NON_NULL_UNIT: core::ptr::NonNull<()> = unsafe {
+    core::ptr::NonNull::new_unchecked(&CONST_MESSAGE as *const ConstMessage as *mut ())
+};
+
+#[derive(Copy, Clone)]
+struct ConstPointerRepr(core::ptr::NonNull<()>, core::marker::PhantomData<()>);
+
+#[derive(Copy, Clone)]
+struct ConstPointerError {
+    repr: ConstPointerRepr,
+}
+
+const CONST_POINTER_ERROR: ConstPointerError = ConstPointerError {
+    repr: ConstPointerRepr(CONST_NON_NULL_UNIT, core::marker::PhantomData),
+};
+
 fn const_pointer_operations() {
     unsafe {
         assert_eq!(*OFFSET_PTR, 30);
     }
     assert!(!PTR_ADDR_IS_NULL);
+    assert_eq!(
+        CONST_NON_NULL_UNIT.as_ptr(),
+        &CONST_MESSAGE as *const ConstMessage as *mut (),
+    );
+    assert_eq!(
+        CONST_POINTER_ERROR.repr.0.as_ptr(),
+        &CONST_MESSAGE as *const ConstMessage as *mut (),
+    );
 }
 
 #[derive(Copy, Clone, PartialEq, Debug)]

@@ -1,4 +1,4 @@
-use rustc_abi::{FieldIdx, FieldsShape, Size, TagEncoding, VariantIdx, Variants};
+use rustc_abi::{BackendRepr, FieldIdx, FieldsShape, Size, TagEncoding, VariantIdx, Variants};
 use rustc_middle::mir::interpret::{
     AllocId, AllocRange, Allocation, CtfeProvenance, GlobalAlloc, Pointer, Provenance, Scalar,
 };
@@ -259,7 +259,7 @@ pub fn read_scalar_int_constant<'tcx>(
         });
     }
 
-    if let TyKind::Adt(adt_def, substs) = ty.kind() {
+    if let TyKind::Adt(adt_def, _) = ty.kind() {
         if adt_def.is_enum() {
             // A scalar enum constant is the enum's physical ABI carrier, not
             // necessarily its source-level discriminant. Niche-encoded enums
@@ -281,44 +281,8 @@ pub fn read_scalar_int_constant<'tcx>(
             return scalar_int_to_oomir_constant(tcx, scalar_int, carrier_ty);
         }
 
-        let variant = adt_def
-            .variants()
-            .iter()
-            .next()
-            .ok_or_else(|| format!("Transparent ADT {:?} has no variants", ty))?;
-        let non_zst_fields = variant
-            .fields
-            .iter()
-            .filter(|field_def| {
-                !tcx.layout_of(PseudoCanonicalInput {
-                    typing_env: TypingEnv::post_analysis(tcx, field_def.did),
-                    value: field_def.ty(tcx, substs).skip_norm_wip(),
-                })
-                .map(|layout| layout.is_zst())
-                .unwrap_or(false)
-            })
-            .collect::<Vec<_>>();
-
-        if non_zst_fields.len() != 1 {
-            return Err(format!(
-                "Transparent ADT {:?} has {} non-ZST fields, expected exactly one",
-                ty,
-                non_zst_fields.len()
-            ));
-        }
-
-        let field_def = non_zst_fields[0];
-        let unnormalized_field_ty = field_def.ty(tcx, substs);
-        let field_ty = tcx
-            .try_normalize_erasing_regions(TypingEnv::fully_monomorphized(), unnormalized_field_ty)
-            .map_err(|error| {
-                format!(
-                    "Could not normalize constant field {} of type {:?}: {:?}",
-                    field_def.ident(tcx),
-                    unnormalized_field_ty,
-                    error
-                )
-            })?;
+        let field_ty = scalar_struct_field_ty(tcx, ty)?
+            .ok_or_else(|| format!("Scalar constant ADT {ty:?} did not have one non-ZST field"))?;
         // A scalar ADT is carried using the bits of its one non-ZST field.
         // Keep that physical carrier here and let value-representation
         // adaptation reconstruct the nominal JVM object at the use site.
@@ -330,6 +294,57 @@ pub fn read_scalar_int_constant<'tcx>(
     }
 
     scalar_int_to_oomir_constant(tcx, scalar_int, ty)
+}
+
+fn scalar_struct_field_ty<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    ty: Ty<'tcx>,
+) -> Result<Option<Ty<'tcx>>, String> {
+    let TyKind::Adt(adt_def, substs) = ty.kind() else {
+        return Ok(None);
+    };
+    if !adt_def.is_struct() {
+        return Ok(None);
+    }
+    let layout = tcx
+        .layout_of(TypingEnv::fully_monomorphized().as_query_input(ty))
+        .map_err(|error| format!("Could not determine constant layout for {ty:?}: {error:?}"))?;
+    if !matches!(layout.backend_repr, BackendRepr::Scalar(_)) {
+        return Ok(None);
+    }
+
+    let variant = adt_def
+        .variants()
+        .iter()
+        .next()
+        .ok_or_else(|| format!("Scalar ADT {ty:?} has no variants"))?;
+    let non_zst_fields = variant
+        .fields
+        .iter()
+        .filter(|field_def| {
+            !tcx.layout_of(PseudoCanonicalInput {
+                typing_env: TypingEnv::post_analysis(tcx, field_def.did),
+                value: field_def.ty(tcx, substs).skip_norm_wip(),
+            })
+            .map(|layout| layout.is_zst())
+            .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    let [field_def] = non_zst_fields.as_slice() else {
+        return Err(format!(
+            "Scalar ADT {ty:?} has {} non-ZST fields, expected exactly one",
+            non_zst_fields.len()
+        ));
+    };
+    let field_ty = field_def.ty(tcx, substs);
+    tcx.try_normalize_erasing_regions(TypingEnv::fully_monomorphized(), field_ty)
+        .map(Some)
+        .map_err(|error| {
+            format!(
+                "Could not normalize constant field {} of type {field_ty:?}: {error:?}",
+                field_def.ident(tcx)
+            )
+        })
 }
 
 pub fn read_zero_sized_constant<'tcx>(
@@ -513,6 +528,22 @@ pub fn read_pointer_constant<'tcx>(
     oomir_data_types: &mut HashMap<String, oomir::DataType>,
     instance: Instance<'tcx>,
 ) -> Result<oomir::Constant, String> {
+    let ty = EarlyBinder::bind(tcx, ty)
+        .instantiate(tcx, instance.args)
+        .skip_norm_wip();
+    let ty = tcx
+        .try_normalize_erasing_regions(
+            TypingEnv::fully_monomorphized(),
+            rustc_middle::ty::Unnormalized::new_wip(ty),
+        )
+        .unwrap_or(ty);
+    if let TyKind::Pat(inner, _) = ty.kind() {
+        return read_pointer_constant(tcx, pointer, *inner, oomir_data_types, instance);
+    }
+    if let Some(field_ty) = scalar_struct_field_ty(tcx, ty)? {
+        return read_pointer_constant(tcx, pointer, field_ty, oomir_data_types, instance);
+    }
+
     match ty.kind() {
         TyKind::FnPtr(..) => {
             read_function_pointer_constant(tcx, pointer, ty, oomir_data_types, instance)
@@ -1183,9 +1214,20 @@ pub fn read_constant_value_from_memory<'tcx>(
                                 oomir_data_types,
                                 instance,
                             )?;
-                            let pointee_type =
-                                ty_to_oomir_type(*inner_ty, tcx, oomir_data_types, instance);
-                            Ok(oomir::Constant::Array(Box::new(pointee_type), vec![value]))
+                            if matches!(oomir::Type::from_constant(&value), oomir::Type::Pointer(_))
+                            {
+                                // A static reference is already its stable address. Keep that
+                                // Pointer carrier rather than adding a pointer-to-pointer cell.
+                                Ok(value)
+                            } else {
+                                pointer_constant_for_pointee(
+                                    tcx,
+                                    *inner_ty,
+                                    value,
+                                    oomir_data_types,
+                                    instance,
+                                )
+                            }
                         }
                     }
                 }
