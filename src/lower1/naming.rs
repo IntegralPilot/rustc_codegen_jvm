@@ -272,6 +272,7 @@ pub fn mono_fn_name_from_instance<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'t
         };
     }
     let mut data_types = HashMap::new();
+    let mut generic_tokens = Vec::new();
     if let Some(item) = tcx.opt_associated_item(instance.def_id()) {
         if let Some(trait_def_id) = item.trait_container(tcx) {
             safe_base = format!(
@@ -293,7 +294,22 @@ pub fn mono_fn_name_from_instance<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'t
             .map(|token| super::types::sanitize_name_token(&token))
             .unwrap_or_else(|| "Self".to_string());
             let trait_prefix = tcx.impl_opt_trait_ref(impl_def_id).map(|trait_ref| {
-                jvm_names::method_for_function(tcx, trait_ref.skip_binder().def_id)
+                let trait_ref = trait_ref.instantiate(tcx, instance.args).skip_norm_wip();
+                let self_arg = trait_ref.args[0];
+                for arg in trait_ref.args.iter().skip(1) {
+                    if arg == self_arg {
+                        continue;
+                    }
+                    if let Some(token) = super::types::readable_rust_generic_arg_name(
+                        arg,
+                        tcx,
+                        &mut data_types,
+                        instance,
+                    ) {
+                        generic_tokens.push(super::types::sanitize_name_token(&token));
+                    }
+                }
+                jvm_names::method_for_function(tcx, trait_ref.def_id)
             });
             safe_base = if let Some(trait_prefix) = trait_prefix {
                 format!("{trait_prefix}_{self_token}_{safe_base}")
@@ -307,8 +323,6 @@ pub fn mono_fn_name_from_instance<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'t
     ) {
         safe_base = jvm_names::disambiguated_def_path_token(tcx, instance.def_id());
     }
-
-    let mut generic_tokens = Vec::new();
 
     // Collect type and const generics. Regions are erased by the JVM ABI.
     for arg in instance.args.iter() {

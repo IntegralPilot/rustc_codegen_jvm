@@ -175,6 +175,7 @@ fn main() {
     test_manual_realloc();
 
     test_string_ops();
+    test_string_partial_eq_specializations();
     test_string_utf_conversions();
     test_vecdeque();
     test_vecdeque_ring_wrapping();
@@ -388,6 +389,26 @@ fn test_string_ops() {
 
     let joined = ["a", "b", "c"].join(",");
     assert!(joined == "a,b,c");
+}
+
+#[inline(never)]
+fn strings_are_equal(left: &String, right: &String) -> bool {
+    left == right
+}
+
+#[inline(never)]
+fn string_equals_str_reference(left: &String, right: &&str) -> bool {
+    <String as PartialEq<&str>>::eq(left, right)
+}
+
+fn test_string_partial_eq_specializations() {
+    let left = String::from("--");
+    let right = String::from("--");
+    let borrowed = "--";
+
+    assert!(strings_are_equal(&left, &right));
+    assert!(string_equals_str_reference(&left, &borrowed));
+    assert!(!string_equals_str_reference(&left, &"different"));
 }
 
 fn test_string_utf_conversions() {
