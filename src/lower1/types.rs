@@ -4584,9 +4584,9 @@ pub fn ty_to_oomir_type<'tcx>(
             // Named functions are Zero-Sized Types (ZSTs).
             // We generate a singleton class so generics like Map<Iter, MyFunc>
             // produce unique JVM class names.
-            let safe_name = jvm_names::class_for_def_id(tcx, *def_id);
+            let safe_name = jvm_names::function_item_class_for_def_id(tcx, *def_id);
 
-            if should_define_named_data_type(tcx, *def_id) && !data_types.contains_key(&safe_name) {
+            if !data_types.contains_key(&safe_name) {
                 data_types.insert(
                     safe_name.clone(),
                     oomir::DataType::Class {

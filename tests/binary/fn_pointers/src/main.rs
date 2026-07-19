@@ -202,6 +202,18 @@ fn increment_i32(value: i32) -> i32 {
     value + 1
 }
 
+#[derive(Copy, Clone)]
+struct Constructed(u32);
+
+#[derive(Copy, Clone)]
+enum ConstructedVariant {
+    Value(u32),
+}
+
+fn apply_constructor<F: FnOnce(u32) -> Constructed>(constructor: F, value: u32) -> Constructed {
+    constructor(value)
+}
+
 fn main() {
     let res_const = derivative(constant, 10.0, 0.125);
     assert!(res_const == 0.0);
@@ -326,4 +338,15 @@ fn main() {
     // A named function item is a zero-sized value, not yet a `fn` pointer.
     // Borrowing it as a callable trait object must preserve the callable.
     assert!(apply_dyn_fn(&increment_i32, 41) == 42);
+
+    let mapped = Some(42_u32).map(Constructed).unwrap();
+    assert!(mapped.0 == 42);
+
+    let constructed = apply_constructor(Constructed, 42);
+    assert!(constructed.0 == 42);
+
+    let variant = Some(42_u32).map(ConstructedVariant::Value).unwrap();
+    match variant {
+        ConstructedVariant::Value(value) => assert!(value == 42),
+    }
 }

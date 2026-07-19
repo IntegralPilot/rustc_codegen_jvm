@@ -1,3 +1,4 @@
+use rustc_hir::def::{CtorOf, DefKind};
 use rustc_middle::ty::{GenericArgsRef, Instance, TyCtxt};
 use rustc_span::def_id::{CrateNum, DefId, LOCAL_CRATE};
 use rustc_span::sym;
@@ -60,6 +61,15 @@ pub fn class_for_def_id<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> String {
     }
     segments.insert(0, root);
     segments.join("/")
+}
+
+pub fn function_item_class_for_def_id<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> String {
+    let base = class_for_def_id(tcx, def_id);
+    if matches!(tcx.def_kind(def_id), DefKind::Ctor(CtorOf::Struct, _)) {
+        format!("{base}$FnItem")
+    } else {
+        base
+    }
 }
 
 pub fn disambiguated_def_path_token(tcx: TyCtxt<'_>, def_id: DefId) -> String {
