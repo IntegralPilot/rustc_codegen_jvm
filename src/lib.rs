@@ -275,26 +275,35 @@ fn place_or_insert_mono_function<'tcx>(
             && (assoc_item.trait_item_def_id().is_none() || assoc_item.is_method());
         if attachable_to_receiver_class {
             let fallback_function = oomir_function.clone();
-            let has_enum_reference_receiver = assoc_item.is_method()
-                && tcx
-                    .fn_sig(instance.def_id())
-                    .instantiate(tcx, instance.args)
-                    .skip_binder()
-                    .inputs()
-                    .first()
-                    .is_some_and(|receiver| {
-                        matches!(
-                            receiver.kind(),
-                            TyKind::Ref(_, pointee, _)
-                                if matches!(pointee.kind(), TyKind::Adt(adt_def, _)
-                                    if adt_def.is_enum())
-                        )
-                    });
             let container_id = assoc_item.container_id(tcx);
             let container_ty = tcx
                 .type_of(container_id)
                 .instantiate(tcx, instance.args)
                 .skip_norm_wip();
+            let receiver_ty = assoc_item.is_method().then(|| {
+                tcx.fn_sig(instance.def_id())
+                    .instantiate(tcx, instance.args)
+                    .skip_binder()
+                    .inputs()
+                    .first()
+                    .copied()
+                    .expect("a Rust method has a receiver")
+            });
+            let has_enum_reference_receiver = receiver_ty.is_some_and(|receiver| {
+                matches!(
+                    receiver.kind(),
+                    TyKind::Ref(_, pointee, _)
+                        if matches!(pointee.kind(), TyKind::Adt(adt_def, _)
+                            if adt_def.is_enum())
+                )
+            });
+            let has_arbitrary_self_receiver = receiver_ty.is_some_and(|receiver| {
+                let receiver_self = match receiver.kind() {
+                    TyKind::Ref(_, pointee, _) => *pointee,
+                    _ => receiver,
+                };
+                receiver_self != container_ty
+            });
             // The method may be monomorphized in a downstream crate. Emit a
             // receiver-class fragment there so the linker can attach it to the
             // upstream class definition rather than leaving only a static copy.
@@ -305,7 +314,10 @@ fn place_or_insert_mono_function<'tcx>(
                 instance,
             );
 
-            if !has_enum_reference_receiver && let Type::Class(class_name) = self_oomir_ty {
+            if !has_enum_reference_receiver
+                && !has_arbitrary_self_receiver
+                && let Type::Class(class_name) = self_oomir_ty
+            {
                 let can_extend_compiled_core_class = lower1::jvm_names::uses_compiled_core(tcx)
                     && (instance.def_id().is_local()
                         || lower1::jvm_names::compiles_external_core_instances(tcx));

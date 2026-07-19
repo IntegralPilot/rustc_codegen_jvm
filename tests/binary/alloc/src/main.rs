@@ -26,6 +26,16 @@ struct DropTracker {
     _val: u32,
 }
 
+struct BoxReceiver {
+    value: u32,
+}
+
+impl BoxReceiver {
+    fn consume(self: Box<Self>) -> u32 {
+        self.value
+    }
+}
+
 impl Drop for DropTracker {
     fn drop(&mut self) {
         unsafe {
@@ -201,7 +211,12 @@ fn main() {
     test_layout_computations();
     test_layout_failures_and_alignments();
     test_array_from_mut();
+    test_boxed_self_receiver();
     test_vec_aggregate_with_function_pointer();
+}
+
+fn test_boxed_self_receiver() {
+    assert!(Box::new(BoxReceiver { value: 42 }).consume() == 42);
 }
 
 fn test_vec_aggregate_with_function_pointer() {
