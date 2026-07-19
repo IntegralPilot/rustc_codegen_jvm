@@ -194,6 +194,14 @@ fn apply2(f: fn(i32, i32) -> i32, a: i32, b: i32) -> i32 {
     f(a, b)
 }
 
+fn apply_dyn_fn(f: &dyn Fn(i32) -> i32, value: i32) -> i32 {
+    f(value)
+}
+
+fn increment_i32(value: i32) -> i32 {
+    value + 1
+}
+
 fn main() {
     let res_const = derivative(constant, 10.0, 0.125);
     assert!(res_const == 0.0);
@@ -314,4 +322,8 @@ fn main() {
         NAMED_OPS.unary
     };
     assert!(picked(2) == 6);
+
+    // A named function item is a zero-sized value, not yet a `fn` pointer.
+    // Borrowing it as a callable trait object must preserve the callable.
+    assert!(apply_dyn_fn(&increment_i32, 41) == 42);
 }

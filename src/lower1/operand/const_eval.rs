@@ -1000,6 +1000,12 @@ pub fn read_constant_value_from_memory<'tcx>(
         .layout_of(pci)
         .map_err(|_| "Couldn't get layout.".to_string())?;
 
+    // A reference to a ZST can point at a zero-byte allocation, so there are
+    // no bytes to decode. Reconstruct its nominal JVM value from the type.
+    if layout.is_zst() {
+        return read_zero_sized_constant(tcx, ty, oomir_data_types, instance);
+    }
+
     breadcrumbs::log!(
         breadcrumbs::LogLevel::Info,
         "const-eval",

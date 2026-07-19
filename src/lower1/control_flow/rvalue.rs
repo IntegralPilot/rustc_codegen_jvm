@@ -2923,8 +2923,34 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                                 instance,
                             )
                         });
+                    let callable_fn_def_adapter = callable_abi.as_ref().and_then(|callable_abi| {
+                        let callable_ty = match source_mir_ty.kind() {
+                            TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _) => *pointee,
+                            _ => source_mir_ty,
+                        };
+                        let TyKind::FnDef(def_id, args) = callable_ty.kind() else {
+                            return None;
+                        };
+                        let function_instance = Instance::resolve_for_fn_ptr(
+                            tcx,
+                            TypingEnv::post_analysis(tcx, mir.source.def_id()),
+                            *def_id,
+                            args.no_bound_vars()?,
+                        )?;
+                        let target =
+                            fn_pointer_target(tcx, function_instance, &callable_abi.signature);
+                        Some(ensure_fn_pointer_adapter_class(
+                            data_types,
+                            target.as_ref(),
+                            &callable_abi.signature,
+                            &callable_abi.interface_name,
+                            tcx,
+                            instance,
+                        ))
+                    });
 
                     let trait_object_adapter = if !callable_closure_bridge
+                        && callable_fn_def_adapter.is_none()
                         && matches!(
                             cast_kind,
                             CastKind::PointerCoercion(PointerCoercion::Unsize, _)
@@ -2988,6 +3014,12 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                             op: oomir_operand,
                             ty: oomir_target_type.clone(),
                             dest: temp_cast_var.clone(),
+                        });
+                    } else if let Some(adapter_class) = callable_fn_def_adapter {
+                        instructions.push(oomir::Instruction::ConstructObject {
+                            dest: temp_cast_var.clone(),
+                            class_name: adapter_class,
+                            args: Vec::new(),
                         });
                     } else if let Some(adapter_class) = trait_object_adapter {
                         instructions.push(oomir::Instruction::ConstructObject {

@@ -96,3 +96,9 @@ impl GenericMethodOwner {
         value
     }
 }
+
+// This deliberately shares its name with `core::ptr::metadata`. A backend
+// must identify intrinsics by identity rather than names alone.
+pub fn metadata(value: &i32) -> Result<i32, i32> {
+    Err(*value)
+}

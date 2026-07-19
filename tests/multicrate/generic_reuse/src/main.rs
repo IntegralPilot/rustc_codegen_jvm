@@ -7,8 +7,8 @@ include!("../../../support/test_prelude.rs");
 use alloc::vec;
 use alloc::vec::Vec;
 use provider::{
-    DynValue, GenericMethodOwner, Holder, ProviderCounter, provider_scaled, provider_score,
-    pull_i32, pull_i64, scaled_sum,
+    DynValue, GenericMethodOwner, Holder, ProviderCounter, metadata, provider_scaled,
+    provider_score, pull_i32, pull_i64, scaled_sum,
 };
 
 struct LocalI32(i32);
@@ -81,4 +81,7 @@ fn main() {
     // by the downstream crate. Its body must still be attached to that type.
     let owner = GenericMethodOwner;
     assert!(owner.identity(123_i64) == 123);
+
+    // An external function named `metadata` is still an ordinary Rust call.
+    assert!(matches!(metadata(&42), Err(42)));
 }

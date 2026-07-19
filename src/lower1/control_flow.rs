@@ -28,6 +28,20 @@ mod trait_objects;
 
 pub use checked_intrinsic_registry::take_needed_intrinsics;
 
+fn is_core_ptr_metadata_api(tcx: TyCtxt<'_>, def_id: rustc_span::def_id::DefId) -> bool {
+    let metadata = Symbol::intern("metadata");
+    let Some(metadata_module) = tcx.opt_parent(def_id) else {
+        return false;
+    };
+    let Some(ptr_module) = tcx.opt_parent(metadata_module) else {
+        return false;
+    };
+    tcx.crate_name(def_id.krate) == sym::core
+        && tcx.opt_item_name(def_id) == Some(metadata)
+        && tcx.opt_item_name(metadata_module) == Some(metadata)
+        && tcx.opt_item_name(ptr_module) == Some(sym::ptr)
+}
+
 fn caller_location_operand<'tcx>(
     source_info: SourceInfo,
     tcx: TyCtxt<'tcx>,
@@ -3702,6 +3716,11 @@ pub(super) fn convert_basic_block<'tcx>(
                             || has_diagnostic_item("mem_size_of_val");
                         let is_align_of_val =
                             is_compiler_intrinsic && intrinsic_name.as_str() == "align_of_val";
+                        // The public wrapper has no diagnostic/lang item of its own,
+                        // so identify it by its defining module rather than its bare name.
+                        let is_ptr_metadata = (is_compiler_intrinsic
+                            && intrinsic_name.as_str() == "ptr_metadata")
+                            || is_core_ptr_metadata_api(tcx, called_def_id);
                         if is_compiler_intrinsic
                             && matches!(
                                 intrinsic_name.as_str(),
@@ -4639,7 +4658,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                     dest,
                                 });
                             }
-                        } else if matches!(intrinsic_name.as_str(), "metadata" | "ptr_metadata")
+                        } else if is_ptr_metadata
                             && (is_core_ptr || is_local_core_ptr)
                             && (matches!(
                                 oomir_operands[0].get_type(),
@@ -4676,7 +4695,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                     });
                                 }
                             }
-                        } else if matches!(intrinsic_name.as_str(), "metadata" | "ptr_metadata")
+                        } else if is_ptr_metadata
                             && (is_core_ptr || is_local_core_ptr)
                             && matches!(oomir_operands[0].get_type(), Some(oomir::Type::Pointer(_)))
                         {
