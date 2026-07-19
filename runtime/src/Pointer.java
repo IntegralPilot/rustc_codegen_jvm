@@ -22,11 +22,14 @@ public final class Pointer {
     private static final String MANAGED_OBJECT_VIEW_CODEC = "@managed-object";
     private static final String RAW_POINTER_VIEW_CODEC = "@raw-pointer";
     private static final String SLICE_POINTER_VIEW_CODEC_PREFIX = "@slice-pointer\n";
+    private static final String STRUCT_TAIL_POINTER_VIEW_CODEC_PREFIX =
+            "@struct-tail-pointer\n";
     private static final String TRAIT_POINTER_VIEW_CODEC_PREFIX = "@trait-pointer\n";
     private static final String SIGNED_BIG_INTEGER_CODEC = "@signed-big-integer";
     private static final String UNSIGNED_BIG_INTEGER_CODEC = "@unsigned-big-integer";
     private static final String F128_CODEC = "@f128";
     private static final String STRUCTURAL_VIEW_CODEC_PREFIX = "@structural-view:";
+    private static final String STRUCT_TAIL_VIEW_CODEC_PREFIX = "@struct-tail-view:";
     private static final String SLICE_VIEW_CLASS_NAME = "org.rustlang.runtime.SliceView";
     private static final AtomicLong NEXT_ADDRESS = new AtomicLong(0x1_0000_0000L);
     private static final Map<Object, Long> ALLOCATION_BASES = new WeakHashMap<>();
@@ -401,6 +404,7 @@ public final class Pointer {
     private static boolean isFatPointerCodec(String codec) {
         return codec != null
                 && (codec.startsWith(SLICE_POINTER_VIEW_CODEC_PREFIX)
+                        || codec.startsWith(STRUCT_TAIL_POINTER_VIEW_CODEC_PREFIX)
                         || codec.startsWith(TRAIT_POINTER_VIEW_CODEC_PREFIX));
     }
 
@@ -451,6 +455,39 @@ public final class Pointer {
         }
     }
 
+    private static String[] structTailPointerDescriptor(String codec) {
+        String descriptor = codec.substring(STRUCT_TAIL_POINTER_VIEW_CODEC_PREFIX.length());
+        String[] parts = descriptor.split("\\n", 5);
+        if (parts.length != 5) {
+            throw new IllegalArgumentException("invalid Rust struct-tail pointer codec descriptor");
+        }
+        return parts;
+    }
+
+    private static long structTailPointerPrefixSize(String[] descriptor) {
+        try {
+            long size = Long.parseLong(descriptor[1]);
+            if (size < 0) {
+                throw new IllegalArgumentException("negative Rust struct-tail prefix size");
+            }
+            return size;
+        } catch (NumberFormatException error) {
+            throw new IllegalArgumentException("invalid Rust struct-tail prefix size", error);
+        }
+    }
+
+    private static int structTailPointerElementSize(String[] descriptor) {
+        try {
+            int size = Integer.parseInt(descriptor[3]);
+            if (size < 0) {
+                throw new IllegalArgumentException("negative Rust struct-tail element size");
+            }
+            return size;
+        } catch (NumberFormatException error) {
+            throw new IllegalArgumentException("invalid Rust struct-tail element size", error);
+        }
+    }
+
     private static byte[] encodeFatPointer(Object value, int size, String codec) {
         int wordSize = fatPointerWordSize(size);
         byte[] image = new byte[size];
@@ -472,6 +509,14 @@ public final class Pointer {
             } catch (ReflectiveOperationException error) {
                 throw new IllegalArgumentException("invalid Rust slice fat pointer", error);
             }
+        } else if (codec.startsWith(STRUCT_TAIL_POINTER_VIEW_CODEC_PREFIX)) {
+            if (!(value instanceof Pointer)) {
+                throw new IllegalArgumentException(
+                        "Rust struct-tail pointer requires a Pointer carrier");
+            }
+            Pointer pointer = (Pointer) value;
+            dataAddress = pointer.address();
+            pointerMetadata = pointer.metadata();
         } else {
             if (!(value instanceof Pointer)) {
                 throw new IllegalArgumentException(
@@ -495,6 +540,22 @@ public final class Pointer {
         long pointerMetadata = readMemoryWord(bytes, offset + wordSize, wordSize);
         if (codec.startsWith(TRAIT_POINTER_VIEW_CODEC_PREFIX)) {
             return pointerObjectFromAddress(dataAddress);
+        }
+
+        if (codec.startsWith(STRUCT_TAIL_POINTER_VIEW_CODEC_PREFIX)) {
+            String[] descriptor = structTailPointerDescriptor(codec);
+            int elementSize = structTailPointerElementSize(descriptor);
+            String elementCodec = descriptor[4].isEmpty() ? null : descriptor[4];
+            Pointer data = pointerObjectFromAddress(dataAddress).retype(elementSize, elementCodec);
+            return data.retype(
+                            structTailPointerPrefixSize(descriptor),
+                            STRUCT_TAIL_VIEW_CODEC_PREFIX
+                                    + descriptor[0] + "\n"
+                                    + descriptor[1] + "\n"
+                                    + descriptor[2] + "\n"
+                                    + descriptor[3] + "\n"
+                                    + descriptor[4])
+                    .withMetadata(pointerMetadata);
         }
 
         String[] descriptor = slicePointerDescriptor(codec);
@@ -569,7 +630,8 @@ public final class Pointer {
 
     private static boolean isStructuralViewCodec(String codecClassName) {
         return codecClassName != null
-                && codecClassName.startsWith(STRUCTURAL_VIEW_CODEC_PREFIX);
+                && (codecClassName.startsWith(STRUCTURAL_VIEW_CODEC_PREFIX)
+                        || codecClassName.startsWith(STRUCT_TAIL_VIEW_CODEC_PREFIX));
     }
 
     private static Field instanceField(Class<?> owner, String name)
@@ -644,6 +706,19 @@ public final class Pointer {
 
     private static Object constructStructuralView(Object source, Class<?> targetClass) {
         try {
+            Object transparentInner = null;
+            for (Field field : source.getClass().getFields()) {
+                if (!Modifier.isStatic(field.getModifiers())) {
+                    if (transparentInner != null) {
+                        transparentInner = null;
+                        break;
+                    }
+                    transparentInner = field.get(source);
+                }
+            }
+            if (transparentInner != null && targetClass.isInstance(transparentInner)) {
+                return transparentInner;
+            }
             Field[] targetFields = java.util.Arrays.stream(targetClass.getFields())
                     .filter(field -> !Modifier.isStatic(field.getModifiers()))
                     .toArray(Field[]::new);
@@ -651,12 +726,16 @@ public final class Pointer {
             Object[] args = new Object[constructor.getParameterCount()];
             java.lang.reflect.Parameter[] parameters = constructor.getParameters();
             for (int index = 0; index < parameters.length; index++) {
-                String fieldName = parameters[index].isNamePresent()
-                        ? parameters[index].getName()
-                        : targetFields[index].getName();
-                Field sourceField = instanceField(source.getClass(), fieldName);
-                args[index] = adaptStructuralField(
-                        sourceField.get(source), parameters[index].getType());
+                if (parameters.length == 1 && parameters[index].getType().isInstance(source)) {
+                    args[index] = source;
+                } else {
+                    String fieldName = parameters[index].isNamePresent()
+                            ? parameters[index].getName()
+                            : targetFields[index].getName();
+                    Field sourceField = instanceField(source.getClass(), fieldName);
+                    args[index] = adaptStructuralField(
+                            sourceField.get(source), parameters[index].getType());
+                }
             }
             return constructor.newInstance(args);
         } catch (ReflectiveOperationException error) {
@@ -669,10 +748,24 @@ public final class Pointer {
 
     private static void copyStructuralFields(Object source, Object target) {
         try {
-            for (Field targetField : target.getClass().getFields()) {
-                if (Modifier.isStatic(targetField.getModifiers())) {
-                    continue;
+            Field[] targetFields = java.util.Arrays.stream(target.getClass().getFields())
+                    .filter(field -> !Modifier.isStatic(field.getModifiers()))
+                    .toArray(Field[]::new);
+            if (targetFields.length == 1 && targetFields[0].getType().isInstance(source)) {
+                targetFields[0].set(target, source);
+                return;
+            }
+            Field[] sourceFields = java.util.Arrays.stream(source.getClass().getFields())
+                    .filter(field -> !Modifier.isStatic(field.getModifiers()))
+                    .toArray(Field[]::new);
+            if (sourceFields.length == 1) {
+                Object inner = sourceFields[0].get(source);
+                if (inner != null && target.getClass().isInstance(inner)) {
+                    copyStructuralFields(inner, target);
+                    return;
                 }
+            }
+            for (Field targetField : targetFields) {
                 Field sourceField = instanceField(source.getClass(), targetField.getName());
                 Object sourceValue = sourceField.get(source);
                 Object targetValue = targetField.get(target);
@@ -972,6 +1065,15 @@ public final class Pointer {
         return parts;
     }
 
+    private String[] structTailViewDescriptor() {
+        String descriptor = viewCodecClassName.substring(STRUCT_TAIL_VIEW_CODEC_PREFIX.length());
+        String[] parts = descriptor.split("\n", 5);
+        if (parts.length != 5) {
+            throw new IllegalStateException("invalid Rust struct-tail view descriptor");
+        }
+        return parts;
+    }
+
     private Object structuralSourceObject(String[] descriptor) {
         int sourceViewSize;
         try {
@@ -992,10 +1094,38 @@ public final class Pointer {
                 .getObject();
     }
 
+    private Object structTailSourceObject(String[] descriptor) {
+        long prefixSize = structTailPointerPrefixSize(descriptor);
+        int elementSize = structTailPointerElementSize(descriptor);
+        String elementCodec = descriptor[4].isEmpty() ? null : descriptor[4];
+        Pointer data = byte_offset(prefixSize).retype(elementSize, elementCodec);
+        try {
+            Class<?> viewClass = Class.forName(
+                    descriptor[2].replace('/', '.'), true, Pointer.class.getClassLoader());
+            return viewClass
+                    .getConstructor(Object.class, int.class, int.class)
+                    .newInstance(data, 0, Math.toIntExact(metadata()));
+        } catch (ReflectiveOperationException error) {
+            throw new IllegalStateException("could not construct Rust struct-tail source view", error);
+        }
+    }
+
+    private Object structuralSourceObject() {
+        return viewCodecClassName.startsWith(STRUCT_TAIL_VIEW_CODEC_PREFIX)
+                ? structTailSourceObject(structTailViewDescriptor())
+                : structuralSourceObject(structuralViewDescriptor());
+    }
+
+    private String structuralTargetClassName() {
+        String name = viewCodecClassName.startsWith(STRUCT_TAIL_VIEW_CODEC_PREFIX)
+                ? structTailViewDescriptor()[0]
+                : structuralViewDescriptor()[0];
+        return name.replace('/', '.');
+    }
+
     private Object structuralViewObject() {
-        String[] descriptor = structuralViewDescriptor();
-        String targetClassName = descriptor[0].replace('/', '.');
-        Object source = structuralSourceObject(descriptor);
+        String targetClassName = structuralTargetClassName();
+        Object source = structuralSourceObject();
         try {
             ClassLoader loader = source.getClass().getClassLoader();
             Class<?> targetClass = Class.forName(targetClassName, true, loader);
@@ -1331,8 +1461,9 @@ public final class Pointer {
         if (hasStableManagedCarrier()) {
             Object owner = compatibleStructView(ownerClassName);
             if (owner != null
-                    && fieldCodecClassName != null
-                    && !isBuiltInCodec(fieldCodecClassName)) {
+                    && (fieldSize == 0
+                            || (fieldCodecClassName != null
+                                    && !isBuiltInCodec(fieldCodecClassName)))) {
                 return field(owner, fieldName, fieldSize, fieldCodecClassName);
             }
         }
@@ -2506,10 +2637,15 @@ public final class Pointer {
         flushMemoryViewsOverlapping(
                 byteOffset, Math.max(1, allocationElementSize));
         if (allocationElementSize == 0) {
-            if (allocation instanceof Cell || allocation instanceof ReceiverCell) {
-                return allocation instanceof Cell
-                        ? ((Cell) allocation).value
-                        : ((ReceiverCell) allocation).value;
+            if (allocation instanceof Cell
+                    || allocation instanceof ReceiverCell
+                    || allocation instanceof FieldCell) {
+                if (allocation instanceof Cell) {
+                    return ((Cell) allocation).value;
+                }
+                return allocation instanceof ReceiverCell
+                        ? ((ReceiverCell) allocation).value
+                        : ((FieldCell) allocation).get();
             }
             return allocation.getClass().isArray() && Array.getLength(allocation) != 0
                     ? Array.get(allocation, 0)
@@ -3017,7 +3153,7 @@ public final class Pointer {
         Object value;
         StructuralViewState state;
         if (isStructuralViewCodec(viewCodecClassName)) {
-            value = structuralSourceObject(structuralViewDescriptor());
+            value = structuralSourceObject();
             state = structuralViewState(value, true);
         } else {
             value = getObject();

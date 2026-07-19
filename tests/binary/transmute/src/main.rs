@@ -52,6 +52,36 @@ union WordBytes {
 
 struct Marker;
 
+#[repr(transparent)]
+struct ByteSlice([u8]);
+
+#[repr(transparent)]
+struct OuterByteSlice(ByteSlice);
+
+impl ByteSlice {
+    #[inline(never)]
+    fn first(&self) -> u8 {
+        self.0[0]
+    }
+
+    #[inline(never)]
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+impl OuterByteSlice {
+    #[inline(never)]
+    fn first(&self) -> u8 {
+        self.0.first()
+    }
+
+    #[inline(never)]
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
 fn test_scalar_bits() {
     let truth: bool = unsafe { transmute(1u8) };
     assert!(truth);
@@ -173,6 +203,21 @@ fn test_zero_sized_values() {
     assert!(unit == ());
 }
 
+fn test_unsized_transparent_reference_transmute() {
+    let bytes = [11_u8, 22, 33, 44];
+    let wrapped: &ByteSlice = unsafe { transmute::<&[u8], &ByteSlice>(&bytes) };
+    assert!(wrapped.len() == 4);
+    assert!(wrapped.first() == 11);
+
+    let outer = unsafe { &*(wrapped as *const ByteSlice as *const OuterByteSlice) };
+    assert!(outer.len() == 4);
+    assert!(outer.first() == 11);
+
+    let empty: &[u8] = &[];
+    let empty_wrapped: &ByteSlice = unsafe { transmute(empty) };
+    assert!(empty_wrapped.len() == 0);
+}
+
 fn main() {
     test_scalar_bits();
     test_float_bits();
@@ -181,4 +226,5 @@ fn main() {
     test_data_carrying_enums();
     test_union_storage_round_trips();
     test_zero_sized_values();
+    test_unsized_transparent_reference_transmute();
 }

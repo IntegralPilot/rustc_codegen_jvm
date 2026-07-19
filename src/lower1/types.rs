@@ -16,6 +16,7 @@ pub const UNION_OBJECTS_FIELD: &str = "_objects";
 pub const MANAGED_OBJECT_POINTER_VIEW_CODEC: &str = "@managed-object";
 pub const RAW_POINTER_VIEW_CODEC: &str = "@raw-pointer";
 const SLICE_POINTER_VIEW_CODEC_PREFIX: &str = "@slice-pointer\n";
+const STRUCT_TAIL_POINTER_VIEW_CODEC_PREFIX: &str = "@struct-tail-pointer\n";
 const TRAIT_POINTER_VIEW_CODEC_PREFIX: &str = "@trait-pointer\n";
 pub(super) const ENUM_UNION_DISCRIMINANT_METHOD: &str = "_unionDiscriminant";
 const ENUM_FROM_UNION_DISCRIMINANT_METHOD: &str = "_fromUnionDiscriminant";
@@ -3477,7 +3478,28 @@ fn fat_pointer_codec_operand<'tcx>(
             .to_string();
         format!("{TRAIT_POINTER_VIEW_CODEC_PREFIX}{interface}")
     } else {
-        return None;
+        let tail = tcx.struct_tail_for_codegen(pointee, TypingEnv::fully_monomorphized());
+        let (carrier_class, element) = if tail.is_slice() {
+            (oomir::SLICE_VIEW_CLASS, tail.sequence_element_type(tcx))
+        } else if tail.is_str() {
+            (oomir::UTF8_VIEW_CLASS, tcx.types.u8)
+        } else {
+            return None;
+        };
+        let target_class = ty_to_oomir_type(pointee, tcx, data_types, instance_context)
+            .get_class_name()?
+            .to_string();
+        let prefix_size = layout_size_bytes(tcx, pointee).ok()?;
+        let element_size = layout_size_bytes(tcx, element).ok()?;
+        let element_codec = pointer_view_codec_operand(element, tcx, data_types, instance_context);
+        let element_codec = match element_codec {
+            oomir::Operand::Constant(oomir::Constant::String(codec)) => codec,
+            oomir::Operand::Constant(oomir::Constant::Null(_)) => String::new(),
+            other => panic!("struct-tail element codec must be constant, found {other:?}"),
+        };
+        format!(
+            "{STRUCT_TAIL_POINTER_VIEW_CODEC_PREFIX}{target_class}\n{prefix_size}\n{carrier_class}\n{element_size}\n{element_codec}"
+        )
     };
 
     Some(oomir::Operand::Constant(oomir::Constant::String(

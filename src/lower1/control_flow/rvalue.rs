@@ -148,6 +148,30 @@ fn struct_tail_unsize_target_class<'tcx>(
     }
 }
 
+fn struct_tail_pointer_target_class<'tcx>(
+    target_pointer_ty: rustc_middle::ty::Ty<'tcx>,
+    target_oomir_ty: &oomir::Type,
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
+) -> Option<String> {
+    let target_pointee = match target_pointer_ty.kind() {
+        TyKind::Ref(_, target, _) | TyKind::RawPtr(target, _) => *target,
+        _ => return None,
+    };
+    let target_pointee = normalize_unsize_ty(target_pointee, tcx, instance);
+    let tail = tcx.struct_tail_for_codegen(target_pointee, TypingEnv::fully_monomorphized());
+    if !matches!(tail.kind(), TyKind::Slice(_) | TyKind::Str) {
+        return None;
+    }
+    let oomir::Type::Pointer(target) = target_oomir_ty else {
+        return None;
+    };
+    let oomir::Type::Class(target_class) = target.as_ref() else {
+        return None;
+    };
+    Some(target_class.clone())
+}
+
 fn normalize_unsize_ty<'tcx>(
     ty: Ty<'tcx>,
     tcx: TyCtxt<'tcx>,
@@ -3265,6 +3289,39 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                     } else if matches!(oomir_source_type, oomir::Type::Pointer(_))
                         && matches!(oomir_target_type, oomir::Type::Pointer(_))
                     {
+                        if let Some(target_class) = struct_tail_pointer_target_class(
+                            *target_mir_ty,
+                            &oomir_target_type,
+                            tcx,
+                            instance,
+                        ) {
+                            instructions.push(oomir::Instruction::InvokeStatic {
+                                dest: Some(temp_cast_var.clone()),
+                                class_name: oomir::POINTER_CLASS.to_string(),
+                                method_name: "unsizeStruct".to_string(),
+                                method_ty: oomir::Signature {
+                                    params: vec![
+                                        ("pointer".to_string(), oomir_source_type),
+                                        ("view_size".to_string(), oomir::Type::U64),
+                                        ("target_class".to_string(), oomir::Type::java_string()),
+                                    ],
+                                    ret: Box::new(oomir_target_type.clone()),
+                                    is_static: true,
+                                },
+                                args: vec![
+                                    oomir_operand,
+                                    pointer_view_size_operand(*target_mir_ty, tcx, instance),
+                                    oomir::Operand::Constant(oomir::Constant::String(target_class)),
+                                ],
+                            });
+                            return (
+                                instructions,
+                                oomir::Operand::Variable {
+                                    name: temp_cast_var,
+                                    ty: oomir_target_type,
+                                },
+                            );
+                        }
                         if matches!(
                             pointer_pointee_ty(*target_mir_ty).kind(),
                             TyKind::Dynamic(_, _)
