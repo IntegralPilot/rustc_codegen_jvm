@@ -1804,9 +1804,11 @@ pub(super) fn convert_basic_block<'tcx>(
                 });
 
                 let typing_env = TypingEnv::post_analysis(tcx, mir.source.def_id());
-                let func_ty = EarlyBinder::bind(tcx, func.ty(mir, tcx))
-                    .instantiate(tcx, instance.args)
-                    .skip_norm_wip();
+                let instantiated_func_ty =
+                    EarlyBinder::bind(tcx, func.ty(mir, tcx)).instantiate(tcx, instance.args);
+                let func_ty = tcx
+                    .try_normalize_erasing_regions(typing_env, instantiated_func_ty)
+                    .unwrap_or_else(|_| instantiated_func_ty.skip_norm_wip());
                 if let rustc_middle::ty::TyKind::FnDef(def_id, substs) = func_ty.kind() {
                     // Resolve the instance
                     let func_instance = rustc_middle::ty::Instance::expect_resolve(

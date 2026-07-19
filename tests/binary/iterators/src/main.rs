@@ -1,5 +1,6 @@
 #![no_std]
 #![feature(lang_items)]
+#![feature(iter_map_windows)]
 #![allow(internal_features)]
 
 include!("../../../support/test_prelude.rs");
@@ -7,7 +8,6 @@ include!("../../../support/test_prelude.rs");
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::ops::Bound::{Excluded, Included, Unbounded};
 
 #[derive(Clone, Copy)]
 struct Marker;
@@ -343,6 +343,18 @@ fn generator_and_transform_adapters() {
     assert!(core::iter::empty::<i32>().next().is_none());
     assert!(core::iter::once(7).chain(core::iter::once_with(|| 9)).sum::<i32>() == 16);
     assert!(core::iter::repeat(3).take(5).product::<i32>() == 243);
+
+    let repeated_strings = core::iter::repeat(String::from("owned"))
+        .take(3)
+        .collect::<Vec<_>>();
+    assert!(repeated_strings.len() == 3);
+    assert!(repeated_strings.iter().all(|value| value == "owned"));
+
+    let window_count = core::iter::repeat(String::from("window"))
+        .map_windows(|window: &[_; 3]| window.len())
+        .take(4)
+        .sum::<usize>();
+    assert!(window_count == 12);
 
     let powers = core::iter::successors(Some(1i32), |value| {
         (*value < 16).then_some(*value * 2)

@@ -626,9 +626,11 @@ fn direct_mir_callees<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> Vec<
             let rustc_middle::mir::TerminatorKind::Call { func, .. } = &terminator.kind else {
                 return None;
             };
-            let func_ty = EarlyBinder::bind(tcx, func.ty(mir, tcx))
-                .instantiate(tcx, instance.args)
-                .skip_norm_wip();
+            let instantiated_func_ty =
+                EarlyBinder::bind(tcx, func.ty(mir, tcx)).instantiate(tcx, instance.args);
+            let func_ty = tcx
+                .try_normalize_erasing_regions(typing_env, instantiated_func_ty)
+                .unwrap_or_else(|_| instantiated_func_ty.skip_norm_wip());
             let TyKind::FnDef(def_id, args) = func_ty.kind() else {
                 return None;
             };
