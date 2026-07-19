@@ -161,13 +161,15 @@ pub(super) fn ensure_trait_object_adapter_class<'tcx>(
                 };
                 let mut method_ty = target_signature.clone();
                 method_ty.is_static = false;
+                let method_name = super::super::naming::associated_method_name_from_instance(
+                    tcx,
+                    *target_instance,
+                    &method_ty,
+                );
                 oomir::Instruction::InvokeVirtual {
                     dest: call_dest.clone(),
                     class_name: receiver_class.clone(),
-                    method_name: super::super::naming::associated_method_name_from_instance(
-                        tcx,
-                        *target_instance,
-                    ),
+                    method_name,
                     method_ty,
                     args: call_args.into_iter().skip(1).collect(),
                     operand: oomir::Operand::Variable {

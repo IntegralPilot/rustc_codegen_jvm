@@ -2003,6 +2003,7 @@ pub(super) fn convert_basic_block<'tcx>(
                             let method_name = super::naming::associated_method_name_from_instance(
                                 tcx,
                                 func_instance,
+                                &method_signature,
                             );
                             let declared_method_name = item.name().as_str().to_string();
 
@@ -3577,11 +3578,12 @@ pub(super) fn convert_basic_block<'tcx>(
                                 }
                             }
                         } else {
+                            method_signature.is_static = true;
                             let method_name = super::naming::associated_method_name_from_instance(
                                 tcx,
                                 func_instance,
+                                &method_signature,
                             );
-                            method_signature.is_static = true;
 
                             let self_ty_opt = if let Some(impl_def_id) = item.impl_container(tcx) {
                                 Some(

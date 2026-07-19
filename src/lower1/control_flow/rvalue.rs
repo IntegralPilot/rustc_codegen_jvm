@@ -1344,8 +1344,13 @@ pub(crate) fn fn_pointer_target<'tcx>(
         oomir::Type::Pointer(inner) | oomir::Type::Reference(inner) => inner.as_ref(),
         other => other,
     };
-    let method_name =
-        super::super::naming::associated_method_name_from_instance(tcx, target_instance);
+    let mut method_signature = signature.clone();
+    method_signature.is_static = false;
+    let method_name = super::super::naming::associated_method_name_from_instance(
+        tcx,
+        target_instance,
+        &method_signature,
+    );
     match receiver_ty {
         oomir::Type::Class(class_name) => Some(FnPointerTarget::Virtual {
             class_name: class_name.clone(),

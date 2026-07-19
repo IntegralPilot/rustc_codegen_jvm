@@ -4,6 +4,37 @@
 
 include!("../../../support/test_prelude.rs");
 
+struct ObjectMethodCollision;
+
+impl ObjectMethodCollision {
+    fn wait(&self) {}
+
+    fn notify(&self) {}
+
+    #[allow(non_snake_case)]
+    fn notifyAll(&self) {}
+}
+
+struct ObjectWaitMillis;
+
+impl ObjectWaitMillis {
+    fn wait(&self, _millis: u64) {}
+}
+
+struct ObjectWaitMillisNanos;
+
+impl ObjectWaitMillisNanos {
+    fn wait(&self, _millis: u64, _nanos: i32) {}
+}
+
+struct NonConflictingWait;
+
+impl NonConflictingWait {
+    fn wait(&self, value: i32) -> i32 {
+        value + 1
+    }
+}
+
 // A struct representing a simple counter with a name (using a static string slice)
 struct NamedCounter {
     name: &'static str,
@@ -132,6 +163,13 @@ impl NamedCounter {
 
 
 fn main() {
+    ObjectMethodCollision.wait();
+    ObjectMethodCollision.notify();
+    ObjectMethodCollision.notifyAll();
+    ObjectWaitMillis.wait(1);
+    ObjectWaitMillisNanos.wait(1, 2);
+    assert!(NonConflictingWait.wait(41) == 42);
+
     // === Test Case 1: Basic Operations ===
     let mut counter1 = NamedCounter::new("Clicks", 5);
 

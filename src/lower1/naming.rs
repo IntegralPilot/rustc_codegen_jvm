@@ -10,6 +10,14 @@ use std::collections::HashMap;
 const MAX_MONO_FN_NAME_LEN: usize = 128;
 const WEAK_LANG_ITEMS_CLASS: &str = "org/rustlang/runtime/WeakLangItems";
 const GLOBAL_LINK_SYMBOLS_PACKAGE: &str = "org/rustlang/runtime/symbols";
+const FINAL_OBJECT_METHODS: &[(&str, &str)] = &[
+    ("getClass", "()Ljava/lang/Class;"),
+    ("notify", "()V"),
+    ("notifyAll", "()V"),
+    ("wait", "()V"),
+    ("wait", "(J)V"),
+    ("wait", "(JI)V"),
+];
 
 #[derive(Debug, Clone)]
 pub struct FnNameData {
@@ -140,6 +148,23 @@ pub fn is_global_link_symbol_class(class_name: &str) -> bool {
 }
 
 pub fn associated_method_name_from_instance<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
+    signature: &crate::oomir::Signature,
+) -> String {
+    let method_name = associated_method_base_name_from_instance(tcx, instance);
+    let descriptor = signature.to_string();
+    if FINAL_OBJECT_METHODS
+        .iter()
+        .any(|(name, final_descriptor)| method_name == *name && descriptor == *final_descriptor)
+    {
+        format!("{method_name}$rust")
+    } else {
+        method_name
+    }
+}
+
+fn associated_method_base_name_from_instance<'tcx>(
     tcx: TyCtxt<'tcx>,
     instance: Instance<'tcx>,
 ) -> String {

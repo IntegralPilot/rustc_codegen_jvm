@@ -330,13 +330,15 @@ fn place_or_insert_mono_function<'tcx>(
                 let is_runtime_owned_class =
                     class_name.starts_with("org/rustlang/") && !can_extend_compiled_core_class;
                 if !class_name.starts_with("java/") && !is_runtime_owned_class {
-                    oomir_function.name =
-                        lower1::naming::associated_method_name_from_instance(tcx, instance);
-                    oomir_function.owner_class = None;
-
                     if assoc_item.is_method() {
                         oomir_function.signature.is_static = false;
                     }
+                    oomir_function.name = lower1::naming::associated_method_name_from_instance(
+                        tcx,
+                        instance,
+                        &oomir_function.signature,
+                    );
+                    oomir_function.owner_class = None;
 
                     let implemented_trait_def_id = assoc_item
                         .impl_container(tcx)
