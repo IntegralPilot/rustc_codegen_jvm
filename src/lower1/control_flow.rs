@@ -9,6 +9,7 @@ use super::{
 };
 use crate::oomir;
 
+use rustc_hir::def::DefKind;
 use rustc_middle::{
     mir::{
         BasicBlock, BasicBlockData, Body, Local, Location, NonDivergingIntrinsic,
@@ -1994,6 +1995,37 @@ pub(super) fn convert_basic_block<'tcx>(
                                 data_types,
                                 &mut instructions,
                             );
+                        }
+                    } else if matches!(tcx.def_kind(func_instance.def_id()), DefKind::Ctor(..)) {
+                        let TyKind::Adt(adt_def, _) = fn_output.kind() else {
+                            panic!("constructor returned non-ADT type {fn_output:?}")
+                        };
+                        if let Some(dest) = effective_dest {
+                            let base_class = oomir_output_type
+                                .get_class_name()
+                                .expect("constructor result has a JVM class");
+                            let class_name = if adt_def.is_enum() {
+                                let variant_def_id = tcx.parent(func_instance.def_id());
+                                format!(
+                                    "{}${}",
+                                    base_class,
+                                    jvm_names::member_name(tcx.item_name(variant_def_id).as_str())
+                                )
+                            } else {
+                                base_class.to_string()
+                            };
+                            let constructor_args = oomir_operands
+                                .into_iter()
+                                .filter_map(|operand| {
+                                    let operand_ty = operand.get_type()?;
+                                    operand_ty.has_jvm_value().then_some((operand, operand_ty))
+                                })
+                                .collect();
+                            instructions.push(oomir::Instruction::ConstructObject {
+                                dest,
+                                class_name,
+                                args: constructor_args,
+                            });
                         }
                     } else if let Some(item) = assoc_item {
                         if item.is_method() {
