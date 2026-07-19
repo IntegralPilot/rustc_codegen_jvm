@@ -4,7 +4,12 @@
 
 include!("../../../support/test_prelude.rs");
 
-use provider::{DynValue, Holder, provider_scaled, provider_score, pull_i32, pull_i64, scaled_sum};
+use alloc::vec;
+use alloc::vec::Vec;
+use provider::{
+    DynValue, Holder, ProviderCounter, provider_scaled, provider_score, pull_i32, pull_i64,
+    scaled_sum,
+};
 
 struct LocalI32(i32);
 
@@ -65,4 +70,10 @@ fn main() {
     let mut local_i64 = LocalI64(100);
     assert!(pull_i64(&mut local_i64) == 100);
     assert!(pull_i64(&mut local_i64) == 102);
+
+    // The blanket `IntoIterator for I where I: Iterator` method is not an
+    // instance method on an upstream concrete iterator class. A downstream
+    // `collect` must call the resolved monomorphized impl statically.
+    let collected = ProviderCounter::new(4, 8).collect::<Vec<_>>();
+    assert!(collected == vec![4, 5, 6, 7]);
 }

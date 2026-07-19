@@ -2153,26 +2153,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                 let trait_impl_self_requires_static_dispatch =
                                     item.impl_container(tcx).is_some_and(|impl_def_id| {
                                         tcx.impl_opt_trait_ref(impl_def_id).is_some()
-                                    }) && impl_container_mir_ty.is_some_and(|self_ty| {
-                                        matches!(
-                                            self_ty.kind(),
-                                            TyKind::Ref(..)
-                                                | TyKind::RawPtr(..)
-                                                | TyKind::Dynamic(..)
-                                                | TyKind::Tuple(..)
-                                                | TyKind::Array(..)
-                                                | TyKind::Slice(..)
-                                                | TyKind::Str
-                                                | TyKind::Bool
-                                                | TyKind::Char
-                                                | TyKind::Int(..)
-                                                | TyKind::Uint(..)
-                                                | TyKind::Float(..)
-                                                | TyKind::FnDef(..)
-                                                | TyKind::FnPtr(..)
-                                                | TyKind::Closure(..)
-                                        )
-                                    });
+                                    }) && !has_concrete_receiver_method;
                                 let has_arbitrary_self_receiver = inherent_container_mir_ty
                                     .is_some_and(|container_ty| {
                                         container_ty != receiver_self_mir_ty

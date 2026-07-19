@@ -63,3 +63,28 @@ pub fn scaled_sum<T: Copy + Add<Output = T> + Mul<Output = T>>(a: T, b: T, k: T)
 pub fn provider_scaled() -> i32 {
     scaled_sum(2, 3, 4)
 }
+
+pub struct ProviderCounter {
+    next: i32,
+    end: i32,
+}
+
+impl ProviderCounter {
+    pub fn new(next: i32, end: i32) -> Self {
+        Self { next, end }
+    }
+}
+
+impl Iterator for ProviderCounter {
+    type Item = i32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next == self.end {
+            None
+        } else {
+            let value = self.next;
+            self.next += 1;
+            Some(value)
+        }
+    }
+}
