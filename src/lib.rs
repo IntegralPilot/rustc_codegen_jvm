@@ -295,7 +295,10 @@ fn place_or_insert_mono_function<'tcx>(
                 .type_of(container_id)
                 .instantiate(tcx, instance.args)
                 .skip_norm_wip();
-            let self_oomir_ty = lower1::types::ty_to_oomir_type(
+            // The method may be monomorphized in a downstream crate. Emit a
+            // receiver-class fragment there so the linker can attach it to the
+            // upstream class definition rather than leaving only a static copy.
+            let self_oomir_ty = lower1::types::force_define_named_adt(
                 container_ty,
                 tcx,
                 &mut oomir_module.data_types,

@@ -7,8 +7,8 @@ include!("../../../support/test_prelude.rs");
 use alloc::vec;
 use alloc::vec::Vec;
 use provider::{
-    DynValue, Holder, ProviderCounter, provider_scaled, provider_score, pull_i32, pull_i64,
-    scaled_sum,
+    DynValue, GenericMethodOwner, Holder, ProviderCounter, provider_scaled, provider_score,
+    pull_i32, pull_i64, scaled_sum,
 };
 
 struct LocalI32(i32);
@@ -76,4 +76,9 @@ fn main() {
     // `collect` must call the resolved monomorphized impl statically.
     let collected = ProviderCounter::new(4, 8).collect::<Vec<_>>();
     assert!(collected == vec![4, 5, 6, 7]);
+
+    // A generic method on a non-generic upstream type is instantiated only
+    // by the downstream crate. Its body must still be attached to that type.
+    let owner = GenericMethodOwner;
+    assert!(owner.identity(123_i64) == 123);
 }

@@ -3977,6 +3977,110 @@ pub fn ty_to_erased_oomir_type<'tcx>(
     }
 }
 
+fn ensure_adt_data_type<'tcx>(
+    adt_def: &AdtDef<'tcx>,
+    substs: GenericArgsRef<'tcx>,
+    jvm_name: &str,
+    tcx: TyCtxt<'tcx>,
+    data_types: &mut HashMap<String, oomir::DataType>,
+    instance_context: rustc_middle::ty::Instance<'tcx>,
+) {
+    if adt_def.is_struct() {
+        let variant = adt_def.variant(0usize.into());
+        if !data_types.contains_key(jvm_name) {
+            // Pre-populate with a placeholder class to break recursive resolution loops.
+            data_types.insert(
+                jvm_name.to_string(),
+                oomir::DataType::Class {
+                    fields: vec![],
+                    is_abstract: false,
+                    methods: HashMap::new(),
+                    super_class: None,
+                    interfaces: vec![],
+                },
+            );
+
+            let oomir_fields = variant
+                .fields
+                .iter()
+                .filter_map(|field_def| {
+                    let field_name = field_def.ident(tcx).to_string();
+                    let field_ty = field_def.ty(tcx, substs);
+                    let field_mir_ty = if field_ty.has_param() || field_ty.has_escaping_bound_vars()
+                    {
+                        field_ty.skip_norm_wip()
+                    } else {
+                        tcx.try_normalize_erasing_regions(
+                            TypingEnv::fully_monomorphized(),
+                            field_ty,
+                        )
+                        .unwrap_or_else(|_| field_ty.skip_norm_wip())
+                    };
+                    let field_oomir_type =
+                        ty_to_oomir_type(field_mir_ty, tcx, data_types, instance_context);
+                    field_oomir_type
+                        .has_jvm_value()
+                        .then_some((field_name, field_oomir_type))
+                })
+                .collect::<Vec<_>>();
+            let methods = HashMap::from([(
+                "eq".to_string(),
+                DataTypeMethod::AdtHelperMethod {
+                    kind: oomir::AdtHelperKind::PartialEqClass {
+                        fields: oomir_fields.clone(),
+                    },
+                },
+            )]);
+            if let Some(oomir::DataType::Class {
+                fields,
+                methods: existing_methods,
+                ..
+            }) = data_types.get_mut(jvm_name)
+            {
+                *fields = oomir_fields;
+                // Field type resolution may recursively enrich the placeholder.
+                existing_methods.extend(methods);
+            }
+        } else if let Some(oomir::DataType::Class {
+            fields, methods, ..
+        }) = data_types.get_mut(jvm_name)
+        {
+            methods
+                .entry("eq".to_string())
+                .or_insert_with(|| DataTypeMethod::AdtHelperMethod {
+                    kind: oomir::AdtHelperKind::PartialEqClass {
+                        fields: fields.clone(),
+                    },
+                });
+        }
+    } else if adt_def.is_enum() {
+        ensure_enum_data_types(adt_def, substs, jvm_name, tcx, data_types, instance_context);
+    } else if adt_def.is_union() {
+        ensure_union_data_type(adt_def, substs, tcx, data_types, instance_context);
+    }
+}
+
+pub fn force_define_named_adt<'tcx>(
+    ty: Ty<'tcx>,
+    tcx: TyCtxt<'tcx>,
+    data_types: &mut HashMap<String, oomir::DataType>,
+    instance_context: rustc_middle::ty::Instance<'tcx>,
+) -> oomir::Type {
+    let TyKind::Adt(adt_def, substs) = ty.kind() else {
+        return ty_to_oomir_type(ty, tcx, data_types, instance_context);
+    };
+    let jvm_name = generate_adt_jvm_class_name(adt_def, substs, tcx, data_types, instance_context);
+    ensure_adt_data_type(
+        adt_def,
+        substs,
+        &jvm_name,
+        tcx,
+        data_types,
+        instance_context,
+    );
+    oomir::Type::Class(jvm_name)
+}
+
 /// Converts a fully monomorphized Rust MIR type (`Ty`) to an OOMIR type.
 pub fn ty_to_oomir_type<'tcx>(
     ty: Ty<'tcx>,
@@ -4035,89 +4139,14 @@ pub fn ty_to_oomir_type<'tcx>(
                 return oomir::Type::Class(jvm_name_full);
             }
 
-            if adt_def.is_struct() {
-                let variant = adt_def.variant(0usize.into());
-                if !data_types.contains_key(&jvm_name_full) {
-                    // Pre-populate with a placeholder class to break recursive resolution loops
-                    data_types.insert(
-                        jvm_name_full.clone(),
-                        oomir::DataType::Class {
-                            fields: vec![],
-                            is_abstract: false,
-                            methods: HashMap::new(),
-                            super_class: None,
-                            interfaces: vec![],
-                        },
-                    );
-
-                    let oomir_fields = variant
-                        .fields
-                        .iter()
-                        .filter_map(|field_def| {
-                            let field_name = field_def.ident(tcx).to_string();
-                            let field_ty = field_def.ty(tcx, substs);
-                            let field_mir_ty =
-                                if field_ty.has_param() || field_ty.has_escaping_bound_vars() {
-                                    field_ty.skip_norm_wip()
-                                } else {
-                                    tcx.try_normalize_erasing_regions(
-                                        TypingEnv::fully_monomorphized(),
-                                        field_ty,
-                                    )
-                                    .unwrap_or_else(|_| field_ty.skip_norm_wip())
-                                };
-                            let field_oomir_type =
-                                ty_to_oomir_type(field_mir_ty, tcx, data_types, instance_context);
-                            field_oomir_type
-                                .has_jvm_value()
-                                .then_some((field_name, field_oomir_type))
-                        })
-                        .collect::<Vec<_>>();
-                    let mut methods = HashMap::new();
-                    methods.insert(
-                        "eq".to_string(),
-                        DataTypeMethod::AdtHelperMethod {
-                            kind: oomir::AdtHelperKind::PartialEqClass {
-                                fields: oomir_fields.clone(),
-                            },
-                        },
-                    );
-                    if let Some(oomir::DataType::Class {
-                        fields,
-                        methods: existing_methods,
-                        ..
-                    }) = data_types.get_mut(&jvm_name_full)
-                    {
-                        *fields = oomir_fields;
-                        // Field type resolution can recursively enrich this
-                        // placeholder (for example with aggregate codecs).
-                        // Completing the class must not discard those methods.
-                        existing_methods.extend(methods);
-                    }
-                } else if let Some(oomir::DataType::Class {
-                    fields, methods, ..
-                }) = data_types.get_mut(&jvm_name_full)
-                {
-                    methods.entry("eq".to_string()).or_insert_with(|| {
-                        DataTypeMethod::AdtHelperMethod {
-                            kind: oomir::AdtHelperKind::PartialEqClass {
-                                fields: fields.clone(),
-                            },
-                        }
-                    });
-                }
-            } else if adt_def.is_enum() {
-                ensure_enum_data_types(
-                    &adt_def,
-                    substs,
-                    &jvm_name_full,
-                    tcx,
-                    data_types,
-                    instance_context,
-                );
-            } else if adt_def.is_union() {
-                ensure_union_data_type(&adt_def, substs, tcx, data_types, instance_context);
-            }
+            ensure_adt_data_type(
+                adt_def,
+                substs,
+                &jvm_name_full,
+                tcx,
+                data_types,
+                instance_context,
+            );
             oomir::Type::Class(jvm_name_full)
         }
         rustc_middle::ty::TyKind::Str => oomir::Type::Str,

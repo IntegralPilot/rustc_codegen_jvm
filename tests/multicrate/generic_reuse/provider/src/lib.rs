@@ -88,3 +88,11 @@ impl Iterator for ProviderCounter {
         }
     }
 }
+
+pub struct GenericMethodOwner;
+
+impl GenericMethodOwner {
+    pub fn identity<T: Copy>(&self, value: T) -> T {
+        value
+    }
+}
