@@ -4,7 +4,7 @@ use super::jvm::{
     attributes::{ArrayType, Attribute, Instruction, StackFrame, VerificationType},
 };
 use crate::oomir::{self, Type};
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum FrameValue {
@@ -287,15 +287,173 @@ pub(super) fn build_stack_map_attributes(
     }
 }
 
-pub(super) fn move_zero_branch_target(
+/// Give verifier-visible defaults to control-flow-guarded locals, especially
+/// drop values. Rust never observes them, but the JVM cannot correlate a drop
+/// flag with its guarded load and requires a value on every incoming path.
+pub(super) fn initialize_locals_loaded_as_top(
     instructions: &mut Vec<Instruction>,
+    initial_locals: &[FrameValue],
+    local_hints: &[FrameValue],
+    max_locals: u16,
+    constant_pool: &ConstantPool,
     context: &str,
-) -> jvm::Result<bool> {
-    if !branch_targets(instructions).contains(&0) {
-        return Ok(false);
+) -> jvm::Result<usize> {
+    if instructions.is_empty() {
+        return Ok(0);
     }
 
-    for instruction in instructions.iter_mut() {
+    let states = solve_frame_states(
+        instructions,
+        initial_locals,
+        local_hints,
+        max_locals as usize,
+        constant_pool,
+        context,
+    )?;
+    let locals = locals_loaded_as_top(instructions, &states, context)?;
+    if locals.is_empty() {
+        return Ok(0);
+    }
+
+    let mut prefix = Vec::with_capacity(locals.len() * 2);
+    for (local, value) in locals {
+        prefix.extend(default_local_initializer(local, &value));
+    }
+    let prefix_len = u16::try_from(prefix.len()).map_err(|_| jvm::Error::VerificationError {
+        context: context.to_string(),
+        message: "Verifier local-initialization prefix exceeds the JVM instruction limit"
+            .to_string(),
+    })?;
+    shift_absolute_branch_targets(instructions, prefix_len, context)?;
+    instructions.splice(0..0, prefix);
+
+    let states = solve_frame_states(
+        instructions,
+        initial_locals,
+        local_hints,
+        max_locals as usize,
+        constant_pool,
+        context,
+    )?;
+    let remaining = locals_loaded_as_top(instructions, &states, context)?;
+    if !remaining.is_empty() {
+        return Err(jvm::Error::VerificationError {
+            context: context.to_string(),
+            message: format!(
+                "Local initialization could not resolve verifier Top loads: {remaining:?}"
+            ),
+        });
+    }
+
+    Ok(usize::from(prefix_len))
+}
+
+fn locals_loaded_as_top(
+    instructions: &[Instruction],
+    states: &[Option<FrameState>],
+    context: &str,
+) -> jvm::Result<BTreeMap<u16, FrameValue>> {
+    let mut locals = BTreeMap::new();
+    for (instruction_index, (instruction, state)) in instructions.iter().zip(states).enumerate() {
+        let Some(state) = state else {
+            continue;
+        };
+        let Some((local, value)) = loaded_local(instruction) else {
+            continue;
+        };
+        if state.locals.get(usize::from(local)) != Some(&FrameValue::Top) {
+            continue;
+        }
+        if let Some(existing) = locals.insert(local, value.clone())
+            && existing != value
+        {
+            return Err(jvm::Error::VerificationError {
+                context: context.to_string(),
+                message: format!(
+                    "Local {local} is loaded with incompatible types {existing:?} and {value:?}; latest load is instruction {instruction_index}"
+                ),
+            });
+        }
+    }
+    Ok(locals)
+}
+
+fn loaded_local(instruction: &Instruction) -> Option<(u16, FrameValue)> {
+    use Instruction as I;
+
+    let (local, value) = match instruction {
+        I::Iload(local) => (u16::from(*local), FrameValue::Integer),
+        I::Lload(local) => (u16::from(*local), FrameValue::Long),
+        I::Fload(local) => (u16::from(*local), FrameValue::Float),
+        I::Dload(local) => (u16::from(*local), FrameValue::Double),
+        I::Aload(local) => (
+            u16::from(*local),
+            FrameValue::Object("java/lang/Object".to_string()),
+        ),
+        I::Iload_0 => (0, FrameValue::Integer),
+        I::Iload_1 => (1, FrameValue::Integer),
+        I::Iload_2 => (2, FrameValue::Integer),
+        I::Iload_3 => (3, FrameValue::Integer),
+        I::Lload_0 => (0, FrameValue::Long),
+        I::Lload_1 => (1, FrameValue::Long),
+        I::Lload_2 => (2, FrameValue::Long),
+        I::Lload_3 => (3, FrameValue::Long),
+        I::Fload_0 => (0, FrameValue::Float),
+        I::Fload_1 => (1, FrameValue::Float),
+        I::Fload_2 => (2, FrameValue::Float),
+        I::Fload_3 => (3, FrameValue::Float),
+        I::Dload_0 => (0, FrameValue::Double),
+        I::Dload_1 => (1, FrameValue::Double),
+        I::Dload_2 => (2, FrameValue::Double),
+        I::Dload_3 => (3, FrameValue::Double),
+        I::Aload_0 => (0, FrameValue::Object("java/lang/Object".to_string())),
+        I::Aload_1 => (1, FrameValue::Object("java/lang/Object".to_string())),
+        I::Aload_2 => (2, FrameValue::Object("java/lang/Object".to_string())),
+        I::Aload_3 => (3, FrameValue::Object("java/lang/Object".to_string())),
+        I::Iload_w(local) | I::Iinc_w(local, _) => (*local, FrameValue::Integer),
+        I::Lload_w(local) => (*local, FrameValue::Long),
+        I::Fload_w(local) => (*local, FrameValue::Float),
+        I::Dload_w(local) => (*local, FrameValue::Double),
+        I::Aload_w(local) => (*local, FrameValue::Object("java/lang/Object".to_string())),
+        I::Iinc(local, _) => (u16::from(*local), FrameValue::Integer),
+        _ => return None,
+    };
+    Some((local, value))
+}
+
+fn default_local_initializer(local: u16, value: &FrameValue) -> [Instruction; 2] {
+    use Instruction as I;
+
+    let (constant, store) = match value {
+        FrameValue::Integer => (I::Iconst_0, local_store(local, I::Istore, I::Istore_w)),
+        FrameValue::Long => (I::Lconst_0, local_store(local, I::Lstore, I::Lstore_w)),
+        FrameValue::Float => (I::Fconst_0, local_store(local, I::Fstore, I::Fstore_w)),
+        FrameValue::Double => (I::Dconst_0, local_store(local, I::Dstore, I::Dstore_w)),
+        FrameValue::Null
+        | FrameValue::Object(_)
+        | FrameValue::UninitializedThis
+        | FrameValue::Uninitialized(_) => {
+            (I::Aconst_null, local_store(local, I::Astore, I::Astore_w))
+        }
+        FrameValue::Top => unreachable!("a local load always supplies a concrete JVM type"),
+    };
+    [constant, store]
+}
+
+fn local_store(
+    local: u16,
+    narrow: impl FnOnce(u8) -> Instruction,
+    wide: impl FnOnce(u16) -> Instruction,
+) -> Instruction {
+    u8::try_from(local).map_or_else(|_| wide(local), narrow)
+}
+
+fn shift_absolute_branch_targets(
+    instructions: &mut [Instruction],
+    amount: u16,
+    context: &str,
+) -> jvm::Result<()> {
+    for instruction in instructions {
         match instruction {
             Instruction::Ifeq(target)
             | Instruction::Ifne(target)
@@ -315,29 +473,41 @@ pub(super) fn move_zero_branch_target(
             | Instruction::Jsr(target)
             | Instruction::Ifnull(target)
             | Instruction::Ifnonnull(target) => {
-                *target = target
-                    .checked_add(1)
-                    .ok_or_else(|| jvm::Error::VerificationError {
-                        context: context.to_string(),
-                        message: "Branch target overflow while moving the zero-offset loop header"
-                            .to_string(),
-                    })?;
+                *target =
+                    target
+                        .checked_add(amount)
+                        .ok_or_else(|| jvm::Error::VerificationError {
+                            context: context.to_string(),
+                            message: "Branch target overflow while inserting a method-entry prefix"
+                                .to_string(),
+                        })?;
             }
             Instruction::Goto_w(target) | Instruction::Jsr_w(target) => {
-                *target = target
-                    .checked_add(1)
-                    .ok_or_else(|| jvm::Error::VerificationError {
+                *target = target.checked_add(i32::from(amount)).ok_or_else(|| {
+                    jvm::Error::VerificationError {
                         context: context.to_string(),
                         message:
-                            "Wide branch target overflow while moving the zero-offset loop header"
+                            "Wide branch target overflow while inserting a method-entry prefix"
                                 .to_string(),
-                    })?;
+                    }
+                })?;
             }
-            // Switch targets are relative to the switch instruction. Both the
-            // source and target move by one, so their deltas stay unchanged.
+            // Switch offsets are relative: both source and target move equally.
             _ => {}
         }
     }
+    Ok(())
+}
+
+pub(super) fn move_zero_branch_target(
+    instructions: &mut Vec<Instruction>,
+    context: &str,
+) -> jvm::Result<bool> {
+    if !branch_targets(instructions).contains(&0) {
+        return Ok(false);
+    }
+
+    shift_absolute_branch_targets(instructions, 1, context)?;
     instructions.insert(0, Instruction::Nop);
     Ok(true)
 }

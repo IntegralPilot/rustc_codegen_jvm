@@ -742,6 +742,18 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             &optimised.local_slot_map,
             self.max_locals_used,
         );
+        let initializer_count = stackmaps::initialize_locals_loaded_as_top(
+            &mut self.jvm_instructions,
+            &self.initial_locals,
+            &local_hints,
+            self.max_locals_used,
+            self.constant_pool,
+            &format!("Function {}", self.oomir_func.name),
+        )?;
+        self.jvm_metadata.splice(
+            0..0,
+            std::iter::repeat_n(optimise2::BytecodeMetadata::default(), initializer_count),
+        );
         let mut code_attributes = stackmaps::build_stack_map_attributes(
             &self.jvm_instructions,
             &self.initial_locals,
