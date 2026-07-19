@@ -168,6 +168,7 @@ pub extern "C" fn arc_concurrent_worker(context: *const ArcWorkerContext) {
 
 fn main() {
     test_vec_basic();
+    test_vec_in_place_collect_relinquishes_source();
     test_zst_allocations();
     test_drop_semantics();
     test_dynamic_dispatch();
@@ -215,6 +216,12 @@ fn main() {
     test_array_from_mut();
     test_boxed_self_receiver();
     test_vec_aggregate_with_function_pointer();
+}
+
+fn test_vec_in_place_collect_relinquishes_source() {
+    let source = vec![(1_u64, 2_u64), (3, 4), (5, 6)];
+    let collected: Vec<_> = source.into_iter().map(|value| value).collect();
+    assert!(collected == vec![(1, 2), (3, 4), (5, 6)]);
 }
 
 fn test_boxed_self_receiver() {

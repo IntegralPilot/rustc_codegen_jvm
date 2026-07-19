@@ -979,6 +979,7 @@ public final class Pointer {
 
     /** Commits direct field mutations made through the current decoded view. */
     public void commitMemoryView() {
+        discardProjectedFieldViews(managedViewObject());
         if (allocation == null || viewCodecClassName == null) {
             return;
         }
@@ -1011,6 +1012,57 @@ public final class Pointer {
             if (!views.containsKey(byteOffset)) {
                 views.put(byteOffset, state);
             }
+        }
+    }
+
+    private Object managedViewObject() {
+        if (boundMemoryViewState != null) {
+            return boundMemoryViewState.value;
+        }
+        if (allocation instanceof Cell) {
+            return ((Cell) allocation).value;
+        }
+        if (allocation instanceof ReceiverCell) {
+            return ((ReceiverCell) allocation).value;
+        }
+        if (allocation instanceof FieldCell) {
+            return ((FieldCell) allocation).get();
+        }
+        return isDirectAllocationView() ? readAlignedElement() : null;
+    }
+
+    private static void discardProjectedFieldViews(Object owner) {
+        if (owner == null) {
+            return;
+        }
+        java.util.List<FieldCell> projected = new java.util.ArrayList<>();
+        synchronized (FIELD_CELLS) {
+            Map<String, WeakReference<FieldCell>> fields = FIELD_CELLS.get(owner);
+            if (fields == null) {
+                return;
+            }
+            for (WeakReference<FieldCell> reference : fields.values()) {
+                FieldCell cell = reference.get();
+                if (cell != null) {
+                    projected.add(cell);
+                }
+            }
+        }
+        synchronized (MEMORY_VIEWS) {
+            for (FieldCell cell : projected) {
+                MEMORY_VIEWS.remove(cell);
+            }
+        }
+        synchronized (STRUCTURAL_VIEWS) {
+            for (FieldCell cell : projected) {
+                STRUCTURAL_VIEWS.remove(cell);
+            }
+        }
+        synchronized (MEMORY_VIEW_ORIGINS) {
+            MEMORY_VIEW_ORIGINS.entrySet().removeIf(entry -> {
+                Object originAllocation = entry.getValue().allocation.get();
+                return projected.contains(originAllocation);
+            });
         }
     }
 

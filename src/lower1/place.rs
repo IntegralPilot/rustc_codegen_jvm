@@ -493,6 +493,46 @@ fn emit_union_writebacks(writebacks: &[UnionWriteback], instructions: &mut Vec<I
     }
 }
 
+fn collect_memory_view_writebacks(get_instructions: &[Instruction]) -> Vec<Operand> {
+    get_instructions
+        .iter()
+        .filter_map(|instruction| match instruction {
+            Instruction::InvokeVirtual {
+                class_name,
+                method_name,
+                operand,
+                ..
+            } if class_name == oomir::POINTER_CLASS
+                && matches!(method_name.as_str(), "getObject" | "getObjectAs")
+                && matches!(operand.get_type(), Some(oomir::Type::Pointer(_))) =>
+            {
+                Some(operand.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn emit_memory_view_writebacks(writebacks: &[Operand], instructions: &mut Vec<Instruction>) {
+    for pointer in writebacks.iter().rev() {
+        let pointer_ty = pointer
+            .get_type()
+            .expect("a memory-view writeback requires a typed pointer");
+        instructions.push(Instruction::InvokeVirtual {
+            dest: None,
+            class_name: oomir::POINTER_CLASS.to_string(),
+            method_name: "commitMemoryView".to_string(),
+            method_ty: oomir::Signature {
+                params: vec![("self".to_string(), pointer_ty)],
+                ret: Box::new(oomir::Type::Void),
+                is_static: false,
+            },
+            args: vec![],
+            operand: pointer.clone(),
+        });
+    }
+}
+
 fn field_name_from_rust_ty<'tcx>(
     ty: Ty<'tcx>,
     field_index: usize,
@@ -1366,6 +1406,7 @@ pub fn emit_instructions_to_set_value<'tcx>(
             mir,
             data_types,
         );
+        let memory_view_writebacks = collect_memory_view_writebacks(&get_base_instructions);
         instructions.extend(get_base_instructions); // Add instructions to get the base
 
         // 3. Generate the final store instruction based on the *last* projection.
@@ -1453,6 +1494,7 @@ pub fn emit_instructions_to_set_value<'tcx>(
                         &mut instructions,
                     );
                     emit_union_writebacks(&union_writebacks, &mut instructions);
+                    emit_memory_view_writebacks(&memory_view_writebacks, &mut instructions);
                     return instructions;
                 }
                 if let Some((adt_def, _substs)) = union_parts_from_ty(base_rust_ty) {
@@ -1509,6 +1551,7 @@ pub fn emit_instructions_to_set_value<'tcx>(
                         },
                     });
                     emit_union_writebacks(&union_writebacks, &mut instructions);
+                    emit_memory_view_writebacks(&memory_view_writebacks, &mut instructions);
                     return instructions;
                 }
 
@@ -1713,6 +1756,7 @@ pub fn emit_instructions_to_set_value<'tcx>(
             }
         }
         emit_union_writebacks(&union_writebacks, &mut instructions);
+        emit_memory_view_writebacks(&memory_view_writebacks, &mut instructions);
     }
 
     instructions
