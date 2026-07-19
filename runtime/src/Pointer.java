@@ -3223,6 +3223,23 @@ public final class Pointer {
         return Math.toIntExact(byteOffset / allocationElementSize);
     }
 
+    // A decoded view assigned back to its source already aliases that storage.
+    // Flush it with its own codec instead of reinterpreting its JVM carrier.
+    private boolean flushSameOriginMemoryView(Object value, int size) {
+        MemoryViewOrigin origin;
+        synchronized (MEMORY_VIEW_ORIGINS) {
+            origin = MEMORY_VIEW_ORIGINS.get(value);
+        }
+        if (origin == null
+                || origin.allocation.get() != allocation
+                || origin.byteOffset != byteOffset
+                || origin.viewSize != size) {
+            return false;
+        }
+        flushMemoryViewsOverlapping(byteOffset, size);
+        return true;
+    }
+
     public void set(Object value) {
         if (viewSize == 0 || allocationElementSize == 0) {
             // Every pointer to an element of zero-sized storage has the same
@@ -3239,6 +3256,9 @@ public final class Pointer {
         }
 
         int materializedSize = materializedViewSize();
+        if (flushSameOriginMemoryView(value, materializedSize)) {
+            return;
+        }
         prepareMemoryWrite(byteOffset, materializedSize);
 
         if (isStructuralViewCodec(viewCodecClassName)) {

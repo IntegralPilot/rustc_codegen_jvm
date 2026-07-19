@@ -35,7 +35,7 @@ use rustc_metadata::EncodedMetadata;
 use rustc_middle::{
     dep_graph::{WorkProduct, WorkProductId},
     mono::MonoItem,
-    ty::{EarlyBinder, GenericArgs, Instance, InstanceKind, TyCtxt, TyKind, TypingEnv},
+    ty::{EarlyBinder, GenericArgs, Instance, InstanceKind, ShimKind, TyCtxt, TyKind, TypingEnv},
 };
 use rustc_session::{
     Session,
@@ -271,15 +271,21 @@ fn place_or_insert_mono_function<'tcx>(
         .as_deref()
         .is_some_and(lower1::naming::is_global_link_symbol_class);
     if !has_global_linkage && let Some(assoc_item) = tcx.opt_associated_item(instance.def_id()) {
-        let attachable_to_receiver_class = assoc_item.trait_container(tcx).is_none()
-            && (assoc_item.trait_item_def_id().is_none() || assoc_item.is_method());
+        let clone_shim_self_ty = match instance.def {
+            InstanceKind::Shim(ShimKind::Clone(_, self_ty)) => Some(self_ty),
+            _ => None,
+        };
+        let attachable_to_receiver_class = clone_shim_self_ty.is_some()
+            || (assoc_item.trait_container(tcx).is_none()
+                && (assoc_item.trait_item_def_id().is_none() || assoc_item.is_method()));
         if attachable_to_receiver_class {
             let fallback_function = oomir_function.clone();
             let container_id = assoc_item.container_id(tcx);
-            let container_ty = tcx
-                .type_of(container_id)
-                .instantiate(tcx, instance.args)
-                .skip_norm_wip();
+            let container_ty = clone_shim_self_ty.unwrap_or_else(|| {
+                tcx.type_of(container_id)
+                    .instantiate(tcx, instance.args)
+                    .skip_norm_wip()
+            });
             let receiver_ty = assoc_item.is_method().then(|| {
                 tcx.fn_sig(instance.def_id())
                     .instantiate(tcx, instance.args)
@@ -332,24 +338,24 @@ fn place_or_insert_mono_function<'tcx>(
                         oomir_function.signature.is_static = false;
                     }
 
-                    let implemented_trait = assoc_item
+                    let implemented_trait_def_id = assoc_item
                         .impl_container(tcx)
                         .and_then(|impl_def_id| tcx.impl_opt_trait_ref(impl_def_id))
                         .map(|trait_ref| {
-                            let trait_ref =
-                                trait_ref.instantiate(tcx, instance.args).skip_norm_wip();
-                            let trait_name =
-                                lower1::jvm_names::class_for_def_id(tcx, trait_ref.def_id);
-                            ensure_trait_interface(
-                                tcx,
-                                trait_ref.def_id,
-                                &mut oomir_module.data_types,
-                            );
-                            oomir_function
-                                .signature
-                                .replace_class_in_signature(&trait_name, &class_name);
-                            trait_name
-                        });
+                            trait_ref
+                                .instantiate(tcx, instance.args)
+                                .skip_norm_wip()
+                                .def_id
+                        })
+                        .or_else(|| clone_shim_self_ty.and(assoc_item.trait_container(tcx)));
+                    let implemented_trait = implemented_trait_def_id.map(|trait_def_id| {
+                        let trait_name = lower1::jvm_names::class_for_def_id(tcx, trait_def_id);
+                        ensure_trait_interface(tcx, trait_def_id, &mut oomir_module.data_types);
+                        oomir_function
+                            .signature
+                            .replace_class_in_signature(&trait_name, &class_name);
+                        trait_name
+                    });
 
                     if assoc_item.is_method() {
                         materialize_instance_receiver_pointer(

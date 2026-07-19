@@ -176,6 +176,7 @@ fn main() {
 
     test_string_ops();
     test_string_partial_eq_specializations();
+    test_aggregate_clone_shims();
     test_string_utf_conversions();
     test_vecdeque();
     test_vecdeque_ring_wrapping();
@@ -409,6 +410,23 @@ fn test_string_partial_eq_specializations() {
     assert!(strings_are_equal(&left, &right));
     assert!(string_equals_str_reference(&left, &borrowed));
     assert!(!string_equals_str_reference(&left, &"different"));
+}
+
+fn test_aggregate_clone_shims() {
+    let values = vec![(7_usize, String::from("seven")), (11, String::from("eleven"))];
+    let cloned = values.clone();
+
+    assert!(cloned.len() == 2);
+    assert!(cloned[0].0 == 7);
+    assert!(cloned[0].1 == "seven");
+    assert!(cloned[1].0 == 11);
+    assert!(cloned[1].1 == "eleven");
+
+    let captured = String::from("captured");
+    let closure = move || captured.len();
+    let cloned_closure = closure.clone();
+    assert!(closure() == 8);
+    assert!(cloned_closure() == 8);
 }
 
 fn test_string_utf_conversions() {
