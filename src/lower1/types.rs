@@ -9,7 +9,10 @@ use rustc_middle::ty::{
     TypeVisitableExt, TypingEnv, UintTy,
 };
 use rustc_span::{def_id::DefId, sym};
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{LazyLock, Mutex},
+};
 
 pub const UNION_BYTES_FIELD: &str = "_bytes";
 pub const UNION_OBJECTS_FIELD: &str = "_objects";
@@ -1903,44 +1906,37 @@ fn emit_union_storage_copy(
     instructions: &mut Vec<oomir::Instruction>,
     temp_counter: &mut usize,
 ) {
-    for relative_offset in 0..size {
-        let byte_dest = next_union_temp("union_copied_byte", temp_counter);
-        let source_index =
-            source.byte_index(source_offset + relative_offset, instructions, temp_counter);
-        instructions.push(oomir::Instruction::ArrayGet {
-            dest: byte_dest.clone(),
-            array: operand_var(source.bytes_var.clone(), byte_array_type()),
-            index: source_index,
-        });
-        let target_index =
-            target.byte_index(target_offset + relative_offset, instructions, temp_counter);
-        instructions.push(oomir::Instruction::ArrayStore {
-            array: target.bytes_var.clone(),
-            index: target_index,
-            value: operand_var(byte_dest, oomir::Type::I8),
-            copy_value: false,
-        });
-
-        let object_dest = next_union_temp("union_copied_object", temp_counter);
-        let source_object_index =
-            source.byte_index(source_offset + relative_offset, instructions, temp_counter);
-        instructions.push(oomir::Instruction::ArrayGet {
-            dest: object_dest.clone(),
-            array: operand_var(source.objects_var.clone(), object_array_type()),
-            index: source_object_index,
-        });
-        let target_object_index =
-            target.byte_index(target_offset + relative_offset, instructions, temp_counter);
-        instructions.push(oomir::Instruction::ArrayStore {
-            array: target.objects_var.clone(),
-            index: target_object_index,
-            value: operand_var(
-                object_dest,
-                oomir::Type::Class("java/lang/Object".to_string()),
-            ),
-            copy_value: false,
-        });
-    }
+    let source_index = source.byte_index(source_offset, instructions, temp_counter);
+    let target_index = target.byte_index(target_offset, instructions, temp_counter);
+    instructions.push(oomir::Instruction::InvokeStatic {
+        dest: None,
+        class_name: oomir::POINTER_CLASS.to_string(),
+        method_name: "copyUnionStorage".to_string(),
+        method_ty: oomir::Signature {
+            params: vec![
+                ("source_bytes".to_string(), byte_array_type()),
+                ("source_objects".to_string(), object_array_type()),
+                ("source_offset".to_string(), oomir::Type::I32),
+                ("target_bytes".to_string(), byte_array_type()),
+                ("target_objects".to_string(), object_array_type()),
+                ("target_offset".to_string(), oomir::Type::I32),
+                ("size".to_string(), oomir::Type::I32),
+            ],
+            ret: Box::new(oomir::Type::Void),
+            is_static: true,
+        },
+        args: vec![
+            operand_var(source.bytes_var.clone(), byte_array_type()),
+            operand_var(source.objects_var.clone(), object_array_type()),
+            source_index,
+            operand_var(target.bytes_var.clone(), byte_array_type()),
+            operand_var(target.objects_var.clone(), object_array_type()),
+            target_index,
+            oomir::Operand::Constant(oomir::Constant::I32(
+                i32::try_from(size).expect("union storage exceeds the JVM runtime address space"),
+            )),
+        ],
+    });
 }
 
 fn emit_ty_to_union_bytes<'tcx>(
@@ -4804,6 +4800,11 @@ pub fn stable_normalized_instance_key<'tcx>(
 // with the other generated-name families.
 const MAX_TUPLE_NAME_LEN: usize = 180;
 
+// Shards need one crate-wide view of readable names to avoid assigning the
+// same JVM class name to ABI-incompatible tuples in different units.
+static TUPLE_ABIS_BY_READABLE_NAME: LazyLock<Mutex<HashMap<String, Vec<oomir::Type>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 // Produce a compact, human readable token for an OOMIR type to use in tuple class names.
 pub fn readable_oomir_type_name(t: &oomir::Type) -> String {
     use oomir::Type;
@@ -5176,7 +5177,7 @@ pub fn generate_tuple_jvm_class_name<'tcx>(
     }
 
     let readable_name = format!("org/rustlang/core/Tuple_{}", tokens.join("_"));
-    let has_incompatible_collision = match data_types.get(&readable_name) {
+    let local_incompatible_collision = match data_types.get(&readable_name) {
         Some(oomir::DataType::Class { fields, .. }) => fields
             .iter()
             .map(|(_, field_ty)| field_ty)
@@ -5185,8 +5186,22 @@ pub fn generate_tuple_jvm_class_name<'tcx>(
         None => false,
     };
 
-    if readable_name.len() <= MAX_TUPLE_NAME_LEN && !has_incompatible_collision {
-        return readable_name;
+    if readable_name.len() <= MAX_TUPLE_NAME_LEN {
+        let crate_incompatible_collision = {
+            let mut tuple_abis = TUPLE_ABIS_BY_READABLE_NAME
+                .lock()
+                .expect("tuple ABI name registry lock was poisoned");
+            match tuple_abis.get(&readable_name) {
+                Some(existing) => existing != &oomir_element_types,
+                None => {
+                    tuple_abis.insert(readable_name.clone(), oomir_element_types.clone());
+                    false
+                }
+            }
+        };
+        if !local_incompatible_collision && !crate_incompatible_collision {
+            return readable_name;
+        }
     }
 
     let identity = element_tys

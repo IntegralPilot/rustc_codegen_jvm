@@ -18,7 +18,11 @@ use self::jvm::{
 use constant_pool::{InternedConstantPool, verify_no_duplicate_constants};
 use consts::load_constant;
 use rustc_middle::ty::TyCtxt;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 mod constant_pool;
 mod consts;
@@ -32,6 +36,25 @@ mod translator;
 pub const F128_CLASS: &str = "org/rustlang/runtime/F128";
 pub const I128_CLASS: &str = "org/rustlang/runtime/I128";
 pub const U128_CLASS: &str = "org/rustlang/runtime/U128";
+
+static OUTPUT_DIRECTORY_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Default)]
+pub(crate) struct EmittedClassRegistry {
+    variants: HashMap<String, Vec<EmittedClassVariant>>,
+}
+
+struct EmittedClassVariant {
+    hash: u64,
+    len: usize,
+    path: PathBuf,
+}
+
+fn bytecode_hash(bytecode: &[u8]) -> u64 {
+    bytecode.iter().fold(0xcbf29ce484222325u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    })
+}
 
 fn factory_return_instruction(ty: &oomir::Type) -> Instruction {
     match ty {
@@ -225,27 +248,91 @@ fn create_static_initializer_method(
     })
 }
 
-/// Converts an OOMIR module into JVM class files
-/// Returns a HashMap where the key is the JVM class name (with '/') and the value is the bytecode
-pub fn oomir_to_jvm_bytecode(
-    module: &oomir::Module,
-    _tcx: TyCtxt, // Keep tcx in signature if needed later, but unused now
-) -> jvm::Result<HashMap<String, Vec<u8>>> {
-    // Map to store the generated class files (Class Name -> Bytes)
-    let mut generated_classes: HashMap<String, Vec<u8>> = HashMap::new();
-    generated_classes.insert(
-        oomir::SLICE_VIEW_CLASS.to_string(),
-        create_slice_view_classfile()?,
-    );
-    generated_classes.insert(
-        oomir::UTF8_VIEW_CLASS.to_string(),
-        create_utf8_view_classfile()?,
-    );
+fn emit_generated_class(
+    output_directory: &Path,
+    generated_classes: &mut Vec<(String, PathBuf)>,
+    registry: &mut EmittedClassRegistry,
+    class_name: String,
+    bytecode: Vec<u8>,
+) -> jvm::Result<()> {
+    let hash = bytecode_hash(&bytecode);
+    let bytecode_len = bytecode.len();
+    if let Some(variants) = registry.variants.get(&class_name) {
+        for variant in variants
+            .iter()
+            .filter(|variant| variant.hash == hash && variant.len == bytecode_len)
+        {
+            let previous =
+                std::fs::read(&variant.path).map_err(|error| jvm::Error::VerificationError {
+                    context: format!("Class {class_name}"),
+                    message: format!("Failed to compare an emitted class fragment: {error}"),
+                })?;
+            if previous == bytecode {
+                return Ok(());
+            }
+        }
+    }
 
-    let mut functions_by_class: BTreeMap<String, Vec<&oomir::Function>> = BTreeMap::new();
-    for function in module.functions.values() {
+    let path = output_directory.join(format!("{}.class", generated_classes.len()));
+    std::fs::write(&path, bytecode).map_err(|error| jvm::Error::VerificationError {
+        context: format!("Class {class_name}"),
+        message: format!("Failed to write temporary class file: {error}"),
+    })?;
+    registry
+        .variants
+        .entry(class_name.clone())
+        .or_default()
+        .push(EmittedClassVariant {
+            hash,
+            len: bytecode_len,
+            path: path.clone(),
+        });
+    generated_classes.push((class_name, path));
+    Ok(())
+}
+
+/// Converts an OOMIR module into JVM class files, streaming each completed
+/// class to disk so crate-wide bytecode does not coexist with crate-wide OOMIR.
+pub fn oomir_to_jvm_bytecode(
+    mut module: oomir::Module,
+    _tcx: TyCtxt, // Keep tcx in signature if needed later, but unused now
+    emit_runtime_views: bool,
+    registry: &mut EmittedClassRegistry,
+) -> jvm::Result<Vec<(String, PathBuf)>> {
+    let output_ordinal = OUTPUT_DIRECTORY_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let output_directory = std::env::temp_dir().join(format!(
+        "rustc-codegen-jvm-{}-{}-{output_ordinal}",
+        std::process::id(),
+        crate::stable_hash::short_hash(&module.name, 12)
+    ));
+    std::fs::create_dir_all(&output_directory).map_err(|error| jvm::Error::VerificationError {
+        context: module.name.clone(),
+        message: format!("Failed to create temporary class directory: {error}"),
+    })?;
+    let mut generated_classes = Vec::new();
+    if emit_runtime_views {
+        emit_generated_class(
+            &output_directory,
+            &mut generated_classes,
+            registry,
+            oomir::SLICE_VIEW_CLASS.to_string(),
+            create_slice_view_classfile()?,
+        )?;
+        emit_generated_class(
+            &output_directory,
+            &mut generated_classes,
+            registry,
+            oomir::UTF8_VIEW_CLASS.to_string(),
+            create_utf8_view_classfile()?,
+        )?;
+    }
+
+    // Consume functions class-by-class so their OOMIR is released as soon as
+    // the corresponding classfile has been serialized.
+    let mut functions_by_class: BTreeMap<String, Vec<oomir::Function>> = BTreeMap::new();
+    for (_, function) in std::mem::take(&mut module.functions) {
         functions_by_class
-            .entry(module.owner_class_for_function(function).to_string())
+            .entry(module.owner_class_for_function(&function).to_string())
             .or_default()
             .push(function);
     }
@@ -354,10 +441,10 @@ pub fn oomir_to_jvm_bytecode(
             // Translate the function body using its own constant pool reference
             // Free functions at module level don't have an owner class
             let translator = FunctionTranslator::new(
-                function,
+                &function,
                 &mut main_cp, // Use the main class's constant pool
                 &mut bootstrap_methods,
-                module,
+                &module,
                 true,
                 None, // No owner class for free functions
             );
@@ -372,7 +459,7 @@ pub fn oomir_to_jvm_bytecode(
                         message: format!("Failed to translate function: {error:?}"),
                     })?;
 
-            let stack_floor = oomir_function_stack_floor(function);
+            let stack_floor = oomir_function_stack_floor(&function);
             let max_stack_val = match jvm_code.max_stack(&main_cp) {
                 Ok(max_stack) => max_stack.saturating_mul(2).max(stack_floor),
                 Err(error) => {
@@ -473,7 +560,13 @@ pub fn oomir_to_jvm_bytecode(
                 context: format!("Class {class_name_jvm}"),
                 message: format!("Failed to serialize class file: {error:?}"),
             })?;
-        generated_classes.insert(class_name_jvm.clone(), byte_vector);
+        emit_generated_class(
+            &output_directory,
+            &mut generated_classes,
+            registry,
+            class_name_jvm.clone(),
+            byte_vector,
+        )?;
 
         breadcrumbs::log!(
             breadcrumbs::LogLevel::Info,
@@ -532,16 +625,35 @@ pub fn oomir_to_jvm_bytecode(
                     subclasses,
                     nest_host,
                 )?;
-                generated_classes.insert(dt_name_oomir.clone(), dt_bytecode);
+                emit_generated_class(
+                    &output_directory,
+                    &mut generated_classes,
+                    registry,
+                    dt_name_oomir.clone(),
+                    dt_bytecode,
+                )?;
             }
             DataType::Interface { methods } => {
                 // Create and serialize the class file for this data type
                 let dt_bytecode =
                     create_data_type_classfile_for_interface(&dt_name_oomir, &methods)?;
-                generated_classes.insert(dt_name_oomir.clone(), dt_bytecode);
+                emit_generated_class(
+                    &output_directory,
+                    &mut generated_classes,
+                    registry,
+                    dt_name_oomir.clone(),
+                    dt_bytecode,
+                )?;
             }
         }
     }
 
-    Ok(generated_classes) // Return the map containing all generated classes
+    if generated_classes.is_empty() {
+        std::fs::remove_dir(&output_directory).map_err(|error| jvm::Error::VerificationError {
+            context: module.name.clone(),
+            message: format!("Failed to remove empty temporary class directory: {error}"),
+        })?;
+    }
+
+    Ok(generated_classes)
 }

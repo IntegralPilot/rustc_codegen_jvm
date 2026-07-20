@@ -3766,6 +3766,18 @@ public final class Pointer {
         }
     }
 
+    public static void copyUnionStorage(
+            byte[] sourceBytes,
+            Object[] sourceObjects,
+            int sourceOffset,
+            byte[] targetBytes,
+            Object[] targetObjects,
+            int targetOffset,
+            int size) {
+        System.arraycopy(sourceBytes, sourceOffset, targetBytes, targetOffset, size);
+        System.arraycopy(sourceObjects, sourceOffset, targetObjects, targetOffset, size);
+    }
+
     private static byte[] encodeAggregate(String codecClassName, Object value) {
         try {
             return (byte[]) codecMethods(codecClassName)[0].invoke(null, value);

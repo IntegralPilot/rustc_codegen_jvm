@@ -45,7 +45,6 @@ use rustc_span::def_id::{DefId, LOCAL_CRATE};
 use std::{
     any::Any,
     ffi::OsString,
-    io::Write,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -59,6 +58,11 @@ mod stable_hash;
 
 /// An instance of our Java bytecode codegen backend.
 struct MyBackend;
+
+/// Rustc's codegen-unit partitioning is tuned for native backends which lower
+/// functions into independently owned LLVM modules. Keep each OOMIR shard
+/// bounded as a second line of defence for unusually large codegen units.
+const MAX_MONO_ITEMS_PER_OOMIR_SHARD: usize = 256;
 
 fn write_linker_response_file(path: &Path, arguments: &[OsString]) -> std::io::Result<()> {
     let mut contents = vec![0xff, 0xfe];
@@ -573,37 +577,34 @@ fn lower_mono_function<'tcx>(
     place_or_insert_mono_function(tcx, instance, &name, oomir_function, oomir_module);
 }
 
-fn lower_mono_items<'tcx>(
+fn lower_codegen_unit_items<'tcx>(
     tcx: TyCtxt<'tcx>,
+    mono_items: impl IntoIterator<Item = MonoItem<'tcx>>,
+    partitioned_functions: &HashSet<Instance<'tcx>>,
     oomir_module: &mut oomir::Module,
+    claimed_mono_items: &mut HashSet<MonoItem<'tcx>>,
     lowered_instances: &mut HashSet<Instance<'tcx>>,
 ) {
-    let cgus = tcx.collect_and_partition_mono_items(());
-    let mut seen = HashSet::new();
     let mut functions = VecDeque::new();
 
-    for cgu in cgus.codegen_units {
-        for (mono_item, _data) in cgu.items_in_deterministic_order(tcx) {
-            if !seen.insert(mono_item) {
-                continue;
+    for mono_item in mono_items {
+        if !claimed_mono_items.insert(mono_item) {
+            continue;
+        }
+        match mono_item {
+            MonoItem::Fn(instance) => {
+                functions.push_back(instance);
             }
-
-            match mono_item {
-                MonoItem::Fn(instance) => {
-                    functions.push_back(instance);
-                }
-                MonoItem::Static(def_id) => {
-                    lower1::statics::lower_static(tcx, def_id, oomir_module).unwrap_or_else(
-                        |error| panic!("failed to lower static {def_id:?}: {error}"),
-                    );
-                }
-                MonoItem::GlobalAsm(item_id) => {
-                    breadcrumbs::log!(
-                        breadcrumbs::LogLevel::Warn,
-                        "mono-lowering",
-                        format!("Skipping global asm mono item: {:?}", item_id)
-                    );
-                }
+            MonoItem::Static(def_id) => {
+                lower1::statics::lower_static(tcx, def_id, oomir_module)
+                    .unwrap_or_else(|error| panic!("failed to lower static {def_id:?}: {error}"));
+            }
+            MonoItem::GlobalAsm(item_id) => {
+                breadcrumbs::log!(
+                    breadcrumbs::LogLevel::Warn,
+                    "mono-lowering",
+                    format!("Skipping global asm mono item: {:?}", item_id)
+                );
             }
         }
     }
@@ -616,8 +617,11 @@ fn lower_mono_items<'tcx>(
                 InstanceKind::Intrinsic(_)
                     | InstanceKind::LlvmIntrinsic(_)
                     | InstanceKind::Virtual(..)
-            ) && queued.insert(callee)
+            ) && !partitioned_functions.contains(&callee)
+                && queued.insert(callee)
             {
+                // Rustc owns ordinary reachability. Only follow supplemental
+                // instances that were not assigned to another codegen unit.
                 functions.push_back(callee);
             }
         }
@@ -878,6 +882,88 @@ fn lower_public_library_exports<'tcx>(
     }
 }
 
+fn empty_oomir_module(tcx: TyCtxt<'_>, name: &str) -> oomir::Module {
+    oomir::Module {
+        name: name.to_string(),
+        source_file: tcx
+            .sess
+            .local_crate_source_file()
+            .map(|file_name| rustc_span::FileName::Real(file_name).short().to_string()),
+        functions: HashMap::new(),
+        data_types: HashMap::new(),
+        statics: HashMap::new(),
+    }
+}
+
+fn emit_oomir_shard(
+    tcx: TyCtxt<'_>,
+    crate_name: &str,
+    shard_name: &str,
+    mut oomir_module: oomir::Module,
+    emit_runtime_views: bool,
+    emitted_class_registry: &mut lower2::EmittedClassRegistry,
+) -> Vec<(String, PathBuf)> {
+    // Intrinsic use is registered while MIR is lowered. Drain the registry per
+    // shard so no crate-wide OOMIR state has to remain alive.
+    let needed_intrinsics = lower1::control_flow::take_needed_intrinsics();
+    if !needed_intrinsics.is_empty() {
+        breadcrumbs::log!(
+            breadcrumbs::LogLevel::Info,
+            "intrinsics",
+            format!(
+                "Emitting {} checked arithmetic intrinsics for {shard_name}: {:?}",
+                needed_intrinsics.len(),
+                needed_intrinsics
+            )
+        );
+        let intrinsic_class = lower1::control_flow::checked_intrinsics::emit_all_needed_intrinsics(
+            &needed_intrinsics,
+        );
+        oomir_module
+            .data_types
+            .insert("RustcCodegenJVMIntrinsics".to_string(), intrinsic_class);
+    }
+
+    breadcrumbs::log!(
+        breadcrumbs::LogLevel::Info,
+        "backend",
+        format!(
+            "OOMIR shard {shard_name} contains {} functions, {} data types, and {} statics",
+            oomir_module.functions.len(),
+            oomir_module.data_types.len(),
+            oomir_module.statics.len()
+        )
+    );
+
+    let optimise1_timer = instrumentation::Timer::phase("optimise1", Some(crate_name));
+    let oomir_module = optimise1::optimise_module(oomir_module);
+    drop(optimise1_timer);
+
+    breadcrumbs::log!(
+        breadcrumbs::LogLevel::Info,
+        "optimisation",
+        format!(
+            "Optimised OOMIR shard {shard_name} contains {} functions, {} data types, and {} statics",
+            oomir_module.functions.len(),
+            oomir_module.data_types.len(),
+            oomir_module.statics.len()
+        )
+    );
+
+    let lower2_timer = instrumentation::Timer::phase("lower2", Some(crate_name));
+    let generated_classes = lower2::oomir_to_jvm_bytecode(
+        oomir_module,
+        tcx,
+        emit_runtime_views,
+        emitted_class_registry,
+    )
+    .unwrap_or_else(|error| {
+        panic!("failed to lower OOMIR shard {shard_name} to JVM bytecode: {error}")
+    });
+    drop(lower2_timer);
+    generated_classes
+}
+
 impl CodegenBackend for MyBackend {
     fn name(&self) -> &'static str {
         "rustc_codegen_jvm"
@@ -896,108 +982,74 @@ impl CodegenBackend for MyBackend {
             let rust_crate = LOCAL_CRATE;
             let crate_name = tcx.crate_name(rust_crate).to_string();
             let crate_module_class = lower1::jvm_names::crate_module_class(tcx, rust_crate);
-
-            let mut oomir_module = oomir::Module {
-                name: crate_module_class.clone(),
-                source_file: tcx
-                    .sess
-                    .local_crate_source_file()
-                    .map(|file_name| rustc_span::FileName::Real(file_name).short().to_string()),
-                functions: std::collections::HashMap::new(),
-                data_types: std::collections::HashMap::new(),
-                statics: std::collections::HashMap::new(),
-            };
-
-            let lower1_timer = instrumentation::Timer::phase("lower1", Some(&crate_name));
-
             let mut lowered_instances = HashSet::new();
-            lower_public_library_exports(tcx, &mut oomir_module, &mut lowered_instances);
-            lower_mono_items(tcx, &mut oomir_module, &mut lowered_instances);
-            emit_allocator_shim_guard(tcx, &mut oomir_module);
+            let mut claimed_mono_items = HashSet::new();
+            let mut generated_classes = Vec::new();
+            let mut emitted_class_registry = lower2::EmittedClassRegistry::default();
 
-            breadcrumbs::log!(
-                breadcrumbs::LogLevel::Info,
-                "backend",
-                format!("OOMIR module: {:?}", oomir_module)
-            );
+            let mono_items = tcx.collect_and_partition_mono_items(());
+            let partitioned_functions: HashSet<_> = mono_items
+                .codegen_units
+                .iter()
+                .flat_map(|cgu| cgu.items_in_deterministic_order(tcx))
+                .filter_map(|(item, _)| match item {
+                    MonoItem::Fn(instance) => Some(instance),
+                    MonoItem::Static(_) | MonoItem::GlobalAsm(_) => None,
+                })
+                .collect();
 
-            // Emit checked arithmetic intrinsics for all needed operations
-            breadcrumbs::log!(
-                breadcrumbs::LogLevel::Info,
-                "intrinsics",
-                "Emitting checked arithmetic intrinsics..."
-            );
-            let needed_intrinsics = lower1::control_flow::take_needed_intrinsics();
-            if !needed_intrinsics.is_empty() {
-                breadcrumbs::log!(
-                    breadcrumbs::LogLevel::Info,
-                    "intrinsics",
-                    format!(
-                        "Emitting {} intrinsics: {:?}",
-                        needed_intrinsics.len(),
-                        needed_intrinsics
-                    )
-                );
-                let intrinsic_class =
-                    lower1::control_flow::checked_intrinsics::emit_all_needed_intrinsics(
-                        &needed_intrinsics,
-                    );
-                oomir_module
-                    .data_types
-                    .insert("RustcCodegenJVMIntrinsics".to_string(), intrinsic_class);
-            }
+            // Java exports are additional roots, so keep them out of the first
+            // ordinary codegen unit and emit them as their own small shard.
+            let mut export_module = empty_oomir_module(tcx, &crate_module_class);
+            let lower1_timer = instrumentation::Timer::phase("lower1", Some(&crate_name));
+            lower_public_library_exports(tcx, &mut export_module, &mut lowered_instances);
+            emit_allocator_shim_guard(tcx, &mut export_module);
             drop(lower1_timer);
+            generated_classes.extend(emit_oomir_shard(
+                tcx,
+                &crate_name,
+                "java-exports",
+                export_module,
+                true,
+                &mut emitted_class_registry,
+            ));
 
-            breadcrumbs::log!(
-                breadcrumbs::LogLevel::Info,
-                "optimisation",
-                format!(
-                    "--- Starting OOMIR Optimisation for module: {} ---",
-                    crate_name
-                )
-            );
+            for (index, cgu) in mono_items.codegen_units.into_iter().enumerate() {
+                let items = cgu
+                    .items_in_deterministic_order(tcx)
+                    .into_iter()
+                    .map(|(item, _)| item)
+                    .collect::<Vec<_>>();
+                if items.is_empty() {
+                    continue;
+                }
 
-            let optimise1_timer = instrumentation::Timer::phase("optimise1", Some(&crate_name));
-            let oomir_module = optimise1::optimise_module(oomir_module);
-            drop(optimise1_timer);
+                for (chunk_index, chunk) in items.chunks(MAX_MONO_ITEMS_PER_OOMIR_SHARD).enumerate()
+                {
+                    let shard_name = format!("cgu-{index}-{chunk_index}");
+                    let mut oomir_module = empty_oomir_module(tcx, &crate_module_class);
+                    let lower1_timer = instrumentation::Timer::phase("lower1", Some(&crate_name));
+                    lower_codegen_unit_items(
+                        tcx,
+                        chunk.iter().copied(),
+                        &partitioned_functions,
+                        &mut oomir_module,
+                        &mut claimed_mono_items,
+                        &mut lowered_instances,
+                    );
+                    drop(lower1_timer);
+                    generated_classes.extend(emit_oomir_shard(
+                        tcx,
+                        &crate_name,
+                        &shard_name,
+                        oomir_module,
+                        false,
+                        &mut emitted_class_registry,
+                    ));
+                }
+            }
 
-            breadcrumbs::log!(
-                breadcrumbs::LogLevel::Info,
-                "optimisation",
-                format!("Optimised OOMIR module: {:?}", oomir_module)
-            );
-
-            breadcrumbs::log!(
-                breadcrumbs::LogLevel::Info,
-                "optimisation",
-                format!(
-                    "--- Finished OOMIR Optimisation for module: {} ---",
-                    crate_name
-                )
-            );
-
-            breadcrumbs::log!(
-                breadcrumbs::LogLevel::Info,
-                "bytecode-gen",
-                format!(
-                    "--- Starting OOMIR to JVM Bytecode Lowering for module: {} ---",
-                    crate_name
-                )
-            );
-            let lower2_timer = instrumentation::Timer::phase("lower2", Some(&crate_name));
-            let bytecode = lower2::oomir_to_jvm_bytecode(&oomir_module, tcx).unwrap();
-            drop(lower2_timer);
-            //let bytecode = vec![0; 1024];
-            breadcrumbs::log!(
-                breadcrumbs::LogLevel::Info,
-                "bytecode-gen",
-                format!(
-                    "--- Finished OOMIR to JVM Bytecode Lowering for module: {} ---",
-                    crate_name
-                )
-            );
-
-            Box::new((bytecode, crate_name))
+            Box::new((generated_classes, crate_name))
         })
     }
 
@@ -1009,22 +1061,21 @@ impl CodegenBackend for MyBackend {
         _crate_info: &CrateInfo,
     ) -> (CompiledModules, UnordMap<WorkProductId, WorkProduct>) {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            // Update the downcast to expect a HashMap now.
-            // panic!("{:#?}", ongoing_codegen.downcast::<std::collections::HashMap<String, Vec<u8>>>());
-            let (bytecode_map, _) = *ongoing_codegen
-                .downcast::<(std::collections::HashMap<String, Vec<u8>>, String)>()
-                .expect("in join_codegen: ongoing_codegen is not a bytecode map");
+            let (generated_classes, _) = *ongoing_codegen
+                .downcast::<(Vec<(String, PathBuf)>, String)>()
+                .expect("in join_codegen: ongoing_codegen is not a generated-class list");
 
             let mut compiled_modules = Vec::new();
+            let temporary_directories: HashSet<_> = generated_classes
+                .iter()
+                .filter_map(|(_, path)| path.parent().map(Path::to_path_buf))
+                .collect();
 
-            // Iterate over each (file_name, bytecode) pair in the map.
-            for (name, bytecode) in bytecode_map.into_iter() {
-                let cgu_name = name.replace('/', "_");
+            for (index, (name, generated_path)) in generated_classes.into_iter().enumerate() {
+                let cgu_name = format!("{}_{index}", name.replace('/', "_"));
                 // The filesystem object name must remain crate-specific. Multiple
-                // crates may emit complementary definitions for the same JVM class,
-                // and Cargo can compile and archive those crates concurrently. The
-                // canonical JVM name is stored inside the classfile and recovered by
-                // the JVM linker; it does not need to be repeated in the path.
+                // crates and codegen units can emit complementary definitions for
+                // one JVM class, so each fragment needs a unique object path.
                 let file_path = outputs.temp_path_ext_for_cgu("class", &cgu_name);
                 if let Some(parent) = file_path.parent() {
                     std::fs::create_dir_all(parent).unwrap_or_else(|e| {
@@ -1036,21 +1087,17 @@ impl CodegenBackend for MyBackend {
                     });
                 }
 
-                // Write the bytecode to the file
-                let mut file = std::fs::File::create(&file_path).unwrap_or_else(|e| {
-                    panic!("Could not create file {}: {}", file_path.display(), e)
-                });
-                file.write_all(&bytecode).unwrap_or_else(|e| {
+                std::fs::copy(&generated_path, &file_path).unwrap_or_else(|e| {
                     panic!(
-                        "Could not write bytecode to file {}: {}",
+                        "Could not copy generated class {} to {}: {}",
+                        generated_path.display(),
                         file_path.display(),
                         e
                     )
                 });
 
-                // Create a CompiledModule for this file
                 compiled_modules.push(CompiledModule {
-                    name: name.clone(),
+                    name: cgu_name,
                     kind: ModuleKind::Regular,
                     object: Some(file_path),
                     global_asm_object: None,
@@ -1059,6 +1106,15 @@ impl CodegenBackend for MyBackend {
                     llvm_ir: None,
                     links_from_incr_cache: Vec::new(),
                     assembly: None,
+                });
+            }
+            for temporary_directory in temporary_directories {
+                std::fs::remove_dir_all(&temporary_directory).unwrap_or_else(|error| {
+                    panic!(
+                        "Could not remove temporary class directory {}: {}",
+                        temporary_directory.display(),
+                        error
+                    )
                 });
             }
 

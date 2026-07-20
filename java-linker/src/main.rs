@@ -11,7 +11,9 @@ use regex::Regex;
 use ristretto_classfile::attributes::{
     Attribute, BootstrapMethod, Instruction, StackFrame, VerificationType,
 };
-use ristretto_classfile::{ClassFile, Constant, ConstantPool, MethodAccessFlags};
+use ristretto_classfile::{
+    ClassAccessFlags, ClassFile, Constant, ConstantPool, MethodAccessFlags,
+};
 use tempfile::tempdir;
 use zip::write::{SimpleFileOptions, ZipWriter};
 use zip::{CompressionMethod, ZipArchive};
@@ -28,8 +30,8 @@ fn constant_pool_error(context: &str, error: impl std::fmt::Display) -> io::Erro
 
 fn import_constant(
     source_index: u16,
-    source: &ConstantPool,
-    target: &mut ConstantPool,
+    source: &ConstantPool<'static>,
+    target: &mut ConstantPool<'static>,
     indexes: &mut HashMap<u16, u16>,
     bootstrap_method_offset: u16,
 ) -> io::Result<u16> {
@@ -40,7 +42,8 @@ fn import_constant(
     let constant = source
         .try_get(source_index)
         .map_err(|error| constant_pool_error("invalid incoming constant-pool reference", error))?
-        .clone();
+        .clone()
+        .into_owned();
     let imported = match constant {
         Constant::Class(index) => Constant::Class(import_constant(
             index,
@@ -229,8 +232,8 @@ fn import_constant(
 }
 
 fn import_constant_pool(
-    source: &ConstantPool,
-    target: &mut ConstantPool,
+    source: &ConstantPool<'static>,
+    target: &mut ConstantPool<'static>,
     bootstrap_method_offset: u16,
 ) -> io::Result<HashMap<u16, u16>> {
     let mut indexes = HashMap::new();
@@ -484,8 +487,8 @@ fn remap_attribute(attribute: &mut Attribute, indexes: &HashMap<u16, u16>) -> io
     Ok(())
 }
 
-fn class_file_from_data(data: &[u8]) -> io::Result<ClassFile> {
-    ClassFile::from_bytes(&mut Cursor::new(data.to_vec())).map_err(|error| {
+fn class_file_from_data(data: &[u8]) -> io::Result<ClassFile<'static>> {
+    ClassFile::from_bytes(data).map_err(|error| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("invalid JVM class while merging generic specializations: {error}"),
@@ -493,7 +496,10 @@ fn class_file_from_data(data: &[u8]) -> io::Result<ClassFile> {
     })
 }
 
-fn method_identity(class_file: &ClassFile, method_index: usize) -> io::Result<(String, String)> {
+fn method_identity(
+    class_file: &ClassFile<'_>,
+    method_index: usize,
+) -> io::Result<(String, String)> {
     let method = &class_file.methods[method_index];
     let name = class_file
         .constant_pool
@@ -503,10 +509,10 @@ fn method_identity(class_file: &ClassFile, method_index: usize) -> io::Result<(S
         .constant_pool
         .try_get_utf8(method.descriptor_index)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
-    Ok((name.clone(), descriptor.clone()))
+    Ok((name.to_rust_string(), descriptor.to_rust_string()))
 }
 
-fn interface_name(class_file: &ClassFile, interface_index: usize) -> io::Result<String> {
+fn interface_name(class_file: &ClassFile<'_>, interface_index: usize) -> io::Result<String> {
     let constant_index = *class_file.interfaces.get(interface_index).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -516,18 +522,52 @@ fn interface_name(class_file: &ClassFile, interface_index: usize) -> io::Result<
     class_file
         .constant_pool
         .try_get_class(constant_index)
-        .cloned()
+        .map(|name| name.to_rust_string())
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
 }
 
 fn merge_class_data(base_data: &[u8], incoming_data: &[u8]) -> io::Result<Vec<u8>> {
-    let mut base = class_file_from_data(base_data)?;
-    let incoming = class_file_from_data(incoming_data)?;
+    let mut base = class_file_from_data(base_data).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("could not parse the accumulated base fragment: {error}"),
+        )
+    })?;
+    let incoming = class_file_from_data(incoming_data).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("could not parse the incoming fragment: {error}"),
+        )
+    })?;
     if base.class_name().ok() != incoming.class_name().ok() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "cannot merge class files with different JVM names",
         ));
+    }
+
+    // A trait interface can receive static helper methods from an ordinary
+    // holder fragment. Preserve the interface identity and never retain the
+    // holder's synthetic constructor.
+    let merged_is_interface = base.access_flags.contains(ClassAccessFlags::INTERFACE)
+        || incoming.access_flags.contains(ClassAccessFlags::INTERFACE);
+    let mut base_changed = false;
+    if merged_is_interface {
+        if incoming.access_flags.contains(ClassAccessFlags::INTERFACE)
+            && base.access_flags != incoming.access_flags
+        {
+            base.access_flags = incoming.access_flags;
+            base_changed = true;
+        }
+        let original_method_count = base.methods.len();
+        let mut retained_methods = Vec::with_capacity(original_method_count);
+        for index in 0..original_method_count {
+            if method_identity(&base, index)?.0 != "<init>" {
+                retained_methods.push(base.methods[index].clone());
+            }
+        }
+        base.methods = retained_methods;
+        base_changed |= base.methods.len() != original_method_count;
     }
 
     let mut existing_methods = HashSet::new();
@@ -536,7 +576,9 @@ fn merge_class_data(base_data: &[u8], incoming_data: &[u8]) -> io::Result<Vec<u8
     }
     let mut missing_method_indexes = Vec::new();
     for index in 0..incoming.methods.len() {
-        if !existing_methods.contains(&method_identity(&incoming, index)?) {
+        let identity = method_identity(&incoming, index)?;
+        if !(merged_is_interface && identity.0 == "<init>") && !existing_methods.contains(&identity)
+        {
             missing_method_indexes.push(index);
         }
     }
@@ -553,7 +595,17 @@ fn merge_class_data(base_data: &[u8], incoming_data: &[u8]) -> io::Result<Vec<u8
     }
 
     if missing_method_indexes.is_empty() && missing_interface_indexes.is_empty() {
-        return Ok(base_data.to_vec());
+        if !base_changed {
+            return Ok(base_data.to_vec());
+        }
+        let mut merged = Vec::new();
+        base.to_bytes(&mut merged).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("failed to serialize merged JVM class: {error}"),
+            )
+        })?;
+        return Ok(merged);
     }
 
     let base_bootstrap_count = base
@@ -649,7 +701,16 @@ fn merge_duplicate_classes(classes: Vec<ClassInfo>) -> io::Result<Vec<ClassInfo>
     let mut merged: Vec<ClassInfo> = Vec::new();
     for class_info in classes {
         if let Some(&index) = positions.get(&class_info.jar_entry_name) {
-            merged[index].data = merge_class_data(&merged[index].data, &class_info.data)?;
+            merged[index].data =
+                merge_class_data(&merged[index].data, &class_info.data).map_err(|error| {
+                    io::Error::new(
+                        error.kind(),
+                        format!(
+                            "failed to merge duplicate JVM class {}: {error}",
+                            class_info.jar_entry_name
+                        ),
+                    )
+                })?;
         } else {
             positions.insert(class_info.jar_entry_name.clone(), merged.len());
             merged.push(class_info);
@@ -1083,7 +1144,7 @@ fn check_class_data_for_main(
     main_method_name: &str,
     main_method_descriptor: &str,
 ) -> io::Result<Option<String>> {
-    let class_file = match ClassFile::from_bytes(&mut Cursor::new(data.to_vec())) {
+    let class_file = match ClassFile::from_bytes(data) {
         Ok(cf) => cf,
         Err(_e) => {
             // Ignore parse error details for this check
@@ -1101,17 +1162,19 @@ fn check_class_data_for_main(
                 .constant_pool
                 .try_get_utf8(method.name_index)
                 .ok()
-                .cloned();
+                .map(|name| name.to_rust_string());
             let descriptor = class_file
                 .constant_pool
                 .try_get_utf8(method.descriptor_index)
                 .ok()
-                .cloned();
+                .map(|descriptor| descriptor.to_rust_string());
 
             if let (Some(n), Some(d)) = (name, descriptor) {
                 if n == main_method_name && d == main_method_descriptor {
                     return match class_file.class_name() {
-                        Ok(class_name_ref) => Ok(Some(class_name_ref.replace('/', "."))),
+                        Ok(class_name_ref) => {
+                            Ok(Some(class_name_ref.to_rust_string().replace('/', ".")))
+                        }
                         Err(e) => {
                             eprintln!(
                                 "Warning (check_class_data): Found main method but failed to get class name: {}",
@@ -1298,12 +1361,8 @@ fn create_jar(
     Ok(())
 }
 
-fn class_info_from_class_data(mut data: Vec<u8>, fallback_name: String) -> ClassInfo {
-    let mut cursor = Cursor::new(data.clone());
-    let class_file = ClassFile::from_bytes(&mut cursor).ok();
-    if class_file.is_some() {
-        data.truncate(cursor.position() as usize);
-    }
+fn class_info_from_class_data(data: Vec<u8>, fallback_name: String) -> ClassInfo {
+    let class_file = ClassFile::from_bytes(&data).ok();
 
     let jar_entry_name = class_name_from_header(&data)
         .or_else(|| {
@@ -1311,7 +1370,7 @@ fn class_info_from_class_data(mut data: Vec<u8>, fallback_name: String) -> Class
                 class_file
                     .class_name()
                     .ok()
-                    .map(|class_name| class_name.to_string())
+                    .map(|class_name| class_name.to_rust_string())
             })
         })
         .map(|class_name| format!("{class_name}.class"))
@@ -1405,20 +1464,16 @@ fn class_name_from_header(data: &[u8]) -> Option<String> {
     Some(name.clone())
 }
 
-fn try_class_info_from_class_data(mut data: Vec<u8>, fallback_name: String) -> Option<ClassInfo> {
+fn try_class_info_from_class_data(data: Vec<u8>, fallback_name: String) -> Option<ClassInfo> {
     let header_class_name = class_name_from_header(&data);
-    let mut cursor = Cursor::new(data.clone());
-    let class_file = ClassFile::from_bytes(&mut cursor).ok();
-    if class_file.is_some() {
-        data.truncate(cursor.position() as usize);
-    }
+    let class_file = ClassFile::from_bytes(&data).ok();
     let jar_entry_name = header_class_name
         .or_else(|| {
             class_file.and_then(|class_file| {
-            class_file
-                .class_name()
-                .ok()
-                    .map(|class_name| class_name.to_string())
+                class_file
+                    .class_name()
+                    .ok()
+                    .map(|class_name| class_name.to_rust_string())
             })
         })
         .map(|class_name| format!("{class_name}.class"))
@@ -1688,6 +1743,32 @@ mod tests {
         abstract_class_with_method_and_interface(method_name, None)
     }
 
+    fn interface_with_method(method_name: &str) -> Vec<u8> {
+        let bytes = abstract_class_with_method(method_name);
+        let mut class_file = class_file_from_data(&bytes).unwrap();
+        class_file.access_flags =
+            ClassAccessFlags::PUBLIC | ClassAccessFlags::ABSTRACT | ClassAccessFlags::INTERFACE;
+        let mut bytes = Vec::new();
+        class_file.to_bytes(&mut bytes).unwrap();
+        bytes
+    }
+
+    fn holder_class_with_method_and_constructor(method_name: &str) -> Vec<u8> {
+        let bytes = abstract_class_with_method(method_name);
+        let mut class_file = class_file_from_data(&bytes).unwrap();
+        let name_index = class_file.constant_pool.add_utf8("<init>").unwrap();
+        let descriptor_index = class_file.constant_pool.add_utf8("()V").unwrap();
+        class_file.methods.push(Method {
+            access_flags: MethodAccessFlags::PUBLIC,
+            name_index,
+            descriptor_index,
+            attributes: Vec::new(),
+        });
+        let mut bytes = Vec::new();
+        class_file.to_bytes(&mut bytes).unwrap();
+        bytes
+    }
+
     fn abstract_class_with_method_and_interface(
         method_name: &str,
         interface_name: Option<&str>,
@@ -1902,6 +1983,46 @@ mod tests {
 
         assert_eq!(interfaces, ["test/First", "test/Second"]);
         assert_eq!(class_file.methods.len(), 1);
+    }
+
+    #[test]
+    fn merging_trait_helpers_preserves_interface_and_drops_holder_constructor() {
+        let holder = holder_class_with_method_and_constructor("helper");
+        let interface = interface_with_method("next");
+
+        for (base, incoming) in [(&holder, &interface), (&interface, &holder)] {
+            let merged = merge_class_data(base, incoming).unwrap();
+            let class_file = class_file_from_data(&merged).unwrap();
+            let mut methods: Vec<_> = (0..class_file.methods.len())
+                .map(|index| method_identity(&class_file, index).unwrap().0)
+                .collect();
+            methods.sort();
+
+            assert!(
+                class_file
+                    .access_flags
+                    .contains(ClassAccessFlags::INTERFACE)
+            );
+            assert_eq!(methods, ["helper", "next"]);
+        }
+    }
+
+    #[test]
+    fn merging_matching_trait_fragment_still_removes_holder_constructor() {
+        let holder = holder_class_with_method_and_constructor("same");
+        let interface = interface_with_method("same");
+        let merged = merge_class_data(&holder, &interface).unwrap();
+        let class_file = class_file_from_data(&merged).unwrap();
+        let methods: Vec<_> = (0..class_file.methods.len())
+            .map(|index| method_identity(&class_file, index).unwrap().0)
+            .collect();
+
+        assert!(
+            class_file
+                .access_flags
+                .contains(ClassAccessFlags::INTERFACE)
+        );
+        assert_eq!(methods, ["same"]);
     }
 
     #[test]
