@@ -83,6 +83,19 @@ pub fn provider_result_identity() -> Result<(), u32> {
     shared_result_identity(Ok(()))
 }
 
+struct PrivateToken {
+    value: u32,
+}
+
+// This body is monomorphized downstream, while its non-generic helper type is
+// private to the provider and therefore has no independent provider root.
+pub fn use_private_token<T>(input: T) -> u32 {
+    let mut token = PrivateToken { value: 42 };
+    core::hint::black_box(&mut token);
+    core::hint::black_box(&input);
+    token.value
+}
+
 pub fn invoke_result_closure<F: FnOnce() -> Result<(), u32>>(callback: F) -> Result<(), u32> {
     shared_result_identity(callback())
 }

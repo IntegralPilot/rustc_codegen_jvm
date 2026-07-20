@@ -4312,6 +4312,14 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                 ) => {
                     let adt_def = tcx.adt_def(*def_id);
                     let should_define_data_type = should_define_named_data_type(tcx, *def_id);
+                    if !should_define_data_type {
+                        super::super::types::force_define_named_adt(
+                            Ty::new_adt(tcx, adt_def, substs),
+                            tcx,
+                            data_types,
+                            instance,
+                        );
+                    }
                     if adt_def.is_struct() {
                         let variant = adt_def.variant(*variant_idx);
                         let jvm_class_name = generate_adt_jvm_class_name(

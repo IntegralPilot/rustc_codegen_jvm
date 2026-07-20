@@ -10,7 +10,7 @@ use provider::{
     DynValue, GenericMethodOwner, Holder, ProviderConstructed, ProviderCounter,
     invoke_callback_through_a_deliberately_long_generic_wrapper_that_exercises_hashed_closure_names_and_forces_the_fallback_path,
     invoke_result_closure, metadata, provider_result_identity, provider_scaled, provider_score,
-    pull_i32, pull_i64, scaled_sum,
+    pull_i32, pull_i64, scaled_sum, use_private_token,
 };
 
 struct LocalI32(i32);
@@ -67,6 +67,7 @@ fn main() {
     // and a downstream-only closure instantiation of the generic wrapper.
     assert!(provider_result_identity().is_ok());
     assert!(invoke_result_closure(|| Ok(())).is_ok());
+    assert!(use_private_token("downstream") == 42);
 
     // The provider's inner closure is instantiated with two different
     // downstream closure types whose readable class names exceed the limit.

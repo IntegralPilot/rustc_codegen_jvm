@@ -9,7 +9,7 @@ use rustc_middle::ty::{
     TypeVisitableExt, TypingEnv, UintTy,
 };
 use rustc_span::{def_id::DefId, sym};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub const UNION_BYTES_FIELD: &str = "_bytes";
 pub const UNION_OBJECTS_FIELD: &str = "_objects";
@@ -3030,6 +3030,53 @@ pub(super) struct ExactTransmuteHelper {
     pub signature: oomir::Signature,
 }
 
+fn force_define_transmute_adts<'tcx>(
+    ty: Ty<'tcx>,
+    tcx: TyCtxt<'tcx>,
+    data_types: &mut HashMap<String, oomir::DataType>,
+    instance_context: rustc_middle::ty::Instance<'tcx>,
+    visited: &mut HashSet<Ty<'tcx>>,
+) {
+    if !visited.insert(ty) {
+        return;
+    }
+
+    match ty.kind() {
+        TyKind::Adt(adt_def, substs) => {
+            if !should_define_named_data_type(tcx, adt_def.did()) && substs.is_empty() {
+                force_define_named_adt(ty, tcx, data_types, instance_context);
+            }
+            for field in adt_def
+                .variants()
+                .iter()
+                .flat_map(|variant| variant.fields.iter())
+            {
+                force_define_transmute_adts(
+                    field.ty(tcx, substs).skip_norm_wip(),
+                    tcx,
+                    data_types,
+                    instance_context,
+                    visited,
+                );
+            }
+        }
+        TyKind::Tuple(elements) => {
+            for element in elements.iter() {
+                force_define_transmute_adts(element, tcx, data_types, instance_context, visited);
+            }
+        }
+        TyKind::Array(element, _) | TyKind::Slice(element) | TyKind::Pat(element, _) => {
+            force_define_transmute_adts(*element, tcx, data_types, instance_context, visited);
+        }
+        TyKind::Closure(_, closure_args) => {
+            for capture in closure_args.as_closure().upvar_tys() {
+                force_define_transmute_adts(capture, tcx, data_types, instance_context, visited);
+            }
+        }
+        _ => {}
+    }
+}
+
 pub(super) fn ensure_exact_transmute_helper<'tcx>(
     source_ty: Ty<'tcx>,
     target_ty: Ty<'tcx>,
@@ -3048,6 +3095,13 @@ pub(super) fn ensure_exact_transmute_helper<'tcx>(
     }
     exact_bytes_supported(source_ty, tcx, instance_context)?;
     exact_bytes_supported(target_ty, tcx, instance_context)?;
+
+    // Optimized downstream MIR can materialize a dependency-private ADT by
+    // transmuting its scalar representation instead of constructing it. Emit
+    // only the named dependency types reached by this generated helper.
+    let mut visited = HashSet::new();
+    force_define_transmute_adts(source_ty, tcx, data_types, instance_context, &mut visited);
+    force_define_transmute_adts(target_ty, tcx, data_types, instance_context, &mut visited);
 
     let source_oomir_ty = ty_to_oomir_type(source_ty, tcx, data_types, instance_context);
     let target_oomir_ty = ty_to_oomir_type(target_ty, tcx, data_types, instance_context);
