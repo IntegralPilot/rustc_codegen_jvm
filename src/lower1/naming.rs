@@ -3,7 +3,7 @@
 use super::jvm_names;
 use rustc_hir::{LangItem, def::DefKind};
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
-use rustc_middle::ty::{GenericArg, Instance, TyCtxt, TypeVisitableExt};
+use rustc_middle::ty::{GenericArg, Instance, InstanceKind, TyCtxt, TypeVisitableExt};
 use rustc_span::{def_id::LOCAL_CRATE, sym};
 use std::collections::HashMap;
 
@@ -35,6 +35,7 @@ pub struct JvmStaticImport {
 pub fn mono_owner_class<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> String {
     let def_id = instance.def_id();
     if !def_id.is_local()
+        && !matches!(instance.def, InstanceKind::Intrinsic(_))
         && jvm_names::is_runtime_crate(tcx, def_id.krate)
         && jvm_names::compiles_external_core_instances(tcx)
         && tcx.generics_of(def_id).requires_monomorphization(tcx)

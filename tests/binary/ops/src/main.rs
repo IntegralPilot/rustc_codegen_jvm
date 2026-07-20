@@ -237,6 +237,18 @@ fn runtime_integer_ops() {
         (opaque_u64(1u64 << 63) >> opaque_u32(63)) == 1,
         "u64 logical shift right"
     );
+    let (low, carry) = opaque_u64(u64::MAX).carrying_mul_add(
+        opaque_u64(2),
+        opaque_u64(0),
+        opaque_u64(1),
+    );
+    assert!(low == u64::MAX && carry == 1, "u64 carrying multiply-add");
+    let mut filled = [1_u8, 2, 3, 4];
+    filled.fill(9);
+    assert!(filled == [9, 9, 9, 9], "u8 slice fill");
+    let (mut left, mut right) = (11_i32, 29_i32);
+    core::mem::swap(&mut left, &mut right);
+    assert!(left == 29 && right == 11, "typed non-overlapping swap");
     assert!(
         opaque_i64(i64::MAX).wrapping_add(opaque_i64(1)) == i64::MIN,
         "i64 wrapping add"

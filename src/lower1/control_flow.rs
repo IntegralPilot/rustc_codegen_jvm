@@ -3751,10 +3751,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                     )
                                 )
                             });
-                        let is_core_ptr = is_external_intrinsic && has_pointer_like_operand;
-                        let is_local_core_ptr = called_def_id.is_local()
-                            && tcx.crate_name(called_def_id.krate).as_str() == "core"
-                            && has_pointer_like_operand;
+                        let is_core_ptr = is_core_crate_item && has_pointer_like_operand;
                         let is_size_of = (is_compiler_intrinsic
                             && intrinsic_name.as_str() == "size_of")
                             || has_diagnostic_item("mem_size_of");
@@ -4770,7 +4767,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                 });
                             }
                         } else if is_ptr_metadata
-                            && (is_core_ptr || is_local_core_ptr)
+                            && is_core_ptr
                             && (matches!(
                                 oomir_operands[0].get_type(),
                                 Some(oomir::Type::Slice(_) | oomir::Type::Str)
@@ -4807,7 +4804,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                 }
                             }
                         } else if is_ptr_metadata
-                            && (is_core_ptr || is_local_core_ptr)
+                            && is_core_ptr
                             && matches!(oomir_operands[0].get_type(), Some(oomir::Type::Pointer(_)))
                         {
                             if let Some(dest) = effective_dest.clone() {
@@ -5153,7 +5150,11 @@ pub(super) fn convert_basic_block<'tcx>(
                                 args: oomir_operands[..3].to_vec(),
                                 dest: None,
                             });
-                        } else if is_diagnostic_item(sym::ptr_swap) && is_core_ptr {
+                        } else if (is_diagnostic_item(sym::ptr_swap)
+                            || (is_compiler_intrinsic
+                                && intrinsic_name.as_str() == "typed_swap_nonoverlapping"))
+                            && is_core_ptr
+                        {
                             if let Some(oomir::Type::Pointer(pointee)) =
                                 oomir_operands[0].get_type()
                             {
