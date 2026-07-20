@@ -74,6 +74,19 @@ pub fn provider_scaled() -> i32 {
     scaled_sum(2, 3, 4)
 }
 
+#[inline(never)]
+pub fn shared_result_identity<T>(value: T) -> T {
+    core::hint::black_box(value)
+}
+
+pub fn provider_result_identity() -> Result<(), u32> {
+    shared_result_identity(Ok(()))
+}
+
+pub fn invoke_result_closure<F: FnOnce() -> Result<(), u32>>(callback: F) -> Result<(), u32> {
+    shared_result_identity(callback())
+}
+
 pub struct ProviderCounter {
     next: i32,
     end: i32,

@@ -3784,6 +3784,44 @@ pub(super) fn convert_basic_block<'tcx>(
                             // following unsafe operation UB. Valid monomorphizations therefore
                             // require no JVM instruction.
                         } else if is_compiler_intrinsic
+                            && intrinsic_name == "black_box"
+                            && oomir_operands.len() == 1
+                        {
+                            if let Some(dest) = effective_dest.clone() {
+                                instructions.push(oomir::Instruction::Move {
+                                    dest,
+                                    src: oomir_operands[0].clone(),
+                                });
+                            }
+                        } else if is_compiler_intrinsic
+                            && intrinsic_name == "catch_unwind"
+                            && oomir_operands.len() == 3
+                        {
+                            let data_ty = oomir_operands[1]
+                                .get_type()
+                                .expect("catch_unwind data pointer is typed");
+                            instructions.push(oomir::Instruction::InvokeStatic {
+                                class_name: oomir::POINTER_CLASS.to_string(),
+                                method_name: "catchUnwind".to_string(),
+                                method_ty: oomir::Signature {
+                                    params: vec![
+                                        (
+                                            "try_function".to_string(),
+                                            oomir::Type::Class("java/lang/Object".to_string()),
+                                        ),
+                                        ("data".to_string(), data_ty),
+                                        (
+                                            "catch_function".to_string(),
+                                            oomir::Type::Class("java/lang/Object".to_string()),
+                                        ),
+                                    ],
+                                    ret: Box::new(oomir::Type::Boolean),
+                                    is_static: true,
+                                },
+                                args: oomir_operands.clone(),
+                                dest: effective_dest.clone(),
+                            });
+                        } else if is_compiler_intrinsic
                             && emit_atomic_intrinsic(
                                 &intrinsic_name,
                                 func_instance,

@@ -25,6 +25,55 @@ public final class Pointer {
         }
     }
 
+    public static boolean catchUnwind(Object tryFunction, Pointer data, Object catchFunction) {
+        try {
+            invokeRustFunction(tryFunction, data);
+            return false;
+        } catch (PanicSupport.RustPanic failure) {
+            Pointer payload = Pointer.cell(failure, 8, MANAGED_OBJECT_VIEW_CODEC);
+            invokeRustFunction(catchFunction, data, payload);
+            return true;
+        }
+    }
+
+    private static Object invokeRustFunction(Object function, Object... arguments) {
+        if (function == null) {
+            throw new NullPointerException("Rust function pointer is null");
+        }
+        Method target = null;
+        for (Method method : function.getClass().getMethods()) {
+            if (method.getName().equals("call")
+                    && method.getParameterTypes().length == arguments.length) {
+                target = method;
+                break;
+            }
+        }
+        if (target == null) {
+            throw new IllegalArgumentException(
+                    "Rust function pointer has no compatible call method: "
+                            + function.getClass().getName());
+        }
+        try {
+            target.setAccessible(true);
+            return target.invoke(function, arguments);
+        } catch (InvocationTargetException failure) {
+            rethrowUnchecked(failure.getCause());
+            return null;
+        } catch (IllegalAccessException failure) {
+            throw new IllegalStateException("Rust function pointer invocation failed", failure);
+        }
+    }
+
+    private static void rethrowUnchecked(Throwable failure) {
+        if (failure instanceof RuntimeException) {
+            throw (RuntimeException) failure;
+        }
+        if (failure instanceof Error) {
+            throw (Error) failure;
+        }
+        throw new IllegalStateException("Rust unwind handler failed", failure);
+    }
+
     private static final String MANAGED_OBJECT_VIEW_CODEC = "@managed-object";
     private static final String RAW_POINTER_VIEW_CODEC = "@raw-pointer";
     private static final String SLICE_POINTER_VIEW_CODEC_PREFIX = "@slice-pointer\n";

@@ -1,7 +1,7 @@
 #![no_std]
 #![feature(lang_items)]
 #![allow(internal_features, dead_code)]
-#![feature(f16, f128, ptr_internals, ptr_metadata, set_ptr_value, layout_for_ptr)]
+#![feature(core_intrinsics, f16, f128, ptr_internals, ptr_metadata, set_ptr_value, layout_for_ptr)]
 
 include!("../../../support/test_prelude.rs");
 
@@ -1073,6 +1073,37 @@ fn raw_dyn_drop_in_place() {
     assert!(unsafe { *core::ptr::addr_of!(DROP_COUNT) } == before + 24);
 }
 
+unsafe fn unwind_try(data: *mut u32) {
+    unsafe {
+        *data = 42;
+    }
+}
+
+unsafe fn unwind_catch(data: *mut u32, _payload: *mut u8) {
+    unsafe {
+        *data = 99;
+    }
+}
+
+unsafe fn unwind_panic(_data: *mut u32) {
+    panic!("caught by the intrinsic");
+}
+
+fn catch_unwind_intrinsic_paths() {
+    let mut value = 0_u32;
+    let caught = unsafe {
+        core::intrinsics::catch_unwind(unwind_try, &mut value, unwind_catch)
+    };
+    assert!(!caught);
+    assert!(value == 42);
+
+    let caught = unsafe {
+        core::intrinsics::catch_unwind(unwind_panic, &mut value, unwind_catch)
+    };
+    assert!(caught);
+    assert!(value == 99);
+}
+
 fn automatic_recursive_drop_glue() {
     let before = unsafe { *core::ptr::addr_of!(DROP_COUNT) };
     {
@@ -1929,6 +1960,7 @@ fn main() {
     replace_and_swap();
     raw_drop_in_place();
     raw_dyn_drop_in_place();
+    catch_unwind_intrinsic_paths();
     automatic_recursive_drop_glue();
     pointer_niche_layouts();
     custom_dst_projections();

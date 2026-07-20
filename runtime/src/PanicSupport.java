@@ -6,6 +6,12 @@ import java.nio.charset.StandardCharsets;
 public final class PanicSupport {
     private PanicSupport() {}
 
+    public static final class RustPanic extends RuntimeException {
+        private RustPanic(String message) {
+            super(message);
+        }
+    }
+
     public static void raise(Pointer message, long length) {
         if (length < 0 || length > Integer.MAX_VALUE) {
             throw new IllegalArgumentException("invalid Rust panic message length: " + length);
@@ -15,6 +21,6 @@ public final class PanicSupport {
         for (int index = 0; index < utf8.length; index++) {
             utf8[index] = message.add(index).getI8();
         }
-        throw new RuntimeException("Rust panic: " + new String(utf8, StandardCharsets.UTF_8));
+        throw new RustPanic("Rust panic: " + new String(utf8, StandardCharsets.UTF_8));
     }
 }

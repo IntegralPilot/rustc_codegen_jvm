@@ -9,7 +9,8 @@ use alloc::vec::Vec;
 use provider::{
     DynValue, GenericMethodOwner, Holder, ProviderConstructed, ProviderCounter,
     invoke_callback_through_a_deliberately_long_generic_wrapper_that_exercises_hashed_closure_names_and_forces_the_fallback_path,
-    metadata, provider_scaled, provider_score, pull_i32, pull_i64, scaled_sum,
+    invoke_result_closure, metadata, provider_result_identity, provider_scaled, provider_score,
+    pull_i32, pull_i64, scaled_sum,
 };
 
 struct LocalI32(i32);
@@ -61,6 +62,11 @@ fn main() {
     assert!(scaled_sum(2, 3, 4) == 20);
     assert!(scaled_sum(1.5_f64, 2.5_f64, 2.0_f64) == 8.0);
     assert!(scaled_sum(100_i64, 200_i64, 3_i64) == 900);
+
+    // Exercise core::hint::black_box through both an upstream instantiation
+    // and a downstream-only closure instantiation of the generic wrapper.
+    assert!(provider_result_identity().is_ok());
+    assert!(invoke_result_closure(|| Ok(())).is_ok());
 
     // The provider's inner closure is instantiated with two different
     // downstream closure types whose readable class names exceed the limit.
