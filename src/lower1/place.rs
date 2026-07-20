@@ -109,6 +109,48 @@ pub(crate) fn emit_pointer_read(
     }
 }
 
+/// Implements Rust's `ptr::read` family. Unlike an ordinary dereference, these
+/// operations produce an independent bitwise copy of the pointee. JVM-backed
+/// aggregate carriers therefore need to be detached from the memory view.
+pub(crate) fn emit_pointer_read_copy(
+    pointer: Operand,
+    pointee_ty: &oomir::Type,
+    dest: &str,
+    instructions: &mut Vec<Instruction>,
+) -> Operand {
+    if !pointee_ty.is_jvm_reference_type() {
+        return emit_pointer_read(pointer, pointee_ty, dest, instructions);
+    }
+
+    let loaded_dest = format!("{dest}_loaded");
+    let loaded = emit_pointer_read(pointer, pointee_ty, &loaded_dest, instructions);
+    let object_dest = format!("{dest}_copy_object");
+    let object_ty = oomir::Type::Class("java/lang/Object".to_string());
+    instructions.push(Instruction::InvokeStatic {
+        dest: Some(object_dest.clone()),
+        class_name: oomir::POINTER_CLASS.to_string(),
+        method_name: "copyManagedValue".to_string(),
+        method_ty: oomir::Signature {
+            params: vec![("value".to_string(), object_ty.clone())],
+            ret: Box::new(object_ty.clone()),
+            is_static: true,
+        },
+        args: vec![loaded],
+    });
+    instructions.push(Instruction::Cast {
+        op: Operand::Variable {
+            name: object_dest,
+            ty: object_ty,
+        },
+        ty: pointee_ty.clone(),
+        dest: dest.to_string(),
+    });
+    Operand::Variable {
+        name: dest.to_string(),
+        ty: pointee_ty.clone(),
+    }
+}
+
 pub(crate) fn emit_pointer_write(
     pointer: Operand,
     pointee_ty: &oomir::Type,

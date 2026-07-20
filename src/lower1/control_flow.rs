@@ -1557,7 +1557,7 @@ pub(super) fn convert_basic_block<'tcx>(
                     matches!(projection, rustc_middle::mir::ProjectionElem::Deref)
                 }) {
                     instructions.extend(emit_selected_mutable_borrow_writebacks(
-                        initialized_borrows.iter().copied(),
+                        [place.local],
                         mutable_borrow_arrays,
                         tcx,
                         instance,
@@ -2926,7 +2926,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                                 dest: None,
                                             });
                                         }
-                                        super::place::emit_pointer_read(
+                                        super::place::emit_pointer_read_copy(
                                             receiver_operand,
                                             pointee_ty,
                                             &dest,
@@ -5054,7 +5054,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                 && let Some(oomir::Type::Pointer(pointee)) =
                                     oomir_operands[0].get_type()
                             {
-                                super::place::emit_pointer_read(
+                                super::place::emit_pointer_read_copy(
                                     oomir_operands[0].clone(),
                                     pointee.as_ref(),
                                     &dest,
@@ -5530,7 +5530,7 @@ pub(super) fn convert_basic_block<'tcx>(
                     }
                 }
 
-                let mut writeback_locals = initialized_borrows.clone();
+                let mut writeback_locals = HashSet::new();
                 for arg in args {
                     if let MirOperand::Move(place) | MirOperand::Copy(place) = &arg.node
                         && place.projection.is_empty()

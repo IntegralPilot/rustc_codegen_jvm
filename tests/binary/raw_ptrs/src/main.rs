@@ -1104,6 +1104,69 @@ fn catch_unwind_intrinsic_paths() {
     assert!(value == 99);
 }
 
+union UnwindData<F, R> {
+    function: core::mem::ManuallyDrop<F>,
+    result: core::mem::ManuallyDrop<R>,
+}
+
+unsafe fn unwind_data_try<F: FnOnce() -> R, R>(data: *mut UnwindData<F, R>) {
+    unsafe {
+        let function = core::mem::ManuallyDrop::take(&mut (*data).function);
+        (*data).result = core::mem::ManuallyDrop::new(function());
+    }
+}
+
+unsafe fn unwind_data_catch<F, R>(_data: *mut UnwindData<F, R>, _payload: *mut u8) {}
+
+fn catch_unwind_with_captured_aggregate<F: FnOnce() -> R, R>(function: F) -> R {
+    let mut data = UnwindData {
+        function: core::mem::ManuallyDrop::new(function),
+    };
+    let caught = unsafe {
+        core::intrinsics::catch_unwind(
+            unwind_data_try::<F, R>,
+            &mut data,
+            unwind_data_catch::<F, R>,
+        )
+    };
+    assert!(!caught);
+    unsafe { core::mem::ManuallyDrop::into_inner(data.result) }
+}
+
+enum CapturedChoice {
+    Number(u32),
+    Pair(u32, u32),
+}
+
+fn ptr_read_detaches_aggregate_value() {
+    let original = CapturedChoice::Pair(11, 17);
+    let mut copied = unsafe { core::ptr::read(core::ptr::addr_of!(original)) };
+    match &mut copied {
+        CapturedChoice::Number(value) => *value += 1,
+        CapturedChoice::Pair(left, right) => {
+            *left += 20;
+            *right += 30;
+        }
+    }
+    assert!(matches!(original, CapturedChoice::Pair(11, 17)));
+    assert!(matches!(copied, CapturedChoice::Pair(31, 47)));
+}
+
+fn catch_unwind_intrinsic_captured_aggregate() {
+    let choice = CapturedChoice::Pair(19, 23);
+    let value = catch_unwind_with_captured_aggregate(move || match choice {
+        CapturedChoice::Number(value) => value,
+        CapturedChoice::Pair(left, right) => left + right,
+    });
+    assert!(value == 42);
+
+    let choice = CapturedChoice::Number(37);
+    assert!(catch_unwind_with_captured_aggregate(move || match choice {
+        CapturedChoice::Number(value) => value,
+        CapturedChoice::Pair(left, right) => left + right,
+    }) == 37);
+}
+
 fn automatic_recursive_drop_glue() {
     let before = unsafe { *core::ptr::addr_of!(DROP_COUNT) };
     {
@@ -1794,10 +1857,10 @@ fn raw_doubly_linked_list_mutation() {
 fn fat_pointer_metadata_inequality() {
     let array = [1_i32, 2, 3, 4];
     let base_ptr = array.as_ptr();
-    
+
     let slice_short: *const [i32] = core::ptr::slice_from_raw_parts(base_ptr, 2);
     let slice_long: *const [i32] = core::ptr::slice_from_raw_parts(base_ptr, 4);
-    
+
     assert_ne!(slice_short, slice_long);
 }
 
@@ -1809,7 +1872,7 @@ fn zst_slice_metadata_and_queries() {
         assert_eq!(core::ptr::metadata(raw_slice), 3);
         assert_eq!(size_of_val_raw(raw_slice), 0);
         assert_eq!(align_of_val_raw(raw_slice), 1);
-        
+
         let fake_slice = core::ptr::slice_from_raw_parts(zst_array.as_ptr(), usize::MAX);
         assert_eq!(size_of_val_raw(fake_slice), 0);
     }
@@ -1869,15 +1932,15 @@ struct VolatilePayload {
 fn volatile_aggregate_operations() {
     let mut storage = VolatilePayload { a: 100, b: 200, c: 300 };
     let ptr = &mut storage as *mut VolatilePayload;
-    
+
     unsafe {
         let temp = ptr.read_volatile();
         assert_eq!(temp.a, 100);
         assert_eq!(temp.b, 200);
-        
+
         ptr.write_volatile(VolatilePayload { a: 1, b: 2, c: 3 });
     }
-    
+
     assert_eq!(storage.a, 1);
     assert_eq!(storage.b, 2);
 }
@@ -1894,18 +1957,18 @@ impl Doubler for Item {
 
 fn multi_trait_object_casting() {
     let item = Item { value: 21 };
-    
+
     let raw_inspector: *const dyn Inspector = &item;
     let raw_doubler: *const dyn Doubler = &item;
-    
+
     let data_inspector = raw_inspector.cast::<()>();
     let data_doubler = raw_doubler.cast::<()>();
-    
+
     assert_eq!(data_inspector, data_doubler);
-    
+
     let metadata_inspector = core::ptr::metadata(raw_inspector);
     let metadata_doubler = core::ptr::metadata(raw_doubler);
-    
+
     assert_ne!(
         unsafe { core::mem::transmute::<_, *const ()>(metadata_inspector) },
         unsafe { core::mem::transmute::<_, *const ()>(metadata_doubler) }
@@ -1917,9 +1980,9 @@ fn atomic_pointer_manipulation() {
 
     let mut val_a = 42_i32;
     let mut val_b = 84_i32;
-    
+
     let atomic_ptr = AtomicPtr::new(&mut val_a as *mut i32);
-    
+
     let loaded = atomic_ptr.load(Ordering::SeqCst);
     unsafe { assert_eq!(*loaded, 42); }
     
@@ -1961,6 +2024,8 @@ fn main() {
     raw_drop_in_place();
     raw_dyn_drop_in_place();
     catch_unwind_intrinsic_paths();
+    ptr_read_detaches_aggregate_value();
+    catch_unwind_intrinsic_captured_aggregate();
     automatic_recursive_drop_glue();
     pointer_niche_layouts();
     custom_dst_projections();
