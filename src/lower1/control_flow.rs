@@ -820,6 +820,22 @@ pub(super) fn emit_rust_drop_value<'tcx>(
                 dest: None,
             });
         }
+        TyKind::Dynamic(..) => {
+            instructions.push(oomir::Instruction::InvokeStatic {
+                class_name: oomir::POINTER_CLASS.to_string(),
+                method_name: "dropRustValue".to_string(),
+                method_ty: oomir::Signature {
+                    params: vec![(
+                        "value".to_string(),
+                        oomir::Type::Class("java/lang/Object".to_string()),
+                    )],
+                    ret: Box::new(oomir::Type::Void),
+                    is_static: true,
+                },
+                args: vec![value],
+                dest: None,
+            });
+        }
         // Rust unions require ManuallyDrop fields. Enums use a virtual helper
         // generated on every variant so the active payload is destroyed without
         // trying to reinterpret the JVM subclass as an inactive variant.
@@ -1977,7 +1993,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                     }
                                     other => other,
                                 }
-                            } else {
+                            } else if matches!(pointer.get_type(), Some(oomir::Type::Pointer(_))) {
                                 let value_name = format!("{label}_drop_glue_value");
                                 super::place::emit_pointer_read(
                                     pointer,
@@ -1985,6 +2001,8 @@ pub(super) fn convert_basic_block<'tcx>(
                                     &value_name,
                                     &mut instructions,
                                 )
+                            } else {
+                                pointer
                             };
                             emit_rust_drop_value(
                                 drop_ty,

@@ -23,6 +23,8 @@ const ENUM_FROM_UNION_DISCRIMINANT_METHOD: &str = "_fromUnionDiscriminant";
 const ENUM_WRITE_UNION_STORAGE_METHOD: &str = "_writeUnionStorage";
 const ENUM_READ_UNION_STORAGE_METHOD: &str = "_readUnionStorage";
 const ENUM_DROP_FIELDS_METHOD: &str = "_rust_drop_fields";
+const MANAGED_DROP_METHOD: &str = "rustDrop";
+const MANAGED_DROP_INTERFACE: &str = "org/rustlang/runtime/RustDrop";
 
 pub fn union_from_method_name(field_name: &str) -> String {
     format!("from_{}", jvm_names::member_name(field_name))
@@ -587,6 +589,48 @@ fn enum_variant_drop_glue_function<'tcx>(
 
     oomir::Function {
         name: ENUM_DROP_FIELDS_METHOD.to_string(),
+        owner_class: None,
+        debug_variables: Vec::new(),
+        signature: oomir::Signature {
+            params: vec![("self".to_string(), self_ty)],
+            ret: Box::new(oomir::Type::Void),
+            is_static: false,
+        },
+        body: oomir::CodeBlock {
+            entry: "entry".to_string(),
+            basic_blocks: HashMap::from([(
+                "entry".to_string(),
+                oomir::BasicBlock {
+                    label: "entry".to_string(),
+                    instructions,
+                },
+            )]),
+        },
+    }
+}
+
+fn managed_drop_glue_function<'tcx>(
+    rust_ty: Ty<'tcx>,
+    class_name: &str,
+    tcx: TyCtxt<'tcx>,
+    data_types: &mut HashMap<String, oomir::DataType>,
+    instance_context: rustc_middle::ty::Instance<'tcx>,
+) -> oomir::Function {
+    let self_ty = oomir::Type::Class(class_name.to_string());
+    let mut instructions = Vec::new();
+    super::control_flow::emit_rust_drop_value(
+        rust_ty,
+        operand_var("_1", self_ty.clone()),
+        "_managed_drop",
+        tcx,
+        instance_context,
+        data_types,
+        &mut instructions,
+    );
+    instructions.push(oomir::Instruction::Return { operand: None });
+
+    oomir::Function {
+        name: MANAGED_DROP_METHOD.to_string(),
         owner_class: None,
         debug_variables: Vec::new(),
         signature: oomir::Signature {
@@ -4079,6 +4123,43 @@ fn ensure_adt_data_type<'tcx>(
         ensure_enum_data_types(adt_def, substs, jvm_name, tcx, data_types, instance_context);
     } else if adt_def.is_union() {
         ensure_union_data_type(adt_def, substs, tcx, data_types, instance_context);
+    }
+
+    let rust_ty = Ty::new_adt(tcx, *adt_def, substs);
+    let needs_managed_drop = !rust_ty.has_param()
+        && !rust_ty.has_escaping_bound_vars()
+        && rust_ty.needs_drop(tcx, TypingEnv::fully_monomorphized())
+        && matches!(
+            data_types.get(jvm_name),
+            Some(oomir::DataType::Class { methods, .. })
+                if !methods.contains_key(MANAGED_DROP_METHOD)
+        );
+    if needs_managed_drop {
+        if let Some(oomir::DataType::Class {
+            methods,
+            interfaces,
+            ..
+        }) = data_types.get_mut(jvm_name)
+        {
+            methods.insert(
+                MANAGED_DROP_METHOD.to_string(),
+                DataTypeMethod::SimpleConstantReturn(oomir::Type::Void, None),
+            );
+            if !interfaces
+                .iter()
+                .any(|interface| interface == MANAGED_DROP_INTERFACE)
+            {
+                interfaces.push(MANAGED_DROP_INTERFACE.to_string());
+            }
+        }
+        let drop_method =
+            managed_drop_glue_function(rust_ty, jvm_name, tcx, data_types, instance_context);
+        if let Some(oomir::DataType::Class { methods, .. }) = data_types.get_mut(jvm_name) {
+            methods.insert(
+                MANAGED_DROP_METHOD.to_string(),
+                DataTypeMethod::Function(drop_method),
+            );
+        }
     }
 }
 

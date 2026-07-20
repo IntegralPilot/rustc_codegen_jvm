@@ -19,6 +19,12 @@ import java.util.WeakHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 
 public final class Pointer {
+    public static void dropRustValue(Object value) {
+        if (value instanceof RustDrop) {
+            ((RustDrop) value).rustDrop();
+        }
+    }
+
     private static final String MANAGED_OBJECT_VIEW_CODEC = "@managed-object";
     private static final String RAW_POINTER_VIEW_CODEC = "@raw-pointer";
     private static final String SLICE_POINTER_VIEW_CODEC_PREFIX = "@slice-pointer\n";

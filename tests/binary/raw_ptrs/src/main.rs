@@ -263,6 +263,48 @@ impl Drop for NeedsDrop {
     }
 }
 
+trait DynDropProbe {
+    fn amount(&self) -> u32;
+}
+
+struct DynDropAmount {
+    amount: u32,
+}
+
+impl DynDropProbe for DynDropAmount {
+    fn amount(&self) -> u32 {
+        self.amount
+    }
+}
+
+impl Drop for DynDropAmount {
+    fn drop(&mut self) {
+        unsafe {
+            *core::ptr::addr_of_mut!(DROP_COUNT) += self.amount;
+        }
+    }
+}
+
+struct DynDropContainer {
+    child: DropAmount,
+}
+
+impl DynDropProbe for DynDropContainer {
+    fn amount(&self) -> u32 {
+        self.child.amount
+    }
+}
+
+struct PlainDynDropValue {
+    amount: u32,
+}
+
+impl DynDropProbe for PlainDynDropValue {
+    fn amount(&self) -> u32 {
+        self.amount
+    }
+}
+
 struct DropAmount {
     amount: u32,
 }
@@ -999,6 +1041,36 @@ fn raw_drop_in_place() {
     unsafe {
         assert!(*core::ptr::addr_of!(DROP_COUNT) == 19);
     }
+}
+
+fn raw_dyn_drop_in_place() {
+    let before = unsafe { *core::ptr::addr_of!(DROP_COUNT) };
+    let mut value = DynDropAmount { amount: 11 };
+    let pointer: *mut dyn DynDropProbe = &mut value;
+    unsafe {
+        assert!((*pointer).amount() == 11);
+        core::ptr::drop_in_place(pointer);
+    }
+    core::mem::forget(value);
+
+    let mut container = DynDropContainer {
+        child: DropAmount { amount: 13 },
+    };
+    let container_pointer: *mut dyn DynDropProbe = &mut container;
+    unsafe {
+        assert!((*container_pointer).amount() == 13);
+        core::ptr::drop_in_place(container_pointer);
+    }
+    core::mem::forget(container);
+
+    let mut plain = PlainDynDropValue { amount: 17 };
+    let plain_pointer: *mut dyn DynDropProbe = &mut plain;
+    unsafe {
+        assert!((*plain_pointer).amount() == 17);
+        core::ptr::drop_in_place(plain_pointer);
+    }
+    core::mem::forget(plain);
+    assert!(unsafe { *core::ptr::addr_of!(DROP_COUNT) } == before + 24);
 }
 
 fn automatic_recursive_drop_glue() {
@@ -1856,6 +1928,7 @@ fn main() {
     raw_trait_object_metadata();
     replace_and_swap();
     raw_drop_in_place();
+    raw_dyn_drop_in_place();
     automatic_recursive_drop_glue();
     pointer_niche_layouts();
     custom_dst_projections();
