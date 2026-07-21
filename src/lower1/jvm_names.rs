@@ -3,7 +3,7 @@ use rustc_middle::ty::{GenericArgsRef, Instance, TyCtxt};
 use rustc_span::def_id::{CrateNum, DefId, LOCAL_CRATE};
 use rustc_span::sym;
 
-const RUNTIME_CRATES: &[rustc_span::Symbol] = &[sym::core, sym::alloc];
+const RUNTIME_CRATES: &[rustc_span::Symbol] = &[sym::core, sym::alloc, sym::std];
 
 fn is_runtime_crate_name(crate_name: rustc_span::Symbol) -> bool {
     RUNTIME_CRATES.contains(&crate_name)

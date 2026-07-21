@@ -1,1 +1,2 @@
 *.patch text eol=lf
+tests/**/java-stdin.txt text eol=lf

@@ -192,16 +192,33 @@ def run_command(
     env: dict[str, str] | None = None,
     input_text: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
+    if input_text is None:
+        return subprocess.run(
+            command,
+            cwd=cwd or ROOT,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+
+    # Text-mode pipes translate LF to CRLF on Windows. Feed UTF-8 bytes so a
+    # test fixture reaches Rust's stdin unchanged on every host.
+    completed = subprocess.run(
         command,
         cwd=cwd or ROOT,
         env=env,
-        input=input_text,
+        input=input_text.encode("utf-8"),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
+    )
+    return subprocess.CompletedProcess(
+        completed.args,
+        completed.returncode,
+        completed.stdout.decode("utf-8", errors="replace"),
+        completed.stderr.decode("utf-8", errors="replace"),
     )
 
 
