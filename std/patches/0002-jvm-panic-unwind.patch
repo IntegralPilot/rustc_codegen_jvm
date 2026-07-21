@@ -23,3 +23,31 @@ diff --git a/std/src/sys/personality/mod.rs b/std/src/sys/personality/mod.rs
          // This is required by the compiler to exist (e.g., it's a lang item),
          // but it's never actually called by the compiler because
          // __CxxFrameHandler3 (msvc) / __gxx_wasm_personality_v0 (wasm) is the
+diff --git a/std/src/panicking.rs b/std/src/panicking.rs
+--- a/std/src/panicking.rs
++++ b/std/src/panicking.rs
+@@ -555,11 +555,23 @@ pub unsafe fn try<F: FnOnce() -> R, R>(f: F) -> Result<R, Box<dyn Any + Send>> {
+     #[cold]
+     #[optimize(size)]
+     unsafe fn cleanup(payload: *mut u8) -> Box<dyn Any + Send + 'static> {
++        #[cfg(target_os = "jvm")]
++        unsafe extern "C" {
++            #[link_name = "jvm:static:org/rustlang/runtime/PanicSupport:isRustPanic:(Lorg/rustlang/runtime/Pointer;)Z"]
++            fn is_rust_panic(payload: *mut u8) -> bool;
++        }
++        #[cfg(target_os = "jvm")]
++        let counted_rust_panic = unsafe { is_rust_panic(payload) };
++        #[cfg(not(target_os = "jvm"))]
++        let counted_rust_panic = true;
++
+         // SAFETY: The whole unsafe block hinges on a correct implementation of
+         // the panic handler `__rust_panic_cleanup`. As such we can only
+         // assume it returns the correct thing for `Box::from_raw` to work
+         // without undefined behavior.
+         let obj = unsafe { Box::from_raw(__rust_panic_cleanup(payload)) };
+-        panic_count::decrease();
++        if counted_rust_panic {
++            panic_count::decrease();
++        }
+         obj
+     }

@@ -29,7 +29,10 @@ public final class Pointer {
         try {
             invokeRustFunction(tryFunction, data);
             return false;
-        } catch (PanicSupport.RustPanic failure) {
+        } catch (Throwable failure) {
+            if (failure instanceof VirtualMachineError || failure instanceof ThreadDeath) {
+                rethrowUnchecked(failure);
+            }
             Pointer payload = Pointer.cell(failure, 8, MANAGED_OBJECT_VIEW_CODEC);
             invokeRustFunction(catchFunction, data, payload);
             return true;
@@ -92,6 +95,7 @@ public final class Pointer {
     private static final Map<Object, Integer> ALLOCATION_ALIGNMENTS = new WeakHashMap<>();
     private static final Map<Object, String> ALLOCATION_CODECS = new WeakHashMap<>();
     private static final Map<String, byte[]> CONSTANT_ALLOCATIONS = new HashMap<>();
+    private static final Map<String, Pointer> CONSTANT_CELLS = new HashMap<>();
     private static final Map<Long, ExposedTarget> EXPOSED_ADDRESSES = new HashMap<>();
     private static final Map<String, Method[]> CODEC_METHODS = new HashMap<>();
     private static final Map<Class<?>, Method[]> SCALAR_ENUM_METHODS = new HashMap<>();
@@ -1754,6 +1758,29 @@ public final class Pointer {
                 -1);
     }
 
+    /** Materializes one stable JVM allocation for an anonymous CTFE allocation. */
+    public static Pointer constantCell(
+            String identity,
+            Object value,
+            long viewSize,
+            String viewCodecClassName,
+            long alignment) {
+        int checkedSize = checkedArrayLength(viewSize);
+        int checkedAlignment = checkedAlignment(alignment);
+        synchronized (CONSTANT_CELLS) {
+            Pointer pointer = CONSTANT_CELLS.get(identity);
+            if (pointer == null) {
+                pointer = cellAligned(
+                        value,
+                        checkedSize,
+                        viewCodecClassName,
+                        checkedAlignment);
+                CONSTANT_CELLS.put(identity, pointer);
+            }
+            return pointer.retype(checkedSize, viewCodecClassName);
+        }
+    }
+
     public static Pointer reallocateBytes(
             Pointer source,
             long oldByteCount,
@@ -2929,8 +2956,23 @@ public final class Pointer {
             }
             return bytes[withinElement] & 0xff;
         }
-        long bits = valueBits(value, allocationElementSize);
-        return (int) ((bits >>> (withinElement * 8)) & 0xffL);
+        try {
+            long bits = valueBits(value, allocationElementSize);
+            return (int) ((bits >>> (withinElement * 8)) & 0xffL);
+        } catch (UnsupportedOperationException error) {
+            throw new UnsupportedOperationException(
+                    error.getMessage()
+                            + " (allocation element size "
+                            + allocationElementSize
+                            + ", allocation codec "
+                            + allocationCodecClassName
+                            + ", view size "
+                            + viewSize
+                            + ", view codec "
+                            + viewCodecClassName
+                            + ")",
+                    error);
+        }
     }
 
     private void storeBytes(long bits, int byteCount) {
@@ -3480,13 +3522,14 @@ public final class Pointer {
     }
 
     public Object sliceBackingArray() {
-        if (allocation == null || !allocation.getClass().isArray()) {
-            throw new IllegalStateException("slice data pointer is not backed by a JVM array");
-        }
-        return allocation;
+        return hasDirectSliceArrayBacking() ? allocation : this;
     }
 
     public int sliceElementOffset() {
+        if (!hasDirectSliceArrayBacking()) {
+            // The returned slice backing is this already-offset Pointer.
+            return 0;
+        }
         if (allocationElementSize == 0) {
             return 0;
         }
@@ -3494,6 +3537,18 @@ public final class Pointer {
             throw new IllegalStateException("slice data pointer is not element-aligned");
         }
         return Math.toIntExact(byteOffset / allocationElementSize);
+    }
+
+    private boolean hasDirectSliceArrayBacking() {
+        if (allocation == null || !allocation.getClass().isArray()) {
+            return false;
+        }
+        if (allocationElementSize != viewSize) {
+            return false;
+        }
+        return allocationCodecClassName == null
+                ? viewCodecClassName == null
+                : allocationCodecClassName.equals(viewCodecClassName);
     }
 
     // A decoded view assigned back to its source already aliases that storage.

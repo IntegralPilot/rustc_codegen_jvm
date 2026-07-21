@@ -7,6 +7,11 @@ struct FormattingFields {
     suffix: [u64; 12],
 }
 
+unsafe extern "C" {
+    #[link_name = "jvm:static:java/lang/Math:addExact:(II)I"]
+    fn java_add_exact(left: i32, right: i32) -> i32;
+}
+
 fn main() {
     let fields = FormattingFields {
         prefix: [0; 11],
@@ -39,6 +44,15 @@ fn main() {
     let resumed = catch_unwind(AssertUnwindSafe(|| resume_unwind(typed)))
         .expect_err("resume_unwind must be caught by the next unwind boundary");
     assert_eq!(resumed.downcast_ref::<u32>(), Some(&1234));
+
+    let foreign = catch_unwind(|| unsafe { java_add_exact(i32::MAX, 1) })
+        .expect_err("a foreign JVM exception must unwind into catch_unwind");
+    let message = foreign
+        .downcast_ref::<String>()
+        .expect("foreign JVM failures should carry a diagnostic String");
+    assert!(message.contains("java.lang.ArithmeticException"));
+    assert!(message.contains("integer overflow"));
+    assert_eq!(unsafe { java_add_exact(20, 22) }, 42);
 
     let hook = std::panic::take_hook();
     std::panic::set_hook(hook);

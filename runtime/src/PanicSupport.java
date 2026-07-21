@@ -1,5 +1,7 @@
 package org.rustlang.runtime;
 
+import java.io.PrintWriter;
+import java.io.StringWriter;
 import java.nio.charset.StandardCharsets;
 
 /** Minimal JVM boundary used by Rust panic handlers. */
@@ -49,15 +51,47 @@ public final class PanicSupport {
     }
 
     public static Pointer takePayload(Pointer caughtException) {
+        return ((RustPanic) caughtThrowable(caughtException)).takePayload();
+    }
+
+    public static boolean isRustPanic(Pointer caughtException) {
+        return caughtThrowable(caughtException) instanceof RustPanic;
+    }
+
+    public static Pointer foreignFailureMessage(Pointer caughtException) {
+        byte[] message = describe(caughtThrowable(caughtException)).getBytes(StandardCharsets.UTF_8);
+        return Pointer.array(message, 0, 1);
+    }
+
+    public static long foreignFailureMessageLength(Pointer caughtException) {
+        return describe(caughtThrowable(caughtException)).getBytes(StandardCharsets.UTF_8).length;
+    }
+
+    private static Throwable caughtThrowable(Pointer caughtException) {
         Object value = caughtException.directCellValueOrSelf();
-        if (!(value instanceof RustPanic)) {
-            throw new IllegalArgumentException("caught object is not a Rust panic");
+        if (!(value instanceof Throwable)) {
+            throw new IllegalArgumentException("caught object is not a JVM throwable");
         }
-        return ((RustPanic) value).takePayload();
+        return (Throwable) value;
+    }
+
+    private static String describe(Throwable failure) {
+        StringWriter trace = new StringWriter();
+        failure.printStackTrace(new PrintWriter(trace));
+        return trace.toString();
     }
 
     /** Implements Rust's non-unwinding abort boundary. */
-    public static void abort(Throwable ignored) {
-        Runtime.getRuntime().halt(134);
+    public static void abort(Throwable failure) {
+        if (failure instanceof RustPanic) {
+            Runtime.getRuntime().halt(134);
+        }
+        if (failure instanceof RuntimeException) {
+            throw (RuntimeException) failure;
+        }
+        if (failure instanceof Error) {
+            throw (Error) failure;
+        }
+        throw new IllegalStateException("foreign JVM throwable crossed a Rust abort boundary", failure);
     }
 }
