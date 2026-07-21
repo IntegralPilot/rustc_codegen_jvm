@@ -37,138 +37,87 @@ diff --git a/std/src/sys/random/mod.rs b/std/src/sys/random/mod.rs
      }
      any(
          target_os = "dragonfly",
+diff --git a/std/src/sys/time/mod.rs b/std/src/sys/time/mod.rs
+--- a/std/src/sys/time/mod.rs
++++ b/std/src/sys/time/mod.rs
+@@ -3,6 +3,10 @@ cfg_select! {
+         mod hermit;
+         use hermit as imp;
+     }
++    target_os = "jvm" => {
++        mod jvm;
++        use jvm as imp;
++    }
+     target_os = "motor" => {
+         use moto_rt::time as imp;
+     }
 diff --git a/std/src/sys/sync/mutex/mod.rs b/std/src/sys/sync/mutex/mod.rs
 --- a/std/src/sys/sync/mutex/mod.rs
 +++ b/std/src/sys/sync/mutex/mod.rs
-@@ -38,6 +38,10 @@ cfg_select! {
-         mod xous;
-         pub use xous::Mutex;
-     }
-+    target_os = "jvm" => {
-+        mod no_threads;
-+        pub use no_threads::Mutex;
-+    }
-     _ => {
-         mod no_threads;
-         pub use no_threads::Mutex;
-diff --git a/std/src/sys/sync/mutex/no_threads.rs b/std/src/sys/sync/mutex/no_threads.rs
---- a/std/src/sys/sync/mutex/no_threads.rs
-+++ b/std/src/sys/sync/mutex/no_threads.rs
-@@ -1,6 +1,6 @@
- use crate::cell::Cell;
- 
--#[cfg(target_has_threads)]
-+#[cfg(all(target_has_threads, not(target_os = "jvm")))]
- compile_error!("Using no_threads implementation on a target with threads");
- 
- pub struct Mutex {
+@@ -9,5 +9,6 @@ cfg_select! {
+         all(target_family = "wasm", target_feature = "atomics"),
+         target_os = "hermit",
++        target_os = "jvm",
+     ) => {
+         mod futex;
+         pub use futex::Mutex;
 diff --git a/std/src/sys/sync/rwlock/mod.rs b/std/src/sys/sync/rwlock/mod.rs
 --- a/std/src/sys/sync/rwlock/mod.rs
 +++ b/std/src/sys/sync/rwlock/mod.rs
-@@ -33,6 +33,10 @@ cfg_select! {
-         mod solid;
-         pub use solid::RwLock;
-     }
-+    target_os = "jvm" => {
-+        mod no_threads;
-+        pub use no_threads::RwLock;
-+    }
-     _ => {
-         mod no_threads;
-         pub use no_threads::RwLock;
-diff --git a/std/src/sys/sync/rwlock/no_threads.rs b/std/src/sys/sync/rwlock/no_threads.rs
---- a/std/src/sys/sync/rwlock/no_threads.rs
-+++ b/std/src/sys/sync/rwlock/no_threads.rs
-@@ -1,6 +1,6 @@
- use crate::cell::Cell;
- 
--#[cfg(target_has_threads)]
-+#[cfg(all(target_has_threads, not(target_os = "jvm")))]
- compile_error!("Using no_threads implementation on a target with threads");
- 
- pub struct RwLock {
+@@ -9,5 +9,6 @@ cfg_select! {
+         target_os = "hermit",
+        target_os = "motor",
++        target_os = "jvm",
+     ) => {
+         mod futex;
+         pub use futex::RwLock;
 diff --git a/std/src/sys/sync/condvar/mod.rs b/std/src/sys/sync/condvar/mod.rs
 --- a/std/src/sys/sync/condvar/mod.rs
 +++ b/std/src/sys/sync/condvar/mod.rs
-@@ -45,6 +45,10 @@ cfg_select! {
-         mod xous;
-         pub use xous::Condvar;
-     }
-+    target_os = "jvm" => {
-+        mod no_threads;
-+        pub use no_threads::Condvar;
-+    }
-     _ => {
-         mod no_threads;
-         pub use no_threads::Condvar;
-diff --git a/std/src/sys/sync/condvar/no_threads.rs b/std/src/sys/sync/condvar/no_threads.rs
---- a/std/src/sys/sync/condvar/no_threads.rs
-+++ b/std/src/sys/sync/condvar/no_threads.rs
-@@ -2,7 +2,7 @@ use crate::sys::sync::Mutex;
- use crate::thread::sleep;
- use crate::time::Duration;
- 
--#[cfg(target_has_threads)]
-+#[cfg(all(target_has_threads, not(target_os = "jvm")))]
- compile_error!("Using no_threads implementation on a target with threads");
- 
- pub struct Condvar {}
+@@ -10,5 +10,6 @@ cfg_select! {
+         all(target_family = "wasm", target_feature = "atomics"),
+         target_os = "hermit",
++        target_os = "jvm",
+     ) => {
+         mod futex;
+         pub use futex::Condvar;
 diff --git a/std/src/sys/sync/once/mod.rs b/std/src/sys/sync/once/mod.rs
 --- a/std/src/sys/sync/once/mod.rs
 +++ b/std/src/sys/sync/once/mod.rs
-@@ -35,6 +35,10 @@ cfg_select! {
-         mod queue;
-         pub use queue::{Once, OnceState};
-     }
-+    target_os = "jvm" => {
-+        mod no_threads;
-+        pub use no_threads::{Once, OnceState};
-+    }
-     _ => {
-         mod no_threads;
-         pub use no_threads::{Once, OnceState};
-diff --git a/std/src/sys/sync/once/no_threads.rs b/std/src/sys/sync/once/no_threads.rs
---- a/std/src/sys/sync/once/no_threads.rs
-+++ b/std/src/sys/sync/once/no_threads.rs
-@@ -2,7 +2,7 @@ use crate::cell::Cell;
- use crate::sync as public;
- use crate::sync::once::OnceExclusiveState;
- 
--#[cfg(target_has_threads)]
-+#[cfg(all(target_has_threads, not(target_os = "jvm")))]
- compile_error!("Using no_threads implementation on a target with threads");
- 
- pub struct Once {
+@@ -16,5 +16,6 @@ cfg_select! {
+         target_os = "fuchsia",
+         target_os = "hermit",
++        target_os = "jvm",
+     ) => {
+         mod futex;
+         pub use futex::{Once, OnceState};
 diff --git a/std/src/sys/thread_local/mod.rs b/std/src/sys/thread_local/mod.rs
 --- a/std/src/sys/thread_local/mod.rs
 +++ b/std/src/sys/thread_local/mod.rs
-@@ -23,6 +23,7 @@ cfg_select! {
-         target_os = "zkvm",
-         target_os = "trusty",
-         target_os = "vexos",
-+        target_os = "jvm",
-     ) => {
-         mod no_threads;
-         pub use no_threads::{EagerStorage, LazyStorage, thread_local_inner};
-@@ -92,6 +93,7 @@ pub(crate) mod guard {
-             target_os = "zkvm",
-             target_os = "trusty",
-             target_os = "vexos",
+@@ -107,6 +107,7 @@ pub(crate) mod guard {
+         any(
+             target_os = "hermit",
+             target_os = "xous",
 +            target_os = "jvm",
          ) => {
-             pub(crate) fn enable() {
-                 // FIXME: Right now there is no concept of "thread exit" on
-diff --git a/std/src/sys/thread_local/no_threads.rs b/std/src/sys/thread_local/no_threads.rs
---- a/std/src/sys/thread_local/no_threads.rs
-+++ b/std/src/sys/thread_local/no_threads.rs
-@@ -5,6 +5,6 @@ use crate::mem::MaybeUninit;
- use crate::ptr;
- 
--#[cfg(target_has_threads)]
-+#[cfg(all(target_has_threads, not(target_os = "jvm")))]
- compile_error!("Using no_threads implementation on a target with threads");
- 
- #[doc(hidden)]
+             // `std` is the only runtime, so it just calls the destructor functions
+             // itself when the time comes.
+@@ -172,5 +173,15 @@ pub(crate) mod key {
+             use xous::{create, destroy};
+         }
++        target_os = "jvm" => {
++            mod jvm;
++            mod racy;
++            #[cfg(test)]
++            mod tests;
++            pub(super) use jvm::{Key, get, set};
++            pub(crate) use jvm::destroy_tls;
++            pub(super) use racy::LazyKey;
++            use jvm::{create, destroy};
++        }
+         target_os = "motor" => {
+             mod racy;
+             #[cfg(test)]
 diff --git a/std/src/sys/args/mod.rs b/std/src/sys/args/mod.rs
 --- a/std/src/sys/args/mod.rs
 +++ b/std/src/sys/args/mod.rs
@@ -219,6 +168,44 @@ diff --git a/std/src/sys/stdio/mod.rs b/std/src/sys/stdio/mod.rs
      any(target_family = "unix", target_os = "hermit", target_os = "wasi") => {
          mod unix;
          pub use unix::*;
+diff --git a/std/src/sys/pal/mod.rs b/std/src/sys/pal/mod.rs
+--- a/std/src/sys/pal/mod.rs
++++ b/std/src/sys/pal/mod.rs
+@@ -21,6 +21,10 @@ cfg_select! {
+         mod hermit;
+         pub use self::hermit::*;
+     }
++    target_os = "jvm" => {
++        mod jvm;
++        pub use self::jvm::*;
++    }
+     target_os = "motor" => {
+         mod motor;
+         pub use self::motor::*;
+diff --git a/std/src/sys/thread/mod.rs b/std/src/sys/thread/mod.rs
+--- a/std/src/sys/thread/mod.rs
++++ b/std/src/sys/thread/mod.rs
+@@ -5,6 +5,10 @@ cfg_select! {
+         mod unsupported;
+         pub use unsupported::{current_os_id, set_name};
+     }
++    target_os = "jvm" => {
++        mod jvm;
++        pub use jvm::*;
++    }
+     target_os = "motor" => {
+         mod motor;
+         pub use motor::*;
+diff --git a/std/src/sys/sync/thread_parking/mod.rs b/std/src/sys/sync/thread_parking/mod.rs
+--- a/std/src/sys/sync/thread_parking/mod.rs
++++ b/std/src/sys/sync/thread_parking/mod.rs
+@@ -12,5 +12,6 @@ cfg_select! {
+         target_os = "motor",
+         target_os = "hermit",
++        target_os = "jvm",
+     ) => {
+         mod futex;
+         pub use futex::Parker;
 diff --git a/std/src/sys/exit.rs b/std/src/sys/exit.rs
 --- a/std/src/sys/exit.rs
 +++ b/std/src/sys/exit.rs
@@ -249,14 +236,3 @@ diff --git a/std/build.rs b/std/build.rs
 +        || target_os == "jvm"
          || target_os == "android"
          || target_os == "netbsd"
-diff --git a/test/src/lib.rs b/test/src/lib.rs
---- a/test/src/lib.rs
-+++ b/test/src/lib.rs
-@@ -17,6 +17,7 @@
- #![doc(test(attr(deny(warnings))))]
- #![doc(rust_logo)]
- #![feature(rustdoc_internals)]
-+#![feature(restricted_std)]
- #![feature(file_buffered)]
- #![feature(internal_output_capture)]
- #![feature(io_const_error)]

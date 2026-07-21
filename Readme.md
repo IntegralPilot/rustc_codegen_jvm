@@ -101,7 +101,7 @@ Here are a few selected more complex demos:
 - **Unions** support primitive values, references, tuples, structs, fixed-size arrays, and fieldless or data-carrying enums, including recursively nested combinations of these types.
 - **Transmute** between everything supported by unions (uses the same inner machinery)
 - **Coroutines:** support for basic state machines, including yield and resume operations, preservation of local variables across suspension points, move and reference captures, and handling of zero-sized types.
-- **Standard library:** collections and allocation, arguments and environment variables, standard I/O, panic unwinding and randomness.
+- **Standard library:** collections and allocation, arguments and environment variables, standard I/O, panic unwinding, time and randomness, plus JVM-backed threads, thread-local storage and synchronization.
 - **Outputs** executable, self-contained `.jar` generation for binary crates.
 - **Testing** with integration coverage across debug and release modes for all of the above.
 
