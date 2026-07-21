@@ -2778,13 +2778,51 @@ pub(super) fn convert_basic_block<'tcx>(
                                                 &format!("{label}_non_null_wrapper"),
                                                 &mut instructions,
                                             );
+                                            let field_ty = match data_types.get(owner_class) {
+                                                Some(oomir::DataType::Class { fields, .. }) => {
+                                                    fields
+                                                        .iter()
+                                                        .find(|(name, _)| name == "pointer")
+                                                        .map(|(_, ty)| ty.clone())
+                                                        .expect(
+                                                            "NonNull carrier has a pointer field",
+                                                        )
+                                                }
+                                                _ => panic!(
+                                                    "NonNull carrier class {owner_class} was not generated"
+                                                ),
+                                            };
+                                            let field_dest = if field_ty == oomir_output_type {
+                                                dest.clone()
+                                            } else {
+                                                format!("{label}_non_null_pointer")
+                                            };
                                             instructions.push(oomir::Instruction::GetField {
-                                                dest,
+                                                dest: field_dest.clone(),
                                                 object: wrapper,
                                                 field_name: "pointer".to_string(),
-                                                field_ty: oomir_output_type.clone(),
+                                                field_ty: field_ty.clone(),
                                                 owner_class: owner_class.clone(),
                                             });
+                                            if field_ty != oomir_output_type {
+                                                let adapted =
+                                                    super::value_repr::adapt_operand_to_rust_type(
+                                                        oomir::Operand::Variable {
+                                                            name: field_dest,
+                                                            ty: field_ty,
+                                                        },
+                                                        fn_output,
+                                                        &format!("{label}_non_null_reference"),
+                                                        tcx,
+                                                        instance,
+                                                        data_types,
+                                                        &mut instructions,
+                                                    );
+                                                instructions.push(oomir::Instruction::Move {
+                                                    dest,
+                                                    src: adapted,
+                                                });
+                                            }
                                         } else {
                                             instructions.push(oomir::Instruction::Move {
                                                 dest,
@@ -4829,20 +4867,49 @@ pub(super) fn convert_basic_block<'tcx>(
                             let data = oomir_operands[0].clone();
                             if let Some(dest) = effective_dest.clone() {
                                 let is_str = matches!(oomir_output_type, oomir::Type::Str);
+                                let pointee_ty = match fn_output.kind() {
+                                    TyKind::RawPtr(pointee, _) | TyKind::Ref(_, pointee, _) => {
+                                        *pointee
+                                    }
+                                    other => panic!(
+                                        "raw slice constructor returned unexpected type {other:?}"
+                                    ),
+                                };
+                                let element_ty = match pointee_ty.kind() {
+                                    TyKind::Slice(element_ty) => *element_ty,
+                                    TyKind::Str => tcx.types.u8,
+                                    other => panic!(
+                                        "raw slice constructor returned unexpected pointee {other:?}"
+                                    ),
+                                };
+                                let element_size = super::types::layout_size_bytes(tcx, element_ty)
+                                    .unwrap_or_else(|error| {
+                                        panic!(
+                                            "could not determine raw slice element layout: {error}"
+                                        )
+                                    });
+                                let data = super::place::emit_retyped_slice_data_pointer(
+                                    data,
+                                    oomir::Operand::Constant(oomir::Constant::U64(
+                                        u64::try_from(element_size)
+                                            .expect("Rust slice element layout exceeds u64"),
+                                    )),
+                                    super::types::pointer_view_codec_operand(
+                                        element_ty, tcx, data_types, instance,
+                                    ),
+                                    &format!("{label}_raw_slice"),
+                                    &mut instructions,
+                                );
                                 let view_class = if is_str {
                                     oomir::UTF8_VIEW_CLASS
                                 } else {
                                     oomir::SLICE_VIEW_CLASS
                                 };
-                                let (backing, offset) = if is_str {
-                                    super::place::emit_pointer_slice_parts(
-                                        data,
-                                        &format!("{label}_raw_str"),
-                                        &mut instructions,
-                                    )
-                                } else {
-                                    (data, oomir::Operand::Constant(oomir::Constant::I32(0)))
-                                };
+                                let (backing, offset) = super::place::emit_pointer_slice_parts(
+                                    data,
+                                    &format!("{label}_raw_slice"),
+                                    &mut instructions,
+                                );
                                 let slice_object = format!("{label}_raw_slice_object");
                                 instructions.push(oomir::Instruction::ConstructObject {
                                     dest: slice_object.clone(),

@@ -162,7 +162,11 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             // The hidden track-caller parameter is not a MIR local and keeps a
             // reserved name so it cannot alias the first body temporary.
             let (param_name, param_ty) = &oomir_func.signature.params[i];
-            let param_oomir_name = if param_name == oomir::CALLER_LOCATION_PARAM_NAME {
+            let param_oomir_name = if let Some(name) =
+                param_name.strip_prefix(super::large_methods::PARAMETER_PREFIX)
+            {
+                name.to_string()
+            } else if param_name == oomir::CALLER_LOCATION_PARAM_NAME {
                 param_name.clone()
             } else {
                 format!("_{}", i + 1)
@@ -881,7 +885,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             &optimised.local_slot_map,
             self.max_locals_used,
         );
-        let initializer_count = stackmaps::initialize_locals_loaded_as_top(
+        let (initializer_count, frame_analysis) = stackmaps::initialize_locals_loaded_as_top(
             &mut self.jvm_instructions,
             &self.initial_locals,
             &local_hints,
@@ -934,14 +938,12 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 ),
             });
         }
-        let mut code_attributes = stackmaps::build_stack_map_attributes(
+        let mut code_attributes = stackmaps::build_stack_map_attributes_from_analysis(
             &self.jvm_instructions,
             &self.initial_locals,
-            &local_hints,
-            self.max_locals_used,
             self.constant_pool,
-            &format!("Function {}", self.oomir_func.name),
             &self.exception_table,
+            &frame_analysis,
         )
         .map_err(|error| jvm::Error::VerificationError {
             context: format!("Function {}", self.oomir_func.name),
@@ -4099,6 +4101,9 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 }
             }
             OI::Cast { op, ty, dest } => {
+                let restored_dest = dest
+                    .strip_prefix(super::large_methods::RESTORE_PREFIX)
+                    .unwrap_or(dest);
                 let preserves_receiver_identity =
                     matches!(
                         op,
@@ -4106,13 +4111,15 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     ) && matches!(ty, oomir::Type::Class(_) | oomir::Type::Interface(_));
                 self.load_operand_as(op, ty)?;
 
-                // 4. Store the casted value into the destination variable
-                //    The type for storage is the new type (ty)
-                self.store_result(dest, ty)?; // Stack: []
-                if preserves_receiver_identity {
-                    self.direct_this_aliases.insert(dest.clone());
+                if restored_dest == dest {
+                    self.store_result(dest, ty)?;
                 } else {
-                    self.direct_this_aliases.remove(dest);
+                    self.store_result_in_distinct_slot(restored_dest, ty)?;
+                }
+                if preserves_receiver_identity {
+                    self.direct_this_aliases.insert(restored_dest.to_string());
+                } else {
+                    self.direct_this_aliases.remove(restored_dest);
                 }
             }
 

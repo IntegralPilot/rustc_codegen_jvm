@@ -14,7 +14,8 @@ use super::{
         operand::{convert_operand, get_placeholder_operand},
         place::{
             coroutine_saved_field_name, emit_instructions_to_get_on_own, emit_pointer_read,
-            emit_pointer_slice_parts, emit_slice_view, get_place_type, place_to_string,
+            emit_pointer_slice_parts, emit_retyped_slice_data_pointer, emit_slice_view,
+            get_place_type, place_to_string,
         },
         types::{
             ENUM_UNION_DISCRIMINANT_METHOD, adapt_simple_enum_operand,
@@ -5002,16 +5003,30 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                             &mut instructions,
                         );
                         let is_str = pointee_ty.is_str();
+                        let element_ty = if is_str {
+                            tcx.types.u8
+                        } else {
+                            match pointee_ty.kind() {
+                                TyKind::Slice(element_ty) => *element_ty,
+                                _ => unreachable!("slice pointee changed during lowering"),
+                            }
+                        };
+                        let data = emit_retyped_slice_data_pointer(
+                            data,
+                            rust_layout_size_operand(element_ty, tcx, instance),
+                            super::super::types::pointer_view_codec_operand(
+                                element_ty, tcx, data_types, instance,
+                            ),
+                            &temp_aggregate_var,
+                            &mut instructions,
+                        );
                         let view_class = if is_str {
                             oomir::UTF8_VIEW_CLASS
                         } else {
                             oomir::SLICE_VIEW_CLASS
                         };
-                        let (backing, offset) = if is_str {
-                            emit_pointer_slice_parts(data, &temp_aggregate_var, &mut instructions)
-                        } else {
-                            (data, oomir::Operand::Constant(oomir::Constant::I32(0)))
-                        };
+                        let (backing, offset) =
+                            emit_pointer_slice_parts(data, &temp_aggregate_var, &mut instructions);
                         instructions.push(oomir::Instruction::ConstructObject {
                             dest: temp_aggregate_var.clone(),
                             class_name: view_class.to_string(),

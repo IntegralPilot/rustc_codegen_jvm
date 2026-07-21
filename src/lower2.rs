@@ -21,9 +21,10 @@ use consts::load_constant;
 use rustc_middle::ty::TyCtxt;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
+    io::{BufWriter, Write},
     path::{Path, PathBuf},
     sync::{
-        Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
 };
@@ -33,6 +34,7 @@ mod consts;
 mod helpers;
 mod jvm;
 mod jvm_gen;
+mod large_methods;
 mod optimise2;
 mod stackmaps;
 mod translator;
@@ -45,13 +47,19 @@ static OUTPUT_DIRECTORY_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Default)]
 pub(crate) struct EmittedClassRegistry {
-    variants: Mutex<HashMap<String, Vec<EmittedClassVariant>>>,
+    variants: Mutex<HashMap<String, Vec<Arc<EmittedClassVariant>>>>,
 }
 
 struct EmittedClassVariant {
     hash: u64,
     len: usize,
-    path: PathBuf,
+    state: Mutex<EmittedClassState>,
+    ready: Condvar,
+}
+
+enum EmittedClassState {
+    Pending,
+    Ready(Arc<[u8]>),
 }
 
 fn bytecode_hash(bytecode: &[u8]) -> u64 {
@@ -128,6 +136,27 @@ fn create_constant_factory(
             element_type: element_type.clone(),
             offset: *offset,
             length: *length,
+        },
+        oomir::Constant::InternedPointer {
+            identity,
+            value,
+            view_size,
+            alignment,
+            view_codec,
+            pointee,
+        } => oomir::Constant::InternedPointer {
+            identity: identity.clone(),
+            value: Box::new(create_constant_factory(
+                cp,
+                owner_class,
+                value,
+                methods,
+                next_factory,
+            )?),
+            view_size: *view_size,
+            alignment: *alignment,
+            view_codec: view_codec.clone(),
+            pointee: pointee.clone(),
         },
         oomir::Constant::Instance {
             class_name,
@@ -209,6 +238,7 @@ fn constant_instruction_cost(constant: &oomir::Constant) -> usize {
         C::FunctionPointer { .. } => 3,
         C::PointerAddress { .. } => 3,
         C::RepeatedBytePointer { .. } => 8,
+        C::InternedPointer { value, .. } => 7usize.saturating_add(constant_instruction_cost(value)),
         C::I64(_) | C::U64(_) | C::F64(_) => 1,
         C::I8(_)
         | C::U8(_)
@@ -431,52 +461,92 @@ fn create_static_initializer_method(
 }
 
 fn emit_generated_class(
-    output_directory: &Path,
-    generated_classes: &mut Vec<(String, PathBuf)>,
+    generated_classes: &mut Vec<(String, Arc<[u8]>)>,
     registry: &EmittedClassRegistry,
     class_name: String,
     bytecode: Vec<u8>,
 ) -> jvm::Result<()> {
     let hash = bytecode_hash(&bytecode);
     let bytecode_len = bytecode.len();
-    let mut registry = registry
-        .variants
-        .lock()
-        .map_err(|_| jvm::Error::VerificationError {
-            context: format!("Class {class_name}"),
-            message: "Emitted-class registry lock was poisoned".to_string(),
-        })?;
-    if let Some(variants) = registry.get(&class_name) {
-        for variant in variants
-            .iter()
-            .filter(|variant| variant.hash == hash && variant.len == bytecode_len)
-        {
-            let previous =
-                std::fs::read(&variant.path).map_err(|error| jvm::Error::VerificationError {
+    let mut checked = std::collections::HashSet::new();
+    loop {
+        let (candidates, reservation) = {
+            let mut variants =
+                registry
+                    .variants
+                    .lock()
+                    .map_err(|_| jvm::Error::VerificationError {
+                        context: format!("Class {class_name}"),
+                        message: "Emitted-class registry lock was poisoned".to_string(),
+                    })?;
+            let variants = variants.entry(class_name.clone()).or_default();
+            let candidates = variants
+                .iter()
+                .filter(|variant| {
+                    variant.hash == hash
+                        && variant.len == bytecode_len
+                        && !checked.contains(&(Arc::as_ptr(variant) as usize))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if candidates.is_empty() {
+                let reservation = Arc::new(EmittedClassVariant {
+                    hash,
+                    len: bytecode_len,
+                    state: Mutex::new(EmittedClassState::Pending),
+                    ready: Condvar::new(),
+                });
+                variants.push(Arc::clone(&reservation));
+                (candidates, Some(reservation))
+            } else {
+                (candidates, None)
+            }
+        };
+
+        if let Some(reservation) = reservation {
+            let bytecode: Arc<[u8]> = bytecode.into();
+            let mut state =
+                reservation
+                    .state
+                    .lock()
+                    .map_err(|_| jvm::Error::VerificationError {
+                        context: format!("Class {class_name}"),
+                        message: "Emitted-class reservation lock was poisoned".to_string(),
+                    })?;
+            *state = EmittedClassState::Ready(Arc::clone(&bytecode));
+            reservation.ready.notify_all();
+            generated_classes.push((class_name, bytecode));
+            return Ok(());
+        }
+
+        for candidate in candidates {
+            checked.insert(Arc::as_ptr(&candidate) as usize);
+            let mut state = candidate
+                .state
+                .lock()
+                .map_err(|_| jvm::Error::VerificationError {
                     context: format!("Class {class_name}"),
-                    message: format!("Failed to compare an emitted class fragment: {error}"),
+                    message: "Emitted-class reservation lock was poisoned".to_string(),
                 })?;
-            if previous == bytecode {
+            while matches!(*state, EmittedClassState::Pending) {
+                state = candidate
+                    .ready
+                    .wait(state)
+                    .map_err(|_| jvm::Error::VerificationError {
+                        context: format!("Class {class_name}"),
+                        message: "Emitted-class reservation lock was poisoned".to_string(),
+                    })?;
+            }
+            let previous = match &*state {
+                EmittedClassState::Ready(bytecode) => Arc::clone(bytecode),
+                EmittedClassState::Pending => unreachable!(),
+            };
+            drop(state);
+            if previous.as_ref() == bytecode.as_slice() {
                 return Ok(());
             }
         }
     }
-
-    let path = output_directory.join(format!("{}.class", generated_classes.len()));
-    std::fs::write(&path, bytecode).map_err(|error| jvm::Error::VerificationError {
-        context: format!("Class {class_name}"),
-        message: format!("Failed to write temporary class file: {error}"),
-    })?;
-    registry
-        .entry(class_name.clone())
-        .or_default()
-        .push(EmittedClassVariant {
-            hash,
-            len: bytecode_len,
-            path: path.clone(),
-        });
-    generated_classes.push((class_name, path));
-    Ok(())
 }
 
 fn serialize_class_file(class_file: &ClassFile<'_>, context: &str) -> jvm::Result<Vec<u8>> {
@@ -513,14 +583,67 @@ fn serialize_class_file(class_file: &ClassFile<'_>, context: &str) -> jvm::Resul
     Ok(bytecode)
 }
 
+fn write_class_bundle(
+    output_directory: &Path,
+    classes: &[(String, Arc<[u8]>)],
+    context: &str,
+) -> jvm::Result<PathBuf> {
+    let path = output_directory.join("classes.jvmbundle");
+    let file = std::fs::File::create(&path).map_err(|error| jvm::Error::VerificationError {
+        context: context.to_string(),
+        message: format!("Failed to create temporary class bundle: {error}"),
+    })?;
+    let mut output = BufWriter::new(file);
+    output
+        .write_all(super::CLASS_BUNDLE_MAGIC)
+        .map_err(|error| jvm::Error::VerificationError {
+            context: context.to_string(),
+            message: format!("Failed to write temporary class bundle: {error}"),
+        })?;
+    for (name, bytecode) in classes {
+        let name = name.as_bytes();
+        let name_len = u32::try_from(name.len()).map_err(|_| jvm::Error::VerificationError {
+            context: context.to_string(),
+            message: "JVM class name exceeds bundle format limit".to_string(),
+        })?;
+        let bytecode_len =
+            u64::try_from(bytecode.len()).map_err(|_| jvm::Error::VerificationError {
+                context: context.to_string(),
+                message: "JVM class data exceeds bundle format limit".to_string(),
+            })?;
+        for bytes in [
+            name_len.to_le_bytes().as_slice(),
+            bytecode_len.to_le_bytes().as_slice(),
+            name,
+            bytecode.as_ref(),
+        ] {
+            output
+                .write_all(bytes)
+                .map_err(|error| jvm::Error::VerificationError {
+                    context: context.to_string(),
+                    message: format!("Failed to write temporary class bundle: {error}"),
+                })?;
+        }
+    }
+    output
+        .flush()
+        .map_err(|error| jvm::Error::VerificationError {
+            context: context.to_string(),
+            message: format!("Failed to flush temporary class bundle: {error}"),
+        })?;
+    Ok(path)
+}
+
 /// Converts an OOMIR module into JVM class files, streaming each completed
-/// class to disk so crate-wide bytecode does not coexist with crate-wide OOMIR.
+/// class into one shard bundle so rustc does not manage tens of thousands of
+/// temporary object paths.
 pub fn oomir_to_jvm_bytecode(
     mut module: oomir::Module,
     debug_info: DebugInfoOptions,
     emit_runtime_views: bool,
     registry: &EmittedClassRegistry,
 ) -> jvm::Result<Vec<(String, PathBuf)>> {
+    large_methods::outline_large_functions(&mut module)?;
     let output_ordinal = OUTPUT_DIRECTORY_COUNTER.fetch_add(1, Ordering::Relaxed);
     let output_directory = std::env::temp_dir().join(format!(
         "rustc-codegen-jvm-{}-{}-{output_ordinal}",
@@ -534,14 +657,12 @@ pub fn oomir_to_jvm_bytecode(
     let mut generated_classes = Vec::new();
     if emit_runtime_views {
         emit_generated_class(
-            &output_directory,
             &mut generated_classes,
             registry,
             oomir::SLICE_VIEW_CLASS.to_string(),
             create_slice_view_classfile()?,
         )?;
         emit_generated_class(
-            &output_directory,
             &mut generated_classes,
             registry,
             oomir::UTF8_VIEW_CLASS.to_string(),
@@ -738,7 +859,13 @@ pub fn oomir_to_jvm_bytecode(
 
             let mut method = jvm::Method::default();
             // Assume static for now, adjust if instance methods are needed
-            method.access_flags = MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC;
+            method.access_flags = if function.name.starts_with(large_methods::METHOD_PREFIX) {
+                MethodAccessFlags::PRIVATE
+                    | MethodAccessFlags::STATIC
+                    | MethodAccessFlags::SYNTHETIC
+            } else {
+                MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC
+            };
             if function.name == "<init>" {
                 // Constructors cannot be static
                 method.access_flags = MethodAccessFlags::PUBLIC;
@@ -747,7 +874,8 @@ pub fn oomir_to_jvm_bytecode(
             method.descriptor_index = descriptor_index;
             method.attributes.push(code_attribute);
             // Add MethodParameters attribute (skip for constructors as they often have synthetic params)
-            if function.name != "<init>" {
+            if function.name != "<init>" && !function.name.starts_with(large_methods::METHOD_PREFIX)
+            {
                 method.attributes.push(method_parameters_attribute);
             }
 
@@ -792,7 +920,6 @@ pub fn oomir_to_jvm_bytecode(
         // Serialize the main class file
         let byte_vector = serialize_class_file(&class_file, &format!("Class {class_name_jvm}"))?;
         emit_generated_class(
-            &output_directory,
             &mut generated_classes,
             registry,
             class_name_jvm.clone(),
@@ -804,6 +931,35 @@ pub fn oomir_to_jvm_bytecode(
             "bytecode-gen",
             format!("Generated module class: {}", class_name_jvm)
         );
+    }
+
+    let data_type_names = module
+        .data_types
+        .keys()
+        .map(String::as_str)
+        .collect::<std::collections::HashSet<_>>();
+    let mut subclasses_by_host = HashMap::<String, Vec<String>>::new();
+    let mut nest_host_by_class = HashMap::<String, String>::new();
+    for class_name in module.data_types.keys() {
+        for (separator, _) in class_name.match_indices('$') {
+            let host = &class_name[..separator];
+            if data_type_names.contains(host) {
+                subclasses_by_host
+                    .entry(host.to_string())
+                    .or_default()
+                    .push(class_name.clone());
+            }
+        }
+        if let Some(separator) = class_name.rfind('$') {
+            let host = &class_name[..separator];
+            if data_type_names.contains(host) {
+                nest_host_by_class.insert(class_name.clone(), host.to_string());
+            }
+        }
+    }
+    for subclasses in subclasses_by_host.values_mut() {
+        subclasses.sort();
+        subclasses.dedup();
     }
 
     for (dt_name_oomir, data_type) in &module.data_types {
@@ -825,40 +981,22 @@ pub fn oomir_to_jvm_bytecode(
                 methods,
                 interfaces,
             } => {
-                let mut subclasses = Vec::new();
-                let mut nest_host = None;
-                // does our class name contain '$'?
-                let mut potential_nest_host = None;
-                if dt_name_oomir.contains('$') {
-                    // strip everything after the last '$', including $
-                    let last_dollar_index = dt_name_oomir.rfind('$').unwrap();
-                    potential_nest_host = Some(dt_name_oomir[..last_dollar_index].to_string());
-                }
-                for (other_dt_name, _) in &module.data_types {
-                    if other_dt_name.starts_with(&format!("{}$", dt_name_oomir)) {
-                        subclasses.push(other_dt_name.clone());
-                    }
-                    if let Some(potential_nest_host) = &potential_nest_host {
-                        if other_dt_name == potential_nest_host {
-                            nest_host = Some(potential_nest_host.clone());
-                        }
-                    }
-                }
+                let subclasses = subclasses_by_host.remove(dt_name_oomir).unwrap_or_default();
+                let nest_host = nest_host_by_class.remove(dt_name_oomir);
                 // Create and serialize the class file for this data type
                 let dt_bytecode = create_data_type_classfile_for_class(
                     &dt_name_oomir,
-                    fields.clone(),
+                    fields,
                     is_abstract,
-                    methods.clone(),
+                    methods,
                     super_class.as_deref().unwrap_or("java/lang/Object"),
-                    interfaces.clone(),
+                    interfaces,
                     &module,
                     subclasses,
                     nest_host,
                     debug_info,
                 )?;
                 emit_generated_class(
-                    &output_directory,
                     &mut generated_classes,
                     registry,
                     dt_name_oomir.clone(),
@@ -870,7 +1008,6 @@ pub fn oomir_to_jvm_bytecode(
                 let dt_bytecode =
                     create_data_type_classfile_for_interface(&dt_name_oomir, &methods)?;
                 emit_generated_class(
-                    &output_directory,
                     &mut generated_classes,
                     registry,
                     dt_name_oomir.clone(),
@@ -885,9 +1022,11 @@ pub fn oomir_to_jvm_bytecode(
             context: module.name.clone(),
             message: format!("Failed to remove empty temporary class directory: {error}"),
         })?;
+        return Ok(Vec::new());
     }
 
-    Ok(generated_classes)
+    let bundle = write_class_bundle(&output_directory, &generated_classes, &module.name)?;
+    Ok(vec![(module.name, bundle)])
 }
 
 pub(crate) fn debug_info_options(tcx: TyCtxt<'_>) -> DebugInfoOptions {

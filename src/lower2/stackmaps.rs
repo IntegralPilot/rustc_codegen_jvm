@@ -7,6 +7,7 @@ use super::jvm::{
 };
 use crate::oomir::{self, Type};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::sync::Arc;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum FrameValue {
@@ -16,15 +17,27 @@ pub(super) enum FrameValue {
     Long,
     Double,
     Null,
-    Object(String),
+    Object(Arc<str>),
     UninitializedThis,
     Uninitialized(u16),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct FrameState {
-    locals: Vec<FrameValue>,
+    locals: Arc<Vec<FrameValue>>,
     stack: Vec<FrameValue>,
+}
+
+pub(super) struct FrameAnalysis {
+    block_starts: Vec<usize>,
+    entry_states: Vec<Option<FrameState>>,
+}
+
+impl FrameAnalysis {
+    fn state_at(&self, instruction: usize) -> Option<&FrameState> {
+        let block = self.block_starts.binary_search(&instruction).ok()?;
+        self.entry_states.get(block)?.as_ref()
+    }
 }
 
 impl FrameValue {
@@ -48,7 +61,7 @@ impl FrameState {
         let mut locals = initial_locals;
         locals.resize(max_locals, FrameValue::Top);
         Self {
-            locals,
+            locals: Arc::new(locals),
             stack: Vec::new(),
         }
     }
@@ -134,22 +147,23 @@ impl FrameState {
     fn store_local(&mut self, index: u16, value: FrameValue) {
         let index = index as usize;
         let width = if value.is_category2() { 2 } else { 1 };
-        if self.locals.len() < index + width {
-            self.locals.resize(index + width, FrameValue::Top);
+        let locals = Arc::make_mut(&mut self.locals);
+        if locals.len() < index + width {
+            locals.resize(index + width, FrameValue::Top);
         }
 
-        if index > 0 && self.locals[index - 1].is_category2() {
-            self.locals[index - 1] = FrameValue::Top;
+        if index > 0 && locals[index - 1].is_category2() {
+            locals[index - 1] = FrameValue::Top;
         }
-        self.locals[index] = value;
+        locals[index] = value;
         if width == 2 {
-            self.locals[index + 1] = FrameValue::Top;
+            locals[index + 1] = FrameValue::Top;
         }
     }
 
     fn initialize_object(&mut self, uninitialized: &FrameValue, class_name: &str) {
-        let initialized = FrameValue::Object(normalize_class_name(class_name));
-        for local in &mut self.locals {
+        let initialized = FrameValue::Object(normalize_class_name(class_name).into());
+        for local in Arc::make_mut(&mut self.locals) {
             if local == uninitialized {
                 *local = initialized.clone();
             }
@@ -172,11 +186,14 @@ pub(super) fn initial_locals_for_oomir_function(
         let this_value = if function.name == "<init>" {
             FrameValue::UninitializedThis
         } else {
-            FrameValue::Object(normalize_class_name(
-                owner_class_name
-                    .or(function.owner_class.as_deref())
-                    .unwrap_or("java/lang/Object"),
-            ))
+            FrameValue::Object(
+                normalize_class_name(
+                    owner_class_name
+                        .or(function.owner_class.as_deref())
+                        .unwrap_or("java/lang/Object"),
+                )
+                .into(),
+            )
         };
         push_local_value(&mut locals, this_value);
     }
@@ -201,9 +218,9 @@ pub(super) fn initial_locals_for_descriptor(
         let this_value = if is_constructor {
             FrameValue::UninitializedThis
         } else {
-            FrameValue::Object(normalize_class_name(
-                this_class_name.unwrap_or("java/lang/Object"),
-            ))
+            FrameValue::Object(
+                normalize_class_name(this_class_name.unwrap_or("java/lang/Object")).into(),
+            )
         };
         push_local_value(&mut locals, this_value);
     }
@@ -236,13 +253,7 @@ pub(super) fn build_stack_map_attributes(
     context: &str,
     exception_table: &[ExceptionTableEntry],
 ) -> jvm::Result<Vec<Attribute>> {
-    let mut target_offsets = branch_targets(instructions);
-    target_offsets.extend(exception_table.iter().map(|entry| entry.handler_pc));
-    if instructions.is_empty() || target_offsets.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let states = solve_frame_states(
+    let analysis = solve_frame_states(
         instructions,
         initial_locals,
         local_hints,
@@ -251,6 +262,27 @@ pub(super) fn build_stack_map_attributes(
         context,
         exception_table,
     )?;
+    build_stack_map_attributes_from_analysis(
+        instructions,
+        initial_locals,
+        constant_pool,
+        exception_table,
+        &analysis,
+    )
+}
+
+pub(super) fn build_stack_map_attributes_from_analysis(
+    instructions: &[Instruction],
+    initial_locals: &[FrameValue],
+    constant_pool: &mut InternedConstantPool,
+    exception_table: &[ExceptionTableEntry],
+    analysis: &FrameAnalysis,
+) -> jvm::Result<Vec<Attribute>> {
+    let mut target_offsets = branch_targets(instructions);
+    target_offsets.extend(exception_table.iter().map(|entry| entry.handler_pc));
+    if instructions.is_empty() || target_offsets.is_empty() {
+        return Ok(Vec::new());
+    }
 
     let name_index = constant_pool.add_utf8("StackMapTable")?;
     let mut previous_instruction_offset: Option<u16> = None;
@@ -262,7 +294,7 @@ pub(super) fn build_stack_map_attributes(
         if target == 0 {
             continue;
         }
-        let Some(state) = states.get(target as usize).and_then(Option::as_ref) else {
+        let Some(state) = analysis.state_at(target as usize) else {
             continue;
         };
         let instruction_delta = match previous_instruction_offset {
@@ -355,23 +387,35 @@ pub(super) fn initialize_locals_loaded_as_top(
     constant_pool: &ConstantPool,
     context: &str,
     exception_table: &mut [ExceptionTableEntry],
-) -> jvm::Result<usize> {
+) -> jvm::Result<(usize, FrameAnalysis)> {
     if instructions.is_empty() {
-        return Ok(0);
+        return Ok((
+            0,
+            FrameAnalysis {
+                block_starts: Vec::new(),
+                entry_states: Vec::new(),
+            },
+        ));
     }
 
-    let states = solve_frame_states(
+    let locals = locals_loaded_before_definite_store(
         instructions,
         initial_locals,
-        local_hints,
         max_locals as usize,
-        constant_pool,
         context,
         exception_table,
     )?;
-    let locals = locals_loaded_as_top(instructions, &states, context)?;
     if locals.is_empty() {
-        return Ok(0);
+        let analysis = solve_frame_states(
+            instructions,
+            initial_locals,
+            local_hints,
+            max_locals as usize,
+            constant_pool,
+            context,
+            exception_table,
+        )?;
+        return Ok((0, analysis));
     }
 
     let mut prefix = Vec::with_capacity(locals.len() * 2);
@@ -387,16 +431,13 @@ pub(super) fn initialize_locals_loaded_as_top(
     instructions.splice(0..0, prefix);
     shift_exception_table(exception_table, prefix_len, context)?;
 
-    let states = solve_frame_states(
+    let remaining = locals_loaded_before_definite_store(
         instructions,
         initial_locals,
-        local_hints,
         max_locals as usize,
-        constant_pool,
         context,
         exception_table,
     )?;
-    let remaining = locals_loaded_as_top(instructions, &states, context)?;
     if !remaining.is_empty() {
         return Err(jvm::Error::VerificationError {
             context: context.to_string(),
@@ -406,7 +447,17 @@ pub(super) fn initialize_locals_loaded_as_top(
         });
     }
 
-    Ok(usize::from(prefix_len))
+    let analysis = solve_frame_states(
+        instructions,
+        initial_locals,
+        local_hints,
+        max_locals as usize,
+        constant_pool,
+        context,
+        exception_table,
+    )?;
+
+    Ok((usize::from(prefix_len), analysis))
 }
 
 fn shift_exception_table(
@@ -439,36 +490,6 @@ fn shift_exception_table(
     Ok(())
 }
 
-fn locals_loaded_as_top(
-    instructions: &[Instruction],
-    states: &[Option<FrameState>],
-    context: &str,
-) -> jvm::Result<BTreeMap<u16, FrameValue>> {
-    let mut locals = BTreeMap::new();
-    for (instruction_index, (instruction, state)) in instructions.iter().zip(states).enumerate() {
-        let Some(state) = state else {
-            continue;
-        };
-        let Some((local, value)) = loaded_local(instruction) else {
-            continue;
-        };
-        if state.locals.get(usize::from(local)) != Some(&FrameValue::Top) {
-            continue;
-        }
-        if let Some(existing) = locals.insert(local, value.clone())
-            && existing != value
-        {
-            return Err(jvm::Error::VerificationError {
-                context: context.to_string(),
-                message: format!(
-                    "Local {local} is loaded with incompatible types {existing:?} and {value:?}; latest load is instruction {instruction_index}"
-                ),
-            });
-        }
-    }
-    Ok(locals)
-}
-
 fn loaded_local(instruction: &Instruction) -> Option<(u16, FrameValue)> {
     use Instruction as I;
 
@@ -479,7 +500,7 @@ fn loaded_local(instruction: &Instruction) -> Option<(u16, FrameValue)> {
         I::Dload(local) => (u16::from(*local), FrameValue::Double),
         I::Aload(local) => (
             u16::from(*local),
-            FrameValue::Object("java/lang/Object".to_string()),
+            FrameValue::Object("java/lang/Object".into()),
         ),
         I::Iload_0 => (0, FrameValue::Integer),
         I::Iload_1 => (1, FrameValue::Integer),
@@ -497,19 +518,262 @@ fn loaded_local(instruction: &Instruction) -> Option<(u16, FrameValue)> {
         I::Dload_1 => (1, FrameValue::Double),
         I::Dload_2 => (2, FrameValue::Double),
         I::Dload_3 => (3, FrameValue::Double),
-        I::Aload_0 => (0, FrameValue::Object("java/lang/Object".to_string())),
-        I::Aload_1 => (1, FrameValue::Object("java/lang/Object".to_string())),
-        I::Aload_2 => (2, FrameValue::Object("java/lang/Object".to_string())),
-        I::Aload_3 => (3, FrameValue::Object("java/lang/Object".to_string())),
+        I::Aload_0 => (0, FrameValue::Object("java/lang/Object".into())),
+        I::Aload_1 => (1, FrameValue::Object("java/lang/Object".into())),
+        I::Aload_2 => (2, FrameValue::Object("java/lang/Object".into())),
+        I::Aload_3 => (3, FrameValue::Object("java/lang/Object".into())),
         I::Iload_w(local) | I::Iinc_w(local, _) => (*local, FrameValue::Integer),
         I::Lload_w(local) => (*local, FrameValue::Long),
         I::Fload_w(local) => (*local, FrameValue::Float),
         I::Dload_w(local) => (*local, FrameValue::Double),
-        I::Aload_w(local) => (*local, FrameValue::Object("java/lang/Object".to_string())),
+        I::Aload_w(local) => (*local, FrameValue::Object("java/lang/Object".into())),
         I::Iinc(local, _) => (u16::from(*local), FrameValue::Integer),
         _ => return None,
     };
     Some((local, value))
+}
+
+fn stored_local(instruction: &Instruction) -> Option<u16> {
+    use Instruction as I;
+
+    Some(match instruction {
+        I::Istore(local)
+        | I::Lstore(local)
+        | I::Fstore(local)
+        | I::Dstore(local)
+        | I::Astore(local) => u16::from(*local),
+        I::Istore_0 | I::Lstore_0 | I::Fstore_0 | I::Dstore_0 | I::Astore_0 => 0,
+        I::Istore_1 | I::Lstore_1 | I::Fstore_1 | I::Dstore_1 | I::Astore_1 => 1,
+        I::Istore_2 | I::Lstore_2 | I::Fstore_2 | I::Dstore_2 | I::Astore_2 => 2,
+        I::Istore_3 | I::Lstore_3 | I::Fstore_3 | I::Dstore_3 | I::Astore_3 => 3,
+        I::Istore_w(local)
+        | I::Lstore_w(local)
+        | I::Fstore_w(local)
+        | I::Dstore_w(local)
+        | I::Astore_w(local)
+        | I::Iinc_w(local, _) => *local,
+        I::Iinc(local, _) => u16::from(*local),
+        _ => return None,
+    })
+}
+
+/// Find locals whose loads are not preceded by a store on every incoming path.
+/// This only needs definite-assignment bits; exact verifier types and operand
+/// stacks are left to the single typed analysis performed after prefixing.
+fn locals_loaded_before_definite_store(
+    instructions: &[Instruction],
+    initial_locals: &[FrameValue],
+    max_locals: usize,
+    context: &str,
+    exception_table: &[ExceptionTableEntry],
+) -> jvm::Result<BTreeMap<u16, FrameValue>> {
+    if instructions.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let (block_starts, block_ends, block_by_instruction) =
+        frame_blocks(instructions, exception_table);
+    let word_count = max_locals.div_ceil(u64::BITS as usize);
+    let mut initial = vec![0u64; word_count];
+    for (slot, value) in initial_locals.iter().enumerate().take(max_locals) {
+        if *value != FrameValue::Top {
+            assignment_insert(&mut initial, slot);
+        }
+    }
+
+    let mut handlers_by_instruction = vec![Vec::new(); instructions.len()];
+    for handler in exception_table {
+        let start = usize::from(handler.range_pc.start).min(instructions.len());
+        let end = usize::from(handler.range_pc.end).min(instructions.len());
+        for handlers in &mut handlers_by_instruction[start..end] {
+            let target = usize::from(handler.handler_pc);
+            if !handlers.contains(&target) {
+                handlers.push(target);
+            }
+        }
+    }
+
+    let mut entries = vec![None; block_starts.len()];
+    let mut block_loads = vec![BTreeMap::new(); block_starts.len()];
+    entries[0] = Some(initial);
+    let mut worklist = VecDeque::from([0usize]);
+    let mut queued = vec![false; block_starts.len()];
+    queued[0] = true;
+    while let Some(block) = worklist.pop_front() {
+        queued[block] = false;
+        let Some(mut assigned) = entries[block].clone() else {
+            continue;
+        };
+        let mut loads = BTreeMap::new();
+        let mut last_handler_assignments = HashMap::<usize, Vec<u64>>::new();
+        for index in block_starts[block]..block_ends[block] {
+            for &target in &handlers_by_instruction[index] {
+                if last_handler_assignments.get(&target) == Some(&assigned) {
+                    continue;
+                }
+                last_handler_assignments.insert(target, assigned.clone());
+                merge_assignment_entry(
+                    target,
+                    &assigned,
+                    &block_starts,
+                    &block_by_instruction,
+                    &mut entries,
+                    &mut worklist,
+                    &mut queued,
+                    context,
+                )?;
+            }
+            if let Some((local, value)) = loaded_local(&instructions[index])
+                && !assignment_contains(&assigned, usize::from(local))
+                && let Some(existing) = loads.insert(local, value.clone())
+                && existing != value
+            {
+                return Err(jvm::Error::VerificationError {
+                    context: context.to_string(),
+                    message: format!(
+                        "Local {local} is loaded with incompatible types {existing:?} and {value:?}; latest load is instruction {index}"
+                    ),
+                });
+            }
+            if let Some(local) = stored_local(&instructions[index]) {
+                assignment_insert(&mut assigned, usize::from(local));
+            }
+        }
+        let last = block_ends[block] - 1;
+        for target in assignment_successors(last, &instructions[last], context)? {
+            if target < instructions.len() {
+                merge_assignment_entry(
+                    target,
+                    &assigned,
+                    &block_starts,
+                    &block_by_instruction,
+                    &mut entries,
+                    &mut worklist,
+                    &mut queued,
+                    context,
+                )?;
+            }
+        }
+        block_loads[block] = loads;
+    }
+
+    let mut loads = BTreeMap::new();
+    for local_loads in block_loads {
+        for (local, value) in local_loads {
+            if let Some(existing) = loads.insert(local, value.clone())
+                && existing != value
+            {
+                return Err(jvm::Error::VerificationError {
+                    context: context.to_string(),
+                    message: format!(
+                        "Local {local} is loaded with incompatible types {existing:?} and {value:?}"
+                    ),
+                });
+            }
+        }
+    }
+    Ok(loads)
+}
+
+fn assignment_contains(assignments: &[u64], local: usize) -> bool {
+    assignments
+        .get(local / u64::BITS as usize)
+        .is_some_and(|word| word & (1 << (local % u64::BITS as usize)) != 0)
+}
+
+fn assignment_insert(assignments: &mut [u64], local: usize) {
+    if let Some(word) = assignments.get_mut(local / u64::BITS as usize) {
+        *word |= 1 << (local % u64::BITS as usize);
+    }
+}
+
+fn merge_assignment_entry(
+    target: usize,
+    incoming: &[u64],
+    block_starts: &[usize],
+    block_by_instruction: &[usize],
+    entries: &mut [Option<Vec<u64>>],
+    worklist: &mut VecDeque<usize>,
+    queued: &mut [bool],
+    context: &str,
+) -> jvm::Result<()> {
+    let Some(&block) = block_by_instruction.get(target) else {
+        return Ok(());
+    };
+    if block_starts[block] != target {
+        return Err(jvm::Error::VerificationError {
+            context: context.to_string(),
+            message: format!("Control flow targets the middle of bytecode block at {target}"),
+        });
+    }
+    let changed = match &mut entries[block] {
+        Some(existing) => {
+            let previous = existing.clone();
+            for (word, incoming) in existing.iter_mut().zip(incoming) {
+                *word &= incoming;
+            }
+            *existing != previous
+        }
+        slot @ None => {
+            *slot = Some(incoming.to_vec());
+            true
+        }
+    };
+    if changed && !queued[block] {
+        queued[block] = true;
+        worklist.push_back(block);
+    }
+    Ok(())
+}
+
+fn assignment_successors(
+    index: usize,
+    instruction: &Instruction,
+    context: &str,
+) -> jvm::Result<Vec<usize>> {
+    use Instruction as I;
+
+    let fallthrough = || vec![index + 1];
+    Ok(match instruction {
+        I::Ifeq(target)
+        | I::Ifne(target)
+        | I::Iflt(target)
+        | I::Ifge(target)
+        | I::Ifgt(target)
+        | I::Ifle(target)
+        | I::If_icmpeq(target)
+        | I::If_icmpne(target)
+        | I::If_icmplt(target)
+        | I::If_icmpge(target)
+        | I::If_icmpgt(target)
+        | I::If_icmple(target)
+        | I::If_acmpeq(target)
+        | I::If_acmpne(target)
+        | I::Ifnull(target)
+        | I::Ifnonnull(target) => vec![usize::from(*target), index + 1],
+        I::Goto(target) | I::Jsr(target) => vec![usize::from(*target)],
+        I::Goto_w(target) | I::Jsr_w(target) => usize::try_from(*target)
+            .ok()
+            .map(|target| vec![target])
+            .unwrap_or_default(),
+        I::Tableswitch(table) => std::iter::once(table.default)
+            .chain(table.offsets.iter().copied())
+            .map(|offset| relative_switch_target(index, offset, context))
+            .collect::<jvm::Result<Vec<_>>>()?,
+        I::Lookupswitch(table) => std::iter::once(table.default)
+            .chain(table.pairs.iter().map(|(_, offset)| *offset))
+            .map(|offset| relative_switch_target(index, offset, context))
+            .collect::<jvm::Result<Vec<_>>>()?,
+        I::Ret(_)
+        | I::Ret_w(_)
+        | I::Ireturn
+        | I::Lreturn
+        | I::Freturn
+        | I::Dreturn
+        | I::Areturn
+        | I::Return
+        | I::Athrow => Vec::new(),
+        _ => fallthrough(),
+    })
 }
 
 fn default_local_initializer(local: u16, value: &FrameValue) -> [Instruction; 2] {
@@ -611,76 +875,237 @@ fn solve_frame_states(
     constant_pool: &ConstantPool,
     context: &str,
     exception_table: &[ExceptionTableEntry],
-) -> jvm::Result<Vec<Option<FrameState>>> {
-    let mut states = vec![None; instructions.len()];
-    states[0] = Some(FrameState::new(initial_locals.to_vec(), max_locals));
-    let mut worklist = VecDeque::from([0usize]);
-    while let Some(index) = worklist.pop_front() {
-        let Some(input_state) = states[index].clone() else {
-            continue;
-        };
-        let successors = transfer_instruction(
-            index,
-            &instructions[index],
-            input_state.clone(),
-            local_hints,
-            constant_pool,
-            context,
-        )
-        .map_err(|error| jvm::Error::VerificationError {
-            context: context.to_string(),
-            message: format!(
-                "Stack-map transfer failed at instruction {index} ({}) with input stack {:?} and locals {:?}: {error:?}\nInstruction window:\n{}",
-                describe_instruction(&instructions[index], constant_pool),
-                input_state.stack,
-                input_state.locals,
-                instruction_window(instructions, index, constant_pool),
-            ),
-        })?;
+) -> jvm::Result<FrameAnalysis> {
+    if instructions.is_empty() {
+        return Ok(FrameAnalysis {
+            block_starts: Vec::new(),
+            entry_states: Vec::new(),
+        });
+    }
 
-        for (target, successor_state) in successors {
-            if target >= instructions.len() {
-                continue;
-            }
-            let changed = match &mut states[target] {
-                Some(existing) => merge_state(existing, &successor_state),
-                slot @ None => {
-                    *slot = Some(successor_state);
-                    true
-                }
-            };
-            if changed && !worklist.contains(&target) {
-                worklist.push_back(target);
-            }
-        }
-
-        for handler in exception_table
-            .iter()
-            .filter(|handler| handler.range_pc.contains(&(index as u16)))
-        {
+    let (block_starts, block_ends, block_by_instruction) =
+        frame_blocks(instructions, exception_table);
+    let mut handlers_by_instruction = vec![Vec::new(); instructions.len()];
+    for handler in exception_table {
+        let start = usize::from(handler.range_pc.start).min(instructions.len());
+        let end = usize::from(handler.range_pc.end).min(instructions.len());
+        for handlers in &mut handlers_by_instruction[start..end] {
             let target = usize::from(handler.handler_pc);
-            if target >= instructions.len() {
-                continue;
-            }
-            let mut handler_state = input_state.clone();
-            handler_state.stack.clear();
-            handler_state
-                .stack
-                .push(FrameValue::Object("java/lang/Throwable".to_string()));
-            let changed = match &mut states[target] {
-                Some(existing) => merge_state(existing, &handler_state),
-                slot @ None => {
-                    *slot = Some(handler_state);
-                    true
-                }
-            };
-            if changed && !worklist.contains(&target) {
-                worklist.push_back(target);
+            if !handlers.contains(&target) {
+                handlers.push(target);
             }
         }
     }
 
-    Ok(states)
+    let mut entry_states = vec![None; block_starts.len()];
+    entry_states[0] = Some(FrameState::new(initial_locals.to_vec(), max_locals));
+    let mut worklist = VecDeque::from([0usize]);
+    let mut queued = vec![false; block_starts.len()];
+    queued[0] = true;
+    while let Some(block) = worklist.pop_front() {
+        queued[block] = false;
+        let Some(mut state) = entry_states[block].clone() else {
+            continue;
+        };
+
+        let mut last_handler_locals = HashMap::<usize, Arc<Vec<FrameValue>>>::new();
+        for index in block_starts[block]..block_ends[block] {
+            for &target in &handlers_by_instruction[index] {
+                let unchanged = last_handler_locals
+                    .get(&target)
+                    .is_some_and(|locals| **locals == *state.locals);
+                if unchanged || target >= instructions.len() {
+                    continue;
+                }
+                last_handler_locals.insert(target, Arc::clone(&state.locals));
+                let mut handler_state = state.clone();
+                handler_state.stack.clear();
+                handler_state
+                    .stack
+                    .push(FrameValue::Object("java/lang/Throwable".into()));
+                merge_block_entry(
+                    target,
+                    handler_state,
+                    &block_starts,
+                    &block_by_instruction,
+                    &mut entry_states,
+                    &mut worklist,
+                    &mut queued,
+                    context,
+                )?;
+            }
+
+            let mut successors = transfer_instruction(
+                index,
+                &instructions[index],
+                state,
+                local_hints,
+                constant_pool,
+                context,
+            )
+            .map_err(|error| jvm::Error::VerificationError {
+                context: context.to_string(),
+                message: format!(
+                    "Stack-map transfer failed at instruction {index} ({}): {error:?}\nInstruction window:\n{}",
+                    describe_instruction(&instructions[index], constant_pool),
+                    instruction_window(instructions, index, constant_pool),
+                ),
+            })?;
+
+            if index + 1 < block_ends[block] {
+                let Some(position) = successors
+                    .iter()
+                    .position(|(target, _)| *target == index + 1)
+                else {
+                    return Err(jvm::Error::VerificationError {
+                        context: context.to_string(),
+                        message: format!(
+                            "Bytecode block ended unexpectedly after instruction {index}"
+                        ),
+                    });
+                };
+                state = successors.swap_remove(position).1;
+                if !successors.is_empty() {
+                    return Err(jvm::Error::VerificationError {
+                        context: context.to_string(),
+                        message: format!(
+                            "Bytecode block contains an internal branch at instruction {index}"
+                        ),
+                    });
+                }
+            } else {
+                for (target, successor_state) in successors {
+                    if target >= instructions.len() {
+                        continue;
+                    }
+                    merge_block_entry(
+                        target,
+                        successor_state,
+                        &block_starts,
+                        &block_by_instruction,
+                        &mut entry_states,
+                        &mut worklist,
+                        &mut queued,
+                        context,
+                    )?;
+                }
+                break;
+            }
+        }
+    }
+
+    Ok(FrameAnalysis {
+        block_starts,
+        entry_states,
+    })
+}
+
+fn frame_blocks(
+    instructions: &[Instruction],
+    exception_table: &[ExceptionTableEntry],
+) -> (Vec<usize>, Vec<usize>, Vec<usize>) {
+    let mut starts = BTreeSet::from([0usize]);
+    for target in branch_targets(instructions) {
+        if usize::from(target) < instructions.len() {
+            starts.insert(usize::from(target));
+        }
+    }
+    for entry in exception_table {
+        for boundary in [entry.range_pc.start, entry.range_pc.end, entry.handler_pc] {
+            if usize::from(boundary) < instructions.len() {
+                starts.insert(usize::from(boundary));
+            }
+        }
+    }
+    for (index, instruction) in instructions.iter().enumerate() {
+        if instruction_ends_block(instruction) && index + 1 < instructions.len() {
+            starts.insert(index + 1);
+        }
+    }
+
+    let block_starts = starts.into_iter().collect::<Vec<_>>();
+    let block_ends = block_starts
+        .iter()
+        .copied()
+        .skip(1)
+        .chain(std::iter::once(instructions.len()))
+        .collect::<Vec<_>>();
+    let mut block_by_instruction = vec![0usize; instructions.len()];
+    for (block, (&start, &end)) in block_starts.iter().zip(&block_ends).enumerate() {
+        block_by_instruction[start..end].fill(block);
+    }
+    (block_starts, block_ends, block_by_instruction)
+}
+
+fn instruction_ends_block(instruction: &Instruction) -> bool {
+    use Instruction as I;
+    matches!(
+        instruction,
+        I::Ifeq(_)
+            | I::Ifne(_)
+            | I::Iflt(_)
+            | I::Ifge(_)
+            | I::Ifgt(_)
+            | I::Ifle(_)
+            | I::If_icmpeq(_)
+            | I::If_icmpne(_)
+            | I::If_icmplt(_)
+            | I::If_icmpge(_)
+            | I::If_icmpgt(_)
+            | I::If_icmple(_)
+            | I::If_acmpeq(_)
+            | I::If_acmpne(_)
+            | I::Ifnull(_)
+            | I::Ifnonnull(_)
+            | I::Goto(_)
+            | I::Goto_w(_)
+            | I::Tableswitch(_)
+            | I::Lookupswitch(_)
+            | I::Jsr(_)
+            | I::Jsr_w(_)
+            | I::Ret(_)
+            | I::Ret_w(_)
+            | I::Ireturn
+            | I::Lreturn
+            | I::Freturn
+            | I::Dreturn
+            | I::Areturn
+            | I::Return
+            | I::Athrow
+    )
+}
+
+fn merge_block_entry(
+    target: usize,
+    incoming: FrameState,
+    block_starts: &[usize],
+    block_by_instruction: &[usize],
+    entry_states: &mut [Option<FrameState>],
+    worklist: &mut VecDeque<usize>,
+    queued: &mut [bool],
+    context: &str,
+) -> jvm::Result<()> {
+    let Some(&block) = block_by_instruction.get(target) else {
+        return Ok(());
+    };
+    if block_starts[block] != target {
+        return Err(jvm::Error::VerificationError {
+            context: context.to_string(),
+            message: format!("Control flow targets the middle of bytecode block at {target}"),
+        });
+    }
+    let changed = match &mut entry_states[block] {
+        Some(existing) => merge_state(existing, &incoming),
+        slot @ None => {
+            *slot = Some(incoming);
+            true
+        }
+    };
+    if changed && !queued[block] {
+        queued[block] = true;
+        worklist.push_back(block);
+    }
+    Ok(())
 }
 
 fn describe_instruction(instruction: &Instruction, constant_pool: &ConstantPool) -> String {
@@ -1195,9 +1620,9 @@ fn transfer_instruction(
         }
         I::Newarray(array_type) => {
             state.pop(context, instruction_index)?;
-            state
-                .stack
-                .push(FrameValue::Object(array_descriptor_from_type(array_type)));
+            state.stack.push(FrameValue::Object(
+                array_descriptor_from_type(array_type).into(),
+            ));
         }
         I::Anewarray(class_index) => {
             state.pop(context, instruction_index)?;
@@ -1207,7 +1632,7 @@ fn transfer_instruction(
             } else {
                 format!("[L{};", normalize_class_name(&class_name))
             };
-            state.stack.push(FrameValue::Object(array_name));
+            state.stack.push(FrameValue::Object(array_name.into()));
         }
         I::Arraylength => {
             state.pop_reference(context, instruction_index)?;
@@ -1222,7 +1647,7 @@ fn transfer_instruction(
             let class_name = constant_pool.try_get_class(*class_index)?.to_string();
             state
                 .stack
-                .push(FrameValue::Object(normalize_class_name(&class_name)));
+                .push(FrameValue::Object(normalize_class_name(&class_name).into()));
         }
         I::Instanceof(_) => {
             state.pop_reference(context, instruction_index)?;
@@ -1238,7 +1663,7 @@ fn transfer_instruction(
             let class_name = constant_pool.try_get_class(*class_index)?.to_string();
             state
                 .stack
-                .push(FrameValue::Object(normalize_class_name(&class_name)));
+                .push(FrameValue::Object(normalize_class_name(&class_name).into()));
         }
         I::Wide | I::Breakpoint | I::Impdep1 | I::Impdep2 => {}
     }
@@ -1384,12 +1809,13 @@ fn merge_state(existing: &mut FrameState, incoming: &FrameState) -> bool {
     let mut changed = false;
 
     let local_len = existing.locals.len().max(incoming.locals.len());
-    existing.locals.resize(local_len, FrameValue::Top);
+    let locals = Arc::make_mut(&mut existing.locals);
+    locals.resize(local_len, FrameValue::Top);
     for index in 0..local_len {
         let incoming_value = incoming.locals.get(index).unwrap_or(&FrameValue::Top);
-        let merged = merge_value(&existing.locals[index], incoming_value);
-        if existing.locals[index] != merged {
-            existing.locals[index] = merged;
+        let merged = merge_value(&locals[index], incoming_value);
+        if locals[index] != merged {
+            locals[index] = merged;
             changed = true;
         }
     }
@@ -1422,7 +1848,7 @@ fn merge_value(a: &FrameValue, b: &FrameValue) -> FrameValue {
         }
         (FrameValue::Null, FrameValue::Null) => FrameValue::Null,
         (FrameValue::Object(a_class), FrameValue::Object(b_class)) => {
-            FrameValue::Object(common_object_class(a_class, b_class))
+            FrameValue::Object(common_object_class(a_class, b_class).into())
         }
         _ => FrameValue::Top,
     }
@@ -1574,7 +2000,7 @@ fn load_hint_for_instruction(instruction: &Instruction) -> FrameValue {
         | Instruction::Aload_1
         | Instruction::Aload_2
         | Instruction::Aload_3
-        | Instruction::Aload_w(_) => FrameValue::Object("java/lang/Object".to_string()),
+        | Instruction::Aload_w(_) => FrameValue::Object("java/lang/Object".into()),
         _ => FrameValue::Top,
     }
 }
@@ -1594,16 +2020,20 @@ fn frame_value_from_oomir_type(ty: &Type) -> FrameValue {
         Type::I64 | Type::U64 => FrameValue::Long,
         Type::F32 => FrameValue::Float,
         Type::F64 => FrameValue::Double,
-        Type::Str => FrameValue::Object(oomir::UTF8_VIEW_CLASS.to_string()),
-        Type::Class(name) | Type::Interface(name) => FrameValue::Object(normalize_class_name(name)),
-        Type::Array(_) | Type::MutableReference(_) => FrameValue::Object(ty.to_jvm_descriptor()),
-        Type::Pointer(_) => FrameValue::Object(oomir::POINTER_CLASS.to_string()),
-        Type::Slice(_) => FrameValue::Object(oomir::SLICE_VIEW_CLASS.to_string()),
+        Type::Str => FrameValue::Object(oomir::UTF8_VIEW_CLASS.into()),
+        Type::Class(name) | Type::Interface(name) => {
+            FrameValue::Object(normalize_class_name(name).into())
+        }
+        Type::Array(_) | Type::MutableReference(_) => {
+            FrameValue::Object(ty.to_jvm_descriptor().into())
+        }
+        Type::Pointer(_) => FrameValue::Object(oomir::POINTER_CLASS.into()),
+        Type::Slice(_) => FrameValue::Object(oomir::SLICE_VIEW_CLASS.into()),
         Type::Reference(inner) => {
             if inner.is_jvm_reference_type() {
                 frame_value_from_oomir_type(inner)
             } else {
-                FrameValue::Object("java/lang/Object".to_string())
+                FrameValue::Object("java/lang/Object".into())
             }
         }
     }
@@ -1616,9 +2046,9 @@ fn frame_value_from_field_type(field_type: &FieldType) -> FrameValue {
         FieldType::Base(BaseType::Double) => FrameValue::Double,
         FieldType::Base(_) => FrameValue::Integer,
         FieldType::Object(class_name) => {
-            FrameValue::Object(normalize_class_name(&class_name.to_string()))
+            FrameValue::Object(normalize_class_name(&class_name.to_string()).into())
         }
-        FieldType::Array(_) => FrameValue::Object(field_type.class_name()),
+        FieldType::Array(_) => FrameValue::Object(field_type.class_name().into()),
     }
 }
 
@@ -1626,13 +2056,11 @@ fn frame_value_from_ldc(constant_pool: &ConstantPool, index: u16) -> jvm::Result
     let value = match constant_pool.try_get(index)? {
         Constant::Integer(_) => FrameValue::Integer,
         Constant::Float(_) => FrameValue::Float,
-        Constant::String(_) => FrameValue::Object("java/lang/String".to_string()),
-        Constant::Class(_) => FrameValue::Object("java/lang/Class".to_string()),
-        Constant::MethodType(_) => FrameValue::Object("java/lang/invoke/MethodType".to_string()),
-        Constant::MethodHandle { .. } => {
-            FrameValue::Object("java/lang/invoke/MethodHandle".to_string())
-        }
-        Constant::Dynamic { .. } => FrameValue::Object("java/lang/Object".to_string()),
+        Constant::String(_) => FrameValue::Object("java/lang/String".into()),
+        Constant::Class(_) => FrameValue::Object("java/lang/Class".into()),
+        Constant::MethodType(_) => FrameValue::Object("java/lang/invoke/MethodType".into()),
+        Constant::MethodHandle { .. } => FrameValue::Object("java/lang/invoke/MethodHandle".into()),
+        Constant::Dynamic { .. } => FrameValue::Object("java/lang/Object".into()),
         _ => FrameValue::Top,
     };
     Ok(value)
@@ -1780,11 +2208,11 @@ fn to_verification_type(
         FrameValue::Double => VerificationType::Double,
         FrameValue::Null => VerificationType::Null,
         FrameValue::Object(class_name) => {
-            let cpool_index = match verification_class_cache.get(class_name) {
+            let cpool_index = match verification_class_cache.get(class_name.as_ref()) {
                 Some(cpool_index) => *cpool_index,
                 None => {
                     let cpool_index = constant_pool.add_class(class_name)?;
-                    verification_class_cache.insert(class_name.clone(), cpool_index);
+                    verification_class_cache.insert(class_name.to_string(), cpool_index);
                     cpool_index
                 }
             };
@@ -1797,13 +2225,13 @@ fn to_verification_type(
 
 fn array_component_value(array: &FrameValue) -> FrameValue {
     let FrameValue::Object(class_name) = array else {
-        return FrameValue::Object("java/lang/Object".to_string());
+        return FrameValue::Object("java/lang/Object".into());
     };
     let Some(component_descriptor) = class_name.strip_prefix('[') else {
-        return FrameValue::Object("java/lang/Object".to_string());
+        return FrameValue::Object("java/lang/Object".into());
     };
     if component_descriptor.starts_with('[') {
-        return FrameValue::Object(component_descriptor.to_string());
+        return FrameValue::Object(component_descriptor.into());
     }
     if component_descriptor.starts_with('L') && component_descriptor.ends_with(';') {
         return FrameValue::Object(component_descriptor[1..component_descriptor.len() - 1].into());
@@ -1813,7 +2241,7 @@ fn array_component_value(array: &FrameValue) -> FrameValue {
         Some('F') => FrameValue::Float,
         Some('D') => FrameValue::Double,
         Some('Z' | 'B' | 'C' | 'S' | 'I') => FrameValue::Integer,
-        _ => FrameValue::Object("java/lang/Object".to_string()),
+        _ => FrameValue::Object("java/lang/Object".into()),
     }
 }
 
@@ -1892,5 +2320,40 @@ mod tests {
             ),
             StackFrame::FullFrame { .. }
         ));
+    }
+
+    #[test]
+    fn definite_assignment_finds_control_flow_guarded_loads() {
+        let instructions = vec![
+            Instruction::Iconst_0,
+            Instruction::Ifeq(4),
+            Instruction::Iconst_1,
+            Instruction::Istore_1,
+            Instruction::Iload_1,
+            Instruction::Pop,
+            Instruction::Return,
+        ];
+        let loads =
+            locals_loaded_before_definite_store(&instructions, &[], 2, "test", &[]).unwrap();
+        assert_eq!(loads, BTreeMap::from([(1, FrameValue::Integer)]));
+    }
+
+    #[test]
+    fn definite_assignment_accepts_a_store_on_every_path() {
+        let instructions = vec![
+            Instruction::Iconst_0,
+            Instruction::Ifeq(5),
+            Instruction::Iconst_1,
+            Instruction::Istore_1,
+            Instruction::Goto(7),
+            Instruction::Iconst_0,
+            Instruction::Istore_1,
+            Instruction::Iload_1,
+            Instruction::Pop,
+            Instruction::Return,
+        ];
+        let loads =
+            locals_loaded_before_definite_store(&instructions, &[], 2, "test", &[]).unwrap();
+        assert!(loads.is_empty());
     }
 }

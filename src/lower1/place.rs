@@ -342,6 +342,41 @@ pub fn emit_pointer_slice_parts(
     )
 }
 
+/// Gives a raw slice data pointer the element view used by `SliceView` accessors.
+/// This matters when MIR constructs a fat pointer from an erased or whole-array
+/// view: the backing `Pointer` must advance and load one Rust element at a time.
+pub fn emit_retyped_slice_data_pointer(
+    data: Operand,
+    element_size: Operand,
+    element_codec: Operand,
+    dest_prefix: &str,
+    instructions: &mut Vec<Instruction>,
+) -> Operand {
+    let data_ty = data
+        .get_type()
+        .expect("slice data pointer must have an OOMIR type");
+    let dest = format!("{dest_prefix}_element_pointer");
+    instructions.push(Instruction::InvokeStatic {
+        dest: Some(dest.clone()),
+        class_name: oomir::POINTER_CLASS.to_string(),
+        method_name: "retype".to_string(),
+        method_ty: oomir::Signature {
+            params: vec![
+                ("pointer".to_string(), data_ty.clone()),
+                ("view_size".to_string(), oomir::Type::U64),
+                ("view_codec".to_string(), oomir::Type::java_string()),
+            ],
+            ret: Box::new(data_ty.clone()),
+            is_static: true,
+        },
+        args: vec![data, element_size, element_codec],
+    });
+    Operand::Variable {
+        name: dest,
+        ty: data_ty,
+    }
+}
+
 pub fn place_to_string<'tcx>(place: &Place<'tcx>, _tcx: TyCtxt<'tcx>) -> String {
     // Base variable name (e.g., "_1")
     format!("_{}", place.local.index()) // Start with base local "_N"
@@ -1001,8 +1036,18 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
                 // Create a temporary name for the result of this field access.
                 let next_var = format!("{}_{}", current_var, field_index.index());
                 let obj_type = current_type.clone();
-                // Update the type to the field’s type.
-                current_type = ty_to_oomir_type(field_ty, tcx, data_types, instance);
+                // The class declaration is the source of truth for the JVM field
+                // descriptor. A projected Rust field can carry a reference type
+                // that is semantically equivalent but uses another JVM carrier
+                // (notably &[T; N] as SliceView versus *const [T; N] as Pointer).
+                let projected_type = ty_to_oomir_type(field_ty, tcx, data_types, instance);
+                current_type = match data_types.get(&owner_class_name) {
+                    Some(oomir::DataType::Class { fields, .. }) => fields
+                        .iter()
+                        .find_map(|(name, ty)| (name == &field_name).then(|| ty.clone()))
+                        .unwrap_or(projected_type),
+                    _ => projected_type,
+                };
                 instructions.push(oomir::Instruction::GetField {
                     dest: next_var.clone(),
                     object: Operand::Variable {

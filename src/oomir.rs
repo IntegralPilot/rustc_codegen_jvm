@@ -595,6 +595,16 @@ pub enum Constant {
         view_codec: Option<String>,
         pointee: Box<Type>,
     },
+    /// A pointer to a fully materialized anonymous CTFE allocation. Repeated
+    /// loads use `identity` to retain Rust allocation identity on the JVM.
+    InternedPointer {
+        identity: String,
+        value: Box<Constant>,
+        view_size: u64,
+        alignment: u64,
+        view_codec: Box<Constant>,
+        pointee: Box<Type>,
+    },
     /// A typed JVM null. The type is needed when null appears in a constructor
     /// argument list, because constructor descriptors are exact.
     Null(Type),
@@ -646,6 +656,7 @@ impl Constant {
             Constant::StaticRef { .. }
             | Constant::FactoryCall { .. }
             | Constant::StaticCall { .. }
+            | Constant::InternedPointer { .. }
             | Constant::Str(..)
             | Constant::Slice(..)
             | Constant::SliceRef { .. } => false,
@@ -724,6 +735,21 @@ impl std::hash::Hash for Constant {
                 byte.hash(state);
                 length.hash(state);
                 offset.hash(state);
+                view_size.hash(state);
+                alignment.hash(state);
+                view_codec.hash(state);
+                pointee.hash(state);
+            }
+            Constant::InternedPointer {
+                identity,
+                value,
+                view_size,
+                alignment,
+                view_codec,
+                pointee,
+            } => {
+                identity.hash(state);
+                value.hash(state);
                 view_size.hash(state);
                 alignment.hash(state);
                 view_codec.hash(state);
@@ -1104,6 +1130,7 @@ impl Type {
             Constant::StaticCall { ty, .. } => ty.clone(),
             Constant::PointerAddress { pointee, .. } => Type::Pointer(pointee.clone()),
             Constant::RepeatedBytePointer { pointee, .. } => Type::Pointer(pointee.clone()),
+            Constant::InternedPointer { pointee, .. } => Type::Pointer(pointee.clone()),
             Constant::Null(ty) => ty.clone(),
             Constant::I8(_) => Type::I8,
             Constant::U8(_) => Type::U8,

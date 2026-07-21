@@ -636,6 +636,84 @@ fn adapt_mutable_reference_carrier<'tcx>(
         return source;
     }
 
+    if matches!(source.get_type(), Some(oomir::Type::Pointer(_)))
+        && let oomir::Type::Slice(element_ty) = target_jvm_ty
+        && let TyKind::Ref(_, pointee_ty, _) = target_rust_ty.kind()
+        && let TyKind::Array(array_element_ty, length) = pointee_ty.kind()
+        && let Some(length) = length.try_to_target_usize(tcx)
+    {
+        let source_ty = source
+            .get_type()
+            .expect("fixed-array reference pointer is typed");
+        let element_pointer_ty = oomir::Type::Pointer(element_ty.clone());
+        let pointer_name = format!("{temp_prefix}_array_ref_element_pointer");
+        instructions.push(oomir::Instruction::InvokeVirtual {
+            dest: Some(pointer_name.clone()),
+            class_name: oomir::POINTER_CLASS.to_string(),
+            method_name: "retype".to_string(),
+            method_ty: oomir::Signature {
+                params: vec![
+                    ("self".to_string(), source_ty),
+                    ("view_size".to_string(), oomir::Type::U64),
+                    ("view_codec".to_string(), oomir::Type::java_string()),
+                ],
+                ret: Box::new(element_pointer_ty.clone()),
+                is_static: false,
+            },
+            args: vec![
+                oomir::Operand::Constant(oomir::Constant::U64(
+                    u64::try_from(
+                        super::types::layout_size_bytes(
+                            tcx,
+                            resolved_ty(*array_element_ty, tcx, instance),
+                        )
+                        .expect("fixed-array element must have a layout"),
+                    )
+                    .expect("Rust array element layout exceeds u64"),
+                )),
+                super::types::pointer_view_codec_operand(
+                    resolved_ty(*array_element_ty, tcx, instance),
+                    tcx,
+                    data_types,
+                    instance,
+                ),
+            ],
+            operand: source,
+        });
+        let object_name = format!("{temp_prefix}_array_ref_view_object");
+        instructions.push(oomir::Instruction::ConstructObject {
+            dest: object_name.clone(),
+            class_name: oomir::SLICE_VIEW_CLASS.to_string(),
+            args: vec![
+                (
+                    operand_var(pointer_name, element_pointer_ty),
+                    oomir::Type::Class("java/lang/Object".to_string()),
+                ),
+                (
+                    oomir::Operand::Constant(oomir::Constant::I32(0)),
+                    oomir::Type::I32,
+                ),
+                (
+                    oomir::Operand::Constant(oomir::Constant::I32(
+                        i32::try_from(length).expect("Rust array length exceeds JVM slice limits"),
+                    )),
+                    oomir::Type::I32,
+                ),
+            ],
+        });
+        let dest = format!("{temp_prefix}_array_ref_view");
+        let slice_ty = oomir::Type::Slice(element_ty.clone());
+        instructions.push(oomir::Instruction::Cast {
+            dest: dest.clone(),
+            op: operand_var(
+                object_name,
+                oomir::Type::Class(oomir::SLICE_VIEW_CLASS.to_string()),
+            ),
+            ty: slice_ty.clone(),
+        });
+        return operand_var(dest, slice_ty);
+    }
+
     if matches!(source.get_type(), Some(oomir::Type::Slice(_)))
         && matches!(target_jvm_ty, oomir::Type::Pointer(_))
     {

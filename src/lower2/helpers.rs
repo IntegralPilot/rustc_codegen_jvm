@@ -31,6 +31,7 @@ fn constant_load_stack_floor(constant: &oomir::Constant) -> u16 {
         }
         Constant::SliceRef { backing, .. } => (2 + constant_load_stack_floor(backing)).max(4),
         Constant::RepeatedBytePointer { .. } => 10,
+        Constant::InternedPointer { value, .. } => (3 + constant_load_stack_floor(value)).max(8),
         Constant::Instance { params, .. } => {
             let mut stack = 2;
             let mut peak = stack;

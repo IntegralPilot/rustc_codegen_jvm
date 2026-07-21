@@ -208,6 +208,46 @@ pub fn load_constant(
             )?;
             instructions_to_add.push(JI::Invokestatic(factory));
         }
+        OC::InternedPointer {
+            identity,
+            value,
+            view_size,
+            alignment,
+            view_codec,
+            ..
+        } => {
+            let identity_index = cp.add_string(identity)?;
+            instructions_to_add.push(if let Ok(index) = u8::try_from(identity_index) {
+                JI::Ldc(index)
+            } else {
+                JI::Ldc_w(identity_index)
+            });
+            load_constant(&mut instructions_to_add, cp, value)?;
+            let value_ty = Type::from_constant(value);
+            if !value_ty.has_jvm_value() {
+                instructions_to_add.push(JI::Aconst_null);
+            } else if value_ty != Type::Class("java/lang/Object".to_string()) {
+                instructions_to_add.extend(get_cast_instructions(
+                    "interned constant allocation",
+                    &value_ty,
+                    &Type::Class("java/lang/Object".to_string()),
+                    cp,
+                )?);
+            }
+            instructions_to_add.push(get_long_const_instr(cp, *view_size as i64));
+            load_constant(&mut instructions_to_add, cp, view_codec)?;
+            instructions_to_add.push(get_long_const_instr(cp, *alignment as i64));
+            let pointer_class = cp.add_class(oomir::POINTER_CLASS)?;
+            let factory = cp.add_method_ref(
+                pointer_class,
+                "constantCell",
+                &format!(
+                    "(Ljava/lang/String;Ljava/lang/Object;JLjava/lang/String;J)L{};",
+                    oomir::POINTER_CLASS
+                ),
+            )?;
+            instructions_to_add.push(JI::Invokestatic(factory));
+        }
         OC::I8(v) => instructions_to_add.push(get_int_const_instr(cp, *v as i32)),
         OC::U8(v) => instructions_to_add.push(get_int_const_instr(cp, i32::from(*v as i8))),
         OC::I16(v) => instructions_to_add.push(get_int_const_instr(cp, *v as i32)),

@@ -5,14 +5,27 @@ use rustc_abi::{FieldIdx, TagEncoding, VariantIdx, Variants};
 use rustc_middle::ty::layout::TyAndLayout;
 use rustc_middle::ty::print::{with_no_trimmed_paths, with_resolve_crate_name};
 use rustc_middle::ty::{
-    AdtDef, EarlyBinder, ExistentialPredicate, FloatTy, GenericArgsRef, IntTy, Ty, TyCtxt, TyKind,
-    TypeVisitableExt, TypingEnv, UintTy,
+    AdtDef, EarlyBinder, ExistentialPredicate, FloatTy, GenericArgsRef, IntTy, Region, Ty, TyCtxt,
+    TyKind, TypeFoldable, TypeFolder, TypeVisitableExt, TypingEnv, UintTy,
 };
 use rustc_span::{def_id::DefId, sym};
 use std::{
+    cell::RefCell,
     collections::{HashMap, HashSet},
     sync::{LazyLock, Mutex},
 };
+
+thread_local! {
+    /// Type definitions live in one OOMIR shard, so cached mappings must have
+    /// exactly the same lifetime. `Ty` values are interned for the compilation;
+    /// their `TyKind` address is therefore an exact, compact identity key.
+    static TYPE_LOWERING_CACHE: RefCell<HashMap<(usize, usize), oomir::Type>> =
+        RefCell::new(HashMap::new());
+}
+
+pub(crate) fn reset_type_lowering_cache() {
+    TYPE_LOWERING_CACHE.with(|cache| cache.borrow_mut().clear());
+}
 
 pub const UNION_BYTES_FIELD: &str = "_bytes";
 pub const UNION_OBJECTS_FIELD: &str = "_objects";
@@ -573,10 +586,12 @@ fn enum_variant_drop_glue_function<'tcx>(
             oomir::Operand::Constant(oomir::Constant::Unit)
         };
 
-        let drop_field_ty = tcx.erase_and_anonymize_regions(field_ty);
-        if !drop_field_ty.has_escaping_bound_vars()
-            && drop_field_ty.needs_drop(tcx, TypingEnv::fully_monomorphized())
-        {
+        // Enum data types can first be discovered below a higher-ranked
+        // function, leaving otherwise irrelevant bound lifetimes in a payload
+        // type. `needs_drop` cannot query a type with escaping bound vars, but
+        // lifetimes do not affect either JVM representation or drop glue.
+        let drop_field_ty = erase_all_regions(tcx, field_ty);
+        if drop_field_ty.needs_drop(tcx, TypingEnv::fully_monomorphized()) {
             super::control_flow::emit_rust_drop_value(
                 drop_field_ty,
                 field_value,
@@ -610,6 +625,24 @@ fn enum_variant_drop_glue_function<'tcx>(
             )]),
         },
     }
+}
+
+struct AllRegionEraser<'tcx> {
+    tcx: TyCtxt<'tcx>,
+}
+
+impl<'tcx> TypeFolder<TyCtxt<'tcx>> for AllRegionEraser<'tcx> {
+    fn cx(&self) -> TyCtxt<'tcx> {
+        self.tcx
+    }
+
+    fn fold_region(&mut self, _region: Region<'tcx>) -> Region<'tcx> {
+        self.tcx.lifetimes.re_erased
+    }
+}
+
+fn erase_all_regions<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Ty<'tcx> {
+    ty.fold_with(&mut AllRegionEraser { tcx })
 }
 
 fn managed_drop_glue_function<'tcx>(
@@ -4259,6 +4292,27 @@ pub fn ty_to_oomir_type<'tcx>(
             Err(_) => instantiated.skip_norm_wip(),
         }
     };
+    let cache_key = (
+        std::ptr::from_ref(data_types) as usize,
+        std::ptr::from_ref(resolved_ty.kind()) as usize,
+    );
+    if let Some(cached) = TYPE_LOWERING_CACHE.with(|cache| cache.borrow().get(&cache_key).cloned())
+    {
+        return cached;
+    }
+    let lowered = ty_to_oomir_type_resolved(resolved_ty, tcx, data_types, instance_context);
+    TYPE_LOWERING_CACHE.with(|cache| {
+        cache.borrow_mut().insert(cache_key, lowered.clone());
+    });
+    lowered
+}
+
+fn ty_to_oomir_type_resolved<'tcx>(
+    resolved_ty: Ty<'tcx>,
+    tcx: TyCtxt<'tcx>,
+    data_types: &mut HashMap<String, oomir::DataType>,
+    instance_context: rustc_middle::ty::Instance<'tcx>,
+) -> oomir::Type {
     match resolved_ty.kind() {
         rustc_middle::ty::TyKind::Bool => oomir::Type::Boolean,
         // Rust `char` is a 32-bit Unicode scalar value, unlike the JVM's
@@ -4399,7 +4453,7 @@ pub fn ty_to_oomir_type<'tcx>(
                     "type-mapping",
                     format!(
                         "Info: Defining new tuple type class: {} for MIR type {:?}",
-                        tuple_class_name, ty
+                        tuple_class_name, resolved_ty
                     )
                 );
                 // Create the fields ("field0", "field1", ...) and their OOMIR types
@@ -4661,7 +4715,8 @@ pub fn ty_to_oomir_type<'tcx>(
         }
         rustc_middle::ty::TyKind::Param(param_ty) => panic!(
             "unresolved generic parameter `{}` reached monomorphic JVM type lowering for {ty:?} in {instance_context:?}",
-            param_ty.name
+            param_ty.name,
+            ty = resolved_ty,
         ),
         rustc_middle::ty::TyKind::Closure(def_id, args) => {
             let safe_name = jvm_names::closure_class_for_args(tcx, *def_id, args, instance_context);
@@ -4778,13 +4833,14 @@ pub fn ty_to_oomir_type<'tcx>(
             oomir::Type::Class(safe_name)
         }
         rustc_middle::ty::TyKind::Alias(_, alias_ty) => panic!(
-            "unresolved type alias/projection {alias_ty:?} reached monomorphic JVM type lowering for {ty:?} in {instance_context:?}"
+            "unresolved type alias/projection {alias_ty:?} reached monomorphic JVM type lowering for {ty:?} in {instance_context:?}",
+            ty = resolved_ty
         ),
         _ => {
             breadcrumbs::log!(
                 breadcrumbs::LogLevel::Warn,
                 "type-mapping",
-                format!("Warning: Unhandled type {:?}", ty)
+                format!("Warning: Unhandled type {:?}", resolved_ty)
             );
             oomir::Type::Class("java/lang/Object".to_string())
         }

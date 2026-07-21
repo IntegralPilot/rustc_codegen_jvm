@@ -1,18 +1,18 @@
+use core::cell::{Ref, RefCell, RefMut};
+use core::ops::Bound::{Excluded, Included, Unbounded};
+use core::pin::Pin;
+use core::sync::atomic::{AtomicUsize, Ordering};
+use std::alloc::Layout;
 use std::alloc::{alloc_zeroed, dealloc, realloc};
 use std::borrow::Cow;
 use std::boxed::Box;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, LinkedList, VecDeque};
 use std::format;
 use std::rc::{Rc, Weak};
-use std::sync::{Arc, Weak as ArcWeak};
 use std::string::{String, ToString};
+use std::sync::{Arc, Weak as ArcWeak};
 use std::vec;
 use std::vec::Vec;
-use std::alloc::Layout;
-use core::cell::RefCell;
-use core::ops::Bound::{Excluded, Included, Unbounded};
-use core::pin::Pin;
-use core::sync::atomic::{AtomicUsize, Ordering};
 
 static mut DROP_COUNTER: usize = 0;
 
@@ -211,6 +211,43 @@ fn main() {
     test_array_from_mut();
     test_boxed_self_receiver();
     test_vec_aggregate_with_function_pointer();
+    test_refcell_borrow_guards_drop();
+}
+
+fn test_refcell_borrow_guards_drop() {
+    let value = RefCell::new(Some(21));
+
+    assert!(value.try_borrow().is_ok());
+    *value.borrow_mut() = Some(42);
+
+    {
+        let first = value.borrow();
+        let second = Ref::clone(&first);
+        assert!(value.try_borrow_mut().is_err());
+        drop(second);
+        assert!(value.try_borrow_mut().is_err());
+    }
+    assert!(value.try_borrow_mut().is_ok());
+
+    {
+        let mapped = Ref::map(value.borrow(), |option| option.as_ref().unwrap());
+        assert!(*mapped == 42);
+    }
+    assert!(value.try_borrow_mut().is_ok());
+
+    let array = RefCell::new([1, 2]);
+    let (left, right) = Ref::map_split(array.borrow(), |values| values.split_at(1));
+    assert!(*left == [1]);
+    assert!(*right == [2]);
+
+    let mutable_array = RefCell::new([1, 2, 3]);
+    {
+        let mut fixed = mutable_array.borrow_mut();
+        fixed[0] = 4;
+        let mut slice: RefMut<'_, [i32]> = fixed;
+        slice[2] = 5;
+    }
+    assert!(*mutable_array.borrow() == [4, 2, 5]);
 }
 
 fn test_vec_in_place_collect_relinquishes_source() {
@@ -415,7 +452,10 @@ fn test_string_partial_eq_specializations() {
 }
 
 fn test_aggregate_clone_shims() {
-    let values = vec![(7_usize, String::from("seven")), (11, String::from("eleven"))];
+    let values = vec![
+        (7_usize, String::from("seven")),
+        (11, String::from("eleven")),
+    ];
     let cloned = values.clone();
 
     assert!(cloned.len() == 2);
@@ -1029,12 +1069,8 @@ fn test_arc_concurrent_clone_drop() {
         );
     }
 
-    assert!(
-        context.relaxed_counter.load(Ordering::Acquire) == (WORKERS + 1) * ITERATIONS
-    );
-    assert!(
-        context.sequential_counter.load(Ordering::SeqCst) == (WORKERS + 1) * ITERATIONS * 2
-    );
+    assert!(context.relaxed_counter.load(Ordering::Acquire) == (WORKERS + 1) * ITERATIONS);
+    assert!(context.sequential_counter.load(Ordering::SeqCst) == (WORKERS + 1) * ITERATIONS * 2);
     assert!(Arc::strong_count(&context.relaxed_counter) == 1);
     assert!(Arc::strong_count(&context.sequential_counter) == 1);
     assert!(Arc::weak_count(&context.relaxed_counter) == 0);
@@ -1061,7 +1097,9 @@ fn test_zst_collection_behavior() {
     assert!(zst_deque.is_empty());
 
     let mut zst_map: BTreeMap<(), DropTracker> = BTreeMap::new();
-    unsafe { DROP_COUNTER = 0; }
+    unsafe {
+        DROP_COUNTER = 0;
+    }
     zst_map.insert((), DropTracker { _val: 1234 });
 
     let displaced = zst_map.insert((), DropTracker { _val: 5678 });

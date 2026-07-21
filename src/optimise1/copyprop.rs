@@ -1,12 +1,42 @@
 use super::*;
+use std::sync::Arc;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct AliasValue {
     source: usize,
-    ty: Type,
+    ty: Arc<Type>,
 }
 
 type AliasMap = HashMap<usize, AliasValue>;
+
+struct AliasScratch {
+    invalidated: Vec<bool>,
+    touched: Vec<usize>,
+}
+
+impl AliasScratch {
+    fn new(local_count: usize) -> Self {
+        Self {
+            invalidated: vec![false; local_count],
+            touched: Vec::new(),
+        }
+    }
+
+    fn mark_invalid(&mut self, local: usize) -> bool {
+        if self.invalidated[local] {
+            return false;
+        }
+        self.invalidated[local] = true;
+        self.touched.push(local);
+        true
+    }
+
+    fn clear(&mut self) {
+        for local in self.touched.drain(..) {
+            self.invalidated[local] = false;
+        }
+    }
+}
 
 #[derive(Debug)]
 struct LocalInterner {
@@ -22,7 +52,9 @@ impl LocalInterner {
         }
         for block in function.body.basic_blocks.values() {
             for instruction in &block.instructions {
-                names.extend(instruction_uses(instruction));
+                visit_instruction_uses(instruction, &mut |name| {
+                    names.insert(name);
+                });
                 if let Some(def) = instruction_def(instruction) {
                     names.insert(def);
                 }
@@ -68,6 +100,7 @@ fn propagate_copies(
     debug_locals: &HashSet<usize>,
 ) {
     let (labels, block_entry_aliases) = analyze_copy_aliases(function, locals, debug_locals);
+    let mut scratch = AliasScratch::new(locals.len());
     for (block_index, label) in labels.into_iter().enumerate() {
         let Some(block) = function.body.basic_blocks.get_mut(&label) else {
             continue;
@@ -76,7 +109,13 @@ fn propagate_copies(
 
         for instruction in &mut block.instructions {
             rewrite_instruction_uses(instruction, &aliases, locals);
-            transfer_aliases_through_instruction(instruction, &mut aliases, locals, debug_locals);
+            transfer_aliases_through_instruction(
+                instruction,
+                &mut aliases,
+                locals,
+                debug_locals,
+                &mut scratch,
+            );
         }
     }
 }
@@ -113,6 +152,7 @@ fn analyze_copy_aliases(
     let mut exit_aliases = entry_aliases.clone();
     let mut queue = (0..labels.len()).collect::<VecDeque<_>>();
     let mut queued = vec![true; labels.len()];
+    let mut scratch = AliasScratch::new(locals.len());
     while let Some(index) = queue.pop_front() {
         queued[index] = false;
         let next_entry = if Some(index) == entry {
@@ -120,14 +160,17 @@ fn analyze_copy_aliases(
         } else {
             meet_predecessor_aliases(&predecessors[index], &exit_aliases)
         };
-        let next_exit = function
-            .body
-            .basic_blocks
-            .get(&labels[index])
-            .map(|block| {
-                transfer_aliases_through_block(block, next_entry.clone(), locals, debug_locals)
-            })
-            .unwrap_or_default();
+        let next_exit = if let Some(block) = function.body.basic_blocks.get(&labels[index]) {
+            transfer_aliases_through_block(
+                block,
+                next_entry.clone(),
+                locals,
+                debug_locals,
+                &mut scratch,
+            )
+        } else {
+            AliasMap::new()
+        };
         entry_aliases[index] = next_entry;
         if exit_aliases[index] != next_exit {
             exit_aliases[index] = next_exit;
@@ -144,13 +187,18 @@ fn analyze_copy_aliases(
 }
 
 fn meet_predecessor_aliases(predecessors: &[usize], exit_aliases: &[AliasMap]) -> AliasMap {
-    let mut predecessor_iter = predecessors.iter();
-    let Some(first_predecessor) = predecessor_iter.next() else {
+    let Some(first_predecessor) = predecessors
+        .iter()
+        .min_by_key(|predecessor| exit_aliases[**predecessor].len())
+    else {
         return AliasMap::new();
     };
 
     let mut aliases = exit_aliases[*first_predecessor].clone();
-    for predecessor in predecessor_iter {
+    for predecessor in predecessors {
+        if predecessor == first_predecessor {
+            continue;
+        }
         let predecessor_aliases = &exit_aliases[*predecessor];
         aliases.retain(|dest, alias| predecessor_aliases.get(dest) == Some(alias));
     }
@@ -162,9 +210,16 @@ fn transfer_aliases_through_block(
     mut aliases: AliasMap,
     locals: &LocalInterner,
     debug_locals: &HashSet<usize>,
+    scratch: &mut AliasScratch,
 ) -> AliasMap {
     for instruction in &block.instructions {
-        transfer_aliases_through_instruction(instruction, &mut aliases, locals, debug_locals);
+        transfer_aliases_through_instruction(
+            instruction,
+            &mut aliases,
+            locals,
+            debug_locals,
+            scratch,
+        );
     }
     aliases
 }
@@ -174,6 +229,7 @@ fn transfer_aliases_through_instruction(
     aliases: &mut AliasMap,
     locals: &LocalInterner,
     debug_locals: &HashSet<usize>,
+    scratch: &mut AliasScratch,
 ) {
     let rewritten_move_src = if let Instruction::Move { src, .. } = instruction {
         let mut src = src.clone();
@@ -184,7 +240,7 @@ fn transfer_aliases_through_instruction(
     };
 
     if let Some(def) = instruction_def(instruction).and_then(|name| locals.id(name)) {
-        kill_aliases_touching(def, aliases);
+        kill_aliases_touching(def, aliases, scratch);
     }
 
     if let (Instruction::Move { dest, .. }, Some(Operand::Variable { name, ty })) =
@@ -193,7 +249,13 @@ fn transfer_aliases_through_instruction(
         && dest != source
         && !debug_locals.contains(&dest)
     {
-        aliases.insert(dest, AliasValue { source, ty });
+        aliases.insert(
+            dest,
+            AliasValue {
+                source,
+                ty: Arc::new(ty),
+            },
+        );
     }
 }
 
@@ -230,11 +292,11 @@ fn eliminate_dead_moves(
                 if let Some(def) = def {
                     bit_set_remove(&mut live, def);
                 }
-                for used in instruction_uses(instruction) {
+                visit_instruction_uses(instruction, &mut |used| {
                     if let Some(used) = locals.id(used) {
                         bit_set_insert(&mut live, used);
                     }
-                }
+                });
             }
 
             if keep.iter().any(|keep| !keep) {
@@ -275,14 +337,14 @@ fn block_live_out(function: &Function, locals: &LocalInterner) -> (Vec<String>, 
             continue;
         };
         for instruction in &block.instructions {
-            for used in instruction_uses(instruction) {
+            visit_instruction_uses(instruction, &mut |used| {
                 let Some(used) = locals.id(used) else {
-                    continue;
+                    return;
                 };
                 if !bit_set_contains(&def_sets[index], used) {
                     bit_set_insert(&mut use_sets[index], used);
                 }
-            }
+            });
             if let Some(def) = instruction_def(instruction).and_then(|name| locals.id(name)) {
                 bit_set_insert(&mut def_sets[index], def);
             }
@@ -450,11 +512,11 @@ fn rewrite_operand(operand: &mut Operand, aliases: &AliasMap, locals: &LocalInte
         return;
     };
     if let Some(alias) = resolve_alias(name, aliases, locals)
-        && alias.ty == *expected_ty
+        && alias.ty.as_ref() == expected_ty
     {
         *operand = Operand::Variable {
             name: locals.name(alias.source).to_string(),
-            ty: alias.ty,
+            ty: alias.ty.as_ref().clone(),
         };
     }
 }
@@ -468,37 +530,34 @@ fn rewrite_variable_name(name: &mut String, aliases: &AliasMap, locals: &LocalIn
 
 fn resolve_alias(name: &str, aliases: &AliasMap, locals: &LocalInterner) -> Option<AliasValue> {
     let mut current = locals.id(name)?;
-    let mut seen = HashSet::new();
     let mut resolved = None;
-    while let Some(alias) = aliases.get(&current) {
-        if !seen.insert(current) {
-            return None;
-        }
+    // One more edge than the map contains proves a cycle, avoiding a visited
+    // set allocation for every operand rewrite.
+    for _ in 0..=aliases.len() {
+        let Some(alias) = aliases.get(&current) else {
+            return resolved;
+        };
         resolved = Some(alias.clone());
         current = alias.source;
     }
-    resolved
+    None
 }
 
-fn kill_aliases_touching(local: usize, aliases: &mut AliasMap) {
-    let mut invalidated = HashSet::from([local]);
+fn kill_aliases_touching(local: usize, aliases: &mut AliasMap, scratch: &mut AliasScratch) {
+    scratch.clear();
+    scratch.mark_invalid(local);
     loop {
-        let dependants = aliases
-            .iter()
-            .filter_map(|(alias_dest, alias_src)| {
-                let touches_invalidated =
-                    invalidated.contains(alias_dest) || invalidated.contains(&alias_src.source);
-                touches_invalidated.then_some(*alias_dest)
-            })
-            .collect::<Vec<_>>();
-        if dependants.is_empty() {
+        let mut changed = false;
+        for (dest, alias) in aliases.iter() {
+            if scratch.invalidated[alias.source] {
+                changed |= scratch.mark_invalid(*dest);
+            }
+        }
+        if !changed {
             break;
         }
-        for dependant in dependants {
-            aliases.remove(&dependant);
-            invalidated.insert(dependant);
-        }
     }
+    aliases.retain(|dest, alias| !scratch.invalidated[*dest] && !scratch.invalidated[alias.source]);
 }
 
 #[cfg(test)]
@@ -513,31 +572,26 @@ mod tests {
                 0,
                 AliasValue {
                     source: 1,
-                    ty: slice_ty.clone(),
+                    ty: Arc::new(slice_ty.clone()),
                 },
             ),
             (
                 1,
                 AliasValue {
                     source: 2,
-                    ty: slice_ty,
+                    ty: Arc::new(slice_ty),
                 },
             ),
         ]);
 
-        kill_aliases_touching(2, &mut aliases);
+        let mut scratch = AliasScratch::new(3);
+        kill_aliases_touching(2, &mut aliases, &mut scratch);
 
         assert!(aliases.is_empty());
     }
 }
 
-fn instruction_uses(instruction: &Instruction) -> HashSet<&str> {
-    let mut uses = HashSet::new();
-    collect_instruction_uses(instruction, &mut uses);
-    uses
-}
-
-fn collect_instruction_uses<'a>(instruction: &'a Instruction, uses: &mut HashSet<&'a str>) {
+fn visit_instruction_uses<'a>(instruction: &'a Instruction, visitor: &mut impl FnMut(&'a str)) {
     match instruction {
         Instruction::Add { op1, op2, .. }
         | Instruction::Sub { op1, op2, .. }
@@ -555,35 +609,35 @@ fn collect_instruction_uses<'a>(instruction: &'a Instruction, uses: &mut HashSet
         | Instruction::BitXor { op1, op2, .. }
         | Instruction::Shl { op1, op2, .. }
         | Instruction::Shr { op1, op2, .. } => {
-            collect_operand_use(op1, uses);
-            collect_operand_use(op2, uses);
+            visit_operand_use(op1, visitor);
+            visit_operand_use(op2, visitor);
         }
         Instruction::Not { src, .. }
         | Instruction::Neg { src, .. }
-        | Instruction::Move { src, .. } => collect_operand_use(src, uses),
-        Instruction::Branch { condition, .. } => collect_operand_use(condition, uses),
+        | Instruction::Move { src, .. } => visit_operand_use(src, visitor),
+        Instruction::Branch { condition, .. } => visit_operand_use(condition, visitor),
         Instruction::Return { operand } => {
             if let Some(operand) = operand {
-                collect_operand_use(operand, uses);
+                visit_operand_use(operand, visitor);
             }
         }
         Instruction::InvokeStatic { args, .. } => {
-            collect_operand_uses(args, uses);
+            visit_operand_uses(args, visitor);
         }
         Instruction::CallIndirect {
             function_ptr, args, ..
         } => {
-            collect_operand_use(function_ptr, uses);
-            collect_operand_uses(args, uses);
+            visit_operand_use(function_ptr, visitor);
+            visit_operand_uses(args, visitor);
         }
         Instruction::InvokeInterface { operand, args, .. }
         | Instruction::InvokeVirtual { operand, args, .. } => {
-            collect_operand_use(operand, uses);
-            collect_operand_uses(args, uses);
+            visit_operand_use(operand, visitor);
+            visit_operand_uses(args, visitor);
         }
-        Instruction::Switch { discr, .. } => collect_operand_use(discr, uses),
+        Instruction::Switch { discr, .. } => visit_operand_use(discr, visitor),
         Instruction::NewArray { size, .. } | Instruction::Length { array: size, .. } => {
-            collect_operand_use(size, uses);
+            visit_operand_use(size, visitor);
         }
         Instruction::ArrayStore {
             array,
@@ -591,29 +645,29 @@ fn collect_instruction_uses<'a>(instruction: &'a Instruction, uses: &mut HashSet
             value,
             ..
         } => {
-            uses.insert(array);
-            collect_operand_use(index, uses);
-            collect_operand_use(value, uses);
+            visitor(array);
+            visit_operand_use(index, visitor);
+            visit_operand_use(value, visitor);
         }
         Instruction::ArrayFill { array, value, .. } => {
-            uses.insert(array);
-            collect_operand_use(value, uses);
+            visitor(array);
+            visit_operand_use(value, visitor);
         }
         Instruction::ArrayGet { array, index, .. } => {
-            collect_operand_use(array, uses);
-            collect_operand_use(index, uses);
+            visit_operand_use(array, visitor);
+            visit_operand_use(index, visitor);
         }
         Instruction::ConstructObject { args, .. } => {
             for (arg, _) in args {
-                collect_operand_use(arg, uses);
+                visit_operand_use(arg, visitor);
             }
         }
         Instruction::SetField { object, value, .. } => {
-            uses.insert(object);
-            collect_operand_use(value, uses);
+            visitor(object);
+            visit_operand_use(value, visitor);
         }
         Instruction::GetField { object, .. } | Instruction::Cast { op: object, .. } => {
-            collect_operand_use(object, uses);
+            visit_operand_use(object, visitor);
         }
         Instruction::SourceLocation(_)
         | Instruction::LocalVariableScope(_)
@@ -627,15 +681,15 @@ fn collect_instruction_uses<'a>(instruction: &'a Instruction, uses: &mut HashSet
     }
 }
 
-fn collect_operand_uses<'a>(operands: &'a [Operand], uses: &mut HashSet<&'a str>) {
+fn visit_operand_uses<'a>(operands: &'a [Operand], visitor: &mut impl FnMut(&'a str)) {
     for operand in operands {
-        collect_operand_use(operand, uses);
+        visit_operand_use(operand, visitor);
     }
 }
 
-fn collect_operand_use<'a>(operand: &'a Operand, uses: &mut HashSet<&'a str>) {
+fn visit_operand_use<'a>(operand: &'a Operand, visitor: &mut impl FnMut(&'a str)) {
     if let Operand::Variable { name, .. } = operand {
-        uses.insert(name);
+        visitor(name);
     }
 }
 

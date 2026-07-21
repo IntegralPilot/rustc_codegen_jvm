@@ -18,6 +18,8 @@ use tempfile::tempdir;
 use zip::write::{SimpleFileOptions, ZipWriter};
 use zip::{CompressionMethod, ZipArchive};
 
+const CLASS_BUNDLE_MAGIC: &[u8; 8] = b"RCJVMB1\0";
+
 #[derive(Debug)]
 struct ClassInfo {
     jar_entry_name: String,
@@ -794,25 +796,56 @@ fn merge_class_data(base_data: &[u8], incoming_data: &[u8]) -> io::Result<Vec<u8
 
 fn merge_duplicate_classes(classes: Vec<ClassInfo>) -> io::Result<Vec<ClassInfo>> {
     let mut positions: HashMap<String, usize> = HashMap::new();
-    let mut merged: Vec<ClassInfo> = Vec::new();
+    let mut groups: Vec<Vec<ClassInfo>> = Vec::new();
     for class_info in classes {
         if let Some(&index) = positions.get(&class_info.jar_entry_name) {
-            merged[index].data =
-                merge_class_data(&merged[index].data, &class_info.data).map_err(|error| {
+            groups[index].push(class_info);
+        } else {
+            positions.insert(class_info.jar_entry_name.clone(), groups.len());
+            groups.push(vec![class_info]);
+        }
+    }
+
+    groups
+        .into_iter()
+        .map(|mut fragments| {
+            // Preserve the largest fragment's compact constant indexes. This
+            // avoids growing its near-limit methods through ldc-to-ldc_w remaps.
+            if class_fragments_can_be_reordered(&fragments)? {
+                fragments.sort_by(|left, right| right.data.len().cmp(&left.data.len()));
+            }
+            let mut merged = fragments.remove(0);
+            for fragment in fragments {
+                merged.data = merge_class_data(&merged.data, &fragment.data).map_err(|error| {
                     io::Error::new(
                         error.kind(),
                         format!(
                             "failed to merge duplicate JVM class {}: {error}",
-                            class_info.jar_entry_name
+                            merged.jar_entry_name
                         ),
                     )
                 })?;
-        } else {
-            positions.insert(class_info.jar_entry_name.clone(), merged.len());
-            merged.push(class_info);
+            }
+            Ok(merged)
+        })
+        .collect()
+}
+
+fn class_fragments_can_be_reordered(fragments: &[ClassInfo]) -> io::Result<bool> {
+    let mut methods = HashSet::new();
+    for fragment in fragments {
+        let class_file = class_file_from_data(&fragment.data)?;
+        if !class_file.fields.is_empty() {
+            return Ok(false);
+        }
+        for index in 0..class_file.methods.len() {
+            let identity = method_identity(&class_file, index)?;
+            if identity.0 != "<init>" && !methods.insert(identity) {
+                return Ok(false);
+            }
         }
     }
-    Ok(merged)
+    Ok(true)
 }
 
 struct InstrumentationTimer {
@@ -993,6 +1026,7 @@ fn main() -> Result<(), i32> {
     let _linker_timer = InstrumentationTimer::new("java-linker");
 
     let mut input_class_files: Vec<String> = Vec::new();
+    let mut input_class_bundles: Vec<String> = Vec::new();
     let mut input_jar_files: Vec<String> = Vec::new(); // Separate JARs
     let mut input_rlib_files: Vec<String> = Vec::new();
     let mut output_file: Option<String> = None;
@@ -1021,6 +1055,9 @@ fn main() -> Result<(), i32> {
             if arg.ends_with(".class") {
                 input_class_files.push(arg.clone());
                 i += 1;
+            } else if arg.ends_with(".jvmbundle") {
+                input_class_bundles.push(arg.clone());
+                i += 1;
             } else if arg.ends_with(".jar") {
                 input_jar_files.push(arg.clone());
                 i += 1;
@@ -1036,16 +1073,12 @@ fn main() -> Result<(), i32> {
         }
     }
 
-    // Combine inputs for scanning, but keep them separate for create_jar
-    let all_input_paths: Vec<String> = input_class_files
-        .iter()
-        .cloned()
-        .chain(input_jar_files.iter().cloned())
-        .chain(input_rlib_files.iter().cloned())
-        .collect();
-
-    if all_input_paths.is_empty() {
-        eprintln!("Error: No input files (.class or .jar) provided.");
+    if input_class_files.is_empty()
+        && input_class_bundles.is_empty()
+        && input_jar_files.is_empty()
+        && input_rlib_files.is_empty()
+    {
+        eprintln!("Error: No JVM input files provided.");
         return Err(1);
     }
 
@@ -1057,8 +1090,18 @@ fn main() -> Result<(), i32> {
         }
     };
 
-    // Find main class (scan both .class and .jar inputs)
-    let main_classes = find_main_classes_with_ristretto(&all_input_paths).map_err(|e| {
+    // Load generated classes once. They are retained for duplicate merging and
+    // final JAR output, so scanning them again here only adds I/O and parsing.
+    let app_classes = collect_input_classes(
+        &input_class_files,
+        &input_class_bundles,
+        &input_rlib_files,
+    )
+    .map_err(|e| {
+        eprintln!("Error collecting JVM classes: {e}");
+        1
+    })?;
+    let main_classes = find_main_classes(&app_classes).map_err(|e| {
         eprintln!("Error during main class scan: {}", e);
         1
     })?;
@@ -1072,11 +1115,9 @@ fn main() -> Result<(), i32> {
     }
     let main_class_name = main_classes.into_iter().next();
 
-    // Create the JAR (pass separated inputs)
     create_jar(
-        &input_class_files,
-        &input_jar_files, // Pass JARs separately
-        &input_rlib_files,
+        app_classes,
+        &input_jar_files,
         &output_file_path,
         main_class_name.as_deref(),
     )
@@ -1090,146 +1131,18 @@ fn main() -> Result<(), i32> {
     Ok(())
 }
 
-fn find_main_classes_with_ristretto(input_files: &[String]) -> io::Result<Vec<String>> {
+fn find_main_classes(classes: &[ClassInfo]) -> io::Result<Vec<String>> {
     let mut main_classes = Vec::new();
     let main_method_name = "main";
     let main_method_descriptor = "([Ljava/lang/String;)V";
 
-    for file_path_str in input_files {
-        let path = Path::new(file_path_str);
-        if !path.exists() {
-            eprintln!(
-                "Warning (main scan): Input path does not exist: {}. Skipping.",
-                file_path_str
-            );
-            continue;
-        }
-        if !path.is_file() {
-            eprintln!(
-                "Warning (main scan): Input path is not a file: {}. Skipping.",
-                file_path_str
-            );
-            continue;
-        }
-
-        if file_path_str.ends_with(".class") {
-            match fs::read(path) {
-                Ok(data) => {
-                    match check_class_data_for_main(&data, main_method_name, main_method_descriptor)
-                    {
-                        Ok(Some(class_name)) => {
-                            //println!("Found main method in class file: {}", class_name);
-                            main_classes.push(class_name);
-                        }
-                        Ok(None) => {} // No main method here
-                        Err(e) => {
-                            eprintln!(
-                                "Warning (main scan): Could not parse class file '{}': {}. Skipping.",
-                                file_path_str, e
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!(
-                        "Warning (main scan): Failed to read file '{}': {}. Skipping.",
-                        file_path_str, e
-                    );
-                }
-            }
-        } else if file_path_str.ends_with(".jar") {
-            match fs::File::open(path) {
-                Ok(jar_file) => {
-                    let reader = BufReader::new(jar_file);
-                    match ZipArchive::new(reader) {
-                        Ok(mut archive) => {
-                            for i in 0..archive.len() {
-                                match archive.by_index(i) {
-                                    Ok(mut file) => {
-                                        if file.is_file() && file.name().ends_with(".class") {
-                                            let entry_name = file.name().to_string();
-                                            let mut data = Vec::with_capacity(file.size() as usize);
-                                            if let Err(e) = file.read_to_end(&mut data) {
-                                                eprintln!(
-                                                    "Warning (main scan): Failed to read entry '{}' in JAR '{}': {}. Skipping entry.",
-                                                    entry_name, file_path_str, e
-                                                );
-                                                continue;
-                                            }
-
-                                            match check_class_data_for_main(
-                                                &data,
-                                                main_method_name,
-                                                main_method_descriptor,
-                                            ) {
-                                                Ok(Some(class_name)) => {
-                                                    // println!(
-                                                    //     "  Found main method in: {} (within {})",
-                                                    //     class_name, entry_name
-                                                    // );
-                                                    main_classes.push(class_name);
-                                                }
-                                                Ok(None) => {}
-                                                Err(e) => {
-                                                    eprintln!(
-                                                        "Warning (main scan): Could not parse class entry '{}' within JAR '{}': {}. Skipping entry.",
-                                                        entry_name, file_path_str, e
-                                                    );
-                                                }
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        eprintln!(
-                                            "Warning (main scan): Error reading entry {} in JAR '{}': {}. Skipping entry.",
-                                            i, file_path_str, e
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "Warning (main scan): Could not open or read JAR file '{}' as zip archive: {}. Skipping.",
-                                file_path_str, e
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!(
-                        "Warning (main scan): Failed to open file '{}': {}. Skipping.",
-                        file_path_str, e
-                    );
-                }
-            }
-        } else if file_path_str.ends_with(".rlib") {
-            match collect_rlib_classes(path) {
-                Ok(classes) => {
-                    for class_info in classes {
-                        match check_class_data_for_main(
-                            &class_info.data,
-                            main_method_name,
-                            main_method_descriptor,
-                        ) {
-                            Ok(Some(class_name)) => main_classes.push(class_name),
-                            Ok(None) => {}
-                            Err(e) => {
-                                eprintln!(
-                                    "Warning (main scan): Could not parse class entry '{}' within rlib '{}': {}. Skipping entry.",
-                                    class_info.jar_entry_name, file_path_str, e
-                                );
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!(
-                        "Warning (main scan): Could not read rlib '{}': {}. Skipping.",
-                        file_path_str, e
-                    );
-                }
-            }
+    for class_info in classes {
+        if let Some(class_name) = check_class_data_for_main(
+            &class_info.data,
+            main_method_name,
+            main_method_descriptor,
+        )? {
+            main_classes.push(class_name);
         }
     }
     Ok(main_classes)
@@ -1294,72 +1207,11 @@ fn check_class_data_for_main(
 
 // --- create_jar ---
 fn create_jar(
-    input_class_files: &[String],
+    app_classes: Vec<ClassInfo>,
     input_jar_files: &[String],
-    input_rlib_files: &[String],
     final_output_jar_path: &str,
     main_class_name: Option<&str>,
 ) -> io::Result<()> {
-    // Regex for stripping cargo hashes from .class filenames
-    let re_strip_hash = Regex::new(r"^(?P<name>[^-]+)(?:-[0-9a-fA-F]+)?\.class$").unwrap();
-
-    // Stage 1: Collect only loose class files
-    let mut app_classes = Vec::new();
-    // let mut seen_classes = HashSet::new(); // Less critical now we don't merge JARs
-
-    for path_str in input_class_files {
-        let path = Path::new(path_str);
-        if !path.exists() {
-            eprintln!(
-                "Warning (create_jar): Input class path does not exist: {}. Skipping.",
-                path_str
-            );
-            continue;
-        }
-        if !path.is_file() {
-            eprintln!(
-                "Warning (create_jar): Input class path is not a file: {}. Skipping.",
-                path_str
-            );
-            continue;
-        }
-
-        let file_name_os = path.file_name().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("Invalid class file path: {}", path_str),
-            )
-        })?;
-        let file_name = file_name_os.to_string_lossy();
-
-        // Use the regex to get the base name, default to full name if no match
-        let base_name = re_strip_hash
-            .captures(&file_name)
-            .and_then(|caps| caps.name("name").map(|m| format!("{}.class", m.as_str())))
-            .unwrap_or_else(|| file_name.to_string());
-
-        app_classes.push(class_info_from_class_data(fs::read(path)?, base_name));
-    }
-
-    for path_str in input_rlib_files {
-        let path = Path::new(path_str);
-        if !path.exists() {
-            eprintln!(
-                "Warning (create_jar): Input rlib path does not exist: {}. Skipping.",
-                path_str
-            );
-            continue;
-        }
-        if !path.is_file() {
-            eprintln!(
-                "Warning (create_jar): Input rlib path is not a file: {}. Skipping.",
-                path_str
-            );
-            continue;
-        }
-        app_classes.extend(collect_rlib_classes(path)?);
-    }
-
     let app_classes = merge_duplicate_classes(app_classes)?;
 
     // Input JARs are bundled into the final artifact alongside generated classes.
@@ -1372,55 +1224,15 @@ fn create_jar(
         ));
     }
 
-    // --- Use a temporary directory ---
     let temp_dir = tempdir()?;
-    let temp_dir_path = temp_dir.path();
-
-    // --- Stage 2: Create Intermediate JAR (only with loose app classes) ---
-    let intermediate_jar_path = temp_dir_path.join("intermediate_app.jar");
-    if !app_classes.is_empty() {
-        let output_file = fs::File::create(&intermediate_jar_path)?;
-        let mut zip_writer = ZipWriter::new(output_file);
-        let options = SimpleFileOptions::default()
-            .compression_method(CompressionMethod::DEFLATE)
-            .unix_permissions(0o644);
-
-        let mut seen_class_entries = HashSet::new();
-        for class_info in &app_classes {
-            if !seen_class_entries.insert(class_info.jar_entry_name.as_str()) {
-                continue;
-            }
-            zip_writer.start_file(&class_info.jar_entry_name, options)?;
-            zip_writer.write_all(&class_info.data)?;
-        }
-        zip_writer.finish()?;
-    }
-
-    // --- Stage 3: Bundle generated classes and input JARs ---
-    let source_jar_for_manifest = if intermediate_jar_path.exists() && library_jar_paths.is_empty()
-    {
-        intermediate_jar_path
-    } else {
-        let bundled_jar_path = temp_dir_path.join("bundled.jar");
-        let app_jar_path = if intermediate_jar_path.exists() {
-            Some(intermediate_jar_path.as_path())
-        } else {
-            None
-        };
-        merge_input_jars(app_jar_path, &library_jar_paths, &bundled_jar_path)?;
-        bundled_jar_path
-    };
-
-    // --- Stage 4: Add Manifest ---
-    let final_jar_temp_path = temp_dir_path.join("final_with_manifest.jar");
-
-    add_manifest_to_jar(
-        &source_jar_for_manifest,
+    let final_jar_temp_path = temp_dir.path().join("output.jar");
+    write_final_jar(
+        &app_classes,
+        &library_jar_paths,
         &final_jar_temp_path,
         main_class_name,
     )?;
 
-    // --- Stage 5: Move final JAR to destination ---
     if let Some(parent_dir) = Path::new(final_output_jar_path).parent() {
         fs::create_dir_all(parent_dir)?;
     }
@@ -1454,6 +1266,79 @@ fn create_jar(
         }
     }
 
+    Ok(())
+}
+
+fn collect_input_classes(
+    input_class_files: &[String],
+    input_class_bundles: &[String],
+    input_rlib_files: &[String],
+) -> io::Result<Vec<ClassInfo>> {
+    let re_strip_hash = Regex::new(r"^(?P<name>[^-]+)(?:-[0-9a-fA-F]+)?\.class$").unwrap();
+    let mut classes = Vec::new();
+    for path_str in input_class_files {
+        let path = Path::new(path_str);
+        if !path.is_file() {
+            eprintln!("Warning: Input class is not a file: {path_str}. Skipping.");
+            continue;
+        }
+        let file_name = path
+            .file_name()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid class path"))?
+            .to_string_lossy();
+        let base_name = re_strip_hash
+            .captures(&file_name)
+            .and_then(|caps| caps.name("name").map(|name| format!("{}.class", name.as_str())))
+            .unwrap_or_else(|| file_name.to_string());
+        classes.push(class_info_from_class_data(fs::read(path)?, base_name));
+    }
+    for path_str in input_class_bundles {
+        let path = Path::new(path_str);
+        if !path.is_file() {
+            eprintln!("Warning: Input class bundle is not a file: {path_str}. Skipping.");
+            continue;
+        }
+        classes.extend(collect_class_bundle(path)?);
+    }
+    for path_str in input_rlib_files {
+        let path = Path::new(path_str);
+        if !path.is_file() {
+            eprintln!("Warning: Input rlib is not a file: {path_str}. Skipping.");
+            continue;
+        }
+        classes.extend(collect_rlib_classes(path)?);
+    }
+    Ok(classes)
+}
+
+fn write_final_jar(
+    app_classes: &[ClassInfo],
+    library_jar_paths: &[PathBuf],
+    output_path: &Path,
+    main_class_name: Option<&str>,
+) -> io::Result<()> {
+    let output_file = fs::File::create(output_path)?;
+    let mut zip_writer = ZipWriter::new(output_file);
+    let options = SimpleFileOptions::default()
+        .compression_method(CompressionMethod::DEFLATE)
+        .unix_permissions(0o644);
+    let mut seen_entries = HashSet::new();
+
+    zip_writer.start_file("META-INF/MANIFEST.MF", options)?;
+    zip_writer.write_all(create_manifest_content(main_class_name).as_bytes())?;
+    seen_entries.insert("META-INF/MANIFEST.MF".to_string());
+    seen_entries.insert("META-INF/".to_string());
+
+    for class_info in app_classes {
+        if seen_entries.insert(class_info.jar_entry_name.clone()) {
+            zip_writer.start_file(&class_info.jar_entry_name, options)?;
+            zip_writer.write_all(&class_info.data)?;
+        }
+    }
+    for library_jar_path in library_jar_paths {
+        copy_jar_entries(library_jar_path, &mut zip_writer, &mut seen_entries)?;
+    }
+    zip_writer.finish()?;
     Ok(())
 }
 
@@ -1581,6 +1466,58 @@ fn try_class_info_from_class_data(data: Vec<u8>, fallback_name: String) -> Optio
     })
 }
 
+fn collect_class_bundle(path: &Path) -> io::Result<Vec<ClassInfo>> {
+    let reader = BufReader::new(fs::File::open(path)?);
+    collect_class_bundle_reader(reader, path)
+}
+
+fn collect_class_bundle_bytes(data: &[u8], path: &Path) -> io::Result<Vec<ClassInfo>> {
+    collect_class_bundle_reader(Cursor::new(data), path)
+}
+
+fn collect_class_bundle_reader(
+    mut reader: impl Read,
+    path: &Path,
+) -> io::Result<Vec<ClassInfo>> {
+    let mut magic = [0u8; CLASS_BUNDLE_MAGIC.len()];
+    reader.read_exact(&mut magic)?;
+    if &magic != CLASS_BUNDLE_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} is not a JVM class bundle", path.display()),
+        ));
+    }
+    let mut classes = Vec::new();
+    loop {
+        let mut name_len_bytes = [0u8; 4];
+        match reader.read(&mut name_len_bytes[..1])? {
+            0 => break,
+            1 => reader.read_exact(&mut name_len_bytes[1..])?,
+            _ => unreachable!(),
+        }
+        let name_len = u32::from_le_bytes(name_len_bytes) as usize;
+        let mut class_len_bytes = [0u8; 8];
+        reader.read_exact(&mut class_len_bytes)?;
+        let class_len = usize::try_from(u64::from_le_bytes(class_len_bytes)).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("class length exceeds this host's address space in {}", path.display()),
+            )
+        })?;
+        let mut name = vec![0; name_len];
+        reader.read_exact(&mut name)?;
+        let name = String::from_utf8(name)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let mut class = vec![0; class_len];
+        reader.read_exact(&mut class)?;
+        classes.push(ClassInfo {
+            jar_entry_name: format!("{name}.class"),
+            data: class,
+        });
+    }
+    Ok(classes)
+}
+
 fn gnu_long_name(table: &[u8], offset_text: &str, path: &Path) -> io::Result<String> {
     let offset = offset_text.trim().parse::<usize>().map_err(|e| {
         io::Error::new(
@@ -1698,6 +1635,8 @@ fn collect_rlib_classes(path: &Path) -> io::Result<Vec<ClassInfo>> {
         let data = &archive[data_start..data_start + data_len];
         if member_name == "__gnu_long_names__" {
             gnu_long_names = data.to_vec();
+        } else if data.starts_with(CLASS_BUNDLE_MAGIC) {
+            classes.extend(collect_class_bundle_bytes(data, path)?);
         } else if member_name.ends_with(".class") || data.starts_with(b"\xca\xfe\xba\xbe") {
             if let Some(class_info) =
                 try_class_info_from_class_data(data.to_vec(), member_name.clone())
@@ -1715,6 +1654,7 @@ fn collect_rlib_classes(path: &Path) -> io::Result<Vec<ClassInfo>> {
     Ok(classes)
 }
 
+#[cfg(test)]
 fn merge_input_jars(
     app_jar_path: Option<&Path>,
     library_jar_paths: &[PathBuf],
@@ -1763,45 +1703,6 @@ fn copy_jar_entries<W: Write + Seek>(
     Ok(())
 }
 
-fn add_manifest_to_jar(
-    input_jar_path: &Path,
-    output_jar_path: &Path,
-    main_class_name: Option<&str>,
-) -> io::Result<()> {
-    let input_file = fs::File::open(input_jar_path)?;
-    let reader = BufReader::new(input_file);
-    let mut input_archive = ZipArchive::new(reader)?;
-
-    let output_file = fs::File::create(output_jar_path)?;
-    let mut zip_writer = ZipWriter::new(output_file);
-    let options = SimpleFileOptions::default()
-        .compression_method(CompressionMethod::DEFLATE) // Use DEFLATE for better compatibility
-        .unix_permissions(0o644);
-
-    let manifest_content = create_manifest_content(main_class_name);
-    zip_writer.start_file("META-INF/MANIFEST.MF", options)?;
-    zip_writer.write_all(manifest_content.as_bytes())?;
-
-    for i in 0..input_archive.len() {
-        let entry = input_archive.by_index_raw(i)?;
-
-        let entry_name = entry.name();
-
-        // Skip the existing manifest directory entry and file entry
-        if entry_name == "META-INF/" || entry_name == "META-INF/MANIFEST.MF" {
-            //println!("Debug: Skipping existing manifest entry: {}", entry_name);
-            continue;
-        }
-
-        //println!("Debug: Copying entry: {}", entry_name);
-        // raw_copy_file_rename might be useful if names need changing
-        zip_writer.raw_copy_file(entry)?;
-    }
-
-    zip_writer.finish()?;
-    Ok(())
-}
-
 fn create_manifest_content(main_class_name: Option<&str>) -> String {
     let mut manifest = String::new();
     manifest.push_str("Manifest-Version: 1.0\r\n");
@@ -1820,9 +1721,10 @@ fn create_manifest_content(main_class_name: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        class_file_from_data, instruction_byte_offsets, interface_name, jar_output_path,
-        merge_class_data, merge_input_jars, method_identity, msvc_output_path,
-        parse_response_lines, remap_local_variable_ranges,
+        CLASS_BUNDLE_MAGIC, ClassInfo, class_file_from_data, collect_class_bundle_bytes,
+        instruction_byte_offsets, interface_name, jar_output_path, merge_class_data,
+        merge_duplicate_classes, merge_input_jars, method_identity, msvc_output_path,
+        parse_response_lines, remap_local_variable_ranges, write_final_jar,
     };
     use ristretto_classfile::attributes::{
         Attribute, BootstrapMethod, Instruction, LocalVariableTable,
@@ -1960,6 +1862,57 @@ mod tests {
         bytes
     }
 
+    fn class_with_near_limit_ldc_method() -> Vec<u8> {
+        let mut constant_pool = ConstantPool::default();
+        let this_class = constant_pool.add_class("test/Generic").unwrap();
+        let super_class = constant_pool.add_class("java/lang/Object").unwrap();
+        let name_index = constant_pool.add_utf8("large").unwrap();
+        let descriptor_index = constant_pool.add_utf8("()V").unwrap();
+        let code_name_index = constant_pool.add_utf8("Code").unwrap();
+        let value_index = constant_pool.add_integer(123_456).unwrap();
+        let value_index = u8::try_from(value_index).unwrap();
+        let mut code = Vec::with_capacity(43_601);
+        for _ in 0..21_800 {
+            code.extend([Instruction::Ldc(value_index), Instruction::Pop]);
+        }
+        code.push(Instruction::Return);
+        let class_file = ClassFile {
+            version: Version::Java8 { minor: 0 },
+            constant_pool,
+            access_flags: ClassAccessFlags::PUBLIC | ClassAccessFlags::SUPER,
+            this_class,
+            super_class,
+            methods: vec![Method {
+                access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
+                name_index,
+                descriptor_index,
+                attributes: vec![Attribute::Code {
+                    name_index: code_name_index,
+                    max_stack: 1,
+                    max_locals: 0,
+                    code,
+                    exception_table: Vec::new(),
+                    attributes: Vec::new(),
+                }],
+            }],
+            ..Default::default()
+        };
+        let mut bytes = Vec::new();
+        class_file.to_bytes(&mut bytes).unwrap();
+        bytes
+    }
+
+    fn class_with_large_constant_pool() -> Vec<u8> {
+        let bytes = abstract_class_with_method("small");
+        let mut class_file = class_file_from_data(&bytes).unwrap();
+        for value in 0..260 {
+            class_file.constant_pool.add_integer(value).unwrap();
+        }
+        let mut bytes = Vec::new();
+        class_file.to_bytes(&mut bytes).unwrap();
+        bytes
+    }
+
     fn write_test_jar(path: &std::path::Path, name: &str, contents: &[u8]) {
         let mut writer = ZipWriter::new(File::create(path).unwrap());
         writer
@@ -2043,6 +1996,23 @@ mod tests {
     }
 
     #[test]
+    fn reads_compiler_class_bundles() {
+        let class = abstract_class_with_method("bundled");
+        let name = b"test/Generic";
+        let mut bundle = CLASS_BUNDLE_MAGIC.to_vec();
+        bundle.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        bundle.extend_from_slice(&(class.len() as u64).to_le_bytes());
+        bundle.extend_from_slice(name);
+        bundle.extend_from_slice(&class);
+
+        let classes = collect_class_bundle_bytes(&bundle, std::path::Path::new("test.jvmbundle"))
+            .unwrap();
+        assert_eq!(classes.len(), 1);
+        assert_eq!(classes[0].jar_entry_name, "test/Generic.class");
+        assert_eq!(classes[0].data, class);
+    }
+
+    #[test]
     fn merges_complementary_generic_class_methods() {
         let first = abstract_class_with_method("first");
         let second = abstract_class_with_method("second");
@@ -2065,6 +2035,27 @@ mod tests {
             first_constant_count + 1,
             "merging should reuse every shared class, descriptor, and attribute constant"
         );
+    }
+
+    #[test]
+    fn merge_keeps_near_limit_method_constant_indexes_compact() {
+        let small = class_with_large_constant_pool();
+        let large = class_with_near_limit_ldc_method();
+        assert!(merge_class_data(&small, &large).is_err());
+
+        let classes = vec![
+            ClassInfo {
+                jar_entry_name: "test/Generic.class".to_string(),
+                data: small,
+            },
+            ClassInfo {
+                jar_entry_name: "test/Generic.class".to_string(),
+                data: large,
+            },
+        ];
+        let merged = merge_duplicate_classes(classes).unwrap();
+        assert_eq!(merged.len(), 1);
+        assert_eq!(class_file_from_data(&merged[0].data).unwrap().methods.len(), 2);
     }
 
     #[test]
@@ -2173,5 +2164,42 @@ mod tests {
             .read_to_end(&mut contents)
             .unwrap();
         assert_eq!(contents, b"compiled");
+    }
+
+    #[test]
+    fn final_jar_is_written_directly_with_manifest_and_app_precedence() {
+        let directory = tempdir().unwrap();
+        let runtime = directory.path().join("runtime.jar");
+        let output = directory.path().join("output.jar");
+        let entry = "test/Generic.class";
+        let class = abstract_class_with_method("compiled");
+        write_test_jar(&runtime, entry, b"runtime");
+
+        write_final_jar(
+            &[ClassInfo {
+                jar_entry_name: entry.to_string(),
+                data: class.clone(),
+            }],
+            &[runtime],
+            &output,
+            Some("test.Generic"),
+        )
+        .unwrap();
+
+        let mut archive = ZipArchive::new(File::open(output).unwrap()).unwrap();
+        let mut contents = Vec::new();
+        archive
+            .by_name(entry)
+            .unwrap()
+            .read_to_end(&mut contents)
+            .unwrap();
+        assert_eq!(contents, class);
+        contents.clear();
+        archive
+            .by_name("META-INF/MANIFEST.MF")
+            .unwrap()
+            .read_to_end(&mut contents)
+            .unwrap();
+        assert!(String::from_utf8(contents).unwrap().contains("Main-Class: test.Generic\r\n"));
     }
 }

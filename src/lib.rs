@@ -45,6 +45,7 @@ use rustc_span::def_id::{DefId, LOCAL_CRATE};
 use std::{
     any::Any,
     ffi::OsString,
+    io::{BufReader, BufWriter, Read, Write},
     path::{Path, PathBuf},
     process::Command,
     sync::{Arc, Mutex, mpsc},
@@ -64,6 +65,29 @@ struct MyBackend;
 /// functions into independently owned LLVM modules. Keep each OOMIR shard
 /// bounded as a second line of defence for unusually large codegen units.
 const MAX_MONO_ITEMS_PER_OOMIR_SHARD: usize = 256;
+// Four lower2 workers usefully saturate large crates without retaining an
+// unbounded number of prepared OOMIR modules on many-core hosts.
+const MAX_CODEGEN_WORKERS: usize = 4;
+const OOMIR_SHARD_QUEUE_DEPTH: usize = 1;
+const CLASS_BUNDLE_MAGIC: &[u8; 8] = b"RCJVMB1\0";
+
+fn combine_class_bundles(path: &Path, bundles: &[(String, PathBuf)]) -> std::io::Result<()> {
+    let mut output = BufWriter::new(std::fs::File::create(path)?);
+    output.write_all(CLASS_BUNDLE_MAGIC)?;
+    for (_, bundle_path) in bundles {
+        let mut bundle = BufReader::new(std::fs::File::open(bundle_path)?);
+        let mut magic = [0u8; CLASS_BUNDLE_MAGIC.len()];
+        bundle.read_exact(&mut magic)?;
+        if &magic != CLASS_BUNDLE_MAGIC {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{} is not a JVM class bundle", bundle_path.display()),
+            ));
+        }
+        std::io::copy(&mut bundle, &mut output)?;
+    }
+    output.flush()
+}
 
 fn write_linker_response_file(path: &Path, arguments: &[OsString]) -> std::io::Result<()> {
     let mut contents = vec![0xff, 0xfe];
@@ -116,7 +140,10 @@ fn emit_library_sidecar_jar(
     let class_files: Vec<_> = compiled_modules
         .iter()
         .filter_map(|module| module.object.as_ref())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "class"))
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|ext| ext == "class" || ext == "jvmbundle")
+        })
         .collect();
     if class_files.is_empty() {
         return;
@@ -1103,6 +1130,7 @@ fn lower_public_library_exports<'tcx>(
 }
 
 fn empty_oomir_module(tcx: TyCtxt<'_>, name: &str) -> oomir::Module {
+    lower1::types::reset_type_lowering_cache();
     oomir::Module {
         name: name.to_string(),
         source_file: tcx
@@ -1226,9 +1254,11 @@ impl CodegenBackend for MyBackend {
             let generated_classes = std::thread::scope(|scope| {
                 let worker_count = std::thread::available_parallelism()
                     .map_or(1, std::num::NonZeroUsize::get)
-                    .min(2);
+                    .min(MAX_CODEGEN_WORKERS);
                 let (job_sender, job_receiver) =
-                    mpsc::sync_channel::<(usize, String, oomir::Module, bool)>(worker_count);
+                    mpsc::sync_channel::<(usize, String, oomir::Module, bool)>(
+                        OOMIR_SHARD_QUEUE_DEPTH,
+                    );
                 let job_receiver = Arc::new(Mutex::new(job_receiver));
                 let (result_sender, result_receiver) = mpsc::channel();
 
@@ -1349,18 +1379,15 @@ impl CodegenBackend for MyBackend {
                 .downcast::<(Vec<(String, PathBuf)>, String)>()
                 .expect("in join_codegen: ongoing_codegen is not a generated-class list");
 
-            let mut compiled_modules = Vec::new();
             let temporary_directories: HashSet<_> = generated_classes
                 .iter()
                 .filter_map(|(_, path)| path.parent().map(Path::to_path_buf))
                 .collect();
 
-            for (index, (name, generated_path)) in generated_classes.into_iter().enumerate() {
-                let cgu_name = format!("{}_{index}", name.replace('/', "_"));
-                // The filesystem object name must remain crate-specific. Multiple
-                // crates and codegen units can emit complementary definitions for
-                // one JVM class, so each fragment needs a unique object path.
-                let file_path = outputs.temp_path_ext_for_cgu("class", &cgu_name);
+            let mut compiled_modules = Vec::new();
+            if !generated_classes.is_empty() {
+                let cgu_name = "jvm_class_bundle".to_string();
+                let file_path = outputs.temp_path_ext_for_cgu("jvmbundle", &cgu_name);
                 if let Some(parent) = file_path.parent() {
                     std::fs::create_dir_all(parent).unwrap_or_else(|e| {
                         panic!(
@@ -1371,15 +1398,13 @@ impl CodegenBackend for MyBackend {
                     });
                 }
 
-                std::fs::copy(&generated_path, &file_path).unwrap_or_else(|e| {
+                combine_class_bundles(&file_path, &generated_classes).unwrap_or_else(|e| {
                     panic!(
-                        "Could not copy generated class {} to {}: {}",
-                        generated_path.display(),
+                        "Could not write generated class bundle {}: {}",
                         file_path.display(),
                         e
                     )
                 });
-
                 compiled_modules.push(CompiledModule {
                     name: cgu_name,
                     kind: ModuleKind::Regular,
