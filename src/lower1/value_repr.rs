@@ -337,35 +337,36 @@ pub(super) fn materialize_implicit_zst<'tcx>(
         }
         TyKind::Array(element_ty, length) => {
             let length = length.try_to_target_usize(tcx)?;
+            let jvm_length = i32::try_from(length).ok()?;
             let element_jvm_ty = ty_to_oomir_type(*element_ty, tcx, data_types, instance);
             let dest = format!("{temp_prefix}_array_value");
             instructions.push(oomir::Instruction::NewArray {
                 dest: dest.clone(),
                 element_type: element_jvm_ty.clone(),
-                size: oomir::Operand::Constant(oomir::Constant::I32(length as i32)),
+                size: oomir::Operand::Constant(oomir::Constant::I32(jvm_length)),
             });
-            if !element_jvm_ty.has_jvm_value() {
+            if length == 0 || !element_jvm_ty.has_jvm_value() {
                 return Some(operand_var(
                     dest,
                     oomir::Type::Array(Box::new(element_jvm_ty)),
                 ));
             }
-            for index in 0..length {
-                let element_value = materialize_implicit_zst(
-                    *element_ty,
-                    &format!("{temp_prefix}_element_{index}"),
-                    tcx,
-                    instance,
-                    data_types,
-                    instructions,
-                )?;
-                instructions.push(oomir::Instruction::ArrayStore {
-                    array: dest.clone(),
-                    index: oomir::Operand::Constant(oomir::Constant::I32(index as i32)),
-                    value: element_value,
-                    copy_value: false,
-                });
-            }
+            let element_value = materialize_implicit_zst(
+                *element_ty,
+                &format!("{temp_prefix}_element"),
+                tcx,
+                instance,
+                data_types,
+                instructions,
+            )?;
+            // Keep generated code independent of the array length. Pointer.fillArray
+            // performs the repeated value copies at runtime, just like MIR array-repeat
+            // lowering, instead of emitting one OOMIR instruction per ZST element.
+            instructions.push(oomir::Instruction::ArrayFill {
+                array: dest.clone(),
+                value: element_value,
+                copy_value: true,
+            });
             Some(operand_var(
                 dest,
                 oomir::Type::Array(Box::new(element_jvm_ty)),

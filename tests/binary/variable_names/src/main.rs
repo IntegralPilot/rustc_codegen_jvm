@@ -1,9 +1,3 @@
-#![no_std]
-#![feature(lang_items)]
-#![allow(internal_features)]
-
-include!("../../../support/test_prelude.rs");
-
 #[inline(never)]
 fn exercise_variable_names(first: i32, wide: i64) -> i32 {
     let doubled = first * 2;

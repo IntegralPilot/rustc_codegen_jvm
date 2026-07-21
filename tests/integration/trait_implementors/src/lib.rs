@@ -1,9 +1,3 @@
-#![no_std]
-#![feature(lang_items)]
-#![allow(internal_features)]
-
-include!("../../../support/test_prelude.rs");
-
 /// A Java class can implement this generated interface and Rust will dispatch
 /// through it exactly as it would through any other `dyn Accumulator`.
 pub trait Accumulator {

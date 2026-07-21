@@ -1,0 +1,21 @@
+diff --git a/proc_macro/src/quote.rs b/proc_macro/src/quote.rs
+--- a/proc_macro/src/quote.rs
++++ b/proc_macro/src/quote.rs
+@@ -274,7 +274,17 @@ macro_rules! minimal_quote {
+ /// This is the actual implementation of the `quote!()` proc macro.
+ ///
+ /// It is loaded by the compiler in `register_builtin_macros`.
++#[cfg(target_os = "jvm")]
++#[unstable(feature = "proc_macro_quote", issue = "54722")]
++pub fn quote(_stream: TokenStream) -> TokenStream {
++    // Procedural macros execute in rustc's host process. Cargo still builds a
++    // target-side proc_macro sysroot artifact, but its compiler callbacks can
++    // never run on the JVM target.
++    panic!("proc_macro::quote is unavailable in target-side JVM code")
++}
++
++#[cfg(not(target_os = "jvm"))]
+ #[unstable(feature = "proc_macro_quote", issue = "54722")]
+ pub fn quote(stream: TokenStream) -> TokenStream {
+     if stream.is_empty() {
+         return minimal_quote!(crate::TokenStream::new());

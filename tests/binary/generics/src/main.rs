@@ -1,9 +1,3 @@
-#![no_std]
-#![feature(lang_items)]
-#![allow(internal_features)]
-
-include!("../../../support/test_prelude.rs");
-
 // Generic identity function
 fn identity<T>(x: T) -> T {
     x

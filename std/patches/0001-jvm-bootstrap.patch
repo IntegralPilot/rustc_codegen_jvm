@@ -1,0 +1,262 @@
+diff --git a/std/src/sys/alloc/mod.rs b/std/src/sys/alloc/mod.rs
+--- a/std/src/sys/alloc/mod.rs
++++ b/std/src/sys/alloc/mod.rs
+@@ -57,6 +57,10 @@ cfg_select! {
+         mod unix;
+         use unix as imp;
+     }
++    target_os = "jvm" => {
++        mod jvm;
++        use jvm as imp;
++    }
+     target_os = "windows" => {
+         mod windows;
+         use windows as imp;
+diff --git a/std/src/sys/io/error/mod.rs b/std/src/sys/io/error/mod.rs
+--- a/std/src/sys/io/error/mod.rs
++++ b/std/src/sys/io/error/mod.rs
+@@ -36,6 +36,7 @@ cfg_select! {
+         target_family = "wasm",
+         target_os = "zkvm",
+         target_os = "trusty",
++        target_os = "jvm",
+     ) => {
+         mod generic;
+         pub use generic::*;
+diff --git a/std/src/sys/random/mod.rs b/std/src/sys/random/mod.rs
+--- a/std/src/sys/random/mod.rs
++++ b/std/src/sys/random/mod.rs
+@@ -9,6 +9,10 @@ cfg_select! {
+         mod apple;
+         pub use apple::fill_bytes;
+     // Others, in alphabetical ordering.
++    }
++    target_os = "jvm" => {
++        mod jvm;
++        pub use jvm::fill_bytes;
+     }
+     any(
+         target_os = "dragonfly",
+diff --git a/std/src/sys/sync/mutex/mod.rs b/std/src/sys/sync/mutex/mod.rs
+--- a/std/src/sys/sync/mutex/mod.rs
++++ b/std/src/sys/sync/mutex/mod.rs
+@@ -38,6 +38,10 @@ cfg_select! {
+         mod xous;
+         pub use xous::Mutex;
+     }
++    target_os = "jvm" => {
++        mod no_threads;
++        pub use no_threads::Mutex;
++    }
+     _ => {
+         mod no_threads;
+         pub use no_threads::Mutex;
+diff --git a/std/src/sys/sync/mutex/no_threads.rs b/std/src/sys/sync/mutex/no_threads.rs
+--- a/std/src/sys/sync/mutex/no_threads.rs
++++ b/std/src/sys/sync/mutex/no_threads.rs
+@@ -1,6 +1,6 @@
+ use crate::cell::Cell;
+ 
+-#[cfg(target_has_threads)]
++#[cfg(all(target_has_threads, not(target_os = "jvm")))]
+ compile_error!("Using no_threads implementation on a target with threads");
+ 
+ pub struct Mutex {
+diff --git a/std/src/sys/sync/rwlock/mod.rs b/std/src/sys/sync/rwlock/mod.rs
+--- a/std/src/sys/sync/rwlock/mod.rs
++++ b/std/src/sys/sync/rwlock/mod.rs
+@@ -33,6 +33,10 @@ cfg_select! {
+         mod solid;
+         pub use solid::RwLock;
+     }
++    target_os = "jvm" => {
++        mod no_threads;
++        pub use no_threads::RwLock;
++    }
+     _ => {
+         mod no_threads;
+         pub use no_threads::RwLock;
+diff --git a/std/src/sys/sync/rwlock/no_threads.rs b/std/src/sys/sync/rwlock/no_threads.rs
+--- a/std/src/sys/sync/rwlock/no_threads.rs
++++ b/std/src/sys/sync/rwlock/no_threads.rs
+@@ -1,6 +1,6 @@
+ use crate::cell::Cell;
+ 
+-#[cfg(target_has_threads)]
++#[cfg(all(target_has_threads, not(target_os = "jvm")))]
+ compile_error!("Using no_threads implementation on a target with threads");
+ 
+ pub struct RwLock {
+diff --git a/std/src/sys/sync/condvar/mod.rs b/std/src/sys/sync/condvar/mod.rs
+--- a/std/src/sys/sync/condvar/mod.rs
++++ b/std/src/sys/sync/condvar/mod.rs
+@@ -45,6 +45,10 @@ cfg_select! {
+         mod xous;
+         pub use xous::Condvar;
+     }
++    target_os = "jvm" => {
++        mod no_threads;
++        pub use no_threads::Condvar;
++    }
+     _ => {
+         mod no_threads;
+         pub use no_threads::Condvar;
+diff --git a/std/src/sys/sync/condvar/no_threads.rs b/std/src/sys/sync/condvar/no_threads.rs
+--- a/std/src/sys/sync/condvar/no_threads.rs
++++ b/std/src/sys/sync/condvar/no_threads.rs
+@@ -2,7 +2,7 @@ use crate::sys::sync::Mutex;
+ use crate::thread::sleep;
+ use crate::time::Duration;
+ 
+-#[cfg(target_has_threads)]
++#[cfg(all(target_has_threads, not(target_os = "jvm")))]
+ compile_error!("Using no_threads implementation on a target with threads");
+ 
+ pub struct Condvar {}
+diff --git a/std/src/sys/sync/once/mod.rs b/std/src/sys/sync/once/mod.rs
+--- a/std/src/sys/sync/once/mod.rs
++++ b/std/src/sys/sync/once/mod.rs
+@@ -35,6 +35,10 @@ cfg_select! {
+         mod queue;
+         pub use queue::{Once, OnceState};
+     }
++    target_os = "jvm" => {
++        mod no_threads;
++        pub use no_threads::{Once, OnceState};
++    }
+     _ => {
+         mod no_threads;
+         pub use no_threads::{Once, OnceState};
+diff --git a/std/src/sys/sync/once/no_threads.rs b/std/src/sys/sync/once/no_threads.rs
+--- a/std/src/sys/sync/once/no_threads.rs
++++ b/std/src/sys/sync/once/no_threads.rs
+@@ -2,7 +2,7 @@ use crate::cell::Cell;
+ use crate::sync as public;
+ use crate::sync::once::OnceExclusiveState;
+ 
+-#[cfg(target_has_threads)]
++#[cfg(all(target_has_threads, not(target_os = "jvm")))]
+ compile_error!("Using no_threads implementation on a target with threads");
+ 
+ pub struct Once {
+diff --git a/std/src/sys/thread_local/mod.rs b/std/src/sys/thread_local/mod.rs
+--- a/std/src/sys/thread_local/mod.rs
++++ b/std/src/sys/thread_local/mod.rs
+@@ -23,6 +23,7 @@ cfg_select! {
+         target_os = "zkvm",
+         target_os = "trusty",
+         target_os = "vexos",
++        target_os = "jvm",
+     ) => {
+         mod no_threads;
+         pub use no_threads::{EagerStorage, LazyStorage, thread_local_inner};
+@@ -92,6 +93,7 @@ pub(crate) mod guard {
+             target_os = "zkvm",
+             target_os = "trusty",
+             target_os = "vexos",
++            target_os = "jvm",
+         ) => {
+             pub(crate) fn enable() {
+                 // FIXME: Right now there is no concept of "thread exit" on
+diff --git a/std/src/sys/thread_local/no_threads.rs b/std/src/sys/thread_local/no_threads.rs
+--- a/std/src/sys/thread_local/no_threads.rs
++++ b/std/src/sys/thread_local/no_threads.rs
+@@ -5,6 +5,6 @@ use crate::mem::MaybeUninit;
+ use crate::ptr;
+ 
+-#[cfg(target_has_threads)]
++#[cfg(all(target_has_threads, not(target_os = "jvm")))]
+ compile_error!("Using no_threads implementation on a target with threads");
+ 
+ #[doc(hidden)]
+diff --git a/std/src/sys/args/mod.rs b/std/src/sys/args/mod.rs
+--- a/std/src/sys/args/mod.rs
++++ b/std/src/sys/args/mod.rs
+@@ -10,5 +10,6 @@
+     target_os = "wasi",
+     target_os = "xous",
++    target_os = "jvm",
+ ))]
+ mod common;
+
+@@ -17,3 +18,7 @@ cfg_select! {
++    target_os = "jvm" => {
++        mod jvm;
++        pub use jvm::*;
++    }
+     any(
+         all(target_family = "unix", not(any(all(target_family = "wasm", target_os = "linux"), target_os = "espidf", target_os = "vita"))),
+         target_os = "hermit",
+diff --git a/std/src/sys/env/mod.rs b/std/src/sys/env/mod.rs
+--- a/std/src/sys/env/mod.rs
++++ b/std/src/sys/env/mod.rs
+@@ -12,9 +12,14 @@
+     target_os = "wasi",
+     target_os = "xous",
++    target_os = "jvm",
+ ))]
+ mod common;
+
+ cfg_select! {
++    target_os = "jvm" => {
++        mod jvm;
++        pub use jvm::*;
++    }
+     target_family = "unix" => {
+         mod unix;
+         pub use unix::*;
+diff --git a/std/src/sys/stdio/mod.rs b/std/src/sys/stdio/mod.rs
+--- a/std/src/sys/stdio/mod.rs
++++ b/std/src/sys/stdio/mod.rs
+@@ -1,6 +1,10 @@
+ #![forbid(unsafe_op_in_unsafe_fn)]
+
+ cfg_select! {
++    target_os = "jvm" => {
++        mod jvm;
++        pub use jvm::*;
++    }
+     any(target_family = "unix", target_os = "hermit", target_os = "wasi") => {
+         mod unix;
+         pub use unix::*;
+diff --git a/std/src/sys/exit.rs b/std/src/sys/exit.rs
+--- a/std/src/sys/exit.rs
++++ b/std/src/sys/exit.rs
+@@ -1,3 +1,9 @@
++#[cfg(target_os = "jvm")]
++unsafe extern "C" {
++    #[link_name = "jvm:static:org/rustlang/runtime/RuntimeSupport:exit:(I)V"]
++    fn jvm_exit(code: i32) -> !;
++}
++
+ cfg_select! {
+     target_os = "linux" => {
+         /// Mitigation for <https://github.com/rust-lang/rust/issues/126600>
+@@ -105,4 +111,7 @@ pub fn exit(code: i32) -> ! {
+     cfg_select! {
++        target_os = "jvm" => {
++            unsafe { jvm_exit(code) }
++        }
+         target_os = "hermit" => {
+             unsafe { hermit_abi::exit(code) }
+         }
+diff --git a/std/build.rs b/std/build.rs
+--- a/std/build.rs
++++ b/std/build.rs
+@@ -18,4 +18,5 @@ fn main() {
+     println!("cargo:rustc-check-cfg=cfg(restricted_std)");
+     if target_os == "linux"
++        || target_os == "jvm"
+         || target_os == "android"
+         || target_os == "netbsd"
+diff --git a/test/src/lib.rs b/test/src/lib.rs
+--- a/test/src/lib.rs
++++ b/test/src/lib.rs
+@@ -17,6 +17,7 @@
+ #![doc(test(attr(deny(warnings))))]
+ #![doc(rust_logo)]
+ #![feature(rustdoc_internals)]
++#![feature(restricted_std)]
+ #![feature(file_buffered)]
+ #![feature(internal_output_capture)]
+ #![feature(io_const_error)]

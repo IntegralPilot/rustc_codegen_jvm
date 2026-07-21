@@ -1,9 +1,3 @@
-#![no_std]
-#![feature(lang_items)]
-#![allow(internal_features)]
-
-include!("../../../support/test_prelude.rs");
-
 fn collatz(n: u32) -> u32 {
     if n == 1 {
         1

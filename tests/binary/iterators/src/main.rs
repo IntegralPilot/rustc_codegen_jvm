@@ -1,13 +1,11 @@
-#![no_std]
-#![feature(lang_items)]
 #![feature(iter_map_windows)]
-#![allow(internal_features)]
+#![feature(iter_advance_by)]
+#![feature(ascii_char)]
+#![feature(ascii_char_variants)]
 
-include!("../../../support/test_prelude.rs");
-
-use alloc::string::String;
-use alloc::vec;
-use alloc::vec::Vec;
+use std::string::String;
+use std::vec;
+use std::vec::Vec;
 
 #[derive(Clone, Copy)]
 struct Marker;
@@ -159,6 +157,36 @@ fn array_iteration() {
         count += 1;
     }
     assert!(count == 1000);
+}
+
+fn ascii_escape_iterator() {
+    let mut escaped = b"\0fastpath\xffremainder\xff".escape_ascii();
+    assert!(escaped.advance_by(4).is_ok());
+    assert!(escaped.advance_back_by(4).is_ok());
+    assert!(escaped.to_string() == r#"fastpath\xffremainder"#);
+}
+
+fn ascii_char_formatting() {
+    use std::ascii::Char;
+
+    assert!(std::format!("{:?}", Char::Null) == r#"'\0'"#);
+    assert!(Char::CapitalA.to_string() == "A");
+
+    for byte in 0..128_u8 {
+        let mut expected = std::format!("{:?}", byte as char);
+        if let Some(rest) = expected.strip_prefix("'\\u{") {
+            expected = std::format!("'\\x{:0>2}'", rest.strip_suffix("}'").unwrap());
+        }
+        let actual = std::format!("{:?}", Char::from_u8(byte).unwrap());
+        if actual != expected {
+            std::println!("ASCII_CHAR_MISMATCH byte={byte} expected={expected} actual={actual}");
+            break;
+        }
+    }
+
+    let mut extended = String::from("abc");
+    extended.extend(Char::CapitalA..=Char::CapitalC);
+    assert!(extended == "abcABC");
 }
 
 fn borrowed_iteration() {
@@ -707,6 +735,8 @@ fn test_partial_array_into_iter_drop() {
 
 fn main() {
     array_iteration();
+    ascii_escape_iterator();
+    ascii_char_formatting();
     borrowed_iteration();
     loop_control();
     iterator_state();

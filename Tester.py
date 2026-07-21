@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import sys
@@ -81,10 +82,38 @@ def check_results(proc, test: TestCase, release: bool, logs: list[str]) -> bool:
     ci_diagnostic(logs, diff)
     return False
 
+def java_process_inputs(test: TestCase) -> tuple[list[str], str | None]:
+    arguments_path = test.directory / "java-args.json"
+    arguments: list[str] = []
+    if arguments_path.exists():
+        parsed = json.loads(read(arguments_path))
+        if not isinstance(parsed, list) or not all(isinstance(value, str) for value in parsed):
+            raise ValueError(f"{arguments_path} must contain a JSON array of strings")
+        arguments = parsed
+    stdin_path = test.directory / "java-stdin.txt"
+    stdin = read(stdin_path) if stdin_path.exists() else None
+    return arguments, stdin
+
+
 def run_java(test: TestCase, jar: Path, release: bool, logs: list[str]) -> bool:
+    try:
+        java_arguments, stdin = java_process_inputs(test)
+    except (json.JSONDecodeError, ValueError) as error:
+        logs.append(f"|---- ❌ Invalid Java process test input: {error}")
+        return False
+
     if test.kind != "integration":
         logs.append("|--- 🤖 Running with Java...")
-        proc = run_command(["java", "-cp", str(jar), f"{test.artifact_name}.{test.artifact_name}"])
+        proc = run_command(
+            [
+                "java",
+                "-cp",
+                str(jar),
+                f"{test.artifact_name}.{test.artifact_name}",
+                *java_arguments,
+            ],
+            input_text=stdin,
+        )
         return check_results(proc, test, release, logs)
 
     java_files = sorted(path.name for path in test.directory.glob("*.java"))
@@ -105,7 +134,11 @@ def run_java(test: TestCase, jar: Path, release: bool, logs: list[str]) -> bool:
         return False
 
     logs.append("|--- 🤖 Running with Java...")
-    proc = run_command(["java", "-cp", classpath, "Main"], cwd=test.directory)
+    proc = run_command(
+        ["java", "-cp", classpath, "Main", *java_arguments],
+        cwd=test.directory,
+        input_text=stdin,
+    )
     return check_results(proc, test, release, logs)
 
 
@@ -261,18 +294,18 @@ def main() -> int:
     mode = "release" if args.release else "debug"
     per_build_jobs = cargo_jobs(workers)
     print("🧪 rustc_codegen_jvm test suite")
-    print(f"|- Target: {mode} jvm-unknown-unknown with real core")
+    print(f"|- Target: {mode} jvm-unknown-unknown with real std")
     print(f"|- Parallelism: {workers} test worker(s), {per_build_jobs} Cargo job(s) each")
     if cache_invalidated:
         print("|- Compiler inputs changed; reset the shared test cache")
-    print("|- Building shared core/alloc/compiler_builtins cache once...")
+    print("|- Building the shared standard-library cache once...")
     prime = prime_core(args.release)
     if prime.returncode != 0:
         print(prime.stdout)
         print(prime.stderr, file=sys.stderr)
-        print("|- ❌ Shared core build failed")
+        print("|- ❌ Shared standard-library build failed")
         return 1
-    print("|- ✅ Shared core cache is ready")
+    print("|- ✅ Shared standard-library cache is ready")
     print(f"|- Running {len(tests)} test(s)...\n")
 
     success = True

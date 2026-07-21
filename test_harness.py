@@ -8,6 +8,13 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from stdlib_overlay import (
+    STDLIB_OVERLAY_ROOT,
+    STDLIB_PATCH_ROOT,
+    prepare_stdlib_source,
+    rustc_info,
+)
+
 ROOT = Path(__file__).resolve().parent
 TARGET_SPEC = ROOT / "jvm-unknown-unknown.json"
 TEST_TARGET_DIR = ROOT / "target" / "test-suite"
@@ -18,6 +25,8 @@ CACHE_TAG = (
     "Signature: 8a477f597d28d172789f06886806bc55\n"
     "# This file is a cache directory tag created by rustc_codegen_jvm.\n"
 )
+_STDLIB_SOURCE: Path | None = None
+_STDLIB_FINGERPRINT: str | None = None
 
 
 @dataclass(frozen=True)
@@ -96,22 +105,42 @@ def validate_configuration() -> None:
         )
 
 
+def prepare_stdlib() -> tuple[Path, str]:
+    global _STDLIB_SOURCE, _STDLIB_FINGERPRINT
+    if _STDLIB_SOURCE is None or _STDLIB_FINGERPRINT is None:
+        sysroot, _, commit = rustc_info()
+        _STDLIB_SOURCE, overlay_hash = prepare_stdlib_source(sysroot, commit)
+        _STDLIB_FINGERPRINT = f"{commit}:{overlay_hash}"
+    return _STDLIB_SOURCE, _STDLIB_FINGERPRINT
+
+
+def stdlib_build_environment(base: dict[str, str] | None = None) -> dict[str, str]:
+    source, _ = prepare_stdlib()
+    environment = (base if base is not None else os.environ).copy()
+    environment["__CARGO_TESTS_ONLY_SRC_ROOT"] = str(source)
+    return environment
+
+
 def prepare_shared_cache() -> bool:
     """Invalidate all test artifacts when the compiler toolchain inputs change."""
     validate_configuration()
+    _, stdlib_fingerprint = prepare_stdlib()
     inputs = [
+        Path(__file__),
         TARGET_SPEC,
         TEST_CONFIG,
-        ROOT / "tests" / "support" / "test_prelude.rs",
         ROOT / "runtime" / "build" / "libs" / "runtime-0.1.0.jar",
         ROOT / "java-linker" / "target" / "release" / (
             "java-linker.exe" if os.name == "nt" else "java-linker"
         ),
     ]
+    inputs.extend(path for path in STDLIB_OVERLAY_ROOT.rglob("*") if path.is_file())
+    inputs.extend(path for path in STDLIB_PATCH_ROOT.rglob("*.patch") if path.is_file())
     backend_candidates = list((ROOT / "target" / "release").glob("*rustc_codegen_jvm.*"))
     inputs.extend(path for path in backend_candidates if path.suffix in {".dll", ".dylib", ".so"})
 
     digest = hashlib.sha256()
+    digest.update(stdlib_fingerprint.encode("utf-8"))
     for path in sorted(inputs):
         if not path.exists():
             raise RuntimeError(f"missing test toolchain input: {path}; run `python3 build.py all`")
@@ -140,7 +169,8 @@ def cargo_build_command(manifest: Path, release: bool, jobs: int) -> list[str]:
         "--target",
         str(TARGET_SPEC),
         "-Zjson-target-spec",
-        "-Zbuild-std=core,compiler_builtins,alloc",
+        "-Zbuild-std=std,panic_unwind",
+        "-Zbuild-std-features=",
         "--target-dir",
         str(TEST_TARGET_DIR),
         "--config",
@@ -149,7 +179,9 @@ def cargo_build_command(manifest: Path, release: bool, jobs: int) -> list[str]:
         str(jobs),
     ]
     if release:
-        command.append("--release")
+        command.extend(
+            ["--release", "--config", 'profile.release.debug="line-tables-only"']
+        )
     return command
 
 
@@ -158,11 +190,13 @@ def run_command(
     *,
     cwd: Path | None = None,
     env: dict[str, str] | None = None,
+    input_text: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         command,
         cwd=cwd or ROOT,
         env=env,
+        input=input_text,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -175,6 +209,7 @@ def prime_core(release: bool) -> subprocess.CompletedProcess[str]:
     validate_configuration()
     return run_command(
         cargo_build_command(CORE_BUILD_MANIFEST, release, cpu_count()),
+        env=stdlib_build_environment(),
     )
 
 
@@ -187,7 +222,7 @@ def build_test(
 ) -> subprocess.CompletedProcess[str]:
     return run_command(
         cargo_build_command(test.directory / "Cargo.toml", release, jobs),
-        env=env,
+        env=stdlib_build_environment(env),
     )
 
 

@@ -1,7 +1,7 @@
 // src/lower2/jvm_gen.rs
 
 use super::{
-    FunctionTranslator,
+    DebugInfoOptions, FunctionTranslator,
     constant_pool::{InternedConstantPool, verify_no_duplicate_constants},
     consts::{get_int_const_instr, load_constant},
     helpers::{get_load_instruction, get_type_size, oomir_function_stack_floor},
@@ -27,12 +27,14 @@ fn code_attribute_with_stack_maps(
 ) -> jvm::Result<Attribute> {
     let fixed_prefix_slots = initial_locals.len() as u16;
     let source_locations = vec![optimise2::BytecodeMetadata::default(); code.len()];
+    let mut exception_table = Vec::new();
     let optimised = optimise2::optimise(
         code,
         source_locations,
         max_locals,
         fixed_prefix_slots,
         &std::collections::BTreeSet::new(),
+        &mut exception_table,
     )?;
     let mut code = optimised.instructions;
     let max_locals = optimised.max_locals;
@@ -45,6 +47,7 @@ fn code_attribute_with_stack_maps(
         max_locals,
         cp,
         context,
+        &[],
     )?;
     Ok(Attribute::Code {
         name_index,
@@ -1203,6 +1206,7 @@ pub(super) fn create_data_type_classfile_for_class(
     module: &oomir::Module,
     subclasses: Vec<String>,
     nest_host: Option<String>,
+    debug_info: DebugInfoOptions,
 ) -> jvm::Result<Vec<u8>> {
     let source_files = methods
         .values()
@@ -1273,6 +1277,7 @@ pub(super) fn create_data_type_classfile_for_class(
     let mut jvm_methods = vec![constructor];
     let mut class_attributes = Vec::new();
     let mut bootstrap_methods: Vec<BootstrapMethod> = Vec::new();
+    let mut next_factory = 0;
 
     // Check for jvm_methods
     for (method_name, method) in methods.iter() {
@@ -1311,6 +1316,20 @@ pub(super) fn create_data_type_classfile_for_class(
                 jvm_methods.push(jvm_method);
             }
             DataTypeMethod::Function(function) => {
+                let mut function = function.clone();
+                super::prepare_function_constants(
+                    &mut function,
+                    &mut cp,
+                    class_name_jvm,
+                    &mut jvm_methods,
+                    &mut next_factory,
+                )
+                .map_err(|error| jvm::Error::VerificationError {
+                    context: format!("Constants for {class_name_jvm}::{method_name}"),
+                    message: format!(
+                        "Failed after creating {next_factory} constant factories: {error:?}"
+                    ),
+                })?;
                 let instrumented_fn_name = format!("{class_name_jvm}::{method_name}");
                 let _timer =
                     crate::instrumentation::Timer::function("lower2", None, &instrumented_fn_name);
@@ -1322,22 +1341,22 @@ pub(super) fn create_data_type_classfile_for_class(
                     None
                 };
                 let translator = FunctionTranslator::new(
-                    function,
+                    &function,
                     &mut cp,
                     &mut bootstrap_methods,
                     module,
                     function.signature.is_static,
                     owner_class,
+                    debug_info,
                 );
-                let (jvm_code, max_locals_val, code_attributes) =
-                    translator
-                        .translate()
-                        .map_err(|error| jvm::Error::VerificationError {
-                            context: format!("Function {class_name_jvm}::{method_name}"),
-                            message: format!("Failed to translate function: {error:?}"),
-                        })?;
+                let (jvm_code, max_locals_val, code_attributes, exception_table) = translator
+                    .translate()
+                    .map_err(|error| jvm::Error::VerificationError {
+                        context: format!("Function {class_name_jvm}::{method_name}"),
+                        message: format!("Failed to translate function: {error:?}"),
+                    })?;
 
-                let stack_floor = oomir_function_stack_floor(function);
+                let stack_floor = oomir_function_stack_floor(&function);
                 let max_stack_val = match jvm_code.max_stack(&cp) {
                     Ok(max_stack) => max_stack.saturating_mul(2).max(stack_floor),
                     Err(error) => {
@@ -1358,7 +1377,7 @@ pub(super) fn create_data_type_classfile_for_class(
                     max_stack: max_stack_val,
                     max_locals: max_locals_val,
                     code: jvm_code,
-                    exception_table: Vec::new(),
+                    exception_table,
                     attributes: code_attributes,
                 };
 
@@ -1407,7 +1426,7 @@ pub(super) fn create_data_type_classfile_for_class(
                         &mut cp,
                         class_name_jvm,
                         method_name,
-                        function,
+                        &function,
                     )?);
                 }
             }
@@ -1724,15 +1743,7 @@ pub(super) fn create_data_type_classfile_for_class(
     };
     verify_no_duplicate_constants(&class_file)?;
 
-    let mut byte_vector = Vec::new();
-    class_file
-        .to_bytes(&mut byte_vector)
-        .map_err(|error| jvm::Error::VerificationError {
-            context: format!("Class {class_name_jvm}"),
-            message: format!("Failed to serialize class file: {error:?}"),
-        })?;
-
-    Ok(byte_vector)
+    super::serialize_class_file(&class_file, &format!("Class {class_name_jvm}"))
 }
 
 /// Creates a ClassFile (as bytes) for a given OOMIR DataType that's an interface
@@ -1801,15 +1812,7 @@ pub(super) fn create_data_type_classfile_for_interface(
     };
     verify_no_duplicate_constants(&class_file)?;
 
-    let mut byte_vector = Vec::new();
-    class_file
-        .to_bytes(&mut byte_vector)
-        .map_err(|error| jvm::Error::VerificationError {
-            context: format!("Interface {interface_name_jvm}"),
-            message: format!("Failed to serialize class file: {error:?}"),
-        })?;
-
-    Ok(byte_vector)
+    super::serialize_class_file(&class_file, &format!("Interface {interface_name_jvm}"))
 }
 
 /// Creates a code attribute for a method that returns a constant value.

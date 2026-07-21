@@ -1,9 +1,5 @@
-#![no_std]
-
-extern crate alloc;
-
-use alloc::string::{String, ToString};
-use alloc::vec::Vec;
+use std::string::{String, ToString};
+use std::vec::Vec;
 use kinds::{OptionArgument, OptionOccurrence};
 
 #[derive(Clone, Copy)]

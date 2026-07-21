@@ -41,7 +41,7 @@ So much of the modern internet runs on a JVM stack. If a company (or open-source
 
 ### It's fast for debugging, a known problem with native Rust
 
-Once the shared `core` artifacts are warm, compilation for most small test crates is fast, making the backend practical for rapid experimentation compared to native compilation. Due to the rich hot reload and debugging ecosystem of the JVM, my vision is that this project can in future make rapidly iterating on Rust code (which is a known drawback of Rust) fast and enjoyable. Though there is still lots of work to be done on both making this compiler faster, and making it easy for Rust code to tap into that ecosystem!
+Once the shared standard-library artifacts are warm, compilation for most small test crates is fast, making the backend practical for rapid experimentation compared to native compilation. Due to the rich hot reload and debugging ecosystem of the JVM, my vision is that this project can in future make rapidly iterating on Rust code (which is a known drawback of Rust) fast and enjoyable. Though there is still lots of work to be done on both making this compiler faster, and making it easy for Rust code to tap into that ecosystem!
 
 Future visions for the project include it being able to help you leverage the JVM's safety to debug undefined behaviour, like [Miri](https://github.com/rust-lang/miri/) but faster because of the JVM's JIT. Particually with raw pointers, due to the translation layer, in some cases of UB you will already get a nice Java exception with full traceback saying where it happened, but there is still a lot more to do in this area.
 
@@ -60,7 +60,7 @@ Future visions for the project include it being able to help you leverage the JV
 
 ## Demos
 
-These examples live in `tests/`, are compiled with upstream Rust `core` and `alloc` to JVM bytecode, and are verified on every CI run as part of the integration test suite. Use `Instrument.py` to inspect compilation timings.
+These examples live in `tests/`, are compiled with Rust's standard library to JVM bytecode, and are verified on every CI run as part of the integration test suite. A small, versioned JVM platform overlay supplies the target-specific parts of `std` without modifying the installed Rust source. Use `Instrument.py` to inspect compilation timings.
 
 Here are a few selected more complex demos:
 
@@ -101,10 +101,11 @@ Here are a few selected more complex demos:
 - **Unions** support primitive values, references, tuples, structs, fixed-size arrays, and fieldless or data-carrying enums, including recursively nested combinations of these types.
 - **Transmute** between everything supported by unions (uses the same inner machinery)
 - **Coroutines:** support for basic state machines, including yield and resume operations, preservation of local variables across suspension points, move and reference captures, and handling of zero-sized types.
+- **Standard library:** collections and allocation, arguments and environment variables, standard I/O, panic unwinding and randomness.
 - **Outputs** executable, self-contained `.jar` generation for binary crates.
 - **Testing** with integration coverage across debug and release modes for all of the above.
 
-Every test crate is compiled from scratch for `jvm-unknown-unknown` alongside upstream Rust `core`, `alloc`, `compiler_builtins`.
+Every test crate is compiled for `jvm-unknown-unknown` alongside `std` and `panic_unwind`. The prepared standard-library source and Cargo artifacts are cached and shared between tests.
 
 The [runtime](runtime/) contains JVM runtime support such as pointer and 128-bit-number carriers and is automatically integrated into generated jars.
 
@@ -192,28 +193,18 @@ Create a Rust project like normal.
 
 Then, copy the `config.toml` at the root of this project (generated after running the build as detailed above) into `.cargo/config.toml` of your Rust project.
 
-JVM crates currently need to be `#![no_std]`, because we can compile upstream `core` and `alloc`, but `std` would require changes to upstream which can only be made once the integration of the JVM target upstream begins. 
-
-A reusable prelude has been created to deal with this. Simply prepend this to your `main.rs`, and then write the rest of the crate (including a `main` function) like you normally would (without calling any APIs that are in `std` but not `core` or `alloc`). It includes a panic handler and allocator which work on JVM.
-
-```rust
-#![no_std]
-#![feature(lang_items)]
-#![allow(internal_features)]
-
-include!("/path/to/rustc_codegen_jvm/tests/support/test_prelude.rs");
-```
-
-Then, build the project with cargo for `jvm-unknown-unknown`.
+Write an ordinary Rust binary using `std`. Before building, prepare a cached copy of the active nightly's standard-library source with the JVM platform overlay. The script never modifies the installed toolchain source.
 
 ```bash
+export __CARGO_TESTS_ONLY_SRC_ROOT="$(python3 /path/to/rustc_codegen_jvm/stdlib_overlay.py)"
 cargo build \
   --target "/path/to/rustc_codegen_jvm/jvm-unknown-unknown.json" \
   -Zjson-target-spec \
-  -Zbuild-std=core,alloc,compiler_builtins
+  -Zbuild-std=std,panic_unwind \
+  -Zbuild-std-features=
 ```
 
-Add `--release` for an optimised build. The generated JAR is under the crate's `target/jvm-unknown-unknown/debug` or `target/jvm-unknown-unknown/release` directory and can be run with `java -jar`.
+Add `--release` for an optimised build. The generated JAR is under the crate's `target/jvm-unknown-unknown/debug` or `target/jvm-unknown-unknown/release` directory and can be run with `java -jar`. Java does not expose its launcher as an argument, so `std::env::args()` uses `rust-jvm` as the synthesized argument zero and then returns the Java command-line arguments unchanged.
 
 ## Running Tests
 
@@ -250,7 +241,8 @@ Results are printed to the console.
 │   ├── binary/               # Runnable Rust test and example crates
 │   ├── integration/          # Rust libraries exercised from Java
 │   ├── multicrate/           # Tests with multiple Rust crates
-│   └── support/              # Shared no_std prelude and core cache seed crate
+│   └── support/              # Shared standard-library cache seed crate
+├── std/                      # JVM platform overlay and upstream-source patches
 ├── runtime/                  # Java runtime support classes
 ├── build.py                  # Orchestrator build script
 ├── config.toml.template      # Cargo configuration template

@@ -3912,22 +3912,25 @@ pub fn ensure_union_data_type<'tcx>(
     let union_class =
         generate_adt_jvm_class_name(adt_def, substs, tcx, data_types, instance_context);
 
-    // Pre-populate with placeholder class to break recursive resolution loops
-    if !data_types.contains_key(&union_class) {
-        data_types.insert(
-            union_class.clone(),
-            oomir::DataType::Class {
-                fields: vec![
-                    (UNION_BYTES_FIELD.to_string(), byte_array_type()),
-                    (UNION_OBJECTS_FIELD.to_string(), object_array_type()),
-                ],
-                is_abstract: false,
-                methods: HashMap::new(),
-                super_class: Some("java/lang/Object".to_string()),
-                interfaces: vec![],
-            },
-        );
+    // This function is the sole creator of union classes. An existing class is
+    // therefore either complete or the placeholder installed by an outer call.
+    // Returning for both cases breaks recursive ZST/union codec generation.
+    if data_types.contains_key(&union_class) {
+        return union_class;
     }
+    data_types.insert(
+        union_class.clone(),
+        oomir::DataType::Class {
+            fields: vec![
+                (UNION_BYTES_FIELD.to_string(), byte_array_type()),
+                (UNION_OBJECTS_FIELD.to_string(), object_array_type()),
+            ],
+            is_abstract: false,
+            methods: HashMap::new(),
+            super_class: Some("java/lang/Object".to_string()),
+            interfaces: vec![],
+        },
+    );
 
     let union_ty = tcx
         .type_of(adt_def.did())
@@ -4459,6 +4462,49 @@ pub fn ty_to_oomir_type<'tcx>(
                 );
             }
 
+            let needs_managed_drop = !resolved_ty.has_param()
+                && !resolved_ty.has_escaping_bound_vars()
+                && resolved_ty.needs_drop(tcx, TypingEnv::fully_monomorphized())
+                && matches!(
+                    data_types.get(&tuple_class_name),
+                    Some(oomir::DataType::Class { methods, .. })
+                        if !methods.contains_key(MANAGED_DROP_METHOD)
+                );
+            if needs_managed_drop {
+                if let Some(oomir::DataType::Class {
+                    methods,
+                    interfaces,
+                    ..
+                }) = data_types.get_mut(&tuple_class_name)
+                {
+                    methods.insert(
+                        MANAGED_DROP_METHOD.to_string(),
+                        DataTypeMethod::SimpleConstantReturn(oomir::Type::Void, None),
+                    );
+                    if !interfaces
+                        .iter()
+                        .any(|interface| interface == MANAGED_DROP_INTERFACE)
+                    {
+                        interfaces.push(MANAGED_DROP_INTERFACE.to_string());
+                    }
+                }
+                let drop_method = managed_drop_glue_function(
+                    resolved_ty,
+                    &tuple_class_name,
+                    tcx,
+                    data_types,
+                    instance_context,
+                );
+                if let Some(oomir::DataType::Class { methods, .. }) =
+                    data_types.get_mut(&tuple_class_name)
+                {
+                    methods.insert(
+                        MANAGED_DROP_METHOD.to_string(),
+                        DataTypeMethod::Function(drop_method),
+                    );
+                }
+            }
+
             // Return the OOMIR type as a Class reference
             oomir::Type::Class(tuple_class_name)
         }
@@ -4842,6 +4888,21 @@ pub fn readable_oomir_type_name(t: &oomir::Type) -> String {
     }
 }
 
+fn readable_tuple_abi_type_name(t: &oomir::Type) -> String {
+    use oomir::Type;
+    match t {
+        Type::Class(name) => sanitize_name_token(name),
+        Type::Interface(name) => format!("I{}", sanitize_name_token(name)),
+        Type::Array(inner) => format!("{}Array", readable_tuple_abi_type_name(inner)),
+        Type::Slice(inner) => format!("{}Slice", readable_tuple_abi_type_name(inner)),
+        Type::Pointer(inner) => format!("Ptr{}", readable_tuple_abi_type_name(inner)),
+        Type::Reference(inner) | Type::MutableReference(inner) => {
+            format!("Ref{}", readable_tuple_abi_type_name(inner))
+        }
+        _ => readable_oomir_type_name(t),
+    }
+}
+
 /// Produce a readable type token without erasing Rust distinctions that share a
 /// JVM carrier. In particular, DST references such as `&str` are represented by
 /// the same `Utf8View` carrier as `str`, but they are different generic types and
@@ -4895,6 +4956,24 @@ pub fn readable_rust_type_name<'tcx>(
                 .collect::<Vec<_>>()
                 .join("_")
         ),
+        TyKind::Dynamic(predicates, _) => {
+            let base =
+                readable_oomir_type_name(&ty_to_oomir_type(ty, tcx, data_types, instance_context));
+            let auto_traits = predicates
+                .iter()
+                .filter_map(|predicate| match predicate.skip_binder() {
+                    ExistentialPredicate::AutoTrait(def_id) => {
+                        Some(readable_qualified_def_path(tcx, def_id))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if auto_traits.is_empty() {
+                base
+            } else {
+                format!("{base}_{}", auto_traits.join("_"))
+            }
+        }
         TyKind::Adt(adt_def, substs) => {
             // Generic arguments participate in the generated class identity.
             // Retain their qualified Rust path so unrelated types with the
@@ -4924,6 +5003,7 @@ pub fn readable_rust_type_name<'tcx>(
                 format!("{}_{}", base, args.join("_"))
             }
         }
+        TyKind::Char => "char".to_string(),
         TyKind::Int(IntTy::Isize) => "isize".to_string(),
         TyKind::Uint(UintTy::Usize) => "usize".to_string(),
         _ => readable_oomir_type_name(&ty_to_oomir_type(ty, tcx, data_types, instance_context)),
@@ -5012,6 +5092,7 @@ fn readable_pointer_codec_type_name<'tcx>(
                 format!("{}_of_{}", base, args.join("_and_"))
             }
         }
+        TyKind::Char => "char".to_string(),
         TyKind::Int(IntTy::Isize) => "isize".to_string(),
         TyKind::Uint(UintTy::Usize) => "usize".to_string(),
         _ => readable_oomir_type_name(&ty_to_oomir_type(ty, tcx, data_types, instance_context)),
@@ -5171,7 +5252,9 @@ pub fn generate_tuple_jvm_class_name<'tcx>(
     let mut oomir_element_types = Vec::new();
     for ty in element_tys {
         let oomir_ty = ty_to_oomir_type(*ty, tcx, data_types, instance_context);
-        let token = readable_oomir_type_name(&oomir_ty);
+        // Downstream monomorphizations have a fresh collision registry, so keep
+        // carrier paths in tuple names to prevent incompatible linker fragments.
+        let token = readable_tuple_abi_type_name(&oomir_ty);
         tokens.push(sanitize_name_token(&token));
         oomir_element_types.push(oomir_ty);
     }

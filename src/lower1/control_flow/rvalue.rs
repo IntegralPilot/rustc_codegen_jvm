@@ -6,7 +6,6 @@ use rustc_middle::{
     },
     ty::{EarlyBinder, Instance, Ty, TyCtxt, TyKind, TypingEnv, adjustment::PointerCoercion},
 };
-use rustc_span::sym;
 use std::collections::{HashMap, HashSet};
 
 use super::{
@@ -25,9 +24,7 @@ use super::{
             union_from_method_name,
         },
     },
-    checked_ops::{
-        checked_arithmetic_tuple_local_name, emit_checked_arithmetic_oomir_instructions,
-    },
+    checked_ops::emit_checked_arithmetic_oomir_instructions,
     oomir::{self, DataTypeMethod},
     trait_objects::{carrier_needs_trait_object_adapter, ensure_trait_object_adapter_class},
 };
@@ -221,35 +218,147 @@ fn emit_raw_array_pointer_unsize<'tcx>(
         && matches!(source_oomir_ty, oomir::Type::Pointer(_))
         && matches!(target_oomir_ty, oomir::Type::Pointer(_))
     {
-        if let Some(callable_abi) = super::super::types::callable_trait_object_abi(
+        let callable_abi = super::super::types::callable_trait_object_abi(
             target_pointer_ty,
             tcx,
             data_types,
             instance,
-        ) {
-            ensure_closure_callable_bridge(
-                source_pointee,
-                &callable_abi,
-                data_types,
-                tcx,
-                instance,
-            );
-        }
+        );
+        let callable_closure_bridge = callable_abi.as_ref().is_some_and(|callable_abi| {
+            ensure_closure_callable_bridge(source_pointee, &callable_abi, data_types, tcx, instance)
+        });
+        let callable_fn_def_adapter = if callable_closure_bridge {
+            None
+        } else {
+            callable_abi.as_ref().and_then(|callable_abi| {
+                let TyKind::FnDef(def_id, args) = source_pointee.kind() else {
+                    return None;
+                };
+                let function_instance = Instance::resolve_for_fn_ptr(
+                    tcx,
+                    TypingEnv::post_analysis(tcx, instance.def_id()),
+                    *def_id,
+                    args.no_bound_vars()?,
+                )?;
+                let target = fn_pointer_target(tcx, function_instance, &callable_abi.signature);
+                Some(ensure_fn_pointer_adapter_class(
+                    data_types,
+                    target.as_ref(),
+                    &callable_abi.signature,
+                    &callable_abi.interface_name,
+                    tcx,
+                    instance,
+                ))
+            })
+        };
+        let erased_pointer_dest = format!("{dest}_pointer");
         instructions.push(oomir::Instruction::InvokeVirtual {
-            dest: Some(dest.to_string()),
+            dest: Some(erased_pointer_dest.clone()),
             class_name: oomir::POINTER_CLASS.to_string(),
             method_name: "retype".to_string(),
             method_ty: oomir::Signature {
                 params: vec![
-                    ("self".to_string(), source_oomir_ty),
+                    ("self".to_string(), source_oomir_ty.clone()),
                     ("view_size".to_string(), oomir::Type::U64),
                 ],
                 ret: Box::new(target_oomir_ty.clone()),
                 is_static: false,
             },
             args: vec![oomir::Operand::Constant(oomir::Constant::U64(0))],
-            operand: source,
+            operand: source.clone(),
         });
+        let erased_pointer = oomir::Operand::Variable {
+            name: erased_pointer_dest,
+            ty: target_oomir_ty.clone(),
+        };
+        if callable_closure_bridge {
+            instructions.push(oomir::Instruction::InvokeStatic {
+                dest: Some(dest.to_string()),
+                class_name: oomir::POINTER_CLASS.to_string(),
+                method_name: "attachPointeeTraitObjectCarrier".to_string(),
+                method_ty: oomir::Signature {
+                    params: vec![("pointer".to_string(), target_oomir_ty.clone())],
+                    ret: Box::new(target_oomir_ty.clone()),
+                    is_static: true,
+                },
+                args: vec![erased_pointer],
+            });
+        } else if let Some(adapter_class) = callable_fn_def_adapter {
+            let carrier_dest = format!("{dest}_carrier");
+            instructions.push(oomir::Instruction::ConstructObject {
+                dest: carrier_dest.clone(),
+                class_name: adapter_class.clone(),
+                args: Vec::new(),
+            });
+            instructions.push(oomir::Instruction::InvokeStatic {
+                dest: Some(dest.to_string()),
+                class_name: oomir::POINTER_CLASS.to_string(),
+                method_name: "attachTraitObjectCarrier".to_string(),
+                method_ty: oomir::Signature {
+                    params: vec![
+                        ("pointer".to_string(), target_oomir_ty.clone()),
+                        (
+                            "carrier".to_string(),
+                            oomir::Type::Class("java/lang/Object".to_string()),
+                        ),
+                    ],
+                    ret: Box::new(target_oomir_ty.clone()),
+                    is_static: true,
+                },
+                args: vec![
+                    erased_pointer,
+                    oomir::Operand::Variable {
+                        name: carrier_dest,
+                        ty: oomir::Type::Class(adapter_class),
+                    },
+                ],
+            });
+        } else {
+            let oomir::Type::Interface(interface_name) =
+                ty_to_oomir_type(target_pointee, tcx, data_types, instance)
+            else {
+                return None;
+            };
+            let adapter_class = ensure_trait_object_adapter_class(
+                source_pointer_ty,
+                target_pointer_ty,
+                &source_oomir_ty,
+                &interface_name,
+                data_types,
+                tcx,
+                instance,
+            )
+            .ok()?;
+            let carrier_dest = format!("{dest}_carrier");
+            instructions.push(oomir::Instruction::ConstructObject {
+                dest: carrier_dest.clone(),
+                class_name: adapter_class.clone(),
+                args: vec![(source.clone(), source_oomir_ty.clone())],
+            });
+            instructions.push(oomir::Instruction::InvokeStatic {
+                dest: Some(dest.to_string()),
+                class_name: oomir::POINTER_CLASS.to_string(),
+                method_name: "attachTraitObjectCarrier".to_string(),
+                method_ty: oomir::Signature {
+                    params: vec![
+                        ("pointer".to_string(), target_oomir_ty.clone()),
+                        (
+                            "carrier".to_string(),
+                            oomir::Type::Class("java/lang/Object".to_string()),
+                        ),
+                    ],
+                    ret: Box::new(target_oomir_ty.clone()),
+                    is_static: true,
+                },
+                args: vec![
+                    erased_pointer,
+                    oomir::Operand::Variable {
+                        name: carrier_dest,
+                        ty: oomir::Type::Class(adapter_class),
+                    },
+                ],
+            });
+        }
         return Some(oomir::Operand::Variable {
             name: dest.to_string(),
             ty: target_oomir_ty,
@@ -354,6 +463,7 @@ fn emit_unsize_value<'tcx>(
     let checkpoint = instructions.len();
     let source_ty = normalize_unsize_ty(source_ty, tcx, instance);
     let target_ty = normalize_unsize_ty(target_ty, tcx, instance);
+    ensure_nested_callable_unsize(source_ty, target_ty, tcx, instance, data_types);
     let source_oomir_ty = ty_to_oomir_type(source_ty, tcx, data_types, instance);
     let target_oomir_ty = ty_to_oomir_type(target_ty, tcx, data_types, instance);
 
@@ -467,6 +577,57 @@ fn emit_unsize_value<'tcx>(
         instructions.truncate(checkpoint);
     }
     result
+}
+
+/// Coercions such as `Box<Closure> -> Box<dyn FnOnce()>` can pass through
+/// several transparent pointer wrappers whose JVM carriers are already ABI-
+/// compatible. Walk the Rust types as well so that an equal-carrier fast path
+/// cannot skip installing the callable interface on the concrete closure.
+fn ensure_nested_callable_unsize<'tcx>(
+    source_ty: Ty<'tcx>,
+    target_ty: Ty<'tcx>,
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
+    data_types: &mut HashMap<String, oomir::DataType>,
+) -> bool {
+    let source_ty = normalize_unsize_ty(source_ty, tcx, instance);
+    let target_ty = normalize_unsize_ty(target_ty, tcx, instance);
+    if matches!(source_ty.kind(), TyKind::Closure(..))
+        && matches!(target_ty.kind(), TyKind::Dynamic(..))
+        && let Some(callable_abi) =
+            super::super::types::callable_trait_object_abi(target_ty, tcx, data_types, instance)
+    {
+        return ensure_closure_callable_bridge(source_ty, &callable_abi, data_types, tcx, instance);
+    }
+
+    match (source_ty.kind(), target_ty.kind()) {
+        (TyKind::Ref(_, source, _), TyKind::Ref(_, target, _))
+        | (TyKind::RawPtr(source, _), TyKind::RawPtr(target, _))
+        | (TyKind::Pat(source, _), TyKind::Pat(target, _)) => {
+            ensure_nested_callable_unsize(*source, *target, tcx, instance, data_types)
+        }
+        (TyKind::Adt(source_def, source_args), TyKind::Adt(target_def, target_args))
+            if source_def.did() == target_def.did() =>
+        {
+            source_def.variants().iter().any(|variant| {
+                variant.fields.iter().any(|field| {
+                    ensure_nested_callable_unsize(
+                        field.ty(tcx, source_args).skip_norm_wip(),
+                        field.ty(tcx, target_args).skip_norm_wip(),
+                        tcx,
+                        instance,
+                        data_types,
+                    )
+                })
+            })
+        }
+        (TyKind::Tuple(source), TyKind::Tuple(target)) if source.len() == target.len() => {
+            source.iter().zip(target.iter()).any(|(source, target)| {
+                ensure_nested_callable_unsize(source, target, tcx, instance, data_types)
+            })
+        }
+        _ => false,
+    }
 }
 
 fn emit_pointer_factory(
@@ -634,12 +795,7 @@ fn emit_pointer_to_place<'tcx>(
                 let (base_name, base_instructions, base_ty) =
                     emit_instructions_to_get_on_own(&base_place, tcx, instance, mir, data_types);
                 instructions.extend(base_instructions);
-                let dereferences_direct_jvm_self = base_place.local.index() == 1
-                    && base_place.projection.is_empty()
-                    && tcx
-                        .opt_associated_item(instance.def_id())
-                        .is_some_and(|item| item.is_method());
-                if matches!(base_ty, oomir::Type::Pointer(_)) && !dereferences_direct_jvm_self {
+                if matches!(base_ty, oomir::Type::Pointer(_)) {
                     let dest = format!("{temp_prefix}_reborrow");
                     instructions.push(oomir::Instruction::Move {
                         dest: dest.clone(),
@@ -825,22 +981,8 @@ fn emit_pointer_to_place<'tcx>(
                 let base_rust_ty = EarlyBinder::bind(tcx, base_place.ty(&mir.local_decls, tcx).ty)
                     .instantiate(tcx, instance.args)
                     .skip_norm_wip();
-                // Project aggregate fields from the base Pointer so they retain
-                // the allocation and byte offset of the complete Rust value.
-                // Ordinary direct JVM receivers use write-through field cells.
-                // Atomic<T>, identified semantically by its diagnostic item,
-                // must preserve its decoded byte-storage origin so aliases use
-                // the same physical atomic location and lock stripe.
-                let projects_direct_instance_self = base_place.local.index() == 1
-                    && matches!(base_place.projection.as_ref(), [ProjectionElem::Deref])
-                    && tcx
-                        .opt_associated_item(instance.def_id())
-                        .is_some_and(|item| item.is_method());
-                let is_atomic_receiver = matches!(
-                    base_rust_ty.kind(),
-                    TyKind::Adt(adt_def, _)
-                        if tcx.is_diagnostic_item(sym::Atomic, adt_def.did())
-                );
+                // Preserve allocation provenance for aggregate field pointers;
+                // the runtime still uses write-through cells for managed receivers.
                 let use_managed_field = (matches!(
                     base_rust_ty.kind(),
                     TyKind::Adt(adt_def, _) if adt_def.is_struct() || adt_def.is_enum()
@@ -898,7 +1040,6 @@ fn emit_pointer_to_place<'tcx>(
                         instructions,
                     );
                     if matches!(base_rust_ty.kind(), TyKind::Adt(adt_def, _) if adt_def.is_struct())
-                        && (!projects_direct_instance_self || is_atomic_receiver)
                     {
                         let base_layout = tcx
                             .layout_of(
@@ -1337,6 +1478,23 @@ pub(crate) fn fn_pointer_target<'tcx>(
         return Some(FnPointerTarget::Static(static_name));
     };
     if !associated_item.is_method() {
+        return Some(FnPointerTarget::Static(static_name));
+    }
+    let rust_receiver_ty = tcx
+        .fn_sig(target_instance.def_id())
+        .instantiate(tcx, target_instance.args)
+        .skip_binder()
+        .inputs()
+        .first()
+        .copied()?;
+    if matches!(
+        rust_receiver_ty.kind(),
+        TyKind::Ref(_, pointee, _)
+            if matches!(pointee.kind(), TyKind::Adt(adt_def, _) if adt_def.is_enum())
+    ) {
+        // Enum implementations can contain trait methods with identical JVM
+        // signatures (notably Debug::fmt and Display::fmt). They therefore
+        // remain distinct static functions rather than methods on the enum.
         return Some(FnPointerTarget::Static(static_name));
     }
     let (_, receiver_ty) = signature.params.first()?;
@@ -1913,31 +2071,62 @@ fn ensure_closure_callable_bridge<'tcx>(
     let mut closure_params = Vec::new();
     let mut closure_call_args = Vec::new();
     if has_captures {
+        let closure_mir = tcx.instance_mir(closure_instance.def);
+        let environment_rust_ty = EarlyBinder::bind(
+            tcx,
+            closure_mir.local_decls[rustc_middle::mir::Local::from_usize(1)].ty,
+        )
+        .instantiate(tcx, closure_instance.args)
+        .skip_norm_wip();
         let environment_ty =
-            oomir::Type::Pointer(Box::new(oomir::Type::Class(closure_class.clone())));
-        let environment_dest = "_closure_environment".to_string();
-        instructions.push(oomir::Instruction::InvokeStatic {
-            dest: Some(environment_dest.clone()),
-            class_name: oomir::POINTER_CLASS.to_string(),
-            method_name: "cell".to_string(),
-            method_ty: oomir::Signature {
-                params: vec![(
-                    "value".to_string(),
-                    oomir::Type::Class("java/lang/Object".to_string()),
-                )],
-                ret: Box::new(environment_ty.clone()),
-                is_static: true,
-            },
-            args: vec![oomir::Operand::Variable {
-                name: "_1".to_string(),
-                ty: oomir::Type::Class(closure_class.clone()),
-            }],
-        });
+            ty_to_oomir_type(environment_rust_ty, tcx, data_types, instance_context);
         closure_params.push(("closure_env".to_string(), environment_ty.clone()));
-        closure_call_args.push(oomir::Operand::Variable {
-            name: environment_dest,
-            ty: environment_ty,
-        });
+        let receiver = oomir::Operand::Variable {
+            name: "_1".to_string(),
+            ty: oomir::Type::Class(closure_class.clone()),
+        };
+        if matches!(environment_ty, oomir::Type::Pointer(_)) {
+            let environment_name = "_closure_env".to_string();
+            instructions.push(oomir::Instruction::InvokeStatic {
+                dest: Some(environment_name.clone()),
+                class_name: oomir::POINTER_CLASS.to_string(),
+                method_name: "cell".to_string(),
+                method_ty: oomir::Signature {
+                    params: vec![
+                        (
+                            "value".to_string(),
+                            oomir::Type::Class("java/lang/Object".to_string()),
+                        ),
+                        ("size".to_string(), oomir::Type::U64),
+                        ("codec".to_string(), oomir::Type::java_string()),
+                    ],
+                    ret: Box::new(environment_ty.clone()),
+                    is_static: true,
+                },
+                args: vec![
+                    receiver,
+                    oomir::Operand::Constant(oomir::Constant::U64(
+                        u64::try_from(
+                            super::super::types::layout_size_bytes(tcx, closure_ty)
+                                .expect("closure layout is available"),
+                        )
+                        .expect("closure layout exceeds u64"),
+                    )),
+                    super::super::types::pointer_view_codec_operand(
+                        closure_ty,
+                        tcx,
+                        data_types,
+                        instance_context,
+                    ),
+                ],
+            });
+            closure_call_args.push(oomir::Operand::Variable {
+                name: environment_name,
+                ty: environment_ty,
+            });
+        } else {
+            closure_call_args.push(receiver);
+        }
     }
     if let Some(tuple_call_arg) = tuple_call_arg {
         closure_params.push(("args".to_string(), tuple_oomir_ty));
@@ -2009,6 +2198,43 @@ fn ensure_closure_callable_bridge<'tcx>(
         interfaces.push(callable_abi.interface_name.clone());
     }
     true
+}
+
+fn closure_callable_abi<'tcx>(
+    closure_ty: Ty<'tcx>,
+    tcx: TyCtxt<'tcx>,
+    data_types: &mut HashMap<String, oomir::DataType>,
+    instance: Instance<'tcx>,
+) -> Option<super::super::types::CallableTraitObjectAbi<'tcx>> {
+    let closure_ty = normalize_unsize_ty(closure_ty, tcx, instance);
+    let TyKind::Closure(_, closure_args) = closure_ty.kind() else {
+        return None;
+    };
+    let closure_signature = closure_args.as_closure().sig();
+    let tuple_ty = *closure_signature.inputs().skip_binder().first()?;
+    let TyKind::Tuple(tuple_elements) = tuple_ty.kind() else {
+        return None;
+    };
+    let params = tuple_elements
+        .iter()
+        .enumerate()
+        .filter_map(|(index, element_ty)| {
+            let ty = ty_to_oomir_type(element_ty, tcx, data_types, instance);
+            ty.has_jvm_value().then(|| (format!("arg{index}"), ty))
+        })
+        .collect();
+    let output_ty = closure_signature.output().skip_binder();
+    let signature = oomir::Signature {
+        params,
+        ret: Box::new(ty_to_oomir_type(output_ty, tcx, data_types, instance)),
+        is_static: true,
+    };
+    let interface_name = ensure_fn_ptr_interface(&signature, data_types, tcx, instance);
+    Some(super::super::types::CallableTraitObjectAbi {
+        tuple_ty,
+        signature,
+        interface_name,
+    })
 }
 
 fn ensure_erased_receiver_fn_pointer_bridge<'tcx>(
@@ -2121,15 +2347,32 @@ fn ensure_erased_receiver_fn_pointer_bridge<'tcx>(
             field_ty: erased_payload_ty.clone(),
             owner_class: carrier_class.clone(),
         },
-        oomir::Instruction::Cast {
-            op: oomir::Operand::Variable {
-                name: erased_payload_name,
-                ty: erased_payload_ty,
+    ];
+    let erased_payload = oomir::Operand::Variable {
+        name: erased_payload_name,
+        ty: erased_payload_ty.clone(),
+    };
+    if matches!(source_receiver_ty, oomir::Type::Pointer(_))
+        && matches!(erased_payload_ty, oomir::Type::Pointer(_))
+    {
+        instructions.push(oomir::Instruction::InvokeStatic {
+            dest: Some(typed_receiver_name.clone()),
+            class_name: oomir::POINTER_CLASS.to_string(),
+            method_name: "restoreErasedView".to_string(),
+            method_ty: oomir::Signature {
+                params: vec![("pointer".to_string(), erased_payload_ty)],
+                ret: Box::new(source_receiver_ty.clone()),
+                is_static: true,
             },
+            args: vec![erased_payload],
+        });
+    } else {
+        instructions.push(oomir::Instruction::Cast {
+            op: erased_payload,
             ty: source_receiver_ty.clone(),
             dest: typed_receiver_name.clone(),
-        },
-    ];
+        });
+    }
 
     let mut call_args = vec![oomir::Operand::Variable {
         name: typed_receiver_name,
@@ -2768,6 +3011,47 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                         ty_to_oomir_type(source_mir_ty, tcx, data_types, instance);
                     let raw_oomir_operand =
                         convert_operand(operand, tcx, instance, mir, data_types, &mut instructions);
+                    if matches!(source_mir_ty.kind(), TyKind::RawPtr(..) | TyKind::Ref(..))
+                        && matches!(
+                            pointer_pointee_ty(source_mir_ty).kind(),
+                            TyKind::Dynamic(..)
+                        )
+                        && matches!(target_mir_ty.kind(), TyKind::RawPtr(..) | TyKind::Ref(..))
+                        && matches!(oomir_target_type, oomir::Type::Pointer(_))
+                    {
+                        instructions.push(oomir::Instruction::InvokeStatic {
+                            dest: Some(temp_cast_var.clone()),
+                            class_name: "org/rustlang/runtime/RuntimeSupport".to_string(),
+                            method_name: "traitObjectDataPointer".to_string(),
+                            method_ty: oomir::Signature {
+                                params: vec![
+                                    ("pointer".to_string(), oomir_source_type),
+                                    ("view_size".to_string(), oomir::Type::U64),
+                                    ("view_codec".to_string(), oomir::Type::java_string()),
+                                ],
+                                ret: Box::new(oomir_target_type.clone()),
+                                is_static: true,
+                            },
+                            args: vec![
+                                raw_oomir_operand,
+                                pointer_view_size_operand(*target_mir_ty, tcx, instance),
+                                super::super::types::pointer_view_codec_operand(
+                                    pointer_pointee_ty(*target_mir_ty),
+                                    tcx,
+                                    data_types,
+                                    instance,
+                                ),
+                            ],
+                        });
+                        return (
+                            instructions,
+                            oomir::Operand::Variable {
+                                name: temp_cast_var,
+                                ty: oomir_target_type,
+                            },
+                        );
+                    }
+
                     // Promoted reference constants are exposed by rustc as the
                     // pointee scalar/object. Re-materialize their canonical
                     // Pointer carrier before interpreting any pointer cast.
@@ -2913,8 +3197,10 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                         )
                     })
                     .flatten();
-                    let callable_closure_bridge =
-                        callable_abi.as_ref().is_some_and(|callable_abi| {
+                    let direct_callable_interface =
+                        matches!(oomir_target_type, oomir::Type::Interface(_));
+                    let callable_closure_bridge = direct_callable_interface
+                        && callable_abi.as_ref().is_some_and(|callable_abi| {
                             ensure_closure_callable_bridge(
                                 source_mir_ty,
                                 callable_abi,
@@ -2923,31 +3209,34 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                                 instance,
                             )
                         });
-                    let callable_fn_def_adapter = callable_abi.as_ref().and_then(|callable_abi| {
-                        let callable_ty = match source_mir_ty.kind() {
-                            TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _) => *pointee,
-                            _ => source_mir_ty,
-                        };
-                        let TyKind::FnDef(def_id, args) = callable_ty.kind() else {
-                            return None;
-                        };
-                        let function_instance = Instance::resolve_for_fn_ptr(
-                            tcx,
-                            TypingEnv::post_analysis(tcx, mir.source.def_id()),
-                            *def_id,
-                            args.no_bound_vars()?,
-                        )?;
-                        let target =
-                            fn_pointer_target(tcx, function_instance, &callable_abi.signature);
-                        Some(ensure_fn_pointer_adapter_class(
-                            data_types,
-                            target.as_ref(),
-                            &callable_abi.signature,
-                            &callable_abi.interface_name,
-                            tcx,
-                            instance,
-                        ))
-                    });
+                    let callable_fn_def_adapter = direct_callable_interface
+                        .then(|| callable_abi.as_ref())
+                        .flatten()
+                        .and_then(|callable_abi| {
+                            let callable_ty = match source_mir_ty.kind() {
+                                TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _) => *pointee,
+                                _ => source_mir_ty,
+                            };
+                            let TyKind::FnDef(def_id, args) = callable_ty.kind() else {
+                                return None;
+                            };
+                            let function_instance = Instance::resolve_for_fn_ptr(
+                                tcx,
+                                TypingEnv::post_analysis(tcx, mir.source.def_id()),
+                                *def_id,
+                                args.no_bound_vars()?,
+                            )?;
+                            let target =
+                                fn_pointer_target(tcx, function_instance, &callable_abi.signature);
+                            Some(ensure_fn_pointer_adapter_class(
+                                data_types,
+                                target.as_ref(),
+                                &callable_abi.signature,
+                                &callable_abi.interface_name,
+                                tcx,
+                                instance,
+                            ))
+                        });
 
                     let trait_object_adapter = if !callable_closure_bridge
                         && callable_fn_def_adapter.is_none()
@@ -3942,11 +4231,10 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                         BinOp::MulWithOverflow => "mul",
                         _ => unreachable!(),
                     };
-                    let tuple_local_name = checked_arithmetic_tuple_local_name(&op_oomir_ty)
-                        .unwrap_or_else(|| {
-                            panic!("Unsupported type for checked arithmetic: {:?}", op_oomir_ty)
-                        });
-                    let tuple_type_name = format!("org/rustlang/core/{tuple_local_name}");
+                    let tuple_type_name = oomir_result_type
+                        .get_class_name()
+                        .unwrap_or_else(|| panic!("checked arithmetic result is not a tuple class"))
+                        .to_string();
                     let (checked_instructions, tmp_pair_var, _tmp_result_var, _tmp_overflow_var) =
                         emit_checked_arithmetic_oomir_instructions(
                             &base_temp_name, // Use base temp name for context
@@ -4200,6 +4488,18 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                     }
                 }
                 rustc_middle::mir::AggregateKind::Closure(_, _) => {
+                    let closure_ty = original_dest_place.ty(&mir.local_decls, tcx).ty;
+                    if let Some(callable_abi) =
+                        closure_callable_abi(closure_ty, tcx, data_types, instance)
+                    {
+                        ensure_closure_callable_bridge(
+                            closure_ty,
+                            &callable_abi,
+                            data_types,
+                            tcx,
+                            instance,
+                        );
+                    }
                     let closure_class_name = match &aggregate_oomir_type {
                         oomir::Type::Class(name) => name.clone(),
                         _ => panic!("Closure aggregate type error"),

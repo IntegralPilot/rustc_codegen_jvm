@@ -2,9 +2,10 @@
 rustflags = [
   "-C", "link-args=../../../runtime/build/libs/runtime-0.1.0.jar",
   "-C", "strip=none",
-  "-Z", "share-generics=yes"
+  "-Z", "share-generics=yes",
+  "-Z", "inline-mir=no"
 ]
 
-# Throwing a JVM exception will unwind and give a stack trace, no need for rust to handle unwinding.
+# Rust panics cross JVM frames as exceptions and are caught by panic_unwind.
 [profile]
-panic = "abort"
+panic = "unwind"

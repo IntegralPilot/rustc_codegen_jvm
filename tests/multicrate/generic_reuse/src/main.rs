@@ -1,11 +1,5 @@
-#![no_std]
-#![feature(lang_items)]
-#![allow(internal_features)]
-
-include!("../../../support/test_prelude.rs");
-
-use alloc::vec;
-use alloc::vec::Vec;
+use std::vec;
+use std::vec::Vec;
 use provider::{
     DynValue, GenericMethodOwner, Holder, ProviderConstructed, ProviderCounter,
     invoke_callback_through_a_deliberately_long_generic_wrapper_that_exercises_hashed_closure_names_and_forces_the_fallback_path,

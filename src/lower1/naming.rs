@@ -34,21 +34,26 @@ pub struct JvmStaticImport {
 
 pub fn mono_owner_class<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> String {
     let def_id = instance.def_id();
-    if !def_id.is_local()
+    let external_runtime_generic = !def_id.is_local()
         && !matches!(instance.def, InstanceKind::Intrinsic(_))
         && jvm_names::is_runtime_crate(tcx, def_id.krate)
         && jvm_names::compiles_external_core_instances(tcx)
         && tcx.generics_of(def_id).requires_monomorphization(tcx)
         && !instance.args.has_param()
-        && !instance.args.has_escaping_bound_vars()
-        && instance.upstream_monomorphization(tcx).is_none()
-    {
-        let instance_key =
-            super::types::stable_normalized_instance_key(tcx, instance.def_id(), instance.args);
+        && !instance.args.has_escaping_bound_vars();
+    let mono_owner_crate = match instance.upstream_monomorphization(tcx) {
+        None => Some(LOCAL_CRATE),
+        Some(exporter) if exporter != def_id.krate => Some(exporter),
+        Some(_) => None,
+    };
+    if external_runtime_generic && let Some(owner_crate) = mono_owner_crate {
+        // Runtime generics are emitted by the first downstream crate that
+        // needs them. Later crates must call that exporter's mono bucket.
+        let instance_key = tcx.symbol_name(instance).name;
         let bucket = super::types::short_hash(&instance_key, 1);
         format!(
             "{}/mono/MonoBucket_{}",
-            jvm_names::crate_root(tcx, LOCAL_CRATE),
+            jvm_names::crate_root(tcx, owner_crate),
             bucket
         )
     } else if let Some(trait_def_id) = tcx
@@ -244,7 +249,7 @@ fn associated_specialization_name<'tcx>(
     let identity = format!(
         "{}:{}",
         super::types::stable_def_path(tcx, canonical_def_id),
-        super::types::stable_normalized_instance_key(tcx, instance.def_id(), instance.args)
+        tcx.symbol_name(instance).name
     );
     crate::stable_hash::readable_or_hashed_name(
         &method,
@@ -359,8 +364,7 @@ pub fn mono_fn_name_from_instance<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'t
         }
     }
 
-    let identity =
-        super::types::stable_normalized_instance_key(tcx, instance.def_id(), instance.args);
+    let identity = tcx.symbol_name(instance).name;
     FnNameData {
         class_to_call_on: class,
         method_name: crate::stable_hash::readable_or_hashed_name(

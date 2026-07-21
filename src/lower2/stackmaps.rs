@@ -1,7 +1,9 @@
 use super::constant_pool::InternedConstantPool;
 use super::jvm::{
     self, BaseType, Constant, ConstantPool, FieldType,
-    attributes::{ArrayType, Attribute, Instruction, StackFrame, VerificationType},
+    attributes::{
+        ArrayType, Attribute, ExceptionTableEntry, Instruction, StackFrame, VerificationType,
+    },
 };
 use crate::oomir::{self, Type};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -232,8 +234,10 @@ pub(super) fn build_stack_map_attributes(
     max_locals: u16,
     constant_pool: &mut InternedConstantPool,
     context: &str,
+    exception_table: &[ExceptionTableEntry],
 ) -> jvm::Result<Vec<Attribute>> {
-    let target_offsets = branch_targets(instructions);
+    let mut target_offsets = branch_targets(instructions);
+    target_offsets.extend(exception_table.iter().map(|entry| entry.handler_pc));
     if instructions.is_empty() || target_offsets.is_empty() {
         return Ok(Vec::new());
     }
@@ -245,6 +249,7 @@ pub(super) fn build_stack_map_attributes(
         max_locals as usize,
         constant_pool,
         context,
+        exception_table,
     )?;
 
     let name_index = constant_pool.add_utf8("StackMapTable")?;
@@ -297,6 +302,7 @@ pub(super) fn initialize_locals_loaded_as_top(
     max_locals: u16,
     constant_pool: &ConstantPool,
     context: &str,
+    exception_table: &mut [ExceptionTableEntry],
 ) -> jvm::Result<usize> {
     if instructions.is_empty() {
         return Ok(0);
@@ -309,6 +315,7 @@ pub(super) fn initialize_locals_loaded_as_top(
         max_locals as usize,
         constant_pool,
         context,
+        exception_table,
     )?;
     let locals = locals_loaded_as_top(instructions, &states, context)?;
     if locals.is_empty() {
@@ -326,6 +333,7 @@ pub(super) fn initialize_locals_loaded_as_top(
     })?;
     shift_absolute_branch_targets(instructions, prefix_len, context)?;
     instructions.splice(0..0, prefix);
+    shift_exception_table(exception_table, prefix_len, context)?;
 
     let states = solve_frame_states(
         instructions,
@@ -334,6 +342,7 @@ pub(super) fn initialize_locals_loaded_as_top(
         max_locals as usize,
         constant_pool,
         context,
+        exception_table,
     )?;
     let remaining = locals_loaded_as_top(instructions, &states, context)?;
     if !remaining.is_empty() {
@@ -346,6 +355,36 @@ pub(super) fn initialize_locals_loaded_as_top(
     }
 
     Ok(usize::from(prefix_len))
+}
+
+fn shift_exception_table(
+    exception_table: &mut [ExceptionTableEntry],
+    amount: u16,
+    context: &str,
+) -> jvm::Result<()> {
+    for entry in exception_table {
+        entry.range_pc.start = entry.range_pc.start.checked_add(amount).ok_or_else(|| {
+            jvm::Error::VerificationError {
+                context: context.to_string(),
+                message: "exception range start overflowed while inserting a prefix".to_string(),
+            }
+        })?;
+        entry.range_pc.end = entry.range_pc.end.checked_add(amount).ok_or_else(|| {
+            jvm::Error::VerificationError {
+                context: context.to_string(),
+                message: "exception range end overflowed while inserting a prefix".to_string(),
+            }
+        })?;
+        entry.handler_pc =
+            entry
+                .handler_pc
+                .checked_add(amount)
+                .ok_or_else(|| jvm::Error::VerificationError {
+                    context: context.to_string(),
+                    message: "exception handler overflowed while inserting a prefix".to_string(),
+                })?;
+    }
+    Ok(())
 }
 
 fn locals_loaded_as_top(
@@ -519,6 +558,7 @@ fn solve_frame_states(
     max_locals: usize,
     constant_pool: &ConstantPool,
     context: &str,
+    exception_table: &[ExceptionTableEntry],
 ) -> jvm::Result<Vec<Option<FrameState>>> {
     let mut states = vec![None; instructions.len()];
     states[0] = Some(FrameState::new(initial_locals.to_vec(), max_locals));
@@ -561,6 +601,31 @@ fn solve_frame_states(
                 worklist.push_back(target);
             }
         }
+
+        for handler in exception_table
+            .iter()
+            .filter(|handler| handler.range_pc.contains(&(index as u16)))
+        {
+            let target = usize::from(handler.handler_pc);
+            if target >= instructions.len() {
+                continue;
+            }
+            let mut handler_state = input_state.clone();
+            handler_state.stack.clear();
+            handler_state
+                .stack
+                .push(FrameValue::Object("java/lang/Throwable".to_string()));
+            let changed = match &mut states[target] {
+                Some(existing) => merge_state(existing, &handler_state),
+                slot @ None => {
+                    *slot = Some(handler_state);
+                    true
+                }
+            };
+            if changed && !worklist.contains(&target) {
+                worklist.push_back(target);
+            }
+        }
     }
 
     Ok(states)
@@ -568,9 +633,10 @@ fn solve_frame_states(
 
 fn describe_instruction(instruction: &Instruction, constant_pool: &ConstantPool) -> String {
     let method = match instruction {
-        Instruction::Invokevirtual(index)
-        | Instruction::Invokestatic(index)
-        | Instruction::Invokespecial(index) => method_ref_info(constant_pool, *index, false).ok(),
+        Instruction::Invokevirtual(index) | Instruction::Invokespecial(index) => {
+            method_ref_info(constant_pool, *index, false).ok()
+        }
+        Instruction::Invokestatic(index) => static_method_ref_info(constant_pool, *index).ok(),
         Instruction::Invokeinterface(index, _) => method_ref_info(constant_pool, *index, true).ok(),
         _ => None,
     };
@@ -1038,18 +1104,20 @@ fn transfer_instruction(
             state.pop(context, instruction_index)?;
             state.pop_reference(context, instruction_index)?;
         }
-        I::Invokevirtual(method_ref)
-        | I::Invokestatic(method_ref)
-        | I::Invokespecial(method_ref) => {
+        I::Invokevirtual(method_ref) | I::Invokespecial(method_ref) => {
             let method = method_ref_info(constant_pool, *method_ref, false)?;
             apply_invoke(
                 &mut state,
                 &method,
-                matches!(instruction, I::Invokestatic(_)),
+                false,
                 matches!(instruction, I::Invokespecial(_)),
                 context,
                 instruction_index,
             )?;
+        }
+        I::Invokestatic(method_ref) => {
+            let method = static_method_ref_info(constant_pool, *method_ref)?;
+            apply_invoke(&mut state, &method, true, false, context, instruction_index)?;
         }
         I::Invokedynamic(invoke_dynamic_ref) => {
             let method = invoke_dynamic_info(constant_pool, *invoke_dynamic_ref)?;
@@ -1554,6 +1622,17 @@ fn method_ref_info(
         method_name,
         descriptor,
     })
+}
+
+fn static_method_ref_info(
+    constant_pool: &ConstantPool,
+    method_ref: u16,
+) -> jvm::Result<MethodRefInfo> {
+    let is_interface = matches!(
+        constant_pool.try_get(method_ref)?,
+        Constant::InterfaceMethodRef { .. }
+    );
+    method_ref_info(constant_pool, method_ref, is_interface)
 }
 
 fn invoke_dynamic_info(

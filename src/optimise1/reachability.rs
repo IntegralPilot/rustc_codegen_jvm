@@ -4,6 +4,7 @@ use super::*;
 pub fn get_instruction_successors(instruction: &Instruction) -> Vec<String> {
     match instruction {
         Instruction::Jump { target } => vec![target.clone()],
+        Instruction::UnwindStart { target } => vec![target.clone()],
         Instruction::Branch {
             true_block,
             false_block,
@@ -21,6 +22,20 @@ pub fn get_instruction_successors(instruction: &Instruction) -> Vec<String> {
         // Other instructions are not terminators
         _ => vec![],
     }
+}
+
+/// Returns every control-flow successor of a block, including exceptional
+/// cleanup edges which precede the ordinary terminator in the instruction list.
+pub fn get_block_successors(block: &BasicBlock) -> Vec<String> {
+    let mut successors = Vec::new();
+    for instruction in &block.instructions {
+        for successor in get_instruction_successors(instruction) {
+            if !successors.contains(&successor) {
+                successors.push(successor);
+            }
+        }
+    }
+    successors
 }
 
 pub fn find_reachable_blocks(

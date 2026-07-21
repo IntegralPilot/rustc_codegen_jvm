@@ -1,9 +1,3 @@
-#![no_std]
-#![feature(lang_items)]
-#![allow(internal_features)]
-
-include!("../../../support/test_prelude.rs");
-
 fn sum(values: &[i32]) -> i32 {
     let mut total = 0;
     let mut index = 0;
@@ -161,6 +155,30 @@ fn check_slice_to_str_view() {
     assert!(unchecked_utf8(&bytes) == "é");
 }
 
+fn check_slice_to_array_conversions() {
+    macro_rules! check {
+        ($length:expr) => {{
+            type Array = [u8; $length];
+            let mut array: Array = [7; $length];
+            let slice: &[u8] = &array[..];
+
+            assert!(<&Array>::try_from(slice).unwrap() == &array);
+            assert!(<Array>::try_from(slice).unwrap() == array);
+
+            let mutable_slice: &mut [u8] = &mut array[..];
+            assert!(<&mut Array>::try_from(mutable_slice).unwrap() == &[7; $length]);
+        }};
+    }
+
+    check!(0);
+    check!(1);
+    check!(3);
+    check!(19);
+
+    let too_short: &[u8] = &[1, 2];
+    assert!(<[u8; 3]>::try_from(too_short).is_err());
+}
+
 fn main() {
     let values = [10, 20, 30, 40, 50];
     let whole: &[i32] = &values;
@@ -175,4 +193,5 @@ fn main() {
     check_utf8_char_prefix();
     check_utf8_byte_contents();
     check_slice_to_str_view();
+    check_slice_to_array_conversions();
 }

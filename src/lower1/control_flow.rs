@@ -13,7 +13,7 @@ use rustc_hir::def::DefKind;
 use rustc_middle::{
     mir::{
         BasicBlock, BasicBlockData, Body, Local, Location, NonDivergingIntrinsic,
-        Operand as MirOperand, Place, SourceInfo, StatementKind, TerminatorKind,
+        Operand as MirOperand, Place, SourceInfo, StatementKind, TerminatorKind, UnwindAction,
         visit::{PlaceContext, Visitor},
     },
     ty::{EarlyBinder, Instance, InstanceKind, ShimKind, Ty, TyCtxt, TyKind, TypingEnv},
@@ -613,11 +613,6 @@ pub(super) fn emit_rust_drop_value<'tcx>(
 
     match rust_ty.kind() {
         TyKind::Adt(adt_def, substs) if adt_def.is_struct() => {
-            if !super::types::should_define_named_data_type(tcx, adt_def.did()) {
-                // JVM-backed foreign containers use managed carriers whose
-                // native Rust field layout is not the JVM object layout.
-                return;
-            }
             if adt_def.destructor(tcx).is_some() {
                 let class_name = oomir_ty
                     .get_class_name()
@@ -857,20 +852,18 @@ pub(super) fn emit_rust_drop_value<'tcx>(
                     dest: None,
                 });
             }
-            if super::types::should_define_named_data_type(tcx, adt_def.did()) {
-                instructions.push(oomir::Instruction::InvokeVirtual {
-                    class_name,
-                    method_name: "_rust_drop_fields".to_string(),
-                    method_ty: oomir::Signature {
-                        params: vec![("self".to_string(), oomir_ty)],
-                        ret: Box::new(oomir::Type::Void),
-                        is_static: false,
-                    },
-                    args: Vec::new(),
-                    dest: None,
-                    operand: value,
-                });
-            }
+            instructions.push(oomir::Instruction::InvokeVirtual {
+                class_name,
+                method_name: "_rust_drop_fields".to_string(),
+                method_ty: oomir::Signature {
+                    params: vec![("self".to_string(), oomir_ty)],
+                    ret: Box::new(oomir::Type::Void),
+                    is_static: false,
+                },
+                args: Vec::new(),
+                dest: None,
+                operand: value,
+            });
         }
         _ => {}
     }
@@ -1722,6 +1715,26 @@ pub(super) fn convert_basic_block<'tcx>(
         let mut debug_local_collector = DebugLocalCollector::default();
         debug_local_collector.visit_terminator(terminator, terminator_location);
         let instruction_start = instructions.len();
+        let unwind_target = match &terminator.kind {
+            TerminatorKind::Call {
+                unwind: UnwindAction::Cleanup(target),
+                ..
+            }
+            | TerminatorKind::Assert {
+                unwind: UnwindAction::Cleanup(target),
+                ..
+            }
+            | TerminatorKind::Drop {
+                unwind: UnwindAction::Cleanup(target),
+                ..
+            } => Some(format!("bb{}", target.index())),
+            _ => None,
+        };
+        if let Some(target) = &unwind_target {
+            instructions.push(oomir::Instruction::UnwindStart {
+                target: target.clone(),
+            });
+        }
         match &terminator.kind {
             TerminatorKind::Return => {
                 // Handle Return without operand
@@ -2246,7 +2259,8 @@ pub(super) fn convert_basic_block<'tcx>(
                                 // when that pointee has no generated instance
                                 // methods (notably closures and function items).
                                 let receiver_self_requires_static_dispatch =
-                                    has_enum_reference_receiver
+                                    inherent_container_mir_ty.is_some()
+                                        || has_enum_reference_receiver
                                         || has_arbitrary_self_receiver
                                         || trait_impl_self_requires_static_dispatch
                                         || matches!(
@@ -3790,6 +3804,84 @@ pub(super) fn convert_basic_block<'tcx>(
                                     src: oomir_operands[0].clone(),
                                 });
                             }
+                        } else if is_compiler_intrinsic
+                            && intrinsic_name == "disjoint_bitor"
+                            && oomir_operands.len() == 2
+                            && let Some(dest) = effective_dest.clone()
+                        {
+                            instructions.push(oomir::Instruction::BitOr {
+                                dest,
+                                op1: oomir_operands[0].clone(),
+                                op2: oomir_operands[1].clone(),
+                            });
+                        } else if is_compiler_intrinsic
+                            && matches!(intrinsic_name.as_str(), "bswap" | "fabs")
+                            && oomir_operands.len() == 1
+                        {
+                            instructions.push(oomir::Instruction::InvokeStatic {
+                                class_name: "org/rustlang/runtime/Intrinsics".to_string(),
+                                method_name: if intrinsic_name == "bswap" {
+                                    "byteSwap".to_string()
+                                } else {
+                                    "floatAbs".to_string()
+                                },
+                                method_ty: oomir::Signature {
+                                    params: vec![(
+                                        "value".to_string(),
+                                        oomir_operands[0]
+                                            .get_type()
+                                            .expect("unary intrinsic operand is typed"),
+                                    )],
+                                    ret: Box::new(oomir_output_type.clone()),
+                                    is_static: true,
+                                },
+                                args: oomir_operands.clone(),
+                                dest: effective_dest.clone(),
+                            });
+                        } else if is_compiler_intrinsic
+                            && matches!(
+                                intrinsic_name.as_str(),
+                                "unchecked_funnel_shl" | "unchecked_funnel_shr"
+                            )
+                            && oomir_operands.len() == 3
+                        {
+                            instructions.push(oomir::Instruction::InvokeStatic {
+                                class_name: "org/rustlang/runtime/Intrinsics".to_string(),
+                                method_name: if intrinsic_name == "unchecked_funnel_shl" {
+                                    "funnelShiftLeft".to_string()
+                                } else {
+                                    "funnelShiftRight".to_string()
+                                },
+                                method_ty: oomir::Signature {
+                                    params: vec![
+                                        ("high".to_string(), oomir_output_type.clone()),
+                                        ("low".to_string(), oomir_output_type.clone()),
+                                        ("shift".to_string(), oomir::Type::U32),
+                                    ],
+                                    ret: Box::new(oomir_output_type.clone()),
+                                    is_static: true,
+                                },
+                                args: oomir_operands.clone(),
+                                dest: effective_dest.clone(),
+                            });
+                        } else if is_compiler_intrinsic
+                            && intrinsic_name == "carryless_mul"
+                            && oomir_operands.len() == 2
+                        {
+                            instructions.push(oomir::Instruction::InvokeStatic {
+                                class_name: "org/rustlang/runtime/Intrinsics".to_string(),
+                                method_name: "carrylessMultiply".to_string(),
+                                method_ty: oomir::Signature {
+                                    params: vec![
+                                        ("left".to_string(), oomir_output_type.clone()),
+                                        ("right".to_string(), oomir_output_type.clone()),
+                                    ],
+                                    ret: Box::new(oomir_output_type.clone()),
+                                    is_static: true,
+                                },
+                                args: oomir_operands.clone(),
+                                dest: effective_dest.clone(),
+                            });
                         } else if is_compiler_intrinsic
                             && intrinsic_name == "catch_unwind"
                             && oomir_operands.len() == 3
@@ -5771,11 +5863,29 @@ pub(super) fn convert_basic_block<'tcx>(
                 });
             }
             TerminatorKind::UnwindResume => {
-                // "Resume" implies we are in a cleanup block, we finished cleanup,
-                // and now we must continue unwinding (rethrow the exception).
+                instructions.push(oomir::Instruction::Rethrow);
+            }
+            TerminatorKind::UnwindTerminate(_) => {
+                instructions.push(oomir::Instruction::InvokeStatic {
+                    dest: None,
+                    class_name: "org/rustlang/runtime/PanicSupport".to_string(),
+                    method_name: "abort".to_string(),
+                    method_ty: oomir::Signature {
+                        params: vec![(
+                            "failure".to_string(),
+                            oomir::Type::Class("java/lang/Throwable".to_string()),
+                        )],
+                        ret: Box::new(oomir::Type::Void),
+                        is_static: true,
+                    },
+                    args: vec![oomir::Operand::Variable {
+                        name: "__rust_unwind_exception".to_string(),
+                        ty: oomir::Type::Class("java/lang/Throwable".to_string()),
+                    }],
+                });
                 instructions.push(oomir::Instruction::ThrowNewWithMessage {
-                    exception_class: "java/lang/RuntimeException".to_string(),
-                    message: "Panic unwinding resumed.".to_string(),
+                    exception_class: "java/lang/AssertionError".to_string(),
+                    message: "Rust abort unexpectedly returned".to_string(),
                 });
             }
             // Other terminator kinds will be added as needed.
@@ -5786,6 +5896,9 @@ pub(super) fn convert_basic_block<'tcx>(
                     format!("Warning: Unhandled terminator {:?}", terminator.kind)
                 );
             }
+        }
+        if unwind_target.is_some() {
+            instructions.push(oomir::Instruction::UnwindEnd);
         }
         if instructions.len() > instruction_start {
             let mut metadata = Vec::new();

@@ -87,11 +87,7 @@ fn block_predecessors(function: &Function) -> HashMap<String, Vec<String>> {
         .collect();
 
     for (label, block) in &function.body.basic_blocks {
-        let successors = block
-            .instructions
-            .last()
-            .map(super::reachability::get_instruction_successors)
-            .unwrap_or_default();
+        let successors = super::reachability::get_block_successors(block);
         for successor in successors {
             if let Some(successor_predecessors) = predecessors.get_mut(&successor) {
                 successor_predecessors.push(label.clone());
@@ -230,11 +226,7 @@ fn block_live_out(function: &Function) -> HashMap<String, HashSet<String>> {
             defined.extend(instruction_defs(instruction));
         }
 
-        let block_successors = block
-            .instructions
-            .last()
-            .map(super::reachability::get_instruction_successors)
-            .unwrap_or_default()
+        let block_successors = super::reachability::get_block_successors(block)
             .into_iter()
             .filter(|successor| function.body.basic_blocks.contains_key(successor))
             .collect::<Vec<_>>();
@@ -372,6 +364,9 @@ fn rewrite_instruction_uses(instruction: &mut Instruction, aliases: &AliasMap) {
         }
         Instruction::SourceLocation(_)
         | Instruction::LocalVariableScope(_)
+        | Instruction::UnwindStart { .. }
+        | Instruction::UnwindEnd
+        | Instruction::Rethrow
         | Instruction::CreateFunctionPointer { .. }
         | Instruction::Jump { .. }
         | Instruction::ThrowNewWithMessage { .. }
@@ -573,6 +568,9 @@ fn collect_instruction_uses(instruction: &Instruction, uses: &mut HashSet<String
         }
         Instruction::SourceLocation(_)
         | Instruction::LocalVariableScope(_)
+        | Instruction::UnwindStart { .. }
+        | Instruction::UnwindEnd
+        | Instruction::Rethrow
         | Instruction::CreateFunctionPointer { .. }
         | Instruction::Jump { .. }
         | Instruction::ThrowNewWithMessage { .. }
@@ -633,6 +631,9 @@ fn instruction_defs(instruction: &Instruction) -> HashSet<String> {
         }
         Instruction::SourceLocation(_)
         | Instruction::LocalVariableScope(_)
+        | Instruction::UnwindStart { .. }
+        | Instruction::UnwindEnd
+        | Instruction::Rethrow
         | Instruction::Jump { .. }
         | Instruction::Branch { .. }
         | Instruction::Return { .. }

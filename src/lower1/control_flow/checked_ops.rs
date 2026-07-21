@@ -1,22 +1,6 @@
 use super::{checked_intrinsic_registry, checked_intrinsics};
 use crate::oomir::{Instruction, Operand, Type};
 
-pub fn checked_arithmetic_tuple_local_name(op_ty: &Type) -> Option<&'static str> {
-    match op_ty {
-        Type::I8 => Some("Tuple_i8_bool"),
-        Type::U8 => Some("Tuple_u8_bool"),
-        Type::I16 => Some("Tuple_i16_bool"),
-        Type::U16 => Some("Tuple_u16_bool"),
-        Type::I32 => Some("Tuple_i32_bool"),
-        Type::U32 => Some("Tuple_u32_bool"),
-        Type::I64 => Some("Tuple_i64_bool"),
-        Type::U64 => Some("Tuple_u64_bool"),
-        Type::Class(c) if c == crate::lower2::I128_CLASS => Some("Tuple_I128_bool"),
-        Type::Class(c) if c == crate::lower2::U128_CLASS => Some("Tuple_U128_bool"),
-        _ => None,
-    }
-}
-
 pub fn emit_checked_arithmetic_oomir_instructions(
     dest_base_name: &str,
     op1: &Operand,

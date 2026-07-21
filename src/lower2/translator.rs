@@ -11,13 +11,22 @@ use crate::oomir::{self, Type};
 
 use super::jvm::{
     self,
-    attributes::{ArrayType, BootstrapMethod, Instruction, LookupSwitch, TableSwitch},
+    attributes::{
+        ArrayType, BootstrapMethod, ExceptionTableEntry, Instruction, LookupSwitch, TableSwitch,
+    },
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::convert::TryInto;
 use std::io::Cursor;
+use std::rc::Rc;
 
 use super::{F128_CLASS, I128_CLASS, U128_CLASS};
+
+#[derive(Clone, Copy)]
+pub(super) struct DebugInfoOptions {
+    pub line_numbers: bool,
+    pub local_variables: bool,
+}
 
 /// Represents the state during the translation of a single function's body.
 pub struct FunctionTranslator<'a, 'cp> {
@@ -40,12 +49,24 @@ pub struct FunctionTranslator<'a, 'cp> {
     initial_locals: Vec<stackmaps::FrameValue>,
     direct_this_aliases: HashSet<String>,
     jvm_metadata: Vec<optimise2::BytecodeMetadata>,
-    current_source_location: Option<oomir::SourceLocation>,
-    current_active_variables: Vec<usize>,
+    current_source_location: Option<Rc<oomir::SourceLocation>>,
+    current_active_variables: Rc<Vec<usize>>,
+    debug_info: DebugInfoOptions,
+    active_unwind_region: Option<(usize, String)>,
+    unwind_regions: Vec<UnwindRegion>,
+    exception_table: Vec<ExceptionTableEntry>,
 
     // For max_locals calculation - track highest index used + size
     max_locals_used: u16,
 }
+
+struct UnwindRegion {
+    start: usize,
+    end: usize,
+    target: String,
+}
+
+const UNWIND_EXCEPTION_LOCAL: &str = "__rust_unwind_exception";
 
 struct SwitchFixup {
     instruction_index: usize,
@@ -66,6 +87,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         module: &'a oomir::Module,
         is_static: bool,
         owner_class_name: Option<&str>,
+        debug_info: DebugInfoOptions,
     ) -> Self {
         let mut translator = FunctionTranslator {
             oomir_func,
@@ -90,7 +112,11 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             direct_this_aliases: HashSet::new(),
             jvm_metadata: Vec::new(),
             current_source_location: None,
-            current_active_variables: Vec::new(),
+            current_active_variables: Rc::new(Vec::new()),
+            debug_info,
+            active_unwind_region: None,
+            unwind_regions: Vec::new(),
+            exception_table: Vec::new(),
             max_locals_used: 0,
         };
 
@@ -462,6 +488,54 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         Ok(order)
     }
 
+    fn emit_unwind_handlers(&mut self) -> Result<(), jvm::Error> {
+        if self.unwind_regions.is_empty() {
+            return Ok(());
+        }
+
+        let targets = self
+            .unwind_regions
+            .iter()
+            .map(|region| region.target.clone())
+            .collect::<BTreeSet<_>>();
+        let mut handlers = HashMap::new();
+        let exception_ty = oomir::Type::Class("java/lang/Throwable".to_string());
+        for target in targets {
+            let handler = u16::try_from(self.jvm_instructions.len()).map_err(|_| {
+                jvm::Error::VerificationError {
+                    context: format!("Function {}", self.oomir_func.name),
+                    message: "unwind handler exceeds the JVM instruction limit".to_string(),
+                }
+            })?;
+            self.store_result(UNWIND_EXCEPTION_LOCAL, &exception_ty)?;
+            let jump_index = self.jvm_instructions.len();
+            self.jvm_instructions.push(Instruction::Goto(0));
+            self.branch_fixups.push((jump_index, target.clone()));
+            handlers.insert(target, handler);
+        }
+        self.jvm_metadata.resize(
+            self.jvm_instructions.len(),
+            optimise2::BytecodeMetadata::default(),
+        );
+
+        for region in &self.unwind_regions {
+            let start = u16::try_from(region.start).map_err(|_| jvm::Error::VerificationError {
+                context: format!("Function {}", self.oomir_func.name),
+                message: "unwind range start exceeds the JVM instruction limit".to_string(),
+            })?;
+            let end = u16::try_from(region.end).map_err(|_| jvm::Error::VerificationError {
+                context: format!("Function {}", self.oomir_func.name),
+                message: "unwind range end exceeds the JVM instruction limit".to_string(),
+            })?;
+            self.exception_table.push(ExceptionTableEntry {
+                range_pc: start..end,
+                handler_pc: handlers[&region.target],
+                catch_type: 0,
+            });
+        }
+        Ok(())
+    }
+
     fn assign_local(&mut self, var_name: &str, ty: &oomir::Type) -> u16 {
         let key = (var_name.to_string(), ty.clone());
         if let Some(index) = self.typed_local_var_map.get(&key).copied() {
@@ -541,6 +615,13 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             .get(&(var_name.to_string(), ty.clone()))
             .copied()
     }
+
+    fn local_slot_has_slice_alias(&self, var_name: &str, index: u16) -> bool {
+        self.typed_local_var_map.iter().any(|((name, ty), slot)| {
+            name == var_name && *slot == index && matches!(ty, oomir::Type::Slice(_))
+        })
+    }
+
     fn get_local_index(&self, var_name: &str) -> Result<u16, jvm::Error> {
         self.local_var_map
             .get(var_name)
@@ -577,6 +658,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             Vec<jvm::attributes::Instruction>,
             u16,
             Vec<jvm::attributes::Attribute>,
+            Vec<jvm::attributes::ExceptionTableEntry>,
         ),
         jvm::Error,
     > {
@@ -599,18 +681,51 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 .map(|label| label.to_string());
 
             // Record the start instruction index for this block label
-            let start_instr_index = self.jvm_instructions.len().try_into().unwrap();
+            let start_instr_index = self.jvm_instructions.len().try_into().map_err(|_| {
+                jvm::Error::VerificationError {
+                    context: format!("Function {}", self.oomir_func.name),
+                    message: "Function exceeds the JVM's 65,535-instruction limit".to_string(),
+                }
+            })?;
             self.label_to_instr_index
                 .insert(block_label.clone(), start_instr_index);
 
             // Translate instructions in the block
             for (instruction_index, instr) in block.instructions.iter().enumerate() {
                 if let oomir::Instruction::SourceLocation(location) = instr {
-                    self.current_source_location = Some(location.clone());
+                    if self.debug_info.line_numbers {
+                        self.current_source_location = Some(Rc::new(location.clone()));
+                    }
                     continue;
                 }
                 if let oomir::Instruction::LocalVariableScope(variables) = instr {
-                    self.current_active_variables.clone_from(variables);
+                    if self.debug_info.local_variables {
+                        self.current_active_variables = Rc::new(variables.clone());
+                    }
+                    continue;
+                }
+                if let oomir::Instruction::UnwindStart { target } = instr {
+                    if self.active_unwind_region.is_some() {
+                        return Err(jvm::Error::VerificationError {
+                            context: format!("Function {}", self.oomir_func.name),
+                            message: "nested OOMIR unwind regions are not supported".to_string(),
+                        });
+                    }
+                    self.active_unwind_region = Some((self.jvm_instructions.len(), target.clone()));
+                    continue;
+                }
+                if matches!(instr, oomir::Instruction::UnwindEnd) {
+                    let Some((start, target)) = self.active_unwind_region.take() else {
+                        return Err(jvm::Error::VerificationError {
+                            context: format!("Function {}", self.oomir_func.name),
+                            message: "OOMIR unwind end has no matching start".to_string(),
+                        });
+                    };
+                    let end = self.jvm_instructions.len();
+                    if end > start {
+                        self.unwind_regions
+                            .push(UnwindRegion { start, end, target });
+                    }
                     continue;
                 }
                 self.translate_instruction(instr).map_err(|error| {
@@ -622,11 +737,21 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                         message: format!("Failed to translate {instr:?}: {error:?}"),
                     }
                 })?;
+                if self.jvm_instructions.len() > usize::from(u16::MAX) {
+                    return Err(jvm::Error::VerificationError {
+                        context: format!("Function {}", self.oomir_func.name),
+                        message: format!(
+                            "Function exceeded the JVM's 65,535-instruction limit in block \
+                             {block_label}, after OOMIR instruction {instruction_index} ({})",
+                            oomir_instruction_kind(instr)
+                        ),
+                    });
+                }
                 self.jvm_metadata.resize(
                     self.jvm_instructions.len(),
                     optimise2::BytecodeMetadata {
                         source_location: self.current_source_location.clone(),
-                        active_variables: self.current_active_variables.clone(),
+                        active_variables: Rc::clone(&self.current_active_variables),
                     },
                 );
             }
@@ -640,6 +765,15 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             }
         }
         self.current_fallthrough_block_label = None;
+
+        if self.active_unwind_region.is_some() {
+            return Err(jvm::Error::VerificationError {
+                context: format!("Function {}", self.oomir_func.name),
+                message: "unterminated OOMIR unwind region".to_string(),
+            });
+        }
+
+        self.emit_unwind_handlers()?;
 
         let branch_fixups = std::mem::take(&mut self.branch_fixups);
         for (instr_index, target_label) in branch_fixups {
@@ -702,18 +836,22 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             self.max_locals_used,
         );
         let fixed_prefix_slots = self.initial_locals.len() as u16;
-        let pinned_local_slots = self
-            .oomir_func
-            .debug_variables
-            .iter()
-            .filter_map(|variable| self.debug_variable_local(variable).map(|(slot, _)| slot))
-            .collect::<BTreeSet<_>>();
+        let pinned_local_slots = if self.debug_info.local_variables {
+            self.oomir_func
+                .debug_variables
+                .iter()
+                .filter_map(|variable| self.debug_variable_local(variable).map(|(slot, _)| slot))
+                .collect::<BTreeSet<_>>()
+        } else {
+            BTreeSet::new()
+        };
         let optimised = optimise2::optimise(
             std::mem::take(&mut self.jvm_instructions),
             std::mem::take(&mut self.jvm_metadata),
             self.max_locals_used,
             fixed_prefix_slots,
             &pinned_local_slots,
+            &mut self.exception_table,
         )
         .map_err(|error| jvm::Error::VerificationError {
             context: format!("Function {}", self.oomir_func.name),
@@ -727,6 +865,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             &mut self.jvm_instructions,
             &format!("Function {}", self.oomir_func.name),
         )? {
+            shift_exception_table_after_insert(&mut self.exception_table, 0)?;
             self.jvm_metadata
                 .insert(0, optimise2::BytecodeMetadata::default());
         }
@@ -749,11 +888,52 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             self.max_locals_used,
             self.constant_pool,
             &format!("Function {}", self.oomir_func.name),
+            &mut self.exception_table,
         )?;
         self.jvm_metadata.splice(
             0..0,
             std::iter::repeat_n(optimise2::BytecodeMetadata::default(), initializer_count),
         );
+        let code_size = instruction_byte_offsets(&self.jvm_instructions)?
+            .last()
+            .copied()
+            .unwrap_or(0);
+        if code_size > usize::from(u16::MAX) {
+            let handler_count = self
+                .exception_table
+                .iter()
+                .map(|entry| entry.handler_pc)
+                .collect::<BTreeSet<_>>()
+                .len();
+            let offsets = instruction_byte_offsets(&self.jvm_instructions)?;
+            let mut reachable = vec![false; self.jvm_instructions.len()];
+            let mut work = vec![0usize];
+            while let Some(index) = work.pop() {
+                if index >= reachable.len() || std::mem::replace(&mut reachable[index], true) {
+                    continue;
+                }
+                work.extend(optimise2::instruction_successors(
+                    index,
+                    &self.jvm_instructions[index],
+                    self.jvm_instructions.len(),
+                ));
+            }
+            let normal_size = reachable
+                .iter()
+                .enumerate()
+                .filter(|(_, reachable)| **reachable)
+                .map(|(index, _)| offsets[index + 1] - offsets[index])
+                .sum::<usize>();
+            return Err(jvm::Error::VerificationError {
+                context: format!("Function {}", self.oomir_func.name),
+                message: format!(
+                    "Generated JVM method is {code_size} bytes ({normal_size} normally reachable, {} instructions, {} unwind ranges, {handler_count} handlers); the JVM limit is {} bytes",
+                    self.jvm_instructions.len(),
+                    self.exception_table.len(),
+                    u16::MAX,
+                ),
+            });
+        }
         let mut code_attributes = stackmaps::build_stack_map_attributes(
             &self.jvm_instructions,
             &self.initial_locals,
@@ -761,80 +941,83 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             self.max_locals_used,
             self.constant_pool,
             &format!("Function {}", self.oomir_func.name),
+            &self.exception_table,
         )
         .map_err(|error| jvm::Error::VerificationError {
             context: format!("Function {}", self.oomir_func.name),
             message: format!("Failed to build StackMapTable: {error:?}"),
         })?;
 
-        let mut line_numbers = Vec::new();
-        let mut previous_line = None;
-        for (instruction_index, metadata) in self.jvm_metadata.iter().enumerate() {
-            let Some(location) = &metadata.source_location else {
-                continue;
-            };
-            if previous_line == Some(location.line) {
-                continue;
-            }
-            // ristretto's in-memory code attributes use instruction indices;
-            // serialization converts them to bytecode offsets together with
-            // branch and stack-map entries.
-            let start_pc =
-                u16::try_from(instruction_index).map_err(|_| jvm::Error::VerificationError {
-                    context: format!("Function {}", self.oomir_func.name),
-                    message: "JVM instruction index exceeds the LineNumberTable limit".to_string(),
+        if self.debug_info.line_numbers {
+            let mut line_numbers = Vec::new();
+            let mut previous_line = None;
+            for (instruction_index, metadata) in self.jvm_metadata.iter().enumerate() {
+                let Some(location) = &metadata.source_location else {
+                    continue;
+                };
+                if previous_line == Some(location.line) {
+                    continue;
+                }
+                // Ristretto converts instruction indices to byte offsets when serializing.
+                let start_pc = u16::try_from(instruction_index).map_err(|_| {
+                    jvm::Error::VerificationError {
+                        context: format!("Function {}", self.oomir_func.name),
+                        message: "JVM instruction index exceeds the LineNumberTable limit"
+                            .to_string(),
+                    }
                 })?;
-            let line_number =
-                u16::try_from(location.line).map_err(|_| jvm::Error::VerificationError {
-                    context: format!("Function {}", self.oomir_func.name),
-                    message: format!(
-                        "Rust source line {} exceeds the JVM LineNumberTable limit",
-                        location.line
-                    ),
-                })?;
-            line_numbers.push(jvm::attributes::LineNumber {
-                start_pc,
-                line_number,
-            });
-            previous_line = Some(location.line);
-        }
-        if !line_numbers.is_empty() {
-            code_attributes.push(jvm::attributes::Attribute::LineNumberTable {
-                name_index: self.constant_pool.add_utf8("LineNumberTable")?,
-                line_numbers,
-            });
-        }
-
-        let byte_offsets = instruction_byte_offsets(&self.jvm_instructions)?;
-        let mut local_variables = Vec::new();
-        for (variable_index, variable) in self.oomir_func.debug_variables.iter().enumerate() {
-            let Some((old_slot, actual_type)) = self.debug_variable_local(variable) else {
-                continue;
-            };
-            let Some(slot) = optimised.local_slot_map.get(&old_slot).copied() else {
-                // The value was completely optimized out and has no final JVM slot.
-                continue;
-            };
-
-            let width = get_type_size(&actual_type);
-            let slot_is_valid = slot
-                .checked_add(width)
-                .is_some_and(|end| end <= self.max_locals_used);
-            let is_parameter = slot < fixed_prefix_slots;
-            let is_materialized = is_parameter
-                || self
-                    .jvm_instructions
-                    .iter()
-                    .any(|instruction| optimise2::instruction_uses_local(instruction, slot));
-            if !slot_is_valid || !is_materialized {
-                // Late peepholes can remove a store/load pair after slot
-                // allocation. Such a binding is genuinely optimized out and
-                // must not leave a stale or out-of-bounds LVT entry behind.
-                continue;
+                let line_number =
+                    u16::try_from(location.line).map_err(|_| jvm::Error::VerificationError {
+                        context: format!("Function {}", self.oomir_func.name),
+                        message: format!(
+                            "Rust source line {} exceeds the JVM LineNumberTable limit",
+                            location.line
+                        ),
+                    })?;
+                line_numbers.push(jvm::attributes::LineNumber {
+                    start_pc,
+                    line_number,
+                });
+                previous_line = Some(location.line);
             }
+            if !line_numbers.is_empty() {
+                code_attributes.push(jvm::attributes::Attribute::LineNumberTable {
+                    name_index: self.constant_pool.add_utf8("LineNumberTable")?,
+                    line_numbers,
+                });
+            }
+        }
 
-            let initialized_at =
-                if is_parameter {
+        if self.debug_info.local_variables {
+            let byte_offsets = instruction_byte_offsets(&self.jvm_instructions)?;
+            let mut local_variables = Vec::new();
+            for (variable_index, variable) in self.oomir_func.debug_variables.iter().enumerate() {
+                let Some((old_slot, actual_type)) = self.debug_variable_local(variable) else {
+                    continue;
+                };
+                let Some(slot) = optimised.local_slot_map.get(&old_slot).copied() else {
+                    // The value was completely optimized out and has no final JVM slot.
+                    continue;
+                };
+
+                let width = get_type_size(&actual_type);
+                let slot_is_valid = slot
+                    .checked_add(width)
+                    .is_some_and(|end| end <= self.max_locals_used);
+                let is_parameter = slot < fixed_prefix_slots;
+                let is_materialized = is_parameter
+                    || self
+                        .jvm_instructions
+                        .iter()
+                        .any(|instruction| optimise2::instruction_uses_local(instruction, slot));
+                if !slot_is_valid || !is_materialized {
+                    // Late peepholes can remove a store/load pair after slot
+                    // allocation. Such a binding is genuinely optimized out and
+                    // must not leave a stale or out-of-bounds LVT entry behind.
+                    continue;
+                }
+
+                let initialized_at = if is_parameter {
                     0
                 } else {
                     let Some(write_index) = self.jvm_instructions.iter().position(|instruction| {
@@ -845,61 +1028,67 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     write_index + 1
                 };
 
-            let name_index = self.constant_pool.add_utf8(&variable.name)?;
-            let descriptor_index = self
-                .constant_pool
-                .add_utf8(actual_type.to_jvm_descriptor())?;
-            let mut range_start = None;
-            for instruction_index in 0..=self.jvm_metadata.len() {
-                let is_visible = self
-                    .jvm_metadata
-                    .get(instruction_index)
-                    .is_some_and(|metadata| {
-                        instruction_index >= initialized_at
-                            && metadata.active_variables.contains(&variable_index)
-                    });
-                match (range_start, is_visible) {
-                    (None, true) => range_start = Some(instruction_index),
-                    (Some(start), false) => {
-                        let start_pc = byte_offsets[start];
-                        let end_pc = byte_offsets[instruction_index];
-                        if end_pc > start_pc {
-                            local_variables.push(jvm::attributes::LocalVariableTable {
-                                start_pc: u16::try_from(start_pc).map_err(|_| {
-                                    jvm::Error::VerificationError {
-                                        context: format!("Function {}", self.oomir_func.name),
-                                        message:
-                                            "Local variable start offset exceeds the JVM limit"
-                                                .to_string(),
-                                    }
-                                })?,
-                                length: u16::try_from(end_pc - start_pc).map_err(|_| {
-                                    jvm::Error::VerificationError {
-                                        context: format!("Function {}", self.oomir_func.name),
-                                        message: "Local variable range exceeds the JVM limit"
-                                            .to_string(),
-                                    }
-                                })?,
-                                name_index,
-                                descriptor_index,
-                                index: slot,
+                let name_index = self.constant_pool.add_utf8(&variable.name)?;
+                let descriptor_index = self
+                    .constant_pool
+                    .add_utf8(actual_type.to_jvm_descriptor())?;
+                let mut range_start = None;
+                for instruction_index in 0..=self.jvm_metadata.len() {
+                    let is_visible =
+                        self.jvm_metadata
+                            .get(instruction_index)
+                            .is_some_and(|metadata| {
+                                instruction_index >= initialized_at
+                                    && metadata.active_variables.contains(&variable_index)
                             });
+                    match (range_start, is_visible) {
+                        (None, true) => range_start = Some(instruction_index),
+                        (Some(start), false) => {
+                            let start_pc = byte_offsets[start];
+                            let end_pc = byte_offsets[instruction_index];
+                            if end_pc > start_pc {
+                                local_variables.push(jvm::attributes::LocalVariableTable {
+                                    start_pc: u16::try_from(start_pc).map_err(|_| {
+                                        jvm::Error::VerificationError {
+                                            context: format!("Function {}", self.oomir_func.name),
+                                            message:
+                                                "Local variable start offset exceeds the JVM limit"
+                                                    .to_string(),
+                                        }
+                                    })?,
+                                    length: u16::try_from(end_pc - start_pc).map_err(|_| {
+                                        jvm::Error::VerificationError {
+                                            context: format!("Function {}", self.oomir_func.name),
+                                            message: "Local variable range exceeds the JVM limit"
+                                                .to_string(),
+                                        }
+                                    })?,
+                                    name_index,
+                                    descriptor_index,
+                                    index: slot,
+                                });
+                            }
+                            range_start = None;
                         }
-                        range_start = None;
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
-        }
-        local_variables.sort_by_key(|variable| (variable.index, variable.start_pc));
-        if !local_variables.is_empty() {
-            code_attributes.push(jvm::attributes::Attribute::LocalVariableTable {
-                name_index: self.constant_pool.add_utf8("LocalVariableTable")?,
-                variables: local_variables,
-            });
+            local_variables.sort_by_key(|variable| (variable.index, variable.start_pc));
+            if !local_variables.is_empty() {
+                code_attributes.push(jvm::attributes::Attribute::LocalVariableTable {
+                    name_index: self.constant_pool.add_utf8("LocalVariableTable")?,
+                    variables: local_variables,
+                });
+            }
         }
 
-        Ok((self.jvm_instructions, self.max_locals_used, code_attributes))
+        Ok((
+            self.jvm_instructions,
+            self.max_locals_used,
+            code_attributes,
+            self.exception_table,
+        ))
     }
 
     fn widen_branches(&mut self) -> Result<(), jvm::Error> {
@@ -967,6 +1156,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
 
     fn retarget_after_insert(&mut self, insert_at: usize) -> Result<(), jvm::Error> {
         let context = format!("Function {}", self.oomir_func.name);
+        shift_exception_table_after_insert(&mut self.exception_table, insert_at)?;
         for (instruction_index, instruction) in self.jvm_instructions.iter_mut().enumerate() {
             match instruction {
                 Instruction::Ifeq(target)
@@ -1123,11 +1313,17 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     };
                 let load_instr = get_load_instruction(&actual_ty, index)?;
                 self.jvm_instructions.push(load_instr);
+                let adapted_shared_slice = ty.to_jvm_descriptor().starts_with('[')
+                    && self.local_slot_has_slice_alias(var_name, index);
+                if adapted_shared_slice {
+                    self.adapt_loaded_slice_to_array(&ty.to_jvm_descriptor())?;
+                }
                 if !self.direct_this_aliases.contains(var_name)
+                    && !adapted_shared_slice
                     && actual_ty != *ty
                     && actual_ty.to_jvm_descriptor() != ty.to_jvm_descriptor()
                 {
-                    if !self.adapt_loaded_utf8_view(&actual_ty, ty)? {
+                    if !self.adapt_loaded_view(&actual_ty, ty)? {
                         let casts = get_cast_instructions(
                             &self.oomir_func.name,
                             &actual_ty,
@@ -1142,14 +1338,21 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         Ok(())
     }
 
-    /// Converts between the distinct JVM carriers used for Rust `str` and
-    /// `[u8]`. Optimised MIR can expose a temporary with one carrier while its
-    /// Rust-level operand has the other type (for example `char::encode_utf8`).
-    fn adapt_loaded_utf8_view(
+    /// Converts between JVM view carriers and the concrete carrier expected by
+    /// a Rust operation. Optimised MIR can expose a temporary using a different
+    /// carrier from the operand type recorded at its eventual use.
+    fn adapt_loaded_view(
         &mut self,
         actual_ty: &oomir::Type,
         expected_ty: &oomir::Type,
     ) -> Result<bool, jvm::Error> {
+        if matches!(actual_ty, oomir::Type::Slice(_))
+            && expected_ty.to_jvm_descriptor().starts_with('[')
+        {
+            self.adapt_loaded_slice_to_array(&expected_ty.to_jvm_descriptor())?;
+            return Ok(true);
+        }
+
         // Rust's optimised UTF-8 construction can expose `[MaybeUninit<u8>]`
         // as the intermediate slice type, so the element's OOMIR spelling is
         // not necessarily plain `u8` even though the view is byte-backed.
@@ -1291,7 +1494,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         if actual_ty != *expected_ty
             && actual_ty.to_jvm_descriptor() != expected_ty.to_jvm_descriptor()
         {
-            if self.adapt_loaded_utf8_view(&actual_ty, expected_ty)? {
+            if self.adapt_loaded_view(&actual_ty, expected_ty)? {
                 return Ok(());
             }
             let cast_instructions = get_cast_instructions(
@@ -1507,12 +1710,14 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
     }
 
     fn adapt_loaded_slice_to_array(&mut self, expected_jvm_type: &str) -> Result<(), jvm::Error> {
-        let slice_class = self.constant_pool.add_class(oomir::SLICE_VIEW_CLASS)?;
-        let to_array =
-            self.constant_pool
-                .add_method_ref(slice_class, "toArray", "()Ljava/lang/Object;")?;
+        let pointer_class = self.constant_pool.add_class(oomir::POINTER_CLASS)?;
+        let to_array = self.constant_pool.add_method_ref(
+            pointer_class,
+            "arrayCarrier",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+        )?;
         self.jvm_instructions
-            .push(Instruction::Invokevirtual(to_array));
+            .push(Instruction::Invokestatic(to_array));
 
         let expected_array_class = self.constant_pool.add_class(expected_jvm_type)?;
         self.jvm_instructions
@@ -2288,7 +2493,17 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         use oomir::Operand as OO;
 
         match instr {
-            OI::SourceLocation(_) | OI::LocalVariableScope(_) => {}
+            OI::SourceLocation(_)
+            | OI::LocalVariableScope(_)
+            | OI::UnwindStart { .. }
+            | OI::UnwindEnd => {}
+            OI::Rethrow => {
+                let exception_ty = oomir::Type::Class("java/lang/Throwable".to_string());
+                let local = self.get_or_assign_local(UNWIND_EXCEPTION_LOCAL, &exception_ty);
+                self.jvm_instructions
+                    .push(get_load_instruction(&exception_ty, local)?);
+                self.jvm_instructions.push(JI::Athrow);
+            }
             OI::Add { dest, op1, op2 } => {
                 if self.emit_iinc_add(dest, op1, op2)? {
                     return Ok(());
@@ -3597,28 +3812,12 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     // 1. Load array reference
                     self.load_operand(&array)?; // Stack: [arrayref]
 
-                    // 2. Determine thw element type by inspecting the array operand's type
-                    let array_operand_type = match &array {
-                        OO::Variable { ty, .. } => ty,
-                        OO::Constant(c) => match c.clone() {
-                            // Need the type representation for a constant array, e.g.,
-                            oomir::Constant::Array(inner_ty, _) => {
-                                &oomir::Type::Array(inner_ty.clone())
-                            }
-                            _ => {
-                                return Err(jvm::Error::VerificationError {
-                                    context: format!("Function {}", self.oomir_func.name),
-                                    message: format!(
-                                        "Operand {:?} used in ArrayGet is not an array type, found {:?}",
-                                        array, c
-                                    ),
-                                });
-                            }
-                        },
-                    };
+                    // Factory-backed constants retain their array type even though the
+                    // concrete constant is now an invokestatic rather than Array(...).
+                    let array_operand_type = get_operand_type(array);
 
                     // Now extract the element type *from* the array type
-                    let element_type = match array_operand_type {
+                    let element_type = match &array_operand_type {
                         oomir::Type::Array(inner_type)
                         | oomir::Type::MutableReference(inner_type) => {
                             // inner_type is likely Box<oomir::Type>, so deref it
@@ -4248,11 +4447,22 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             } => {
                 // 1. Add Method reference to constant pool
                 let class_index = self.constant_pool.add_class(class_name)?;
-                let method_ref_index = self.constant_pool.add_method_ref(
-                    class_index,
-                    method_name,
-                    &method_ty.to_string(),
-                )?;
+                let method_ref_index = if matches!(
+                    self.module.data_types.get(class_name),
+                    Some(oomir::DataType::Interface { .. })
+                ) {
+                    self.constant_pool.add_interface_method_ref(
+                        class_index,
+                        method_name,
+                        &method_ty.to_string(),
+                    )?
+                } else {
+                    self.constant_pool.add_method_ref(
+                        class_index,
+                        method_name,
+                        &method_ty.to_string(),
+                    )?
+                };
 
                 if args.len() != method_ty.params.len() {
                     return Err(jvm::Error::VerificationError {
@@ -4345,15 +4555,21 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
 
                 let load_instr = get_load_instruction(load_type, index)?;
                 self.jvm_instructions.push(load_instr);
+                let adapted_shared_slice = ty.to_jvm_descriptor().starts_with('[')
+                    && self.local_slot_has_slice_alias(var_name, index);
+                if adapted_shared_slice {
+                    self.adapt_loaded_slice_to_array(&ty.to_jvm_descriptor())?;
+                }
                 // A direct alias of JVM `this` contains the receiver object,
                 // even where MIR types the alias as a Rust pointer. It must
                 // remain an object until the call adapter wraps it in a
                 // Pointer cell.
                 if !self.direct_this_aliases.contains(var_name)
+                    && !adapted_shared_slice
                     && stored_ty != *ty
                     && stored_ty.to_jvm_descriptor() != ty.to_jvm_descriptor()
                 {
-                    if !self.adapt_loaded_utf8_view(&stored_ty, ty)? {
+                    if !self.adapt_loaded_view(&stored_ty, ty)? {
                         let casts = get_cast_instructions(
                             &self.oomir_func.name,
                             &stored_ty,
@@ -4431,7 +4647,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         if actual_ty != *expected_ty
             && actual_ty.to_jvm_descriptor() != expected_ty.to_jvm_descriptor()
         {
-            if self.adapt_loaded_utf8_view(&actual_ty, expected_ty)? {
+            if self.adapt_loaded_view(&actual_ty, expected_ty)? {
                 return Ok(());
             }
             self.jvm_instructions.extend(get_cast_instructions(
@@ -4458,6 +4674,32 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             context: format!("Function {}", self.oomir_func.name),
             message: format!("invokeinterface argument slot count {slots} exceeds u8 range"),
         })
+    }
+}
+
+fn oomir_instruction_kind(instruction: &oomir::Instruction) -> &'static str {
+    use oomir::Instruction as I;
+    match instruction {
+        I::Move {
+            src: oomir::Operand::Constant(_),
+            ..
+        } => "Move constant",
+        I::ArrayStore {
+            value: oomir::Operand::Constant(_),
+            ..
+        } => "ArrayStore constant",
+        I::ConstructObject { .. } => "ConstructObject",
+        I::InvokeStatic { .. } => "InvokeStatic",
+        I::InvokeVirtual { .. } => "InvokeVirtual",
+        I::InvokeInterface { .. } => "InvokeInterface",
+        I::CallIndirect { .. } => "CallIndirect",
+        I::NewArray { .. } => "NewArray",
+        I::ArrayStore { .. } => "ArrayStore",
+        I::ArrayFill { .. } => "ArrayFill",
+        I::Return {
+            operand: Some(oomir::Operand::Constant(_)),
+        } => "Return constant",
+        _ => "other",
     }
 }
 
@@ -4492,7 +4734,22 @@ fn layout_successors(block: &oomir::BasicBlock) -> Vec<String> {
         }
     };
 
-    match block.instructions.last() {
+    for instruction in &block.instructions {
+        if let oomir::Instruction::UnwindStart { target } = instruction {
+            push_unique(target);
+        }
+    }
+
+    let terminator = block.instructions.iter().rev().find(|instruction| {
+        !matches!(
+            instruction,
+            oomir::Instruction::SourceLocation(_)
+                | oomir::Instruction::LocalVariableScope(_)
+                | oomir::Instruction::UnwindStart { .. }
+                | oomir::Instruction::UnwindEnd
+        )
+    });
+    match terminator {
         Some(oomir::Instruction::Jump { target }) => push_unique(target),
         Some(oomir::Instruction::Branch {
             true_block,
@@ -4514,6 +4771,33 @@ fn layout_successors(block: &oomir::BasicBlock) -> Vec<String> {
     }
 
     successors
+}
+
+fn shift_exception_table_after_insert(
+    exception_table: &mut [ExceptionTableEntry],
+    insert_at: usize,
+) -> Result<(), jvm::Error> {
+    let bump = |value: &mut u16| {
+        *value = value
+            .checked_add(1)
+            .ok_or_else(|| jvm::Error::VerificationError {
+                context: "JVM exception-table rewrite".to_string(),
+                message: "exception-table instruction index overflowed u16".to_string(),
+            })?;
+        Ok::<(), jvm::Error>(())
+    };
+    for entry in exception_table {
+        if usize::from(entry.range_pc.start) >= insert_at {
+            bump(&mut entry.range_pc.start)?;
+        }
+        if usize::from(entry.range_pc.end) > insert_at {
+            bump(&mut entry.range_pc.end)?;
+        }
+        if usize::from(entry.handler_pc) >= insert_at {
+            bump(&mut entry.handler_pc)?;
+        }
+    }
+    Ok(())
 }
 
 fn is_null_operand(operand: &oomir::Operand) -> bool {

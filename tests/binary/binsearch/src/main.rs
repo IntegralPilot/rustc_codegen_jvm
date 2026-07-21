@@ -1,9 +1,3 @@
-#![no_std]
-#![feature(lang_items)]
-#![allow(internal_features)]
-
-include!("../../../support/test_prelude.rs");
-
 /// Binary search for u32 slices.
 /// Returns `Some(index)` if `target` is found, or `None` otherwise.
 pub fn binary_search(slice: &[u32], target: u32) -> Option<usize> {

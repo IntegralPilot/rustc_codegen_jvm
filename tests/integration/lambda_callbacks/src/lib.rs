@@ -1,9 +1,3 @@
-#![no_std]
-#![feature(lang_items)]
-#![allow(internal_features)]
-
-include!("../../../support/test_prelude.rs");
-
 pub fn apply_i32(callback: &dyn Fn(i32) -> i32, value: i32) -> i32 {
     callback(value)
 }

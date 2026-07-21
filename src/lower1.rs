@@ -494,6 +494,14 @@ pub fn mir_to_oomir<'tcx>(
             }
         }
     }
+    let is_jvm_main = signature.is_static
+        && fn_name == "main"
+        && matches!(
+            signature.params.as_slice(),
+            [(name, oomir::Type::Array(element))]
+                if name == "args"
+                    && matches!(element.as_ref(), oomir::Type::Class(class_name) if class_name == "java/lang/String")
+        );
 
     let mut debug_variables = Vec::new();
     let mut debug_variable_scopes = Vec::new();
@@ -604,6 +612,24 @@ pub fn mir_to_oomir<'tcx>(
     // For closures, we need to unpack the tuple argument into local variables
     // Closures take a single tuple parameter, but MIR expects individual arguments in separate locals
     let mut instrs = vec![];
+
+    if is_jvm_main {
+        let args_ty = signature.params[0].1.clone();
+        instrs.push(oomir::Instruction::InvokeStatic {
+            dest: None,
+            class_name: "org/rustlang/runtime/RuntimeSupport".to_string(),
+            method_name: "initializeArgs".to_string(),
+            method_ty: oomir::Signature {
+                params: vec![("args".to_string(), args_ty.clone())],
+                ret: Box::new(oomir::Type::Void),
+                is_static: true,
+            },
+            args: vec![oomir::Operand::Variable {
+                name: "param_0".to_string(),
+                ty: args_ty,
+            }],
+        });
+    }
 
     if matches!(instance_ty.kind(), TyKind::Closure(..)) && mir_cloned.arg_count > 0 {
         // For closures: local 0 = return place, local 1 = tuple argument

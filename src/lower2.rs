@@ -9,7 +9,7 @@ use jvm_gen::{
     create_default_constructor, create_slice_view_classfile, create_utf8_view_classfile,
     oomir_type_to_ristretto_field_type,
 };
-use translator::FunctionTranslator;
+use translator::{DebugInfoOptions, FunctionTranslator};
 
 use self::jvm::{
     ClassAccessFlags, ClassFile, FieldAccessFlags, MethodAccessFlags, Version,
@@ -134,8 +134,28 @@ fn create_constant_factory(
             fields: fields.clone(),
             params: params
                 .iter()
-                .map(|param| create_constant_factory(cp, owner_class, param, methods, next_factory))
+                .map(|param| {
+                    if constant_instruction_cost(param) > MAX_INLINE_CONSTANT_INSTRUCTIONS {
+                        create_constant_factory(cp, owner_class, param, methods, next_factory)
+                    } else {
+                        Ok(param.clone())
+                    }
+                })
                 .collect::<jvm::Result<Vec<_>>>()?,
+        },
+        oomir::Constant::StaticCall {
+            owner_class: call_owner,
+            method_name,
+            args,
+            ty,
+        } => oomir::Constant::StaticCall {
+            owner_class: call_owner.clone(),
+            method_name: method_name.clone(),
+            args: args
+                .iter()
+                .map(|arg| create_constant_factory(cp, owner_class, arg, methods, next_factory))
+                .collect::<jvm::Result<Vec<_>>>()?,
+            ty: ty.clone(),
         },
         _ => return Ok(constant.clone()),
     };
@@ -172,15 +192,173 @@ fn create_constant_factory(
     })
 }
 
+const MAX_INLINE_CONSTANT_INSTRUCTIONS: usize = 1_024;
+
+fn constant_instruction_cost(constant: &oomir::Constant) -> usize {
+    use oomir::Constant as C;
+    match constant {
+        C::Unit => 0,
+        C::StaticRef { .. } | C::FactoryCall { .. } => 1,
+        C::StaticCall { args, .. } => args.iter().fold(1usize, |cost, arg| {
+            cost.saturating_add(constant_instruction_cost(arg))
+        }),
+        C::FunctionPointer { .. } => 3,
+        C::PointerAddress { .. } => 3,
+        C::RepeatedBytePointer { .. } => 8,
+        C::I64(_) | C::U64(_) | C::F64(_) => 1,
+        C::I8(_)
+        | C::U8(_)
+        | C::I16(_)
+        | C::U16(_)
+        | C::I32(_)
+        | C::U32(_)
+        | C::F16(_)
+        | C::F32(_)
+        | C::Boolean(_)
+        | C::Char(_)
+        | C::String(_)
+        | C::Null(_) => 1,
+        C::Str(_) => 2,
+        C::Array(element_type, elements) => {
+            let element_cost = if element_type.has_jvm_value() {
+                elements.iter().fold(0usize, |cost, element| {
+                    cost.saturating_add(3 + constant_instruction_cost(element))
+                })
+            } else {
+                0
+            };
+            2usize.saturating_add(element_cost)
+        }
+        C::Slice(_, elements) => elements.iter().fold(7usize, |cost, element| {
+            cost.saturating_add(3 + constant_instruction_cost(element))
+        }),
+        C::SliceRef { backing, .. } => 5usize.saturating_add(constant_instruction_cost(backing)),
+        C::Instance { params, .. } => params.iter().fold(3usize, |cost, param| {
+            cost.saturating_add(constant_instruction_cost(param))
+        }),
+    }
+}
+
+fn prepare_constant_operand(
+    operand: &mut oomir::Operand,
+    cp: &mut InternedConstantPool,
+    owner_class: &str,
+    methods: &mut Vec<jvm::Method>,
+    next_factory: &mut usize,
+) -> jvm::Result<()> {
+    let oomir::Operand::Constant(constant) = operand else {
+        return Ok(());
+    };
+    if constant_instruction_cost(constant) > MAX_INLINE_CONSTANT_INSTRUCTIONS {
+        *constant = create_constant_factory(cp, owner_class, constant, methods, next_factory)?;
+    }
+    Ok(())
+}
+
+fn prepare_function_constants(
+    function: &mut oomir::Function,
+    cp: &mut InternedConstantPool,
+    owner_class: &str,
+    methods: &mut Vec<jvm::Method>,
+    next_factory: &mut usize,
+) -> jvm::Result<()> {
+    use oomir::Instruction as I;
+    for block in function.body.basic_blocks.values_mut() {
+        for instruction in &mut block.instructions {
+            let mut prepare = |operand: &mut oomir::Operand| {
+                prepare_constant_operand(operand, cp, owner_class, methods, next_factory)
+            };
+            match instruction {
+                I::Add { op1, op2, .. }
+                | I::Sub { op1, op2, .. }
+                | I::Mul { op1, op2, .. }
+                | I::Div { op1, op2, .. }
+                | I::Rem { op1, op2, .. }
+                | I::Eq { op1, op2, .. }
+                | I::Ne { op1, op2, .. }
+                | I::Lt { op1, op2, .. }
+                | I::Le { op1, op2, .. }
+                | I::Gt { op1, op2, .. }
+                | I::Ge { op1, op2, .. }
+                | I::BitAnd { op1, op2, .. }
+                | I::BitOr { op1, op2, .. }
+                | I::BitXor { op1, op2, .. }
+                | I::Shl { op1, op2, .. }
+                | I::Shr { op1, op2, .. } => {
+                    prepare(op1)?;
+                    prepare(op2)?;
+                }
+                I::Not { src, .. } | I::Neg { src, .. } | I::Move { src, .. } => prepare(src)?,
+                I::Branch { condition, .. } => prepare(condition)?,
+                I::Return { operand } => {
+                    if let Some(operand) = operand {
+                        prepare(operand)?;
+                    }
+                }
+                I::CallIndirect {
+                    function_ptr, args, ..
+                } => {
+                    prepare(function_ptr)?;
+                    for argument in args {
+                        prepare(argument)?;
+                    }
+                }
+                I::InvokeInterface { args, operand, .. }
+                | I::InvokeVirtual { args, operand, .. } => {
+                    prepare(operand)?;
+                    for argument in args {
+                        prepare(argument)?;
+                    }
+                }
+                I::InvokeStatic { args, .. } => {
+                    for argument in args {
+                        prepare(argument)?;
+                    }
+                }
+                I::NewArray { size, .. } => prepare(size)?,
+                I::ArrayStore { index, value, .. } => {
+                    prepare(index)?;
+                    prepare(value)?;
+                }
+                I::ArrayFill { value, .. } => prepare(value)?,
+                I::ArrayGet { array, index, .. } => {
+                    prepare(array)?;
+                    prepare(index)?;
+                }
+                I::Length { array, .. } => prepare(array)?,
+                I::ConstructObject { args, .. } => {
+                    for (argument, _) in args {
+                        prepare(argument)?;
+                    }
+                }
+                I::SetField { value, .. } => prepare(value)?,
+                I::GetField { object, .. } => prepare(object)?,
+                I::Cast { op, .. } => prepare(op)?,
+                I::Switch { discr, .. } => prepare(discr)?,
+                I::SourceLocation(_)
+                | I::LocalVariableScope(_)
+                | I::UnwindStart { .. }
+                | I::UnwindEnd
+                | I::Rethrow
+                | I::Jump { .. }
+                | I::CreateFunctionPointer { .. }
+                | I::ThrowNewWithMessage { .. }
+                | I::Label { .. } => {}
+            }
+        }
+    }
+    Ok(())
+}
+
 fn create_static_initializer_method(
     cp: &mut InternedConstantPool,
     this_class_index: u16,
     owner_class: &str,
     statics: &[&oomir::Static],
     methods: &mut Vec<jvm::Method>,
+    next_factory: &mut usize,
 ) -> jvm::Result<jvm::Method> {
     let mut instructions = Vec::new();
-    let mut next_factory = 0;
     for static_value in statics {
         if static_value.is_thread_local {
             return Err(jvm::Error::VerificationError {
@@ -197,7 +375,7 @@ fn create_static_initializer_method(
             owner_class,
             &static_value.initializer,
             methods,
-            &mut next_factory,
+            next_factory,
         )?;
         let initializer_type = oomir::Type::from_constant(&initializer);
         load_constant(&mut instructions, cp, &initializer)?;
@@ -291,14 +469,55 @@ fn emit_generated_class(
     Ok(())
 }
 
+fn serialize_class_file(class_file: &ClassFile<'_>, context: &str) -> jvm::Result<Vec<u8>> {
+    let mut bytecode = Vec::new();
+    if let Err(error) = class_file.to_bytes(&mut bytecode) {
+        let failing_method = class_file.methods.iter().find_map(|method| {
+            let mut method_bytes = Vec::new();
+            method
+                .to_bytes(&mut method_bytes)
+                .err()
+                .map(|method_error| {
+                    let name = class_file
+                        .constant_pool
+                        .try_get_utf8(method.name_index)
+                        .map_or_else(|_| format!("#{}", method.name_index), ToString::to_string);
+                    let descriptor = class_file
+                        .constant_pool
+                        .try_get_utf8(method.descriptor_index)
+                        .map_or_else(
+                            |_| format!("#{}", method.descriptor_index),
+                            ToString::to_string,
+                        );
+                    format!("method {name}{descriptor}: {method_error:?}")
+                })
+        });
+        return Err(jvm::Error::VerificationError {
+            context: context.to_string(),
+            message: failing_method.map_or_else(
+                || format!("Failed to serialize class file: {error:?}"),
+                |method| format!("Failed to serialize class file ({method})"),
+            ),
+        });
+    }
+    Ok(bytecode)
+}
+
 /// Converts an OOMIR module into JVM class files, streaming each completed
 /// class to disk so crate-wide bytecode does not coexist with crate-wide OOMIR.
 pub fn oomir_to_jvm_bytecode(
     mut module: oomir::Module,
-    _tcx: TyCtxt, // Keep tcx in signature if needed later, but unused now
+    tcx: TyCtxt,
     emit_runtime_views: bool,
     registry: &mut EmittedClassRegistry,
 ) -> jvm::Result<Vec<(String, PathBuf)>> {
+    let debug_info = DebugInfoOptions {
+        line_numbers: tcx.sess.opts.debuginfo != rustc_session::config::DebugInfo::None,
+        local_variables: matches!(
+            tcx.sess.opts.debuginfo,
+            rustc_session::config::DebugInfo::Limited | rustc_session::config::DebugInfo::Full
+        ),
+    };
     let output_ordinal = OUTPUT_DIRECTORY_COUNTER.fetch_add(1, Ordering::Relaxed);
     let output_directory = std::env::temp_dir().join(format!(
         "rustc-codegen-jvm-{}-{}-{output_ordinal}",
@@ -397,6 +616,7 @@ pub fn oomir_to_jvm_bytecode(
 
         let mut methods: Vec<jvm::Method> = Vec::new();
         let mut bootstrap_methods: Vec<BootstrapMethod> = Vec::new();
+        let mut next_factory = 0;
         let mut fields = Vec::new();
         let mut has_constructor = false;
 
@@ -420,11 +640,12 @@ pub fn oomir_to_jvm_bytecode(
                 &class_name_jvm,
                 &class_statics,
                 &mut methods,
+                &mut next_factory,
             )?;
             methods.push(static_initializer);
         }
 
-        for function in functions {
+        for mut function in functions {
             current_index += 1;
             let instrumented_fn_name = format!("{class_name_jvm}::{}", function.name);
             let _timer =
@@ -437,6 +658,19 @@ pub fn oomir_to_jvm_bytecode(
 
             let name_index = main_cp.add_utf8(&function.name)?;
             let descriptor_index = main_cp.add_utf8(&function.signature.to_string())?;
+            prepare_function_constants(
+                &mut function,
+                &mut main_cp,
+                &class_name_jvm,
+                &mut methods,
+                &mut next_factory,
+            )
+            .map_err(|error| jvm::Error::VerificationError {
+                context: format!("Constants for {class_name_jvm}::{}", function.name),
+                message: format!(
+                    "Failed after creating {next_factory} constant factories: {error:?}"
+                ),
+            })?;
 
             // Translate the function body using its own constant pool reference
             // Free functions at module level don't have an owner class
@@ -447,17 +681,17 @@ pub fn oomir_to_jvm_bytecode(
                 &module,
                 true,
                 None, // No owner class for free functions
+                debug_info,
             );
-            let (jvm_code, max_locals_val, code_attributes) =
-                translator
-                    .translate()
-                    .map_err(|error| jvm::Error::VerificationError {
-                        context: format!(
-                            "Function {class_name_jvm}::{} - {} of {}",
-                            function.name, current_index, total_functions
-                        ),
-                        message: format!("Failed to translate function: {error:?}"),
-                    })?;
+            let (jvm_code, max_locals_val, code_attributes, exception_table) = translator
+                .translate()
+                .map_err(|error| jvm::Error::VerificationError {
+                    context: format!(
+                        "Function {class_name_jvm}::{} - {} of {}",
+                        function.name, current_index, total_functions
+                    ),
+                    message: format!("Failed to translate function: {error:?}"),
+                })?;
 
             let stack_floor = oomir_function_stack_floor(&function);
             let max_stack_val = match jvm_code.max_stack(&main_cp) {
@@ -480,7 +714,7 @@ pub fn oomir_to_jvm_bytecode(
                 max_stack: max_stack_val,
                 max_locals: max_locals_val,
                 code: jvm_code,
-                exception_table: Vec::new(),
+                exception_table,
                 attributes: code_attributes,
             };
 
@@ -553,13 +787,7 @@ pub fn oomir_to_jvm_bytecode(
         verify_no_duplicate_constants(&class_file)?;
 
         // Serialize the main class file
-        let mut byte_vector = Vec::new();
-        class_file
-            .to_bytes(&mut byte_vector)
-            .map_err(|error| jvm::Error::VerificationError {
-                context: format!("Class {class_name_jvm}"),
-                message: format!("Failed to serialize class file: {error:?}"),
-            })?;
+        let byte_vector = serialize_class_file(&class_file, &format!("Class {class_name_jvm}"))?;
         emit_generated_class(
             &output_directory,
             &mut generated_classes,
@@ -624,6 +852,7 @@ pub fn oomir_to_jvm_bytecode(
                     &module,
                     subclasses,
                     nest_host,
+                    debug_info,
                 )?;
                 emit_generated_class(
                     &output_directory,

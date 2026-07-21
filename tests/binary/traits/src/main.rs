@@ -1,9 +1,3 @@
-#![no_std]
-#![feature(lang_items)]
-#![allow(internal_features)]
-
-include!("../../../support/test_prelude.rs");
-
 trait Calculator {
     // Performs a primary calculation
     fn calculate(&self, a: i32, b: i32) -> i32;
@@ -92,8 +86,18 @@ impl PrimitiveTraitObject for i32 {
     }
 }
 
+impl<T: PrimitiveTraitObject + ?Sized> PrimitiveTraitObject for &T {
+    fn doubled(&self) -> i32 {
+        (**self).doubled()
+    }
+}
+
 fn use_primitive_trait_object(value: &dyn PrimitiveTraitObject) -> i32 {
     value.doubled()
+}
+
+fn drop_send_from_any(value: &(dyn core::any::Any + Send)) -> &dyn core::any::Any {
+    value
 }
 
 // --- First Implementation ---
@@ -221,6 +225,54 @@ fn by_ref<T: Score>(value: &T, base: i32) -> i32 {
     value.score(base)
 }
 
+trait ProvidedMethod {
+    fn base(&self) -> i32;
+
+    fn with_default(&self) -> i32 {
+        self.base() + 1
+    }
+}
+
+struct UsesProvidedMethod;
+
+impl ProvidedMethod for UsesProvidedMethod {
+    fn base(&self) -> i32 {
+        41
+    }
+}
+
+mod first_tuple_trait {
+    pub trait SameName {
+        fn value(&self) -> i32;
+    }
+}
+
+mod second_tuple_trait {
+    pub trait SameName {
+        fn value(&self) -> i32;
+    }
+}
+
+impl first_tuple_trait::SameName for i32 {
+    fn value(&self) -> i32 {
+        *self
+    }
+}
+
+impl second_tuple_trait::SameName for i64 {
+    fn value(&self) -> i32 {
+        *self as i32
+    }
+}
+
+fn first_tuple_value(value: (&dyn first_tuple_trait::SameName,)) -> i32 {
+    value.0.value()
+}
+
+fn second_tuple_value(value: (&dyn second_tuple_trait::SameName,)) -> i32 {
+    value.0.value()
+}
+
 fn main() {
     assert!(41i32.carrier_value() == 42);
     assert!([2, 3, 5].carrier_value() == 10);
@@ -230,6 +282,14 @@ fn main() {
     let primitive_object: &dyn PrimitiveTraitObject = &primitive;
     assert!(primitive_object.doubled() == 42);
     assert!(use_primitive_trait_object(&primitive) == 42);
+    let forwarded_object: &dyn PrimitiveTraitObject = &primitive_object;
+    assert!(forwarded_object.doubled() == 42);
+
+    let any_value = 42_i32;
+    let send_any: &(dyn core::any::Any + Send) = &any_value;
+    let plain_any = drop_send_from_any(send_any);
+    assert!(plain_any.type_id() == core::any::TypeId::of::<i32>());
+    assert!(*plain_any.downcast_ref::<i32>().unwrap() == 42);
 
     let mut i32_source = I32Source { next: 7 };
     assert!(next_i32(&mut i32_source) == 7);
@@ -338,6 +398,13 @@ fn main() {
     // Double indirection for good measure.
     let unit_ref = &();
     assert!(by_ref(&unit_ref, 3) == 4);
+
+    let provided = UsesProvidedMethod;
+    assert!(provided.with_default() == 42);
+    let provided_object: &dyn ProvidedMethod = &provided;
+    assert!(provided_object.with_default() == 42);
+    assert!(first_tuple_value((&20_i32,)) == 20);
+    assert!(second_tuple_value((&22_i64,)) == 22);
 
     // If we reach here without panic, the test passes
 }

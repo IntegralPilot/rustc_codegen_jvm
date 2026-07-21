@@ -314,6 +314,11 @@ pub struct BasicBlock {
 pub enum Instruction {
     SourceLocation(SourceLocation), // metadata. does not emit JVM bytecode.
     LocalVariableScope(Vec<usize>), // same
+    UnwindStart {
+        target: String,
+    }, // metadata for a protected JVM region.
+    UnwindEnd,                      // ends the current protected region.
+    Rethrow,                        // resumes the current Rust unwind.
     Add {
         dest: String,
         op1: Operand,
@@ -562,12 +567,32 @@ pub enum Constant {
         method_name: String,
         ty: Type,
     },
+    /// A call to a generated pure helper used to construct a constant whose
+    /// JVM representation cannot be expressed as a constructor alone.
+    StaticCall {
+        owner_class: String,
+        method_name: String,
+        args: Vec<Constant>,
+        ty: Type,
+    },
     /// A provenance-free Rust pointer represented by its exposed address.
     /// The pointee type keeps address-only constants from degenerating into an
     /// ambiguous `Pointer<Unit>` carrier during representation adaptation.
     PointerAddress {
         address: u64,
         view_size: u64,
+        pointee: Box<Type>,
+    },
+    /// A pointer into an anonymous repeated-byte CTFE allocation. This compact
+    /// form preserves the allocation without duplicating a large byte image.
+    RepeatedBytePointer {
+        identity: String,
+        byte: u8,
+        length: u64,
+        offset: u64,
+        view_size: u64,
+        alignment: u64,
+        view_codec: Option<String>,
         pointee: Box<Type>,
     },
     /// A typed JVM null. The type is needed when null appears in a constructor
@@ -620,6 +645,7 @@ impl Constant {
         match self {
             Constant::StaticRef { .. }
             | Constant::FactoryCall { .. }
+            | Constant::StaticCall { .. }
             | Constant::Str(..)
             | Constant::Slice(..)
             | Constant::SliceRef { .. } => false,
@@ -663,6 +689,17 @@ impl std::hash::Hash for Constant {
                 method_name.hash(state);
                 ty.hash(state);
             }
+            Constant::StaticCall {
+                owner_class,
+                method_name,
+                args,
+                ty,
+            } => {
+                owner_class.hash(state);
+                method_name.hash(state);
+                args.hash(state);
+                ty.hash(state);
+            }
             Constant::PointerAddress {
                 address,
                 view_size,
@@ -671,6 +708,25 @@ impl std::hash::Hash for Constant {
                 2.hash(state);
                 address.hash(state);
                 view_size.hash(state);
+                pointee.hash(state);
+            }
+            Constant::RepeatedBytePointer {
+                identity,
+                byte,
+                length,
+                offset,
+                view_size,
+                alignment,
+                view_codec,
+                pointee,
+            } => {
+                identity.hash(state);
+                byte.hash(state);
+                length.hash(state);
+                offset.hash(state);
+                view_size.hash(state);
+                alignment.hash(state);
+                view_codec.hash(state);
                 pointee.hash(state);
             }
             Constant::Null(ty) => {
@@ -1045,7 +1101,9 @@ impl Type {
                 Type::Interface(interface_name.clone())
             }
             Constant::FactoryCall { ty, .. } => ty.clone(),
+            Constant::StaticCall { ty, .. } => ty.clone(),
             Constant::PointerAddress { pointee, .. } => Type::Pointer(pointee.clone()),
+            Constant::RepeatedBytePointer { pointee, .. } => Type::Pointer(pointee.clone()),
             Constant::Null(ty) => ty.clone(),
             Constant::I8(_) => Type::I8,
             Constant::U8(_) => Type::U8,

@@ -8,7 +8,7 @@ mod reorganisation;
 
 use copyprop::propagate_copies_and_eliminate_dead_moves;
 use dataflow::{analyze_constant_propagation, process_block_instructions};
-use reachability::{find_reachable_blocks, get_instruction_successors};
+use reachability::{find_reachable_blocks, get_block_successors};
 use reorganisation::{
     convert_labels_to_basic_blocks_in_function, eliminate_duplicate_basic_blocks,
 };
@@ -48,8 +48,8 @@ fn build_cfg(code_block: &CodeBlock) -> HashMap<String, BasicBlockInfo> {
     let cfg_keys: HashSet<String> = cfg.keys().cloned().collect();
 
     for (label, info) in &cfg {
-        if let Some(terminator) = info.original_block.instructions.last() {
-            let successors = get_instruction_successors(terminator);
+        if !info.original_block.instructions.is_empty() {
+            let successors = get_block_successors(&info.original_block);
             let valid_successors: Vec<String> = successors
                 .into_iter()
                 .filter(|succ_label| {
@@ -128,8 +128,8 @@ fn transform_function(
         let mut current_successors = HashSet::new();
         // Get the block we just inserted to find its *new* terminator
         if let Some(opt_block) = optimized_blocks_intermediate.get(label) {
-            if let Some(terminator) = opt_block.instructions.last() {
-                let succ_labels = get_instruction_successors(terminator);
+            if !opt_block.instructions.is_empty() {
+                let succ_labels = get_block_successors(opt_block);
                 // Filter successors against the set of original labels.
                 // This ensures edges are kept even if the target block hasn't
                 // been visited in this loop iteration yet.

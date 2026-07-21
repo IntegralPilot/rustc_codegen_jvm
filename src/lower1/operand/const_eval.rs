@@ -5,8 +5,9 @@ use rustc_middle::mir::interpret::{
 use rustc_middle::ty::layout::TyAndLayout;
 use rustc_middle::ty::{
     AdtDef, EarlyBinder, FloatTy, GenericArgsRef, Instance, InstanceKind, IntTy,
-    PseudoCanonicalInput, ScalarInt, ShimKind, Ty, TyCtxt, TyKind, TypingEnv, UintTy,
+    PseudoCanonicalInput, ScalarInt, ShimKind, Ty, TyCtxt, TyKind, TypingEnv, UintTy, Unnormalized,
 };
+use rustc_span::def_id::LOCAL_CRATE;
 use std::collections::HashMap;
 
 use super::super::{
@@ -17,7 +18,7 @@ use super::super::{
     types::{
         UNION_BYTES_FIELD, UNION_OBJECTS_FIELD, ensure_fn_ptr_interface, ensure_union_data_type,
         fn_ptr_signature_from_ty, generate_adt_jvm_class_name, generate_tuple_jvm_class_name,
-        pointer_memory_codec_operand, should_define_named_data_type,
+        pointer_memory_codec_operand, should_define_named_data_type, union_from_method_name,
     },
 };
 use crate::oomir::{self, DataTypeMethod};
@@ -259,6 +260,27 @@ pub fn read_scalar_int_constant<'tcx>(
         });
     }
 
+    let scalar_carrier_ty = || match scalar_int.size().bytes() {
+        1 => Ok(tcx.types.u8),
+        2 => Ok(tcx.types.u16),
+        4 => Ok(tcx.types.u32),
+        8 => Ok(tcx.types.u64),
+        16 => Ok(tcx.types.u128),
+        size => Err(format!("Unsupported {size}-byte scalar carrier for {ty:?}")),
+    };
+
+    if matches!(ty.kind(), TyKind::Tuple(elements) if !elements.is_empty()) {
+        let layout = tcx
+            .layout_of(TypingEnv::fully_monomorphized().as_query_input(ty))
+            .map_err(|error| format!("Could not determine tuple layout for {ty:?}: {error:?}"))?;
+        if !matches!(layout.backend_repr, BackendRepr::Scalar(_)) {
+            return Err(format!(
+                "Scalar constant tuple {ty:?} does not have a scalar ABI representation"
+            ));
+        }
+        return scalar_int_to_oomir_constant(tcx, scalar_int, scalar_carrier_ty()?);
+    }
+
     if let TyKind::Adt(adt_def, _) = ty.kind() {
         if adt_def.is_enum() {
             // A scalar enum constant is the enum's physical ABI carrier, not
@@ -266,19 +288,7 @@ pub fn read_scalar_int_constant<'tcx>(
             // in optimized MIR rely on both the exact bits and their width.
             // Preserve that width so value adaptation can reconstruct the enum
             // through the exact-layout codec instead of widening it to i64.
-            let carrier_ty = match scalar_int.size().bytes() {
-                1 => tcx.types.u8,
-                2 => tcx.types.u16,
-                4 => tcx.types.u32,
-                8 => tcx.types.u64,
-                16 => tcx.types.u128,
-                size => {
-                    return Err(format!(
-                        "Unsupported {size}-byte scalar carrier for enum {ty:?}"
-                    ));
-                }
-            };
-            return scalar_int_to_oomir_constant(tcx, scalar_int, carrier_ty);
+            return scalar_int_to_oomir_constant(tcx, scalar_int, scalar_carrier_ty()?);
         }
 
         let field_ty = scalar_struct_field_ty(tcx, ty)?
@@ -553,6 +563,17 @@ pub fn read_pointer_constant<'tcx>(
             array_reference_to_slice(tcx, *inner_ty, value, oomir_data_types, instance)
         }
         TyKind::Ref(_, inner_ty, _) | TyKind::RawPtr(inner_ty, _) => {
+            if matches!(ty.kind(), TyKind::RawPtr(..)) {
+                if let Some(pointer) = anonymous_memory_pointer_constant(
+                    tcx,
+                    pointer,
+                    *inner_ty,
+                    oomir_data_types,
+                    instance,
+                )? {
+                    return Ok(pointer);
+                }
+            }
             let points_directly_to_static = pointer_references_static(tcx, pointer);
             let value = read_pointee_constant(tcx, pointer, *inner_ty, oomir_data_types, instance)?;
             if points_directly_to_static
@@ -574,6 +595,79 @@ fn pointer_references_static(tcx: TyCtxt<'_>, pointer: Pointer<CtfeProvenance>) 
     provenance
         .get_alloc_id()
         .is_some_and(|alloc_id| matches!(tcx.global_alloc(alloc_id), GlobalAlloc::Static(_)))
+}
+
+fn anonymous_memory_pointer_constant<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    pointer: Pointer<CtfeProvenance>,
+    pointee_ty: Ty<'tcx>,
+    oomir_data_types: &mut HashMap<String, oomir::DataType>,
+    instance: Instance<'tcx>,
+) -> Result<Option<oomir::Constant>, String> {
+    if pointee_ty.is_str()
+        || pointee_ty.is_slice()
+        || matches!(pointee_ty.kind(), TyKind::Dynamic(..))
+    {
+        return Ok(None);
+    }
+    let (provenance, offset) = pointer.into_raw_parts();
+    let Some(alloc_id) = provenance.get_alloc_id() else {
+        return Ok(None);
+    };
+    let GlobalAlloc::Memory(const_allocation) = tcx.global_alloc(alloc_id) else {
+        return Ok(None);
+    };
+    let allocation = const_allocation.inner();
+    if !allocation.provenance().ptrs().is_empty() {
+        return Ok(None);
+    }
+    let pointee_layout = tcx
+        .layout_of(TypingEnv::fully_monomorphized().as_query_input(pointee_ty))
+        .map_err(|error| format!("Could not determine constant pointee layout: {error:?}"))?;
+    if allocation.size() <= pointee_layout.size {
+        return Ok(None);
+    }
+    if offset > allocation.size() {
+        return Err(format!(
+            "constant pointer offset {} exceeds allocation size {}",
+            offset.bytes(),
+            allocation.size().bytes()
+        ));
+    }
+    let bytes = allocation
+        .inspect_with_uninit_and_ptr_outside_interpreter(0..allocation.size().bytes_usize())
+        .to_vec();
+    let Some(&byte) = bytes.first() else {
+        return Ok(None);
+    };
+    if !bytes.iter().all(|candidate| *candidate == byte) {
+        return Ok(None);
+    }
+    let view_codec = match pointer_memory_codec_operand(pointee_ty, tcx, oomir_data_types, instance)
+    {
+        oomir::Operand::Constant(oomir::Constant::String(codec)) => Some(codec),
+        oomir::Operand::Constant(oomir::Constant::Null(_)) => None,
+        other => {
+            return Err(format!(
+                "Constant pointer codec was not a nullable string: {other:?}"
+            ));
+        }
+    };
+    Ok(Some(oomir::Constant::RepeatedBytePointer {
+        identity: format!("{}::{alloc_id:?}", tcx.crate_name(LOCAL_CRATE)),
+        byte,
+        length: allocation.size().bytes(),
+        offset: offset.bytes(),
+        view_size: pointee_layout.size.bytes(),
+        alignment: allocation.align.bytes(),
+        view_codec,
+        pointee: Box::new(ty_to_oomir_type(
+            pointee_ty,
+            tcx,
+            oomir_data_types,
+            instance,
+        )),
+    }))
 }
 
 fn pointer_constant_for_pointee<'tcx>(
@@ -1063,14 +1157,7 @@ pub fn read_constant_value_from_memory<'tcx>(
             // Read as ScalarInt - floats are represented by their bits
             let scalar = allocation
                 .read_scalar(&tcx.data_layout, range, false)
-                .map_err(|e| {
-                    breadcrumbs::log!(
-                        breadcrumbs::LogLevel::Error,
-                        "const-eval",
-                        format!("Error reading scalar: {:?}", e)
-                    );
-                    "Failed to read scalar".to_string()
-                })?;
+                .map_err(|error| format!("Failed to read scalar: {error:?}"))?;
             let scalar_int = match scalar {
                 Scalar::Int(int) => int,
                 Scalar::Ptr(_, _) => {
@@ -1180,6 +1267,15 @@ pub fn read_constant_value_from_memory<'tcx>(
                         read_scalar_int_constant(tcx, address, ty, oomir_data_types, instance)
                     }
                     Scalar::Ptr(pointer, _) => {
+                        if let Some(pointer) = anonymous_memory_pointer_constant(
+                            tcx,
+                            pointer,
+                            *inner_ty,
+                            oomir_data_types,
+                            instance,
+                        )? {
+                            return Ok(pointer);
+                        }
                         let (provenance, pointer_offset) = pointer.into_raw_parts();
                         if provenance.get_alloc_id().is_some_and(|alloc_id| {
                             matches!(tcx.global_alloc(alloc_id), GlobalAlloc::TypeId { .. })
@@ -1314,6 +1410,72 @@ pub fn read_constant_value_from_memory<'tcx>(
             } else if adt_def.is_union() {
                 let class_name =
                     ensure_union_data_type(adt_def, substs, tcx, oomir_data_types, instance);
+                let variant = adt_def.variant(VariantIdx::from_usize(0));
+                let has_function_provenance =
+                    allocation
+                        .provenance()
+                        .ptrs()
+                        .iter()
+                        .any(|&(pointer_offset, provenance)| {
+                            pointer_offset >= offset
+                                && pointer_offset < offset + layout.size
+                                && provenance.get_alloc_id().is_some_and(|alloc_id| {
+                                    matches!(
+                                        tcx.global_alloc(alloc_id),
+                                        GlobalAlloc::Function { .. }
+                                    )
+                                })
+                        });
+                let mut candidates = Vec::new();
+                for field in &variant.fields {
+                    let raw_field_ty = field.ty(tcx, substs).skip_norm_wip();
+                    let instantiated_field_ty = EarlyBinder::bind(tcx, raw_field_ty)
+                        .instantiate(tcx, instance.args)
+                        .skip_norm_wip();
+                    let field_ty = tcx
+                        .try_normalize_erasing_regions(
+                            TypingEnv::fully_monomorphized(),
+                            Unnormalized::new_wip(instantiated_field_ty),
+                        )
+                        .unwrap_or(instantiated_field_ty);
+                    let Ok(value) = read_constant_value_from_memory(
+                        tcx,
+                        allocation,
+                        offset,
+                        field_ty,
+                        oomir_data_types,
+                        instance,
+                    ) else {
+                        continue;
+                    };
+                    let preserves_function = constant_contains_function_pointer(&value);
+                    candidates.push((
+                        preserves_function,
+                        field.ident(tcx).to_string(),
+                        field_ty,
+                        value,
+                    ));
+                }
+                if let Some((_, field_name, field_ty, value)) =
+                    candidates
+                        .into_iter()
+                        .max_by_key(|(preserves_function, ..)| {
+                            usize::from(*preserves_function == has_function_provenance)
+                        })
+                {
+                    let field_oomir_ty =
+                        ty_to_oomir_type(field_ty, tcx, oomir_data_types, instance);
+                    return Ok(oomir::Constant::StaticCall {
+                        owner_class: class_name.clone(),
+                        method_name: union_from_method_name(&field_name),
+                        args: field_oomir_ty
+                            .has_jvm_value()
+                            .then_some(value)
+                            .into_iter()
+                            .collect(),
+                        ty: oomir::Type::Class(class_name),
+                    });
+                }
                 let start = offset.bytes_usize();
                 let end = start
                     .checked_add(layout.size.bytes_usize())
@@ -1412,6 +1574,24 @@ pub fn read_constant_value_from_memory<'tcx>(
         }
 
         _ => Err(format!("Unsupported constant type: {:?}", ty)),
+    }
+}
+
+fn constant_contains_function_pointer(constant: &oomir::Constant) -> bool {
+    match constant {
+        oomir::Constant::FunctionPointer { .. } => true,
+        oomir::Constant::Array(_, values) | oomir::Constant::Slice(_, values) => {
+            values.iter().any(constant_contains_function_pointer)
+        }
+        oomir::Constant::SliceRef { backing, .. } => constant_contains_function_pointer(backing),
+        oomir::Constant::Instance { fields, params, .. } => {
+            fields.values().any(constant_contains_function_pointer)
+                || params.iter().any(constant_contains_function_pointer)
+        }
+        oomir::Constant::StaticCall { args, .. } => {
+            args.iter().any(constant_contains_function_pointer)
+        }
+        _ => false,
     }
 }
 

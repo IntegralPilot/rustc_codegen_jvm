@@ -132,6 +132,27 @@ pub fn load_constant(
                 cp.add_method_ref(owner, method_name, &format!("(){}", ty.to_jvm_descriptor()))?;
             instructions_to_add.push(JI::Invokestatic(method));
         }
+        OC::StaticCall {
+            owner_class,
+            method_name,
+            args,
+            ty,
+        } => {
+            for arg in args {
+                load_constant(&mut instructions_to_add, cp, arg)?;
+            }
+            let owner = cp.add_class(owner_class)?;
+            let params = args
+                .iter()
+                .map(|arg| oomir::Type::from_constant(arg).to_jvm_descriptor())
+                .collect::<String>();
+            let method = cp.add_method_ref(
+                owner,
+                method_name,
+                &format!("({params}){}", ty.to_jvm_descriptor()),
+            )?;
+            instructions_to_add.push(JI::Invokestatic(method));
+        }
         OC::PointerAddress {
             address, view_size, ..
         } => {
@@ -144,6 +165,48 @@ pub fn load_constant(
             instructions_to_add.push(get_long_const_instr(cp, *address as i64));
             instructions_to_add.push(get_long_const_instr(cp, *view_size as i64));
             instructions_to_add.push(JI::Invokestatic(from_address));
+        }
+        OC::RepeatedBytePointer {
+            identity,
+            byte,
+            length,
+            offset,
+            view_size,
+            alignment,
+            view_codec,
+            ..
+        } => {
+            let identity_index = cp.add_string(identity)?;
+            instructions_to_add.push(if let Ok(index) = u8::try_from(identity_index) {
+                JI::Ldc(index)
+            } else {
+                JI::Ldc_w(identity_index)
+            });
+            instructions_to_add.push(get_int_const_instr(cp, i32::from(*byte as i8)));
+            instructions_to_add.push(get_long_const_instr(cp, *length as i64));
+            instructions_to_add.push(get_long_const_instr(cp, *offset as i64));
+            instructions_to_add.push(get_long_const_instr(cp, *view_size as i64));
+            instructions_to_add.push(get_long_const_instr(cp, *alignment as i64));
+            if let Some(codec) = view_codec {
+                let codec_index = cp.add_string(codec)?;
+                instructions_to_add.push(if let Ok(index) = u8::try_from(codec_index) {
+                    JI::Ldc(index)
+                } else {
+                    JI::Ldc_w(codec_index)
+                });
+            } else {
+                instructions_to_add.push(JI::Aconst_null);
+            }
+            let pointer_class = cp.add_class(oomir::POINTER_CLASS)?;
+            let factory = cp.add_method_ref(
+                pointer_class,
+                "constantRepeatedByte",
+                &format!(
+                    "(Ljava/lang/String;IJJJJLjava/lang/String;)L{};",
+                    oomir::POINTER_CLASS
+                ),
+            )?;
+            instructions_to_add.push(JI::Invokestatic(factory));
         }
         OC::I8(v) => instructions_to_add.push(get_int_const_instr(cp, *v as i32)),
         OC::U8(v) => instructions_to_add.push(get_int_const_instr(cp, i32::from(*v as i8))),

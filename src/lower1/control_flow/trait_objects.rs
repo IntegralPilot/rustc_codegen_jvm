@@ -9,6 +9,9 @@ use super::super::{
 };
 use crate::oomir;
 
+const RUNTIME_TRAIT_OBJECT_CARRIER: &str = "org/rustlang/runtime/TraitObjectCarrier";
+const RUNTIME_TRAIT_OBJECT_PAYLOAD_METHOD: &str = "rustTraitObjectPayload";
+
 pub(super) fn carrier_needs_trait_object_adapter(
     carrier_ty: &oomir::Type,
     data_types: &HashMap<String, oomir::DataType>,
@@ -39,18 +42,18 @@ pub(super) fn ensure_trait_object_adapter_class<'tcx>(
     instance_context: Instance<'tcx>,
 ) -> Result<String, String> {
     let concrete_ty = match source_mir_ty.kind() {
-        TyKind::Ref(_, pointee, _) => *pointee,
+        TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _) => *pointee,
         _ => {
             return Err(format!(
-                "trait-object source is not a reference: {source_mir_ty:?}"
+                "trait-object source is not a pointer or reference: {source_mir_ty:?}"
             ));
         }
     };
     let dynamic_ty = match target_mir_ty.kind() {
-        TyKind::Ref(_, pointee, _) => *pointee,
+        TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _) => *pointee,
         _ => {
             return Err(format!(
-                "trait-object target is not a reference: {target_mir_ty:?}"
+                "trait-object target is not a pointer or reference: {target_mir_ty:?}"
             ));
         }
     };
@@ -178,6 +181,25 @@ pub(super) fn ensure_trait_object_adapter_class<'tcx>(
                     },
                 }
             }
+            oomir::Type::Interface(receiver_interface) => {
+                let mut method_ty = target_signature.clone();
+                method_ty.is_static = false;
+                oomir::Instruction::InvokeInterface {
+                    dest: call_dest.clone(),
+                    class_name: receiver_interface.clone(),
+                    method_name: super::super::naming::associated_method_name_from_instance(
+                        tcx,
+                        *target_instance,
+                        &method_ty,
+                    ),
+                    method_ty,
+                    args: call_args.into_iter().skip(1).collect(),
+                    operand: oomir::Operand::Variable {
+                        name: "_trait_object_payload".to_string(),
+                        ty: carrier_ty.clone(),
+                    },
+                }
+            }
             _ => oomir::Instruction::InvokeStatic {
                 dest: call_dest.clone(),
                 class_name: target_name
@@ -238,6 +260,57 @@ pub(super) fn ensure_trait_object_adapter_class<'tcx>(
         );
     }
 
+    let payload_name = "_trait_object_payload".to_string();
+    let boxed_payload_name = "_trait_object_payload_object".to_string();
+    adapter_methods.insert(
+        RUNTIME_TRAIT_OBJECT_PAYLOAD_METHOD.to_string(),
+        oomir::DataTypeMethod::Function(oomir::Function {
+            name: RUNTIME_TRAIT_OBJECT_PAYLOAD_METHOD.to_string(),
+            owner_class: None,
+            debug_variables: Vec::new(),
+            signature: oomir::Signature {
+                params: vec![("self".to_string(), oomir::Type::Class(class_name.clone()))],
+                ret: Box::new(oomir::Type::Class("java/lang/Object".to_string())),
+                is_static: false,
+            },
+            body: oomir::CodeBlock {
+                entry: "bb0".to_string(),
+                basic_blocks: HashMap::from([(
+                    "bb0".to_string(),
+                    oomir::BasicBlock {
+                        label: "bb0".to_string(),
+                        instructions: vec![
+                            oomir::Instruction::GetField {
+                                dest: payload_name.clone(),
+                                object: oomir::Operand::Variable {
+                                    name: "_1".to_string(),
+                                    ty: oomir::Type::Class(class_name.clone()),
+                                },
+                                field_name: "value".to_string(),
+                                field_ty: carrier_ty.clone(),
+                                owner_class: class_name.clone(),
+                            },
+                            oomir::Instruction::Cast {
+                                op: oomir::Operand::Variable {
+                                    name: payload_name,
+                                    ty: carrier_ty.clone(),
+                                },
+                                ty: oomir::Type::Class("java/lang/Object".to_string()),
+                                dest: boxed_payload_name.clone(),
+                            },
+                            oomir::Instruction::Return {
+                                operand: Some(oomir::Operand::Variable {
+                                    name: boxed_payload_name,
+                                    ty: oomir::Type::Class("java/lang/Object".to_string()),
+                                }),
+                            },
+                        ],
+                    },
+                )]),
+            },
+        }),
+    );
+
     match data_types.get_mut(interface_name) {
         Some(oomir::DataType::Interface { methods }) => methods.extend(interface_methods),
         Some(oomir::DataType::Class { .. }) => {
@@ -261,7 +334,10 @@ pub(super) fn ensure_trait_object_adapter_class<'tcx>(
             is_abstract: false,
             methods: adapter_methods,
             super_class: Some("java/lang/Object".to_string()),
-            interfaces: vec![interface_name.to_string()],
+            interfaces: vec![
+                interface_name.to_string(),
+                RUNTIME_TRAIT_OBJECT_CARRIER.to_string(),
+            ],
         },
     );
     Ok(class_name)

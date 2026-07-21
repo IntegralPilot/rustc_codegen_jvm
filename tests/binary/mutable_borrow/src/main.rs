@@ -1,9 +1,3 @@
-#![no_std]
-#![feature(lang_items)]
-#![allow(internal_features)]
-
-include!("../../../support/test_prelude.rs");
-
 // Simple struct
 struct Point {
     x: i32,
@@ -104,6 +98,20 @@ fn check_reference_boundaries() {
     assert!(captured == 42);
 }
 
+fn check_maybe_uninit_pointer_write_through() {
+    let mut integer = std::mem::MaybeUninit::new(11_i32);
+    unsafe {
+        *integer.as_mut_ptr() = 42;
+        assert!(integer.assume_init() == 42);
+    }
+
+    let mut text = std::mem::MaybeUninit::new("old");
+    unsafe {
+        *text.as_mut_ptr() = "new";
+        assert!(text.assume_init() == "new");
+    }
+}
+
 
 fn main() {
     // 1. Initial setup
@@ -129,4 +137,5 @@ fn main() {
 
     check_arrays_of_mutable_references();
     check_reference_boundaries();
+    check_maybe_uninit_pointer_write_through();
 }

@@ -279,17 +279,27 @@ fn place_or_insert_mono_function<'tcx>(
             InstanceKind::Shim(ShimKind::Clone(_, self_ty)) => Some(self_ty),
             _ => None,
         };
+        let provided_trait_receiver_ty = assoc_item
+            .trait_container(tcx)
+            .filter(|trait_def_id| {
+                tcx.provided_trait_methods(*trait_def_id)
+                    .any(|method| method.def_id == assoc_item.def_id)
+            })
+            .map(|_| instance.args.type_at(0));
         let attachable_to_receiver_class = clone_shim_self_ty.is_some()
+            || (provided_trait_receiver_ty.is_some() && assoc_item.is_method())
             || (assoc_item.trait_container(tcx).is_none()
                 && (assoc_item.trait_item_def_id().is_none() || assoc_item.is_method()));
         if attachable_to_receiver_class {
             let fallback_function = oomir_function.clone();
             let container_id = assoc_item.container_id(tcx);
-            let container_ty = clone_shim_self_ty.unwrap_or_else(|| {
-                tcx.type_of(container_id)
-                    .instantiate(tcx, instance.args)
-                    .skip_norm_wip()
-            });
+            let container_ty = clone_shim_self_ty
+                .or(provided_trait_receiver_ty)
+                .unwrap_or_else(|| {
+                    tcx.type_of(container_id)
+                        .instantiate(tcx, instance.args)
+                        .skip_norm_wip()
+                });
             let receiver_ty = assoc_item.is_method().then(|| {
                 tcx.fn_sig(instance.def_id())
                     .instantiate(tcx, instance.args)
@@ -353,7 +363,7 @@ fn place_or_insert_mono_function<'tcx>(
                                 .skip_norm_wip()
                                 .def_id
                         })
-                        .or_else(|| clone_shim_self_ty.and(assoc_item.trait_container(tcx)));
+                        .or_else(|| assoc_item.trait_container(tcx));
                     let implemented_trait = implemented_trait_def_id.map(|trait_def_id| {
                         let trait_name = lower1::jvm_names::class_for_def_id(tcx, trait_def_id);
                         ensure_trait_interface(tcx, trait_def_id, &mut oomir_module.data_types);
@@ -449,14 +459,200 @@ fn place_or_insert_mono_function<'tcx>(
     oomir_module.insert_function(oomir_function);
 }
 
-fn emit_allocator_shim_guard(tcx: TyCtxt<'_>, oomir_module: &mut oomir::Module) {
-    if rustc_codegen_ssa::base::allocator_kind_for_codegen(tcx).is_none() {
+fn allocator_shim_target_signature(
+    method: &rustc_ast::expand::allocator::AllocatorMethod,
+) -> oomir::Signature {
+    use rustc_ast::expand::allocator::AllocatorTy;
+
+    let mut params = Vec::new();
+    for input in method.inputs {
+        match input.ty {
+            AllocatorTy::Layout => {
+                params.push((format!("{}_size", input.name), oomir::Type::U64));
+                params.push((format!("{}_align", input.name), oomir::Type::U64));
+            }
+            AllocatorTy::Ptr => params.push((
+                input.name.to_string(),
+                oomir::Type::Pointer(Box::new(oomir::Type::U8)),
+            )),
+            AllocatorTy::Usize => {
+                params.push((input.name.to_string(), oomir::Type::U64));
+            }
+            AllocatorTy::Never | AllocatorTy::ResultPtr | AllocatorTy::Unit => {
+                panic!("invalid allocator shim input type")
+            }
+        }
+    }
+
+    let ret = match method.output {
+        AllocatorTy::ResultPtr => oomir::Type::Pointer(Box::new(oomir::Type::U8)),
+        AllocatorTy::Never | AllocatorTy::Unit => oomir::Type::Void,
+        AllocatorTy::Layout | AllocatorTy::Ptr | AllocatorTy::Usize => {
+            panic!("invalid allocator shim output type")
+        }
+    };
+    oomir::Signature {
+        params,
+        ret: Box::new(ret),
+        is_static: true,
+    }
+}
+
+fn allocator_shim_source_signature(tcx: TyCtxt<'_>, source_name: &str) -> oomir::Signature {
+    let declaration = std::iter::once(LOCAL_CRATE)
+        .chain(tcx.crates(()).iter().copied())
+        .flat_map(|crate_num| tcx.foreign_modules(crate_num).values())
+        .flat_map(|module| module.foreign_items.iter().copied())
+        .find(|def_id| {
+            if tcx.def_kind(*def_id) != DefKind::Fn {
+                return false;
+            }
+            let name =
+                lower1::naming::mono_fn_name_from_instance(tcx, Instance::mono(tcx, *def_id));
+            name.method_name == source_name
+                && name
+                    .class_to_call_on
+                    .as_deref()
+                    .is_some_and(lower1::naming::is_global_link_symbol_class)
+        })
+        .unwrap_or_else(|| panic!("allocator ABI declaration `{source_name}` was not found"));
+    let instance = Instance::mono(tcx, declaration);
+    let instance_ty = tcx
+        .type_of(declaration)
+        .instantiate(tcx, instance.args)
+        .skip_norm_wip();
+    lower1::types::fn_ptr_signature_from_ty(instance_ty, tcx, &mut HashMap::new(), instance)
+}
+
+fn allocator_shim_call(
+    source_signature: &oomir::Signature,
+    target_signature: &oomir::Signature,
+    target_name: String,
+    result: Option<String>,
+) -> Vec<oomir::Instruction> {
+    assert_eq!(
+        source_signature.params.len(),
+        target_signature.params.len(),
+        "allocator shim source and target parameter counts differ"
+    );
+
+    let mut instructions = Vec::new();
+    let mut args = Vec::new();
+    for (index, ((_, source_ty), (_, target_ty))) in source_signature
+        .params
+        .iter()
+        .zip(&target_signature.params)
+        .enumerate()
+    {
+        let source = oomir::Operand::Variable {
+            name: format!("_{}", index + 1),
+            ty: source_ty.clone(),
+        };
+        if source_ty == target_ty {
+            args.push(source);
+        } else if let (oomir::Type::Class(class_name), oomir::Type::U64) = (source_ty, target_ty) {
+            // Rust exposes Alignment nominally, while the default allocator keeps its usize ABI.
+            let converted = format!("converted_arg_{index}");
+            instructions.push(oomir::Instruction::InvokeStatic {
+                class_name: class_name.clone(),
+                method_name: "as_usize".to_string(),
+                method_ty: oomir::Signature {
+                    params: vec![("value".to_string(), source_ty.clone())],
+                    ret: Box::new(oomir::Type::U64),
+                    is_static: true,
+                },
+                args: vec![source],
+                dest: Some(converted.clone()),
+            });
+            args.push(oomir::Operand::Variable {
+                name: converted,
+                ty: oomir::Type::U64,
+            });
+        } else {
+            panic!(
+                "unsupported allocator ABI argument conversion from {source_ty:?} to {target_ty:?}"
+            );
+        }
+    }
+
+    instructions.push(oomir::Instruction::InvokeStatic {
+        class_name: lower1::naming::global_link_symbol_class(&target_name),
+        method_name: target_name,
+        method_ty: target_signature.clone(),
+        args,
+        dest: result,
+    });
+    instructions
+}
+
+fn emit_allocator_shims(tcx: TyCtxt<'_>, oomir_module: &mut oomir::Module) {
+    use rustc_ast::expand::allocator::{
+        AllocatorTy, NO_ALLOC_SHIM_IS_UNSTABLE, default_fn_name, global_fn_name,
+    };
+
+    let Some(kind) = rustc_codegen_ssa::base::allocator_kind_for_codegen(tcx) else {
         return;
+    };
+
+    for method in rustc_codegen_ssa::base::allocator_shim_contents(tcx, kind) {
+        let source_name = lower1::jvm_names::member_name(&global_fn_name(method.name));
+        let target_name = lower1::jvm_names::member_name(&default_fn_name(method.name));
+        let mut signature = allocator_shim_source_signature(tcx, &source_name);
+        let target_signature = allocator_shim_target_signature(&method);
+        for ((_, source_ty), (_, target_ty)) in
+            signature.params.iter_mut().zip(&target_signature.params)
+        {
+            if let (oomir::Type::Class(class_name), oomir::Type::Pointer(_)) =
+                (&*source_ty, target_ty)
+                && oomir::is_non_null_class_name(class_name)
+            {
+                // Global-link lowering already exposes NonNull as the raw JVM pointer carrier.
+                *source_ty = target_ty.clone();
+            }
+        }
+        assert_eq!(
+            signature.ret.to_jvm_return_descriptor(),
+            target_signature.ret.to_jvm_return_descriptor(),
+            "allocator shim source and target JVM return types differ"
+        );
+        let result = matches!(method.output, AllocatorTy::ResultPtr).then(|| "result".to_string());
+        let mut instructions =
+            allocator_shim_call(&signature, &target_signature, target_name, result.clone());
+        if matches!(method.output, AllocatorTy::Never) {
+            instructions.push(oomir::Instruction::ThrowNewWithMessage {
+                exception_class: "java/lang/AssertionError".to_string(),
+                message: "Diverging allocator call returned unexpectedly".to_string(),
+            });
+        } else {
+            instructions.push(oomir::Instruction::Return {
+                operand: result.map(|name| oomir::Operand::Variable {
+                    name,
+                    ty: signature.ret.as_ref().clone(),
+                }),
+            });
+        }
+
+        let entry = "entry".to_string();
+        oomir_module.insert_function(oomir::Function {
+            owner_class: Some(lower1::naming::global_link_symbol_class(&source_name)),
+            name: source_name,
+            signature,
+            debug_variables: Vec::new(),
+            body: oomir::CodeBlock {
+                entry: entry.clone(),
+                basic_blocks: HashMap::from([(
+                    entry.clone(),
+                    oomir::BasicBlock {
+                        label: entry,
+                        instructions,
+                    },
+                )]),
+            },
+        });
     }
 
     let entry = "entry".to_string();
-    let symbol_name =
-        lower1::jvm_names::member_name(rustc_ast::expand::allocator::NO_ALLOC_SHIM_IS_UNSTABLE);
+    let symbol_name = lower1::jvm_names::member_name(NO_ALLOC_SHIM_IS_UNSTABLE);
     oomir_module.insert_function(oomir::Function {
         owner_class: Some(lower1::naming::global_link_symbol_class(&symbol_name)),
         name: symbol_name,
@@ -584,16 +780,16 @@ fn lower_codegen_unit_items<'tcx>(
     oomir_module: &mut oomir::Module,
     claimed_mono_items: &mut HashSet<MonoItem<'tcx>>,
     lowered_instances: &mut HashSet<Instance<'tcx>>,
+    scanned_instances: &mut HashSet<Instance<'tcx>>,
 ) {
-    let mut functions = VecDeque::new();
-
+    let mut function_roots = Vec::new();
     for mono_item in mono_items {
         if !claimed_mono_items.insert(mono_item) {
             continue;
         }
         match mono_item {
             MonoItem::Fn(instance) => {
-                functions.push_back(instance);
+                function_roots.push(instance);
             }
             MonoItem::Static(def_id) => {
                 lower1::statics::lower_static(tcx, def_id, oomir_module)
@@ -608,9 +804,31 @@ fn lower_codegen_unit_items<'tcx>(
             }
         }
     }
+    lower_supplemental_instance_closure(
+        tcx,
+        function_roots,
+        partitioned_functions,
+        oomir_module,
+        lowered_instances,
+        scanned_instances,
+    );
+}
 
+fn lower_supplemental_instance_closure<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    roots: impl IntoIterator<Item = Instance<'tcx>>,
+    partitioned_functions: &HashSet<Instance<'tcx>>,
+    oomir_module: &mut oomir::Module,
+    lowered_instances: &mut HashSet<Instance<'tcx>>,
+    scanned_instances: &mut HashSet<Instance<'tcx>>,
+) {
+    let mut functions = roots.into_iter().collect::<VecDeque<_>>();
     let mut queued = functions.iter().copied().collect::<HashSet<_>>();
     while let Some(instance) = functions.pop_front() {
+        lower_mono_function(tcx, instance, oomir_module, lowered_instances);
+        if !scanned_instances.insert(instance) {
+            continue;
+        }
         for callee in direct_mir_callees(tcx, instance) {
             if !matches!(
                 callee.def,
@@ -625,7 +843,6 @@ fn lower_codegen_unit_items<'tcx>(
                 functions.push_back(callee);
             }
         }
-        lower_mono_function(tcx, instance, oomir_module, lowered_instances);
     }
 }
 
@@ -659,13 +876,9 @@ fn direct_mir_callees<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> Vec<
                 return None;
             };
             let args = args.no_bound_vars()?;
-            let callee = Instance::expect_resolve(
-                tcx,
-                typing_env,
-                *def_id,
-                args,
-                terminator.source_info.span,
-            );
+            let callee = Instance::try_resolve(tcx, typing_env, *def_id, args)
+                .ok()
+                .flatten()?;
             match callee.def {
                 InstanceKind::Item(_) => tcx.is_mir_available(callee.def_id()).then_some(callee),
                 InstanceKind::Shim(_) => Some(callee),
@@ -855,8 +1068,10 @@ fn materialize_java_public_data_type<'tcx>(
 
 fn lower_public_library_exports<'tcx>(
     tcx: TyCtxt<'tcx>,
+    partitioned_functions: &HashSet<Instance<'tcx>>,
     oomir_module: &mut oomir::Module,
     lowered_instances: &mut HashSet<Instance<'tcx>>,
+    scanned_instances: &mut HashSet<Instance<'tcx>>,
 ) {
     if !crate_emits_library_artifact(tcx) {
         return;
@@ -864,16 +1079,20 @@ fn lower_public_library_exports<'tcx>(
 
     let function_defs = java_public_surface_def_ids(tcx, JavaPublicSurface::Exported);
 
-    for def_id in function_defs {
-        if is_lowerable_java_public_function(tcx, def_id) {
-            lower_mono_function(
-                tcx,
-                Instance::mono(tcx, def_id),
-                oomir_module,
-                lowered_instances,
-            );
-        }
-    }
+    let function_roots = function_defs
+        .into_iter()
+        .filter(|def_id| is_lowerable_java_public_function(tcx, *def_id))
+        .map(|def_id| Instance::mono(tcx, def_id));
+    // Rustc's collector owns ordinary Rust reachability. Java exports are
+    // additional roots, so only they need a supplemental MIR call walk.
+    lower_supplemental_instance_closure(
+        tcx,
+        function_roots,
+        partitioned_functions,
+        oomir_module,
+        lowered_instances,
+        scanned_instances,
+    );
 
     let data_type_defs = java_public_surface_def_ids(tcx, JavaPublicSurface::Reachable);
 
@@ -984,6 +1203,7 @@ impl CodegenBackend for MyBackend {
             let crate_module_class = lower1::jvm_names::crate_module_class(tcx, rust_crate);
             let mut lowered_instances = HashSet::new();
             let mut claimed_mono_items = HashSet::new();
+            let mut scanned_instances = HashSet::new();
             let mut generated_classes = Vec::new();
             let mut emitted_class_registry = lower2::EmittedClassRegistry::default();
 
@@ -1002,8 +1222,14 @@ impl CodegenBackend for MyBackend {
             // ordinary codegen unit and emit them as their own small shard.
             let mut export_module = empty_oomir_module(tcx, &crate_module_class);
             let lower1_timer = instrumentation::Timer::phase("lower1", Some(&crate_name));
-            lower_public_library_exports(tcx, &mut export_module, &mut lowered_instances);
-            emit_allocator_shim_guard(tcx, &mut export_module);
+            lower_public_library_exports(
+                tcx,
+                &partitioned_functions,
+                &mut export_module,
+                &mut lowered_instances,
+                &mut scanned_instances,
+            );
+            emit_allocator_shims(tcx, &mut export_module);
             drop(lower1_timer);
             generated_classes.extend(emit_oomir_shard(
                 tcx,
@@ -1036,6 +1262,7 @@ impl CodegenBackend for MyBackend {
                         &mut oomir_module,
                         &mut claimed_mono_items,
                         &mut lowered_instances,
+                        &mut scanned_instances,
                     );
                     drop(lower1_timer);
                     generated_classes.extend(emit_oomir_shard(

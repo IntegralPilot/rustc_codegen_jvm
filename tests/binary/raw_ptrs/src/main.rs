@@ -1,9 +1,5 @@
-#![no_std]
-#![feature(lang_items)]
 #![allow(internal_features, dead_code)]
 #![feature(core_intrinsics, f16, f128, ptr_internals, ptr_metadata, set_ptr_value, layout_for_ptr)]
-
-include!("../../../support/test_prelude.rs");
 
 fn basic_raw_pointer_round_trip() {
     let mut value = 41_i32;
@@ -506,11 +502,7 @@ fn pointer_ordering() {
     assert!(end >= first);
 }
 
-unsafe fn raw_binary_search(
-    values: *const u32,
-    length: usize,
-    target: u32,
-) -> Option<usize> {
+unsafe fn raw_binary_search(values: *const u32, length: usize, target: u32) -> Option<usize> {
     let mut low = 0;
     let mut high = length;
     while low < high {
@@ -918,7 +910,10 @@ fn generic_sized_raw_pointer_metadata() {
     let rebuilt_word = rebuild_sized_pointer(&word);
     assert!(unsafe { *rebuilt_word } == word);
 
-    let pair = Pair { left: 17, right: 29 };
+    let pair = Pair {
+        left: 17,
+        right: 29,
+    };
     let rebuilt_pair = rebuild_sized_pointer(&pair);
     assert!(unsafe { (*rebuilt_pair).left } == 17);
     assert!(unsafe { (*rebuilt_pair).right } == 29);
@@ -952,7 +947,10 @@ fn pointer_backed_raw_slices() {
     middle[1] = 16;
     assert!(values[2] == 16);
 
-    let mut pair = Pair { left: 20, right: 21 };
+    let mut pair = Pair {
+        left: 20,
+        right: 21,
+    };
     let pair_slice = unsafe { core::slice::from_raw_parts_mut(&mut pair, 1) };
     pair_slice[0].right = 22;
     assert!(pair.left + pair.right == 42);
@@ -1026,10 +1024,7 @@ fn raw_drop_in_place() {
         assert!(*core::ptr::addr_of!(DROP_COUNT) == 6);
     }
 
-    let mut choice = DropChoice::Two(
-        DropAmount { amount: 6 },
-        DropAmount { amount: 7 },
-    );
+    let mut choice = DropChoice::Two(DropAmount { amount: 6 }, DropAmount { amount: 7 });
     match &choice {
         DropChoice::Two(first, second) => assert!(first.amount + second.amount == 13),
         _ => panic!(),
@@ -1209,8 +1204,8 @@ struct CustomDst {
 
 fn custom_dst_projections() {
     let mut storage = (42_u32, [1_u8, 2, 3, 4]);
-    let raw_dst = core::ptr::slice_from_raw_parts_mut(&mut storage as *mut _ as *mut u8, 4)
-        as *mut CustomDst;
+    let raw_dst =
+        core::ptr::slice_from_raw_parts_mut(&mut storage as *mut _ as *mut u8, 4) as *mut CustomDst;
 
     unsafe {
         assert_eq!((*raw_dst).header, 42);
@@ -1268,7 +1263,10 @@ fn fat_pointer_abi_boundaries() {
     let returned_trait = pass_trait_object(raw_trait);
     unsafe {
         assert_eq!((*returned_trait).inspect(), 1234);
-        assert_eq!(core::ptr::metadata(raw_trait), core::ptr::metadata(returned_trait));
+        assert_eq!(
+            core::ptr::metadata(raw_trait),
+            core::ptr::metadata(returned_trait)
+        );
     }
 
     let array = [10, 20, 30, 40];
@@ -1288,7 +1286,10 @@ struct AlignedData {
 
 #[inline(never)]
 fn allocate_on_stack() -> usize {
-    let data = AlignedData { value: 42, payload: [0; 124] };
+    let data = AlignedData {
+        value: 42,
+        payload: [0; 124],
+    };
     let ptr = &data as *const AlignedData;
     ptr as usize
 }
@@ -1361,11 +1362,7 @@ fn enum_discriminant_pointer_manipulation() {
 }
 
 fn multidimensional_pointer_flat_map() {
-    let mut matrix = [
-        [1, 2, 3],
-        [4, 5, 6],
-        [7, 8, 9],
-    ];
+    let mut matrix = [[1, 2, 3], [4, 5, 6], [7, 8, 9]];
 
     let base_ptr = matrix.as_mut_ptr() as *mut i32;
     unsafe {
@@ -1417,7 +1414,7 @@ fn sized_to_unsized_coercion() {
         assert!(core::ptr::metadata(unsized_ptr) == 4);
 
         assert!((*unsized_ptr)[0] == 100);
-        assert!( (*unsized_ptr)[3] == 400);
+        assert!((*unsized_ptr)[3] == 400);
 
         (*unsized_ptr)[2] = 999;
     }
@@ -1462,7 +1459,10 @@ fn nested_union_reinterpretation() {
     assert!(core::mem::size_of::<NestedUnion>() == 4);
 
     let mut u = NestedUnion {
-        parts: SegmentA { low: 0x4433, high: 0x2211 }
+        parts: SegmentA {
+            low: 0x4433,
+            high: 0x2211,
+        },
     };
 
     unsafe {
@@ -1515,8 +1515,8 @@ fn trait_fat_pointer_manipulation() {
     let ptr_a: *const dyn Inspector = &item_a;
     let ptr_b: *const dyn Inspector = &item_b;
 
-    let repr_a = unsafe { *( &ptr_a as *const *const dyn Inspector as *const TraitRepr ) };
-    let repr_b = unsafe { *( &ptr_b as *const *const dyn Inspector as *const TraitRepr ) };
+    let repr_a = unsafe { *(&ptr_a as *const *const dyn Inspector as *const TraitRepr) };
+    let repr_b = unsafe { *(&ptr_b as *const *const dyn Inspector as *const TraitRepr) };
 
     assert_eq!(repr_a.vtable, repr_b.vtable);
 
@@ -1525,7 +1525,8 @@ fn trait_fat_pointer_manipulation() {
         vtable: repr_a.vtable,
     };
 
-    let swapped_ptr = unsafe { *( &swapped_repr as *const TraitRepr as *const *const dyn Inspector ) };
+    let swapped_ptr =
+        unsafe { *(&swapped_repr as *const TraitRepr as *const *const dyn Inspector) };
     unsafe {
         assert_eq!((*swapped_ptr).inspect(), 200);
     }
@@ -1572,13 +1573,22 @@ struct DeepNode {
 
 fn deep_pointer_indirection_and_alignment() {
     let mut node_c = AlignedBox {
-        inner: DeepNode { value: 3, next: core::ptr::null_mut() }
+        inner: DeepNode {
+            value: 3,
+            next: core::ptr::null_mut(),
+        },
     };
     let mut node_b = AlignedBox {
-        inner: DeepNode { value: 2, next: &mut node_c as *mut AlignedBox<DeepNode> }
+        inner: DeepNode {
+            value: 2,
+            next: &mut node_c as *mut AlignedBox<DeepNode>,
+        },
     };
     let mut node_a = AlignedBox {
-        inner: DeepNode { value: 1, next: &mut node_b as *mut AlignedBox<DeepNode> }
+        inner: DeepNode {
+            value: 1,
+            next: &mut node_b as *mut AlignedBox<DeepNode>,
+        },
     };
 
     let start = &mut node_a as *mut AlignedBox<DeepNode>;
@@ -1708,7 +1718,10 @@ fn generic_zst_offsets_and_arithmetic() {
 
         let zst_slice = core::slice::from_raw_parts(zst_ptr, 10);
         assert_eq!(zst_slice.len(), 10);
-        assert_eq!(&zst_slice[0] as *const ZeroSized, &zst_slice[9] as *const ZeroSized);
+        assert_eq!(
+            &zst_slice[0] as *const ZeroSized,
+            &zst_slice[9] as *const ZeroSized
+        );
     }
 }
 
@@ -1766,7 +1779,7 @@ fn volatile_byte_by_byte_copy() {
     assert_eq!(dest, source);
 }
 
-use core::mem::{size_of_val_raw, align_of_val_raw};
+use core::mem::{align_of_val_raw, size_of_val_raw};
 
 fn fat_pointer_equality() {
     let array = [1_i32, 2, 3, 4];
@@ -1820,9 +1833,21 @@ struct CyclicNode {
 }
 
 fn raw_doubly_linked_list_mutation() {
-    let mut first = CyclicNode { val: 1, prev: core::ptr::null_mut(), next: core::ptr::null_mut() };
-    let mut second = CyclicNode { val: 2, prev: core::ptr::null_mut(), next: core::ptr::null_mut() };
-    let mut third = CyclicNode { val: 3, prev: core::ptr::null_mut(), next: core::ptr::null_mut() };
+    let mut first = CyclicNode {
+        val: 1,
+        prev: core::ptr::null_mut(),
+        next: core::ptr::null_mut(),
+    };
+    let mut second = CyclicNode {
+        val: 2,
+        prev: core::ptr::null_mut(),
+        next: core::ptr::null_mut(),
+    };
+    let mut third = CyclicNode {
+        val: 3,
+        prev: core::ptr::null_mut(),
+        next: core::ptr::null_mut(),
+    };
 
     let p1 = &mut first as *mut CyclicNode;
     let p2 = &mut second as *mut CyclicNode;
@@ -1890,9 +1915,8 @@ struct ConstMessage {
 
 static CONST_MESSAGE: ConstMessage = ConstMessage { code: 42 };
 
-const CONST_NON_NULL_UNIT: core::ptr::NonNull<()> = unsafe {
-    core::ptr::NonNull::new_unchecked(&CONST_MESSAGE as *const ConstMessage as *mut ())
-};
+const CONST_NON_NULL_UNIT: core::ptr::NonNull<()> =
+    unsafe { core::ptr::NonNull::new_unchecked(&CONST_MESSAGE as *const ConstMessage as *mut ()) };
 
 #[derive(Copy, Clone)]
 struct ConstPointerRepr(core::ptr::NonNull<()>, core::marker::PhantomData<()>);
@@ -1930,7 +1954,11 @@ struct VolatilePayload {
 }
 
 fn volatile_aggregate_operations() {
-    let mut storage = VolatilePayload { a: 100, b: 200, c: 300 };
+    let mut storage = VolatilePayload {
+        a: 100,
+        b: 200,
+        c: 300,
+    };
     let ptr = &mut storage as *mut VolatilePayload;
 
     unsafe {
@@ -1984,8 +2012,10 @@ fn atomic_pointer_manipulation() {
     let atomic_ptr = AtomicPtr::new(&mut val_a as *mut i32);
 
     let loaded = atomic_ptr.load(Ordering::SeqCst);
-    unsafe { assert_eq!(*loaded, 42); }
-    
+    unsafe {
+        assert_eq!(*loaded, 42);
+    }
+
     let exchanged = atomic_ptr.swap(&mut val_b as *mut i32, Ordering::SeqCst);
     unsafe {
         assert_eq!(*exchanged, 42);

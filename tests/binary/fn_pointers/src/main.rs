@@ -1,9 +1,3 @@
-#![no_std]
-#![feature(lang_items)]
-#![allow(internal_features)]
-
-include!("../../../support/test_prelude.rs");
-
 #[derive(Copy, Clone)]
 enum ComputeStep<T> {
     Unary(fn(T) -> T),
@@ -183,6 +177,15 @@ const NAMED_OPS: Ops = Ops {
 // Static (memory-read) path.
 static STATIC_UNARY: fn(i32) -> i32 = |x| x - 4;
 
+union StaticFunctionUnion {
+    function: fn(i32) -> i32,
+    bits: usize,
+}
+
+static STATIC_FUNCTION_UNION: StaticFunctionUnion = StaticFunctionUnion {
+    function: named_add_one,
+};
+
 const ZERO_ARG_CLOSURE: fn() -> i32 = || 42;
 const CLOSURE_TABLE: [fn(i32) -> i32; 2] = [|x| x + 2, |x| x * 2];
 
@@ -318,6 +321,8 @@ fn main() {
 
     assert!(STATIC_UNARY(46) == 42);
     assert!(apply(STATIC_UNARY, 10) == 6);
+    let static_union_function = unsafe { STATIC_FUNCTION_UNION.function };
+    assert!(static_union_function(41) == 42);
 
     assert!(ZERO_ARG_CLOSURE() == 42);
     let sink: fn(i32) = |value| assert!(value == 42);

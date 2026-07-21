@@ -30,6 +30,7 @@ fn constant_load_stack_floor(constant: &oomir::Constant) -> u16 {
             (2 + constant_load_stack_floor(&backing)).max(4)
         }
         Constant::SliceRef { backing, .. } => (2 + constant_load_stack_floor(backing)).max(4),
+        Constant::RepeatedBytePointer { .. } => 10,
         Constant::Instance { params, .. } => {
             let mut stack = 2;
             let mut peak = stack;
@@ -38,6 +39,15 @@ fn constant_load_stack_floor(constant: &oomir::Constant) -> u16 {
                 stack += get_type_size(&Type::from_constant(param));
             }
             peak
+        }
+        Constant::StaticCall { args, ty, .. } => {
+            let mut stack = 0;
+            let mut peak = 0;
+            for arg in args {
+                peak = peak.max(stack + constant_load_stack_floor(arg));
+                stack += get_type_size(&Type::from_constant(arg));
+            }
+            peak.max(get_type_size(ty))
         }
         Constant::StaticRef { ty, .. } | Constant::FactoryCall { ty, .. } => get_type_size(ty),
         _ => 1,

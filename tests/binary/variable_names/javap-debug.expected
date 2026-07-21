@@ -2,19 +2,19 @@ Compiled from "main.rs"
 
 public static int exercise_variable_names(int, long);
 LineNumberTable:
-line 9
+line 3
+line 4
+line 5
+line 6
+line 7
+line 8
+line 6
+line 10
+line 11
 line 10
 line 11
 line 12
-line 13
-line 14
-line 12
-line 16
-line 17
-line 16
-line 17
-line 18
-line 17
+line 11
 LocalVariableTable:
 Slot Name Signature
 0 first I
@@ -26,12 +26,13 @@ Slot Name Signature
 
 public static void main(java.lang.String[]);
 LineNumberTable:
-line 21
-line 22
-line 21
-line 22
-line 23
-line 22
+line 14
+line 15
+line 16
+line 15
+line 16
+line 17
+line 16
 LocalVariableTable:
 Slot Name Signature
 0 args [Ljava/lang/String;

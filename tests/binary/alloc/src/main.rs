@@ -1,20 +1,14 @@
-#![no_std]
-#![feature(lang_items)]
-#![allow(internal_features)]
-
-include!("../../../support/test_prelude.rs");
-
-use alloc::alloc::{alloc_zeroed, dealloc, realloc};
-use alloc::borrow::Cow;
-use alloc::boxed::Box;
-use alloc::collections::{BTreeMap, BTreeSet, BinaryHeap, LinkedList, VecDeque};
-use alloc::format;
-use alloc::rc::{Rc, Weak};
-use alloc::sync::{Arc, Weak as ArcWeak};
-use alloc::string::{String, ToString};
-use alloc::vec;
-use alloc::vec::Vec;
-use core::alloc::Layout;
+use std::alloc::{alloc_zeroed, dealloc, realloc};
+use std::borrow::Cow;
+use std::boxed::Box;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, LinkedList, VecDeque};
+use std::format;
+use std::rc::{Rc, Weak};
+use std::sync::{Arc, Weak as ArcWeak};
+use std::string::{String, ToString};
+use std::vec;
+use std::vec::Vec;
+use std::alloc::Layout;
 use core::cell::RefCell;
 use core::ops::Bound::{Excluded, Included, Unbounded};
 use core::pin::Pin;
@@ -107,7 +101,8 @@ struct CyclicArcNode {
     weak_self: ArcWeak<CyclicArcNode>,
 }
 
-struct ArcWorkerContext {
+#[repr(C)]
+pub struct ArcWorkerContext {
     relaxed_counter: Arc<AtomicUsize>,
     sequential_counter: Arc<AtomicUsize>,
     iterations: usize,

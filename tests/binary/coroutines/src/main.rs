@@ -1,8 +1,4 @@
-#![no_std]
-#![feature(coroutines, coroutine_trait, lang_items, stmt_expr_attributes)]
-#![allow(internal_features)]
-
-include!("../../../support/test_prelude.rs");
+#![feature(coroutines, coroutine_trait, stmt_expr_attributes)]
 
 use core::ops::{Coroutine, CoroutineState};
 use core::pin::Pin;

@@ -197,6 +197,11 @@ pub fn eliminate_duplicate_basic_blocks(func: &mut Function) {
                             *target = canonical_target.clone();
                         }
                     }
+                    Instruction::UnwindStart { target } => {
+                        if let Some(canonical_target) = redirects.get(target) {
+                            *target = canonical_target.clone();
+                        }
+                    }
                     Instruction::Branch {
                         true_block,
                         false_block,

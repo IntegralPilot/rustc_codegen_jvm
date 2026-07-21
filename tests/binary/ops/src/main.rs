@@ -1,11 +1,10 @@
-#![no_std]
-#![feature(lang_items)]
 #![allow(internal_features)]
 #![feature(f16)]
 #![feature(f128)]
 #![feature(core_intrinsics)]
-
-include!("../../../support/test_prelude.rs");
+#![feature(disjoint_bitor)]
+#![feature(funnel_shifts)]
+#![feature(uint_carryless_mul)]
 
 macro_rules! test_comparisons {
     ($type:ty, $a:expr, $b:expr, $c:expr, $d:expr, $zero:expr, $nzero:expr) => {
@@ -359,11 +358,51 @@ fn runtime_division_intrinsics() {
     test_division_intrinsics!(opaque_i16, i16, -30_000, 3, -10_000, -30_001, -1);
     test_division_intrinsics!(opaque_u16, u16, 60_000, 3, 20_000, 60_001, 1);
     test_division_intrinsics!(opaque_i32, i32, -1_200_000, 3, -400_000, -1_200_001, -1);
-    test_division_intrinsics!(opaque_u32, u32, 3_600_000_000, 3, 1_200_000_000, 3_600_000_001, 1);
-    test_division_intrinsics!(opaque_i64, i64, -6_000_000_000, 3, -2_000_000_000, -6_000_000_001, -1);
-    test_division_intrinsics!(opaque_u64, u64, 12_000_000_000, 3, 4_000_000_000, 12_000_000_001, 1);
-    test_division_intrinsics!(opaque_i128, i128, -(1_i128 << 100), 4, -(1_i128 << 98), -(1_i128 << 100) - 1, -1);
-    test_division_intrinsics!(opaque_u128, u128, 1_u128 << 127, 4, 1_u128 << 125, (1_u128 << 127) + 1, 1);
+    test_division_intrinsics!(
+        opaque_u32,
+        u32,
+        3_600_000_000,
+        3,
+        1_200_000_000,
+        3_600_000_001,
+        1
+    );
+    test_division_intrinsics!(
+        opaque_i64,
+        i64,
+        -6_000_000_000,
+        3,
+        -2_000_000_000,
+        -6_000_000_001,
+        -1
+    );
+    test_division_intrinsics!(
+        opaque_u64,
+        u64,
+        12_000_000_000,
+        3,
+        4_000_000_000,
+        12_000_000_001,
+        1
+    );
+    test_division_intrinsics!(
+        opaque_i128,
+        i128,
+        -(1_i128 << 100),
+        4,
+        -(1_i128 << 98),
+        -(1_i128 << 100) - 1,
+        -1
+    );
+    test_division_intrinsics!(
+        opaque_u128,
+        u128,
+        1_u128 << 127,
+        4,
+        1_u128 << 125,
+        (1_u128 << 127) + 1,
+        1
+    );
     test_division_intrinsics!(opaque_isize, isize, -12_000, 3, -4_000, -12_001, -1);
     test_division_intrinsics!(opaque_usize, usize, 12_000, 3, 4_000, 12_001, 1);
 }
@@ -448,6 +487,42 @@ fn runtime_float_ops() {
         opaque_f32(f32::INFINITY) + opaque_f32(f32::NEG_INFINITY) != 0.0,
         "runtime f32 infinity"
     );
+
+    assert!(opaque_f16(-3.5f16).abs() == 3.5f16, "f16 abs");
+    assert!(opaque_f32(-3.5).abs() == 3.5, "f32 abs");
+    assert!(opaque_f64(-3.5).abs() == 3.5, "f64 abs");
+    assert!(opaque_f128(-3.5f128).abs() == 3.5f128, "f128 abs");
+}
+
+fn runtime_new_integer_intrinsics() {
+    assert!(opaque_u8(0x12).swap_bytes() == 0x12, "u8 byte swap");
+    assert!(opaque_u16(0x1234).swap_bytes() == 0x3412, "u16 byte swap");
+    assert!(opaque_u32(0x1234_5678).swap_bytes() == 0x7856_3412, "u32 byte swap");
+    assert!(
+        opaque_u64(0x0123_4567_89ab_cdef).swap_bytes() == 0xefcd_ab89_6745_2301,
+        "u64 byte swap"
+    );
+    assert!(
+        opaque_u128(0x0011_2233_4455_6677_8899_aabb_ccdd_eeff).swap_bytes()
+            == 0xffee_ddcc_bbaa_9988_7766_5544_3322_1100,
+        "u128 byte swap"
+    );
+
+    assert!(unsafe { opaque_u32(1).unchecked_disjoint_bitor(4) } == 5);
+    assert!(unsafe { core::intrinsics::disjoint_bitor(false, true) });
+    assert!(opaque_u8(0b1000_0001).funnel_shl(0b0011_0001, 4) == 0b0001_0011);
+    assert!(opaque_u16(0x1234).funnel_shr(0xabcd, 8) == 0x34ab);
+    assert!(opaque_u16(0x00ef).carryless_mul(0x0080) == 0x7780);
+    assert!(opaque_u32(0x0123_4567).carryless_mul(1 << 16) == 0x4567_0000);
+    assert!(
+        opaque_u64(0x0123_4567_89ab_cdef).carryless_mul(1 << 32)
+            == 0x89ab_cdef_0000_0000
+    );
+    assert!(
+        opaque_u128(0x0123_4567_89ab_cdef).carryless_mul(1 << 64)
+            == 0x0123_4567_89ab_cdef_0000_0000_0000_0000
+    );
+    assert!(opaque_u8(0xaa).carryless_mul(0x55) == 0x22);
 }
 
 fn runtime_casts() {
@@ -770,6 +845,7 @@ fn main() {
     runtime_division_intrinsics();
     runtime_bit_counts();
     runtime_float_ops();
+    runtime_new_integer_intrinsics();
     runtime_casts();
     runtime_pointer_width();
     forwarded_reference_ops();

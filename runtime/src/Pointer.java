@@ -36,7 +36,7 @@ public final class Pointer {
         }
     }
 
-    private static Object invokeRustFunction(Object function, Object... arguments) {
+    static Object invokeRustFunction(Object function, Object... arguments) {
         if (function == null) {
             throw new NullPointerException("Rust function pointer is null");
         }
@@ -91,8 +91,10 @@ public final class Pointer {
     private static final Map<Object, Integer> ALLOCATION_ELEMENT_SIZES = new WeakHashMap<>();
     private static final Map<Object, Integer> ALLOCATION_ALIGNMENTS = new WeakHashMap<>();
     private static final Map<Object, String> ALLOCATION_CODECS = new WeakHashMap<>();
+    private static final Map<String, byte[]> CONSTANT_ALLOCATIONS = new HashMap<>();
     private static final Map<Long, ExposedTarget> EXPOSED_ADDRESSES = new HashMap<>();
     private static final Map<String, Method[]> CODEC_METHODS = new HashMap<>();
+    private static final Map<Class<?>, Method[]> SCALAR_ENUM_METHODS = new HashMap<>();
     private static final Map<Object, Long> MANAGED_OBJECT_ADDRESSES = new IdentityHashMap<>();
     private static final Map<Long, WeakReference<Object>> MANAGED_OBJECTS = new HashMap<>();
     private static final Map<String, Pointer> TRAIT_METADATA_MARKERS = new HashMap<>();
@@ -235,14 +237,24 @@ public final class Pointer {
             if (data == null && (array == null || !array.getClass().isArray())) {
                 throw new IllegalArgumentException("Rust slice drop requires array-backed storage");
             }
-            Class<?> owner = Class.forName(ownerClassName.replace('/', '.'));
-            MethodHandle drop = MethodHandles.publicLookup().findStatic(
-                    owner, methodName, MethodType.methodType(void.class, Pointer.class));
+            MethodHandle drop = null;
             for (int index = 0; index < length; index++) {
                 Pointer element = data == null
                         ? Pointer.cell(Array.get(array, offset + index))
                         : data.add(index);
-                drop.invokeExact(element);
+                Object managed = element.getObject();
+                if (managed instanceof RustDrop) {
+                    ((RustDrop) managed).rustDrop();
+                } else {
+                    if (drop == null) {
+                        Class<?> owner = Class.forName(ownerClassName.replace('/', '.'));
+                        drop = MethodHandles.publicLookup().findStatic(
+                                owner,
+                                methodName,
+                                MethodType.methodType(void.class, Pointer.class));
+                    }
+                    drop.invokeExact(element);
+                }
             }
         } catch (ReflectiveOperationException error) {
             throw new IllegalStateException("could not invoke Rust slice element drop glue", error);
@@ -726,6 +738,29 @@ public final class Pointer {
         return result;
     }
 
+    /** Normalizes a fixed-array value whose optimized local may still hold a slice view. */
+    public static Object arrayCarrier(Object value) {
+        if (value == null || value.getClass().isArray()) {
+            return value;
+        }
+        if (!isSliceViewCarrierType(value.getClass())) {
+            throw new ClassCastException(
+                    value.getClass().getName() + " is neither a JVM array nor a Rust slice view");
+        }
+        try {
+            Object backing = instanceField(value.getClass(), "array").get(value);
+            if (backing instanceof Pointer) {
+                backing = ((Pointer) backing).backingArray();
+            }
+            if (backing == null || !backing.getClass().isArray()) {
+                throw new IllegalArgumentException("Rust slice view is not backed by an array");
+            }
+            return sliceBackingForArray(value, backing.getClass());
+        } catch (ReflectiveOperationException error) {
+            throw new IllegalArgumentException("invalid Rust slice view", error);
+        }
+    }
+
     private static Object adaptStructuralField(Object value, Class<?> targetType)
             throws ReflectiveOperationException {
         if (value == null) {
@@ -1121,6 +1156,20 @@ public final class Pointer {
         }
     }
 
+    private static boolean hasProjectedFieldCells(Object owner) {
+        if (owner == null) {
+            return false;
+        }
+        synchronized (FIELD_CELLS) {
+            Map<String, WeakReference<FieldCell>> fields = FIELD_CELLS.get(owner);
+            if (fields == null) {
+                return false;
+            }
+            fields.entrySet().removeIf(entry -> entry.getValue().get() == null);
+            return !fields.isEmpty();
+        }
+    }
+
     /**
      * Returns the real inner object for a full-size transparent view of managed
      * storage. Rust wrappers such as {@code UnsafeCell<T>} have the same memory
@@ -1334,6 +1383,7 @@ public final class Pointer {
         private final long metadata;
         private final long zeroSizedSourceViewSize;
         private final String zeroSizedSourceViewCodecClassName;
+        private final Object traitObjectCarrier;
 
         private ExposedTarget(
                 Object allocation,
@@ -1344,7 +1394,8 @@ public final class Pointer {
                 String viewCodecClassName,
                 long metadata,
                 long zeroSizedSourceViewSize,
-                String zeroSizedSourceViewCodecClassName) {
+                String zeroSizedSourceViewCodecClassName,
+                Object traitObjectCarrier) {
             this.allocation = allocation;
             this.allocationElementSize = allocationElementSize;
             this.byteOffset = byteOffset;
@@ -1354,6 +1405,7 @@ public final class Pointer {
             this.metadata = metadata;
             this.zeroSizedSourceViewSize = zeroSizedSourceViewSize;
             this.zeroSizedSourceViewCodecClassName = zeroSizedSourceViewCodecClassName;
+            this.traitObjectCarrier = traitObjectCarrier;
         }
     }
 
@@ -1369,6 +1421,7 @@ public final class Pointer {
     private long metadata = -1;
     private long zeroSizedSourceViewSize = -1;
     private String zeroSizedSourceViewCodecClassName;
+    private Object traitObjectCarrier;
 
     private Pointer(Object allocation, int allocationElementSize, int byteOffset, int viewSize) {
         this(allocation, allocationElementSize, byteOffset, viewSize, null, null, -1);
@@ -1664,6 +1717,43 @@ public final class Pointer {
         }
     }
 
+    /** Materializes a shared repeated-byte CTFE allocation and returns one view into it. */
+    public static Pointer constantRepeatedByte(
+            String identity,
+            int initialByte,
+            long length,
+            long offset,
+            long viewSize,
+            long alignment,
+            String viewCodecClassName) {
+        int checkedLength = checkedArrayLength(length);
+        int checkedOffset = checkedArrayLength(offset);
+        int checkedAlignment = checkedAlignment(alignment);
+        if (checkedOffset > checkedLength) {
+            throw new IndexOutOfBoundsException("constant pointer offset exceeds its allocation");
+        }
+        byte[] allocation;
+        synchronized (CONSTANT_ALLOCATIONS) {
+            allocation = CONSTANT_ALLOCATIONS.get(identity);
+            if (allocation == null) {
+                allocation = new byte[checkedLength];
+                Arrays.fill(allocation, (byte) initialByte);
+                CONSTANT_ALLOCATIONS.put(identity, allocation);
+                synchronized (ALLOCATION_BASES) {
+                    ALLOCATION_ALIGNMENTS.put(allocation, checkedAlignment);
+                }
+            }
+        }
+        return new Pointer(
+                allocation,
+                1,
+                checkedOffset,
+                viewSize,
+                null,
+                viewCodecClassName,
+                -1);
+    }
+
     public static Pointer reallocateBytes(
             Pointer source,
             long oldByteCount,
@@ -1855,7 +1945,7 @@ public final class Pointer {
             if (target != null) {
                 Object allocation = target.allocation;
                 if (allocation != null) {
-                    return new Pointer(
+                    Pointer pointer = new Pointer(
                             allocation,
                             target.allocationElementSize,
                             target.byteOffset,
@@ -1863,6 +1953,13 @@ public final class Pointer {
                             target.codecClassName,
                             viewCodecClassName,
                             -1).withMetadata(target.metadata);
+                    if (viewSize == 0 && target.zeroSizedSourceViewSize >= 0) {
+                        pointer.zeroSizedSourceViewSize = target.zeroSizedSourceViewSize;
+                        pointer.zeroSizedSourceViewCodecClassName =
+                                target.zeroSizedSourceViewCodecClassName;
+                    }
+                    pointer.traitObjectCarrier = target.traitObjectCarrier;
+                    return pointer;
                 }
             }
             for (Map.Entry<Object, Long> entry : ALLOCATION_BASES.entrySet()) {
@@ -1952,6 +2049,7 @@ public final class Pointer {
                     pointer.zeroSizedSourceViewSize = target.zeroSizedSourceViewSize;
                     pointer.zeroSizedSourceViewCodecClassName =
                             target.zeroSizedSourceViewCodecClassName;
+                    pointer.traitObjectCarrier = target.traitObjectCarrier;
                     return pointer;
                 }
             }
@@ -2048,6 +2146,7 @@ public final class Pointer {
                 resultAllocationCodecClassName,
                 newViewCodecClassName,
                 resultExposedAddress).withMetadata(metadata);
+        result.traitObjectCarrier = traitObjectCarrier;
         if (newViewSize == 0 && newViewCodecClassName == null) {
             if (viewSize == 0 && zeroSizedSourceViewSize >= 0) {
                 result.zeroSizedSourceViewSize = zeroSizedSourceViewSize;
@@ -2072,6 +2171,26 @@ public final class Pointer {
     public static Pointer retype(
             Pointer pointer, int newViewSize, String newViewCodecClassName) {
         return pointer.retype(newViewSize, newViewCodecClassName);
+    }
+
+    public static Pointer attachTraitObjectCarrier(Pointer pointer, Object carrier) {
+        if (pointer == null || carrier == null) {
+            throw new NullPointerException("trait-object pointer and carrier must be non-null");
+        }
+        pointer.traitObjectCarrier = carrier;
+        return pointer;
+    }
+
+    public static Pointer attachPointeeTraitObjectCarrier(Pointer pointer) {
+        if (pointer == null) {
+            throw new NullPointerException("trait-object pointer must be non-null");
+        }
+        Object carrier = pointer.getObject();
+        if (carrier == null) {
+            throw new NullPointerException("trait-object pointee must be non-null");
+        }
+        pointer.traitObjectCarrier = carrier;
+        return pointer;
     }
 
     public static Pointer retype(
@@ -2119,7 +2238,7 @@ public final class Pointer {
     }
 
     public static Pointer restoreAllocationView(Pointer pointer) {
-        return new Pointer(
+        Pointer result = new Pointer(
                 pointer.allocation,
                 pointer.allocationElementSize,
                 pointer.byteOffset,
@@ -2127,6 +2246,8 @@ public final class Pointer {
                 pointer.allocationCodecClassName,
                 pointer.allocationCodecClassName,
                 pointer.exposedAddress).withMetadata(pointer.metadata);
+        result.traitObjectCarrier = pointer.traitObjectCarrier;
+        return result;
     }
 
     public static Pointer restoreErasedView(Pointer pointer) {
@@ -2560,8 +2681,8 @@ public final class Pointer {
     /** Implements the compiler's byte-wise comparison intrinsic. */
     public static int compareBytes(Pointer left, Pointer right, long length) {
         for (long index = 0; index < length; index++) {
-            int leftByte = left.byte_offset(index).getI8() & 0xff;
-            int rightByte = right.byte_offset(index).getI8() & 0xff;
+            int leftByte = left.loadByte(Math.addExact(left.byteOffset, index)) & 0xff;
+            int rightByte = right.loadByte(Math.addExact(right.byteOffset, index)) & 0xff;
             if (leftByte != rightByte) {
                 return leftByte - rightByte;
             }
@@ -2623,13 +2744,6 @@ public final class Pointer {
         if (allocation == null) {
             return exposedAddress;
         }
-        // Publishing an address normally commits pending decoded views. While
-        // one of those views is itself being encoded, however, pointer-valued
-        // fields only need their numeric address; recursively flushing their
-        // pointee can detach an unrelated live interior reference.
-        if (MEMORY_VIEW_WRITEBACK_DEPTH.get() == 0) {
-            flushAllMemoryViews();
-        }
         synchronized (ALLOCATION_BASES) {
             Long base = ALLOCATION_BASES.get(allocation);
             if (base == null) {
@@ -2656,7 +2770,8 @@ public final class Pointer {
                             viewCodecClassName,
                             metadata,
                             zeroSizedSourceViewSize,
-                            zeroSizedSourceViewCodecClassName));
+                            zeroSizedSourceViewCodecClassName,
+                            traitObjectCarrier));
             return address;
         }
     }
@@ -2695,7 +2810,8 @@ public final class Pointer {
                                 pointer.viewCodecClassName,
                                 pointer.metadata,
                                 pointer.zeroSizedSourceViewSize,
-                                pointer.zeroSizedSourceViewCodecClassName));
+                                pointer.zeroSizedSourceViewCodecClassName,
+                                pointer.traitObjectCarrier));
                 pointer.erasedAddressToken = token;
                 return token;
             }
@@ -2845,15 +2961,17 @@ public final class Pointer {
                     value,
                     allocationElementSize,
                     SIGNED_BIG_INTEGER_CODEC.equals(allocationCodecClassName));
-            writeElement(elementIndex, updated);
+            writeElementPreservingIdentity(elementIndex, updated);
             return;
         }
         if (current instanceof I128) {
-            writeElement(elementIndex, ((I128) current).withByte(withinElement, value));
+            writeElementPreservingIdentity(
+                    elementIndex, ((I128) current).withByte(withinElement, value));
             return;
         }
         if (current instanceof U128) {
-            writeElement(elementIndex, ((U128) current).withByte(withinElement, value));
+            writeElementPreservingIdentity(
+                    elementIndex, ((U128) current).withByte(withinElement, value));
             return;
         }
         if (current instanceof F128) {
@@ -2863,14 +2981,14 @@ public final class Pointer {
                     value,
                     allocationElementSize,
                     false);
-            writeElement(elementIndex, F128.fromBits(updated));
+            writeElementPreservingIdentity(elementIndex, F128.fromBits(updated));
             return;
         }
         if (isFatPointerCodec(allocationCodecClassName)) {
             byte[] bytes = encodeFatPointer(
                     current, allocationElementSize, allocationCodecClassName);
             bytes[withinElement] = (byte) value;
-            writeElement(
+            writeElementPreservingIdentity(
                     elementIndex,
                     decodeFatPointer(bytes, 0, allocationElementSize, allocationCodecClassName));
             return;
@@ -2882,13 +3000,15 @@ public final class Pointer {
                 throw new IndexOutOfBoundsException("aggregate codec returned a short memory image");
             }
             bytes[withinElement] = (byte) value;
-            writeElement(elementIndex, decodeAggregate(allocationCodecClassName, bytes));
+            writeElementPreservingIdentity(
+                    elementIndex, decodeAggregate(allocationCodecClassName, bytes));
             return;
         }
         long bits = valueBits(current, allocationElementSize);
         long mask = 0xffL << (withinElement * 8);
         bits = (bits & ~mask) | (((long) value & 0xffL) << (withinElement * 8));
-        writeElement(elementIndex, carrierFromBits(current, bits, allocationElementSize));
+        writeElementPreservingIdentity(
+                elementIndex, carrierFromBits(current, bits, allocationElementSize));
     }
 
     private static int checkedAtomicByteCount(int byteCount) {
@@ -2914,23 +3034,34 @@ public final class Pointer {
         return stripes;
     }
 
-    /**
-     * Maps every alias of a Rust atomic location to the same monitor without
-     * assigning an exposed address or allocating during the operation. Hash
-     * collisions only serialize unrelated atomics and therefore remain safe.
-     */
+    /** Maps aliases of a Rust atomic location to the same striped monitor. */
     private static Object atomicStripe(Pointer pointer) {
         return ATOMIC_STRIPES[atomicStripeIndex(pointer)];
     }
 
-    private static int atomicStripeIndex(Pointer pointer) {
-        long key;
-        if (pointer.allocation == null) {
-            key = pointer.exposedAddress;
-        } else {
-            key = ((long) System.identityHashCode(pointer.allocation) << 32)
-                    ^ pointer.byteOffset;
+    /** Shared monitor used by JVM futex wait/wake and Rust atomic operations. */
+    static Object atomicMonitor(Pointer pointer) {
+        if (pointer == null) {
+            throw new NullPointerException("a futex address cannot be null");
         }
+        return atomicStripe(pointer);
+    }
+
+    private static int atomicStripeIndex(Pointer pointer) {
+        Object identity = pointer.allocation;
+        int memberHash = 0;
+        if (identity instanceof ReceiverCell) {
+            identity = ((ReceiverCell) identity).value;
+        } else if (identity instanceof FieldCell) {
+            FieldCell cell = (FieldCell) identity;
+            identity = cell.owner;
+            memberHash = cell.field.getName().hashCode();
+        }
+        long key = identity == null
+                ? pointer.exposedAddress
+                : ((long) System.identityHashCode(identity) << 32)
+                        ^ ((long) memberHash << 1)
+                        ^ pointer.byteOffset;
         key ^= key >>> 33;
         key *= 0xff51afd7ed558ccdL;
         key ^= key >>> 33;
@@ -3160,50 +3291,72 @@ public final class Pointer {
         }
     }
 
+    private void requireScalarViewSize(int expectedSize, String scalarType) {
+        if (viewSize == expectedSize) {
+            return;
+        }
+        String sourceView = zeroSizedSourceViewSize >= 0
+                ? "; recorded erased source view is " + zeroSizedSourceViewSize + " bytes"
+                : "";
+        throw new IllegalStateException(
+                scalarType + " load requires a " + expectedSize + "-byte view, but pointer has a "
+                        + viewSize + "-byte view" + sourceView);
+    }
+
     public boolean getBoolean() {
-        return loadUnsigned((int) Math.min(8, Math.max(1, viewSize))) != 0;
+        requireScalarViewSize(1, "bool");
+        return loadUnsigned(1) != 0;
     }
 
     public byte getI8() {
+        requireScalarViewSize(1, "i8/u8");
         return (byte) loadUnsigned(1);
     }
 
     public short getI16() {
-        long bits = loadUnsigned((int) Math.min(8, Math.max(1, viewSize)));
-        return viewSize == 1 ? (short) (bits & 0xffL) : (short) bits;
+        requireScalarViewSize(2, "i16/u16/f16");
+        return (short) loadUnsigned(2);
     }
 
     public int getI32() {
-        long bits = loadUnsigned((int) Math.min(8, Math.max(1, viewSize)));
-        return viewSize < 4 ? (int) bits : (int) (bits & 0xffff_ffffL);
+        requireScalarViewSize(4, "i32/u32/char");
+        return (int) loadUnsigned(4);
     }
 
     public long getI64() {
-        long bits = loadUnsigned((int) Math.min(8, Math.max(1, viewSize)));
-        return viewSize < 8 ? bits : (long) bits;
+        requireScalarViewSize(8, "i64/u64");
+        return loadUnsigned(8);
     }
 
     public float getF32() {
-        return viewSize == 2
-                ? halfToFloat((int) loadUnsigned(2))
-                : Float.intBitsToFloat((int) loadUnsigned(4));
+        requireScalarViewSize(4, "f32");
+        return Float.intBitsToFloat((int) loadUnsigned(4));
     }
 
     public double getF64() {
+        requireScalarViewSize(8, "f64");
         return Double.longBitsToDouble(loadUnsigned(8));
     }
 
     public Object getObject() {
+        if (traitObjectCarrier != null) {
+            return traitObjectCarrier;
+        }
+        Object direct = directCellValueOrSelf();
+        if (direct != this && direct instanceof TraitObjectCarrier) {
+            return direct;
+        }
         if (viewSize == 0 && zeroSizedSourceViewSize >= 0) {
-            return new Pointer(
+            Pointer pointer = new Pointer(
                             allocation,
                             allocationElementSize,
                             byteOffset,
                             zeroSizedSourceViewSize,
                             allocationCodecClassName,
                             zeroSizedSourceViewCodecClassName,
-                            exposedAddress).withMetadata(metadata)
-                    .getObject();
+                            exposedAddress).withMetadata(metadata);
+            pointer.traitObjectCarrier = traitObjectCarrier;
+            return pointer.getObject();
         }
         if (MANAGED_OBJECT_VIEW_CODEC.equals(viewCodecClassName)
                 && !isDirectAllocationView()) {
@@ -3251,6 +3404,19 @@ public final class Pointer {
             receiver = next;
         }
         return receiver;
+    }
+
+    Object directCellValueOrSelf() {
+        if (byteOffset == 0 && allocation instanceof Cell) {
+            return ((Cell) allocation).value;
+        }
+        if (byteOffset == 0 && allocation instanceof ReceiverCell) {
+            return ((ReceiverCell) allocation).value;
+        }
+        if (byteOffset == 0 && allocation instanceof FieldCell) {
+            return ((FieldCell) allocation).get();
+        }
+        return this;
     }
 
     public Object getObjectAs(String targetClassName) {
@@ -3700,7 +3866,7 @@ public final class Pointer {
             byte[] image = encodeAggregate(allocationCodecClassName, current);
             int chunk = Math.min(source.length - consumed, image.length - withinElement);
             System.arraycopy(source, consumed, image, withinElement, chunk);
-            writeElement(
+            writeElementPreservingIdentity(
                     elementIndex,
                     decodeAggregate(allocationCodecClassName, image));
             consumed += chunk;
@@ -3730,6 +3896,19 @@ public final class Pointer {
             return;
         }
         Array.set(allocation, elementIndex, value);
+    }
+
+    private void writeElementPreservingIdentity(int elementIndex, Object value) {
+        Object current = readElement(elementIndex);
+        if (isGeneratedAggregateCodec(allocationCodecClassName)
+                && current != null
+                && value != null
+                && current.getClass() == value.getClass()
+                && hasProjectedFieldCells(current)) {
+            overwriteManagedObject(current, value);
+        } else {
+            writeElement(elementIndex, value);
+        }
     }
 
     private static Method[] codecMethods(String codecClassName) {
@@ -3763,6 +3942,37 @@ public final class Pointer {
             } catch (ReflectiveOperationException error) {
                 throw new IllegalStateException("could not load Rust pointer codec " + codecClassName, error);
             }
+        }
+    }
+
+    private static Method[] scalarEnumMethods(Class<?> type) {
+        synchronized (SCALAR_ENUM_METHODS) {
+            Method[] cached = SCALAR_ENUM_METHODS.get(type);
+            if (cached != null) {
+                return cached;
+            }
+            Method[] methods = new Method[0];
+            try {
+                boolean hasPayload = false;
+                for (Field field : type.getFields()) {
+                    if (!Modifier.isStatic(field.getModifiers())) {
+                        hasPayload = true;
+                        break;
+                    }
+                }
+                if (!hasPayload) {
+                    Method discriminant = type.getMethod("_unionDiscriminant");
+                    Method fromDiscriminant = type.getMethod("_fromUnionDiscriminant", long.class);
+                    if (discriminant.getReturnType() == long.class
+                            && Modifier.isStatic(fromDiscriminant.getModifiers())) {
+                        methods = new Method[] {discriminant, fromDiscriminant};
+                    }
+                }
+            } catch (NoSuchMethodException ignored) {
+                // This is an ordinary non-enum JVM carrier.
+            }
+            SCALAR_ENUM_METHODS.put(type, methods);
+            return methods;
         }
     }
 
@@ -3820,6 +4030,14 @@ public final class Pointer {
         }
         if (value instanceof Pointer && size <= 8) {
             return ((Pointer) value).address();
+        }
+        Method[] enumMethods = scalarEnumMethods(value.getClass());
+        if (size <= 8 && enumMethods.length != 0) {
+            try {
+                return ((Number) enumMethods[0].invoke(value)).longValue();
+            } catch (ReflectiveOperationException error) {
+                throw new IllegalStateException("could not read Rust enum discriminant", error);
+            }
         }
         throw new UnsupportedOperationException(
                 "value is not scalar byte-addressable: " + value.getClass().getName());
@@ -3900,6 +4118,10 @@ public final class Pointer {
                 || isFatPointerCodec(codec);
     }
 
+    private static boolean isGeneratedAggregateCodec(String codec) {
+        return codec != null && !codec.startsWith("@");
+    }
+
     private static long valueBits(Object value, int size) {
         if (value == null) {
             return 0;
@@ -3936,6 +4158,14 @@ public final class Pointer {
         if (current instanceof Pointer) {
             return pointerObjectFromAddress(bits);
         }
+        Method[] enumMethods = scalarEnumMethods(current.getClass());
+        if (size <= 8 && enumMethods.length != 0) {
+            try {
+                return enumMethods[1].invoke(null, bits);
+            } catch (ReflectiveOperationException error) {
+                throw new IllegalStateException("could not reconstruct Rust enum", error);
+            }
+        }
         if (current == null) {
             if (size <= 4) {
                 return Integer.valueOf((int) bits);
@@ -3948,6 +4178,11 @@ public final class Pointer {
     }
 
     private static Object convertDirectValue(Object current, Object value, int size) {
+        if (value instanceof Boolean
+                && (current instanceof Number || current instanceof Character)) {
+            return carrierFromBits(
+                    current, ((Boolean) value).booleanValue() ? 1L : 0L, size);
+        }
         if (current instanceof Boolean && value instanceof Number) {
             return Boolean.valueOf(((Number) value).intValue() != 0);
         }

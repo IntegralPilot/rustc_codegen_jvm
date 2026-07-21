@@ -1350,6 +1350,9 @@ pub fn process_block_instructions(
 
             Instruction::SourceLocation(_)
             | Instruction::LocalVariableScope(_)
+            | Instruction::UnwindStart { .. }
+            | Instruction::UnwindEnd
+            | Instruction::Rethrow
             | Instruction::ThrowNewWithMessage { .. }
             | Instruction::Label { .. } => {
                 // nothing to do
@@ -1420,6 +1423,9 @@ fn instruction_destination(instruction: &Instruction) -> Option<&str> {
         | Instruction::InvokeStatic { dest, .. } => dest.as_deref(),
         Instruction::SourceLocation(_)
         | Instruction::LocalVariableScope(_)
+        | Instruction::UnwindStart { .. }
+        | Instruction::UnwindEnd
+        | Instruction::Rethrow
         | Instruction::Jump { .. }
         | Instruction::Branch { .. }
         | Instruction::Return { .. }
