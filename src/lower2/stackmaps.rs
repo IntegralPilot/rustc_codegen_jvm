@@ -256,6 +256,8 @@ pub(super) fn build_stack_map_attributes(
     let mut previous_instruction_offset: Option<u16> = None;
     let mut frames = Vec::new();
     let mut verification_class_cache = HashMap::new();
+    let mut previous_locals =
+        locals_for_stack_map(initial_locals, constant_pool, &mut verification_class_cache)?;
     for target in target_offsets {
         if target == 0 {
             continue;
@@ -271,17 +273,13 @@ pub(super) fn build_stack_map_attributes(
             locals_for_stack_map(&state.locals, constant_pool, &mut verification_class_cache)?;
         let stack =
             stack_for_stack_map(&state.stack, constant_pool, &mut verification_class_cache)?;
-        // Full frames are deliberately used here. Ristretto expects logical
-        // instruction deltas at this stage and converts them to JVM byte
-        // deltas while serializing the Code attribute. Keeping a single frame
-        // form avoids the compact-frame conversion that could desynchronise a
-        // StackMapTable and make a frame byte look like a verification tag.
-        frames.push(StackFrame::FullFrame {
-            frame_type: 255,
-            offset_delta: instruction_delta,
-            locals,
+        frames.push(compact_stack_frame(
+            instruction_delta,
+            &previous_locals,
+            &locals,
             stack,
-        });
+        ));
+        previous_locals = locals;
         previous_instruction_offset = Some(target);
     }
 
@@ -289,6 +287,60 @@ pub(super) fn build_stack_map_attributes(
         Ok(Vec::new())
     } else {
         Ok(vec![Attribute::StackMapTable { name_index, frames }])
+    }
+}
+
+fn compact_stack_frame(
+    offset_delta: u16,
+    previous_locals: &[VerificationType],
+    locals: &[VerificationType],
+    stack: Vec<VerificationType>,
+) -> StackFrame {
+    if locals == previous_locals {
+        return match stack.len() {
+            0 => StackFrame::SameFrameExtended {
+                frame_type: 251,
+                offset_delta,
+            },
+            1 => StackFrame::SameLocals1StackItemFrameExtended {
+                frame_type: 247,
+                offset_delta,
+                stack,
+            },
+            _ => StackFrame::FullFrame {
+                frame_type: 255,
+                offset_delta,
+                locals: locals.to_vec(),
+                stack,
+            },
+        };
+    }
+
+    if stack.is_empty() && locals.starts_with(previous_locals) {
+        let appended = &locals[previous_locals.len()..];
+        if (1..=3).contains(&appended.len()) {
+            return StackFrame::AppendFrame {
+                frame_type: 251 + appended.len() as u8,
+                offset_delta,
+                locals: appended.to_vec(),
+            };
+        }
+    }
+    if stack.is_empty() && previous_locals.starts_with(locals) {
+        let removed = previous_locals.len() - locals.len();
+        if (1..=3).contains(&removed) {
+            return StackFrame::ChopFrame {
+                frame_type: 251 - removed as u8,
+                offset_delta,
+            };
+        }
+    }
+
+    StackFrame::FullFrame {
+        frame_type: 255,
+        offset_delta,
+        locals: locals.to_vec(),
+        stack,
     }
 }
 
@@ -1781,4 +1833,64 @@ fn array_descriptor_from_type(array_type: &ArrayType) -> String {
 
 fn normalize_class_name(class_name: &str) -> String {
     class_name.replace('.', "/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compact_frames_reuse_or_extend_previous_locals() {
+        let previous = vec![VerificationType::Integer];
+        assert!(matches!(
+            compact_stack_frame(4, &previous, &previous, Vec::new()),
+            StackFrame::SameFrameExtended {
+                frame_type: 251,
+                offset_delta: 4
+            }
+        ));
+        assert!(matches!(
+            compact_stack_frame(
+                7,
+                &previous,
+                &[VerificationType::Integer, VerificationType::Float],
+                Vec::new()
+            ),
+            StackFrame::AppendFrame {
+                frame_type: 252,
+                offset_delta: 7,
+                ..
+            }
+        ));
+        assert!(matches!(
+            compact_stack_frame(
+                2,
+                &[VerificationType::Integer, VerificationType::Float],
+                &previous,
+                Vec::new()
+            ),
+            StackFrame::ChopFrame {
+                frame_type: 250,
+                offset_delta: 2
+            }
+        ));
+    }
+
+    #[test]
+    fn compact_frames_fall_back_when_stack_or_locals_require_it() {
+        let previous = vec![VerificationType::Integer];
+        assert!(matches!(
+            compact_stack_frame(3, &previous, &previous, vec![VerificationType::Integer]),
+            StackFrame::SameLocals1StackItemFrameExtended { .. }
+        ));
+        assert!(matches!(
+            compact_stack_frame(
+                3,
+                &previous,
+                &[VerificationType::Float],
+                vec![VerificationType::Integer, VerificationType::Integer]
+            ),
+            StackFrame::FullFrame { .. }
+        ));
+    }
 }

@@ -47,6 +47,7 @@ use std::{
     ffi::OsString,
     path::{Path, PathBuf},
     process::Command,
+    sync::{Arc, Mutex, mpsc},
 };
 
 mod instrumentation;
@@ -1114,14 +1115,7 @@ fn empty_oomir_module(tcx: TyCtxt<'_>, name: &str) -> oomir::Module {
     }
 }
 
-fn emit_oomir_shard(
-    tcx: TyCtxt<'_>,
-    crate_name: &str,
-    shard_name: &str,
-    mut oomir_module: oomir::Module,
-    emit_runtime_views: bool,
-    emitted_class_registry: &mut lower2::EmittedClassRegistry,
-) -> Vec<(String, PathBuf)> {
+fn prepare_oomir_shard(shard_name: &str, mut oomir_module: oomir::Module) -> oomir::Module {
     // Intrinsic use is registered while MIR is lowered. Drain the registry per
     // shard so no crate-wide OOMIR state has to remain alive.
     let needed_intrinsics = lower1::control_flow::take_needed_intrinsics();
@@ -1143,6 +1137,17 @@ fn emit_oomir_shard(
             .insert("RustcCodegenJVMIntrinsics".to_string(), intrinsic_class);
     }
 
+    oomir_module
+}
+
+fn emit_oomir_shard(
+    crate_name: &str,
+    shard_name: &str,
+    oomir_module: oomir::Module,
+    emit_runtime_views: bool,
+    debug_info: lower2::DebugInfoOptions,
+    emitted_class_registry: &lower2::EmittedClassRegistry,
+) -> Vec<(String, PathBuf)> {
     breadcrumbs::log!(
         breadcrumbs::LogLevel::Info,
         "backend",
@@ -1172,7 +1177,7 @@ fn emit_oomir_shard(
     let lower2_timer = instrumentation::Timer::phase("lower2", Some(crate_name));
     let generated_classes = lower2::oomir_to_jvm_bytecode(
         oomir_module,
-        tcx,
+        debug_info,
         emit_runtime_views,
         emitted_class_registry,
     )
@@ -1204,8 +1209,8 @@ impl CodegenBackend for MyBackend {
             let mut lowered_instances = HashSet::new();
             let mut claimed_mono_items = HashSet::new();
             let mut scanned_instances = HashSet::new();
-            let mut generated_classes = Vec::new();
-            let mut emitted_class_registry = lower2::EmittedClassRegistry::default();
+            let emitted_class_registry = lower2::EmittedClassRegistry::default();
+            let debug_info = lower2::debug_info_options(tcx);
 
             let mono_items = tcx.collect_and_partition_mono_items(());
             let partitioned_functions: HashSet<_> = mono_items
@@ -1218,63 +1223,115 @@ impl CodegenBackend for MyBackend {
                 })
                 .collect();
 
-            // Java exports are additional roots, so keep them out of the first
-            // ordinary codegen unit and emit them as their own small shard.
-            let mut export_module = empty_oomir_module(tcx, &crate_module_class);
-            let lower1_timer = instrumentation::Timer::phase("lower1", Some(&crate_name));
-            lower_public_library_exports(
-                tcx,
-                &partitioned_functions,
-                &mut export_module,
-                &mut lowered_instances,
-                &mut scanned_instances,
-            );
-            emit_allocator_shims(tcx, &mut export_module);
-            drop(lower1_timer);
-            generated_classes.extend(emit_oomir_shard(
-                tcx,
-                &crate_name,
-                "java-exports",
-                export_module,
-                true,
-                &mut emitted_class_registry,
-            ));
+            let generated_classes = std::thread::scope(|scope| {
+                let worker_count = std::thread::available_parallelism()
+                    .map_or(1, std::num::NonZeroUsize::get)
+                    .min(2);
+                let (job_sender, job_receiver) =
+                    mpsc::sync_channel::<(usize, String, oomir::Module, bool)>(worker_count);
+                let job_receiver = Arc::new(Mutex::new(job_receiver));
+                let (result_sender, result_receiver) = mpsc::channel();
 
-            for (index, cgu) in mono_items.codegen_units.into_iter().enumerate() {
-                let items = cgu
-                    .items_in_deterministic_order(tcx)
-                    .into_iter()
-                    .map(|(item, _)| item)
-                    .collect::<Vec<_>>();
-                if items.is_empty() {
-                    continue;
+                for _ in 0..worker_count {
+                    let job_receiver = Arc::clone(&job_receiver);
+                    let result_sender = result_sender.clone();
+                    let crate_name = &crate_name;
+                    let emitted_class_registry = &emitted_class_registry;
+                    scope.spawn(move || {
+                        loop {
+                            let job = {
+                                let receiver = job_receiver
+                                    .lock()
+                                    .expect("OOMIR shard receiver lock was poisoned");
+                                receiver.recv()
+                            };
+                            let Ok((ordinal, shard_name, module, emit_runtime_views)) = job else {
+                                break;
+                            };
+                            let generated = emit_oomir_shard(
+                                crate_name,
+                                &shard_name,
+                                module,
+                                emit_runtime_views,
+                                debug_info,
+                                emitted_class_registry,
+                            );
+                            result_sender
+                                .send((ordinal, generated))
+                                .expect("OOMIR shard result receiver was dropped");
+                        }
+                    });
                 }
+                drop(result_sender);
 
-                for (chunk_index, chunk) in items.chunks(MAX_MONO_ITEMS_PER_OOMIR_SHARD).enumerate()
-                {
-                    let shard_name = format!("cgu-{index}-{chunk_index}");
-                    let mut oomir_module = empty_oomir_module(tcx, &crate_module_class);
-                    let lower1_timer = instrumentation::Timer::phase("lower1", Some(&crate_name));
-                    lower_codegen_unit_items(
-                        tcx,
-                        chunk.iter().copied(),
-                        &partitioned_functions,
-                        &mut oomir_module,
-                        &mut claimed_mono_items,
-                        &mut lowered_instances,
-                        &mut scanned_instances,
+                let mut submitted = 0usize;
+                let mut submit =
+                    |shard_name: String, module: oomir::Module, emit_runtime_views: bool| {
+                        let module = prepare_oomir_shard(&shard_name, module);
+                        job_sender
+                            .send((submitted, shard_name, module, emit_runtime_views))
+                            .expect("OOMIR shard workers stopped unexpectedly");
+                        submitted += 1;
+                    };
+
+                // Java exports are additional roots, so keep them out of the
+                // first ordinary codegen unit and emit a small separate shard.
+                let mut export_module = empty_oomir_module(tcx, &crate_module_class);
+                let lower1_timer = instrumentation::Timer::phase("lower1", Some(&crate_name));
+                lower_public_library_exports(
+                    tcx,
+                    &partitioned_functions,
+                    &mut export_module,
+                    &mut lowered_instances,
+                    &mut scanned_instances,
+                );
+                emit_allocator_shims(tcx, &mut export_module);
+                drop(lower1_timer);
+                submit("java-exports".to_string(), export_module, true);
+
+                for (index, cgu) in mono_items.codegen_units.into_iter().enumerate() {
+                    let items = cgu
+                        .items_in_deterministic_order(tcx)
+                        .into_iter()
+                        .map(|(item, _)| item)
+                        .collect::<Vec<_>>();
+                    for (chunk_index, chunk) in
+                        items.chunks(MAX_MONO_ITEMS_PER_OOMIR_SHARD).enumerate()
+                    {
+                        let shard_name = format!("cgu-{index}-{chunk_index}");
+                        let mut oomir_module = empty_oomir_module(tcx, &crate_module_class);
+                        let lower1_timer =
+                            instrumentation::Timer::phase("lower1", Some(&crate_name));
+                        lower_codegen_unit_items(
+                            tcx,
+                            chunk.iter().copied(),
+                            &partitioned_functions,
+                            &mut oomir_module,
+                            &mut claimed_mono_items,
+                            &mut lowered_instances,
+                            &mut scanned_instances,
+                        );
+                        drop(lower1_timer);
+                        submit(shard_name, oomir_module, false);
+                    }
+                }
+                drop(submit);
+                drop(job_sender);
+
+                let mut results = Vec::with_capacity(submitted);
+                for _ in 0..submitted {
+                    results.push(
+                        result_receiver
+                            .recv()
+                            .expect("OOMIR shard worker stopped without a result"),
                     );
-                    drop(lower1_timer);
-                    generated_classes.extend(emit_oomir_shard(
-                        tcx,
-                        &crate_name,
-                        &shard_name,
-                        oomir_module,
-                        false,
-                        &mut emitted_class_registry,
-                    ));
                 }
-            }
+                results.sort_by_key(|(ordinal, _)| *ordinal);
+                results
+                    .into_iter()
+                    .flat_map(|(_, generated)| generated)
+                    .collect::<Vec<_>>()
+            });
 
             Box::new((generated_classes, crate_name))
         })

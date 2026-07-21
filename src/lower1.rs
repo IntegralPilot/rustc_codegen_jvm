@@ -65,43 +65,102 @@ fn source_scope_contains<'tcx>(
     }
 }
 
+pub(crate) struct DebugScopeCache {
+    visible_without_references: Vec<Vec<usize>>,
+    variables_by_local: HashMap<usize, Vec<usize>>,
+}
+
+impl DebugScopeCache {
+    fn new(
+        mir: &Body<'_>,
+        debug_variables: &[oomir::DebugVariable],
+        debug_variable_scopes: &[SourceScope],
+    ) -> Self {
+        let mut visible_without_references = Vec::with_capacity(mir.source_scopes.len());
+        for scope in mir.source_scopes.indices() {
+            let mut visible_by_name = HashMap::<String, (usize, SourceScope)>::new();
+            for (index, variable_scope) in debug_variable_scopes.iter().copied().enumerate() {
+                if !source_scope_contains(mir, variable_scope, scope) {
+                    continue;
+                }
+                let Some(variable) = debug_variables.get(index) else {
+                    continue;
+                };
+                match visible_by_name.get(&variable.name).copied() {
+                    Some((_, visible_scope))
+                        if source_scope_contains(mir, visible_scope, variable_scope) =>
+                    {
+                        visible_by_name.insert(variable.name.clone(), (index, variable_scope));
+                    }
+                    None => {
+                        visible_by_name.insert(variable.name.clone(), (index, variable_scope));
+                    }
+                    _ => {}
+                }
+            }
+            let mut visible = visible_by_name
+                .into_values()
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            visible.sort_unstable();
+            visible_without_references.push(visible);
+        }
+
+        let mut variables_by_local = HashMap::<usize, Vec<usize>>::new();
+        for (index, variable) in debug_variables.iter().enumerate() {
+            let local = variable
+                .oomir_name
+                .strip_prefix("_cell_")
+                .or_else(|| variable.oomir_name.strip_prefix('_'))
+                .and_then(|value| value.parse::<usize>().ok());
+            if let Some(local) = local {
+                variables_by_local.entry(local).or_default().push(index);
+            }
+        }
+
+        Self {
+            visible_without_references,
+            variables_by_local,
+        }
+    }
+}
+
 pub(crate) fn local_variable_scope(
-    mir: &Body<'_>,
+    cache: &DebugScopeCache,
     scope: SourceScope,
     referenced_locals: &HashSet<Local>,
     debug_variables: &[oomir::DebugVariable],
     debug_variable_scopes: &[SourceScope],
 ) -> oomir::Instruction {
     let mut visible_by_name = HashMap::<String, (usize, SourceScope)>::new();
-    for (index, variable_scope) in debug_variable_scopes.iter().copied().enumerate() {
-        if !source_scope_contains(mir, variable_scope, scope) {
-            continue;
-        }
+    for index in cache
+        .visible_without_references
+        .get(scope.index())
+        .into_iter()
+        .flatten()
+        .copied()
+    {
         let Some(variable) = debug_variables.get(index) else {
             continue;
         };
-        match visible_by_name.get(&variable.name).copied() {
-            Some((_, visible_scope))
-                if source_scope_contains(mir, visible_scope, variable_scope) =>
-            {
-                // A binding in the more deeply nested Rust scope shadows the
-                // outer binding with the same source name.
-                visible_by_name.insert(variable.name.clone(), (index, variable_scope));
-            }
-            None => {
-                visible_by_name.insert(variable.name.clone(), (index, variable_scope));
-            }
-            _ => {}
-        }
+        let variable_scope = debug_variable_scopes
+            .get(index)
+            .copied()
+            .unwrap_or(OUTERMOST_SOURCE_SCOPE);
+        visible_by_name.insert(variable.name.clone(), (index, variable_scope));
     }
 
     for local in referenced_locals {
-        let plain_name = format!("_{}", local.index());
-        let cell_name = place::local_cell_name(*local);
-        for (index, variable) in debug_variables.iter().enumerate() {
-            if variable.oomir_name != plain_name && variable.oomir_name != cell_name {
+        for index in cache
+            .variables_by_local
+            .get(&local.index())
+            .into_iter()
+            .flatten()
+            .copied()
+        {
+            let Some(variable) = debug_variables.get(index) else {
                 continue;
-            }
+            };
             let variable_scope = debug_variable_scopes
                 .get(index)
                 .copied()
@@ -382,6 +441,7 @@ pub fn mir_to_oomir<'tcx>(
         .map(|owner| format!("{owner}::{fn_name}"))
         .unwrap_or_else(|| fn_name.clone());
     let _timer = crate::instrumentation::Timer::function("lower1", None, &instrumented_fn_name);
+    let _stable_cell_analysis = place::enter_stable_cell_analysis(mir);
 
     // Extract function signature
     // Closures require special handling - we must use as_closure().sig() instead of fn_sig()
@@ -575,6 +635,7 @@ pub fn mir_to_oomir<'tcx>(
         });
         debug_variable_scopes.push(OUTERMOST_SOURCE_SCOPE);
     }
+    let debug_scope_cache = DebugScopeCache::new(mir, &debug_variables, &debug_variable_scopes);
 
     // Build a CodeBlock from the MIR basic blocks.
     let mut basic_blocks = HashMap::new();
@@ -601,6 +662,7 @@ pub fn mir_to_oomir<'tcx>(
             &mut mutable_borrows,
             &debug_variables,
             &debug_variable_scopes,
+            &debug_scope_cache,
             available_pointer_locals
                 .get(&bb)
                 .cloned()
@@ -806,7 +868,7 @@ pub fn mir_to_oomir<'tcx>(
             Some(oomir::Instruction::SourceLocation(_))
         )),
         local_variable_scope(
-            &mir_cloned,
+            &debug_scope_cache,
             OUTERMOST_SOURCE_SCOPE,
             &no_referenced_debug_locals,
             &debug_variables,

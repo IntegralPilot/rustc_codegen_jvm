@@ -12,7 +12,7 @@ use rustc_middle::{
     mir::{Body, Local, Operand as MirOperand, Place, ProjectionElem, Rvalue, StatementKind},
     ty::{AdtDef, EarlyBinder, GenericArgsRef, Instance, Ty, TyCtxt, TyKind, TypingEnv},
 };
-use std::collections::HashMap;
+use std::{cell::RefCell, collections::HashMap};
 
 pub(crate) fn has_slice_or_str_struct_tail<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {
     if !matches!(ty.kind(), TyKind::Adt(adt_def, _) if adt_def.is_struct()) {
@@ -351,10 +351,71 @@ pub(crate) fn local_cell_name(local: Local) -> String {
     format!("_cell_{}", local.index())
 }
 
+thread_local! {
+    static STABLE_CELL_ANALYSES: RefCell<Vec<Vec<bool>>> = const { RefCell::new(Vec::new()) };
+}
+
+pub(crate) struct StableCellAnalysisGuard;
+
+impl Drop for StableCellAnalysisGuard {
+    fn drop(&mut self) {
+        STABLE_CELL_ANALYSES.with(|analyses| {
+            analyses
+                .borrow_mut()
+                .pop()
+                .expect("stable-cell analysis guard stack is unbalanced");
+        });
+    }
+}
+
+/// Cache the address-taken-local analysis for one MIR-to-OOMIR lowering. Place
+/// lowering has many recursive entry points, so a scoped thread-local keeps the
+/// immutable per-body fact available without plumbing it through every helper.
+pub(crate) fn enter_stable_cell_analysis(mir: &Body<'_>) -> StableCellAnalysisGuard {
+    let mut stable = vec![false; mir.local_decls.len()];
+    for block in mir.basic_blocks.iter() {
+        for statement in &block.statements {
+            let StatementKind::Assign(box (_, rvalue)) = &statement.kind else {
+                continue;
+            };
+            let pointed_place = match rvalue {
+                Rvalue::Ref(_, _, place) | Rvalue::RawPtr(_, place) => place,
+                _ => continue,
+            };
+            if !matches!(
+                pointed_place.projection.first(),
+                Some(ProjectionElem::Deref)
+            ) {
+                stable[pointed_place.local.index()] = true;
+            }
+        }
+    }
+    for index in 1..=mir.arg_count {
+        let local = Local::from_usize(index);
+        if matches!(
+            mir.local_decls[local].ty.kind(),
+            TyKind::Ref(..) | TyKind::RawPtr(..)
+        ) {
+            stable[index] = false;
+        }
+    }
+    STABLE_CELL_ANALYSES.with(|analyses| analyses.borrow_mut().push(stable));
+    StableCellAnalysisGuard
+}
+
 /// Returns true when MIR takes the address of the local's storage itself. Such
 /// locals live in a canonical Pointer cell so every alias observes subsequent
 /// direct and indirect writes without copy-in/copy-out bookkeeping.
 pub(crate) fn local_uses_stable_cell(local: Local, mir: &Body<'_>) -> bool {
+    if let Some(stable) = STABLE_CELL_ANALYSES.with(|analyses| {
+        analyses
+            .borrow()
+            .last()
+            .and_then(|analysis| analysis.get(local.index()))
+            .copied()
+    }) {
+        return stable;
+    }
     if local.index() > 0
         && local.index() <= mir.arg_count
         && matches!(

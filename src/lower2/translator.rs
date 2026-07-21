@@ -23,7 +23,7 @@ use std::rc::Rc;
 use super::{F128_CLASS, I128_CLASS, U128_CLASS};
 
 #[derive(Clone, Copy)]
-pub(super) struct DebugInfoOptions {
+pub(crate) struct DebugInfoOptions {
     pub line_numbers: bool,
     pub local_variables: bool,
 }

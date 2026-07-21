@@ -1362,6 +1362,7 @@ pub(super) fn convert_basic_block<'tcx>(
     mutable_borrow_arrays: &mut MutableBorrowMap<'tcx>,
     debug_variables: &[oomir::DebugVariable],
     debug_variable_scopes: &[rustc_middle::mir::SourceScope],
+    debug_scope_cache: &super::DebugScopeCache,
     initially_available_pointer_locals: HashSet<Local>,
 ) -> oomir::BasicBlock {
     // Use the basic block index as its label.
@@ -1696,7 +1697,7 @@ pub(super) fn convert_basic_block<'tcx>(
                 metadata.push(oomir::Instruction::SourceLocation(location));
             }
             metadata.push(super::local_variable_scope(
-                mir,
+                debug_scope_cache,
                 stmt.source_info.scope,
                 &debug_local_collector.locals,
                 debug_variables,
@@ -5805,7 +5806,7 @@ pub(super) fn convert_basic_block<'tcx>(
                     fail_instructions.push(oomir::Instruction::SourceLocation(location));
                 }
                 fail_instructions.push(super::local_variable_scope(
-                    mir,
+                    debug_scope_cache,
                     terminator.source_info.scope,
                     &debug_local_collector.locals,
                     debug_variables,
@@ -5914,7 +5915,7 @@ pub(super) fn convert_basic_block<'tcx>(
                 metadata.push(oomir::Instruction::SourceLocation(location));
             }
             metadata.push(super::local_variable_scope(
-                mir,
+                debug_scope_cache,
                 terminator.source_info.scope,
                 &debug_local_collector.locals,
                 debug_variables,

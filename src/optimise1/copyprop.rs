@@ -1,124 +1,158 @@
 use super::*;
 
-type AliasMap = HashMap<String, Operand>;
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AliasValue {
+    source: usize,
+    ty: Type,
+}
+
+type AliasMap = HashMap<usize, AliasValue>;
+
+#[derive(Debug)]
+struct LocalInterner {
+    names: Vec<String>,
+    ids: HashMap<String, usize>,
+}
+
+impl LocalInterner {
+    fn for_function(function: &Function) -> Self {
+        let mut names = HashSet::new();
+        for variable in &function.debug_variables {
+            names.insert(variable.oomir_name.as_str());
+        }
+        for block in function.body.basic_blocks.values() {
+            for instruction in &block.instructions {
+                names.extend(instruction_uses(instruction));
+                if let Some(def) = instruction_def(instruction) {
+                    names.insert(def);
+                }
+            }
+        }
+        let mut names = names.into_iter().map(str::to_string).collect::<Vec<_>>();
+        names.sort();
+        let ids = names
+            .iter()
+            .enumerate()
+            .map(|(id, name)| (name.clone(), id))
+            .collect();
+        Self { names, ids }
+    }
+
+    fn id(&self, name: &str) -> Option<usize> {
+        self.ids.get(name).copied()
+    }
+
+    fn name(&self, id: usize) -> &str {
+        &self.names[id]
+    }
+
+    fn len(&self) -> usize {
+        self.names.len()
+    }
+}
 
 pub fn propagate_copies_and_eliminate_dead_moves(function: &mut Function) {
+    let locals = LocalInterner::for_function(function);
     let debug_locals = function
         .debug_variables
         .iter()
-        .map(|variable| variable.oomir_name.clone())
+        .filter_map(|variable| locals.id(&variable.oomir_name))
         .collect::<HashSet<_>>();
-    propagate_copies(function, &debug_locals);
-    eliminate_dead_moves(function, &debug_locals);
+    propagate_copies(function, &locals, &debug_locals);
+    eliminate_dead_moves(function, &locals, &debug_locals);
 }
 
-fn propagate_copies(function: &mut Function, debug_locals: &HashSet<String>) {
-    let block_entry_aliases = analyze_copy_aliases(function, debug_locals);
-    let mut labels: Vec<String> = function.body.basic_blocks.keys().cloned().collect();
-    labels.sort();
-
-    for label in labels {
+fn propagate_copies(
+    function: &mut Function,
+    locals: &LocalInterner,
+    debug_locals: &HashSet<usize>,
+) {
+    let (labels, block_entry_aliases) = analyze_copy_aliases(function, locals, debug_locals);
+    for (block_index, label) in labels.into_iter().enumerate() {
         let Some(block) = function.body.basic_blocks.get_mut(&label) else {
             continue;
         };
-        let mut aliases = block_entry_aliases.get(&label).cloned().unwrap_or_default();
+        let mut aliases = block_entry_aliases[block_index].clone();
 
         for instruction in &mut block.instructions {
-            rewrite_instruction_uses(instruction, &aliases);
-            transfer_aliases_through_instruction(instruction, &mut aliases, debug_locals);
+            rewrite_instruction_uses(instruction, &aliases, locals);
+            transfer_aliases_through_instruction(instruction, &mut aliases, locals, debug_locals);
         }
     }
 }
 
 fn analyze_copy_aliases(
     function: &Function,
-    debug_locals: &HashSet<String>,
-) -> HashMap<String, AliasMap> {
+    locals: &LocalInterner,
+    debug_locals: &HashSet<usize>,
+) -> (Vec<String>, Vec<AliasMap>) {
     let mut labels: Vec<String> = function.body.basic_blocks.keys().cloned().collect();
     labels.sort();
-
-    let predecessors = block_predecessors(function);
-    let mut entry_aliases: HashMap<String, AliasMap> = labels
+    let label_ids = labels
         .iter()
-        .map(|label| (label.clone(), AliasMap::new()))
-        .collect();
-    let mut exit_aliases = entry_aliases.clone();
-    let mut changed = true;
-
-    while changed {
-        changed = false;
-
-        for label in &labels {
-            let next_entry = if label == &function.body.entry {
-                AliasMap::new()
-            } else {
-                meet_predecessor_aliases(predecessors.get(label), &exit_aliases)
+        .enumerate()
+        .map(|(index, label)| (label.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    let entry = label_ids.get(function.body.entry.as_str()).copied();
+    let mut successors = vec![Vec::new(); labels.len()];
+    let mut predecessors = vec![Vec::new(); labels.len()];
+    for (index, label) in labels.iter().enumerate() {
+        let Some(block) = function.body.basic_blocks.get(label) else {
+            continue;
+        };
+        for successor in super::reachability::get_block_successors(block) {
+            let Some(successor) = label_ids.get(successor.as_str()).copied() else {
+                continue;
             };
+            successors[index].push(successor);
+            predecessors[successor].push(index);
+        }
+    }
 
-            let next_exit = function
-                .body
-                .basic_blocks
-                .get(label)
-                .map(|block| {
-                    transfer_aliases_through_block(block, next_entry.clone(), debug_locals)
-                })
-                .unwrap_or_default();
-
-            if entry_aliases.get(label) != Some(&next_entry) {
-                entry_aliases.insert(label.clone(), next_entry);
-                changed = true;
-            }
-            if exit_aliases.get(label) != Some(&next_exit) {
-                exit_aliases.insert(label.clone(), next_exit);
-                changed = true;
+    let mut entry_aliases = vec![AliasMap::new(); labels.len()];
+    let mut exit_aliases = entry_aliases.clone();
+    let mut queue = (0..labels.len()).collect::<VecDeque<_>>();
+    let mut queued = vec![true; labels.len()];
+    while let Some(index) = queue.pop_front() {
+        queued[index] = false;
+        let next_entry = if Some(index) == entry {
+            AliasMap::new()
+        } else {
+            meet_predecessor_aliases(&predecessors[index], &exit_aliases)
+        };
+        let next_exit = function
+            .body
+            .basic_blocks
+            .get(&labels[index])
+            .map(|block| {
+                transfer_aliases_through_block(block, next_entry.clone(), locals, debug_locals)
+            })
+            .unwrap_or_default();
+        entry_aliases[index] = next_entry;
+        if exit_aliases[index] != next_exit {
+            exit_aliases[index] = next_exit;
+            for successor in successors[index].iter().copied() {
+                if !queued[successor] {
+                    queue.push_back(successor);
+                    queued[successor] = true;
+                }
             }
         }
     }
 
-    entry_aliases
+    (labels, entry_aliases)
 }
 
-fn block_predecessors(function: &Function) -> HashMap<String, Vec<String>> {
-    let mut predecessors: HashMap<String, Vec<String>> = function
-        .body
-        .basic_blocks
-        .keys()
-        .map(|label| (label.clone(), Vec::new()))
-        .collect();
-
-    for (label, block) in &function.body.basic_blocks {
-        let successors = super::reachability::get_block_successors(block);
-        for successor in successors {
-            if let Some(successor_predecessors) = predecessors.get_mut(&successor) {
-                successor_predecessors.push(label.clone());
-            }
-        }
-    }
-
-    predecessors
-}
-
-fn meet_predecessor_aliases(
-    predecessors: Option<&Vec<String>>,
-    exit_aliases: &HashMap<String, AliasMap>,
-) -> AliasMap {
-    let Some(predecessors) = predecessors else {
-        return AliasMap::new();
-    };
+fn meet_predecessor_aliases(predecessors: &[usize], exit_aliases: &[AliasMap]) -> AliasMap {
     let mut predecessor_iter = predecessors.iter();
     let Some(first_predecessor) = predecessor_iter.next() else {
         return AliasMap::new();
     };
 
-    let mut aliases = exit_aliases
-        .get(first_predecessor)
-        .cloned()
-        .unwrap_or_default();
+    let mut aliases = exit_aliases[*first_predecessor].clone();
     for predecessor in predecessor_iter {
-        let predecessor_aliases = exit_aliases.get(predecessor);
-        aliases.retain(|dest, alias| {
-            predecessor_aliases.is_some_and(|aliases| aliases.get(dest) == Some(alias))
-        });
+        let predecessor_aliases = &exit_aliases[*predecessor];
+        aliases.retain(|dest, alias| predecessor_aliases.get(dest) == Some(alias));
     }
     aliases
 }
@@ -126,10 +160,11 @@ fn meet_predecessor_aliases(
 fn transfer_aliases_through_block(
     block: &BasicBlock,
     mut aliases: AliasMap,
-    debug_locals: &HashSet<String>,
+    locals: &LocalInterner,
+    debug_locals: &HashSet<usize>,
 ) -> AliasMap {
     for instruction in &block.instructions {
-        transfer_aliases_through_instruction(instruction, &mut aliases, debug_locals);
+        transfer_aliases_through_instruction(instruction, &mut aliases, locals, debug_locals);
     }
     aliases
 }
@@ -137,65 +172,72 @@ fn transfer_aliases_through_block(
 fn transfer_aliases_through_instruction(
     instruction: &Instruction,
     aliases: &mut AliasMap,
-    debug_locals: &HashSet<String>,
+    locals: &LocalInterner,
+    debug_locals: &HashSet<usize>,
 ) {
     let rewritten_move_src = if let Instruction::Move { src, .. } = instruction {
         let mut src = src.clone();
-        rewrite_operand(&mut src, aliases);
+        rewrite_operand(&mut src, aliases, locals);
         Some(src)
     } else {
         None
     };
 
-    let defs = instruction_defs(instruction);
-    for def in &defs {
+    if let Some(def) = instruction_def(instruction).and_then(|name| locals.id(name)) {
         kill_aliases_touching(def, aliases);
     }
 
     if let (Instruction::Move { dest, .. }, Some(Operand::Variable { name, ty })) =
         (instruction, rewritten_move_src)
-        && dest != &name
-        && !debug_locals.contains(dest)
+        && let (Some(dest), Some(source)) = (locals.id(dest), locals.id(&name))
+        && dest != source
+        && !debug_locals.contains(&dest)
     {
-        aliases.insert(dest.clone(), Operand::Variable { name, ty });
+        aliases.insert(dest, AliasValue { source, ty });
     }
 }
 
-fn eliminate_dead_moves(function: &mut Function, debug_locals: &HashSet<String>) {
+fn eliminate_dead_moves(
+    function: &mut Function,
+    locals: &LocalInterner,
+    debug_locals: &HashSet<usize>,
+) {
     loop {
-        let live_out = block_live_out(function);
+        let (labels, live_out) = block_live_out(function, locals);
         let mut removed_any = false;
 
-        let mut labels: Vec<String> = function.body.basic_blocks.keys().cloned().collect();
-        labels.sort();
-        for label in labels {
+        for (block_index, label) in labels.into_iter().enumerate() {
             let Some(block) = function.body.basic_blocks.get_mut(&label) else {
                 continue;
             };
 
-            let mut live = live_out.get(&label).cloned().unwrap_or_default();
+            let mut live = live_out[block_index].clone();
             let mut keep = vec![true; block.instructions.len()];
 
             for (index, instruction) in block.instructions.iter().enumerate().rev() {
-                let defs = instruction_defs(instruction);
-                let uses = instruction_uses(instruction);
+                let def = instruction_def(instruction).and_then(|name| locals.id(name));
 
                 if let Instruction::Move { dest, .. } = instruction
-                    && !live.contains(dest)
-                    && !debug_locals.contains(dest)
+                    && let Some(dest) = locals.id(dest)
+                    && !bit_set_contains(&live, dest)
+                    && !debug_locals.contains(&dest)
                 {
                     keep[index] = false;
                     removed_any = true;
                     continue;
                 }
 
-                for def in defs {
-                    live.remove(&def);
+                if let Some(def) = def {
+                    bit_set_remove(&mut live, def);
                 }
-                live.extend(uses);
+                for used in instruction_uses(instruction) {
+                    if let Some(used) = locals.id(used) {
+                        bit_set_insert(&mut live, used);
+                    }
+                }
             }
 
-            if removed_any {
+            if keep.iter().any(|keep| !keep) {
                 let mut keep_iter = keep.into_iter();
                 block
                     .instructions
@@ -209,82 +251,101 @@ fn eliminate_dead_moves(function: &mut Function, debug_locals: &HashSet<String>)
     }
 }
 
-fn block_live_out(function: &Function) -> HashMap<String, HashSet<String>> {
-    let mut use_sets = HashMap::new();
-    let mut def_sets = HashMap::new();
-    let mut successors = HashMap::new();
-
-    for (label, block) in &function.body.basic_blocks {
-        let mut used_before_def = HashSet::new();
-        let mut defined = HashSet::new();
-        for instruction in &block.instructions {
-            for used in instruction_uses(instruction) {
-                if !defined.contains(&used) {
-                    used_before_def.insert(used);
-                }
-            }
-            defined.extend(instruction_defs(instruction));
-        }
-
-        let block_successors = super::reachability::get_block_successors(block)
-            .into_iter()
-            .filter(|successor| function.body.basic_blocks.contains_key(successor))
-            .collect::<Vec<_>>();
-
-        use_sets.insert(label.clone(), used_before_def);
-        def_sets.insert(label.clone(), defined);
-        successors.insert(label.clone(), block_successors);
-    }
-
-    let mut live_in: HashMap<String, HashSet<String>> = function
+fn block_live_out(function: &Function, locals: &LocalInterner) -> (Vec<String>, Vec<Vec<u64>>) {
+    let mut labels = function
         .body
         .basic_blocks
         .keys()
-        .map(|label| (label.clone(), HashSet::new()))
-        .collect();
-    let mut live_out = live_in.clone();
-    let mut changed = true;
+        .cloned()
+        .collect::<Vec<_>>();
+    labels.sort();
+    let label_ids = labels
+        .iter()
+        .enumerate()
+        .map(|(index, label)| (label.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    let word_count = locals.len().div_ceil(u64::BITS as usize);
+    let mut use_sets = vec![vec![0; word_count]; labels.len()];
+    let mut def_sets = vec![vec![0; word_count]; labels.len()];
+    let mut successors = vec![Vec::new(); labels.len()];
+    let mut predecessors = vec![Vec::new(); labels.len()];
 
-    while changed {
-        changed = false;
-        let mut labels: Vec<String> = function.body.basic_blocks.keys().cloned().collect();
-        labels.sort();
-        labels.reverse();
-
-        for label in labels {
-            let mut next_out = HashSet::new();
-            if let Some(block_successors) = successors.get(&label) {
-                for successor in block_successors {
-                    if let Some(successor_live_in) = live_in.get(successor) {
-                        next_out.extend(successor_live_in.iter().cloned());
-                    }
+    for (index, label) in labels.iter().enumerate() {
+        let Some(block) = function.body.basic_blocks.get(label) else {
+            continue;
+        };
+        for instruction in &block.instructions {
+            for used in instruction_uses(instruction) {
+                let Some(used) = locals.id(used) else {
+                    continue;
+                };
+                if !bit_set_contains(&def_sets[index], used) {
+                    bit_set_insert(&mut use_sets[index], used);
                 }
             }
-
-            let mut next_in = use_sets.get(&label).cloned().unwrap_or_default();
-            let block_defs = def_sets.get(&label).cloned().unwrap_or_default();
-            next_in.extend(
-                next_out
-                    .iter()
-                    .filter(|name| !block_defs.contains(*name))
-                    .cloned(),
-            );
-
-            if live_out.get(&label) != Some(&next_out) {
-                live_out.insert(label.clone(), next_out);
-                changed = true;
+            if let Some(def) = instruction_def(instruction).and_then(|name| locals.id(name)) {
+                bit_set_insert(&mut def_sets[index], def);
             }
-            if live_in.get(&label) != Some(&next_in) {
-                live_in.insert(label, next_in);
-                changed = true;
+        }
+
+        for successor in super::reachability::get_block_successors(block) {
+            if let Some(successor) = label_ids.get(successor.as_str()).copied() {
+                successors[index].push(successor);
+                predecessors[successor].push(index);
             }
         }
     }
 
-    live_out
+    let mut live_in = vec![vec![0; word_count]; labels.len()];
+    let mut live_out = live_in.clone();
+    let mut queue = (0..labels.len()).rev().collect::<VecDeque<_>>();
+    let mut queued = vec![true; labels.len()];
+    let mut next_out = vec![0; word_count];
+    let mut next_in = vec![0; word_count];
+    while let Some(index) = queue.pop_front() {
+        queued[index] = false;
+        next_out.fill(0);
+        for successor in successors[index].iter().copied() {
+            for (word, successor_word) in next_out.iter_mut().zip(&live_in[successor]) {
+                *word |= successor_word;
+            }
+        }
+        for word in 0..word_count {
+            next_in[word] = use_sets[index][word] | (next_out[word] & !def_sets[index][word]);
+        }
+        live_out[index].copy_from_slice(&next_out);
+        if live_in[index] != next_in {
+            live_in[index].copy_from_slice(&next_in);
+            for predecessor in predecessors[index].iter().copied() {
+                if !queued[predecessor] {
+                    queue.push_back(predecessor);
+                    queued[predecessor] = true;
+                }
+            }
+        }
+    }
+
+    (labels, live_out)
 }
 
-fn rewrite_instruction_uses(instruction: &mut Instruction, aliases: &AliasMap) {
+fn bit_set_contains(set: &[u64], value: usize) -> bool {
+    set.get(value / u64::BITS as usize)
+        .is_some_and(|word| word & (1 << (value % u64::BITS as usize)) != 0)
+}
+
+fn bit_set_insert(set: &mut [u64], value: usize) {
+    set[value / u64::BITS as usize] |= 1 << (value % u64::BITS as usize);
+}
+
+fn bit_set_remove(set: &mut [u64], value: usize) {
+    set[value / u64::BITS as usize] &= !(1 << (value % u64::BITS as usize));
+}
+
+fn rewrite_instruction_uses(
+    instruction: &mut Instruction,
+    aliases: &AliasMap,
+    locals: &LocalInterner,
+) {
     match instruction {
         Instruction::Add { op1, op2, .. }
         | Instruction::Sub { op1, op2, .. }
@@ -302,35 +363,35 @@ fn rewrite_instruction_uses(instruction: &mut Instruction, aliases: &AliasMap) {
         | Instruction::BitXor { op1, op2, .. }
         | Instruction::Shl { op1, op2, .. }
         | Instruction::Shr { op1, op2, .. } => {
-            rewrite_operand(op1, aliases);
-            rewrite_operand(op2, aliases);
+            rewrite_operand(op1, aliases, locals);
+            rewrite_operand(op2, aliases, locals);
         }
         Instruction::Not { src, .. }
         | Instruction::Neg { src, .. }
-        | Instruction::Move { src, .. } => rewrite_operand(src, aliases),
-        Instruction::Branch { condition, .. } => rewrite_operand(condition, aliases),
+        | Instruction::Move { src, .. } => rewrite_operand(src, aliases, locals),
+        Instruction::Branch { condition, .. } => rewrite_operand(condition, aliases, locals),
         Instruction::Return { operand } => {
             if let Some(operand) = operand {
-                rewrite_operand(operand, aliases);
+                rewrite_operand(operand, aliases, locals);
             }
         }
         Instruction::InvokeStatic { args, .. } => {
-            rewrite_operands(args, aliases);
+            rewrite_operands(args, aliases, locals);
         }
         Instruction::CallIndirect {
             function_ptr, args, ..
         } => {
-            rewrite_operand(function_ptr, aliases);
-            rewrite_operands(args, aliases);
+            rewrite_operand(function_ptr, aliases, locals);
+            rewrite_operands(args, aliases, locals);
         }
         Instruction::InvokeInterface { operand, args, .. }
         | Instruction::InvokeVirtual { operand, args, .. } => {
-            rewrite_operand(operand, aliases);
-            rewrite_operands(args, aliases);
+            rewrite_operand(operand, aliases, locals);
+            rewrite_operands(args, aliases, locals);
         }
-        Instruction::Switch { discr, .. } => rewrite_operand(discr, aliases),
+        Instruction::Switch { discr, .. } => rewrite_operand(discr, aliases, locals),
         Instruction::NewArray { size, .. } | Instruction::Length { array: size, .. } => {
-            rewrite_operand(size, aliases);
+            rewrite_operand(size, aliases, locals);
         }
         Instruction::ArrayStore {
             array,
@@ -338,29 +399,29 @@ fn rewrite_instruction_uses(instruction: &mut Instruction, aliases: &AliasMap) {
             value,
             ..
         } => {
-            rewrite_variable_name(array, aliases);
-            rewrite_operand(index, aliases);
-            rewrite_operand(value, aliases);
+            rewrite_variable_name(array, aliases, locals);
+            rewrite_operand(index, aliases, locals);
+            rewrite_operand(value, aliases, locals);
         }
         Instruction::ArrayFill { array, value, .. } => {
-            rewrite_variable_name(array, aliases);
-            rewrite_operand(value, aliases);
+            rewrite_variable_name(array, aliases, locals);
+            rewrite_operand(value, aliases, locals);
         }
         Instruction::ArrayGet { array, index, .. } => {
-            rewrite_operand(array, aliases);
-            rewrite_operand(index, aliases);
+            rewrite_operand(array, aliases, locals);
+            rewrite_operand(index, aliases, locals);
         }
         Instruction::ConstructObject { args, .. } => {
             for (arg, _) in args {
-                rewrite_operand(arg, aliases);
+                rewrite_operand(arg, aliases, locals);
             }
         }
         Instruction::SetField { object, value, .. } => {
-            rewrite_variable_name(object, aliases);
-            rewrite_operand(value, aliases);
+            rewrite_variable_name(object, aliases, locals);
+            rewrite_operand(value, aliases, locals);
         }
         Instruction::GetField { object, .. } | Instruction::Cast { op: object, .. } => {
-            rewrite_operand(object, aliases);
+            rewrite_operand(object, aliases, locals);
         }
         Instruction::SourceLocation(_)
         | Instruction::LocalVariableScope(_)
@@ -374,13 +435,13 @@ fn rewrite_instruction_uses(instruction: &mut Instruction, aliases: &AliasMap) {
     }
 }
 
-fn rewrite_operands(operands: &mut [Operand], aliases: &AliasMap) {
+fn rewrite_operands(operands: &mut [Operand], aliases: &AliasMap, locals: &LocalInterner) {
     for operand in operands {
-        rewrite_operand(operand, aliases);
+        rewrite_operand(operand, aliases, locals);
     }
 }
 
-fn rewrite_operand(operand: &mut Operand, aliases: &AliasMap) {
+fn rewrite_operand(operand: &mut Operand, aliases: &AliasMap, locals: &LocalInterner) {
     let Operand::Variable {
         name,
         ty: expected_ty,
@@ -388,58 +449,46 @@ fn rewrite_operand(operand: &mut Operand, aliases: &AliasMap) {
     else {
         return;
     };
-    if let Some(alias) = resolve_alias(name, aliases)
-        && alias.get_type().as_ref() == Some(expected_ty)
+    if let Some(alias) = resolve_alias(name, aliases, locals)
+        && alias.ty == *expected_ty
     {
-        *operand = alias;
+        *operand = Operand::Variable {
+            name: locals.name(alias.source).to_string(),
+            ty: alias.ty,
+        };
     }
 }
 
-fn rewrite_variable_name(name: &mut String, aliases: &AliasMap) {
-    let Some(Operand::Variable {
-        name: alias_name, ..
-    }) = resolve_alias(name, aliases)
-    else {
+fn rewrite_variable_name(name: &mut String, aliases: &AliasMap, locals: &LocalInterner) {
+    let Some(alias) = resolve_alias(name, aliases, locals) else {
         return;
     };
-    *name = alias_name;
+    *name = locals.name(alias.source).to_string();
 }
 
-fn resolve_alias(name: &str, aliases: &AliasMap) -> Option<Operand> {
-    let mut current = name;
+fn resolve_alias(name: &str, aliases: &AliasMap, locals: &LocalInterner) -> Option<AliasValue> {
+    let mut current = locals.id(name)?;
     let mut seen = HashSet::new();
-    while let Some(Operand::Variable {
-        name: next_name,
-        ty,
-    }) = aliases.get(current)
-    {
-        if !seen.insert(current.to_string()) {
+    let mut resolved = None;
+    while let Some(alias) = aliases.get(&current) {
+        if !seen.insert(current) {
             return None;
         }
-        if !aliases.contains_key(next_name) {
-            return Some(Operand::Variable {
-                name: next_name.clone(),
-                ty: ty.clone(),
-            });
-        }
-        current = next_name;
+        resolved = Some(alias.clone());
+        current = alias.source;
     }
-    aliases.get(name).cloned()
+    resolved
 }
 
-fn kill_aliases_touching(name: &str, aliases: &mut AliasMap) {
-    let mut invalidated = HashSet::from([name.to_string()]);
+fn kill_aliases_touching(local: usize, aliases: &mut AliasMap) {
+    let mut invalidated = HashSet::from([local]);
     loop {
         let dependants = aliases
             .iter()
             .filter_map(|(alias_dest, alias_src)| {
-                let touches_invalidated = invalidated.contains(alias_dest)
-                    || matches!(
-                        alias_src,
-                        Operand::Variable { name: src_name, .. }
-                            if invalidated.contains(src_name)
-                    );
-                touches_invalidated.then(|| alias_dest.clone())
+                let touches_invalidated =
+                    invalidated.contains(alias_dest) || invalidated.contains(&alias_src.source);
+                touches_invalidated.then_some(*alias_dest)
             })
             .collect::<Vec<_>>();
         if dependants.is_empty() {
@@ -461,34 +510,34 @@ mod tests {
         let slice_ty = Type::Slice(Box::new(Type::U8));
         let mut aliases = AliasMap::from([
             (
-                "a".to_string(),
-                Operand::Variable {
-                    name: "b".to_string(),
+                0,
+                AliasValue {
+                    source: 1,
                     ty: slice_ty.clone(),
                 },
             ),
             (
-                "b".to_string(),
-                Operand::Variable {
-                    name: "c".to_string(),
+                1,
+                AliasValue {
+                    source: 2,
                     ty: slice_ty,
                 },
             ),
         ]);
 
-        kill_aliases_touching("c", &mut aliases);
+        kill_aliases_touching(2, &mut aliases);
 
         assert!(aliases.is_empty());
     }
 }
 
-fn instruction_uses(instruction: &Instruction) -> HashSet<String> {
+fn instruction_uses(instruction: &Instruction) -> HashSet<&str> {
     let mut uses = HashSet::new();
     collect_instruction_uses(instruction, &mut uses);
     uses
 }
 
-fn collect_instruction_uses(instruction: &Instruction, uses: &mut HashSet<String>) {
+fn collect_instruction_uses<'a>(instruction: &'a Instruction, uses: &mut HashSet<&'a str>) {
     match instruction {
         Instruction::Add { op1, op2, .. }
         | Instruction::Sub { op1, op2, .. }
@@ -542,12 +591,12 @@ fn collect_instruction_uses(instruction: &Instruction, uses: &mut HashSet<String
             value,
             ..
         } => {
-            uses.insert(array.clone());
+            uses.insert(array);
             collect_operand_use(index, uses);
             collect_operand_use(value, uses);
         }
         Instruction::ArrayFill { array, value, .. } => {
-            uses.insert(array.clone());
+            uses.insert(array);
             collect_operand_use(value, uses);
         }
         Instruction::ArrayGet { array, index, .. } => {
@@ -560,7 +609,7 @@ fn collect_instruction_uses(instruction: &Instruction, uses: &mut HashSet<String
             }
         }
         Instruction::SetField { object, value, .. } => {
-            uses.insert(object.clone());
+            uses.insert(object);
             collect_operand_use(value, uses);
         }
         Instruction::GetField { object, .. } | Instruction::Cast { op: object, .. } => {
@@ -578,20 +627,19 @@ fn collect_instruction_uses(instruction: &Instruction, uses: &mut HashSet<String
     }
 }
 
-fn collect_operand_uses(operands: &[Operand], uses: &mut HashSet<String>) {
+fn collect_operand_uses<'a>(operands: &'a [Operand], uses: &mut HashSet<&'a str>) {
     for operand in operands {
         collect_operand_use(operand, uses);
     }
 }
 
-fn collect_operand_use(operand: &Operand, uses: &mut HashSet<String>) {
+fn collect_operand_use<'a>(operand: &'a Operand, uses: &mut HashSet<&'a str>) {
     if let Operand::Variable { name, .. } = operand {
-        uses.insert(name.clone());
+        uses.insert(name);
     }
 }
 
-fn instruction_defs(instruction: &Instruction) -> HashSet<String> {
-    let mut defs = HashSet::new();
+fn instruction_def(instruction: &Instruction) -> Option<&str> {
     match instruction {
         Instruction::Add { dest, .. }
         | Instruction::Sub { dest, .. }
@@ -618,17 +666,11 @@ fn instruction_defs(instruction: &Instruction) -> HashSet<String> {
         | Instruction::ConstructObject { dest, .. }
         | Instruction::CreateFunctionPointer { dest, .. }
         | Instruction::GetField { dest, .. }
-        | Instruction::Cast { dest, .. } => {
-            defs.insert(dest.clone());
-        }
+        | Instruction::Cast { dest, .. } => Some(dest),
         Instruction::CallIndirect { dest, .. }
         | Instruction::InvokeInterface { dest, .. }
         | Instruction::InvokeVirtual { dest, .. }
-        | Instruction::InvokeStatic { dest, .. } => {
-            if let Some(dest) = dest {
-                defs.insert(dest.clone());
-            }
-        }
+        | Instruction::InvokeStatic { dest, .. } => dest.as_deref(),
         Instruction::SourceLocation(_)
         | Instruction::LocalVariableScope(_)
         | Instruction::UnwindStart { .. }
@@ -642,7 +684,6 @@ fn instruction_defs(instruction: &Instruction) -> HashSet<String> {
         | Instruction::ArrayStore { .. }
         | Instruction::ArrayFill { .. }
         | Instruction::SetField { .. }
-        | Instruction::Label { .. } => {}
+        | Instruction::Label { .. } => None,
     }
-    defs
 }

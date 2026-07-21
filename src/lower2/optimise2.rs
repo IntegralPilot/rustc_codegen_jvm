@@ -5,7 +5,7 @@ use super::jvm::{
 use super::stackmaps::FrameValue;
 use crate::oomir::SourceLocation;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     rc::Rc,
 };
 
@@ -57,10 +57,79 @@ struct LiveRange {
 #[derive(Debug)]
 struct LocalLiveness {
     widths: BTreeMap<u16, u16>,
-    uses: Vec<BTreeSet<u16>>,
-    defs: Vec<BTreeSet<u16>>,
-    live_in: Vec<BTreeSet<u16>>,
-    live_out: Vec<BTreeSet<u16>>,
+    uses: Vec<Vec<u16>>,
+    defs: Vec<Vec<u16>>,
+    live_in: LocalBitMatrix,
+    live_out: LocalBitMatrix,
+}
+
+#[derive(Debug)]
+struct LocalBitMatrix {
+    words_per_row: usize,
+    words: Vec<u64>,
+}
+
+impl LocalBitMatrix {
+    fn new(rows: usize, local_count: usize) -> Self {
+        let words_per_row = local_count.div_ceil(u64::BITS as usize);
+        Self {
+            words_per_row,
+            words: vec![0; rows.saturating_mul(words_per_row)],
+        }
+    }
+
+    fn row(&self, index: usize) -> &[u64] {
+        let start = index * self.words_per_row;
+        &self.words[start..start + self.words_per_row]
+    }
+
+    fn row_mut(&mut self, index: usize) -> &mut [u64] {
+        let start = index * self.words_per_row;
+        &mut self.words[start..start + self.words_per_row]
+    }
+
+    fn contains(&self, row: usize, local: u16) -> bool {
+        let local = usize::from(local);
+        self.row(row)
+            .get(local / u64::BITS as usize)
+            .is_some_and(|word| word & (1 << (local % u64::BITS as usize)) != 0)
+    }
+
+    fn iter(&self, row: usize) -> LocalBitIter<'_> {
+        LocalBitIter {
+            words: self.row(row),
+            word_index: 0,
+            remaining: self.row(row).first().copied().unwrap_or(0),
+        }
+    }
+}
+
+struct LocalBitIter<'a> {
+    words: &'a [u64],
+    word_index: usize,
+    remaining: u64,
+}
+
+impl Iterator for LocalBitIter<'_> {
+    type Item = u16;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.remaining != 0 {
+                let bit = self.remaining.trailing_zeros() as usize;
+                self.remaining &= self.remaining - 1;
+                return u16::try_from(self.word_index * u64::BITS as usize + bit).ok();
+            }
+            self.word_index += 1;
+            self.remaining = *self.words.get(self.word_index)?;
+        }
+    }
+}
+
+impl LocalLiveness {
+    fn is_live_out(&self, instruction: usize, local: u16) -> bool {
+        self.live_out.contains(instruction, local)
+    }
 }
 
 type LocatedInstructions = (Vec<Instruction>, Vec<BytecodeMetadata>);
@@ -195,7 +264,7 @@ fn fold_boolean_branch_materialization(
     pinned_local_slots: &BTreeSet<u16>,
     exception_table: &mut Vec<ExceptionTableEntry>,
 ) -> jvm::Result<LocatedInstructions> {
-    if instructions.len() < 7 {
+    if instructions.len() < 7 || !has_boolean_branch_materialization(&instructions) {
         return Ok((instructions, source_locations));
     }
 
@@ -256,7 +325,7 @@ fn fold_boolean_branch_materialization(
             continue;
         };
         if (index + 1..=index + 6).contains(&usize::from(final_target))
-            || liveness.live_out[index + 6].contains(&stored_bool.index)
+            || liveness.is_live_out(index + 6, stored_bool.index)
             || !only_expected_incoming(&incoming, index)
         {
             index += 1;
@@ -281,6 +350,18 @@ fn fold_boolean_branch_materialization(
     }
 
     compact_instructions(instructions, source_locations, &keep, exception_table)
+}
+
+fn has_boolean_branch_materialization(instructions: &[Instruction]) -> bool {
+    instructions.windows(7).any(|window| {
+        conditional_branch_target(&window[0]).is_some()
+            && matches!(window[1], Instruction::Iconst_0)
+            && matches!(window[2], Instruction::Goto(_))
+            && matches!(window[3], Instruction::Iconst_1)
+            && matches!(local_store(&window[4]), Some((LocalKind::Int, _)))
+            && matches!(local_load(&window[5]), Some((LocalKind::Int, _)))
+            && bool_branch_target(&window[6]).is_some()
+    })
 }
 
 fn incoming_branch_sources(instructions: &[Instruction]) -> Vec<BTreeSet<usize>> {
@@ -323,7 +404,7 @@ fn fold_boolean_zero_comparisons(
     pinned_local_slots: &BTreeSet<u16>,
     exception_table: &mut Vec<ExceptionTableEntry>,
 ) -> jvm::Result<LocatedInstructions> {
-    if instructions.len() < 6 {
+    if instructions.len() < 6 || !has_boolean_zero_comparison(&instructions) {
         return Ok((instructions, source_locations));
     }
 
@@ -391,7 +472,7 @@ fn fold_boolean_zero_comparisons(
             || (index + 1..=branch_index).contains(&usize::from(final_target))
             || stored_locals
                 .iter()
-                .any(|local| liveness.live_out[branch_index].contains(local))
+                .any(|local| liveness.is_live_out(branch_index, *local))
             || !only_expected_incoming_for_zero_compare(&incoming, index, branch_index)
         {
             index += 1;
@@ -416,6 +497,14 @@ fn fold_boolean_zero_comparisons(
     }
 
     compact_instructions(instructions, source_locations, &keep, exception_table)
+}
+
+fn has_boolean_zero_comparison(instructions: &[Instruction]) -> bool {
+    instructions.windows(2).any(|window| {
+        matches!(window[0], Instruction::Iconst_0) && bool_zero_compare_target(&window[1]).is_some()
+    }) && instructions
+        .iter()
+        .any(|instruction| matches!(instruction, Instruction::Iconst_1))
 }
 
 fn only_expected_incoming_for_zero_compare(
@@ -449,7 +538,7 @@ fn fold_stack_boolean_zero_comparisons(
     pinned_local_slots: &BTreeSet<u16>,
     exception_table: &mut Vec<ExceptionTableEntry>,
 ) -> jvm::Result<LocatedInstructions> {
-    if instructions.len() < 4 {
+    if instructions.len() < 4 || !has_stack_boolean_zero_comparison(&instructions) {
         return Ok((instructions, source_locations));
     }
 
@@ -501,8 +590,7 @@ fn fold_stack_boolean_zero_comparisons(
         let mut kept_live_stores = BTreeSet::new();
         for (dup_index, store_index, local) in stores.into_iter().rev() {
             if pinned_local_slots.contains(&local)
-                || liveness.live_out[branch_index].contains(&local)
-                    && kept_live_stores.insert(local)
+                || liveness.is_live_out(branch_index, local) && kept_live_stores.insert(local)
             {
                 continue;
             }
@@ -522,6 +610,15 @@ fn fold_stack_boolean_zero_comparisons(
     compact_instructions(instructions, source_locations, &keep, exception_table)
 }
 
+fn has_stack_boolean_zero_comparison(instructions: &[Instruction]) -> bool {
+    instructions.windows(2).any(|window| {
+        matches!(window[0], Instruction::Dup)
+            && matches!(local_store(&window[1]), Some((LocalKind::Int, _)))
+    }) && instructions.windows(2).any(|window| {
+        matches!(window[0], Instruction::Iconst_0) && bool_zero_compare_target(&window[1]).is_some()
+    })
+}
+
 fn range_has_no_incoming(incoming: &[BTreeSet<usize>], start: usize, end: usize) -> bool {
     (start..=end).all(|target| {
         incoming
@@ -536,7 +633,7 @@ fn remove_dead_duplicate_stores(
     pinned_local_slots: &BTreeSet<u16>,
     exception_table: &mut Vec<ExceptionTableEntry>,
 ) -> jvm::Result<LocatedInstructions> {
-    if instructions.len() < 2 {
+    if instructions.len() < 2 || !has_duplicate_store(&instructions) {
         return Ok((instructions, source_locations));
     }
 
@@ -562,7 +659,7 @@ fn remove_dead_duplicate_stores(
         };
         if !duplicate_matches_store
             || pinned_local_slots.contains(&stored.index)
-            || liveness.live_out[index + 1].contains(&stored.index)
+            || liveness.is_live_out(index + 1, stored.index)
         {
             index += 1;
             continue;
@@ -574,6 +671,13 @@ fn remove_dead_duplicate_stores(
     }
 
     compact_instructions(instructions, source_locations, &keep, exception_table)
+}
+
+fn has_duplicate_store(instructions: &[Instruction]) -> bool {
+    instructions.windows(2).any(|window| {
+        matches!(window[0], Instruction::Dup | Instruction::Dup2)
+            && local_store(&window[1]).is_some()
+    })
 }
 
 fn remove_redundant_instructions(
@@ -1200,15 +1304,16 @@ fn compute_live_ranges(
     let mut ranges = BTreeMap::new();
 
     for index in 0..instructions.len() {
-        for local in liveness.live_in[index]
-            .iter()
-            .chain(liveness.live_out[index].iter())
-            .chain(liveness.uses[index].iter())
-            .chain(liveness.defs[index].iter())
+        for local in liveness
+            .live_in
+            .iter(index)
+            .chain(liveness.live_out.iter(index))
+            .chain(liveness.uses[index].iter().copied())
+            .chain(liveness.defs[index].iter().copied())
         {
-            let width = liveness.widths.get(local).copied().unwrap_or(1);
+            let width = liveness.widths.get(&local).copied().unwrap_or(1);
             ranges
-                .entry(*local)
+                .entry(local)
                 .and_modify(|range: &mut LiveRange| {
                     range.first = range.first.min(index);
                     range.last = range.last.max(index);
@@ -1230,8 +1335,9 @@ fn analyze_local_liveness(
     exception_table: &[ExceptionTableEntry],
 ) -> LocalLiveness {
     let mut widths = BTreeMap::new();
-    let mut uses = vec![BTreeSet::new(); instructions.len()];
-    let mut defs = vec![BTreeSet::new(); instructions.len()];
+    let mut uses = vec![Vec::new(); instructions.len()];
+    let mut defs = vec![Vec::new(); instructions.len()];
+    let mut highest_local = None;
 
     for (index, instruction) in instructions.iter().enumerate() {
         for local in local_reads(instruction) {
@@ -1239,49 +1345,88 @@ fn analyze_local_liveness(
                 .entry(local.index)
                 .and_modify(|width: &mut u16| *width = (*width).max(local.width))
                 .or_insert(local.width);
-            uses[index].insert(local.index);
+            if !uses[index].contains(&local.index) {
+                uses[index].push(local.index);
+            }
+            highest_local = Some(highest_local.unwrap_or(0).max(local.index));
         }
         for local in local_writes(instruction) {
             widths
                 .entry(local.index)
                 .and_modify(|width: &mut u16| *width = (*width).max(local.width))
                 .or_insert(local.width);
-            defs[index].insert(local.index);
+            if !defs[index].contains(&local.index) {
+                defs[index].push(local.index);
+            }
+            highest_local = Some(highest_local.unwrap_or(0).max(local.index));
         }
     }
 
-    let mut live_in = vec![BTreeSet::new(); instructions.len()];
-    let mut live_out = vec![BTreeSet::new(); instructions.len()];
-    let mut changed = true;
+    let local_count = highest_local.map_or(0, |local| usize::from(local) + 1);
+    let mut live_in = LocalBitMatrix::new(instructions.len(), local_count);
+    let mut live_out = LocalBitMatrix::new(instructions.len(), local_count);
+    let mut successors = instructions
+        .iter()
+        .enumerate()
+        .map(|(index, instruction)| instruction_successors(index, instruction, instructions.len()))
+        .collect::<Vec<_>>();
+    for entry in exception_table {
+        let handler = usize::from(entry.handler_pc);
+        if handler >= instructions.len() {
+            continue;
+        }
+        let end = usize::from(entry.range_pc.end).min(instructions.len());
+        for instruction_successors in successors
+            .iter_mut()
+            .take(end)
+            .skip(usize::from(entry.range_pc.start).min(end))
+        {
+            instruction_successors.push(handler);
+        }
+    }
+    let mut predecessors = vec![Vec::new(); instructions.len()];
+    for (index, instruction_successors) in successors.iter_mut().enumerate() {
+        instruction_successors.retain(|successor| *successor < instructions.len());
+        instruction_successors.sort_unstable();
+        instruction_successors.dedup();
+        for successor in instruction_successors.iter().copied() {
+            predecessors[successor].push(index);
+        }
+    }
 
-    while changed {
-        changed = false;
-        for index in (0..instructions.len()).rev() {
-            let mut next_out = BTreeSet::new();
-            let mut successors =
-                instruction_successors(index, &instructions[index], instructions.len());
-            successors.extend(exception_table.iter().filter_map(|entry| {
-                let range = usize::from(entry.range_pc.start)..usize::from(entry.range_pc.end);
-                range
-                    .contains(&index)
-                    .then_some(usize::from(entry.handler_pc))
-            }));
-            for successor in successors {
-                if let Some(successor_live_in) = live_in.get(successor) {
-                    next_out.extend(successor_live_in.iter().copied());
+    let mut queue = (0..instructions.len()).rev().collect::<VecDeque<_>>();
+    let mut queued = vec![true; instructions.len()];
+    let mut next_out = vec![0; live_in.words_per_row];
+    let mut next_in = vec![0; live_in.words_per_row];
+    while let Some(index) = queue.pop_front() {
+        queued[index] = false;
+        next_out.fill(0);
+        for successor in successors[index].iter().copied() {
+            for (word, successor_word) in next_out.iter_mut().zip(live_in.row(successor)) {
+                *word |= successor_word;
+            }
+        }
+        next_in.copy_from_slice(&next_out);
+        for local in &defs[index] {
+            let local = usize::from(*local);
+            next_in[local / u64::BITS as usize] &= !(1 << (local % u64::BITS as usize));
+        }
+        for local in &uses[index] {
+            let local = usize::from(*local);
+            next_in[local / u64::BITS as usize] |= 1 << (local % u64::BITS as usize);
+        }
+
+        let in_changed = live_in.row(index) != next_in;
+        if live_out.row(index) != next_out {
+            live_out.row_mut(index).copy_from_slice(&next_out);
+        }
+        if in_changed {
+            live_in.row_mut(index).copy_from_slice(&next_in);
+            for predecessor in predecessors[index].iter().copied() {
+                if !queued[predecessor] {
+                    queue.push_back(predecessor);
+                    queued[predecessor] = true;
                 }
-            }
-
-            let mut next_in = next_out.clone();
-            for local in &defs[index] {
-                next_in.remove(local);
-            }
-            next_in.extend(uses[index].iter().copied());
-
-            if next_in != live_in[index] || next_out != live_out[index] {
-                live_in[index] = next_in;
-                live_out[index] = next_out;
-                changed = true;
             }
         }
     }
@@ -2078,5 +2223,24 @@ fn branch_targets(index: usize, instruction: &Instruction) -> Vec<i32> {
             targets
         }
         _ => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_bit_matrix_tracks_dense_and_sparse_slots() {
+        let mut matrix = LocalBitMatrix::new(2, 130);
+        matrix.row_mut(0)[0] |= 1;
+        matrix.row_mut(0)[1] |= 1 << 6;
+        matrix.row_mut(1)[2] |= 1 << 1;
+
+        assert!(matrix.contains(0, 0));
+        assert!(matrix.contains(0, 70));
+        assert!(matrix.contains(1, 129));
+        assert_eq!(matrix.iter(0).collect::<Vec<_>>(), vec![0, 70]);
+        assert!(!matrix.contains(1, 70));
     }
 }

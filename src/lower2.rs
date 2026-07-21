@@ -9,7 +9,8 @@ use jvm_gen::{
     create_default_constructor, create_slice_view_classfile, create_utf8_view_classfile,
     oomir_type_to_ristretto_field_type,
 };
-use translator::{DebugInfoOptions, FunctionTranslator};
+pub(crate) use translator::DebugInfoOptions;
+use translator::FunctionTranslator;
 
 use self::jvm::{
     ClassAccessFlags, ClassFile, FieldAccessFlags, MethodAccessFlags, Version,
@@ -21,7 +22,10 @@ use rustc_middle::ty::TyCtxt;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 mod constant_pool;
@@ -41,7 +45,7 @@ static OUTPUT_DIRECTORY_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Default)]
 pub(crate) struct EmittedClassRegistry {
-    variants: HashMap<String, Vec<EmittedClassVariant>>,
+    variants: Mutex<HashMap<String, Vec<EmittedClassVariant>>>,
 }
 
 struct EmittedClassVariant {
@@ -429,13 +433,20 @@ fn create_static_initializer_method(
 fn emit_generated_class(
     output_directory: &Path,
     generated_classes: &mut Vec<(String, PathBuf)>,
-    registry: &mut EmittedClassRegistry,
+    registry: &EmittedClassRegistry,
     class_name: String,
     bytecode: Vec<u8>,
 ) -> jvm::Result<()> {
     let hash = bytecode_hash(&bytecode);
     let bytecode_len = bytecode.len();
-    if let Some(variants) = registry.variants.get(&class_name) {
+    let mut registry = registry
+        .variants
+        .lock()
+        .map_err(|_| jvm::Error::VerificationError {
+            context: format!("Class {class_name}"),
+            message: "Emitted-class registry lock was poisoned".to_string(),
+        })?;
+    if let Some(variants) = registry.get(&class_name) {
         for variant in variants
             .iter()
             .filter(|variant| variant.hash == hash && variant.len == bytecode_len)
@@ -457,7 +468,6 @@ fn emit_generated_class(
         message: format!("Failed to write temporary class file: {error}"),
     })?;
     registry
-        .variants
         .entry(class_name.clone())
         .or_default()
         .push(EmittedClassVariant {
@@ -507,17 +517,10 @@ fn serialize_class_file(class_file: &ClassFile<'_>, context: &str) -> jvm::Resul
 /// class to disk so crate-wide bytecode does not coexist with crate-wide OOMIR.
 pub fn oomir_to_jvm_bytecode(
     mut module: oomir::Module,
-    tcx: TyCtxt,
+    debug_info: DebugInfoOptions,
     emit_runtime_views: bool,
-    registry: &mut EmittedClassRegistry,
+    registry: &EmittedClassRegistry,
 ) -> jvm::Result<Vec<(String, PathBuf)>> {
-    let debug_info = DebugInfoOptions {
-        line_numbers: tcx.sess.opts.debuginfo != rustc_session::config::DebugInfo::None,
-        local_variables: matches!(
-            tcx.sess.opts.debuginfo,
-            rustc_session::config::DebugInfo::Limited | rustc_session::config::DebugInfo::Full
-        ),
-    };
     let output_ordinal = OUTPUT_DIRECTORY_COUNTER.fetch_add(1, Ordering::Relaxed);
     let output_directory = std::env::temp_dir().join(format!(
         "rustc-codegen-jvm-{}-{}-{output_ordinal}",
@@ -885,4 +888,14 @@ pub fn oomir_to_jvm_bytecode(
     }
 
     Ok(generated_classes)
+}
+
+pub(crate) fn debug_info_options(tcx: TyCtxt<'_>) -> DebugInfoOptions {
+    DebugInfoOptions {
+        line_numbers: tcx.sess.opts.debuginfo != rustc_session::config::DebugInfo::None,
+        local_variables: matches!(
+            tcx.sess.opts.debuginfo,
+            rustc_session::config::DebugInfo::Limited | rustc_session::config::DebugInfo::Full
+        ),
+    }
 }

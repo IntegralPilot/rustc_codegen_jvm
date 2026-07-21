@@ -24,6 +24,72 @@ struct ClassInfo {
     data: Vec<u8>,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum ConstantKey {
+    Utf8(String),
+    Integer(i32),
+    Float(u32),
+    Long(i64),
+    Double(u64),
+    Class(u16),
+    String(u16),
+    FieldRef(u16, u16),
+    MethodRef(u16, u16),
+    InterfaceMethodRef(u16, u16),
+    NameAndType(u16, u16),
+    MethodHandle(u8, u16),
+    MethodType(u16),
+    Dynamic(u16, u16),
+    InvokeDynamic(u16, u16),
+    Module(u16),
+    Package(u16),
+}
+
+impl From<&Constant<'_>> for ConstantKey {
+    fn from(constant: &Constant<'_>) -> Self {
+        match constant {
+            Constant::Utf8(value) => Self::Utf8(value.to_string()),
+            Constant::Integer(value) => Self::Integer(*value),
+            Constant::Float(value) => Self::Float(value.to_bits()),
+            Constant::Long(value) => Self::Long(*value),
+            Constant::Double(value) => Self::Double(value.to_bits()),
+            Constant::Class(index) => Self::Class(*index),
+            Constant::String(index) => Self::String(*index),
+            Constant::FieldRef {
+                class_index,
+                name_and_type_index,
+            } => Self::FieldRef(*class_index, *name_and_type_index),
+            Constant::MethodRef {
+                class_index,
+                name_and_type_index,
+            } => Self::MethodRef(*class_index, *name_and_type_index),
+            Constant::InterfaceMethodRef {
+                class_index,
+                name_and_type_index,
+            } => Self::InterfaceMethodRef(*class_index, *name_and_type_index),
+            Constant::NameAndType {
+                name_index,
+                descriptor_index,
+            } => Self::NameAndType(*name_index, *descriptor_index),
+            Constant::MethodHandle {
+                reference_kind,
+                reference_index,
+            } => Self::MethodHandle(reference_kind.kind(), *reference_index),
+            Constant::MethodType(index) => Self::MethodType(*index),
+            Constant::Dynamic {
+                bootstrap_method_attr_index,
+                name_and_type_index,
+            } => Self::Dynamic(*bootstrap_method_attr_index, *name_and_type_index),
+            Constant::InvokeDynamic {
+                bootstrap_method_attr_index,
+                name_and_type_index,
+            } => Self::InvokeDynamic(*bootstrap_method_attr_index, *name_and_type_index),
+            Constant::Module(index) => Self::Module(*index),
+            Constant::Package(index) => Self::Package(*index),
+        }
+    }
+}
+
 fn constant_pool_error(context: &str, error: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, format!("{context}: {error}"))
 }
@@ -32,6 +98,7 @@ fn import_constant(
     source_index: u16,
     source: &ConstantPool<'static>,
     target: &mut ConstantPool<'static>,
+    target_constants: &mut HashMap<ConstantKey, u16>,
     indexes: &mut HashMap<u16, u16>,
     bootstrap_method_offset: u16,
 ) -> io::Result<u16> {
@@ -49,6 +116,7 @@ fn import_constant(
             index,
             source,
             target,
+            target_constants,
             indexes,
             bootstrap_method_offset,
         )?),
@@ -56,6 +124,7 @@ fn import_constant(
             index,
             source,
             target,
+            target_constants,
             indexes,
             bootstrap_method_offset,
         )?),
@@ -63,6 +132,7 @@ fn import_constant(
             index,
             source,
             target,
+            target_constants,
             indexes,
             bootstrap_method_offset,
         )?),
@@ -70,6 +140,7 @@ fn import_constant(
             index,
             source,
             target,
+            target_constants,
             indexes,
             bootstrap_method_offset,
         )?),
@@ -77,6 +148,7 @@ fn import_constant(
             index,
             source,
             target,
+            target_constants,
             indexes,
             bootstrap_method_offset,
         )?),
@@ -88,6 +160,7 @@ fn import_constant(
                 class_index,
                 source,
                 target,
+                target_constants,
                 indexes,
                 bootstrap_method_offset,
             )?,
@@ -95,6 +168,7 @@ fn import_constant(
                 name_and_type_index,
                 source,
                 target,
+                target_constants,
                 indexes,
                 bootstrap_method_offset,
             )?,
@@ -107,6 +181,7 @@ fn import_constant(
                 class_index,
                 source,
                 target,
+                target_constants,
                 indexes,
                 bootstrap_method_offset,
             )?,
@@ -114,6 +189,7 @@ fn import_constant(
                 name_and_type_index,
                 source,
                 target,
+                target_constants,
                 indexes,
                 bootstrap_method_offset,
             )?,
@@ -126,6 +202,7 @@ fn import_constant(
                 class_index,
                 source,
                 target,
+                target_constants,
                 indexes,
                 bootstrap_method_offset,
             )?,
@@ -133,6 +210,7 @@ fn import_constant(
                 name_and_type_index,
                 source,
                 target,
+                target_constants,
                 indexes,
                 bootstrap_method_offset,
             )?,
@@ -145,6 +223,7 @@ fn import_constant(
                 name_index,
                 source,
                 target,
+                target_constants,
                 indexes,
                 bootstrap_method_offset,
             )?,
@@ -152,6 +231,7 @@ fn import_constant(
                 descriptor_index,
                 source,
                 target,
+                target_constants,
                 indexes,
                 bootstrap_method_offset,
             )?,
@@ -165,6 +245,7 @@ fn import_constant(
                 reference_index,
                 source,
                 target,
+                target_constants,
                 indexes,
                 bootstrap_method_offset,
             )?,
@@ -185,6 +266,7 @@ fn import_constant(
                 name_and_type_index,
                 source,
                 target,
+                target_constants,
                 indexes,
                 bootstrap_method_offset,
             )?,
@@ -205,6 +287,7 @@ fn import_constant(
                 name_and_type_index,
                 source,
                 target,
+                target_constants,
                 indexes,
                 bootstrap_method_offset,
             )?,
@@ -212,20 +295,15 @@ fn import_constant(
         primitive => primitive,
     };
 
-    let existing = (1..=target.len()).find_map(|raw_index| {
-        let index = u16::try_from(raw_index).ok()?;
-        target
-            .try_get(index)
-            .ok()
-            .filter(|candidate| *candidate == &imported)
-            .map(|_| index)
-    });
-    let target_index = if let Some(index) = existing {
-        index
+    let key = ConstantKey::from(&imported);
+    let target_index = if let Some(index) = target_constants.get(&key) {
+        *index
     } else {
-        target
+        let index = target
             .add(imported)
-            .map_err(|error| constant_pool_error("merged JVM constant pool is full", error))?
+            .map_err(|error| constant_pool_error("merged JVM constant pool is full", error))?;
+        target_constants.insert(key, index);
+        index
     };
     indexes.insert(source_index, target_index);
     Ok(target_index)
@@ -237,6 +315,17 @@ fn import_constant_pool(
     bootstrap_method_offset: u16,
 ) -> io::Result<HashMap<u16, u16>> {
     let mut indexes = HashMap::new();
+    let mut target_constants = HashMap::with_capacity(target.len() + source.len());
+    for raw_index in 1..=target.len() {
+        let Ok(index) = u16::try_from(raw_index) else {
+            continue;
+        };
+        if let Ok(constant) = target.try_get(index) {
+            target_constants
+                .entry(ConstantKey::from(constant))
+                .or_insert(index);
+        }
+    }
     for raw_index in 1..=source.len() {
         let index = u16::try_from(raw_index).map_err(|_| {
             io::Error::new(
@@ -245,7 +334,14 @@ fn import_constant_pool(
             )
         })?;
         if source.try_get(index).is_ok() {
-            import_constant(index, source, target, &mut indexes, bootstrap_method_offset)?;
+            import_constant(
+                index,
+                source,
+                target,
+                &mut target_constants,
+                &mut indexes,
+                bootstrap_method_offset,
+            )?;
         }
     }
     Ok(indexes)
