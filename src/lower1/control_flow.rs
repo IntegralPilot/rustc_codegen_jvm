@@ -3708,7 +3708,13 @@ pub(super) fn convert_basic_block<'tcx>(
                                     generated = true;
                                 }
 
-                                if !generated && let Some(class_name) = class_type.get_class_name()
+                                if !generated
+                                    && let Some(class_name) = class_type.get_class_name()
+                                    && matches!(
+                                        data_types.get(class_name),
+                                        Some(oomir::DataType::Class { methods, .. })
+                                            if methods.contains_key(&method_name)
+                                    )
                                 {
                                     instructions.push(oomir::Instruction::InvokeStatic {
                                         class_name: class_name.to_string(),

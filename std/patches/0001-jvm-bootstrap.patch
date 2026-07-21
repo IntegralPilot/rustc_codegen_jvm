@@ -121,13 +121,12 @@ diff --git a/std/src/sys/thread_local/mod.rs b/std/src/sys/thread_local/mod.rs
 diff --git a/std/src/sys/args/mod.rs b/std/src/sys/args/mod.rs
 --- a/std/src/sys/args/mod.rs
 +++ b/std/src/sys/args/mod.rs
-@@ -10,5 +10,6 @@
+@@ -10,4 +10,5 @@
      target_os = "wasi",
      target_os = "xous",
 +    target_os = "jvm",
  ))]
  mod common;
-
 @@ -17,3 +18,7 @@ cfg_select! {
 +    target_os = "jvm" => {
 +        mod jvm;
@@ -139,13 +138,13 @@ diff --git a/std/src/sys/args/mod.rs b/std/src/sys/args/mod.rs
 diff --git a/std/src/sys/env/mod.rs b/std/src/sys/env/mod.rs
 --- a/std/src/sys/env/mod.rs
 +++ b/std/src/sys/env/mod.rs
-@@ -12,9 +12,14 @@
+@@ -12,4 +12,5 @@
      target_os = "wasi",
      target_os = "xous",
 +    target_os = "jvm",
  ))]
  mod common;
-
+@@ -17,4 +18,8 @@
  cfg_select! {
 +    target_os = "jvm" => {
 +        mod jvm;
@@ -157,9 +156,7 @@ diff --git a/std/src/sys/env/mod.rs b/std/src/sys/env/mod.rs
 diff --git a/std/src/sys/stdio/mod.rs b/std/src/sys/stdio/mod.rs
 --- a/std/src/sys/stdio/mod.rs
 +++ b/std/src/sys/stdio/mod.rs
-@@ -1,6 +1,10 @@
- #![forbid(unsafe_op_in_unsafe_fn)]
-
+@@ -3,4 +3,8 @@
  cfg_select! {
 +    target_os = "jvm" => {
 +        mod jvm;

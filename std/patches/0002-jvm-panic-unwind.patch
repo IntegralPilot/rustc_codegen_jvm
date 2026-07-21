@@ -1,8 +1,7 @@
 diff --git a/panic_unwind/src/lib.rs b/panic_unwind/src/lib.rs
 --- a/panic_unwind/src/lib.rs
 +++ b/panic_unwind/src/lib.rs
-@@ -30,6 +30,10 @@ use core::panic::PanicPayload;
-
+@@ -34,4 +34,8 @@
  cfg_select! {
 +    target_os = "jvm" => {
 +        #[path = "jvm.rs"]
