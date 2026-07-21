@@ -43,7 +43,7 @@ fn spawn_join_and_names() {
             assert!(thread::current().id() != main_id);
             assert!(thread::current().name() == Some("named-rust-worker"));
             thread::yield_now();
-            thread::sleep(Duration::from_millis(100));
+            thread::sleep(Duration::from_millis(500));
             42
         })
         .unwrap();
