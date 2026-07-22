@@ -32,6 +32,7 @@ public final class ThreadSupport {
     private static final class ThreadRecord {
         private Thread thread;
         private volatile Throwable failure;
+        private volatile boolean detached;
     }
 
     private static String utf8(Pointer bytes, long length) {
@@ -84,7 +85,16 @@ public final class ThreadSupport {
             try {
                 start.invokeExact(init);
             } catch (Throwable failure) {
-                record.failure = failure;
+                boolean report;
+                synchronized (record) {
+                    report = record.detached;
+                    if (!report) {
+                        record.failure = failure;
+                    }
+                }
+                if (report) {
+                    reportUncaughtFailure(failure);
+                }
             } finally {
                 TLS.remove();
             }
@@ -129,7 +139,19 @@ public final class ThreadSupport {
 
     /** Detaches a Rust thread whose JoinHandle was dropped. */
     public static void detach(long id) {
-        THREADS.remove(id);
+        ThreadRecord record = THREADS.remove(id);
+        if (record == null) {
+            return;
+        }
+        Throwable failure;
+        synchronized (record) {
+            record.detached = true;
+            failure = record.failure;
+            record.failure = null;
+        }
+        if (failure != null) {
+            reportUncaughtFailure(failure);
+        }
     }
 
     public static long currentThreadId() {
@@ -357,5 +379,10 @@ public final class ThreadSupport {
             throw (Error) failure;
         }
         throw new IllegalStateException("generated Rust worker failed", failure);
+    }
+
+    private static void reportUncaughtFailure(Throwable failure) {
+        Thread thread = Thread.currentThread();
+        thread.getUncaughtExceptionHandler().uncaughtException(thread, failure);
     }
 }

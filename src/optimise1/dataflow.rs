@@ -26,110 +26,70 @@ pub fn analyze_constant_propagation(
     cfg: &HashMap<String, BasicBlockInfo>,
     // Potentially add function signature here if needed for argument constants
 ) -> DataflowResult {
-    let mut block_in_state: DataflowResult =
-        cfg.keys().map(|l| (l.clone(), HashMap::new())).collect();
-    let mut worklist: VecDeque<String> = VecDeque::new();
+    let mut block_in_state: HashMap<String, Option<ConstantMap>> =
+        cfg.keys().map(|label| (label.clone(), None)).collect();
+    let mut block_out_state: HashMap<String, Option<ConstantMap>> =
+        cfg.keys().map(|label| (label.clone(), None)).collect();
+    let mut worklist = VecDeque::new();
 
     if cfg.contains_key(entry_label) {
-        // Initialize: Start with the entry block
-        // Assume function arguments are initially non-constant unless specific info is passed
+        block_in_state.insert(entry_label.clone(), Some(ConstantMap::new()));
         worklist.push_back(entry_label.clone());
     }
 
     while let Some(current_label) = worklist.pop_front() {
-        let current_info = match cfg.get(&current_label) {
-            Some(info) => info,
-            None => continue, // Should not happen if CFG is consistent
+        let current_info = cfg
+            .get(&current_label)
+            .expect("worklist label must exist in CFG");
+        let Some(in_state) = block_in_state
+            .get(&current_label)
+            .expect("block input state must exist")
+            .as_ref()
+        else {
+            continue;
         };
+        let out_state = calculate_block_output_state(current_info, in_state);
+        if block_out_state
+            .get(&current_label)
+            .is_some_and(|previous| previous.as_ref() == Some(&out_state))
+        {
+            continue;
+        }
+        block_out_state.insert(current_label.clone(), Some(out_state));
 
-        // Get the merged input state for this block
-        let in_state = if current_info.predecessors.is_empty() {
-            // Entry block or unreachable block - starts empty (or with args if provided)
-            ConstantMap::new()
-        } else {
-            let mut first = true;
-            let mut merged_state = ConstantMap::new(); // Placeholder
-
-            for pred_label in &current_info.predecessors {
-                // Calculate the output state of the predecessor
-                // For simplicity here, we'll approximate using the input state
-                // of the current block before this iteration's merge.
-                // A more precise approach calculates predecessor's output state explicitly.
-                let pred_output_state = calculate_block_output_state(
-                    cfg.get(pred_label).expect("Predecessor must exist in CFG"),
-                    block_in_state
-                        .get(pred_label)
-                        .expect("Predecessor state must exist"),
-                );
-
-                if first {
-                    merged_state = pred_output_state; // Initialize with the first predecessor's output
-                    first = false;
-                } else {
-                    merged_state = meet_constants(&merged_state, &pred_output_state);
-                }
-            }
-            merged_state // This is the state at the entry of 'current_label'
-        };
-
-        // Calculate the output state by executing the block with the input state
-        let out_state = calculate_block_output_state(current_info, &in_state);
-
-        // Propagate changes to successors
         for successor_label in &current_info.successors {
-            let successor_current_in = block_in_state
-                .get(successor_label)
-                .expect("Successor state must exist")
-                .clone(); // Get the state before potential update
-
-            // Merge the calculated 'out_state' of the current block into the successor's input state
-            // This is slightly different from calculating the input state above. Here we merge
-            // the newly calculated output into the existing input of the successor.
-            let mut potential_new_in = ConstantMap::new(); // Placeholder for successor's potential new IN state
-            let successor_info = cfg.get(successor_label).expect("Successor must exist"); // Needed to check predecessors
-
-            if successor_info.predecessors.len() == 1 {
-                potential_new_in = out_state.clone(); // Only one pred, its output becomes successor's input
-            } else {
-                // Re-calculate the meet based on all predecessors' current outputs
-                // (including the one we just processed)
-                let mut first = true;
-                for pred_label in &successor_info.predecessors {
-                    let pred_out = calculate_block_output_state(
-                        cfg.get(pred_label).expect("Pred must exist"),
-                        block_in_state
-                            .get(pred_label)
-                            .expect("Pred state must exist"),
-                    );
-                    if first {
-                        potential_new_in = pred_out;
-                        first = false;
-                    } else {
-                        potential_new_in = meet_constants(&potential_new_in, &pred_out);
-                    }
-                }
+            if successor_label == entry_label {
+                continue;
             }
-
-            // If the successor's input state changed, update it and add to worklist
-            if potential_new_in != successor_current_in {
-                breadcrumbs::log!(
-                    breadcrumbs::LogLevel::Info,
-                    "optimisation",
-                    format!(
-                        "State change for {:?}: {:?} -> {:?}",
-                        successor_label, successor_current_in, potential_new_in
-                    )
-                );
-                block_in_state.insert(successor_label.clone(), potential_new_in);
-                if !worklist.contains(&successor_label) {
+            let successor_info = cfg
+                .get(successor_label)
+                .expect("successor must exist in CFG");
+            let mut predecessor_states = successor_info
+                .predecessors
+                .iter()
+                .filter_map(|predecessor| block_out_state.get(predecessor)?.as_ref());
+            let Some(first_state) = predecessor_states.next() else {
+                continue;
+            };
+            let merged_state = predecessor_states.fold(first_state.clone(), |merged, state| {
+                meet_constants(&merged, state)
+            });
+            let previous = block_in_state
+                .get(successor_label)
+                .expect("successor input state must exist");
+            if previous.as_ref() != Some(&merged_state) {
+                block_in_state.insert(successor_label.clone(), Some(merged_state));
+                if !worklist.contains(successor_label) {
                     worklist.push_back(successor_label.clone());
                 }
             }
         }
     }
 
-    // The final `block_in_state` contains the converged constant info at the entry of each block
     block_in_state
+        .into_iter()
+        .map(|(label, state)| (label, state.unwrap_or_default()))
+        .collect()
 }
 
 // Helper to simulate block execution for dataflow analysis OR transformation
@@ -140,7 +100,7 @@ pub fn process_block_instructions(
     initial_state: &ConstantMap,
     transform: bool, // If true, generate new instructions; otherwise, just calculate state
     _data_types: &HashMap<String, DataType>, // needed later if we try to handle more advanced optimisation
-    debug_locals: &HashSet<String>,
+    _debug_locals: &HashSet<String>,
 ) -> (ConstantMap, Vec<Instruction>) {
     // Returns final state and (if transform=true) new instructions
 
@@ -993,6 +953,7 @@ pub fn process_block_instructions(
                 dest,
                 object,
                 field_name,
+                field_ty,
                 ..
             } => {
                 let const_obj = lookup_const(object, &current_state);
@@ -1009,9 +970,16 @@ pub fn process_block_instructions(
                     if let Some(field_const) =
                         interpret::get_field_constant(c_obj, field_name.clone())
                     {
-                        current_state.insert(dest.clone(), field_const);
-                        keep_original_instruction = false; // Folded away
-                    // Emit Move if needed during transform phase
+                        if Type::from_constant(&field_const) == *field_ty {
+                            current_state.insert(dest.clone(), field_const);
+                            keep_original_instruction = false;
+                        } else {
+                            // An enum variant constant has its concrete subclass type,
+                            // while the field may be declared as the abstract enum base.
+                            // Keep the typed field load so later propagation cannot leave
+                            // the destination uninitialised after rejecting that mismatch.
+                            current_state.remove(dest);
+                        }
                     } else {
                         current_state.remove(dest); // Field access failed or object not right type
                     }
@@ -1022,12 +990,13 @@ pub fn process_block_instructions(
 
             Instruction::ArrayGet { dest, array, index } => {
                 let const_array = lookup_const(array, &current_state);
-                let new_array_op = const_array.clone().map_or(array.clone(), Operand::Constant);
                 let new_index_op =
                     lookup_const(index, &current_state).map_or(index.clone(), Operand::Constant);
                 optimised_instruction = Instruction::ArrayGet {
                     dest: dest.clone(),
-                    array: new_array_op,
+                    // Replacing the array itself would detach reference-valued
+                    // elements from their allocation and pointer metadata.
+                    array: array.clone(),
                     index: new_index_op,
                 };
 
@@ -1036,22 +1005,39 @@ pub fn process_block_instructions(
                     if let Some(index_const) = lookup_const(index, &current_state) {
                         match c_array {
                             Constant::Array(_, c_array) => {
-                                let i = match extract_number_from_operand(Operand::Constant(
-                                    index_const,
-                                )) {
-                                    Some(i) => i as usize,
-                                    None => {
-                                        // Index not constant
+                                if let Some(i) =
+                                    extract_number_from_operand(Operand::Constant(index_const))
+                                {
+                                    if let Some(c) =
+                                        usize::try_from(i).ok().and_then(|index| c_array.get(index))
+                                    {
+                                        if matches!(
+                                            c,
+                                            Constant::Unit
+                                                | Constant::I8(_)
+                                                | Constant::U8(_)
+                                                | Constant::I16(_)
+                                                | Constant::U16(_)
+                                                | Constant::I32(_)
+                                                | Constant::U32(_)
+                                                | Constant::I64(_)
+                                                | Constant::U64(_)
+                                                | Constant::F16(_)
+                                                | Constant::F32(_)
+                                                | Constant::F64(_)
+                                                | Constant::Boolean(_)
+                                                | Constant::Char(_)
+                                        ) {
+                                            current_state.insert(dest.clone(), c.clone());
+                                            keep_original_instruction = false;
+                                        } else {
+                                            current_state.remove(dest);
+                                        }
+                                    } else {
                                         current_state.remove(dest);
-                                        continue;
                                     }
-                                };
-                                if let Some(c) = c_array.get(i) {
-                                    current_state.insert(dest.clone(), c.clone());
-                                    keep_original_instruction = false; // Folded away
-                                // Emit Move if needed during transform phase
                                 } else {
-                                    current_state.remove(dest); // Index out of bounds
+                                    current_state.remove(dest);
                                 }
                             }
                             _ => {
@@ -1365,9 +1351,11 @@ pub fn process_block_instructions(
                 new_instructions.extend(pre_extra_instructions);
                 new_instructions.push(optimised_instruction);
             } else if let Some(dest) = instruction_destination(instruction)
-                && debug_locals.contains(dest)
                 && let Some(value) = current_state.get(dest)
             {
+                // Materialise folded destinations so correctness never depends on a
+                // later block retaining exactly the same propagation state. The copy
+                // pass removes these moves when every use was substituted.
                 new_instructions.push(Instruction::Move {
                     dest: dest.to_string(),
                     src: Operand::Constant(value.clone()),
@@ -1516,6 +1504,158 @@ mod tests {
     use super::*;
 
     #[test]
+    fn analysis_visits_successors_reached_with_an_empty_state() {
+        let block = |label: &str, instructions: Vec<Instruction>| BasicBlockInfo {
+            original_block: BasicBlock {
+                label: label.to_string(),
+                instructions,
+            },
+            predecessors: HashSet::new(),
+            successors: HashSet::new(),
+        };
+        let mut cfg = HashMap::from([
+            (
+                "entry".to_string(),
+                block(
+                    "entry",
+                    vec![Instruction::Jump {
+                        target: "middle".to_string(),
+                    }],
+                ),
+            ),
+            (
+                "middle".to_string(),
+                block(
+                    "middle",
+                    vec![
+                        Instruction::Move {
+                            dest: "value".to_string(),
+                            src: Operand::Constant(Constant::I32(3)),
+                        },
+                        Instruction::Jump {
+                            target: "exit".to_string(),
+                        },
+                    ],
+                ),
+            ),
+            (
+                "exit".to_string(),
+                block("exit", vec![Instruction::Return { operand: None }]),
+            ),
+        ]);
+        cfg.get_mut("entry")
+            .unwrap()
+            .successors
+            .insert("middle".to_string());
+        cfg.get_mut("middle")
+            .unwrap()
+            .predecessors
+            .insert("entry".to_string());
+        cfg.get_mut("middle")
+            .unwrap()
+            .successors
+            .insert("exit".to_string());
+        cfg.get_mut("exit")
+            .unwrap()
+            .predecessors
+            .insert("middle".to_string());
+
+        let states = analyze_constant_propagation(&"entry".to_string(), &cfg);
+
+        assert_eq!(states["exit"].get("value"), Some(&Constant::I32(3)));
+    }
+
+    #[test]
+    fn array_get_folds_unsigned_indices_without_dropping_the_result() {
+        let block = BasicBlock {
+            label: "bb0".to_string(),
+            instructions: vec![Instruction::ArrayGet {
+                dest: "element".to_string(),
+                array: Operand::Variable {
+                    name: "array".to_string(),
+                    ty: Type::Array(Box::new(Type::U32)),
+                },
+                index: Operand::Variable {
+                    name: "index".to_string(),
+                    ty: Type::U64,
+                },
+            }],
+        };
+        let info = BasicBlockInfo {
+            original_block: block,
+            predecessors: HashSet::new(),
+            successors: HashSet::new(),
+        };
+        let state = ConstantMap::from([
+            (
+                "array".to_string(),
+                Constant::Array(
+                    Box::new(Type::U32),
+                    vec![Constant::U32(0), Constant::U32(0), Constant::U32(3)],
+                ),
+            ),
+            ("index".to_string(), Constant::U64(2)),
+        ]);
+
+        let (_, instructions) =
+            process_block_instructions(&info, &state, true, &HashMap::new(), &HashSet::new());
+
+        assert_eq!(
+            instructions,
+            vec![Instruction::Move {
+                dest: "element".to_string(),
+                src: Operand::Constant(Constant::U32(3)),
+            }]
+        );
+    }
+
+    #[test]
+    fn array_get_keeps_reference_elements_attached_to_the_original_array() {
+        let element_ty = Type::Array(Box::new(Type::I32));
+        let array_ty = Type::Array(Box::new(element_ty.clone()));
+        let original_array = Operand::Variable {
+            name: "array".to_string(),
+            ty: array_ty,
+        };
+        let block = BasicBlock {
+            label: "bb0".to_string(),
+            instructions: vec![Instruction::ArrayGet {
+                dest: "element".to_string(),
+                array: original_array.clone(),
+                index: Operand::Variable {
+                    name: "index".to_string(),
+                    ty: Type::U64,
+                },
+            }],
+        };
+        let info = BasicBlockInfo {
+            original_block: block,
+            predecessors: HashSet::new(),
+            successors: HashSet::new(),
+        };
+        let nested = Constant::Array(Box::new(Type::I32), vec![Constant::I32(1)]);
+        let state = ConstantMap::from([
+            (
+                "array".to_string(),
+                Constant::Array(Box::new(element_ty), vec![nested]),
+            ),
+            ("index".to_string(), Constant::U64(0)),
+        ]);
+
+        let (_, instructions) =
+            process_block_instructions(&info, &state, true, &HashMap::new(), &HashSet::new());
+
+        assert_eq!(
+            instructions,
+            vec![Instruction::ArrayGet {
+                dest: "element".to_string(),
+                array: original_array,
+                index: Operand::Constant(Constant::U64(0)),
+            }]
+        );
+    }
+
+    #[test]
     fn constant_propagation_does_not_change_operand_type() {
         let slice_ty = Type::Slice(Box::new(Type::U8));
         let block = BasicBlock {
@@ -1548,5 +1688,62 @@ mod tests {
                 },
             }]
         );
+    }
+
+    #[test]
+    fn field_folding_keeps_declared_supertype_load() {
+        let base_ty = Type::Class("example/Base".to_string());
+        let owner_ty = Type::Class("example/Owner".to_string());
+        let owner = Constant::Instance {
+            class_name: "example/Owner".to_string(),
+            fields: HashMap::from([(
+                "value".to_string(),
+                Constant::Instance {
+                    class_name: "example/Base$Variant".to_string(),
+                    fields: HashMap::new(),
+                    params: Vec::new(),
+                    param_types: Vec::new(),
+                },
+            )]),
+            params: Vec::new(),
+            param_types: Vec::new(),
+        };
+        let block = BasicBlock {
+            label: "bb0".to_string(),
+            instructions: vec![
+                Instruction::Move {
+                    dest: "owner".to_string(),
+                    src: Operand::Constant(owner),
+                },
+                Instruction::GetField {
+                    dest: "value".to_string(),
+                    object: Operand::Variable {
+                        name: "owner".to_string(),
+                        ty: owner_ty,
+                    },
+                    field_name: "value".to_string(),
+                    field_ty: base_ty,
+                    owner_class: "example/Owner".to_string(),
+                },
+            ],
+        };
+        let info = BasicBlockInfo {
+            original_block: block,
+            predecessors: HashSet::new(),
+            successors: HashSet::new(),
+        };
+
+        let (_, instructions) = process_block_instructions(
+            &info,
+            &HashMap::new(),
+            true,
+            &HashMap::new(),
+            &HashSet::new(),
+        );
+
+        assert!(matches!(
+            instructions.last(),
+            Some(Instruction::GetField { .. })
+        ));
     }
 }

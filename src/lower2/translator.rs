@@ -626,6 +626,12 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         })
     }
 
+    fn local_slot_has_pointer_alias(&self, var_name: &str, index: u16) -> bool {
+        self.typed_local_var_map.iter().any(|((name, ty), slot)| {
+            name == var_name && *slot == index && matches!(ty, oomir::Type::Pointer(_))
+        })
+    }
+
     fn get_local_index(&self, var_name: &str) -> Result<u16, jvm::Error> {
         self.local_var_map
             .get(var_name)
@@ -1552,7 +1558,8 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         let (getter, runtime_ty) = match pointee_ty {
             oomir::Type::Boolean => ("getBoolean", oomir::Type::Boolean),
             oomir::Type::I8 | oomir::Type::U8 => ("getI8", oomir::Type::I8),
-            oomir::Type::I16 | oomir::Type::U16 | oomir::Type::F16 => ("getI16", oomir::Type::I16),
+            oomir::Type::I16 | oomir::Type::U16 => ("getI16", oomir::Type::I16),
+            oomir::Type::F16 => ("getI16", oomir::Type::F16),
             oomir::Type::I32 | oomir::Type::U32 | oomir::Type::Char => ("getI32", oomir::Type::I32),
             oomir::Type::I64 | oomir::Type::U64 => ("getI64", oomir::Type::I64),
             oomir::Type::F32 => ("getF32", oomir::Type::F32),
@@ -1716,8 +1723,15 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         let to_array = self.constant_pool.add_method_ref(
             pointer_class,
             "arrayCarrier",
-            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            "(Ljava/lang/Object;Ljava/lang/String;)Ljava/lang/Object;",
         )?;
+        let expected_type = self.constant_pool.add_string(expected_jvm_type)?;
+        if let Ok(index) = u8::try_from(expected_type) {
+            self.jvm_instructions.push(Instruction::Ldc(index));
+        } else {
+            self.jvm_instructions
+                .push(Instruction::Ldc_w(expected_type));
+        }
         self.jvm_instructions
             .push(Instruction::Invokestatic(to_array));
 
@@ -2369,8 +2383,14 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             }
             Type::F32 => {
                 if !["eq", "ne", "lt", "le", "gt", "ge"].contains(&comp_op) { /* error */ }
-                // Use Fcmpl (NaN -> -1) or Fcmpg (NaN -> +1). Doesn't matter for == 0.
-                self.jvm_instructions.push(Instruction::Fcmpl); // Stack: [int_result]
+                // Ordered comparisons must be false for NaN. Pick the comparison whose
+                // NaN result falls on the opposite side of the requested relation.
+                self.jvm_instructions
+                    .push(if matches!(comp_op, "lt" | "le") {
+                        Instruction::Fcmpg
+                    } else {
+                        Instruction::Fcmpl
+                    });
                 branch_constructor = Box::new(move |offset| match comp_op {
                     // move comp_op
                     "eq" => Instruction::Ifeq(offset),
@@ -2384,7 +2404,12 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             }
             Type::F64 => {
                 if !["eq", "ne", "lt", "le", "gt", "ge"].contains(&comp_op) { /* error */ }
-                self.jvm_instructions.push(Instruction::Dcmpl); // Stack: [int_result]
+                self.jvm_instructions
+                    .push(if matches!(comp_op, "lt" | "le") {
+                        Instruction::Dcmpg
+                    } else {
+                        Instruction::Dcmpl
+                    });
                 branch_constructor = Box::new(move |offset| match comp_op {
                     // move comp_op
                     "eq" => Instruction::Ifeq(offset),
@@ -3342,8 +3367,18 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 )?;
 
                 self.load_operand(function_ptr)?;
-                for arg in args.iter() {
-                    self.load_call_argument(arg)?;
+                if args.len() != signature.params.len() {
+                    return Err(jvm::Error::VerificationError {
+                        context: format!("Function {}", self.oomir_func.name),
+                        message: format!(
+                            "Argument count mismatch for indirect call: expected {}, found {}",
+                            signature.params.len(),
+                            args.len()
+                        ),
+                    });
+                }
+                for (arg, (_, expected_ty)) in args.iter().zip(signature.params.iter()) {
+                    self.load_call_argument_as(arg, expected_ty)?;
                 }
 
                 let count = self.invokeinterface_count(args)?;
@@ -3511,10 +3546,23 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 );
                 // 1. Get the type of the array variable to find the element type
                 let array_type = self.get_local_type(array)?.clone(); // Clone to avoid borrow issues
-                if let oomir::Type::Pointer(element_type) = &array_type {
+                let pointer_backed_slice_element = match &array_type {
+                    oomir::Type::Slice(element_type) => self
+                        .local_var_map
+                        .get(array)
+                        .copied()
+                        .filter(|index| self.local_slot_has_pointer_alias(array, *index))
+                        .map(|_| element_type.clone()),
+                    _ => None,
+                };
+                if let Some(element_type) = match &array_type {
+                    oomir::Type::Pointer(element_type) => Some(element_type.clone()),
+                    _ => pointer_backed_slice_element,
+                } {
+                    let pointer_type = oomir::Type::Pointer(element_type.clone());
                     let pointer_operand = oomir::Operand::Variable {
                         name: array.clone(),
-                        ty: array_type.clone(),
+                        ty: pointer_type,
                     };
                     self.load_operand(&pointer_operand)?;
                     self.load_jvm_int_operand(index)?;
@@ -3839,21 +3887,37 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     // 3. Load index
                     self.load_jvm_int_operand(index)?;
 
-                    // 4. Get and add the appropriate array load instruction
-                    let load_instr = if element_type.has_jvm_value() {
-                        element_type // Now correctly holds I64, I32, Class(...), etc.
-                            .get_jvm_array_load_instruction() // Should now return laload, iaload, aaload correctly
-                            .ok_or_else(|| jvm::Error::VerificationError {
-                                context: format!("Function {}", self.oomir_func.name),
-                                message: format!(
-                                    "Cannot determine array load instruction for element type: {:?}",
-                                    element_type // Use the correct element type in error message
-                                ),
-                            })?
+                    // Reference array repeats initially share one carrier and detach
+                    // elements on first access. This avoids eagerly allocating large
+                    // arrays of wrapper objects while retaining Rust value semantics.
+                    if element_type.is_jvm_reference_type() {
+                        let pointer_class = self.constant_pool.add_class(oomir::POINTER_CLASS)?;
+                        let array_get = self.constant_pool.add_method_ref(
+                            pointer_class,
+                            "arrayGetObject",
+                            "(Ljava/lang/Object;I)Ljava/lang/Object;",
+                        )?;
+                        self.jvm_instructions.push(JI::Invokestatic(array_get));
+                        if let Some(internal_name) = element_type.to_jvm_internal_name() {
+                            let expected_class = self.constant_pool.add_class(&internal_name)?;
+                            self.jvm_instructions.push(JI::Checkcast(expected_class));
+                        }
                     } else {
-                        JI::Aaload
-                    };
-                    self.jvm_instructions.push(load_instr); // Pushes the correct instruction (e.g., laload)
+                        let load_instr = if element_type.has_jvm_value() {
+                            element_type.get_jvm_array_load_instruction().ok_or_else(|| {
+                                jvm::Error::VerificationError {
+                                    context: format!("Function {}", self.oomir_func.name),
+                                    message: format!(
+                                        "Cannot determine array load instruction for element type: {:?}",
+                                        element_type
+                                    ),
+                                }
+                            })?
+                        } else {
+                            JI::Aaload
+                        };
+                        self.jvm_instructions.push(load_instr);
+                    }
                     // Stack: [value] (long value in this case)
 
                     // 5. Store the resulting element (which has the correct element_type)
@@ -3945,12 +4009,35 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 // 1. Add Class reference to constant pool
                 let class_index = self.constant_pool.add_class(class_name)?;
 
+                let visible_args = args
+                    .iter()
+                    .filter(|(_, ty)| ty.has_jvm_value())
+                    .collect::<Vec<_>>();
+                let declared_field_types = match self.module.data_types.get(class_name) {
+                    Some(oomir::DataType::Class { fields, .. }) => Some(
+                        fields
+                            .iter()
+                            .filter(|(_, ty)| ty.has_jvm_value())
+                            .map(|(_, ty)| ty)
+                            .collect::<Vec<_>>(),
+                    ),
+                    _ => None,
+                };
+                let constructor_arg_types = declared_field_types
+                    .as_ref()
+                    .filter(|field_types| field_types.len() == visible_args.len());
                 let constructor_descriptor = format!(
                     "({})V",
-                    args.iter()
-                        .filter(|(_, ty)| ty.has_jvm_value())
-                        .map(|(_, ty)| ty.to_jvm_descriptor())
-                        .collect::<String>()
+                    match constructor_arg_types {
+                        Some(field_types) => field_types
+                            .iter()
+                            .map(|ty| ty.to_jvm_descriptor())
+                            .collect::<String>(),
+                        None => visible_args
+                            .iter()
+                            .map(|(_, ty)| ty.to_jvm_descriptor())
+                            .collect::<String>(),
+                    }
                 );
                 let constructor_ref_index = self.constant_pool.add_method_ref(
                     class_index,
@@ -3964,29 +4051,10 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 // 4. Emit 'dup' instruction
                 self.jvm_instructions.push(JI::Dup); // Stack: [uninitialized_ref, uninitialized_ref]
 
-                let copies_rust_value_fields = !class_name.starts_with("java/")
-                    && !class_name.starts_with("org/rustlang/runtime/");
-                for (arg, arg_ty) in args {
-                    if arg_ty.has_jvm_value() {
-                        self.load_operand_as(arg, arg_ty)?;
-                        if copies_rust_value_fields
-                            && matches!(arg_ty, oomir::Type::Class(_) | oomir::Type::Array(_))
-                        {
-                            let pointer_class =
-                                self.constant_pool.add_class(oomir::POINTER_CLASS)?;
-                            let copy_value = self.constant_pool.add_method_ref(
-                                pointer_class,
-                                "copyManagedValue",
-                                "(Ljava/lang/Object;)Ljava/lang/Object;",
-                            )?;
-                            self.jvm_instructions.push(JI::Invokestatic(copy_value));
-                            if let Some(internal_name) = arg_ty.to_jvm_internal_name() {
-                                let expected_class =
-                                    self.constant_pool.add_class(&internal_name)?;
-                                self.jvm_instructions.push(JI::Checkcast(expected_class));
-                            }
-                        }
-                    }
+                for (index, (arg, arg_ty)) in visible_args.into_iter().enumerate() {
+                    let expected_ty =
+                        constructor_arg_types.map_or(arg_ty, |field_types| field_types[index]);
+                    self.load_operand_as(arg, expected_ty)?;
                 }
 
                 // 5. Emit 'invokespecial' to call the constructor
@@ -4104,12 +4172,27 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 let restored_dest = dest
                     .strip_prefix(super::large_methods::RESTORE_PREFIX)
                     .unwrap_or(dest);
+                let source_ty = get_operand_type(op);
                 let preserves_receiver_identity =
                     matches!(
                         op,
                         OO::Variable { name, .. } if self.direct_this_aliases.contains(name)
                     ) && matches!(ty, oomir::Type::Class(_) | oomir::Type::Interface(_));
                 self.load_operand_as(op, ty)?;
+                // Rust f16/i16 casts are numeric, while an outlined carrier
+                // restore is only a bit-preserving JVM-slot reinterpretation.
+                if restored_dest == dest
+                    && source_ty != *ty
+                    && source_ty.to_jvm_descriptor() == ty.to_jvm_descriptor()
+                    && (matches!(source_ty, oomir::Type::F16) || matches!(ty, oomir::Type::F16))
+                {
+                    self.jvm_instructions.extend(get_cast_instructions(
+                        &self.oomir_func.name,
+                        &source_ty,
+                        ty,
+                        self.constant_pool,
+                    )?);
+                }
 
                 if restored_dest == dest {
                     self.store_result(dest, ty)?;

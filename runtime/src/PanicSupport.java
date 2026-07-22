@@ -94,4 +94,9 @@ public final class PanicSupport {
         }
         throw new IllegalStateException("foreign JVM throwable crossed a Rust abort boundary", failure);
     }
+
+    /** Implements Rust's explicit abort intrinsic without running JVM shutdown hooks. */
+    public static void abortNow() {
+        Runtime.getRuntime().halt(134);
+    }
 }

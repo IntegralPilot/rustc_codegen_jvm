@@ -1,5 +1,7 @@
 package org.rustlang.runtime;
 
+import java.math.BigInteger;
+
 public final class Numbers {
     private Numbers() {}
 
@@ -85,6 +87,142 @@ public final class Numbers {
         return value.low == 0
                 ? 64 + Long.numberOfTrailingZeros(value.high)
                 : Long.numberOfTrailingZeros(value.low);
+    }
+
+    public static byte rotateLeft(byte value, int distance) {
+        int shift = distance & 7;
+        int bits = value & 0xff;
+        return (byte) ((bits << shift) | (bits >>> (8 - shift)));
+    }
+
+    public static short rotateLeft(short value, int distance) {
+        int shift = distance & 15;
+        int bits = value & 0xffff;
+        return (short) ((bits << shift) | (bits >>> (16 - shift)));
+    }
+
+    public static char rotateLeft(char value, int distance) {
+        return (char) rotateLeft((short) value, distance);
+    }
+
+    public static int rotateLeft(int value, int distance) {
+        return Integer.rotateLeft(value, distance);
+    }
+
+    public static long rotateLeft(long value, int distance) {
+        return Long.rotateLeft(value, distance);
+    }
+
+    public static I128 rotateLeft(I128 value, int distance) {
+        U128 result = rotateLeft(value.toU128(), distance);
+        return new I128(result.high, result.low);
+    }
+
+    public static U128 rotateLeft(U128 value, int distance) {
+        int shift = distance & 127;
+        return shift == 0 ? value : value.shiftLeft(shift).or(value.shiftRight(128 - shift));
+    }
+
+    public static byte rotateRight(byte value, int distance) {
+        return rotateLeft(value, -distance);
+    }
+
+    public static short rotateRight(short value, int distance) {
+        return rotateLeft(value, -distance);
+    }
+
+    public static char rotateRight(char value, int distance) {
+        return rotateLeft(value, -distance);
+    }
+
+    public static int rotateRight(int value, int distance) {
+        return Integer.rotateRight(value, distance);
+    }
+
+    public static long rotateRight(long value, int distance) {
+        return Long.rotateRight(value, distance);
+    }
+
+    public static I128 rotateRight(I128 value, int distance) {
+        return rotateLeft(value, -distance);
+    }
+
+    public static U128 rotateRight(U128 value, int distance) {
+        return rotateLeft(value, -distance);
+    }
+
+    public static byte bitReverse(byte value) {
+        return (byte) (Integer.reverse(value & 0xff) >>> 24);
+    }
+
+    public static short bitReverse(short value) {
+        return (short) (Integer.reverse(value & 0xffff) >>> 16);
+    }
+
+    public static char bitReverse(char value) {
+        return (char) bitReverse((short) value);
+    }
+
+    public static int bitReverse(int value) { return Integer.reverse(value); }
+    public static long bitReverse(long value) { return Long.reverse(value); }
+    public static I128 bitReverse(I128 value) {
+        return new I128(Long.reverse(value.low), Long.reverse(value.high));
+    }
+    public static U128 bitReverse(U128 value) {
+        return new U128(Long.reverse(value.low), Long.reverse(value.high));
+    }
+
+    private static int carryingTotal(byte a, byte b, byte addend, byte carry) {
+        return a * b + addend + carry;
+    }
+
+    private static long carryingTotal(short a, short b, short addend, short carry) {
+        return (long) a * b + addend + carry;
+    }
+
+    private static long carryingTotal(int a, int b, int addend, int carry) {
+        return (long) a * b + addend + carry;
+    }
+
+    private static BigInteger carryingTotal(long a, long b, long addend, long carry) {
+        return BigInteger.valueOf(a).multiply(BigInteger.valueOf(b))
+                .add(BigInteger.valueOf(addend)).add(BigInteger.valueOf(carry));
+    }
+
+    private static BigInteger carryingTotal(I128 a, I128 b, I128 addend, I128 carry) {
+        return a.toBigInteger().multiply(b.toBigInteger())
+                .add(addend.toBigInteger()).add(carry.toBigInteger());
+    }
+
+    public static byte carryingLowI8(byte a, byte b, byte addend, byte carry) {
+        return (byte) carryingTotal(a, b, addend, carry);
+    }
+    public static byte carryingHighI8(byte a, byte b, byte addend, byte carry) {
+        return (byte) (carryingTotal(a, b, addend, carry) >> 8);
+    }
+    public static char carryingLowI16(short a, short b, short addend, short carry) {
+        return (char) carryingTotal(a, b, addend, carry);
+    }
+    public static short carryingHighI16(short a, short b, short addend, short carry) {
+        return (short) (carryingTotal(a, b, addend, carry) >> 16);
+    }
+    public static int carryingLowI32(int a, int b, int addend, int carry) {
+        return (int) carryingTotal(a, b, addend, carry);
+    }
+    public static int carryingHighI32(int a, int b, int addend, int carry) {
+        return (int) (carryingTotal(a, b, addend, carry) >> 32);
+    }
+    public static long carryingLowI64(long a, long b, long addend, long carry) {
+        return carryingTotal(a, b, addend, carry).longValue();
+    }
+    public static long carryingHighI64(long a, long b, long addend, long carry) {
+        return carryingTotal(a, b, addend, carry).shiftRight(64).longValue();
+    }
+    public static U128 carryingLowI128(I128 a, I128 b, I128 addend, I128 carry) {
+        return U128.fromBigInteger(carryingTotal(a, b, addend, carry));
+    }
+    public static I128 carryingHighI128(I128 a, I128 b, I128 addend, I128 carry) {
+        return I128.fromBigInteger(carryingTotal(a, b, addend, carry).shiftRight(128));
     }
 
     public static float f16ToF32(short value) {

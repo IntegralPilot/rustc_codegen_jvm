@@ -3,13 +3,13 @@ use super::{
     operand::convert_operand,
     place::{
         emit_instructions_to_get_on_own, emit_instructions_to_set_value, emit_pointer_read,
-        place_to_string,
+        emit_pointer_slice_parts, emit_retyped_slice_data_pointer, place_to_string,
     },
     types::mir_int_to_oomir_const,
 };
 use crate::oomir;
 
-use rustc_hir::def::DefKind;
+use rustc_hir::{LangItem, def::DefKind};
 use rustc_middle::{
     mir::{
         BasicBlock, BasicBlockData, Body, Local, Location, NonDivergingIntrinsic,
@@ -82,6 +82,58 @@ fn caller_location_operand<'tcx>(
             instructions,
         )
     })
+}
+
+fn emit_panic_lang_item<'tcx>(
+    lang_item: LangItem,
+    mut args: Vec<oomir::Operand>,
+    source_info: SourceInfo,
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
+    mir: &Body<'tcx>,
+    data_types: &mut HashMap<String, oomir::DataType>,
+    instructions: &mut Vec<oomir::Instruction>,
+    temp_prefix: &str,
+) {
+    let panic_def = tcx.require_lang_item(lang_item, source_info.span);
+    let panic_instance = Instance::mono(tcx, panic_def);
+    args.push(caller_location_operand(
+        source_info,
+        tcx,
+        instance,
+        mir,
+        data_types,
+        instructions,
+        temp_prefix,
+    ));
+    let target = super::naming::mono_fn_name_from_instance(tcx, panic_instance);
+    let params = args
+        .iter()
+        .enumerate()
+        .map(|(index, arg)| {
+            (
+                format!("arg{index}"),
+                arg.get_type().expect("panic argument must have a JVM type"),
+            )
+        })
+        .collect();
+    instructions.push(oomir::Instruction::InvokeStatic {
+        dest: None,
+        class_name: target
+            .class_to_call_on
+            .expect("panic lang item must have an owning JVM class"),
+        method_name: target.method_name,
+        method_ty: oomir::Signature {
+            params,
+            ret: Box::new(oomir::Type::Void),
+            is_static: true,
+        },
+        args,
+    });
+    instructions.push(oomir::Instruction::ThrowNewWithMessage {
+        exception_class: "java/lang/AssertionError".to_string(),
+        message: "Diverging Rust panic call returned unexpectedly".to_string(),
+    });
 }
 
 fn atomic_value_as_bits(
@@ -1320,6 +1372,37 @@ fn emit_comparison_value<'tcx>(
         mir_ty = *pointee;
         depth += 1;
     }
+    if matches!(
+        mir_ty.kind(),
+        TyKind::RawPtr(pointee, _) | TyKind::Ref(_, pointee, _)
+            if matches!(pointee.kind(), TyKind::Dynamic(..))
+    ) && let Some(pointer_ty @ oomir::Type::Pointer(_)) = operand.get_type()
+    {
+        let normalized = format!("{dest_prefix}_trait_data");
+        instructions.push(oomir::Instruction::InvokeStatic {
+            dest: Some(normalized.clone()),
+            class_name: "org/rustlang/runtime/RuntimeSupport".to_string(),
+            method_name: "traitObjectDataPointer".to_string(),
+            method_ty: oomir::Signature {
+                params: vec![
+                    ("pointer".to_string(), pointer_ty.clone()),
+                    ("view_size".to_string(), oomir::Type::U64),
+                    ("view_codec".to_string(), oomir::Type::java_string()),
+                ],
+                ret: Box::new(pointer_ty.clone()),
+                is_static: true,
+            },
+            args: vec![
+                operand,
+                oomir::Operand::Constant(oomir::Constant::U64(0)),
+                oomir::Operand::Constant(oomir::Constant::Null(oomir::Type::java_string())),
+            ],
+        });
+        operand = oomir::Operand::Variable {
+            name: normalized,
+            ty: pointer_ty,
+        };
+    }
     operand
 }
 
@@ -2287,8 +2370,29 @@ pub(super) fn convert_basic_block<'tcx>(
                                         || matches!(
                                             receiver_value_ty.kind(),
                                             TyKind::Adt(adt_def, _)
-                                                if tcx.is_diagnostic_item(sym::NonNull, adt_def.did())
+                                            if tcx.is_diagnostic_item(sym::NonNull, adt_def.did())
                                         )
+                                };
+                                let zero_sized_raw_pointer_offset = matches!(
+                                    declared_method_name.as_str(),
+                                    "add"
+                                        | "sub"
+                                        | "offset"
+                                        | "wrapping_add"
+                                        | "wrapping_sub"
+                                        | "wrapping_offset"
+                                ) && {
+                                    let receiver_value_ty = match resolved_receiver_mir_ty.kind() {
+                                        TyKind::Ref(_, pointee, _) => *pointee,
+                                        _ => resolved_receiver_mir_ty,
+                                    };
+                                    match receiver_value_ty.kind() {
+                                        TyKind::RawPtr(pointee, _) => {
+                                            super::types::layout_size_bytes(tcx, *pointee)
+                                                .is_ok_and(|size| size == 0)
+                                        }
+                                        _ => false,
+                                    }
                                 };
                                 // Upstream core passes the zero-sized `Clone::clone` function
                                 // item through `FnOnce` in helpers such as `Option::cloned`.
@@ -2339,6 +2443,14 @@ pub(super) fn convert_basic_block<'tcx>(
                                     ) && supports_direct_ordering(&comparison_value_ty)
                                         && comparison_rhs_ty.as_ref() == Some(&comparison_value_ty)
                                         && oomir_operands.len() == 2;
+                                let direct_unit_comparison = comparison_value_ty
+                                    == oomir::Type::Unit
+                                    && comparison_rhs_ty.as_ref() == Some(&oomir::Type::Unit)
+                                    && oomir_operands.len() == 2
+                                    && matches!(
+                                        declared_method_name.as_str(),
+                                        "eq" | "ne" | "lt" | "le" | "gt" | "ge"
+                                    );
 
                                 let direct_wrapping_integer_op = matches!(
                                     declared_method_name.as_str(),
@@ -2399,6 +2511,25 @@ pub(super) fn convert_basic_block<'tcx>(
                                                 is_static: true,
                                             },
                                             args: vec![oomir_operands[0].clone()],
+                                        });
+                                    }
+                                } else if direct_unit_comparison {
+                                    if let Some(dest) = effective_dest {
+                                        instructions.push(oomir::Instruction::Move {
+                                            dest,
+                                            src: oomir::Operand::Constant(
+                                                oomir::Constant::Boolean(matches!(
+                                                    declared_method_name.as_str(),
+                                                    "eq" | "le" | "ge"
+                                                )),
+                                            ),
+                                        });
+                                    }
+                                } else if zero_sized_raw_pointer_offset {
+                                    if let Some(dest) = effective_dest {
+                                        instructions.push(oomir::Instruction::Move {
+                                            dest,
+                                            src: oomir_operands[0].clone(),
                                         });
                                     }
                                 } else if direct_overflowing_integer_op {
@@ -2471,7 +2602,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                                 dest.clone()
                                             };
                                             let method_name = match declared_method_name.as_str() {
-                                                "eq" | "ne" => "sameAddress",
+                                                "eq" | "ne" => "samePointer",
                                                 "lt" => "lessThan",
                                                 "le" => "lessOrEqual",
                                                 "gt" => "greaterThan",
@@ -2593,6 +2724,89 @@ pub(super) fn convert_basic_block<'tcx>(
                                                 src: field,
                                             });
                                         }
+                                    }
+                                } else if declared_method_name == "with_metadata_of"
+                                    && matches!(&dispatch_receiver_ty, oomir::Type::Pointer(_))
+                                    && matches!(
+                                        &oomir_output_type,
+                                        oomir::Type::Slice(_) | oomir::Type::Str
+                                    )
+                                    && oomir_operands.get(1).is_some_and(|metadata| {
+                                        matches!(
+                                            metadata.get_type(),
+                                            Some(oomir::Type::Slice(_) | oomir::Type::Str)
+                                        )
+                                    })
+                                {
+                                    if let Some(dest) = effective_dest {
+                                        let data = oomir_operands[0].clone();
+                                        let metadata = oomir_operands[1].clone();
+                                        let target_pointee = match fn_output.kind() {
+                                            TyKind::RawPtr(pointee, _)
+                                            | TyKind::Ref(_, pointee, _) => *pointee,
+                                            other => panic!(
+                                                "with_metadata_of returned non-pointer type {other:?}"
+                                            ),
+                                        };
+                                        let element_ty = if target_pointee.is_str() {
+                                            tcx.types.u8
+                                        } else {
+                                            target_pointee.sequence_element_type(tcx)
+                                        };
+                                        let data = emit_retyped_slice_data_pointer(
+                                            data,
+                                            oomir::Operand::Constant(oomir::Constant::U64(
+                                                u64::try_from(
+                                                    super::types::layout_size_bytes(
+                                                        tcx, element_ty,
+                                                    )
+                                                    .expect("slice element has a layout"),
+                                                )
+                                                .expect("Rust slice element layout exceeds u64"),
+                                            )),
+                                            super::types::pointer_view_codec_operand(
+                                                element_ty, tcx, data_types, instance,
+                                            ),
+                                            &format!("{label}_metadata_data"),
+                                            &mut instructions,
+                                        );
+                                        let (backing, offset) = emit_pointer_slice_parts(
+                                            data,
+                                            &format!("{label}_metadata_data"),
+                                            &mut instructions,
+                                        );
+                                        let length = format!("{label}_metadata_length");
+                                        instructions.push(oomir::Instruction::GetField {
+                                            dest: length.clone(),
+                                            object: metadata,
+                                            field_name: "rustLength".to_string(),
+                                            field_ty: oomir::Type::U64,
+                                            owner_class: oomir::SLICE_VIEW_CLASS.to_string(),
+                                        });
+                                        instructions.push(oomir::Instruction::ConstructObject {
+                                            dest,
+                                            class_name: if target_pointee.is_str() {
+                                                oomir::UTF8_VIEW_CLASS.to_string()
+                                            } else {
+                                                oomir::SLICE_VIEW_CLASS.to_string()
+                                            },
+                                            args: vec![
+                                                (
+                                                    backing,
+                                                    oomir::Type::Class(
+                                                        "java/lang/Object".to_string(),
+                                                    ),
+                                                ),
+                                                (offset, oomir::Type::I32),
+                                                (
+                                                    oomir::Operand::Variable {
+                                                        name: length,
+                                                        ty: oomir::Type::U64,
+                                                    },
+                                                    oomir::Type::U64,
+                                                ),
+                                            ],
+                                        });
                                     }
                                 } else if matches!(
                                     &dispatch_receiver_ty,
@@ -2908,10 +3122,19 @@ pub(super) fn convert_basic_block<'tcx>(
                                             .first()
                                             .map(|(_, ty)| ty.clone())
                                             .expect("to_raw_parts tuple has a data pointer");
+                                        let source_is_trait_object = matches!(
+                                            resolved_receiver_mir_ty.kind(),
+                                            TyKind::RawPtr(pointee, _)
+                                                if matches!(pointee.kind(), TyKind::Dynamic(..))
+                                        );
                                         let data_pointer_name = format!("{label}_raw_parts_data");
                                         instructions.push(oomir::Instruction::InvokeStatic {
                                             class_name: oomir::POINTER_CLASS.to_string(),
-                                            method_name: "retype".to_string(),
+                                            method_name: if source_is_trait_object {
+                                                "traitObjectDataPointer".to_string()
+                                            } else {
+                                                "retype".to_string()
+                                            },
                                             method_ty: oomir::Signature {
                                                 params: vec![
                                                     (
@@ -2928,7 +3151,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                                 is_static: true,
                                             },
                                             args: vec![
-                                                receiver_operand,
+                                                receiver_operand.clone(),
                                                 oomir::Operand::Constant(oomir::Constant::U64(0)),
                                                 oomir::Operand::Constant(oomir::Constant::Null(
                                                     oomir::Type::java_string(),
@@ -2943,13 +3166,35 @@ pub(super) fn convert_basic_block<'tcx>(
                                             },
                                             data_pointer_ty,
                                         )];
-                                        for (_, metadata_ty) in tuple_fields.into_iter().skip(1) {
-                                            tuple_args.push((
-                                                oomir::Operand::Constant(oomir::Constant::Null(
-                                                    metadata_ty.clone(),
-                                                )),
-                                                metadata_ty,
-                                            ));
+                                        for (metadata_index, (_, metadata_ty)) in
+                                            tuple_fields.into_iter().skip(1).enumerate()
+                                        {
+                                            if source_is_trait_object && metadata_index == 0 {
+                                                let metadata_name =
+                                                    format!("{label}_raw_parts_metadata");
+                                                emit_trait_object_metadata(
+                                                    receiver_operand.clone(),
+                                                    &metadata_ty,
+                                                    metadata_name.clone(),
+                                                    &metadata_name,
+                                                    data_types,
+                                                    &mut instructions,
+                                                );
+                                                tuple_args.push((
+                                                    oomir::Operand::Variable {
+                                                        name: metadata_name,
+                                                        ty: metadata_ty.clone(),
+                                                    },
+                                                    metadata_ty,
+                                                ));
+                                            } else {
+                                                tuple_args.push((
+                                                    oomir::Operand::Constant(
+                                                        oomir::Constant::Null(metadata_ty.clone()),
+                                                    ),
+                                                    metadata_ty,
+                                                ));
+                                            }
                                         }
                                         instructions.push(oomir::Instruction::ConstructObject {
                                             dest,
@@ -3442,10 +3687,16 @@ pub(super) fn convert_basic_block<'tcx>(
                                                 "startsWith".to_string(),
                                             ))
                                         }
-                                        oomir::Type::Str if declared_method_name == "eq" => Some((
-                                            oomir::UTF8_VIEW_CLASS.to_string(),
-                                            "equals".to_string(),
-                                        )),
+                                        oomir::Type::Str
+                                            if declared_method_name == "eq"
+                                                && comparison_rhs_ty.as_ref()
+                                                    == Some(&oomir::Type::Str) =>
+                                        {
+                                            Some((
+                                                oomir::UTF8_VIEW_CLASS.to_string(),
+                                                "equals".to_string(),
+                                            ))
+                                        }
                                         oomir::Type::Str if declared_method_name == "len" => Some(
                                             (oomir::UTF8_VIEW_CLASS.to_string(), "len".to_string()),
                                         ),
@@ -3459,6 +3710,20 @@ pub(super) fn convert_basic_block<'tcx>(
                                             Some((
                                                 oomir::SLICE_VIEW_CLASS.to_string(),
                                                 "startsWithI8".to_string(),
+                                            ))
+                                        }
+                                        oomir::Type::Slice(element)
+                                            if declared_method_name == "starts_with"
+                                                && matches!(
+                                                    element.as_ref(),
+                                                    oomir::Type::I32
+                                                        | oomir::Type::U32
+                                                        | oomir::Type::Char
+                                                ) =>
+                                        {
+                                            Some((
+                                                oomir::SLICE_VIEW_CLASS.to_string(),
+                                                "startsWithI32".to_string(),
                                             ))
                                         }
                                         oomir::Type::Slice(_)
@@ -3512,9 +3777,21 @@ pub(super) fn convert_basic_block<'tcx>(
                                                             | "with_metadata_of"
                                                     )) =>
                                         {
+                                            let source_is_trait_object =
+                                                match resolved_receiver_mir_ty.kind() {
+                                                    TyKind::RawPtr(pointee, _)
+                                                    | TyKind::Ref(_, pointee, _) => matches!(
+                                                        pointee.kind(),
+                                                        TyKind::Dynamic(..)
+                                                    ),
+                                                    _ => false,
+                                                };
                                             Some((
                                                 oomir::POINTER_CLASS.to_string(),
-                                                if is_pointer_cast_method
+                                                if is_pointer_cast_method && source_is_trait_object
+                                                {
+                                                    "traitObjectDataPointer".to_string()
+                                                } else if is_pointer_cast_method
                                                     || declared_method_name == "with_metadata_of"
                                                 {
                                                     "retype".to_string()
@@ -3601,7 +3878,10 @@ pub(super) fn convert_basic_block<'tcx>(
                                                 ),
                                             );
                                         } else if class_name == oomir::POINTER_CLASS
-                                            && static_method_name == "retype"
+                                            && matches!(
+                                                static_method_name.as_str(),
+                                                "retype" | "traitObjectDataPointer"
+                                            )
                                         {
                                             if declared_method_name == "with_metadata_of" {
                                                 static_signature.params.truncate(1);
@@ -3822,12 +4102,26 @@ pub(super) fn convert_basic_block<'tcx>(
                             || has_diagnostic_item("mem_size_of_val");
                         let is_align_of_val =
                             is_compiler_intrinsic && intrinsic_name.as_str() == "align_of_val";
+                        let is_vtable_layout = is_compiler_intrinsic
+                            && matches!(intrinsic_name.as_str(), "vtable_size" | "vtable_align");
                         // The public wrapper has no diagnostic/lang item of its own,
                         // so identify it by its defining module rather than its bare name.
                         let is_ptr_metadata = (is_compiler_intrinsic
                             && intrinsic_name.as_str() == "ptr_metadata")
                             || is_core_ptr_metadata_api(tcx, called_def_id);
-                        if is_compiler_intrinsic
+                        if is_compiler_intrinsic && intrinsic_name == "abort" {
+                            instructions.push(oomir::Instruction::InvokeStatic {
+                                dest: None,
+                                class_name: "org/rustlang/runtime/PanicSupport".to_string(),
+                                method_name: "abortNow".to_string(),
+                                method_ty: oomir::Signature {
+                                    params: Vec::new(),
+                                    ret: Box::new(oomir::Type::Void),
+                                    is_static: true,
+                                },
+                                args: Vec::new(),
+                            });
+                        } else if is_compiler_intrinsic
                             && matches!(
                                 intrinsic_name.as_str(),
                                 "assert_inhabited"
@@ -3860,6 +4154,259 @@ pub(super) fn convert_basic_block<'tcx>(
                                 op2: oomir_operands[1].clone(),
                             });
                         } else if is_compiler_intrinsic
+                            && matches!(
+                                intrinsic_name.as_str(),
+                                "fadd_algebraic"
+                                    | "fsub_algebraic"
+                                    | "fmul_algebraic"
+                                    | "fdiv_algebraic"
+                                    | "frem_algebraic"
+                                    | "fadd_fast"
+                                    | "fsub_fast"
+                                    | "fmul_fast"
+                                    | "fdiv_fast"
+                                    | "frem_fast"
+                            )
+                            && oomir_operands.len() == 2
+                            && let Some(dest) = effective_dest.clone()
+                        {
+                            let left = oomir_operands[0].clone();
+                            let right = oomir_operands[1].clone();
+                            instructions.push(match intrinsic_name.as_str() {
+                                "fadd_algebraic" | "fadd_fast" => oomir::Instruction::Add {
+                                    dest,
+                                    op1: left,
+                                    op2: right,
+                                },
+                                "fsub_algebraic" | "fsub_fast" => oomir::Instruction::Sub {
+                                    dest,
+                                    op1: left,
+                                    op2: right,
+                                },
+                                "fmul_algebraic" | "fmul_fast" => oomir::Instruction::Mul {
+                                    dest,
+                                    op1: left,
+                                    op2: right,
+                                },
+                                "fdiv_algebraic" | "fdiv_fast" => oomir::Instruction::Div {
+                                    dest,
+                                    op1: left,
+                                    op2: right,
+                                },
+                                "frem_algebraic" | "frem_fast" => oomir::Instruction::Rem {
+                                    dest,
+                                    op1: left,
+                                    op2: right,
+                                },
+                                _ => unreachable!(),
+                            });
+                        } else if is_compiler_intrinsic
+                            && intrinsic_name == "simd_splat"
+                            && oomir_operands.len() == 1
+                            && let Some(dest) = effective_dest.clone()
+                        {
+                            let oomir::Type::Class(result_class) = &oomir_output_type else {
+                                panic!("simd_splat result is not a generated SIMD carrier");
+                            };
+                            let vector_size = super::types::layout_size_bytes(tcx, fn_output)
+                                .expect("SIMD result must have a layout");
+                            let lane_size = super::types::layout_size_bytes(tcx, fn_inputs[0])
+                                .expect("SIMD lane must have a layout");
+                            let lane_count = vector_size
+                                .checked_div(lane_size)
+                                .filter(|count| *count != 0)
+                                .expect("SIMD lane layout must be nonzero");
+                            let object_ty = oomir::Type::Class("java/lang/Object".to_string());
+                            let result_object = format!("{dest}_simd_object");
+                            let lane_ty = oomir_operands[0]
+                                .get_type()
+                                .expect("simd_splat lane is typed");
+                            instructions.push(oomir::Instruction::InvokeStatic {
+                                class_name: "org/rustlang/runtime/Intrinsics".to_string(),
+                                method_name: "simdSplat".to_string(),
+                                method_ty: oomir::Signature {
+                                    params: vec![
+                                        ("value".to_string(), lane_ty),
+                                        ("result_class".to_string(), oomir::Type::java_string()),
+                                        ("lane_count".to_string(), oomir::Type::U32),
+                                    ],
+                                    ret: Box::new(object_ty.clone()),
+                                    is_static: true,
+                                },
+                                args: vec![
+                                    oomir_operands[0].clone(),
+                                    oomir::Operand::Constant(oomir::Constant::String(
+                                        result_class.clone(),
+                                    )),
+                                    oomir::Operand::Constant(oomir::Constant::U32(
+                                        u32::try_from(lane_count)
+                                            .expect("SIMD lane count exceeds u32"),
+                                    )),
+                                ],
+                                dest: Some(result_object.clone()),
+                            });
+                            instructions.push(oomir::Instruction::Cast {
+                                op: oomir::Operand::Variable {
+                                    name: result_object,
+                                    ty: object_ty,
+                                },
+                                ty: oomir_output_type.clone(),
+                                dest,
+                            });
+                        } else if is_compiler_intrinsic
+                            && matches!(
+                                intrinsic_name.as_str(),
+                                "simd_and" | "simd_or" | "simd_xor"
+                            )
+                            && oomir_operands.len() == 2
+                        {
+                            let object_ty = oomir::Type::Class("java/lang/Object".to_string());
+                            let dest = effective_dest
+                                .clone()
+                                .expect("SIMD bitwise operation has a result");
+                            let result_object = format!("{dest}_simd_object");
+                            instructions.push(oomir::Instruction::InvokeStatic {
+                                class_name: "org/rustlang/runtime/Intrinsics".to_string(),
+                                method_name: "simdBitwise".to_string(),
+                                method_ty: oomir::Signature {
+                                    params: vec![
+                                        ("operation".to_string(), oomir::Type::java_string()),
+                                        ("left".to_string(), object_ty.clone()),
+                                        ("right".to_string(), object_ty.clone()),
+                                    ],
+                                    ret: Box::new(object_ty.clone()),
+                                    is_static: true,
+                                },
+                                args: vec![
+                                    oomir::Operand::Constant(oomir::Constant::String(
+                                        intrinsic_name.clone(),
+                                    )),
+                                    oomir_operands[0].clone(),
+                                    oomir_operands[1].clone(),
+                                ],
+                                dest: Some(result_object.clone()),
+                            });
+                            instructions.push(oomir::Instruction::Cast {
+                                op: oomir::Operand::Variable {
+                                    name: result_object,
+                                    ty: object_ty,
+                                },
+                                ty: oomir_output_type.clone(),
+                                dest,
+                            });
+                        } else if is_compiler_intrinsic
+                            && intrinsic_name == "simd_reduce_all"
+                            && oomir_operands.len() == 1
+                        {
+                            instructions.push(oomir::Instruction::InvokeStatic {
+                                class_name: "org/rustlang/runtime/Intrinsics".to_string(),
+                                method_name: "simdReduceAll".to_string(),
+                                method_ty: oomir::Signature {
+                                    params: vec![(
+                                        "vector".to_string(),
+                                        oomir::Type::Class("java/lang/Object".to_string()),
+                                    )],
+                                    ret: Box::new(oomir::Type::Boolean),
+                                    is_static: true,
+                                },
+                                args: oomir_operands.clone(),
+                                dest: effective_dest.clone(),
+                            });
+                        } else if is_compiler_intrinsic
+                            && matches!(intrinsic_name.as_str(), "simd_eq" | "simd_ne")
+                            && oomir_operands.len() == 2
+                            && let Some(dest) = effective_dest.clone()
+                        {
+                            let oomir::Type::Class(result_class) = &oomir_output_type else {
+                                panic!("SIMD comparison result is not a generated SIMD carrier");
+                            };
+                            let object_ty = oomir::Type::Class("java/lang/Object".to_string());
+                            let result_object = format!("{dest}_simd_object");
+                            instructions.push(oomir::Instruction::InvokeStatic {
+                                class_name: "org/rustlang/runtime/Intrinsics".to_string(),
+                                method_name: "simdCompare".to_string(),
+                                method_ty: oomir::Signature {
+                                    params: vec![
+                                        ("operation".to_string(), oomir::Type::java_string()),
+                                        ("left".to_string(), object_ty.clone()),
+                                        ("right".to_string(), object_ty.clone()),
+                                        ("result_class".to_string(), oomir::Type::java_string()),
+                                    ],
+                                    ret: Box::new(object_ty.clone()),
+                                    is_static: true,
+                                },
+                                args: vec![
+                                    oomir::Operand::Constant(oomir::Constant::String(
+                                        intrinsic_name.clone(),
+                                    )),
+                                    oomir_operands[0].clone(),
+                                    oomir_operands[1].clone(),
+                                    oomir::Operand::Constant(oomir::Constant::String(
+                                        result_class.clone(),
+                                    )),
+                                ],
+                                dest: Some(result_object.clone()),
+                            });
+                            instructions.push(oomir::Instruction::Cast {
+                                op: oomir::Operand::Variable {
+                                    name: result_object,
+                                    ty: object_ty,
+                                },
+                                ty: oomir_output_type.clone(),
+                                dest,
+                            });
+                        } else if is_compiler_intrinsic
+                            && matches!(
+                                intrinsic_name.as_str(),
+                                "simd_neg" | "simd_fabs" | "simd_mul"
+                            )
+                            && let Some(dest) = effective_dest.clone()
+                        {
+                            let object_ty = oomir::Type::Class("java/lang/Object".to_string());
+                            let result_object = format!("{dest}_simd_object");
+                            let (method_name, params) = if intrinsic_name == "simd_mul" {
+                                (
+                                    "simdMultiply",
+                                    vec![
+                                        ("left".to_string(), object_ty.clone()),
+                                        ("right".to_string(), object_ty.clone()),
+                                    ],
+                                )
+                            } else {
+                                oomir_operands.insert(
+                                    0,
+                                    oomir::Operand::Constant(oomir::Constant::String(
+                                        intrinsic_name.clone(),
+                                    )),
+                                );
+                                (
+                                    "simdUnary",
+                                    vec![
+                                        ("operation".to_string(), oomir::Type::java_string()),
+                                        ("vector".to_string(), object_ty.clone()),
+                                    ],
+                                )
+                            };
+                            instructions.push(oomir::Instruction::InvokeStatic {
+                                class_name: "org/rustlang/runtime/Intrinsics".to_string(),
+                                method_name: method_name.to_string(),
+                                method_ty: oomir::Signature {
+                                    params,
+                                    ret: Box::new(object_ty.clone()),
+                                    is_static: true,
+                                },
+                                args: oomir_operands.clone(),
+                                dest: Some(result_object.clone()),
+                            });
+                            instructions.push(oomir::Instruction::Cast {
+                                op: oomir::Operand::Variable {
+                                    name: result_object,
+                                    ty: object_ty,
+                                },
+                                ty: oomir_output_type.clone(),
+                                dest,
+                            });
+                        } else if is_compiler_intrinsic
                             && matches!(intrinsic_name.as_str(), "bswap" | "fabs")
                             && oomir_operands.len() == 1
                         {
@@ -3880,6 +4427,157 @@ pub(super) fn convert_basic_block<'tcx>(
                                     ret: Box::new(oomir_output_type.clone()),
                                     is_static: true,
                                 },
+                                args: oomir_operands.clone(),
+                                dest: effective_dest.clone(),
+                            });
+                        } else if is_compiler_intrinsic
+                            && matches!(
+                                intrinsic_name.as_str(),
+                                "rotate_left" | "rotate_right" | "bitreverse"
+                            )
+                        {
+                            let runtime_signature = oomir::Signature {
+                                params: oomir_operands
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(index, operand)| {
+                                        (
+                                            format!("arg{index}"),
+                                            operand
+                                                .get_type()
+                                                .expect("integer intrinsic operand is typed"),
+                                        )
+                                    })
+                                    .collect(),
+                                ret: Box::new(oomir_output_type.clone()),
+                                is_static: true,
+                            };
+                            let method_name = match intrinsic_name.as_str() {
+                                "rotate_left" => "rotateLeft",
+                                "rotate_right" => "rotateRight",
+                                "bitreverse" => "bitReverse",
+                                _ => unreachable!(),
+                            };
+                            instructions.push(oomir::Instruction::InvokeStatic {
+                                class_name: "org/rustlang/runtime/Numbers".to_string(),
+                                method_name: method_name.to_string(),
+                                method_ty: runtime_signature,
+                                args: oomir_operands.clone(),
+                                dest: effective_dest.clone(),
+                            });
+                        } else if is_compiler_intrinsic
+                            && matches!(
+                                intrinsic_name.as_str(),
+                                "copysignf16"
+                                    | "copysignf32"
+                                    | "copysignf64"
+                                    | "copysignf128"
+                                    | "minimumf16"
+                                    | "minimumf32"
+                                    | "minimumf64"
+                                    | "minimumf128"
+                                    | "maximumf16"
+                                    | "maximumf32"
+                                    | "maximumf64"
+                                    | "maximumf128"
+                                    | "minimum_number_nsz_f16"
+                                    | "minimum_number_nsz_f32"
+                                    | "minimum_number_nsz_f64"
+                                    | "minimum_number_nsz_f128"
+                                    | "maximum_number_nsz_f16"
+                                    | "maximum_number_nsz_f32"
+                                    | "maximum_number_nsz_f64"
+                                    | "maximum_number_nsz_f128"
+                                    | "floorf16"
+                                    | "floorf32"
+                                    | "floorf64"
+                                    | "floorf128"
+                                    | "ceilf16"
+                                    | "ceilf32"
+                                    | "ceilf64"
+                                    | "ceilf128"
+                                    | "truncf16"
+                                    | "truncf32"
+                                    | "truncf64"
+                                    | "truncf128"
+                                    | "roundf16"
+                                    | "roundf32"
+                                    | "roundf64"
+                                    | "roundf128"
+                                    | "round_ties_even_f16"
+                                    | "round_ties_even_f32"
+                                    | "round_ties_even_f64"
+                                    | "round_ties_even_f128"
+                                    | "sqrtf16"
+                                    | "sqrtf32"
+                                    | "sqrtf64"
+                                    | "sqrtf128"
+                                    | "expf16"
+                                    | "expf32"
+                                    | "expf64"
+                                    | "expf128"
+                                    | "exp2f16"
+                                    | "exp2f32"
+                                    | "exp2f64"
+                                    | "exp2f128"
+                                    | "logf16"
+                                    | "logf32"
+                                    | "logf64"
+                                    | "logf128"
+                                    | "log2f16"
+                                    | "log2f32"
+                                    | "log2f64"
+                                    | "log2f128"
+                                    | "log10f16"
+                                    | "log10f32"
+                                    | "log10f64"
+                                    | "log10f128"
+                                    | "sinf16"
+                                    | "sinf32"
+                                    | "sinf64"
+                                    | "sinf128"
+                                    | "cosf16"
+                                    | "cosf32"
+                                    | "cosf64"
+                                    | "cosf128"
+                                    | "powf16"
+                                    | "powf32"
+                                    | "powf64"
+                                    | "powf128"
+                                    | "powif16"
+                                    | "powif32"
+                                    | "powif64"
+                                    | "powif128"
+                                    | "fmaf16"
+                                    | "fmaf32"
+                                    | "fmaf64"
+                                    | "fmaf128"
+                                    | "fmuladdf16"
+                                    | "fmuladdf32"
+                                    | "fmuladdf64"
+                                    | "fmuladdf128"
+                            )
+                        {
+                            let runtime_signature = oomir::Signature {
+                                params: oomir_operands
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(index, operand)| {
+                                        (
+                                            format!("arg{index}"),
+                                            operand
+                                                .get_type()
+                                                .expect("float intrinsic operand is typed"),
+                                        )
+                                    })
+                                    .collect(),
+                                ret: Box::new(oomir_output_type.clone()),
+                                is_static: true,
+                            };
+                            instructions.push(oomir::Instruction::InvokeStatic {
+                                class_name: "org/rustlang/runtime/Intrinsics".to_string(),
+                                method_name: intrinsic_name,
+                                method_ty: runtime_signature,
                                 args: oomir_operands.clone(),
                                 dest: effective_dest.clone(),
                             });
@@ -4049,6 +4747,94 @@ pub(super) fn convert_basic_block<'tcx>(
                                     dest: Some(dest),
                                 });
                             }
+                        } else if is_compiler_intrinsic
+                            && intrinsic_name == "carrying_mul_add"
+                            && oomir_operands.len() == 4
+                            && oomir_operands[0].get_type().is_some_and(|ty| {
+                                matches!(
+                                    ty,
+                                    oomir::Type::I8
+                                        | oomir::Type::I16
+                                        | oomir::Type::I32
+                                        | oomir::Type::I64
+                                ) || matches!(
+                                    ty,
+                                    oomir::Type::Class(class_name)
+                                        if class_name == crate::lower2::I128_CLASS
+                                )
+                            })
+                            && let Some(dest) = effective_dest.clone()
+                        {
+                            let input_ty = oomir_operands[0]
+                                .get_type()
+                                .expect("carrying_mul_add operand is typed");
+                            let (suffix, low_ty) = match &input_ty {
+                                oomir::Type::I8 => ("I8", oomir::Type::U8),
+                                oomir::Type::I16 => ("I16", oomir::Type::U16),
+                                oomir::Type::I32 => ("I32", oomir::Type::U32),
+                                oomir::Type::I64 => ("I64", oomir::Type::U64),
+                                oomir::Type::Class(class_name)
+                                    if class_name == crate::lower2::I128_CLASS =>
+                                {
+                                    (
+                                        "I128",
+                                        oomir::Type::Class(crate::lower2::U128_CLASS.to_string()),
+                                    )
+                                }
+                                _ => unreachable!("signed carrying_mul_add type was checked"),
+                            };
+                            let params = (0..4)
+                                .map(|index| (format!("arg{index}"), input_ty.clone()))
+                                .collect::<Vec<_>>();
+                            let low_dest = format!("{label}_carrying_low");
+                            let high_dest = format!("{label}_carrying_high");
+                            for (method_name, result_ty, result_dest) in [
+                                (
+                                    format!("carryingLow{suffix}"),
+                                    low_ty.clone(),
+                                    low_dest.clone(),
+                                ),
+                                (
+                                    format!("carryingHigh{suffix}"),
+                                    input_ty.clone(),
+                                    high_dest.clone(),
+                                ),
+                            ] {
+                                instructions.push(oomir::Instruction::InvokeStatic {
+                                    class_name: "org/rustlang/runtime/Numbers".to_string(),
+                                    method_name,
+                                    method_ty: oomir::Signature {
+                                        params: params.clone(),
+                                        ret: Box::new(result_ty),
+                                        is_static: true,
+                                    },
+                                    args: oomir_operands.clone(),
+                                    dest: Some(result_dest),
+                                });
+                            }
+                            instructions.push(oomir::Instruction::ConstructObject {
+                                dest,
+                                class_name: oomir_output_type
+                                    .get_class_name()
+                                    .expect("carrying_mul_add returns a tuple class")
+                                    .to_string(),
+                                args: vec![
+                                    (
+                                        oomir::Operand::Variable {
+                                            name: low_dest,
+                                            ty: low_ty.clone(),
+                                        },
+                                        low_ty,
+                                    ),
+                                    (
+                                        oomir::Operand::Variable {
+                                            name: high_dest,
+                                            ty: input_ty.clone(),
+                                        },
+                                        input_ty,
+                                    ),
+                                ],
+                            });
                         } else if is_compiler_intrinsic
                             && intrinsic_name == "ctpop"
                             && let Some(dest) = effective_dest.clone()
@@ -4465,6 +5251,25 @@ pub(super) fn convert_basic_block<'tcx>(
                                 dest,
                                 src: location,
                             });
+                        } else if is_vtable_layout && let Some(dest) = effective_dest.clone() {
+                            let marker_ty = oomir_operands[0]
+                                .get_type()
+                                .expect("vtable layout pointer is typed");
+                            instructions.push(oomir::Instruction::InvokeStatic {
+                                dest: Some(dest),
+                                class_name: oomir::POINTER_CLASS.to_string(),
+                                method_name: if intrinsic_name == "vtable_size" {
+                                    "vtableSize".to_string()
+                                } else {
+                                    "vtableAlign".to_string()
+                                },
+                                method_ty: oomir::Signature {
+                                    params: vec![("marker".to_string(), marker_ty)],
+                                    ret: Box::new(oomir_output_type.clone()),
+                                    is_static: true,
+                                },
+                                args: vec![oomir_operands[0].clone()],
+                            });
                         } else if (is_size_of || is_align_of)
                             && let Some(dest) = effective_dest.clone()
                         {
@@ -4802,7 +5607,11 @@ pub(super) fn convert_basic_block<'tcx>(
                             } else {
                                 instructions.push(oomir::Instruction::InvokeVirtual {
                                     class_name: oomir::POINTER_CLASS.to_string(),
-                                    method_name: "sameAddress".to_string(),
+                                    method_name: if intrinsic_name.as_str() == "addr_eq" {
+                                        "sameAddress".to_string()
+                                    } else {
+                                        "samePointer".to_string()
+                                    },
                                     method_ty: oomir::Signature {
                                         params: vec![
                                             ("self".to_string(), first_ty),
@@ -4920,7 +5729,14 @@ pub(super) fn convert_basic_block<'tcx>(
                                             oomir::Type::Class("java/lang/Object".to_string()),
                                         ),
                                         (offset, oomir::Type::I32),
-                                        (oomir_operands[1].clone(), oomir::Type::I32),
+                                        (
+                                            oomir_operands[1].clone(),
+                                            if is_str {
+                                                oomir::Type::I32
+                                            } else {
+                                                oomir::Type::U64
+                                            },
+                                        ),
                                     ],
                                 });
                                 instructions.push(oomir::Instruction::Cast {
@@ -4946,28 +5762,13 @@ pub(super) fn convert_basic_block<'tcx>(
                             }))
                         {
                             if let Some(dest) = effective_dest.clone() {
-                                let length_dest = if oomir_output_type == oomir::Type::I32 {
-                                    dest.clone()
-                                } else {
-                                    format!("{dest}_slice_metadata_i32")
-                                };
                                 instructions.push(oomir::Instruction::GetField {
-                                    dest: length_dest.clone(),
+                                    dest,
                                     object: oomir_operands[0].clone(),
-                                    field_name: "length".to_string(),
-                                    field_ty: oomir::Type::I32,
+                                    field_name: "rustLength".to_string(),
+                                    field_ty: oomir::Type::U64,
                                     owner_class: oomir::SLICE_VIEW_CLASS.to_string(),
                                 });
-                                if oomir_output_type != oomir::Type::I32 {
-                                    instructions.push(oomir::Instruction::Cast {
-                                        op: oomir::Operand::Variable {
-                                            name: length_dest,
-                                            ty: oomir::Type::I32,
-                                        },
-                                        ty: oomir_output_type.clone(),
-                                        dest,
-                                    });
-                                }
                             }
                         } else if is_ptr_metadata
                             && is_core_ptr
@@ -4989,6 +5790,13 @@ pub(super) fn convert_basic_block<'tcx>(
                                     );
                                     (tail.is_slice() || tail.is_str()).then_some(pointee)
                                 });
+                                let trait_tailed_pointee = pointee.is_some_and(|pointee| {
+                                    let tail = tcx.struct_tail_for_codegen(
+                                        pointee,
+                                        TypingEnv::fully_monomorphized(),
+                                    );
+                                    matches!(tail.kind(), TyKind::Dynamic(..))
+                                });
                                 if slice_tailed_pointee.is_some() {
                                     let pointer_ty = oomir_operands[0]
                                         .get_type()
@@ -5007,7 +5815,8 @@ pub(super) fn convert_basic_block<'tcx>(
                                     });
                                 } else if pointee.is_some_and(|pointee| {
                                     matches!(pointee.kind(), TyKind::Dynamic(..))
-                                }) {
+                                }) || trait_tailed_pointee
+                                {
                                     emit_trait_object_metadata(
                                         oomir_operands[0].clone(),
                                         &oomir_output_type,
@@ -5044,13 +5853,22 @@ pub(super) fn convert_basic_block<'tcx>(
                                 instructions.push(oomir::Instruction::InvokeStatic {
                                     dest: effective_dest.clone(),
                                     class_name: oomir::POINTER_CLASS.to_string(),
-                                    method_name: "restoreErasedView".to_string(),
+                                    method_name: "fromRawTraitParts".to_string(),
                                     method_ty: oomir::Signature {
-                                        params: vec![("pointer".to_string(), source_ty)],
+                                        params: vec![
+                                            ("pointer".to_string(), source_ty),
+                                            (
+                                                "metadata".to_string(),
+                                                oomir::Type::Class("java/lang/Object".to_string()),
+                                            ),
+                                        ],
                                         ret: method_signature.ret.clone(),
                                         is_static: true,
                                     },
-                                    args: vec![oomir_operands[0].clone()],
+                                    args: vec![
+                                        oomir_operands[0].clone(),
+                                        oomir_operands[1].clone(),
+                                    ],
                                 });
                             } else {
                                 let tail = tcx.struct_tail_for_codegen(
@@ -5321,36 +6139,44 @@ pub(super) fn convert_basic_block<'tcx>(
                                 && intrinsic_name.as_str() == "typed_swap_nonoverlapping"))
                             && is_core_ptr
                         {
-                            if let Some(oomir::Type::Pointer(pointee)) =
-                                oomir_operands[0].get_type()
-                            {
-                                let left_name = format!("{}_swap_left", label);
-                                let right_name = format!("{}_swap_right", label);
-                                let left = super::place::emit_pointer_read(
+                            let element_ty = func_instance
+                                .args
+                                .types()
+                                .next()
+                                .expect("pointer swap has a type argument");
+                            let byte_count = super::types::layout_size_bytes(tcx, element_ty)
+                                .expect("pointer swap requires a sized pointee");
+                            let left_ty = oomir_operands[0]
+                                .get_type()
+                                .expect("swap left pointer is typed");
+                            let right_ty = oomir_operands[1]
+                                .get_type()
+                                .expect("swap right pointer is typed");
+                            instructions.push(oomir::Instruction::InvokeStatic {
+                                class_name: oomir::POINTER_CLASS.to_string(),
+                                method_name: if is_diagnostic_item(sym::ptr_swap) {
+                                    "swap".to_string()
+                                } else {
+                                    "swapNonOverlapping".to_string()
+                                },
+                                method_ty: oomir::Signature {
+                                    params: vec![
+                                        ("left".to_string(), left_ty),
+                                        ("right".to_string(), right_ty),
+                                        ("byte_count".to_string(), oomir::Type::U64),
+                                    ],
+                                    ret: Box::new(oomir::Type::Void),
+                                    is_static: true,
+                                },
+                                args: vec![
                                     oomir_operands[0].clone(),
-                                    pointee.as_ref(),
-                                    &left_name,
-                                    &mut instructions,
-                                );
-                                let right = super::place::emit_pointer_read(
                                     oomir_operands[1].clone(),
-                                    pointee.as_ref(),
-                                    &right_name,
-                                    &mut instructions,
-                                );
-                                super::place::emit_pointer_write(
-                                    oomir_operands[0].clone(),
-                                    pointee.as_ref(),
-                                    right,
-                                    &mut instructions,
-                                );
-                                super::place::emit_pointer_write(
-                                    oomir_operands[1].clone(),
-                                    pointee.as_ref(),
-                                    left,
-                                    &mut instructions,
-                                );
-                            }
+                                    oomir::Operand::Constant(oomir::Constant::U64(
+                                        byte_count as u64,
+                                    )),
+                                ],
+                                dest: None,
+                            });
                         } else if is_diagnostic_item(sym::ptr_swap_nonoverlapping) && is_core_ptr {
                             let element_ty = func_instance
                                 .args
@@ -5879,10 +6705,40 @@ pub(super) fn convert_basic_block<'tcx>(
                     debug_variables,
                     debug_variable_scopes,
                 ));
-                fail_instructions.push(oomir::Instruction::ThrowNewWithMessage {
-                    exception_class: "java/lang/RuntimeException".to_string(), // Or ArithmeticException for overflows?
-                    message: panic_message,
-                });
+                if let rustc_middle::mir::AssertKind::BoundsCheck { len, index } = &**msg {
+                    let index = convert_operand(
+                        index,
+                        tcx,
+                        instance,
+                        mir,
+                        data_types,
+                        &mut fail_instructions,
+                    );
+                    let len = convert_operand(
+                        len,
+                        tcx,
+                        instance,
+                        mir,
+                        data_types,
+                        &mut fail_instructions,
+                    );
+                    emit_panic_lang_item(
+                        LangItem::PanicBoundsCheck,
+                        vec![index, len],
+                        terminator.source_info,
+                        tcx,
+                        instance,
+                        mir,
+                        data_types,
+                        &mut fail_instructions,
+                        &format!("{failure_block}_caller_location"),
+                    );
+                } else {
+                    fail_instructions.push(oomir::Instruction::ThrowNewWithMessage {
+                        exception_class: "java/lang/RuntimeException".to_string(),
+                        message: panic_message,
+                    });
+                }
                 breadcrumbs::log!(
                     breadcrumbs::LogLevel::Info,
                     "mir-lowering",

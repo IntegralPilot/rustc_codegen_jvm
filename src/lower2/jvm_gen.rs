@@ -127,6 +127,7 @@ pub(super) fn create_slice_view_classfile() -> jvm::Result<Vec<u8>> {
     let array_field = cp.add_field_ref(this_class, "array", "Ljava/lang/Object;")?;
     let offset_field = cp.add_field_ref(this_class, "offset", "I")?;
     let length_field = cp.add_field_ref(this_class, "length", "I")?;
+    let rust_length_field = cp.add_field_ref(this_class, "rustLength", "J")?;
     let object_init = cp.add_method_ref(object_class, "<init>", "()V")?;
 
     let constructor_descriptor = "(Ljava/lang/Object;II)V";
@@ -136,7 +137,7 @@ pub(super) fn create_slice_view_classfile() -> jvm::Result<Vec<u8>> {
         descriptor_index: cp.add_utf8(constructor_descriptor)?,
         attributes: vec![code_attribute_for_descriptor(
             &mut cp,
-            2,
+            3,
             4,
             vec![
                 Instruction::Aload_0,
@@ -150,6 +151,10 @@ pub(super) fn create_slice_view_classfile() -> jvm::Result<Vec<u8>> {
                 Instruction::Aload_0,
                 Instruction::Iload_3,
                 Instruction::Putfield(length_field),
+                Instruction::Aload_0,
+                Instruction::Iload_3,
+                Instruction::I2l,
+                Instruction::Putfield(rust_length_field),
                 Instruction::Return,
             ],
             constructor_descriptor,
@@ -209,6 +214,40 @@ pub(super) fn create_slice_view_classfile() -> jvm::Result<Vec<u8>> {
             false,
             Some(oomir::SLICE_VIEW_CLASS),
             "toArray",
+        )?],
+    };
+
+    let long_constructor_descriptor = "(Ljava/lang/Object;IJ)V";
+    let long_constructor = jvm::Method {
+        access_flags: MethodAccessFlags::PUBLIC,
+        name_index: cp.add_utf8("<init>")?,
+        descriptor_index: cp.add_utf8(long_constructor_descriptor)?,
+        attributes: vec![code_attribute_for_descriptor(
+            &mut cp,
+            3,
+            5,
+            vec![
+                Instruction::Aload_0,
+                Instruction::Invokespecial(object_init),
+                Instruction::Aload_0,
+                Instruction::Aload_1,
+                Instruction::Putfield(array_field),
+                Instruction::Aload_0,
+                Instruction::Iload_2,
+                Instruction::Putfield(offset_field),
+                Instruction::Aload_0,
+                Instruction::Lload_3,
+                Instruction::L2i,
+                Instruction::Putfield(length_field),
+                Instruction::Aload_0,
+                Instruction::Lload_3,
+                Instruction::Putfield(rust_length_field),
+                Instruction::Return,
+            ],
+            long_constructor_descriptor,
+            false,
+            Some(oomir::SLICE_VIEW_CLASS),
+            "<init>",
         )?],
     };
 
@@ -344,10 +383,9 @@ pub(super) fn create_slice_view_classfile() -> jvm::Result<Vec<u8>> {
         )?],
     };
 
-    let reflect_array = cp.add_class("java/lang/reflect/Array")?;
-    let reflect_get = cp.add_method_ref(
-        reflect_array,
-        "get",
+    let slice_get_object = cp.add_method_ref(
+        pointer_class,
+        "sliceGetObject",
         "(Ljava/lang/Object;I)Ljava/lang/Object;",
     )?;
     let objects_class = cp.add_class("java/util/Objects")?;
@@ -387,14 +425,14 @@ pub(super) fn create_slice_view_classfile() -> jvm::Result<Vec<u8>> {
                 Instruction::Getfield(offset_field),
                 Instruction::Iload_2,
                 Instruction::Iadd,
-                Instruction::Invokestatic(reflect_get),
+                Instruction::Invokestatic(slice_get_object),
                 Instruction::Aload_1,
                 Instruction::Getfield(array_field),
                 Instruction::Aload_1,
                 Instruction::Getfield(offset_field),
                 Instruction::Iload_2,
                 Instruction::Iadd,
-                Instruction::Invokestatic(reflect_get),
+                Instruction::Invokestatic(slice_get_object),
                 Instruction::Invokestatic(objects_equals),
                 Instruction::Ifeq(31),
                 Instruction::Iinc(2, 1),
@@ -464,6 +502,60 @@ pub(super) fn create_slice_view_classfile() -> jvm::Result<Vec<u8>> {
         )?],
     };
 
+    // Integer slice views can be backed by either a JVM primitive array or
+    // encoded Rust allocation storage. Use the typed accessor so equality is
+    // independent of that physical representation.
+    let slice_get_i32 =
+        cp.add_method_ref(pointer_class, "sliceGetI32", "(Ljava/lang/Object;I)I")?;
+    let starts_with_i32 = jvm::Method {
+        access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
+        name_index: cp.add_utf8("startsWithI32")?,
+        descriptor_index: cp.add_utf8(&starts_with_descriptor)?,
+        attributes: vec![code_attribute_for_descriptor(
+            &mut cp,
+            4,
+            3,
+            vec![
+                Instruction::Aload_1,
+                Instruction::Getfield(length_field),
+                Instruction::Aload_0,
+                Instruction::Getfield(length_field),
+                Instruction::If_icmpgt(30),
+                Instruction::Iconst_0,
+                Instruction::Istore_2,
+                Instruction::Iload_2,
+                Instruction::Aload_1,
+                Instruction::Getfield(length_field),
+                Instruction::If_icmpge(28),
+                Instruction::Aload_0,
+                Instruction::Getfield(array_field),
+                Instruction::Aload_0,
+                Instruction::Getfield(offset_field),
+                Instruction::Iload_2,
+                Instruction::Iadd,
+                Instruction::Invokestatic(slice_get_i32),
+                Instruction::Aload_1,
+                Instruction::Getfield(array_field),
+                Instruction::Aload_1,
+                Instruction::Getfield(offset_field),
+                Instruction::Iload_2,
+                Instruction::Iadd,
+                Instruction::Invokestatic(slice_get_i32),
+                Instruction::If_icmpne(30),
+                Instruction::Iinc(2, 1),
+                Instruction::Goto(7),
+                Instruction::Iconst_1,
+                Instruction::Ireturn,
+                Instruction::Iconst_0,
+                Instruction::Ireturn,
+            ],
+            &starts_with_descriptor,
+            true,
+            Some(oomir::SLICE_VIEW_CLASS),
+            "startsWithI32",
+        )?],
+    };
+
     let fields = vec![
         jvm::Field {
             access_flags: FieldAccessFlags::PUBLIC | FieldAccessFlags::FINAL,
@@ -477,6 +569,13 @@ pub(super) fn create_slice_view_classfile() -> jvm::Result<Vec<u8>> {
             name_index: cp.add_utf8("offset")?,
             descriptor_index: cp.add_utf8("I")?,
             field_type: jvm::FieldType::Base(BaseType::Int),
+            attributes: Vec::new(),
+        },
+        jvm::Field {
+            access_flags: FieldAccessFlags::PUBLIC | FieldAccessFlags::FINAL,
+            name_index: cp.add_utf8("rustLength")?,
+            descriptor_index: cp.add_utf8("J")?,
+            field_type: jvm::FieldType::Base(BaseType::Long),
             attributes: Vec::new(),
         },
         jvm::Field {
@@ -499,12 +598,14 @@ pub(super) fn create_slice_view_classfile() -> jvm::Result<Vec<u8>> {
         fields,
         methods: vec![
             constructor,
+            long_constructor,
             to_array,
             from_string,
             to_utf8_string,
             encode_utf8,
             starts_with,
             starts_with_i8,
+            starts_with_i32,
         ],
         attributes: Vec::new(),
     };
@@ -522,6 +623,9 @@ pub(super) fn create_utf8_view_classfile() -> jvm::Result<Vec<u8>> {
     let slice_class = cp.add_class(oomir::SLICE_VIEW_CLASS)?;
     let constructor_descriptor = "(Ljava/lang/Object;II)V";
     let slice_constructor = cp.add_method_ref(slice_class, "<init>", constructor_descriptor)?;
+    let long_constructor_descriptor = "(Ljava/lang/Object;IJ)V";
+    let long_slice_constructor =
+        cp.add_method_ref(slice_class, "<init>", long_constructor_descriptor)?;
     let array_field = cp.add_field_ref(slice_class, "array", "Ljava/lang/Object;")?;
     let offset_field = cp.add_field_ref(slice_class, "offset", "I")?;
     let length_field = cp.add_field_ref(slice_class, "length", "I")?;
@@ -544,6 +648,29 @@ pub(super) fn create_utf8_view_classfile() -> jvm::Result<Vec<u8>> {
                 Instruction::Return,
             ],
             constructor_descriptor,
+            false,
+            Some(oomir::UTF8_VIEW_CLASS),
+            "<init>",
+        )?],
+    };
+
+    let long_constructor = jvm::Method {
+        access_flags: MethodAccessFlags::PUBLIC,
+        name_index: cp.add_utf8("<init>")?,
+        descriptor_index: cp.add_utf8(long_constructor_descriptor)?,
+        attributes: vec![code_attribute_for_descriptor(
+            &mut cp,
+            5,
+            5,
+            vec![
+                Instruction::Aload_0,
+                Instruction::Aload_1,
+                Instruction::Iload_2,
+                Instruction::Lload_3,
+                Instruction::Invokespecial(long_slice_constructor),
+                Instruction::Return,
+            ],
+            long_constructor_descriptor,
             false,
             Some(oomir::UTF8_VIEW_CLASS),
             "<init>",
@@ -812,6 +939,7 @@ pub(super) fn create_utf8_view_classfile() -> jvm::Result<Vec<u8>> {
         fields: Vec::new(),
         methods: vec![
             constructor,
+            long_constructor,
             from_java,
             to_java,
             as_slice,

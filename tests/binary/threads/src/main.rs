@@ -1,3 +1,6 @@
+#![feature(thread_spawn_hook)]
+#![feature(internal_output_capture)]
+
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, DefaultHasher};
@@ -30,8 +33,10 @@ fn main() {
     rwlock_and_once();
     condvar_and_barrier();
     park_and_unpark();
+    channel_block_rollover();
     thread_local_storage();
     hash_maps_across_threads();
+    concurrent_spawn_hook_lifetimes();
 }
 
 fn spawn_join_and_names() {
@@ -187,6 +192,19 @@ fn park_and_unpark() {
     thread::park_timeout(Duration::from_millis(1));
 }
 
+fn channel_block_rollover() {
+    let (sender, receiver) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        for value in 0..32 {
+            sender.send(value).unwrap();
+        }
+    });
+
+    let values = receiver.into_iter().collect::<Vec<_>>();
+    assert!(values == (0..32).collect::<Vec<_>>());
+    worker.join().unwrap();
+}
+
 fn thread_local_storage() {
     TLS_VALUE.with(|value| assert!(value.0.get() == 7));
     let worker = thread::spawn(|| {
@@ -221,4 +239,50 @@ fn hash_maps_across_threads() {
         .map(|worker| worker.join().unwrap())
         .sum::<usize>();
     assert!(total == (0..64).map(|value| value * value).sum::<usize>());
+}
+
+fn concurrent_spawn_hook_lifetimes() {
+    let output = Arc::new(Mutex::new(Vec::new()));
+    std::io::set_output_capture(Some(Arc::clone(&output)));
+    thread::add_spawn_hook(|_| {
+        let output_capture = std::io::set_output_capture(None);
+        std::io::set_output_capture(output_capture.clone());
+        || {
+            std::io::set_output_capture(output_capture);
+        }
+    });
+
+    let prepared = Arc::new(AtomicUsize::new(0));
+    let ran = Arc::new(AtomicUsize::new(0));
+    let hook_prepared = Arc::clone(&prepared);
+    let hook_ran = Arc::clone(&ran);
+    thread::add_spawn_hook(move |_| {
+        hook_prepared.fetch_add(1, Ordering::Relaxed);
+        let child_ran = Arc::clone(&hook_ran);
+        move || {
+            child_ran.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+
+    const WORKERS_PER_WAVE: usize = 32;
+    const WAVES: usize = 16;
+    for _ in 0..WAVES {
+        let barrier = Arc::new(Barrier::new(WORKERS_PER_WAVE + 1));
+        let workers = (0..WORKERS_PER_WAVE)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+    }
+    let expected = WORKERS_PER_WAVE * WAVES;
+    assert_eq!(prepared.load(Ordering::Relaxed), expected);
+    assert_eq!(ran.load(Ordering::Relaxed), expected);
+    std::io::set_output_capture(None);
 }

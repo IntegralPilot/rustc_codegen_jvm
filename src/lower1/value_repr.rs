@@ -445,6 +445,13 @@ fn physical_scalar_rust_ty<'tcx>(
         (oomir::Type::Class(name), 16) if name == crate::lower2::I128_CLASS => Some(tcx.types.i128),
         (oomir::Type::Class(name), 16) if name == crate::lower2::U128_CLASS => Some(tcx.types.u128),
         (oomir::Type::Class(name), 16) if name == crate::lower2::F128_CLASS => Some(tcx.types.f128),
+        (oomir::Type::Pointer(_), size) if size == tcx.data_layout.pointer_size().bytes_usize() => {
+            Some(Ty::new_ptr(
+                tcx,
+                tcx.types.unit,
+                rustc_middle::ty::Mutability::Not,
+            ))
+        }
         _ => None,
     }
 }
@@ -459,9 +466,6 @@ fn adapt_physical_scalar<'tcx>(
     instructions: &mut Vec<oomir::Instruction>,
 ) -> Option<oomir::Operand> {
     let source_jvm_ty = source.get_type()?;
-    if source_jvm_ty.is_jvm_reference_type() {
-        return None;
-    }
     let target_jvm_ty = ty_to_oomir_type(target_rust_ty, tcx, data_types, instance);
     if !target_jvm_ty.is_jvm_reference_type() {
         return None;
@@ -694,10 +698,8 @@ fn adapt_mutable_reference_carrier<'tcx>(
                     oomir::Type::I32,
                 ),
                 (
-                    oomir::Operand::Constant(oomir::Constant::I32(
-                        i32::try_from(length).expect("Rust array length exceeds JVM slice limits"),
-                    )),
-                    oomir::Type::I32,
+                    oomir::Operand::Constant(oomir::Constant::U64(length)),
+                    oomir::Type::U64,
                 ),
             ],
         });
@@ -881,13 +883,13 @@ fn adapt_mutable_reference_carrier<'tcx>(
         return operand_var(dest, target_jvm_ty.clone());
     }
 
-    let target_is_scalar_struct = matches!(target_rust_ty.kind(), TyKind::Adt(adt_def, _) if adt_def.is_struct())
+    let target_is_scalar_adt = matches!(target_rust_ty.kind(), TyKind::Adt(..))
         && tcx
             .layout_of(TypingEnv::fully_monomorphized().as_query_input(target_rust_ty))
             .is_ok_and(|layout| matches!(layout.backend_repr, BackendRepr::Scalar(_)));
     if let Some(oomir::Type::Pointer(inner)) = source.get_type()
         && !matches!(target_rust_ty.kind(), TyKind::RawPtr(..) | TyKind::Ref(..))
-        && !target_is_scalar_struct
+        && !target_is_scalar_adt
     {
         return super::place::emit_pointer_read(
             source,

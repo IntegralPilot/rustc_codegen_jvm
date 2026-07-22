@@ -32,7 +32,8 @@ fn pointer_getter_for_type(ty: &oomir::Type) -> (&'static str, oomir::Type) {
     match ty {
         oomir::Type::Boolean => ("getBoolean", oomir::Type::Boolean),
         oomir::Type::I8 | oomir::Type::U8 => ("getI8", oomir::Type::I8),
-        oomir::Type::I16 | oomir::Type::U16 | oomir::Type::F16 => ("getI16", oomir::Type::I16),
+        oomir::Type::I16 | oomir::Type::U16 => ("getI16", oomir::Type::I16),
+        oomir::Type::F16 => ("getI16", oomir::Type::F16),
         oomir::Type::I32 | oomir::Type::U32 | oomir::Type::Char => ("getI32", oomir::Type::I32),
         oomir::Type::I64 | oomir::Type::U64 => ("getI64", oomir::Type::I64),
         oomir::Type::F32 => ("getF32", oomir::Type::F32),
@@ -62,6 +63,7 @@ pub(crate) fn emit_pointer_read(
     let (mut method_name, runtime_ret_ty) = pointer_getter_for_type(pointee_ty);
     let requested_class = match pointee_ty {
         oomir::Type::Class(class_name) => Some(class_name.clone()),
+        oomir::Type::Slice(_) => Some(oomir::SLICE_VIEW_CLASS.to_string()),
         _ => None,
     };
     if requested_class.is_some() {
@@ -1200,6 +1202,28 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
                 if preserve_slice_tailed_pointer {
                     continue;
                 }
+                if matches!(type_before_proj, oomir::Type::Slice(_))
+                    && pointer_pointee.is_some_and(|pointee| pointee.is_array())
+                {
+                    // Borrowed fixed arrays use SliceView so references can retain an
+                    // offset into shared storage. Dereferencing the reference produces
+                    // an array value again; make that carrier transition explicit so a
+                    // subsequent Copy detaches the array as Rust requires.
+                    let pointee_type =
+                        ty_to_oomir_type(pointer_pointee.unwrap(), tcx, data_types, instance);
+                    let next_var = format!("{}_deref", current_var);
+                    instructions.push(oomir::Instruction::Cast {
+                        dest: next_var.clone(),
+                        op: Operand::Variable {
+                            name: current_var,
+                            ty: type_before_proj,
+                        },
+                        ty: pointee_type.clone(),
+                    });
+                    current_var = next_var;
+                    current_type = pointee_type;
+                    continue;
+                }
                 match type_before_proj {
                     oomir::Type::Pointer(element_type) => {
                         let next_var = format!("{}_deref", current_var);
@@ -1544,8 +1568,40 @@ pub fn emit_instructions_to_set_value<'tcx>(
         //    This base value is the object we'll call SetField on, or the array
         //    we'll call ArrayStore on.
         //    We use `get_on_own` which internally handles recursion if base_place itself is nested.
-        let (base_var_name, get_base_instructions, base_oomir_type) =
-            emit_instructions_to_get_on_own(&base_place, tcx, instance, mir, data_types);
+        // Taking an element through `&[T; N]` or `&mut [T; N]` only needs the
+        // borrowed sequence carrier. Reading `*reference` first would
+        // materialize an array value and detach pointer-backed references such
+        // as `array::from_mut` from their original storage.
+        let direct_slice_base =
+            base_place
+                .projection
+                .split_last()
+                .and_then(|(projection, prefix)| {
+                    if !matches!(projection, ProjectionElem::Deref) {
+                        return None;
+                    }
+                    let reference_place = Place {
+                        local: base_place.local,
+                        projection: tcx.mk_place_elems(prefix),
+                    };
+                    matches!(
+                        get_place_type(&reference_place, mir, tcx, instance, data_types),
+                        oomir::Type::Slice(_)
+                    )
+                    .then(|| {
+                        emit_instructions_to_get_on_own(
+                            &reference_place,
+                            tcx,
+                            instance,
+                            mir,
+                            data_types,
+                        )
+                    })
+                });
+        let (base_var_name, get_base_instructions, base_oomir_type) = direct_slice_base
+            .unwrap_or_else(|| {
+                emit_instructions_to_get_on_own(&base_place, tcx, instance, mir, data_types)
+            });
         let union_writebacks = collect_union_writebacks(
             &base_place,
             &get_base_instructions,

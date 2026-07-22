@@ -1,3 +1,5 @@
+use std::any::Any;
+use std::mem::ManuallyDrop;
 use std::panic::{AssertUnwindSafe, catch_unwind, panic_any, resume_unwind};
 
 #[repr(C)]
@@ -12,7 +14,14 @@ unsafe extern "C" {
     fn java_add_exact(left: i32, right: i32) -> i32;
 }
 
+fn move_plain_panic_payload(payload: Box<dyn Any>) -> Box<dyn Any> {
+    ManuallyDrop::into_inner(ManuallyDrop::new(payload))
+}
+
 fn main() {
+    let plain_payload = move_plain_panic_payload(Box::new(73_u32));
+    assert_eq!(plain_payload.downcast_ref::<u32>(), Some(&73));
+
     let fields = FormattingFields {
         prefix: [0; 11],
         value: 2809,

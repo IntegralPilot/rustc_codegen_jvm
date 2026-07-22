@@ -115,6 +115,7 @@ fn bigint_to_integer_constant_like(value: BigInt, template: &Constant) -> Option
             } else {
                 wrapped.to_string()
             })],
+            param_types: Vec::new(),
         }),
         _ => None,
     }
@@ -401,6 +402,7 @@ fn compare_constants(op1: Constant, op2: Constant) -> Option<std::cmp::Ordering>
         (Constant::Boolean(a), Constant::Boolean(b)) => Some(a.cmp(&b)),
         (Constant::Char(a), Constant::Char(b)) => Some(a.cmp(&b)),
         (Constant::String(a), Constant::String(b)) => Some(a.cmp(&b)),
+        (Constant::Unit, Constant::Unit) => Some(std::cmp::Ordering::Equal),
 
         // Complex types (basic equality was needed for recursion, maybe add cmp?)
         (Constant::Array(ty1, elems1), Constant::Array(ty2, elems2)) => {
@@ -423,11 +425,13 @@ fn compare_constants(op1: Constant, op2: Constant) -> Option<std::cmp::Ordering>
                 class_name: cn1,
                 fields: f1,
                 params: p1,
+                ..
             },
             Constant::Instance {
                 class_name: cn2,
                 fields: f2,
                 params: p2,
+                ..
             },
         ) => {
             // Must be same class, field count, param count to be potentially equal or comparable

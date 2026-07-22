@@ -4,6 +4,7 @@
 #![feature(core_intrinsics)]
 #![feature(disjoint_bitor)]
 #![feature(funnel_shifts)]
+#![feature(signed_bigint_helpers)]
 #![feature(uint_carryless_mul)]
 
 macro_rules! test_comparisons {
@@ -470,6 +471,8 @@ fn runtime_float_ops() {
     assert!(h1 * h2 == 30.0f16, "f16 mul");
     assert!(h1 / h2 == 10.0f16 / 3.0f16, "f16 div rounding");
     assert!(h1 % h2 == 1.0f16, "f16 remainder");
+    assert!(h1.algebraic_add(h2) == h1 + h2, "f16 algebraic add");
+    assert!(h1.algebraic_rem(h2) == h1 % h2, "f16 algebraic remainder");
     assert!(
         (-opaque_f16(2.0f16)).to_bits() == (-2.0f16).to_bits(),
         "f16 negation bits"
@@ -483,6 +486,10 @@ fn runtime_float_ops() {
     let f64_nan = opaque_f64(f64::NAN);
     assert!(f32_nan != f32_nan, "runtime f32 NaN");
     assert!(f64_nan != f64_nan, "runtime f64 NaN");
+    assert!(!(f32_nan < 0.0) && !(f32_nan <= 0.0), "f32 NaN ordered low");
+    assert!(!(f32_nan > 0.0) && !(f32_nan >= 0.0), "f32 NaN ordered high");
+    assert!(!(f64_nan < 0.0) && !(f64_nan <= 0.0), "f64 NaN ordered low");
+    assert!(!(f64_nan > 0.0) && !(f64_nan >= 0.0), "f64 NaN ordered high");
     assert!(
         opaque_f32(f32::INFINITY) + opaque_f32(f32::NEG_INFINITY) != 0.0,
         "runtime f32 infinity"
@@ -492,6 +499,14 @@ fn runtime_float_ops() {
     assert!(opaque_f32(-3.5).abs() == 3.5, "f32 abs");
     assert!(opaque_f64(-3.5).abs() == 3.5, "f64 abs");
     assert!(opaque_f128(-3.5f128).abs() == 3.5f128, "f128 abs");
+
+    let algebraic_left = opaque_f64(123.0);
+    let algebraic_right = opaque_f64(456.0);
+    assert!(algebraic_left.algebraic_add(algebraic_right) == 579.0);
+    assert!(algebraic_left.algebraic_sub(algebraic_right) == -333.0);
+    assert!(algebraic_left.algebraic_mul(algebraic_right) == 56_088.0);
+    assert!(algebraic_left.algebraic_div(algebraic_right) == 123.0 / 456.0);
+    assert!(algebraic_left.algebraic_rem(algebraic_right) == 123.0 % 456.0);
 }
 
 fn runtime_new_integer_intrinsics() {
@@ -506,6 +521,60 @@ fn runtime_new_integer_intrinsics() {
         opaque_u128(0x0011_2233_4455_6677_8899_aabb_ccdd_eeff).swap_bytes()
             == 0xffee_ddcc_bbaa_9988_7766_5544_3322_1100,
         "u128 byte swap"
+    );
+    assert!(opaque_u8(0x81).rotate_left(1) == 0x03, "u8 rotate left");
+    assert!(opaque_i16(-32_767).rotate_right(4) == 0x1800, "i16 rotate right");
+    assert!(
+        opaque_u32(0x0123_4567).reverse_bits() == 0xe6a2_c480,
+        "u32 reverse bits"
+    );
+    let wide = 0x0123_4567_89ab_cdef_fedc_ba98_7654_3210_u128;
+    assert!(
+        opaque_u128(wide).rotate_left(68) == wide.rotate_left(68),
+        "u128 rotate left"
+    );
+    let signed_wide = -0x0123_4567_89ab_cdef_i128;
+    assert!(
+        opaque_i128(signed_wide).reverse_bits() == signed_wide.reverse_bits(),
+        "i128 reverse bits"
+    );
+    let one_at_100 = opaque_u128(1_u128 << 100);
+    assert!(one_at_100.highest_one() == Some(100), "u128 highest one");
+    assert!(one_at_100.lowest_one() == Some(100), "u128 lowest one");
+    assert!(
+        core::num::NonZeroU128::new(one_at_100)
+            .is_some_and(|value| value.highest_one() == 100 && value.lowest_one() == 100),
+        "u128 nonzero niche materialization"
+    );
+    assert!(
+        format!("{} {:x}", opaque_i128(-123_456_789), opaque_u128(0xfeed_beef))
+            == "-123456789 feedbeef",
+        "128-bit formatting function pointers"
+    );
+
+    let signed_i8 = (-100_i8).carrying_mul_add(-2, 100, 100);
+    assert!(
+        opaque_i8(-100).carrying_mul_add(opaque_i8(-2), opaque_i8(100), opaque_i8(100))
+            == signed_i8,
+        "i8 signed carrying multiply-add"
+    );
+    let signed_i32 = 1_000_000_000_i32.carrying_mul_add(-10, 10, 10);
+    assert!(
+        opaque_i32(1_000_000_000).carrying_mul_add(
+            opaque_i32(-10),
+            opaque_i32(10),
+            opaque_i32(10),
+        ) == signed_i32,
+        "i32 signed carrying multiply-add"
+    );
+    let signed_i128 = i128::MIN.carrying_mul_add(-3, i128::MAX, 7);
+    assert!(
+        opaque_i128(i128::MIN).carrying_mul_add(
+            opaque_i128(-3),
+            opaque_i128(i128::MAX),
+            opaque_i128(7),
+        ) == signed_i128,
+        "i128 signed carrying multiply-add"
     );
 
     assert!(unsafe { opaque_u32(1).unchecked_disjoint_bitor(4) } == 5);
@@ -528,6 +597,10 @@ fn runtime_new_integer_intrinsics() {
 fn runtime_casts() {
     assert!(opaque_i8(-1) as u8 == u8::MAX, "i8 to u8");
     assert!(opaque_u8(u8::MAX) as i8 == -1, "u8 to i8");
+    assert!(opaque_u8(u8::MAX) as u16 == 255, "u8 to u16 zero extension");
+    assert!(opaque_u8(u8::MAX) as i16 == 255, "u8 to i16 zero extension");
+    assert!(opaque_u8(u8::MAX) as u32 == 255, "u8 to u32 zero extension");
+    assert!(opaque_u8(u8::MAX) as i32 == 255, "u8 to i32 zero extension");
     assert!(
         opaque_i16(-1) as u64 == u64::MAX,
         "i16 to u64 sign extension"
@@ -563,6 +636,9 @@ fn runtime_casts() {
         opaque_u128((1u128 << 100) + 7) as u64 == 7,
         "u128 to u64 truncation"
     );
+
+    assert!(opaque_u16(255).isqrt() == 15, "u16 isqrt below u8 boundary");
+    assert!(opaque_u16(256).isqrt() == 16, "u16 isqrt above u8 boundary");
 
     assert!(opaque_u32(u32::MAX) as f64 == 4_294_967_295.0, "u32 to f64");
     assert!(opaque_u64(u64::MAX) as f64 == u64::MAX as f64, "u64 to f64");
@@ -607,6 +683,9 @@ fn runtime_casts() {
 
     assert!(opaque_f32(1.5) as f16 == 1.5f16, "f32 to f16");
     assert!(opaque_f64(1.5) as f16 == 1.5f16, "f64 to f16");
+    assert!(opaque_i16(2_046) as f16 == 2_046.0f16, "i16 to f16");
+    assert!(opaque_i16(-2_048) as f16 == -2_048.0f16, "negative i16 to f16");
+    assert!(opaque_f16(2_046.0f16) as i16 == 2_046, "f16 to i16");
     assert!(opaque_f16(1.5f16) as f32 == 1.5, "f16 to f32");
     assert!(opaque_f16(65_504.0f16) as u32 == 65_504, "f16 to u32");
 
@@ -840,6 +919,65 @@ fn read(pointer: *const i32) -> i32 {
     unsafe { *pointer + 1 }
 }
 
+struct ArrayBackedValue {
+    prefix: u32,
+    values: [u32; 40],
+}
+
+impl Clone for ArrayBackedValue {
+    fn clone(&self) -> Self {
+        Self {
+            prefix: self.prefix,
+            values: self.values,
+        }
+    }
+}
+
+fn copied_arrays_are_independent() {
+    let original = ArrayBackedValue {
+        prefix: 7,
+        values: [11; 40],
+    };
+    let mut cloned = original.clone();
+    cloned.values[0] = 99;
+    cloned.values[39] = 101;
+    assert!(original.prefix == 7 && cloned.prefix == 7);
+    assert!(original.values[0] == 11 && original.values[39] == 11);
+    assert!(cloned.values[0] == 99 && cloned.values[39] == 101);
+}
+
+fn dereferenced_array_references_are_values() {
+    let mut bytes = *b"Hello, World!";
+    bytes.copy_within(..3, 10);
+    assert!(&bytes == b"Hello, WorHel");
+
+    let original = [1_u32, 2, 3, 4];
+    let mut copied = *&original;
+    copied[0] = 99;
+    assert!(original == [1, 2, 3, 4]);
+    assert!(copied == [99, 2, 3, 4]);
+}
+
+const fn const_write_bytes_preserves_unwritten_elements() {
+    const ZEROED_PREFIX: [u32; 3] = {
+        let mut values = [1, 2, 3];
+        unsafe { core::intrinsics::write_bytes(values.as_mut_ptr(), 0, 2) };
+        values
+    };
+    const FILLED_PREFIX: [u32; 3] = {
+        let mut values = [1, 2, 3];
+        unsafe { core::intrinsics::write_bytes(values.as_mut_ptr(), 1, 2) };
+        values
+    };
+
+    assert!(ZEROED_PREFIX[0] == 0);
+    assert!(ZEROED_PREFIX[1] == 0);
+    assert!(ZEROED_PREFIX[2] == 3);
+    assert!(FILLED_PREFIX[0] == 0x0101_0101);
+    assert!(FILLED_PREFIX[1] == 0x0101_0101);
+    assert!(FILLED_PREFIX[2] == 3);
+}
+
 fn main() {
     runtime_integer_ops();
     runtime_division_intrinsics();
@@ -849,6 +987,9 @@ fn main() {
     runtime_casts();
     runtime_pointer_width();
     forwarded_reference_ops();
+    copied_arrays_are_independent();
+    dereferenced_array_references_are_values();
+    const_write_bytes_preserves_unwritten_elements();
 
     assert!(sparse_switch(-1000) == 10, "sparse switch negative case");
     assert!(sparse_switch(0) == 20, "sparse switch zero case");

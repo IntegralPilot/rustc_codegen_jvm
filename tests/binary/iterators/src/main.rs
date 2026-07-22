@@ -15,6 +15,28 @@ struct Token(i32);
 #[derive(Clone)]
 struct CloneOnly(i32);
 
+struct Mod3(i32);
+
+impl PartialEq for Mod3 {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 % 3 == other.0 % 3
+    }
+}
+
+impl Eq for Mod3 {}
+
+impl PartialOrd for Mod3 {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Mod3 {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.0 % 3).cmp(&(other.0 % 3))
+    }
+}
+
 static mut DROP_TOTAL: i32 = 0;
 static DROP_THREE: i32 = 3;
 static DROP_FIVE: i32 = 5;
@@ -73,6 +95,26 @@ impl Iterator for Counter {
 }
 
 impl ExactSizeIterator for Counter {}
+
+struct MutableSizeHint((usize, Option<usize>));
+
+impl Iterator for MutableSizeHint {
+    type Item = i32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (ref mut lower, ref mut upper) = self.0;
+        let next = (*upper != Some(0)).then_some(0);
+        *lower = lower.saturating_sub(1);
+        if let Some(upper) = upper {
+            *upper = upper.saturating_sub(1);
+        }
+        next
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.0
+    }
+}
 
 struct Intermittent {
     state: u8,
@@ -203,6 +245,27 @@ fn borrowed_iteration() {
         *value += index as i32;
     }
     assert!(mutable == [1, 3, 5, 7]);
+}
+
+fn fixed_u32_slice_iteration() {
+    let mut words = [0_u32; 40];
+    for (index, word) in words.iter_mut().enumerate() {
+        *word = (index as u32 + 1) * 3;
+    }
+
+    assert!(words.iter().copied().sum::<u32>() == 2_460);
+    assert!(words.iter().rev().copied().take(4).collect::<Vec<_>>() == [120, 117, 114, 111]);
+
+    let mut ends = words.iter();
+    assert!(ends.next() == Some(&3));
+    assert!(ends.next_back() == Some(&120));
+    assert!(ends.len() == 38);
+
+    let mut greater = [0_u32; 40];
+    greater.copy_from_slice(&words);
+    greater[39] += 1;
+    assert!(words.iter().cmp(greater.iter()).is_lt());
+    assert!(words.iter().rev().cmp(greater.iter().rev()).is_lt());
 }
 
 fn loop_control() {
@@ -733,11 +796,103 @@ fn test_partial_array_into_iter_drop() {
     assert!(unsafe { DROP_TOTAL } == 60);
 }
 
+fn test_slice_iteration_over_nominal_zsts() {
+    let empty = [0_u32; 0];
+    let slice: &[[u32; 0]] = &[empty, empty, empty];
+    let expected = [&slice[0] as *const _, &slice[1] as *const _, &slice[2] as *const _];
+
+    assert!(slice.len() == 3);
+    for (index, value) in slice.iter().enumerate() {
+        assert!(value.len() == 0);
+        assert!(value as *const _ == expected[index]);
+    }
+    assert!(slice.iter().nth(2).unwrap() as *const _ == expected[2]);
+    assert!(slice.iter().next_back().unwrap() as *const _ == expected[2]);
+}
+
+fn test_scan_with_function_item() {
+    fn add(state: &mut isize, value: &usize) -> Option<f64> {
+        *state += *value as isize;
+        Some(*state as f64)
+    }
+
+    let source = [0_usize, 1, 2, 3, 4];
+    let expected = [0.0, 1.0, 3.0, 6.0, 10.0];
+    for (actual, expected) in source.iter().scan(0, add).zip(expected) {
+        assert!(actual == expected);
+    }
+}
+
+fn test_core_iterator_regressions() {
+    // These cases mirror iterator compositions used by upstream coretests closely.
+    assert!((0_usize..).take(10).collect::<Vec<_>>() == [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    assert!(
+        (0_usize..).step_by(1).take(10).collect::<Vec<_>>()
+            == [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    );
+    assert!(
+        (0_usize..10)
+            .filter_map(|value| (value % 2 == 0).then_some(value * value))
+            .collect::<Vec<_>>()
+            == [0, 4, 16, 36, 64]
+    );
+    assert!(
+        (0_usize..)
+            .step_by(1)
+            .filter_map(|value| (value % 2 == 0).then_some(value * value))
+            .take(5)
+            .collect::<Vec<_>>()
+            == [0, 4, 16, 36, 64]
+    );
+    let filtered = (0_usize..)
+        .step_by(1)
+        .take(10)
+        .filter_map(|value| (value % 2 == 0).then_some(value * value))
+        .collect::<Vec<_>>();
+    assert!(filtered == [0, 4, 16, 36, 64]);
+
+    let values = [0, 1, 2, 3, 4, 5];
+    let mut peekable = values.iter().peekable();
+    assert!(peekable.peek() == Some(&&0));
+    assert!(peekable.count() == 6);
+
+    let windows = "abcd"
+        .chars()
+        .map_windows(|window: &[_; 2]| *window)
+        .collect::<Vec<_>>();
+    assert!(windows == [['a', 'b'], ['b', 'c'], ['c', 'd']]);
+
+    assert!([1, 2, 2, 9].iter().is_sorted());
+    assert!(![1, 3, 2].iter().is_sorted());
+    assert!([1, 2, 2, 9].is_sorted());
+    assert!(![1, 3, 2].is_sorted());
+
+    let mut advance = [0, 1, 2, 3].iter();
+    assert!(advance.advance_by(2) == Ok(()));
+    assert!(advance.as_slice() == &[2, 3]);
+    let mut advance_back = [0, 1, 2, 3].iter();
+    assert!(advance_back.advance_back_by(2) == Ok(()));
+    assert!(advance_back.as_slice() == &[0, 1]);
+    assert!([0, 1, 2, 3].iter().copied().max() == Some(3));
+    assert!([0, 1, 2, 3].iter().copied().min() == Some(0));
+    assert!((0..11).map(Mod3).max().map(|value| value.0) == Some(8));
+    assert!((0..11).map(Mod3).min().map(|value| value.0) == Some(0));
+
+    let mut size_hint = MutableSizeHint((5, Some(5)));
+    assert!(size_hint.next() == Some(0));
+    assert!(size_hint.size_hint() == (4, Some(4)));
+
+    let empty_repeat = std::iter::repeat_n(String::from("unused"), 0);
+    assert!(std::format!("{empty_repeat:?}") == "RepeatN { count: 0, element: None }");
+}
+
 fn main() {
+    test_core_iterator_regressions();
     array_iteration();
     ascii_escape_iterator();
     ascii_char_formatting();
     borrowed_iteration();
+    fixed_u32_slice_iteration();
     loop_control();
     iterator_state();
     adapter_chains();
@@ -762,4 +917,6 @@ fn main() {
     test_flatten_double_ended();
     test_nested_size_hint_propagation();
     test_partial_array_into_iter_drop();
+    test_slice_iteration_over_nominal_zsts();
+    test_scan_with_function_item();
 }

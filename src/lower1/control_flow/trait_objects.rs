@@ -11,23 +11,23 @@ use crate::oomir;
 
 const RUNTIME_TRAIT_OBJECT_CARRIER: &str = "org/rustlang/runtime/TraitObjectCarrier";
 const RUNTIME_TRAIT_OBJECT_PAYLOAD_METHOD: &str = "rustTraitObjectPayload";
+const RUNTIME_TRAIT_OBJECT_SIZE_METHOD: &str = "rustTraitObjectSize";
+const RUNTIME_TRAIT_OBJECT_ALIGNMENT_METHOD: &str = "rustTraitObjectAlignment";
 
 pub(super) fn carrier_needs_trait_object_adapter(
     carrier_ty: &oomir::Type,
+    interface_name: &str,
     data_types: &HashMap<String, oomir::DataType>,
 ) -> bool {
     match carrier_ty {
         oomir::Type::Class(class_name) => !matches!(
             data_types.get(class_name),
-            Some(oomir::DataType::Class { .. })
+            Some(oomir::DataType::Class { interfaces, .. })
+                if interfaces.iter().any(|interface| interface == interface_name)
         ),
-        oomir::Type::Pointer(inner) => match inner.as_ref() {
-            oomir::Type::Class(class_name) => !matches!(
-                data_types.get(class_name),
-                Some(oomir::DataType::Class { .. })
-            ),
-            _ => true,
-        },
+        // A Rust pointer is never itself an implementation of the JVM trait
+        // interface, even when its pointee class implements that interface.
+        oomir::Type::Pointer(_) => true,
         _ => true,
     }
 }
@@ -62,13 +62,18 @@ pub(super) fn ensure_trait_object_adapter_class<'tcx>(
             "trait-object target is not dynamic: {dynamic_ty:?}"
         ));
     };
-    let principal = predicates
-        .principal()
-        .ok_or_else(|| format!("trait object has no principal trait: {dynamic_ty:?}"))?;
-    let trait_ref =
-        tcx.instantiate_bound_regions_with_erased(principal.with_self_ty(tcx, concrete_ty));
+    let concrete_size = super::super::types::layout_size_bytes(tcx, concrete_ty)
+        .map_err(|error| format!("trait-object pointee size is unavailable: {error}"))?;
+    let concrete_alignment = super::super::types::layout_align_bytes(tcx, concrete_ty)
+        .map_err(|error| format!("trait-object pointee alignment is unavailable: {error}"))?;
+    let trait_ref = predicates.principal().map(|principal| {
+        tcx.instantiate_bound_regions_with_erased(principal.with_self_ty(tcx, concrete_ty))
+    });
 
-    let identity = format!("{trait_ref:?}:{}", carrier_ty.to_jvm_descriptor());
+    let identity = format!(
+        "{dynamic_ty:?}:{trait_ref:?}:{}",
+        carrier_ty.to_jvm_descriptor()
+    );
     let concrete_token = sanitize_name_token(&readable_rust_type_name(
         concrete_ty,
         tcx,
@@ -89,7 +94,10 @@ pub(super) fn ensure_trait_object_adapter_class<'tcx>(
 
     let mut adapter_methods = HashMap::new();
     let mut interface_methods = HashMap::new();
-    for entry in tcx.vtable_entries(trait_ref) {
+    for entry in trait_ref
+        .into_iter()
+        .flat_map(|trait_ref| tcx.vtable_entries(trait_ref).iter())
+    {
         let VtblEntry::Method(target_instance) = entry else {
             continue;
         };
@@ -155,9 +163,20 @@ pub(super) fn ensure_trait_object_adapter_class<'tcx>(
             field_ty: carrier_ty.clone(),
             owner_class: class_name.clone(),
         };
+        let receiver_has_interface = match target_receiver_ty {
+            oomir::Type::Pointer(inner) | oomir::Type::Reference(inner) => match inner.as_ref() {
+                oomir::Type::Class(receiver_class) => matches!(
+                    data_types.get(receiver_class),
+                    Some(oomir::DataType::Class { interfaces, .. })
+                        if interfaces.iter().any(|interface| interface == interface_name)
+                ),
+                _ => false,
+            },
+            _ => false,
+        };
         let call = match target_receiver_ty {
             oomir::Type::Pointer(inner) | oomir::Type::Reference(inner)
-                if matches!(inner.as_ref(), oomir::Type::Class(_)) =>
+                if matches!(inner.as_ref(), oomir::Type::Class(_)) && receiver_has_interface =>
             {
                 let oomir::Type::Class(receiver_class) = inner.as_ref() else {
                     unreachable!()
@@ -310,6 +329,41 @@ pub(super) fn ensure_trait_object_adapter_class<'tcx>(
             },
         }),
     );
+    for (method_name, value) in [
+        (RUNTIME_TRAIT_OBJECT_SIZE_METHOD, concrete_size as u64),
+        (
+            RUNTIME_TRAIT_OBJECT_ALIGNMENT_METHOD,
+            concrete_alignment as u64,
+        ),
+    ] {
+        adapter_methods.insert(
+            method_name.to_string(),
+            oomir::DataTypeMethod::Function(oomir::Function {
+                name: method_name.to_string(),
+                owner_class: None,
+                debug_variables: Vec::new(),
+                signature: oomir::Signature {
+                    params: vec![("self".to_string(), oomir::Type::Class(class_name.clone()))],
+                    ret: Box::new(oomir::Type::U64),
+                    is_static: false,
+                },
+                body: oomir::CodeBlock {
+                    entry: "bb0".to_string(),
+                    basic_blocks: HashMap::from([(
+                        "bb0".to_string(),
+                        oomir::BasicBlock {
+                            label: "bb0".to_string(),
+                            instructions: vec![oomir::Instruction::Return {
+                                operand: Some(oomir::Operand::Constant(oomir::Constant::U64(
+                                    value,
+                                ))),
+                            }],
+                        },
+                    )]),
+                },
+            }),
+        );
+    }
 
     match data_types.get_mut(interface_name) {
         Some(oomir::DataType::Interface { methods }) => methods.extend(interface_methods),

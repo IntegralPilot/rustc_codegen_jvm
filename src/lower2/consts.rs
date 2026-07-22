@@ -59,7 +59,7 @@ pub fn get_long_const_instr(cp: &mut InternedConstantPool, val: i64) -> Instruct
 
 // Helper to get the appropriate float constant loading instruction
 pub fn get_float_const_instr(cp: &mut InternedConstantPool, val: f32) -> Instruction {
-    if val == 0.0 {
+    if val.to_bits() == 0.0f32.to_bits() {
         Instruction::Fconst_0
     } else if val == 1.0 {
         Instruction::Fconst_1
@@ -136,6 +136,7 @@ pub fn load_constant(
             owner_class,
             method_name,
             args,
+            param_types,
             ty,
         } => {
             for arg in args {
@@ -144,7 +145,14 @@ pub fn load_constant(
             let owner = cp.add_class(owner_class)?;
             let params = args
                 .iter()
-                .map(|arg| oomir::Type::from_constant(arg).to_jvm_descriptor())
+                .enumerate()
+                .map(|(index, arg)| {
+                    param_types
+                        .get(index)
+                        .cloned()
+                        .unwrap_or_else(|| oomir::Type::from_constant(arg))
+                        .to_jvm_descriptor()
+                })
                 .collect::<String>();
             let method = cp.add_method_ref(
                 owner,
@@ -208,9 +216,54 @@ pub fn load_constant(
             )?;
             instructions_to_add.push(JI::Invokestatic(factory));
         }
+        OC::ByteArrayPointer {
+            identity,
+            bytes,
+            offset,
+            view_size,
+            alignment,
+            view_codec,
+            ..
+        } => {
+            let identity_index = cp.add_string(identity)?;
+            instructions_to_add.push(if let Ok(index) = u8::try_from(identity_index) {
+                JI::Ldc(index)
+            } else {
+                JI::Ldc_w(identity_index)
+            });
+            let bytes = OC::Array(
+                Box::new(Type::U8),
+                bytes.iter().copied().map(OC::U8).collect(),
+            );
+            load_constant(&mut instructions_to_add, cp, &bytes)?;
+            instructions_to_add.push(get_long_const_instr(cp, *offset as i64));
+            instructions_to_add.push(get_long_const_instr(cp, *view_size as i64));
+            instructions_to_add.push(get_long_const_instr(cp, *alignment as i64));
+            if let Some(codec) = view_codec {
+                let codec_index = cp.add_string(codec)?;
+                instructions_to_add.push(if let Ok(index) = u8::try_from(codec_index) {
+                    JI::Ldc(index)
+                } else {
+                    JI::Ldc_w(codec_index)
+                });
+            } else {
+                instructions_to_add.push(JI::Aconst_null);
+            }
+            let pointer_class = cp.add_class(oomir::POINTER_CLASS)?;
+            let factory = cp.add_method_ref(
+                pointer_class,
+                "constantBytes",
+                &format!(
+                    "(Ljava/lang/String;[BJJJLjava/lang/String;)L{};",
+                    oomir::POINTER_CLASS
+                ),
+            )?;
+            instructions_to_add.push(JI::Invokestatic(factory));
+        }
         OC::InternedPointer {
             identity,
             value,
+            array_backed,
             view_size,
             alignment,
             view_codec,
@@ -240,7 +293,11 @@ pub fn load_constant(
             let pointer_class = cp.add_class(oomir::POINTER_CLASS)?;
             let factory = cp.add_method_ref(
                 pointer_class,
-                "constantCell",
+                if *array_backed {
+                    "constantArray"
+                } else {
+                    "constantCell"
+                },
                 &format!(
                     "(Ljava/lang/String;Ljava/lang/Object;JLjava/lang/String;J)L{};",
                     oomir::POINTER_CLASS
@@ -307,7 +364,7 @@ pub fn load_constant(
         } => {
             let class_index = cp.add_class(oomir::SLICE_VIEW_CLASS)?;
             let constructor =
-                cp.add_method_ref(class_index, "<init>", "(Ljava/lang/Object;II)V")?;
+                cp.add_method_ref(class_index, "<init>", "(Ljava/lang/Object;IJ)V")?;
             instructions_to_add.push(JI::New(class_index));
             instructions_to_add.push(JI::Dup);
             load_constant(&mut instructions_to_add, cp, backing)?;
@@ -318,13 +375,7 @@ pub fn load_constant(
                     message: "Constant slice offset exceeds the JVM address space".to_string(),
                 })?,
             ));
-            instructions_to_add.push(get_int_const_instr(
-                cp,
-                i32::try_from(*length).map_err(|_| jvm::Error::VerificationError {
-                    context: format!("Attempting to load constant {constant:?}"),
-                    message: "Constant slice length exceeds the JVM address space".to_string(),
-                })?,
-            ));
+            instructions_to_add.push(get_long_const_instr(cp, *length as i64));
             instructions_to_add.push(JI::Invokespecial(constructor));
         }
         OC::Array(elem_ty, elements) => {
@@ -422,6 +473,7 @@ pub fn load_constant(
             class_name,
             fields,
             params,
+            param_types,
         } => {
             // 1. Add Class reference to constant pool
             let class_index = cp.add_class(class_name)?;
@@ -502,21 +554,13 @@ pub fn load_constant(
             }
             let constructor_params = params
                 .iter()
-                .filter_map(|param| {
+                .enumerate()
+                .filter_map(|(index, param)| {
                     let ty = Type::from_constant(param);
                     if !ty.has_jvm_value() {
                         return None;
                     }
-                    let declared_ty = match ty {
-                        Type::Class(class_name) if class_name.contains('$') => Type::Class(
-                            class_name
-                                .split_once('$')
-                                .map(|(base, _)| base)
-                                .unwrap_or(&class_name)
-                                .to_string(),
-                        ),
-                        other => other,
-                    };
+                    let declared_ty = param_types.get(index).unwrap_or(&ty).clone();
                     Some((param, declared_ty))
                 })
                 .collect::<Vec<_>>();

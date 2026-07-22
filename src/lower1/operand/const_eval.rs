@@ -58,7 +58,20 @@ pub fn read_slice_constant<'tcx>(
         }
     };
 
-    read_slice_backed_value(
+    if pointee_ty != tcx.struct_tail_for_codegen(pointee_ty, TypingEnv::fully_monomorphized()) {
+        return slice_tailed_pointer_constant(
+            tcx,
+            alloc_id,
+            allocation,
+            Size::ZERO,
+            len,
+            pointee_ty,
+            oomir_data_types,
+            instance,
+        );
+    }
+
+    let value = read_slice_backed_value(
         tcx,
         allocation,
         Size::ZERO,
@@ -66,7 +79,187 @@ pub fn read_slice_constant<'tcx>(
         pointee_ty,
         oomir_data_types,
         instance,
+    )?;
+
+    preserve_slice_allocation(
+        tcx,
+        alloc_id,
+        allocation,
+        Size::ZERO,
+        len,
+        pointee_ty,
+        value,
+        oomir_data_types,
+        instance,
     )
+}
+
+fn slice_tailed_pointer_constant<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    alloc_id: AllocId,
+    allocation: &ConstAllocation,
+    data_offset: Size,
+    len: u64,
+    pointee_ty: Ty<'tcx>,
+    oomir_data_types: &mut HashMap<String, oomir::DataType>,
+    instance: Instance<'tcx>,
+) -> Result<oomir::Constant, String> {
+    let tail_ty = tcx.struct_tail_for_codegen(pointee_ty, TypingEnv::fully_monomorphized());
+    let (element_ty, tail_view_class) = match tail_ty.kind() {
+        TyKind::Str => (tcx.types.u8, oomir::UTF8_VIEW_CLASS),
+        TyKind::Slice(element_ty) => (*element_ty, oomir::SLICE_VIEW_CLASS),
+        _ => {
+            return Err(format!(
+                "{pointee_ty:?} does not have a string or slice tail"
+            ));
+        }
+    };
+    if pointee_ty == tail_ty {
+        return Err(format!(
+            "direct slice tail {pointee_ty:?} does not require a struct-tail pointer"
+        ));
+    }
+
+    let tail_value = read_slice_backed_value(
+        tcx,
+        allocation,
+        data_offset,
+        len,
+        tail_ty,
+        oomir_data_types,
+        instance,
+    )?;
+    let tail_value = preserve_slice_allocation(
+        tcx,
+        alloc_id,
+        allocation,
+        data_offset,
+        len,
+        tail_ty,
+        tail_value,
+        oomir_data_types,
+        instance,
+    )?;
+    let element_layout = tcx
+        .layout_of(TypingEnv::fully_monomorphized().as_query_input(element_ty))
+        .map_err(|error| format!("could not determine slice-tail element layout: {error:?}"))?;
+    let pointee_layout = tcx
+        .layout_of(TypingEnv::fully_monomorphized().as_query_input(pointee_ty))
+        .map_err(|error| format!("could not determine slice-tailed layout: {error:?}"))?;
+    let element_type = ty_to_oomir_type(element_ty, tcx, oomir_data_types, instance);
+    let pointee_type = ty_to_oomir_type(pointee_ty, tcx, oomir_data_types, instance);
+    let oomir::Type::Class(target_class) = &pointee_type else {
+        return Err(format!(
+            "slice-tailed pointee {pointee_ty:?} mapped to non-class type {pointee_type:?}"
+        ));
+    };
+    let element_codec =
+        match pointer_memory_codec_operand(element_ty, tcx, oomir_data_types, instance) {
+            oomir::Operand::Constant(codec) => codec,
+            other => {
+                return Err(format!(
+                    "slice-tail element codec was not constant: {other:?}"
+                ));
+            }
+        };
+    let java_object = oomir::Type::Class("java/lang/Object".to_string());
+    let java_string = oomir::Type::java_string();
+    let data_pointer_type = oomir::Type::Pointer(Box::new(element_type));
+    let data_pointer = oomir::Constant::StaticCall {
+        owner_class: oomir::POINTER_CLASS.to_string(),
+        method_name: "fromSlice".to_string(),
+        args: vec![
+            tail_value,
+            oomir::Constant::U64(element_layout.size.bytes()),
+            element_codec.clone(),
+        ],
+        param_types: vec![java_object, oomir::Type::U64, java_string.clone()],
+        ty: data_pointer_type.clone(),
+    };
+    Ok(oomir::Constant::StaticCall {
+        owner_class: oomir::POINTER_CLASS.to_string(),
+        method_name: "unsizeStructTail".to_string(),
+        args: vec![
+            data_pointer,
+            oomir::Constant::U64(pointee_layout.size.bytes()),
+            oomir::Constant::String(target_class.clone()),
+            oomir::Constant::String(tail_view_class.to_string()),
+            oomir::Constant::U64(element_layout.size.bytes()),
+            element_codec,
+            oomir::Constant::U64(len),
+        ],
+        param_types: vec![
+            data_pointer_type,
+            oomir::Type::U64,
+            java_string.clone(),
+            java_string.clone(),
+            oomir::Type::U64,
+            java_string,
+            oomir::Type::U64,
+        ],
+        ty: oomir::Type::Pointer(Box::new(pointee_type)),
+    })
+}
+
+fn preserve_slice_allocation<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    alloc_id: AllocId,
+    allocation: &ConstAllocation,
+    data_offset: Size,
+    len: u64,
+    slice_ty: Ty<'tcx>,
+    value: oomir::Constant,
+    oomir_data_types: &mut HashMap<String, oomir::DataType>,
+    instance: Instance<'tcx>,
+) -> Result<oomir::Constant, String> {
+    let TyKind::Slice(element_ty) = slice_ty.kind() else {
+        return Ok(value);
+    };
+    let (element_type, elements) = match value {
+        oomir::Constant::Slice(element_type, elements) => (element_type, elements),
+        other => return Ok(other),
+    };
+    let element_layout = tcx
+        .layout_of(TypingEnv::fully_monomorphized().as_query_input(*element_ty))
+        .map_err(|error| format!("could not get constant slice element layout: {error:?}"))?;
+    if data_offset != Size::ZERO
+        || element_layout.size == Size::ZERO
+        || element_layout
+            .size
+            .checked_mul(len, &tcx.data_layout)
+            .is_none_or(|size| size != allocation.size())
+    {
+        return Ok(oomir::Constant::Slice(element_type, elements));
+    }
+
+    // Keep CTFE slice data in the same allocation cache as sized references.
+    // In particular, `const S: &[T] = from_ref(const R: &T)` must give
+    // `R` and `&S[0]` exactly the same runtime address.
+    let allocation_value = oomir::Constant::Array(element_type.clone(), elements);
+    let view_codec =
+        match pointer_memory_codec_operand(*element_ty, tcx, oomir_data_types, instance) {
+            oomir::Operand::Constant(codec) => codec,
+            other => {
+                return Err(format!(
+                    "constant slice element codec was not constant: {other:?}"
+                ));
+            }
+        };
+    let backing = oomir::Constant::InternedPointer {
+        identity: format!("{}::{alloc_id:?}", tcx.crate_name(LOCAL_CRATE)),
+        value: Box::new(allocation_value),
+        array_backed: true,
+        view_size: element_layout.size.bytes(),
+        alignment: allocation.align.bytes(),
+        view_codec: Box::new(view_codec),
+        pointee: element_type.clone(),
+    };
+    Ok(oomir::Constant::SliceRef {
+        backing: Box::new(backing),
+        element_type,
+        offset: 0,
+        length: len,
+    })
 }
 
 fn read_slice_backed_value<'tcx>(
@@ -98,7 +291,15 @@ fn read_slice_backed_value<'tcx>(
                 })?;
             let element_type = ty_to_oomir_type(*element_ty, tcx, oomir_data_types, instance);
             if !element_type.has_jvm_value() {
-                return Ok(oomir::Constant::Slice(Box::new(element_type), Vec::new()));
+                return Ok(oomir::Constant::SliceRef {
+                    backing: Box::new(oomir::Constant::Array(
+                        Box::new(element_type.clone()),
+                        Vec::new(),
+                    )),
+                    element_type: Box::new(element_type),
+                    offset: 0,
+                    length: len,
+                });
             }
             let len = usize::try_from(len)
                 .ok()
@@ -170,6 +371,7 @@ fn read_slice_backed_value<'tcx>(
                 class_name,
                 fields,
                 params: vec![inner],
+                param_types: vec![ty_to_oomir_type(field_ty, tcx, oomir_data_types, instance)],
             })
         }
         _ => Err(format!(
@@ -224,6 +426,7 @@ pub fn read_scalar_int_constant<'tcx>(
         };
         let mut fields = HashMap::new();
         let mut params = Vec::new();
+        let mut param_types = Vec::new();
         let mut non_zst_captures = 0usize;
         for (index, capture_ty) in closure_args.as_closure().upvar_tys().iter().enumerate() {
             let capture_ty = EarlyBinder::bind(tcx, capture_ty)
@@ -248,6 +451,7 @@ pub fn read_scalar_int_constant<'tcx>(
             };
             fields.insert(format!("arg{index}"), capture.clone());
             params.push(capture);
+            param_types.push(capture_jvm_ty);
         }
         if non_zst_captures != 1 {
             return Err(format!(
@@ -258,6 +462,7 @@ pub fn read_scalar_int_constant<'tcx>(
             class_name,
             fields,
             params,
+            param_types,
         });
     }
 
@@ -358,6 +563,34 @@ fn scalar_struct_field_ty<'tcx>(
         })
 }
 
+fn instance_constant_with_declared_fields(
+    class_name: String,
+    named_values: Vec<(String, oomir::Constant)>,
+    oomir_data_types: &HashMap<String, oomir::DataType>,
+) -> oomir::Constant {
+    let declared_fields: &[(String, oomir::Type)] = match oomir_data_types.get(&class_name) {
+        Some(oomir::DataType::Class { fields, .. }) => fields.as_slice(),
+        _ => &[],
+    };
+    let param_types = named_values
+        .iter()
+        .map(|(name, value)| {
+            declared_fields
+                .iter()
+                .find_map(|(field_name, ty)| (field_name == name).then(|| ty.clone()))
+                .unwrap_or_else(|| oomir::Type::from_constant(value))
+        })
+        .collect();
+    let fields = named_values.iter().cloned().collect::<HashMap<_, _>>();
+    let params = named_values.into_iter().map(|(_, value)| value).collect();
+    oomir::Constant::Instance {
+        class_name,
+        fields,
+        params,
+        param_types,
+    }
+}
+
 pub fn read_zero_sized_constant<'tcx>(
     tcx: TyCtxt<'tcx>,
     ty: Ty<'tcx>,
@@ -379,22 +612,16 @@ pub fn read_zero_sized_constant<'tcx>(
         return Ok(oomir::Constant::Unit);
     }
 
-    let make_instance = |class_name: String, named_values: Vec<(String, oomir::Constant)>| {
-        let fields = named_values.iter().cloned().collect::<HashMap<_, _>>();
-        let params = named_values.into_iter().map(|(_, value)| value).collect();
-        oomir::Constant::Instance {
-            class_name,
-            fields,
-            params,
-        }
-    };
-
     match ty.kind() {
         TyKind::FnDef(..) => {
             let oomir::Type::Class(class_name) = oomir_ty else {
                 return Err(format!("ZST function item {ty:?} did not map to a class"));
             };
-            Ok(make_instance(class_name, Vec::new()))
+            Ok(instance_constant_with_declared_fields(
+                class_name,
+                Vec::new(),
+                oomir_data_types,
+            ))
         }
         TyKind::Closure(_, closure_args) => {
             let oomir::Type::Class(class_name) = oomir_ty else {
@@ -413,7 +640,11 @@ pub fn read_zero_sized_constant<'tcx>(
                     ));
                 }
             }
-            Ok(make_instance(class_name, values))
+            Ok(instance_constant_with_declared_fields(
+                class_name,
+                values,
+                oomir_data_types,
+            ))
         }
         TyKind::Adt(adt_def, substs) if adt_def.is_struct() => {
             let oomir::Type::Class(class_name) = oomir_ty else {
@@ -432,7 +663,11 @@ pub fn read_zero_sized_constant<'tcx>(
                     ));
                 }
             }
-            Ok(make_instance(class_name, values))
+            Ok(instance_constant_with_declared_fields(
+                class_name,
+                values,
+                oomir_data_types,
+            ))
         }
         TyKind::Adt(adt_def, substs) if adt_def.is_union() => {
             let class_name =
@@ -451,6 +686,7 @@ pub fn read_zero_sized_constant<'tcx>(
                     (UNION_OBJECTS_FIELD.to_string(), objects.clone()),
                 ]),
                 params: vec![bytes, objects],
+                param_types: Vec::new(),
             })
         }
         TyKind::Adt(adt_def, substs) if adt_def.is_enum() => {
@@ -483,7 +719,11 @@ pub fn read_zero_sized_constant<'tcx>(
                     jvm_index += 1;
                 }
             }
-            Ok(make_instance(class_name, values))
+            Ok(instance_constant_with_declared_fields(
+                class_name,
+                values,
+                oomir_data_types,
+            ))
         }
         TyKind::Tuple(elements) => {
             let element_tys = elements.iter().collect::<Vec<_>>();
@@ -503,7 +743,11 @@ pub fn read_zero_sized_constant<'tcx>(
                     ));
                 }
             }
-            Ok(make_instance(class_name, values))
+            Ok(instance_constant_with_declared_fields(
+                class_name,
+                values,
+                oomir_data_types,
+            ))
         }
         TyKind::Array(element_ty, length) => {
             let length = length
@@ -513,10 +757,16 @@ pub fn read_zero_sized_constant<'tcx>(
             if !element_jvm_ty.has_jvm_value() {
                 return Ok(oomir::Constant::Array(Box::new(element_jvm_ty), Vec::new()));
             }
-            let length = usize::try_from(length)
+            let Some(length) = usize::try_from(length)
                 .ok()
                 .filter(|length| *length <= i32::MAX as usize)
-                .ok_or_else(|| format!("constant ZST array length {length} exceeds JVM limits"))?;
+            else {
+                // The array occupies no Rust storage, so its JVM carrier may
+                // be elided even when its logical length exceeds JVM limits.
+                // Borrow lowering restores that compile-time length in the
+                // SliceView metadata rather than asking the backing array.
+                return Ok(oomir::Constant::Array(Box::new(element_jvm_ty), Vec::new()));
+            };
             let mut elements = Vec::with_capacity(length);
             for _ in 0..length {
                 elements.push(read_zero_sized_constant(
@@ -585,8 +835,10 @@ pub fn read_pointer_constant<'tcx>(
                 }
             }
             let points_directly_to_static = pointer_references_static(tcx, pointer);
+            let points_directly_to_vtable = pointer_references_vtable(tcx, pointer);
             let value = read_pointee_constant(tcx, pointer, *inner_ty, oomir_data_types, instance)?;
             if points_directly_to_static
+                || points_directly_to_vtable
                 || inner_ty.is_str()
                 || inner_ty.is_slice()
                 || matches!(inner_ty.kind(), TyKind::Dynamic(..))
@@ -612,6 +864,13 @@ fn pointer_references_static(tcx: TyCtxt<'_>, pointer: Pointer<CtfeProvenance>) 
     provenance
         .get_alloc_id()
         .is_some_and(|alloc_id| matches!(tcx.global_alloc(alloc_id), GlobalAlloc::Static(_)))
+}
+
+fn pointer_references_vtable(tcx: TyCtxt<'_>, pointer: Pointer<CtfeProvenance>) -> bool {
+    let (provenance, _) = pointer.into_raw_parts();
+    provenance
+        .get_alloc_id()
+        .is_some_and(|alloc_id| matches!(tcx.global_alloc(alloc_id), GlobalAlloc::VTable(..)))
 }
 
 fn anonymous_memory_pointer_constant<'tcx>(
@@ -657,9 +916,6 @@ fn anonymous_memory_pointer_constant<'tcx>(
     let Some(&byte) = bytes.first() else {
         return Ok(None);
     };
-    if !bytes.iter().all(|candidate| *candidate == byte) {
-        return Ok(None);
-    }
     let view_codec = match pointer_memory_codec_operand(pointee_ty, tcx, oomir_data_types, instance)
     {
         oomir::Operand::Constant(oomir::Constant::String(codec)) => Some(codec),
@@ -670,21 +926,35 @@ fn anonymous_memory_pointer_constant<'tcx>(
             ));
         }
     };
-    Ok(Some(oomir::Constant::RepeatedBytePointer {
-        identity: format!("{}::{alloc_id:?}", tcx.crate_name(LOCAL_CRATE)),
-        byte,
-        length: allocation.size().bytes(),
-        offset: offset.bytes(),
-        view_size: pointee_layout.size.bytes(),
-        alignment: allocation.align.bytes(),
-        view_codec,
-        pointee: Box::new(ty_to_oomir_type(
-            pointee_ty,
-            tcx,
-            oomir_data_types,
-            instance,
-        )),
-    }))
+    let identity = format!("{}::{alloc_id:?}", tcx.crate_name(LOCAL_CRATE));
+    let pointee = Box::new(ty_to_oomir_type(
+        pointee_ty,
+        tcx,
+        oomir_data_types,
+        instance,
+    ));
+    if bytes.iter().all(|candidate| *candidate == byte) {
+        Ok(Some(oomir::Constant::RepeatedBytePointer {
+            identity,
+            byte,
+            length: allocation.size().bytes(),
+            offset: offset.bytes(),
+            view_size: pointee_layout.size.bytes(),
+            alignment: allocation.align.bytes(),
+            view_codec,
+            pointee,
+        }))
+    } else {
+        Ok(Some(oomir::Constant::ByteArrayPointer {
+            identity,
+            bytes,
+            offset: offset.bytes(),
+            view_size: pointee_layout.size.bytes(),
+            alignment: allocation.align.bytes(),
+            view_codec,
+            pointee,
+        }))
+    }
 }
 
 fn pointer_constant_for_pointee<'tcx>(
@@ -731,6 +1001,7 @@ fn pointer_constant_for_pointee<'tcx>(
             ),
             codec,
         ],
+        param_types: Vec::new(),
     })
 }
 
@@ -768,6 +1039,7 @@ fn interned_pointer_for_full_allocation<'tcx>(
     Ok(Some(oomir::Constant::InternedPointer {
         identity: format!("{}::{alloc_id:?}", tcx.crate_name(LOCAL_CRATE)),
         value: Box::new(value),
+        array_backed: false,
         view_size: layout.size.bytes(),
         alignment: allocation.align.bytes(),
         view_codec: Box::new(view_codec),
@@ -863,17 +1135,19 @@ fn array_reference_to_slice<'tcx>(
     let TyKind::Array(element_ty, _) = array_ty.kind() else {
         return Err(format!("Expected array type, found {array_ty:?}"));
     };
-    let value = match value {
-        oomir::Constant::Array(element_type, elements) => {
-            return Ok(oomir::Constant::Slice(element_type, elements));
-        }
-        other => other,
-    };
     let layout = tcx
         .layout_of(TypingEnv::fully_monomorphized().as_query_input(array_ty))
         .map_err(|error| format!("Could not get array layout for {array_ty:?}: {error:?}"))?;
     let FieldsShape::Array { count, .. } = layout.fields else {
         return Err(format!("Array type {array_ty:?} had layout {layout:?}"));
+    };
+    let value = match value {
+        oomir::Constant::Array(element_type, elements)
+            if u64::try_from(elements.len()).ok() == Some(count) =>
+        {
+            return Ok(oomir::Constant::Slice(element_type, elements));
+        }
+        other => other,
     };
     slice_ref_constant(
         tcx,
@@ -920,6 +1194,7 @@ fn slice_ref_constant<'tcx>(
                 oomir::Constant::U64(element_layout.size.bytes()),
                 element_codec,
             ],
+            param_types: Vec::new(),
             ty: oomir::Type::Pointer(Box::new(element_type.clone())),
         }
     } else {
@@ -1053,7 +1328,30 @@ fn read_pointee_constant<'tcx>(
                 instance,
             ))
         }
-        GlobalAlloc::VTable(..) => Err("Unsupported constant pointer to vtable".to_string()),
+        GlobalAlloc::VTable(concrete_ty, dyn_ty) => {
+            let concrete_ty = EarlyBinder::bind(tcx, concrete_ty)
+                .instantiate(tcx, instance.args)
+                .skip_norm_wip();
+            let layout = tcx
+                .layout_of(TypingEnv::fully_monomorphized().as_query_input(concrete_ty))
+                .map_err(|error| format!("Could not determine vtable layout: {error:?}"))?;
+            Ok(oomir::Constant::StaticCall {
+                owner_class: oomir::POINTER_CLASS.to_string(),
+                method_name: "constantVtableMarker".to_string(),
+                args: vec![
+                    oomir::Constant::String(format!("{concrete_ty:?}:{dyn_ty:?}")),
+                    oomir::Constant::U64(layout.size.bytes()),
+                    oomir::Constant::U64(layout.align.abi.bytes()),
+                ],
+                param_types: Vec::new(),
+                ty: oomir::Type::Pointer(Box::new(ty_to_oomir_type(
+                    pointee_ty,
+                    tcx,
+                    oomir_data_types,
+                    instance,
+                ))),
+            })
+        }
         GlobalAlloc::TypeId { ty } => Err(format!("Unsupported constant pointer to TypeId {ty:?}")),
     }
 }
@@ -1132,22 +1430,38 @@ fn read_slice_from_fat_pointer<'tcx>(
             ));
         }
     };
-    if len == 0 {
-        let TyKind::Slice(element_ty) = slice_ty.kind() else {
-            return Err(format!("Expected slice type, found {slice_ty:?}"));
-        };
-        return Ok(oomir::Constant::Slice(
-            Box::new(ty_to_oomir_type(
-                *element_ty,
-                tcx,
-                oomir_data_types,
-                instance,
-            )),
-            Vec::new(),
-        ));
-    }
-
-    let data_ptr = read_pointer_from_memory(tcx, allocation, offset)?;
+    let data_scalar = allocation
+        .read_scalar(
+            &tcx.data_layout,
+            AllocRange {
+                start: offset,
+                size: pointer_size,
+            },
+            true,
+        )
+        .map_err(|error| format!("Failed to read slice data pointer at {offset:?}: {error:?}"))?;
+    let data_ptr = match data_scalar {
+        Scalar::Ptr(pointer, _) => pointer,
+        Scalar::Int(address) => {
+            let TyKind::Slice(element_ty) = slice_ty.kind() else {
+                return Err(format!("Expected slice type, found {slice_ty:?}"));
+            };
+            let element_layout = tcx
+                .layout_of(TypingEnv::fully_monomorphized().as_query_input(*element_ty))
+                .map_err(|error| format!("Could not get slice element layout: {error:?}"))?;
+            let element_type = ty_to_oomir_type(*element_ty, tcx, oomir_data_types, instance);
+            return Ok(oomir::Constant::SliceRef {
+                backing: Box::new(oomir::Constant::PointerAddress {
+                    address: address.to_target_usize(tcx) as u64,
+                    view_size: element_layout.size.bytes(),
+                    pointee: Box::new(element_type.clone()),
+                }),
+                element_type: Box::new(element_type),
+                offset: 0,
+                length: len as u64,
+            });
+        }
+    };
 
     let (provenance, data_offset) = data_ptr.into_raw_parts();
     let alloc_id = provenance.get_alloc_id().ok_or_else(|| {
@@ -1157,15 +1471,29 @@ fn read_slice_from_fat_pointer<'tcx>(
         )
     })?;
     match tcx.global_alloc(alloc_id) {
-        GlobalAlloc::Memory(const_alloc) => read_slice_backed_value(
-            tcx,
-            const_alloc.inner(),
-            data_offset,
-            len,
-            slice_ty,
-            oomir_data_types,
-            instance,
-        ),
+        GlobalAlloc::Memory(const_alloc) => {
+            let const_alloc = const_alloc.inner();
+            let value = read_slice_backed_value(
+                tcx,
+                const_alloc,
+                data_offset,
+                len,
+                slice_ty,
+                oomir_data_types,
+                instance,
+            )?;
+            preserve_slice_allocation(
+                tcx,
+                alloc_id,
+                const_alloc,
+                data_offset,
+                len,
+                slice_ty,
+                value,
+                oomir_data_types,
+                instance,
+            )
+        }
         GlobalAlloc::Static(def_id) => read_slice_from_static(
             tcx,
             def_id,
@@ -1178,6 +1506,65 @@ fn read_slice_from_fat_pointer<'tcx>(
         other => Err(format!(
             "Slice data pointer referenced non-memory allocation {:?}",
             other
+        )),
+    }
+}
+
+fn read_slice_tailed_pointer_from_fat_pointer<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    allocation: &ConstAllocation,
+    offset: Size,
+    pointee_ty: Ty<'tcx>,
+    oomir_data_types: &mut HashMap<String, oomir::DataType>,
+    instance: Instance<'tcx>,
+) -> Result<oomir::Constant, String> {
+    let pointer_size = tcx.data_layout.pointer_size();
+    let len_scalar = allocation
+        .read_scalar(
+            &tcx.data_layout,
+            AllocRange {
+                start: offset + pointer_size,
+                size: pointer_size,
+            },
+            false,
+        )
+        .map_err(|error| {
+            format!(
+                "failed to read slice-tail length at {:?}: {:?}",
+                offset + pointer_size,
+                error
+            )
+        })?;
+    let len = match len_scalar {
+        Scalar::Int(len) => len.to_target_usize(tcx),
+        Scalar::Ptr(..) => {
+            return Err(format!(
+                "expected integer slice-tail length at {:?}, found pointer",
+                offset + pointer_size
+            ));
+        }
+    };
+    let data_ptr = read_pointer_from_memory(tcx, allocation, offset)?;
+    let (provenance, data_offset) = data_ptr.into_raw_parts();
+    let alloc_id = provenance.get_alloc_id().ok_or_else(|| {
+        format!(
+            "slice-tail data pointer provenance {:?} has no allocation id",
+            provenance
+        )
+    })?;
+    match tcx.global_alloc(alloc_id) {
+        GlobalAlloc::Memory(const_allocation) => slice_tailed_pointer_constant(
+            tcx,
+            alloc_id,
+            const_allocation.inner(),
+            data_offset,
+            len,
+            pointee_ty,
+            oomir_data_types,
+            instance,
+        ),
+        other => Err(format!(
+            "slice-tail data pointer referenced unsupported allocation {other:?}"
         )),
     }
 }
@@ -1297,6 +1684,18 @@ pub fn read_constant_value_from_memory<'tcx>(
                     )?
                 };
                 Ok(value)
+            } else if {
+                let tail = tcx.struct_tail_for_codegen(*inner_ty, TypingEnv::fully_monomorphized());
+                tail.is_str() || tail.is_slice()
+            } {
+                read_slice_tailed_pointer_from_fat_pointer(
+                    tcx,
+                    allocation,
+                    offset,
+                    *inner_ty,
+                    oomir_data_types,
+                    instance,
+                )
             } else {
                 let ptr = read_pointer_from_memory(tcx, allocation, offset)?;
                 let value = read_pointee_constant(tcx, ptr, *inner_ty, oomir_data_types, instance)?;
@@ -1318,9 +1717,10 @@ pub fn read_constant_value_from_memory<'tcx>(
                         instance,
                     );
                 }
-                if matches!(oomir::Type::from_constant(&value), oomir::Type::Pointer(_)) {
-                    // References to statics already are their canonical stable
-                    // Pointer. Wrapping that address would create Pointer<Pointer<T>>.
+                if pointer_references_static(tcx, ptr) {
+                    // References whose allocation is the static itself already
+                    // are its canonical stable Pointer. An ordinary allocation
+                    // containing a reference still needs another Pointer layer.
                     return Ok(value);
                 }
                 if matches!(inner_ty.kind(), TyKind::Dynamic(..)) {
@@ -1334,7 +1734,26 @@ pub fn read_constant_value_from_memory<'tcx>(
             if inner_ty.is_str() {
                 read_str_from_fat_pointer(tcx, allocation, offset)
             } else if inner_ty.is_slice() {
-                Err("Unsupported raw slice pointer constant".to_string())
+                read_slice_from_fat_pointer(
+                    tcx,
+                    allocation,
+                    offset,
+                    *inner_ty,
+                    oomir_data_types,
+                    instance,
+                )
+            } else if {
+                let tail = tcx.struct_tail_for_codegen(*inner_ty, TypingEnv::fully_monomorphized());
+                tail.is_str() || tail.is_slice()
+            } {
+                read_slice_tailed_pointer_from_fat_pointer(
+                    tcx,
+                    allocation,
+                    offset,
+                    *inner_ty,
+                    oomir_data_types,
+                    instance,
+                )
             } else {
                 let pointer_size = tcx.data_layout.pointer_size();
                 let scalar = allocation
@@ -1397,10 +1816,12 @@ pub fn read_constant_value_from_memory<'tcx>(
                                 oomir_data_types,
                                 instance,
                             )?;
-                            if matches!(oomir::Type::from_constant(&value), oomir::Type::Pointer(_))
+                            if pointer_references_static(tcx, pointer)
+                                || pointer_references_vtable(tcx, pointer)
                             {
-                                // A static reference is already its stable address. Keep that
-                                // Pointer carrier rather than adding a pointer-to-pointer cell.
+                                // Statics and vtables already have canonical runtime Pointer
+                                // carriers. Anonymous allocations containing a pointer still
+                                // require their own outer pointer layer.
                                 Ok(value)
                             } else {
                                 pointer_constant_for_pointee(
@@ -1561,6 +1982,7 @@ pub fn read_constant_value_from_memory<'tcx>(
                             .then_some(value)
                             .into_iter()
                             .collect(),
+                        param_types: Vec::new(),
                         ty: oomir::Type::Class(class_name),
                     });
                 }
@@ -1590,6 +2012,7 @@ pub fn read_constant_value_from_memory<'tcx>(
                         (UNION_OBJECTS_FIELD.to_string(), objects.clone()),
                     ]),
                     params: vec![bytes, objects],
+                    param_types: Vec::new(),
                 })
             } else {
                 Err(format!("Unsupported ADT constant type: {ty:?}"))
@@ -1602,6 +2025,7 @@ pub fn read_constant_value_from_memory<'tcx>(
             }
             let mut fields_map = HashMap::new();
             let mut params = Vec::new();
+            let mut param_types = Vec::new();
             match layout.fields {
                 FieldsShape::Arbitrary { ref offsets, .. } => {
                     for (i, field_ty) in field_tys.iter().enumerate() {
@@ -1614,6 +2038,12 @@ pub fn read_constant_value_from_memory<'tcx>(
                             oomir_data_types,
                             instance,
                         )?;
+                        param_types.push(ty_to_oomir_type(
+                            field_ty,
+                            tcx,
+                            oomir_data_types,
+                            instance,
+                        ));
                         params.push(field_const.clone());
                         fields_map.insert(format!("field{}", i), field_const);
                     }
@@ -1626,6 +2056,7 @@ pub fn read_constant_value_from_memory<'tcx>(
                 class_name: tuple_class_name,
                 fields: fields_map,
                 params,
+                param_types,
             })
         }
 
@@ -1641,6 +2072,7 @@ pub fn read_constant_value_from_memory<'tcx>(
             let capture_tys = closure_args.as_closure().upvar_tys();
             let mut fields = HashMap::new();
             let mut params = Vec::new();
+            let mut param_types = Vec::new();
             for (index, capture_ty) in capture_tys.iter().enumerate() {
                 let capture_offset = layout.fields.offset(index);
                 let capture = read_constant_value_from_memory(
@@ -1651,6 +2083,12 @@ pub fn read_constant_value_from_memory<'tcx>(
                     oomir_data_types,
                     instance,
                 )?;
+                param_types.push(ty_to_oomir_type(
+                    capture_ty,
+                    tcx,
+                    oomir_data_types,
+                    instance,
+                ));
                 fields.insert(format!("arg{index}"), capture.clone());
                 params.push(capture);
             }
@@ -1658,6 +2096,7 @@ pub fn read_constant_value_from_memory<'tcx>(
                 class_name,
                 fields,
                 params,
+                param_types,
             })
         }
 
@@ -1696,6 +2135,7 @@ fn handle_constant_struct<'tcx>(
     let variant = adt_def.variant(VariantIdx::from_usize(0)); // Structs have one variant
     let mut fields_map = HashMap::new();
     let mut params = Vec::new();
+    let mut param_types = Vec::new();
 
     for (i, field_def) in variant.fields.iter().enumerate() {
         let field_idx = FieldIdx::from_usize(i);
@@ -1732,6 +2172,7 @@ fn handle_constant_struct<'tcx>(
             oomir_data_types,
             instance,
         )?;
+        param_types.push(ty_to_oomir_type(field_ty, tcx, oomir_data_types, instance));
         params.push(field_const.clone());
         fields_map.insert(field_name, field_const);
     }
@@ -1742,6 +2183,7 @@ fn handle_constant_struct<'tcx>(
         class_name,
         fields: fields_map,
         params,
+        param_types,
     })
 }
 
@@ -1994,6 +2436,7 @@ fn handle_constant_enum<'tcx>(
 
     let mut fields_map = HashMap::new();
     let mut params = Vec::new();
+    let mut param_types = Vec::new();
     for (i, field_def) in variant_def.fields.iter().enumerate() {
         let field_idx = FieldIdx::from_usize(i);
         let field_ty = field_def.ty(tcx, substs).skip_norm_wip();
@@ -2039,6 +2482,7 @@ fn handle_constant_enum<'tcx>(
             oomir_data_types,
             instance,
         )?;
+        param_types.push(field_oomir_ty);
         params.push(field_const.clone());
         fields_map.insert(field_name, field_const);
     }
@@ -2114,6 +2558,7 @@ fn handle_constant_enum<'tcx>(
         class_name: variant_class_name,
         fields: fields_map,
         params,
+        param_types,
     })
 }
 
@@ -2144,6 +2589,7 @@ pub fn scalar_int_to_oomir_constant<'tcx>(
                     class_name: crate::lower2::I128_CLASS.into(),
                     fields: HashMap::new(),
                     params: vec![param],
+                    param_types: Vec::new(),
                 }
             }
         },
@@ -2158,6 +2604,7 @@ pub fn scalar_int_to_oomir_constant<'tcx>(
                     class_name: crate::lower2::U128_CLASS.into(),
                     fields: HashMap::new(),
                     params: vec![param],
+                    param_types: Vec::new(),
                 }
             }
         },
@@ -2176,6 +2623,7 @@ pub fn scalar_int_to_oomir_constant<'tcx>(
                         oomir::Constant::I64((bits >> 64) as i64),
                         oomir::Constant::I64(bits as i64),
                     ],
+                    param_types: Vec::new(),
                 }
             }
         },

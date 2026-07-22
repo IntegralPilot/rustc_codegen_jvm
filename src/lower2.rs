@@ -140,6 +140,7 @@ fn create_constant_factory(
         oomir::Constant::InternedPointer {
             identity,
             value,
+            array_backed,
             view_size,
             alignment,
             view_codec,
@@ -153,6 +154,7 @@ fn create_constant_factory(
                 methods,
                 next_factory,
             )?),
+            array_backed: *array_backed,
             view_size: *view_size,
             alignment: *alignment,
             view_codec: view_codec.clone(),
@@ -162,9 +164,11 @@ fn create_constant_factory(
             class_name,
             fields,
             params,
+            param_types,
         } => oomir::Constant::Instance {
             class_name: class_name.clone(),
             fields: fields.clone(),
+            param_types: param_types.clone(),
             params: params
                 .iter()
                 .map(|param| {
@@ -180,6 +184,7 @@ fn create_constant_factory(
             owner_class: call_owner,
             method_name,
             args,
+            param_types,
             ty,
         } => oomir::Constant::StaticCall {
             owner_class: call_owner.clone(),
@@ -188,6 +193,7 @@ fn create_constant_factory(
                 .iter()
                 .map(|arg| create_constant_factory(cp, owner_class, arg, methods, next_factory))
                 .collect::<jvm::Result<Vec<_>>>()?,
+            param_types: param_types.clone(),
             ty: ty.clone(),
         },
         _ => return Ok(constant.clone()),
@@ -238,6 +244,7 @@ fn constant_instruction_cost(constant: &oomir::Constant) -> usize {
         C::FunctionPointer { .. } => 3,
         C::PointerAddress { .. } => 3,
         C::RepeatedBytePointer { .. } => 8,
+        C::ByteArrayPointer { bytes, .. } => bytes.len().saturating_mul(4).saturating_add(8),
         C::InternedPointer { value, .. } => 7usize.saturating_add(constant_instruction_cost(value)),
         C::I64(_) | C::U64(_) | C::F64(_) => 1,
         C::I8(_)

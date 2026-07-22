@@ -573,6 +573,9 @@ pub enum Constant {
         owner_class: String,
         method_name: String,
         args: Vec<Constant>,
+        /// Declared JVM parameter types when they are wider than the concrete
+        /// constant carriers (for example, a SliceView passed as Object).
+        param_types: Vec<Type>,
         ty: Type,
     },
     /// A provenance-free Rust pointer represented by its exposed address.
@@ -595,11 +598,24 @@ pub enum Constant {
         view_codec: Option<String>,
         pointee: Box<Type>,
     },
+    /// A pointer into an arbitrary provenance-free CTFE byte allocation.
+    /// This preserves the complete allocation when the pointee is only one
+    /// scalar within it, such as the inline pieces used by `fmt::Arguments`.
+    ByteArrayPointer {
+        identity: String,
+        bytes: Vec<u8>,
+        offset: u64,
+        view_size: u64,
+        alignment: u64,
+        view_codec: Option<String>,
+        pointee: Box<Type>,
+    },
     /// A pointer to a fully materialized anonymous CTFE allocation. Repeated
     /// loads use `identity` to retain Rust allocation identity on the JVM.
     InternedPointer {
         identity: String,
         value: Box<Constant>,
+        array_backed: bool,
         view_size: u64,
         alignment: u64,
         view_codec: Box<Constant>,
@@ -641,6 +657,10 @@ pub enum Constant {
         fields: std::collections::HashMap<String, Constant>,
         /// Any parameters to the constructor.
         params: Vec<Constant>,
+        /// The declared JVM type of each constructor parameter. This can differ
+        /// from the concrete constant type when, for example, an enum variant
+        /// is passed through its abstract enum base class.
+        param_types: Vec<Type>,
     },
 }
 
@@ -704,11 +724,13 @@ impl std::hash::Hash for Constant {
                 owner_class,
                 method_name,
                 args,
+                param_types,
                 ty,
             } => {
                 owner_class.hash(state);
                 method_name.hash(state);
                 args.hash(state);
+                param_types.hash(state);
                 ty.hash(state);
             }
             Constant::PointerAddress {
@@ -740,9 +762,27 @@ impl std::hash::Hash for Constant {
                 view_codec.hash(state);
                 pointee.hash(state);
             }
+            Constant::ByteArrayPointer {
+                identity,
+                bytes,
+                offset,
+                view_size,
+                alignment,
+                view_codec,
+                pointee,
+            } => {
+                identity.hash(state);
+                bytes.hash(state);
+                offset.hash(state);
+                view_size.hash(state);
+                alignment.hash(state);
+                view_codec.hash(state);
+                pointee.hash(state);
+            }
             Constant::InternedPointer {
                 identity,
                 value,
+                array_backed,
                 view_size,
                 alignment,
                 view_codec,
@@ -750,6 +790,7 @@ impl std::hash::Hash for Constant {
             } => {
                 identity.hash(state);
                 value.hash(state);
+                array_backed.hash(state);
                 view_size.hash(state);
                 alignment.hash(state);
                 view_codec.hash(state);
@@ -797,6 +838,7 @@ impl std::hash::Hash for Constant {
                 class_name,
                 fields,
                 params,
+                param_types,
             } => {
                 class_name.hash(state);
                 // iterate over the fields and hash them
@@ -805,6 +847,7 @@ impl std::hash::Hash for Constant {
                     value.hash(state);
                 }
                 params.hash(state);
+                param_types.hash(state);
             }
         }
     }
@@ -1130,6 +1173,7 @@ impl Type {
             Constant::StaticCall { ty, .. } => ty.clone(),
             Constant::PointerAddress { pointee, .. } => Type::Pointer(pointee.clone()),
             Constant::RepeatedBytePointer { pointee, .. } => Type::Pointer(pointee.clone()),
+            Constant::ByteArrayPointer { pointee, .. } => Type::Pointer(pointee.clone()),
             Constant::InternedPointer { pointee, .. } => Type::Pointer(pointee.clone()),
             Constant::Null(ty) => ty.clone(),
             Constant::I8(_) => Type::I8,

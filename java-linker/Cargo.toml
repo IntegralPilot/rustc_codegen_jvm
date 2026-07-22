@@ -8,3 +8,6 @@ regex = "1.11.1"
 ristretto_classfile = "0.31.0"
 tempfile = "3.19.1"
 zip = "2.5.0"
+
+[patch.crates-io]
+ristretto_classfile = { git = "https://github.com/IntegralPilot/ristretto.git", rev = "23cd035e386acad45f420f0478415df1d9856b4f" }

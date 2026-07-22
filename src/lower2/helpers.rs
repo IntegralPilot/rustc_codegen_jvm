@@ -31,6 +31,13 @@ fn constant_load_stack_floor(constant: &oomir::Constant) -> u16 {
         }
         Constant::SliceRef { backing, .. } => (2 + constant_load_stack_floor(backing)).max(4),
         Constant::RepeatedBytePointer { .. } => 10,
+        Constant::ByteArrayPointer { bytes, .. } => {
+            let backing = Constant::Array(
+                Box::new(Type::U8),
+                bytes.iter().copied().map(Constant::U8).collect(),
+            );
+            (6 + constant_load_stack_floor(&backing)).max(10)
+        }
         Constant::InternedPointer { value, .. } => (3 + constant_load_stack_floor(value)).max(8),
         Constant::Instance { params, .. } => {
             let mut stack = 2;
@@ -665,6 +672,12 @@ fn primitive_to_primitive(
         if dest_width <= 32 {
             if src_width == 64 {
                 result.push(JI::L2i);
+            }
+            // The JVM sign-extends a byte local when it is loaded. Preserve the
+            // Rust u8 value before widening it to any larger integer type.
+            if src == &Type::U8 && dest_width > 8 {
+                result.push(get_int_const_instr(cp, 0xff));
+                result.push(JI::Iand);
             }
             if let Some(op) = narrow(dest) {
                 result.push(op);

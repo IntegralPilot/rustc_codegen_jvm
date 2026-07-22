@@ -1,0 +1,13 @@
+diff --git a/core/src/cmp/bytewise.rs b/core/src/cmp/bytewise.rs
+--- a/core/src/cmp/bytewise.rs
++++ b/core/src/cmp/bytewise.rs
+@@ -24,6 +24,6 @@ macro_rules! is_bytewise_comparable {
+ }
+ 
+-// SAFETY: All the ordinary integer types have no padding, and are not pointers.
+-is_bytewise_comparable!(u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize);
++// SAFETY: Unit contains no data, and the ordinary integers have no padding or pointers.
++is_bytewise_comparable!((), u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize);
+ 
+ // SAFETY: These have *niches*, but no *padding* and no *provenance*,
+ // so we can compare them directly.

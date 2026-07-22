@@ -48,15 +48,16 @@ public final class RuntimeSupport {
 
         boolean unwrappedCarrier = false;
         while (value instanceof TraitObjectCarrier) {
-            value = ((TraitObjectCarrier) value).rustTraitObjectPayload();
+            TraitObjectCarrier carrier = (TraitObjectCarrier) value;
+            value = carrier.rustTraitObjectPayload();
             unwrappedCarrier = true;
             if (value instanceof Pointer) {
-                return ((Pointer) value).retype(viewSize, viewCodec);
+                return Pointer.dataPointerView((Pointer) value, viewSize, viewCodec);
             }
         }
         return unwrappedCarrier
                 ? Pointer.cell(value, viewSize, viewCodec)
-                : pointer.retype(viewSize, viewCodec);
+                : Pointer.dataPointerView(pointer, viewSize, viewCodec);
     }
 
     public static long argumentCount() {

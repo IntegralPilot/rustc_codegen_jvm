@@ -1,0 +1,83 @@
+name: Coretests
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: Build profile
+        required: true
+        default: debug
+        type: choice
+        options:
+          - debug
+          - release
+      filter:
+        description: Optional substring filter for test names
+        required: false
+        type: string
+
+jobs:
+  coretests:
+    name: Upstream coretests (${{ inputs.profile }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      PYTHONUTF8: '1'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust (nightly)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: nightly
+          components: rustc-dev rust-src llvm-tools cargo
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build backend and tools
+        run: python build.py ci
+
+      - name: Run upstream coretests
+        id: coretests
+        continue-on-error: true
+        shell: bash
+        env:
+          CORETESTS_PROFILE: ${{ inputs.profile }}
+          CORETESTS_FILTER: ${{ inputs.filter }}
+        run: |
+          args=()
+          if [[ "$CORETESTS_PROFILE" == "release" ]]; then
+            args+=(--release)
+          fi
+          if [[ -n "$CORETESTS_FILTER" ]]; then
+            args+=(--filter "$CORETESTS_FILTER")
+          fi
+          python Coretests.py --allow-test-failures --timeout 20 --build-timeout 1200 "${args[@]}"
+
+      - name: Upload coretests report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coretests-${{ inputs.profile }}
+          path: |
+            target/coretests/reports/
+            target/coretests/logs/
+          if-no-files-found: error
+
+      - name: Propagate coretests result
+        if: steps.coretests.outcome == 'failure'
+        shell: bash
+        run: exit 1

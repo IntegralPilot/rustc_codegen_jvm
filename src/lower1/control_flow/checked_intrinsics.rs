@@ -25,6 +25,7 @@ fn integer_constants(ty: &Type) -> (Constant, Constant, Constant) {
         class_name: class_name.to_string(),
         fields: HashMap::new(),
         params: vec![Constant::String(value.to_string())],
+        param_types: Vec::new(),
     };
     match ty {
         Type::I8 => (Constant::I8(0), Constant::I8(i8::MIN), Constant::I8(-1)),

@@ -328,6 +328,29 @@ public final class F128 {
         return fromRational(numerator, denominator, isNegative());
     }
 
+    /** Computes a * b + c with a single binary128 rounding. */
+    public F128 fusedMultiplyAdd(F128 multiplicand, F128 addend) {
+        if (isNaN() || multiplicand.isNaN() || addend.isNaN()
+                || isInfinite() || multiplicand.isInfinite() || addend.isInfinite()) {
+            return multiply(multiplicand).add(addend);
+        }
+        if ((isZero() || multiplicand.isZero()) && addend.isZero()) {
+            return multiply(multiplicand).add(addend);
+        }
+
+        Rational left = finiteRational();
+        Rational right = multiplicand.finiteRational();
+        Rational extra = addend.finiteRational();
+        BigInteger productDenominator = left.denominator.multiply(right.denominator);
+        BigInteger numerator = left.numerator.multiply(right.numerator)
+                .multiply(extra.denominator)
+                .add(extra.numerator.multiply(productDenominator));
+        return fromRational(
+                numerator,
+                productDenominator.multiply(extra.denominator),
+                false);
+    }
+
     public boolean eq(F128 other) {
         if (isNaN() || other.isNaN()) {
             return false;
@@ -381,20 +404,111 @@ public final class F128 {
                 .compareTo(b.numerator.multiply(a.denominator));
     }
 
-    private boolean isNegative() {
+    public boolean isNegative() {
         return high < 0;
     }
 
-    private boolean isNaN() {
+    public boolean isNaN() {
         return exponent() == MAX_EXPONENT && fraction().signum() != 0;
     }
 
-    private boolean isInfinite() {
+    public boolean isInfinite() {
         return exponent() == MAX_EXPONENT && fraction().signum() == 0;
     }
 
-    private boolean isZero() {
+    public boolean isZero() {
         return exponent() == 0 && fraction().signum() == 0;
+    }
+
+    public F128 copySign(F128 sign) {
+        return new F128((high & Long.MAX_VALUE) | (sign.high & Long.MIN_VALUE), low);
+    }
+
+    public F128 floor() {
+        return roundIntegral(0);
+    }
+
+    public F128 ceil() {
+        return roundIntegral(1);
+    }
+
+    public F128 trunc() {
+        return roundIntegral(2);
+    }
+
+    public F128 round() {
+        return roundIntegral(3);
+    }
+
+    public F128 roundTiesEven() {
+        return roundIntegral(4);
+    }
+
+    /** A binary64 approximation of ln(self) that also covers binary128's full range. */
+    public double naturalLogApprox() {
+        if (isNaN()) return Double.NaN;
+        if (isZero()) return Double.NEGATIVE_INFINITY;
+        if (isNegative()) return Double.NaN;
+        if (isInfinite()) return Double.POSITIVE_INFINITY;
+
+        BigInteger significand = fraction();
+        int binaryExponent;
+        if (exponent() == 0) {
+            int highestBit = significand.bitLength() - 1;
+            binaryExponent = 1 - EXPONENT_BIAS - FRACTION_BITS + highestBit;
+            return Math.log(Math.scalb(significand.doubleValue(), -highestBit))
+                    + binaryExponent * Math.log(2.0);
+        }
+        significand = significand.add(TWO_112);
+        binaryExponent = exponent() - EXPONENT_BIAS;
+        return Math.log(Math.scalb(significand.doubleValue(), -FRACTION_BITS))
+                + binaryExponent * Math.log(2.0);
+    }
+
+    /** Builds an approximate binary128 value from its natural-log magnitude. */
+    public static F128 fromNaturalLog(double logarithm, boolean negative) {
+        if (Double.isNaN(logarithm)) return NAN;
+        if (logarithm == Double.POSITIVE_INFINITY) return infinity(negative);
+        if (logarithm == Double.NEGATIVE_INFINITY) return zero(negative);
+
+        double logTwo = Math.log(2.0);
+        int binaryExponent = (int) Math.floor(logarithm / logTwo);
+        double mantissa = Math.exp(logarithm - binaryExponent * logTwo);
+        if (mantissa >= 2.0) {
+            mantissa *= 0.5;
+            binaryExponent++;
+        }
+        Rational rational = fromF64(mantissa).finiteRational();
+        BigInteger numerator = rational.numerator;
+        BigInteger denominator = rational.denominator;
+        if (binaryExponent >= 0) numerator = numerator.shiftLeft(binaryExponent);
+        else denominator = denominator.shiftLeft(-binaryExponent);
+        if (negative) numerator = numerator.negate();
+        return fromRational(numerator, denominator, negative);
+    }
+
+    /** Rounds a finite value without narrowing binary128 through binary64. */
+    private F128 roundIntegral(int mode) {
+        if (isNaN() || isInfinite() || isZero()) return this;
+        Rational rational = finiteRational();
+        BigInteger[] division = rational.numerator.divideAndRemainder(rational.denominator);
+        if (division[1].signum() == 0) return this;
+
+        BigInteger integer = division[0];
+        int sign = rational.numerator.signum();
+        if (mode == 0 && sign < 0) {
+            integer = integer.subtract(BigInteger.ONE);
+        } else if (mode == 1 && sign > 0) {
+            integer = integer.add(BigInteger.ONE);
+        } else if (mode == 3 || mode == 4) {
+            int halfway = division[1].abs().shiftLeft(1).compareTo(rational.denominator);
+            if (halfway > 0 || (halfway == 0 && (mode == 3 || integer.testBit(0)))) {
+                integer = integer.add(BigInteger.valueOf(sign));
+            }
+        }
+        return integer.signum() == 0
+                ? zero(isNegative())
+                : fromInteger(integer);
     }
 
     private int exponent() {

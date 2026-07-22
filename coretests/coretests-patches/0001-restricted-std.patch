@@ -1,0 +1,25 @@
+diff --git a/lib.rs b/lib.rs
+--- a/lib.rs
++++ b/lib.rs
+@@ -1 +1,2 @@
+ // Intentionally left empty.
++#![feature(restricted_std)]
+diff --git a/tests/lib.rs b/tests/lib.rs
+--- a/tests/lib.rs
++++ b/tests/lib.rs
+@@ -98,6 +98,7 @@
+ #![feature(pointer_is_aligned_to)]
+ #![feature(portable_simd)]
+ #![feature(ptr_metadata)]
++#![feature(restricted_std)]
+ #![feature(rustc_attrs)]
+ #![feature(signed_bigint_helpers)]
+ #![feature(slice_from_ptr_range)]
+@@ -128,6 +129,7 @@
+ #![feature(unwrap_infallible)]
+ // tidy-alphabetical-end
+ #![allow(internal_features)]
++#![allow(unexpected_cfgs)]
+ #![deny(implicit_provenance_casts)]
+ #![deny(unsafe_op_in_unsafe_fn)]
+ 

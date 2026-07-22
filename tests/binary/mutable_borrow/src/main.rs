@@ -4,6 +4,12 @@ struct Point {
     y: i32,
 }
 
+#[derive(Copy, Clone)]
+struct RepeatPoint {
+    x: i32,
+    y: i32,
+}
+
 // Function taking a mutable borrow of a Point field
 fn make_y_negative(p_y: &mut i32) {
     if *p_y > 0 {
@@ -110,8 +116,24 @@ fn check_maybe_uninit_pointer_write_through() {
         *text.as_mut_ptr() = "new";
         assert!(text.assume_init() == "new");
     }
-}
 
+    let mut bytes = [std::mem::MaybeUninit::new(7_u8); 64];
+    unsafe {
+        *bytes[0].as_mut_ptr() = 11;
+        *bytes[63].as_mut_ptr() = 99;
+        assert!(bytes[0].assume_init() == 11);
+        assert!(bytes[1].assume_init() == 7);
+        assert!(bytes[62].assume_init() == 7);
+        assert!(bytes[63].assume_init() == 99);
+    }
+
+    let mut points = [RepeatPoint { x: 3, y: 4 }; 64];
+    points[0].x = 30;
+    points[63].y = 40;
+    assert!(points[0].x == 30 && points[0].y == 4);
+    assert!(points[1].x == 3 && points[1].y == 4);
+    assert!(points[63].x == 3 && points[63].y == 40);
+}
 
 fn main() {
     // 1. Initial setup

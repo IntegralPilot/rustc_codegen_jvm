@@ -84,6 +84,12 @@ struct PackedWords {
     high: u16,
 }
 
+#[repr(C)]
+struct NestedPackedWords {
+    prefix: u8,
+    words: PackedWords,
+}
+
 #[repr(u32)]
 enum WireState {
     First = 0x1122_3344,
@@ -246,6 +252,7 @@ fn nested_and_aggregate_pointers() {
 }
 
 static STATIC_VALUE: i32 = 21;
+static STATIC_SINGLETON_SLICE: &[i32] = &[123];
 static mut MUTABLE_STATIC_VALUE: i32 = 40;
 static mut DROP_COUNT: u32 = 0;
 
@@ -344,6 +351,10 @@ fn static_addresses() {
     unsafe {
         assert!(*first == 21);
     }
+
+    assert_eq!(STATIC_SINGLETON_SLICE, &[123]);
+    assert_eq!(STATIC_SINGLETON_SLICE.as_ptr(), STATIC_SINGLETON_SLICE.as_ptr());
+    assert_eq!(unsafe { *STATIC_SINGLETON_SLICE.as_ptr() }, 123);
 
     let mutable = core::ptr::addr_of_mut!(MUTABLE_STATIC_VALUE);
     unsafe {
@@ -722,11 +733,34 @@ fn projected_field_addresses_share_allocations() {
     }
     assert!(words.low == 0x1122);
     assert!(words.high == 0x5566);
-    let restored = whole.addr() as *mut PackedWords;
+    let restored = whole.expose_provenance() as *mut PackedWords;
     unsafe {
         (*restored).high = 0x7788;
     }
     assert!(words.high == 0x7788);
+
+    let mut nested = NestedPackedWords {
+        prefix: 7,
+        words: PackedWords {
+            low: 0x1234,
+            high: 0x5678,
+        },
+    };
+    let nested_base = &mut nested as *mut NestedPackedWords;
+    let nested_words = core::ptr::addr_of_mut!(nested.words);
+    let nested_high = core::ptr::addr_of_mut!(nested.words.high);
+    assert!(nested_words.addr() == nested_base.addr() + 2);
+    assert!(nested_high.addr() == nested_base.addr() + 4);
+    assert!(unsafe { nested_high.byte_offset_from(nested_base.cast::<u8>()) } == 4);
+    unsafe {
+        *nested_high = 0xabcd;
+    }
+    assert!(nested.words.high == 0xabcd);
+    let restored_nested_high = nested_high.expose_provenance() as *mut u16;
+    unsafe {
+        *restored_nested_high = 0xcdef;
+    }
+    assert!(nested.words.high == 0xcdef);
 
     let mut overlay = WordBytes { word: 0x1122_3344 };
     let word = core::ptr::addr_of_mut!(overlay.word);
@@ -782,6 +816,12 @@ fn byte_methods_alignment_provenance_and_zsts() {
     assert!(rebuilt == first);
     let metadata_from = first.cast::<u8>().with_metadata_of(first);
     assert!(metadata_from == first);
+    let slice_metadata = &values[1..] as *const [u32];
+    let rebuilt_slice = first.cast::<u8>().with_metadata_of(slice_metadata);
+    assert!(core::ptr::metadata(rebuilt_slice) == 1);
+    unsafe {
+        assert!((*rebuilt_slice)[0] == values[0]);
+    }
     let sized_metadata = core::ptr::metadata(first);
     assert!(sized_metadata == ());
 
@@ -898,6 +938,19 @@ fn raw_slice_metadata() {
     let rebuilt_slice = unsafe { &*rebuilt };
     assert!(rebuilt_slice[1] == 6);
     assert!(rebuilt_slice[2] == 9);
+}
+
+fn narrow_integer_slice_writes() {
+    let mut words = [0_u16; 8];
+    for (index, word) in words.iter_mut().enumerate() {
+        *word = (0x1100 + index) as u16;
+    }
+
+    let middle = &mut words[2..6];
+    middle[0] = 0xabcd;
+    middle[3] = 0xfedc;
+
+    assert_eq!(words, [0x1100, 0x1101, 0xabcd, 0x1103, 0x1104, 0xfedc, 0x1106, 0x1107]);
 }
 
 fn rebuild_sized_pointer<T>(pointer: *const T) -> *const T {
@@ -1243,6 +1296,57 @@ struct Item {
 impl Inspector for Item {
     fn inspect(&self) -> i32 {
         self.value
+    }
+}
+
+fn trait_object_raw_pointer_options() {
+    let mut item = Item { value: 17 };
+    let shared: *const dyn Inspector = &item;
+    let mutable: *mut dyn Inspector = &mut item;
+    unsafe {
+        assert_eq!(shared.as_ref().unwrap().inspect(), 17);
+        assert_eq!(mutable.as_mut().unwrap().inspect(), 17);
+    }
+
+    let null_shared = core::ptr::null::<Item>() as *const dyn Inspector;
+    let null_mutable = core::ptr::null_mut::<Item>() as *mut dyn Inspector;
+    unsafe {
+        assert!(null_shared.as_ref().is_none());
+        assert!(null_mutable.as_mut().is_none());
+    }
+}
+
+fn unsized_raw_pointer_as_ref() {
+    unsafe {
+        let slice: &mut [u8] = &mut [1, 2, 3];
+        let shared: *const [u8] = slice;
+        assert_eq!(shared.as_ref(), Some(&*slice));
+
+        let mutable: *mut [u8] = slice;
+        assert_eq!(mutable.as_ref(), Some(&*slice));
+
+        let empty_shared: *const [u8] = &[];
+        assert_eq!(empty_shared.as_ref(), Some(&[][..]));
+
+        let empty_mutable: *mut [u8] = &mut [];
+        assert_eq!(empty_mutable.as_ref(), Some(&[][..]));
+
+        let null_shared: *const [u8] = core::ptr::null::<[u8; 3]>();
+        let null_mutable: *mut [u8] = core::ptr::null_mut::<[u8; 3]>();
+        assert_eq!(null_shared.as_ref(), None);
+        assert_eq!(null_mutable.as_ref(), None);
+
+        let trait_shared: *const dyn ToString = &3;
+        let trait_mutable: *mut dyn ToString = &mut 3;
+        assert!(trait_shared.as_ref().is_some());
+        assert!(trait_mutable.as_ref().is_some());
+
+        let null_trait_shared =
+            core::ptr::null::<isize>() as *const dyn ToString;
+        let null_trait_mutable =
+            core::ptr::null_mut::<isize>() as *mut dyn ToString;
+        assert!(null_trait_shared.as_ref().is_none());
+        assert!(null_trait_mutable.as_ref().is_none());
     }
 }
 
@@ -1722,6 +1826,8 @@ fn generic_zst_offsets_and_arithmetic() {
             &zst_slice[0] as *const ZeroSized,
             &zst_slice[9] as *const ZeroSized
         );
+        assert_eq!(zst_ptr.add(usize::MAX), zst_ptr);
+        assert_eq!(zst_ptr.wrapping_sub(usize::MAX), zst_ptr);
     }
 }
 
@@ -2023,6 +2129,81 @@ fn atomic_pointer_manipulation() {
     }
 }
 
+fn untyped_swap_and_constant_metadata() {
+    let mut left = 5_u8;
+    let mut right = 6_u8;
+    let left_bool = core::ptr::addr_of_mut!(left).cast::<bool>();
+    let right_bool = core::ptr::addr_of_mut!(right).cast::<bool>();
+    unsafe {
+        core::ptr::swap(left_bool, right_bool);
+        core::ptr::swap_nonoverlapping(left_bool, right_bool, 1);
+        core::ptr::copy(left_bool, right_bool, 1);
+        core::ptr::copy_nonoverlapping(left_bool, right_bool, 1);
+    }
+    assert_eq!((left, right), (5, 5));
+
+    const RAW_SLICE: *const [i32] =
+        core::ptr::slice_from_raw_parts(core::ptr::without_provenance(123), 456);
+    assert_eq!(RAW_SLICE.addr(), 123);
+    assert_eq!(RAW_SLICE.len(), 456);
+
+    const DYN_METADATA: core::ptr::DynMetadata<dyn core::fmt::Debug> =
+        core::ptr::metadata::<dyn core::fmt::Debug>(&[0_u8; 42]);
+    assert_eq!(DYN_METADATA.size_of(), 42);
+    assert_eq!(DYN_METADATA.align_of(), 1);
+}
+
+fn struct_tail_pointer_metadata() {
+    struct MetadataPair<A, B: ?Sized>(A, B);
+
+    let slice_pair: &MetadataPair<bool, [u8]> =
+        &MetadataPair(true, [b'f', b'o', b'o']);
+    assert_eq!(core::ptr::metadata(slice_pair), 3);
+    let str_pair: &MetadataPair<bool, str> = unsafe { core::mem::transmute(slice_pair) };
+    assert_eq!(&str_pair.1, "foo");
+    assert_eq!(core::ptr::metadata(str_pair), 3);
+
+    let trait_pair: &MetadataPair<bool, dyn core::fmt::Debug> =
+        &MetadataPair(true, 7_u32);
+    let metadata = core::ptr::metadata(trait_pair);
+    assert_eq!(metadata.size_of(), core::mem::size_of::<u32>());
+    assert_eq!(metadata.align_of(), core::mem::align_of::<u32>());
+
+    let cell = core::cell::UnsafeCell::new([10_u32, 20, 30]);
+    let unsized_cell: &core::cell::UnsafeCell<[u32]> = &cell;
+    let cell_values = unsized_cell.get();
+    assert_eq!(core::ptr::metadata(cell_values), 3);
+    unsafe {
+        (*cell_values)[1] = 25;
+        assert_eq!(&*cell_values, &[10, 25, 30]);
+    }
+}
+
+fn exposed_allocation_churn() {
+    for round in 0..2_u64 {
+        let mut allocations = Vec::with_capacity(4_096);
+        let mut addresses = Vec::with_capacity(16_384);
+        for index in 0..4_096_u64 {
+            let mut allocation = Box::new([round, index, index + 1, index + 2]);
+            let base = allocation.as_mut_ptr();
+            for offset in 0..4 {
+                addresses.push(unsafe { base.add(offset) }.expose_provenance());
+            }
+            allocations.push(allocation);
+        }
+
+        for index in [0, 2_047, 4_095] {
+            let address = addresses[index * 4 + 2];
+            let pointer = core::ptr::with_exposed_provenance::<u64>(address);
+            assert_eq!(unsafe { *pointer }, index as u64 + 1);
+        }
+
+        // Integer addresses do not keep a deallocated Rust allocation live.
+        // Cleanup must therefore remove every published alias efficiently.
+        drop(allocations);
+    }
+}
+
 fn main() {
     basic_raw_pointer_round_trip();
     array_pointer_arithmetic();
@@ -2046,6 +2227,7 @@ fn main() {
     byte_methods_alignment_provenance_and_zsts();
     stable_pointer_api_surface();
     raw_slice_metadata();
+    narrow_integer_slice_writes();
     generic_sized_raw_pointer_metadata();
     raw_str_metadata();
     pointer_backed_raw_slices();
@@ -2060,6 +2242,8 @@ fn main() {
     pointer_niche_layouts();
     custom_dst_projections();
     verify_noalias_handling();
+    trait_object_raw_pointer_options();
+    unsized_raw_pointer_as_ref();
     fat_pointer_abi_boundaries();
     stack_realignment();
     zst_and_padding_offsets();
@@ -2089,4 +2273,7 @@ fn main() {
     volatile_aggregate_operations();
     multi_trait_object_casting();
     atomic_pointer_manipulation();
+    untyped_swap_and_constant_metadata();
+    struct_tail_pointer_metadata();
+    exposed_allocation_churn();
 }

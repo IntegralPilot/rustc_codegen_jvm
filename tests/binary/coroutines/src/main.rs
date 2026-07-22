@@ -140,4 +140,22 @@ fn main() {
         resume(zero_sized.as_mut(), ()),
         CoroutineState::Complete(())
     ));
+
+    // Boxing a coroutine evaluates `Layout::new::<G>()` after monomorphising
+    // the hidden state-machine type. That layout must not become a null JVM
+    // object merely because rustc still reports parameters in its identity.
+    let payload = [70_i32, 71_i32];
+    let mut boxed = Box::pin(#[coroutine]
+    move || {
+        yield payload[0];
+        payload[1]
+    });
+    assert!(matches!(
+        resume(boxed.as_mut(), ()),
+        CoroutineState::Yielded(70)
+    ));
+    assert!(matches!(
+        resume(boxed.as_mut(), ()),
+        CoroutineState::Complete(71)
+    ));
 }

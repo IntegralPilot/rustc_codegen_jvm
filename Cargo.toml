@@ -15,5 +15,8 @@ breadcrumbs = "0.1.5"
 [lib]
 crate-type = ["dylib"]
 
+[patch.crates-io]
+ristretto_classfile = { git = "https://github.com/IntegralPilot/ristretto.git", rev = "23cd035e386acad45f420f0478415df1d9856b4f" }
+
 [package.metadata.rust-analyzer] 
 rustc_private=true

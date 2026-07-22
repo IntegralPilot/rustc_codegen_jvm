@@ -1,4 +1,8 @@
+#![feature(ptr_metadata, type_info)]
+
 use core::cell::{Ref, RefCell, RefMut};
+use core::any::TypeId;
+use core::mem::type_info::{Type, TypeKind};
 use core::ops::Bound::{Excluded, Included, Unbounded};
 use core::pin::Pin;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -191,6 +195,7 @@ fn main() {
     test_cow_mutability();
     test_recursive_box_list();
     test_box_pin_dispatch();
+    test_owned_and_pinned_unsizing();
     test_slice_and_vec_adapters();
     test_vec_resize_and_leak();
     test_try_reserve();
@@ -209,9 +214,28 @@ fn main() {
     test_layout_computations();
     test_layout_failures_and_alignments();
     test_array_from_mut();
+    test_compile_time_type_info();
     test_boxed_self_receiver();
     test_vec_aggregate_with_function_pointer();
     test_refcell_borrow_guards_drop();
+}
+
+fn test_owned_and_pinned_unsizing() {
+    let boxed: Box<[u8]> = Box::new([1, 2, 3]);
+    assert_eq!(&*boxed, &[1, 2, 3]);
+
+    let rc: Rc<[u8]> = Rc::new([4, 5, 6]);
+    assert_eq!(&*rc, &[4, 5, 6]);
+
+    let mut pinned_values = [core::marker::PhantomPinned, core::marker::PhantomPinned];
+    let pinned_array = unsafe { Pin::new_unchecked(&mut pinned_values) };
+    let pinned_slice: Pin<&mut [core::marker::PhantomPinned]> = pinned_array;
+    assert_eq!(pinned_slice.len(), 2);
+
+    let mut pinned_values = [core::marker::PhantomPinned, core::marker::PhantomPinned];
+    let pinned_array = unsafe { Pin::new_unchecked(&mut pinned_values) };
+    let pinned_dyn: Pin<&mut dyn Send> = pinned_array;
+    drop(pinned_dyn);
 }
 
 fn test_refcell_borrow_guards_drop() {
@@ -441,6 +465,11 @@ fn string_equals_str_reference(left: &String, right: &&str) -> bool {
     <String as PartialEq<&str>>::eq(left, right)
 }
 
+#[inline(never)]
+fn str_equals_string(left: &str, right: &String) -> bool {
+    <str as PartialEq<String>>::eq(left, right)
+}
+
 fn test_string_partial_eq_specializations() {
     let left = String::from("--");
     let right = String::from("--");
@@ -449,6 +478,8 @@ fn test_string_partial_eq_specializations() {
     assert!(strings_are_equal(&left, &right));
     assert!(string_equals_str_reference(&left, &borrowed));
     assert!(!string_equals_str_reference(&left, &"different"));
+    assert!(str_equals_string(borrowed, &left));
+    assert!(!str_equals_string("different", &left));
 }
 
 fn test_aggregate_clone_shims() {
@@ -937,6 +968,17 @@ fn test_sort_and_dedup_custom() {
 
     let position = nums.binary_search(&5);
     assert!(position.is_ok());
+
+    // Exceed the insertion-sort threshold so stable sort has to copy wide
+    // values through its MaybeUninit scratch allocation and pointer cursors.
+    let mut wide = Vec::new();
+    for value in (0_u128..96).rev() {
+        wide.push((value << 64) | (95 - value));
+    }
+    wide.sort();
+    for pair in wide.windows(2) {
+        assert!(pair[0] < pair[1]);
+    }
 }
 
 fn test_overaligned_allocations() {
@@ -1187,4 +1229,128 @@ fn test_array_from_mut() {
     let array: &mut [String; 1] = core::array::from_mut(&mut value);
     array[0].push_str("!");
     assert!(value == "Hello World!");
+}
+
+fn test_compile_time_type_info() {
+    trait GenericTrait<T> {}
+    trait ConstTrait<const VALUE: i32> {
+        type Item;
+    }
+    trait LifetimeTrait<'a, 'b, const VALUE: i32> {}
+    trait ProjectorTrait<'a, 'b> {}
+
+    fn predicates_of<T: ?Sized + 'static>() -> &'static [core::mem::type_info::DynTraitPredicate] {
+        match const { Type::of::<T>() }.kind {
+            TypeKind::DynTrait(dynamic) => dynamic.predicates,
+            _ => panic!("wrong dynamic-trait type information"),
+        }
+    }
+
+    fn has_predicate(
+        predicates: &[core::mem::type_info::DynTraitPredicate],
+        expected: TypeId,
+    ) -> bool {
+        predicates
+            .iter()
+            .any(|predicate| predicate.trait_ty.ty == expected)
+    }
+
+    // These values are fully evaluated by rustc before the backend sees them.
+    match const { Type::of::<[u16; 4]>() }.kind {
+        TypeKind::Array(array) => {
+            assert!(array.element_ty == TypeId::of::<u16>());
+            assert!(array.len == 4);
+        }
+        _ => panic!("wrong array type information"),
+    }
+
+    match const { Type::of::<&mut u64>() }.kind {
+        TypeKind::Reference(reference) => {
+            assert!(reference.pointee == TypeId::of::<u64>());
+            assert!(reference.mutable);
+        }
+        _ => panic!("wrong reference type information"),
+    }
+
+    match const { Type::of::<[usize]>() }.kind {
+        TypeKind::Slice(slice) => assert!(slice.element_ty == TypeId::of::<usize>()),
+        _ => panic!("wrong slice type information"),
+    }
+
+    match const { Type::of::<*const u8>() }.kind {
+        TypeKind::Pointer(pointer) => {
+            assert!(pointer.pointee == TypeId::of::<u8>());
+            assert!(!pointer.mutable);
+        }
+        _ => panic!("wrong pointer type information"),
+    }
+
+    match const { Type::of::<dyn Send>() }.kind {
+        TypeKind::DynTrait(dynamic) => {
+            assert!(dynamic.predicates.len() == 1);
+            assert!(dynamic.predicates[0].trait_ty.ty == TypeId::of::<dyn Send>());
+            assert!(dynamic.predicates[0].trait_ty.is_auto);
+        }
+        _ => panic!("wrong dynamic-trait type information"),
+    }
+
+    let predicates = predicates_of::<dyn GenericTrait<i32>>();
+    assert!(predicates.len() == 1);
+    assert!(has_predicate(predicates, TypeId::of::<dyn GenericTrait<i32>>()));
+
+    let predicates = predicates_of::<dyn ConstTrait<5, Item = i32>>();
+    assert!(predicates.len() == 1);
+    assert!(has_predicate(
+        predicates,
+        TypeId::of::<dyn ConstTrait<5, Item = i32>>()
+    ));
+
+    let predicates = predicates_of::<dyn for<'a> LifetimeTrait<'a, 'a, 7>>();
+    assert!(predicates.len() == 1);
+    assert_eq!(
+        predicates[0].trait_ty.ty,
+        TypeId::of::<dyn for<'a> LifetimeTrait<'a, 'a, 7>>()
+    );
+
+    let predicates = predicates_of::<dyn LifetimeTrait<'static, 'static, 7>>();
+    assert!(predicates.len() == 1);
+    assert!(has_predicate(
+        predicates,
+        TypeId::of::<dyn LifetimeTrait<'static, 'static, 7>>()
+    ));
+
+    let predicates = predicates_of::<dyn for<'a, 'b> LifetimeTrait<'a, 'b, 7>>();
+    assert!(predicates.len() == 1);
+    assert!(has_predicate(
+        predicates,
+        TypeId::of::<dyn for<'a, 'b> LifetimeTrait<'a, 'b, 7>>()
+    ));
+
+    let predicates = predicates_of::<dyn for<'a, 'b> ProjectorTrait<'a, 'b>>();
+    assert!(predicates.len() == 1);
+    assert!(has_predicate(
+        predicates,
+        TypeId::of::<dyn for<'a, 'b> ProjectorTrait<'a, 'b>>()
+    ));
+
+    let predicates = predicates_of::<dyn for<'a> LifetimeTrait<'a, 'a, 7> + Send + Sync>();
+    assert!(predicates.len() == 3);
+    assert!(has_predicate(
+        predicates,
+        TypeId::of::<dyn for<'a> LifetimeTrait<'a, 'a, 7>>()
+    ));
+    assert!(has_predicate(predicates, TypeId::of::<dyn Send>()));
+    assert!(has_predicate(predicates, TypeId::of::<dyn Sync>()));
+
+    let action = ConcreteAction { factor: 21 };
+    let trait_info = const {
+        TypeId::of::<ConcreteAction>().trait_info_of::<dyn Action>()
+    };
+    let metadata = trait_info.unwrap().get_vtable();
+    let reflected = unsafe {
+        core::ptr::from_raw_parts::<dyn Action>(&raw const action, metadata)
+            .as_ref()
+            .unwrap()
+    };
+    assert!(reflected.perform() == 42);
 }

@@ -7,9 +7,12 @@ use rustc_middle::{
         Body, Const, ConstOperand, ConstValue, Operand as MirOperand, Place,
         interpret::{ErrorHandled, Scalar},
     },
-    ty::{ConstKind, EarlyBinder, Instance, Ty, TyCtxt, TypeVisitableExt, TypingEnv},
+    ty::{ConstKind, EarlyBinder, Instance, Ty, TyCtxt, TypingEnv},
 };
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static COPY_OPERAND_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 pub(super) mod const_eval;
 
@@ -105,19 +108,10 @@ pub fn convert_operand<'tcx>(
                             rustc_middle::ty::Unnormalized::new_wip(ty),
                         )
                         .unwrap_or(ty);
-                    // If the constant depends on generic parameters (e.g. Self::Assoc),
-                    // we cannot evaluate it at compile time (and trying to causes an ICE).
-                    if uv.args.has_param() {
-                        breadcrumbs::log!(
-                            breadcrumbs::LogLevel::Info,
-                            "const-eval",
-                            format!("Skipping evaluation of generic constant {:?}", uv)
-                        );
-                        return default_operand_for_rust_type(ty, tcx, data_types, instance);
-                    }
-
-                    // Create the parameter environment. reveal_all is usually okay for codegen.
-                    let typing_env = TypingEnv::post_analysis(tcx, uv.def);
+                    // The instantiated arguments are monomorphic even when a
+                    // coroutine identity still reports generic parameters.
+                    // Evaluating in the definition's environment loses that.
+                    let typing_env = TypingEnv::fully_monomorphized();
 
                     // Try to evaluate the unevaluated constant using the correct function
                     // Use uv (the UnevaluatedConst) directly.
@@ -183,8 +177,54 @@ pub fn convert_operand<'tcx>(
 
             instructions.extend(get_instructions);
 
+            let loaded = oomir::Operand::Variable {
+                name: final_var_name.clone(),
+                ty: final_type.clone(),
+            };
+            let MirOperand::Copy(_) = mir_op else {
+                return loaded;
+            };
+            let rust_ty = EarlyBinder::bind(tcx, place.ty(&mir.local_decls, tcx).ty)
+                .instantiate(tcx, instance.args)
+                .skip_norm_wip();
+            let rust_ty = tcx
+                .try_normalize_erasing_regions(
+                    TypingEnv::fully_monomorphized(),
+                    rustc_middle::ty::Unnormalized::new_wip(rust_ty),
+                )
+                .unwrap_or(rust_ty);
+            if !final_type.is_jvm_reference_type()
+                || matches!(final_type, oomir::Type::Pointer(_))
+                || !tcx.type_is_copy_modulo_regions(TypingEnv::fully_monomorphized(), rust_ty)
+            {
+                return loaded;
+            }
+
+            let copy_id = COPY_OPERAND_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let object_ty = oomir::Type::Class("java/lang/Object".to_string());
+            let object_dest = format!("{final_var_name}_copy_object_{copy_id}");
+            let copy_dest = format!("{final_var_name}_copy_{copy_id}");
+            instructions.push(oomir::Instruction::InvokeStatic {
+                dest: Some(object_dest.clone()),
+                class_name: oomir::POINTER_CLASS.to_string(),
+                method_name: "copyManagedValue".to_string(),
+                method_ty: oomir::Signature {
+                    params: vec![("value".to_string(), object_ty.clone())],
+                    ret: Box::new(object_ty.clone()),
+                    is_static: true,
+                },
+                args: vec![loaded],
+            });
+            instructions.push(oomir::Instruction::Cast {
+                op: oomir::Operand::Variable {
+                    name: object_dest,
+                    ty: object_ty,
+                },
+                ty: final_type.clone(),
+                dest: copy_dest.clone(),
+            });
             oomir::Operand::Variable {
-                name: final_var_name,
+                name: copy_dest,
                 ty: final_type,
             }
         }
@@ -387,9 +427,13 @@ pub fn extract_number_from_operand(operand: oomir::Operand) -> Option<i64> {
     match operand {
         oomir::Operand::Constant(constant) => match constant {
             oomir::Constant::I8(val) => Some(val as i64),
+            oomir::Constant::U8(val) => Some(val as i64),
             oomir::Constant::I16(val) => Some(val as i64),
+            oomir::Constant::U16(val) => Some(val as i64),
             oomir::Constant::I32(val) => Some(val as i64),
+            oomir::Constant::U32(val) => Some(val as i64),
             oomir::Constant::I64(val) => Some(val),
+            oomir::Constant::U64(val) => i64::try_from(val).ok(),
             oomir::Constant::Boolean(val) => Some(if val { 1 } else { 0 }),
             oomir::Constant::Char(val) => Some(val as i64),
             oomir::Constant::F32(val) => Some(val.round() as i64),
