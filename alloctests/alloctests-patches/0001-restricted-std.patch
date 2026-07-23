@@ -1,0 +1,116 @@
+diff --git a/lib.rs b/lib.rs
+--- a/lib.rs
++++ b/lib.rs
+@@ -1,3 +1,4 @@
+ #![cfg(test)]
++#![feature(restricted_std)]
+ #![allow(unused_attributes)]
+ #![unstable(feature = "alloctests", issue = "none")]
+diff --git a/tests/lib.rs b/tests/lib.rs
+--- a/tests/lib.rs
++++ b/tests/lib.rs
+@@ -1,5 +1,6 @@
+ // tidy-alphabetical-start
+ #![allow(internal_features)]
++#![allow(unexpected_cfgs)]
+ #![deny(implicit_provenance_casts)]
+ #![deny(unsafe_op_in_unsafe_fn)]
+ #![feature(allocator_api)]
+@@ -45,4 +46,5 @@
+ #![feature(vec_deque_retain_range)]
+ #![feature(vec_peek_mut)]
+ #![feature(vec_try_remove)]
++#![feature(restricted_std)]
+ // tidy-alphabetical-end
+diff --git a/tests/collections/binary_heap.rs b/tests/collections/binary_heap.rs
+--- a/tests/collections/binary_heap.rs
++++ b/tests/collections/binary_heap.rs
+@@ -546,7 +546,7 @@ fn panic_safe() {
+     let mut rng = crate::test_rng();
+     const DATASZ: usize = 32;
+     // Miri is too slow
+-    let ntest = if cfg!(miri) { 1 } else { 10 };
++    let ntest = if cfg!(any(miri, target_os = "jvm")) { 1 } else { 10 };
+ 
+     // don't use 0 in the data -- we want to catch the zeroed-out case.
+     let data = (1..=DATASZ).collect::<Vec<_>>();
+diff --git a/tests/sort/partial.rs b/tests/sort/partial.rs
+--- a/tests/sort/partial.rs
++++ b/tests/sort/partial.rs
+@@ -81,7 +81,7 @@ fn random_patterns() {
+     check_is_partial_sorted_ranges(&patterns::random(50));
+ 
+     // Longer tests would take hours to run under Miri.
+-    if !cfg!(miri) {
++    if !cfg!(any(miri, target_os = "jvm")) {
+         check_is_partial_sorted_ranges(&patterns::random(100));
+         check_is_partial_sorted_ranges(&patterns::random(1000));
+     }
+diff --git a/tests/sort/tests.rs b/tests/sort/tests.rs
+--- a/tests/sort/tests.rs
++++ b/tests/sort/tests.rs
+@@ -927,6 +927,7 @@ macro_rules! instantiate_sort_test_inner {
+ macro_rules! instantiate_sort_test_inner {
+     ($sort_impl:ty, miri_yes, $test_fn_name:ident) => {
+         #[test]
++        #[cfg_attr(target_os = "jvm", ignore)]
+         fn $test_fn_name() {
+             $crate::sort::tests::$test_fn_name::<$sort_impl>();
+         }
+@@ -935,7 +936,7 @@ macro_rules! instantiate_sort_test_inner {
+     };
+     ($sort_impl:ty, miri_no, $test_fn_name:ident) => {
+         #[test]
+-        #[cfg_attr(miri, ignore)]
++        #[cfg_attr(any(miri, target_os = "jvm"), ignore)]
+         fn $test_fn_name() {
+             $crate::sort::tests::$test_fn_name::<$sort_impl>();
+         }
+diff --git a/tests/str.rs b/tests/str.rs
+--- a/tests/str.rs
++++ b/tests/str.rs
+@@ -2362,15 +2362,15 @@ fn test_from_utf8() {
+ #[test]
+ fn utf8_char_counts() {
+     let strs = [("e", 1), ("é", 1), ("€", 1), ("\u{10000}", 1), ("eé€\u{10000}", 4)];
+-    let spread = if cfg!(miri) { 4 } else { 8 };
++    let spread = if cfg!(any(miri, target_os = "jvm")) { 4 } else { 8 };
+     let mut reps = [8, 64, 256, 512]
+         .iter()
+         .copied()
+         .flat_map(|n| n - spread..=n + spread)
+         .collect::<Vec<usize>>();
+-    if cfg!(not(miri)) {
++    if cfg!(not(any(miri, target_os = "jvm"))) {
+         // Miri is too slow
+         reps.extend([1024, 1 << 16].iter().copied().flat_map(|n| n - spread..=n + spread));
+     }
+-    let counts = if cfg!(miri) { 0..1 } else { 0..8 };
++    let counts = if cfg!(any(miri, target_os = "jvm")) { 0..1 } else { 0..8 };
+     let padding = counts.map(|len| " ".repeat(len)).collect::<Vec<String>>();
+ 
+     for repeat in reps {
+diff --git a/tests/sync.rs b/tests/sync.rs
+--- a/tests/sync.rs
++++ b/tests/sync.rs
+@@ -459,7 +459,7 @@ fn test_weak_count_locked() {
+     let a2 = a.clone();
+     let t = thread::spawn(move || {
+         // Miri is too slow
+-        let count = if cfg!(miri) { 1000 } else { 1000000 };
++        let count = if cfg!(any(miri, target_os = "jvm")) { 1000 } else { 1000000 };
+         for _i in 0..count {
+             Arc::get_mut(&mut a);
+         }
+diff --git a/tests/vec_deque.rs b/tests/vec_deque.rs
+--- a/tests/vec_deque.rs
++++ b/tests/vec_deque.rs
+@@ -998,7 +998,7 @@ fn test_append_permutations() {
+     }
+ 
+     // Miri is too slow
+-    let max = if cfg!(miri) { 3 } else { 5 };
++    let max = if cfg!(any(miri, target_os = "jvm")) { 3 } else { 5 };
+ 
+     // Many different permutations of both the `VecDeque` getting appended to
+     // and the one getting appended are generated to check `append`.
