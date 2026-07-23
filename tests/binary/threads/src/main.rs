@@ -153,7 +153,7 @@ fn condvar_and_barrier() {
 
     let timed = Mutex::new(false);
     let result = Condvar::new()
-        .wait_timeout(timed.lock().unwrap(), Duration::from_millis(2))
+        .wait_timeout(timed.lock().unwrap(), Duration::from_millis(1000))
         .unwrap();
     assert!(result.1.timed_out());
 
@@ -189,7 +189,7 @@ fn park_and_unpark() {
     resumed.store(true, Ordering::Release);
     worker_thread.unpark();
     worker.join().unwrap();
-    thread::park_timeout(Duration::from_millis(1));
+    thread::park_timeout(Duration::from_millis(500));
 }
 
 fn channel_block_rollover() {
