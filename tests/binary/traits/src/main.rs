@@ -38,6 +38,33 @@ trait PrimitiveTraitObject {
     fn doubled(&self) -> i32;
 }
 
+trait FallibleTraitObject {
+    fn run(&mut self, descriptor: &FallibleDescriptor) -> std::io::Result<()>;
+}
+
+struct FallibleDescriptor {
+    name: std::borrow::Cow<'static, str>,
+}
+
+struct FallibleRunner {
+    calls: usize,
+}
+
+impl FallibleTraitObject for FallibleRunner {
+    fn run(&mut self, descriptor: &FallibleDescriptor) -> std::io::Result<()> {
+        assert!(descriptor.name == "projection");
+        self.calls += 1;
+        Ok(())
+    }
+}
+
+fn run_fallible(
+    value: &mut dyn FallibleTraitObject,
+    descriptor: &FallibleDescriptor,
+) -> std::io::Result<()> {
+    value.run(descriptor)
+}
+
 trait DynSource {
     type Item;
 
@@ -405,6 +432,13 @@ fn main() {
     assert!(provided_object.with_default() == 42);
     assert!(first_tuple_value((&20_i32,)) == 20);
     assert!(second_tuple_value((&22_i64,)) == 22);
+
+    let mut fallible = FallibleRunner { calls: 0 };
+    let descriptor = FallibleDescriptor {
+        name: std::borrow::Cow::Borrowed("projection"),
+    };
+    run_fallible(&mut fallible, &descriptor).unwrap();
+    assert!(fallible.calls == 1);
 
     // If we reach here without panic, the test passes
 }

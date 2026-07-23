@@ -4936,21 +4936,11 @@ pub fn ty_to_oomir_type<'tcx>(
     data_types: &mut HashMap<String, oomir::DataType>,
     instance_context: rustc_middle::ty::Instance<'tcx>,
 ) -> oomir::Type {
-    // Check if the instance args contain generic parameters.
-    let has_params = instance_context.args.has_param();
-
-    let resolved_ty = if has_params {
-        rustc_middle::ty::EarlyBinder::bind(tcx, ty)
-            .instantiate(tcx, instance_context.args)
-            .skip_norm_wip()
-    } else {
-        let instantiated =
-            rustc_middle::ty::EarlyBinder::bind(tcx, ty).instantiate(tcx, instance_context.args);
-        match tcx.try_normalize_erasing_regions(TypingEnv::fully_monomorphized(), instantiated) {
-            Ok(normalized) => normalized,
-            Err(_) => instantiated.skip_norm_wip(),
-        }
-    };
+    let instantiated =
+        rustc_middle::ty::EarlyBinder::bind(tcx, ty).instantiate(tcx, instance_context.args);
+    let resolved_ty = tcx
+        .try_normalize_erasing_regions(TypingEnv::fully_monomorphized(), instantiated)
+        .unwrap_or_else(|_| instantiated.skip_norm_wip());
     let cache_key = (
         std::ptr::from_ref(data_types) as usize,
         std::ptr::from_ref(resolved_ty.kind()) as usize,

@@ -3,7 +3,7 @@
 
 use std::cell::Cell;
 use std::collections::HashMap;
-use std::hash::{BuildHasherDefault, DefaultHasher};
+use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher, Hasher, RandomState};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Condvar, Mutex, Once, OnceLock, RwLock, mpsc};
 use std::thread;
@@ -35,8 +35,24 @@ fn main() {
     park_and_unpark();
     channel_block_rollover();
     thread_local_storage();
+    random_state_thread_local_cleanup();
     hash_maps_across_threads();
     concurrent_spawn_hook_lifetimes();
+}
+
+fn random_state_thread_local_cleanup() {
+    thread::spawn(|| {
+        let state = RandomState::new();
+        let dynamic: &dyn BuildHasher<Hasher = DefaultHasher> = &state;
+        let hash = || {
+            let mut hasher = dynamic.build_hasher();
+            hasher.write_u64(0x1234_5678_9abc_def0);
+            hasher.finish()
+        };
+        assert!(hash() == hash());
+    })
+    .join()
+    .unwrap();
 }
 
 fn spawn_join_and_names() {

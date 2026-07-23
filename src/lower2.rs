@@ -14,10 +14,10 @@ use translator::FunctionTranslator;
 
 use self::jvm::{
     ClassAccessFlags, ClassFile, FieldAccessFlags, MethodAccessFlags, Version,
-    attributes::{Attribute, BootstrapMethod, Instruction, MaxStack},
+    attributes::{ArrayType, Attribute, BootstrapMethod, Instruction, MaxStack},
 };
 use constant_pool::{InternedConstantPool, verify_no_duplicate_constants};
-use consts::load_constant;
+use consts::{get_int_const_instr, load_constant};
 use rustc_middle::ty::TyCtxt;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -94,6 +94,168 @@ fn factory_return_instruction(ty: &oomir::Type) -> Instruction {
     }
 }
 
+fn add_constant_helper_method(
+    cp: &mut InternedConstantPool,
+    methods: &mut Vec<jvm::Method>,
+    method_name: &str,
+    descriptor: &str,
+    max_locals: u16,
+    instructions: Vec<Instruction>,
+) -> jvm::Result<()> {
+    let max_stack = instructions.max_stack(cp)?.saturating_mul(2).max(4);
+    let code = Attribute::Code {
+        name_index: cp.add_utf8("Code")?,
+        max_stack,
+        max_locals,
+        code: instructions,
+        exception_table: Vec::new(),
+        attributes: Vec::new(),
+    };
+    methods.push(jvm::Method {
+        access_flags: MethodAccessFlags::PRIVATE
+            | MethodAccessFlags::STATIC
+            | MethodAccessFlags::SYNTHETIC,
+        name_index: cp.add_utf8(method_name)?,
+        descriptor_index: cp.add_utf8(descriptor)?,
+        attributes: vec![code],
+    });
+    Ok(())
+}
+
+fn append_empty_array(
+    instructions: &mut Vec<Instruction>,
+    cp: &mut InternedConstantPool,
+    element_type: &oomir::Type,
+    length: usize,
+) -> jvm::Result<()> {
+    let length = i32::try_from(length).map_err(|_| jvm::Error::VerificationError {
+        context: "constant array allocation".to_string(),
+        message: "Constant array length exceeds the JVM address space".to_string(),
+    })?;
+    instructions.push(get_int_const_instr(cp, length));
+    if !element_type.has_jvm_value() {
+        instructions.push(Instruction::Anewarray(cp.add_class("java/lang/Object")?));
+    } else if let Some(code) = element_type.to_jvm_primitive_array_type_code() {
+        let array_type = ArrayType::from_bytes(&mut jvm::ByteReader::new(&[code]))?;
+        instructions.push(Instruction::Newarray(array_type));
+    } else if let Some(internal_name) = element_type.to_jvm_internal_name() {
+        instructions.push(Instruction::Anewarray(cp.add_class(&internal_name)?));
+    } else {
+        return Err(jvm::Error::VerificationError {
+            context: "constant array allocation".to_string(),
+            message: format!("Cannot create a JVM array for element type {element_type:?}"),
+        });
+    }
+    Ok(())
+}
+
+fn create_chunked_array_factory(
+    cp: &mut InternedConstantPool,
+    owner_class: &str,
+    element_type: &oomir::Type,
+    elements: &[oomir::Constant],
+    methods: &mut Vec<jvm::Method>,
+    next_factory: &mut usize,
+) -> jvm::Result<oomir::Constant> {
+    let mut prepared = Vec::with_capacity(elements.len());
+    for element in elements {
+        if constant_instruction_cost(element) > MAX_INLINE_CONSTANT_INSTRUCTIONS {
+            prepared.push(create_constant_factory(
+                cp,
+                owner_class,
+                element,
+                methods,
+                next_factory,
+            )?);
+        } else {
+            prepared.push(element.clone());
+        }
+    }
+
+    let array_type = oomir::Type::Array(Box::new(element_type.clone()));
+    let array_descriptor = array_type.to_jvm_descriptor();
+    let fill_descriptor = format!("({array_descriptor})V");
+    let store_instruction = element_type.get_jvm_array_store_instruction();
+    let mut fill_methods = Vec::new();
+
+    if let Some(store_instruction) = store_instruction {
+        let mut start = 0;
+        while start < prepared.len() {
+            let mut end = start;
+            let mut chunk_cost = 0usize;
+            while end < prepared.len() {
+                let element_cost = 3usize.saturating_add(constant_instruction_cost(&prepared[end]));
+                if end > start
+                    && chunk_cost.saturating_add(element_cost) > MAX_INLINE_CONSTANT_INSTRUCTIONS
+                {
+                    break;
+                }
+                chunk_cost = chunk_cost.saturating_add(element_cost);
+                end += 1;
+            }
+
+            let method_name = format!("_constant_fill_{}", *next_factory);
+            *next_factory += 1;
+            let mut instructions = Vec::new();
+            for (index, element) in prepared[start..end].iter().enumerate() {
+                let absolute_index = start + index;
+                let constant_type = oomir::Type::from_constant(element);
+                if constant_type != *element_type
+                    && !helpers::are_types_jvm_compatible(&constant_type, element_type)
+                {
+                    return Err(jvm::Error::VerificationError {
+                        context: format!("constant array element {absolute_index}"),
+                        message: format!("Expected {element_type:?}, found {constant_type:?}"),
+                    });
+                }
+                instructions.push(Instruction::Aload_0);
+                instructions.push(get_int_const_instr(
+                    cp,
+                    i32::try_from(absolute_index).map_err(|_| jvm::Error::VerificationError {
+                        context: "constant array fill".to_string(),
+                        message: "Constant array index exceeds the JVM address space".to_string(),
+                    })?,
+                ));
+                load_constant(&mut instructions, cp, element)?;
+                instructions.push(store_instruction.clone());
+            }
+            instructions.push(Instruction::Return);
+            add_constant_helper_method(
+                cp,
+                methods,
+                &method_name,
+                &fill_descriptor,
+                1,
+                instructions,
+            )?;
+            fill_methods.push(method_name);
+            start = end;
+        }
+    }
+
+    let method_name = format!("_constant_factory_{}", *next_factory);
+    *next_factory += 1;
+    let descriptor = format!("(){array_descriptor}");
+    let mut instructions = Vec::new();
+    append_empty_array(&mut instructions, cp, element_type, prepared.len())?;
+    instructions.push(Instruction::Astore_0);
+    let owner = cp.add_class(owner_class)?;
+    for fill_method in fill_methods {
+        instructions.push(Instruction::Aload_0);
+        let method = cp.add_method_ref(owner, &fill_method, &fill_descriptor)?;
+        instructions.push(Instruction::Invokestatic(method));
+    }
+    instructions.push(Instruction::Aload_0);
+    instructions.push(Instruction::Areturn);
+    add_constant_helper_method(cp, methods, &method_name, &descriptor, 1, instructions)?;
+
+    Ok(oomir::Constant::FactoryCall {
+        owner_class: owner_class.to_string(),
+        method_name,
+        ty: array_type,
+    })
+}
+
 fn create_constant_factory(
     cp: &mut InternedConstantPool,
     owner_class: &str,
@@ -101,13 +263,54 @@ fn create_constant_factory(
     methods: &mut Vec<jvm::Method>,
     next_factory: &mut usize,
 ) -> jvm::Result<oomir::Constant> {
+    if let oomir::Constant::Array(element_type, elements) = constant
+        && constant_instruction_cost(constant) > MAX_INLINE_CONSTANT_INSTRUCTIONS
+    {
+        return create_chunked_array_factory(
+            cp,
+            owner_class,
+            element_type,
+            elements,
+            methods,
+            next_factory,
+        );
+    }
+    if let oomir::Constant::Slice(element_type, elements) = constant
+        && constant_instruction_cost(constant) > MAX_INLINE_CONSTANT_INSTRUCTIONS
+    {
+        let backing = create_chunked_array_factory(
+            cp,
+            owner_class,
+            element_type,
+            elements,
+            methods,
+            next_factory,
+        )?;
+        return create_constant_factory(
+            cp,
+            owner_class,
+            &oomir::Constant::SliceRef {
+                backing: Box::new(backing),
+                element_type: element_type.clone(),
+                offset: 0,
+                length: elements.len() as u64,
+            },
+            methods,
+            next_factory,
+        );
+    }
+
     let prepared = match constant {
         oomir::Constant::Array(element_type, elements) => oomir::Constant::Array(
             element_type.clone(),
             elements
                 .iter()
                 .map(|element| {
-                    create_constant_factory(cp, owner_class, element, methods, next_factory)
+                    if constant_instruction_cost(element) > MAX_INLINE_CONSTANT_INSTRUCTIONS {
+                        create_constant_factory(cp, owner_class, element, methods, next_factory)
+                    } else {
+                        Ok(element.clone())
+                    }
                 })
                 .collect::<jvm::Result<Vec<_>>>()?,
         ),
@@ -116,7 +319,11 @@ fn create_constant_factory(
             elements
                 .iter()
                 .map(|element| {
-                    create_constant_factory(cp, owner_class, element, methods, next_factory)
+                    if constant_instruction_cost(element) > MAX_INLINE_CONSTANT_INSTRUCTIONS {
+                        create_constant_factory(cp, owner_class, element, methods, next_factory)
+                    } else {
+                        Ok(element.clone())
+                    }
                 })
                 .collect::<jvm::Result<Vec<_>>>()?,
         ),
@@ -206,23 +413,7 @@ fn create_constant_factory(
     let mut instructions = Vec::new();
     load_constant(&mut instructions, cp, &prepared)?;
     instructions.push(factory_return_instruction(&return_type));
-    let max_stack = instructions.max_stack(cp)?.saturating_mul(2).max(4);
-    let code = Attribute::Code {
-        name_index: cp.add_utf8("Code")?,
-        max_stack,
-        max_locals: 0,
-        code: instructions,
-        exception_table: Vec::new(),
-        attributes: Vec::new(),
-    };
-    methods.push(jvm::Method {
-        access_flags: MethodAccessFlags::PRIVATE
-            | MethodAccessFlags::STATIC
-            | MethodAccessFlags::SYNTHETIC,
-        name_index: cp.add_utf8(&method_name)?,
-        descriptor_index: cp.add_utf8(&descriptor)?,
-        attributes: vec![code],
-    });
+    add_constant_helper_method(cp, methods, &method_name, &descriptor, 0, instructions)?;
 
     Ok(oomir::Constant::FactoryCall {
         owner_class: owner_class.to_string(),

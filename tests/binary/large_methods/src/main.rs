@@ -1,3 +1,17 @@
+#[derive(Clone, Copy)]
+struct ConstantEntry {
+    value: u32,
+    enabled: bool,
+}
+
+static LARGE_CONSTANT_TABLE: [ConstantEntry; 17_000] = [
+    ConstantEntry {
+        value: 37,
+        enabled: true,
+    };
+    17_000
+];
+
 macro_rules! repeat_2 {
     ($($body:tt)*) => {
         $($body)*
@@ -635,6 +649,10 @@ fn reference(seed: u64) -> u64 {
 }
 
 fn main() {
+    assert_eq!(LARGE_CONSTANT_TABLE.len(), 17_000);
+    assert_eq!(LARGE_CONSTANT_TABLE[0].value, 37);
+    assert!(LARGE_CONSTANT_TABLE[16_999].enabled);
+
     for seed in [0, 1, 7, u32::MAX as u64, u64::MAX - 300] {
         assert_eq!(outlined_with_many_live_values(seed), reference(seed));
     }

@@ -246,11 +246,7 @@ fn associated_specialization_name<'tcx>(
             generic_tokens.push(super::types::sanitize_name_token(&token));
         }
     }
-    let identity = format!(
-        "{}:{}",
-        super::types::stable_def_path(tcx, canonical_def_id),
-        tcx.symbol_name(instance).name
-    );
+    let identity = super::types::stable_def_path(tcx, canonical_def_id);
     crate::stable_hash::readable_or_hashed_name(
         &method,
         &generic_tokens.join("_"),
@@ -364,7 +360,9 @@ pub fn mono_fn_name_from_instance<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'t
         }
     }
 
-    let identity = tcx.symbol_name(instance).name;
+    // Upstream generic symbols include the instantiating crate, so use the
+    // definition path plus the complete suffix as the cross-crate JVM identity.
+    let identity = super::types::stable_def_path(tcx, instance.def_id());
     FnNameData {
         class_to_call_on: class,
         method_name: crate::stable_hash::readable_or_hashed_name(
