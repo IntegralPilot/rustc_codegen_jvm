@@ -223,17 +223,27 @@ public final class ThreadSupport {
                     monitor.wait(remaining / 1_000_000, (int) (remaining % 1_000_000));
                     long elapsed = Math.max(0, System.nanoTime() - started);
                     remaining = Math.max(0, remaining - elapsed);
-                    if (remaining == 0
-                            && (int) Pointer.atomicLoad(address, 4, 0) == expected) {
+                    // wait() can return early with no real notify (a spurious
+                    // wakeup, and Windows JVMs in particular are prone to this
+                    // due to coarser timer/scheduling granularity than Linux).
+                    // Only report "woken" if the watched value actually
+                    // changed; otherwise keep waiting out the remaining
+                    // budget, and only report a genuine timeout once that
+                    // budget is exhausted.
+                    if ((int) Pointer.atomicLoad(address, 4, 0) != expected) {
+                        if (interrupted) {
+                            Thread.currentThread().interrupt();
+                        }
+                        return true;
+                    }
+                    if (remaining <= 0) {
                         if (interrupted) {
                             Thread.currentThread().interrupt();
                         }
                         return false;
                     }
-                    if (interrupted) {
-                        Thread.currentThread().interrupt();
-                    }
-                    return true;
+                    // Value unchanged and time remains: loop and wait again.
+                    continue;
                 } catch (InterruptedException error) {
                     interrupted = true;
                     long elapsed = Math.max(0, System.nanoTime() - started);
