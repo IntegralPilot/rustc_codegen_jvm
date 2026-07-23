@@ -1465,7 +1465,7 @@ const LISTENING_CHANNELS: &[&str] = &[];
 
 impl breadcrumbs::LogListener for RustcCodegenJvmLogListener {
     fn on_log(&mut self, log: breadcrumbs::Log) {
-        if log.level.is_at_least(breadcrumbs::LogLevel::Warn)
+        if log.level.is_at_least(breadcrumbs::LogLevel::Error)
             || LISTENING_CHANNELS.contains(&log.channel.as_str())
         {
             println!("{}", log);

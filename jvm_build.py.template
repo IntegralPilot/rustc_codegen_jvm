@@ -1,0 +1,47 @@
+#!/usr/bin/env python3
+import os
+import sys
+import subprocess
+
+def main():
+    # 1. Run stdlib_overlay.py using current Python interpreter
+    overlay_script = "../../../stdlib_overlay.py"
+    
+    try:
+        overlay_src = subprocess.check_output(
+            [sys.executable, overlay_script],
+            text=True
+        ).strip()
+    except subprocess.CalledProcessError as e:
+        print(f"Error running {overlay_script}: {e}", file=sys.stderr)
+        sys.exit(e.returncode)
+
+    # 2. Prepare environment variables
+    env = os.environ.copy()
+    env["__CARGO_TESTS_ONLY_SRC_ROOT"] = overlay_src
+
+    # 3. Construct base cargo command
+    target_json = "../../../jvm-unknown-unknown.json"
+    cargo_cmd = [
+        "cargo",
+        "build",
+        "--target", target_json,
+        "-Zjson-target-spec",
+        "-Zbuild-std=std,panic_unwind",
+        "-Zbuild-std-features="
+    ]
+
+    # 4. Forward any arguments passed to this script (e.g., --release) to cargo
+    cargo_cmd.extend(sys.argv[1:])
+
+    # 5. Execute cargo build cross-platform
+    try:
+        subprocess.run(cargo_cmd, env=env, check=True)
+    except subprocess.CalledProcessError as e:
+        sys.exit(e.returncode)
+    except FileNotFoundError:
+        print("Error: 'cargo' executable not found in PATH.", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

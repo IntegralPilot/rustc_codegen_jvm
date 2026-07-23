@@ -234,6 +234,7 @@ def generate_config_files():
         
         target_path = template_path.with_suffix("") # Removes .template
         target_path.write_text(content)
+        shutil.copymode(template_path, target_path)
         print(f"   Generated {target_path.name}")
     print(f"{Colors.GREEN}   Configuration files generated.{Colors.RESET}")
     
