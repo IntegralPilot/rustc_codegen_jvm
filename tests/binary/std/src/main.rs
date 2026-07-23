@@ -1,10 +1,13 @@
 use std::env;
 use std::io::{self, Read};
+use std::net::Ipv6Addr;
 
 fn main() {
     test_arguments();
     test_environment();
     test_stdin();
+    test_pointer_formatting();
+    test_ipv6_formatting();
     println!("std support ok");
 }
 
@@ -40,4 +43,23 @@ fn test_stdin() {
     let mut input = String::new();
     io::stdin().read_to_string(&mut input).unwrap();
     assert_eq!(input, "first line\nsecond café line\n");
+}
+
+fn test_pointer_formatting() {
+    let bytes: &[u8] = b"";
+    let text: &str = "";
+    assert_eq!(format!("{text:p}"), format!("{:p}", text as *const _));
+    assert_eq!(format!("{bytes:p}"), format!("{:p}", bytes as *const _));
+}
+
+fn test_ipv6_formatting() {
+    let address = Ipv6Addr::new(0xae, 0, 0, 0, 0, 0xffff, 0x0102, 0x0304);
+    assert_eq!(
+        address.segments(),
+        [0xae, 0, 0, 0, 0, 0xffff, 0x0102, 0x0304]
+    );
+    assert_eq!(
+        address.to_string(),
+        "ae::ffff:102:304"
+    );
 }

@@ -972,6 +972,26 @@ fn generic_sized_raw_pointer_metadata() {
     assert!(unsafe { (*rebuilt_pair).right } == 29);
 }
 
+fn fixed_array_reference_and_raw_parts_share_address() {
+    let mut array = [5_u32; 5];
+    let address = &mut array as *mut _ as *mut ();
+    let array_ptr = core::ptr::NonNull::from(&mut array);
+    let slice_ptr = core::ptr::NonNull::from(&mut array[..]);
+
+    assert!(core::ptr::from_raw_parts(address, ()) == array_ptr.as_ptr());
+    assert!(core::ptr::from_raw_parts_mut(address, ()) == array_ptr.as_ptr());
+    assert!(
+        core::ptr::NonNull::from_raw_parts(core::ptr::NonNull::new(address).unwrap(), ())
+            == array_ptr
+    );
+    assert!(core::ptr::from_raw_parts(address, 5) == slice_ptr.as_ptr());
+    assert!(core::ptr::from_raw_parts_mut(address, 5) == slice_ptr.as_ptr());
+    assert!(
+        core::ptr::NonNull::from_raw_parts(core::ptr::NonNull::new(address).unwrap(), 5)
+            == slice_ptr
+    );
+}
+
 fn raw_str_metadata() {
     let text = "raw UTF-8 pointer";
     let raw = text as *const str;
@@ -2229,6 +2249,7 @@ fn main() {
     raw_slice_metadata();
     narrow_integer_slice_writes();
     generic_sized_raw_pointer_metadata();
+    fixed_array_reference_and_raw_parts_share_address();
     raw_str_metadata();
     pointer_backed_raw_slices();
     raw_trait_object_metadata();

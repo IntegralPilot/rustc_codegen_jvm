@@ -54,6 +54,10 @@ fn main() {
         .expect_err("resume_unwind must be caught by the next unwind boundary");
     assert_eq!(resumed.downcast_ref::<u32>(), Some(&1234));
 
+    let unit = catch_unwind(AssertUnwindSafe(|| resume_unwind(Box::new(()))))
+        .expect_err("a zero-sized panic payload must unwind");
+    assert_eq!(unit.downcast_ref::<()>(), Some(&()));
+
     let foreign = catch_unwind(|| unsafe { java_add_exact(i32::MAX, 1) })
         .expect_err("a foreign JVM exception must unwind into catch_unwind");
     let message = foreign

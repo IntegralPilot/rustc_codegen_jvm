@@ -6,6 +6,7 @@
 #![feature(funnel_shifts)]
 #![feature(signed_bigint_helpers)]
 #![feature(uint_carryless_mul)]
+#![feature(ergonomic_clones)]
 
 macro_rules! test_comparisons {
     ($type:ty, $a:expr, $b:expr, $c:expr, $d:expr, $zero:expr, $nzero:expr) => {
@@ -73,6 +74,18 @@ fn sparse_switch(value: i32) -> i32 {
 #[inline(never)]
 fn opaque_f128(value: f128) -> f128 {
     value
+}
+
+fn fixed_array_pattern_checks_every_element() {
+    let bytes = [0_u8, 0xae, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 1, 2, 3, 4];
+    assert!(!matches!(
+        bytes,
+        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, _, _, _, _]
+    ));
+    assert!(matches!(
+        bytes,
+        [0, 0xae, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 1, 2, 3, 4]
+    ));
 }
 
 macro_rules! opaque_integer {
@@ -933,6 +946,8 @@ impl Clone for ArrayBackedValue {
     }
 }
 
+impl core::clone::UseCloned for ArrayBackedValue {}
+
 fn copied_arrays_are_independent() {
     let original = ArrayBackedValue {
         prefix: 7,
@@ -979,6 +994,7 @@ const fn const_write_bytes_preserves_unwritten_elements() {
 }
 
 fn main() {
+    fixed_array_pattern_checks_every_element();
     runtime_integer_ops();
     runtime_division_intrinsics();
     runtime_bit_counts();

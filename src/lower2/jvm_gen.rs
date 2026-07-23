@@ -254,8 +254,8 @@ pub(super) fn create_slice_view_classfile() -> jvm::Result<Vec<u8>> {
     let standard_charsets = cp.add_class("java/nio/charset/StandardCharsets")?;
     let utf8 = cp.add_field_ref(standard_charsets, "UTF_8", "Ljava/nio/charset/Charset;")?;
     let string_class = cp.add_class("java/lang/String")?;
-    let get_bytes =
-        cp.add_method_ref(string_class, "getBytes", "(Ljava/nio/charset/Charset;)[B")?;
+    let pointer_class = cp.add_class(oomir::POINTER_CLASS)?;
+    let utf8_bytes = cp.add_method_ref(pointer_class, "utf8Bytes", "(Ljava/lang/String;)[B")?;
     let slice_constructor = cp.add_method_ref(this_class, "<init>", "(Ljava/lang/Object;II)V")?;
     let from_string_descriptor = format!("(Ljava/lang/String;)L{};", oomir::SLICE_VIEW_CLASS);
     let from_string = jvm::Method {
@@ -268,8 +268,7 @@ pub(super) fn create_slice_view_classfile() -> jvm::Result<Vec<u8>> {
             2,
             vec![
                 Instruction::Aload_0,
-                Instruction::Getstatic(utf8),
-                Instruction::Invokevirtual(get_bytes),
+                Instruction::Invokestatic(utf8_bytes),
                 Instruction::Astore_1,
                 Instruction::New(this_class),
                 Instruction::Dup,
@@ -287,7 +286,6 @@ pub(super) fn create_slice_view_classfile() -> jvm::Result<Vec<u8>> {
         )?],
     };
 
-    let pointer_class = cp.add_class(oomir::POINTER_CLASS)?;
     let slice_to_byte_array = cp.add_method_ref(
         pointer_class,
         "sliceToByteArray",

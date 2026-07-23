@@ -2470,6 +2470,9 @@ fn emit_ty_to_union_bytes<'tcx>(
                 ],
             });
             let address_dest = next_union_temp("union_array_reference_address", temp_counter);
+            let pointer_codec =
+                pointer_builtin_codec_operand(ty, tcx, data_types, instance_context)
+                    .expect("fixed-array reference must have a pointer codec");
             instructions.push(oomir::Instruction::InvokeStatic {
                 dest: Some(address_dest.clone()),
                 class_name: oomir::POINTER_CLASS.to_string(),
@@ -2481,6 +2484,7 @@ fn emit_ty_to_union_bytes<'tcx>(
                             "owner".to_string(),
                             oomir::Type::Class("java/lang/Object".to_string()),
                         ),
+                        ("pointer_codec".to_string(), oomir::Type::java_string()),
                     ],
                     ret: Box::new(oomir::Type::U64),
                     is_static: true,
@@ -2496,6 +2500,7 @@ fn emit_ty_to_union_bytes<'tcx>(
                         ))),
                     ),
                     operand_var(storage.bytes_var.clone(), byte_array_type()),
+                    pointer_codec,
                 ],
             });
             emit_bits_to_union_bytes(
@@ -2515,6 +2520,10 @@ fn emit_ty_to_union_bytes<'tcx>(
             ) =>
         {
             let pointer_ty = ty_to_oomir_type(ty, tcx, data_types, instance_context);
+            let pointer_codec =
+                pointer_builtin_codec_operand(ty, tcx, data_types, instance_context);
+            let uses_typed_address =
+                !matches!(pointee.kind(), TyKind::Dynamic(..)) && pointer_codec.is_some();
             let address_dest = next_union_temp("union_pointer_address", temp_counter);
             instructions.push(oomir::Instruction::InvokeStatic {
                 dest: Some(address_dest.clone()),
@@ -2527,6 +2536,15 @@ fn emit_ty_to_union_bytes<'tcx>(
                 method_ty: oomir::Signature {
                     params: if matches!(pointee.kind(), TyKind::Dynamic(..)) {
                         vec![("pointer".to_string(), pointer_ty)]
+                    } else if uses_typed_address {
+                        vec![
+                            ("pointer".to_string(), pointer_ty),
+                            (
+                                "owner".to_string(),
+                                oomir::Type::Class("java/lang/Object".to_string()),
+                            ),
+                            ("pointer_codec".to_string(), oomir::Type::java_string()),
+                        ]
                     } else {
                         vec![
                             ("pointer".to_string(), pointer_ty),
@@ -2541,6 +2559,12 @@ fn emit_ty_to_union_bytes<'tcx>(
                 },
                 args: if matches!(pointee.kind(), TyKind::Dynamic(..)) {
                     vec![source]
+                } else if uses_typed_address {
+                    vec![
+                        source,
+                        operand_var(storage.bytes_var.clone(), byte_array_type()),
+                        pointer_codec.expect("typed pointer codec disappeared"),
+                    ]
                 } else {
                     vec![
                         source,
@@ -3077,15 +3101,19 @@ fn emit_ty_from_union_bytes<'tcx>(
                 temp_counter,
             );
             let pointer_dest = next_union_temp("union_array_reference_pointer", temp_counter);
+            let pointer_codec =
+                pointer_builtin_codec_operand(ty, tcx, data_types, instance_context)
+                    .expect("fixed-array reference must have a pointer codec");
             instructions.push(oomir::Instruction::InvokeStatic {
                 dest: Some(pointer_dest.clone()),
                 class_name: oomir::POINTER_CLASS.to_string(),
-                method_name: "fromAddress".to_string(),
+                method_name: "fromEncodedAddress".to_string(),
                 method_ty: oomir::Signature {
                     params: vec![
                         ("address".to_string(), oomir::Type::U64),
                         ("view_size".to_string(), oomir::Type::U64),
                         ("view_codec".to_string(), oomir::Type::java_string()),
+                        ("pointer_codec".to_string(), oomir::Type::java_string()),
                     ],
                     ret: Box::new(pointer_ty.clone()),
                     is_static: true,
@@ -3097,6 +3125,7 @@ fn emit_ty_from_union_bytes<'tcx>(
                             .map_err(|_| "Rust array element layout exceeds u64")?,
                     )),
                     pointer_view_codec_operand(*element, tcx, data_types, instance_context),
+                    pointer_codec,
                 ],
             });
             let object_dest = next_union_temp("union_array_reference_view", temp_counter);
@@ -3137,6 +3166,10 @@ fn emit_ty_from_union_bytes<'tcx>(
         {
             let pointer_ty = ty_to_oomir_type(ty, tcx, data_types, instance_context);
             let is_erased_trait_object = matches!(pointee.kind(), TyKind::Dynamic(..));
+            let pointer_codec = (!is_erased_trait_object)
+                .then(|| pointer_builtin_codec_operand(ty, tcx, data_types, instance_context))
+                .flatten();
+            let uses_typed_address = pointer_codec.is_some();
             let bits = emit_bits_from_union_bytes(
                 oomir::Type::I64,
                 layout_size_bytes(tcx, ty)?,
@@ -3151,12 +3184,21 @@ fn emit_ty_from_union_bytes<'tcx>(
                 class_name: oomir::POINTER_CLASS.to_string(),
                 method_name: if is_erased_trait_object {
                     "fromErasedAddress".to_string()
+                } else if uses_typed_address {
+                    "fromEncodedAddress".to_string()
                 } else {
                     "fromAddress".to_string()
                 },
                 method_ty: oomir::Signature {
                     params: if is_erased_trait_object {
                         vec![("address".to_string(), oomir::Type::U64)]
+                    } else if uses_typed_address {
+                        vec![
+                            ("address".to_string(), oomir::Type::U64),
+                            ("view_size".to_string(), oomir::Type::U64),
+                            ("view_codec".to_string(), oomir::Type::java_string()),
+                            ("pointer_codec".to_string(), oomir::Type::java_string()),
+                        ]
                     } else {
                         vec![
                             ("address".to_string(), oomir::Type::U64),
@@ -3169,6 +3211,16 @@ fn emit_ty_from_union_bytes<'tcx>(
                 },
                 args: if is_erased_trait_object {
                     vec![bits]
+                } else if uses_typed_address {
+                    vec![
+                        bits,
+                        oomir::Operand::Constant(oomir::Constant::U64(
+                            u64::try_from(layout_size_bytes(tcx, *pointee)?)
+                                .map_err(|_| "Rust pointer pointee layout exceeds u64")?,
+                        )),
+                        pointer_view_codec_operand(*pointee, tcx, data_types, instance_context),
+                        pointer_codec.expect("non-erased pointer codec disappeared"),
+                    ]
                 } else {
                     vec![
                         bits,
@@ -4298,6 +4350,15 @@ fn pointer_builtin_codec_operand<'tcx>(
             if pointee.is_sized(tcx, TypingEnv::fully_monomorphized()) =>
         {
             let pointee_size = layout_size_bytes(tcx, *pointee).ok()?;
+            let pointee_class = match pointee.kind() {
+                TyKind::Tuple(_) | TyKind::Adt(_, _) | TyKind::Closure(_, _) => {
+                    ty_to_oomir_type(*pointee, tcx, data_types, instance_context)
+                        .get_class_name()
+                        .unwrap_or_default()
+                        .to_string()
+                }
+                _ => String::new(),
+            };
             let pointee_codec =
                 pointer_view_codec_operand(*pointee, tcx, data_types, instance_context);
             let pointee_codec = match pointee_codec {
@@ -4305,7 +4366,7 @@ fn pointer_builtin_codec_operand<'tcx>(
                 oomir::Operand::Constant(oomir::Constant::Null(_)) => String::new(),
                 other => panic!("raw-pointer pointee codec must be constant, found {other:?}"),
             };
-            format!("{RAW_POINTER_VIEW_CODEC}\n{pointee_size}\n{pointee_codec}")
+            format!("{RAW_POINTER_VIEW_CODEC}\n{pointee_size}\n{pointee_class}\n{pointee_codec}")
         }
         TyKind::Int(IntTy::I128) => "@signed-big-integer".to_string(),
         TyKind::Uint(UintTy::U128) => "@unsigned-big-integer".to_string(),
@@ -5729,6 +5790,7 @@ pub fn readable_rust_type_name<'tcx>(
                 format!("{}_{}", base, args.join("_"))
             }
         }
+        TyKind::FnDef(def_id, _) => readable_qualified_def_path(tcx, *def_id),
         TyKind::Char => "char".to_string(),
         TyKind::Int(IntTy::Isize) => "isize".to_string(),
         TyKind::Uint(UintTy::Usize) => "usize".to_string(),
@@ -5836,6 +5898,7 @@ fn readable_pointer_codec_type_name<'tcx>(
                 format!("{}_of_{}", base, args.join("_and_"))
             }
         }
+        TyKind::FnDef(def_id, _) => readable_qualified_def_path(tcx, *def_id),
         TyKind::Char => "char".to_string(),
         TyKind::Int(IntTy::Isize) => "isize".to_string(),
         TyKind::Uint(UintTy::Usize) => "usize".to_string(),

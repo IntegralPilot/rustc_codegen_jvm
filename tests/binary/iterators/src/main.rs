@@ -823,6 +823,22 @@ fn test_scan_with_function_item() {
     }
 }
 
+fn test_same_named_function_item_a() {
+    fn f(value: usize) -> usize {
+        value + 10
+    }
+
+    assert!((0_usize..3).map(f).collect::<Vec<_>>() == [10, 11, 12]);
+}
+
+fn test_same_named_function_item_b() {
+    fn f(value: usize) -> usize {
+        value * 10
+    }
+
+    assert!((0_usize..3).map(f).collect::<Vec<_>>() == [0, 10, 20]);
+}
+
 fn test_core_iterator_regressions() {
     // These cases mirror iterator compositions used by upstream coretests closely.
     assert!((0_usize..).take(10).collect::<Vec<_>>() == [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
@@ -919,4 +935,6 @@ fn main() {
     test_partial_array_into_iter_drop();
     test_slice_iteration_over_nominal_zsts();
     test_scan_with_function_item();
+    test_same_named_function_item_a();
+    test_same_named_function_item_b();
 }

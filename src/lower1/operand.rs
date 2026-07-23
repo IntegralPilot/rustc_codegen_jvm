@@ -7,12 +7,13 @@ use rustc_middle::{
         Body, Const, ConstOperand, ConstValue, Operand as MirOperand, Place,
         interpret::{ErrorHandled, Scalar},
     },
-    ty::{ConstKind, EarlyBinder, Instance, Ty, TyCtxt, TypingEnv},
+    ty::{ConstKind, EarlyBinder, Instance, Ty, TyCtxt, TyKind, TypingEnv},
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static COPY_OPERAND_COUNTER: AtomicUsize = AtomicUsize::new(0);
+static LOAD_OPERAND_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 pub(super) mod const_eval;
 
@@ -175,12 +176,25 @@ pub fn convert_operand<'tcx>(
             let (final_var_name, get_instructions, final_type) =
                 emit_instructions_to_get_on_own(place, tcx, instance, mir, data_types);
 
+            let projected_load = !get_instructions.is_empty();
             instructions.extend(get_instructions);
 
-            let loaded = oomir::Operand::Variable {
+            let mut loaded = oomir::Operand::Variable {
                 name: final_var_name.clone(),
                 ty: final_type.clone(),
             };
+            if projected_load {
+                let load_id = LOAD_OPERAND_COUNTER.fetch_add(1, Ordering::Relaxed);
+                let load_dest = format!("{final_var_name}_operand_{load_id}");
+                instructions.push(oomir::Instruction::Move {
+                    dest: load_dest.clone(),
+                    src: loaded,
+                });
+                loaded = oomir::Operand::Variable {
+                    name: load_dest,
+                    ty: final_type.clone(),
+                };
+            }
             let MirOperand::Copy(_) = mir_op else {
                 return loaded;
             };
@@ -195,7 +209,7 @@ pub fn convert_operand<'tcx>(
                 .unwrap_or(rust_ty);
             if !final_type.is_jvm_reference_type()
                 || matches!(final_type, oomir::Type::Pointer(_))
-                || !tcx.type_is_copy_modulo_regions(TypingEnv::fully_monomorphized(), rust_ty)
+                || matches!(rust_ty.kind(), TyKind::Ref(..) | TyKind::RawPtr(..))
             {
                 return loaded;
             }
