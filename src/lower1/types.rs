@@ -5572,10 +5572,17 @@ pub fn stable_def_path(tcx: TyCtxt<'_>, def_id: DefId) -> String {
 }
 
 fn readable_qualified_def_path(tcx: TyCtxt<'_>, def_id: DefId) -> String {
-    let class_name = jvm_names::class_for_def_id(tcx, def_id);
+    readable_qualified_jvm_class(&jvm_names::class_for_def_id(tcx, def_id))
+}
+
+fn readable_qualified_function_item_path(tcx: TyCtxt<'_>, def_id: DefId) -> String {
+    readable_qualified_jvm_class(&jvm_names::function_item_class_for_def_id(tcx, def_id))
+}
+
+fn readable_qualified_jvm_class(class_name: &str) -> String {
     let canonical = class_name
         .strip_prefix("org/rustlang/")
-        .unwrap_or(&class_name);
+        .unwrap_or(class_name);
     sanitize_name_token(&canonical.replace('/', "_"))
 }
 
@@ -5790,7 +5797,7 @@ pub fn readable_rust_type_name<'tcx>(
                 format!("{}_{}", base, args.join("_"))
             }
         }
-        TyKind::FnDef(def_id, _) => readable_qualified_def_path(tcx, *def_id),
+        TyKind::FnDef(def_id, _) => readable_qualified_function_item_path(tcx, *def_id),
         TyKind::Char => "char".to_string(),
         TyKind::Int(IntTy::Isize) => "isize".to_string(),
         TyKind::Uint(UintTy::Usize) => "usize".to_string(),
@@ -5898,7 +5905,7 @@ fn readable_pointer_codec_type_name<'tcx>(
                 format!("{}_of_{}", base, args.join("_and_"))
             }
         }
-        TyKind::FnDef(def_id, _) => readable_qualified_def_path(tcx, *def_id),
+        TyKind::FnDef(def_id, _) => readable_qualified_function_item_path(tcx, *def_id),
         TyKind::Char => "char".to_string(),
         TyKind::Int(IntTy::Isize) => "isize".to_string(),
         TyKind::Uint(UintTy::Usize) => "usize".to_string(),

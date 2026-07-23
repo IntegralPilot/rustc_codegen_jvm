@@ -5954,16 +5954,43 @@ public final class Pointer {
     }
 
     private static void swapBytes(Pointer left, Pointer right, int byteCount) {
-        byte[] leftBytes = new byte[byteCount];
-        byte[] rightBytes = new byte[byteCount];
-        for (int index = 0; index < byteCount; index++) {
-            leftBytes[index] = (byte) left.loadByte(left.byteOffset + index);
-            rightBytes[index] = (byte) right.loadByte(right.byteOffset + index);
+        if (trySwapAlignedElements(left, right, byteCount)) {
+            return;
         }
+        byte[] leftBytes = left.loadRange(byteCount);
+        byte[] rightBytes = right.loadRange(byteCount);
         transferEncodedReferences(left.allocation, leftBytes);
         transferEncodedReferences(right.allocation, rightBytes);
         left.storeRange(rightBytes);
         right.storeRange(leftBytes);
+    }
+
+    private static boolean trySwapAlignedElements(
+            Pointer left, Pointer right, int byteCount) {
+        if (byteCount <= 0
+                || left.allocation == null
+                || left.allocation != right.allocation
+                || left.allocationElementSize != byteCount
+                || right.allocationElementSize != byteCount
+                || Math.floorMod(left.byteOffset, byteCount) != 0
+                || Math.floorMod(right.byteOffset, byteCount) != 0) {
+            return false;
+        }
+        int leftIndex = Math.toIntExact(left.byteOffset / byteCount);
+        int rightIndex = Math.toIntExact(right.byteOffset / byteCount);
+        if (leftIndex == rightIndex) {
+            return true;
+        }
+        left.prepareMemoryWrite(left.byteOffset, byteCount);
+        right.prepareMemoryWrite(right.byteOffset, byteCount);
+        Object leftValue = left.readElement(leftIndex);
+        Object rightValue = right.readElement(rightIndex);
+        if (hasProjectedFieldCells(leftValue) || hasProjectedFieldCells(rightValue)) {
+            return false;
+        }
+        left.writeElement(leftIndex, rightValue);
+        right.writeElement(rightIndex, leftValue);
+        return true;
     }
 
     public static void swap(Pointer left, Pointer right, long byteCount) {

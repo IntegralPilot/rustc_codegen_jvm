@@ -906,6 +906,12 @@ fn stable_pointer_api_surface() {
     assert!(copied[2] == 3);
     assert!(copied[3] == 1);
 
+    let mut strings = ["a", "b", "c", "d"];
+    strings.swap(1, 3);
+    assert!(strings == ["a", "d", "c", "b"]);
+    strings.swap(0, 3);
+    assert!(strings == ["b", "d", "c", "a"]);
+
     let mut bytes = [0_u16; 3];
     unsafe {
         bytes.as_mut_ptr().write_bytes(0x5a, bytes.len());

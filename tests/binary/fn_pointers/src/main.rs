@@ -217,6 +217,10 @@ fn apply_constructor<F: FnOnce(u32) -> Constructed>(constructor: F, value: u32) 
     constructor(value)
 }
 
+fn type_name_of<T>(_: T) -> &'static str {
+    core::any::type_name::<T>()
+}
+
 fn main() {
     let res_const = derivative(constant, 10.0, 0.125);
     assert!(res_const == 0.0);
@@ -349,6 +353,7 @@ fn main() {
 
     let constructed = apply_constructor(Constructed, 42);
     assert!(constructed.0 == 42);
+    assert!(type_name_of(Constructed) != type_name_of(Constructed(0)));
 
     let variant = Some(42_u32).map(ConstructedVariant::Value).unwrap();
     match variant {
