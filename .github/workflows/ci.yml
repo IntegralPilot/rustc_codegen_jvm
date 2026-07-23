@@ -7,13 +7,17 @@ on:
     branches: [main]
 
 jobs:
-  build-and-test:
-    name: Build and test (${{ matrix.os }})
+  self-tests:
+    name: self-tests (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        include:
+          - name: Ubuntu
+            os: ubuntu-latest
+          - name: Windows
+            os: windows-latest
     env:
       PYTHONUTF8: '1'
 
@@ -30,7 +34,7 @@ jobs:
       uses: dtolnay/rust-toolchain@stable
       with:
         toolchain: nightly
-        components: rustc-dev llvm-tools cargo
+        components: rustc-dev rust-src llvm-tools cargo
 
     - name: Set up Java
       uses: actions/setup-java@v4
@@ -43,20 +47,96 @@ jobs:
       with:
         python-version: '3.x'
 
-    - name: Generate configuration files
-      run: python build.py gen-files
-
-    - name: Cache cargo dependencies
+    - name: Cache Cargo dependencies
       uses: Swatinem/rust-cache@v2
- 
+
     - name: Build backend and tools
       run: python build.py ci
 
-    - name: Run cargo unit tests
+    - name: Run compiler unit tests
+      id: compiler_unit_tests
+      continue-on-error: true
       run: cargo test
 
-    - name: Run integration tests (debug mode)
+    - name: Run self-tests (debug)
+      id: self_tests_debug
+      continue-on-error: true
       run: python Tester.py
 
-    - name: Run integration tests (release mode)
+    - name: Run self-tests (release)
+      id: self_tests_release
+      continue-on-error: true
       run: python Tester.py --release
+
+    - name: Require 100% self-test pass rate
+      if: >-
+        always() &&
+        (
+          steps.compiler_unit_tests.outcome != 'success' ||
+          steps.self_tests_debug.outcome != 'success' ||
+          steps.self_tests_release.outcome != 'success'
+        )
+      run: python -c "raise SystemExit('debug and release self-tests must both pass completely')"
+
+  coretests:
+    name: coretests (Ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      PYTHONUTF8: '1'
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Rust (nightly)
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: nightly
+        components: rustc-dev rust-src llvm-tools cargo
+
+    - name: Set up Java
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: '25'
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.x'
+
+    - name: Cache Cargo dependencies
+      uses: Swatinem/rust-cache@v2
+
+    - name: Build backend and tools
+      run: python build.py ci
+
+    - name: Run coretests (debug)
+      id: coretests_debug
+      continue-on-error: true
+      run: python Coretests.py --timeout 20 --build-timeout 1200
+
+    - name: Run coretests (release)
+      id: coretests_release
+      continue-on-error: true
+      run: python Coretests.py --release --timeout 20 --build-timeout 1200
+
+    - name: Upload coretests reports
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: coretests
+        path: |
+          target/coretests/reports/
+          target/coretests/logs/
+        if-no-files-found: error
+
+    - name: Require 100% coretests pass rate
+      if: >-
+        always() &&
+        (
+          steps.coretests_debug.outcome != 'success' ||
+          steps.coretests_release.outcome != 'success'
+        )
+      run: python -c "raise SystemExit('debug and release coretests must both pass completely')"
