@@ -32,7 +32,7 @@ diff --git a/std/src/panicking.rs b/std/src/panicking.rs
      unsafe fn cleanup(payload: *mut u8) -> Box<dyn Any + Send + 'static> {
 +        #[cfg(target_os = "jvm")]
 +        unsafe extern "C" {
-+            #[link_name = "jvm:static:org/rustlang/runtime/PanicSupport:isRustPanic:(Lorg/rustlang/runtime/Pointer;)Z"]
++            #[link_name = "jvm:static:org/rustlang/runtime/PanicSupport:isRustPanic"]
 +            fn is_rust_panic(payload: *mut u8) -> bool;
 +        }
 +        #[cfg(target_os = "jvm")]

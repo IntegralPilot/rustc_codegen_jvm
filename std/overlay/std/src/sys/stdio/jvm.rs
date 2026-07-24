@@ -1,19 +1,19 @@
 use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut};
 
 unsafe extern "C" {
-    #[link_name = "jvm:static:org/rustlang/runtime/RuntimeSupport:writeStdout:(Lorg/rustlang/runtime/Pointer;J)V"]
+    #[link_name = "jvm:static:org/rustlang/runtime/RuntimeSupport:writeStdout"]
     fn write_stdout(bytes: *const u8, length: usize);
 
-    #[link_name = "jvm:static:org/rustlang/runtime/RuntimeSupport:writeStderr:(Lorg/rustlang/runtime/Pointer;J)V"]
+    #[link_name = "jvm:static:org/rustlang/runtime/RuntimeSupport:writeStderr"]
     fn write_stderr(bytes: *const u8, length: usize);
 
-    #[link_name = "jvm:static:org/rustlang/runtime/RuntimeSupport:flushStdout:()V"]
+    #[link_name = "jvm:static:org/rustlang/runtime/RuntimeSupport:flushStdout"]
     fn flush_stdout();
 
-    #[link_name = "jvm:static:org/rustlang/runtime/RuntimeSupport:flushStderr:()V"]
+    #[link_name = "jvm:static:org/rustlang/runtime/RuntimeSupport:flushStderr"]
     fn flush_stderr();
 
-    #[link_name = "jvm:static:org/rustlang/runtime/RuntimeSupport:readStdin:(Lorg/rustlang/runtime/Pointer;J)J"]
+    #[link_name = "jvm:static:org/rustlang/runtime/RuntimeSupport:readStdin"]
     fn read_stdin(destination: *mut u8, length: usize) -> isize;
 }
 

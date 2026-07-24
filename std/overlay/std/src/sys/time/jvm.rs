@@ -1,10 +1,10 @@
 use crate::time::Duration;
 
 unsafe extern "C" {
-    #[link_name = "jvm:static:org/rustlang/runtime/RuntimeSupport:monotonicNanos:()J"]
+    #[link_name = "jvm:static:org/rustlang/runtime/RuntimeSupport:monotonicNanos"]
     fn monotonic_nanos() -> u64;
 
-    #[link_name = "jvm:static:org/rustlang/runtime/RuntimeSupport:unixEpochMillis:()J"]
+    #[link_name = "jvm:static:org/rustlang/runtime/RuntimeSupport:unixEpochMillis"]
     fn unix_epoch_millis() -> u64;
 }
 

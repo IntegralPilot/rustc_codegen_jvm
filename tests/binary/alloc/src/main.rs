@@ -131,7 +131,7 @@ fn double(value: i32) -> i32 {
 }
 
 unsafe extern "C" {
-    #[link_name = "jvm:static:org/rustlang/runtime/ThreadSupport:runStaticPointerWorkers:(Lorg/rustlang/runtime/Pointer;JLorg/rustlang/runtime/Pointer;JLorg/rustlang/runtime/Pointer;I)V"]
+    #[link_name = "jvm:static:org/rustlang/runtime/ThreadSupport:runStaticPointerWorkers"]
     fn run_static_pointer_workers(
         owner: *const u8,
         owner_length: usize,

@@ -2,16 +2,16 @@ pub type Key = usize;
 pub type Dtor = unsafe extern "C" fn(*mut u8);
 
 unsafe extern "C" {
-    #[link_name = "jvm:static:org/rustlang/runtime/ThreadSupport:tlsCreate:(Lorg/rustlang/runtime/Pointer;)J"]
+    #[link_name = "jvm:static:org/rustlang/runtime/ThreadSupport:tlsCreate"]
     fn jvm_tls_create(dtor: *mut ()) -> usize;
 
-    #[link_name = "jvm:static:org/rustlang/runtime/ThreadSupport:tlsGet:(J)Lorg/rustlang/runtime/Pointer;"]
+    #[link_name = "jvm:static:org/rustlang/runtime/ThreadSupport:tlsGet"]
     fn jvm_tls_get(key: usize) -> *mut u8;
 
-    #[link_name = "jvm:static:org/rustlang/runtime/ThreadSupport:tlsSet:(JLorg/rustlang/runtime/Pointer;)V"]
+    #[link_name = "jvm:static:org/rustlang/runtime/ThreadSupport:tlsSet"]
     fn jvm_tls_set(key: usize, value: *mut u8);
 
-    #[link_name = "jvm:static:org/rustlang/runtime/ThreadSupport:tlsRunDestructors:()V"]
+    #[link_name = "jvm:static:org/rustlang/runtime/ThreadSupport:tlsRunDestructors"]
     fn jvm_tls_run_destructors();
 }
 

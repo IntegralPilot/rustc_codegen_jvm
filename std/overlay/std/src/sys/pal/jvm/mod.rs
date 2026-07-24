@@ -17,7 +17,10 @@ pub fn unsupported<T>() -> io::Result<T> {
 }
 
 pub fn unsupported_err() -> io::Error {
-    io::Error::UNSUPPORTED_PLATFORM
+    io::const_error!(
+        io::ErrorKind::Unsupported,
+        "operation not supported on this platform"
+    )
 }
 
 pub fn abort_internal() -> ! {

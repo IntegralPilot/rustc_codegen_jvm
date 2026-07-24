@@ -5,37 +5,37 @@ use crate::vec::Vec;
 use crate::io;
 
 unsafe extern "C" {
-    #[link_name = "jvm:static:org/rustlang/runtime/RuntimeSupport:environmentValueLength:(Lorg/rustlang/runtime/Pointer;J)J"]
+    #[link_name = "jvm:static:org/rustlang/runtime/RuntimeSupport:environmentValueLength"]
     fn environment_value_length(key: *const u8, key_length: usize) -> isize;
 
-    #[link_name = "jvm:static:org/rustlang/runtime/RuntimeSupport:copyEnvironmentValue:(Lorg/rustlang/runtime/Pointer;JLorg/rustlang/runtime/Pointer;)V"]
+    #[link_name = "jvm:static:org/rustlang/runtime/RuntimeSupport:copyEnvironmentValue"]
     fn copy_environment_value(key: *const u8, key_length: usize, destination: *mut u8);
 
-    #[link_name = "jvm:static:org/rustlang/runtime/RuntimeSupport:setEnvironment:(Lorg/rustlang/runtime/Pointer;JLorg/rustlang/runtime/Pointer;J)V"]
+    #[link_name = "jvm:static:org/rustlang/runtime/RuntimeSupport:setEnvironment"]
     fn set_environment(key: *const u8, key_length: usize, value: *const u8, value_length: usize);
 
-    #[link_name = "jvm:static:org/rustlang/runtime/RuntimeSupport:removeEnvironment:(Lorg/rustlang/runtime/Pointer;J)V"]
+    #[link_name = "jvm:static:org/rustlang/runtime/RuntimeSupport:removeEnvironment"]
     fn remove_environment(key: *const u8, key_length: usize);
 
-    #[link_name = "jvm:static:org/rustlang/runtime/RuntimeSupport:beginEnvironmentSnapshot:()J"]
+    #[link_name = "jvm:static:org/rustlang/runtime/RuntimeSupport:beginEnvironmentSnapshot"]
     fn begin_environment_snapshot() -> u64;
 
-    #[link_name = "jvm:static:org/rustlang/runtime/RuntimeSupport:environmentSnapshotCount:(J)J"]
+    #[link_name = "jvm:static:org/rustlang/runtime/RuntimeSupport:environmentSnapshotCount"]
     fn environment_snapshot_count(snapshot: u64) -> usize;
 
-    #[link_name = "jvm:static:org/rustlang/runtime/RuntimeSupport:environmentSnapshotKeyLength:(JJ)J"]
+    #[link_name = "jvm:static:org/rustlang/runtime/RuntimeSupport:environmentSnapshotKeyLength"]
     fn environment_snapshot_key_length(snapshot: u64, index: usize) -> usize;
 
-    #[link_name = "jvm:static:org/rustlang/runtime/RuntimeSupport:environmentSnapshotValueLength:(JJ)J"]
+    #[link_name = "jvm:static:org/rustlang/runtime/RuntimeSupport:environmentSnapshotValueLength"]
     fn environment_snapshot_value_length(snapshot: u64, index: usize) -> usize;
 
-    #[link_name = "jvm:static:org/rustlang/runtime/RuntimeSupport:copyEnvironmentSnapshotKey:(JJLorg/rustlang/runtime/Pointer;)V"]
+    #[link_name = "jvm:static:org/rustlang/runtime/RuntimeSupport:copyEnvironmentSnapshotKey"]
     fn copy_environment_snapshot_key(snapshot: u64, index: usize, destination: *mut u8);
 
-    #[link_name = "jvm:static:org/rustlang/runtime/RuntimeSupport:copyEnvironmentSnapshotValue:(JJLorg/rustlang/runtime/Pointer;)V"]
+    #[link_name = "jvm:static:org/rustlang/runtime/RuntimeSupport:copyEnvironmentSnapshotValue"]
     fn copy_environment_snapshot_value(snapshot: u64, index: usize, destination: *mut u8);
 
-    #[link_name = "jvm:static:org/rustlang/runtime/RuntimeSupport:endEnvironmentSnapshot:(J)V"]
+    #[link_name = "jvm:static:org/rustlang/runtime/RuntimeSupport:endEnvironmentSnapshot"]
     fn end_environment_snapshot(snapshot: u64);
 }
 

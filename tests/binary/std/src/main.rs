@@ -1,4 +1,5 @@
 use std::env;
+use std::fs;
 use std::io::{self, Read};
 use std::net::Ipv6Addr;
 
@@ -8,6 +9,7 @@ fn main() {
     test_stdin();
     test_pointer_formatting();
     test_ipv6_formatting();
+    test_unsupported_filesystem_error();
     println!("std support ok");
 }
 
@@ -61,5 +63,14 @@ fn test_ipv6_formatting() {
     assert_eq!(
         address.to_string(),
         "ae::ffff:102:304"
+    );
+}
+
+fn test_unsupported_filesystem_error() {
+    let error = fs::write("jvm-unsupported-file", b"contents").unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+    assert_eq!(
+        error.to_string(),
+        "operation not supported on this platform"
     );
 }

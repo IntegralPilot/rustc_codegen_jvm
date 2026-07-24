@@ -7,28 +7,28 @@ use crate::time::Duration;
 pub const DEFAULT_MIN_STACK_SIZE: usize = 2 * 1024 * 1024;
 
 unsafe extern "C" {
-    #[link_name = "jvm:static:org/rustlang/runtime/ThreadSupport:spawn:(Lorg/rustlang/runtime/Pointer;J)J"]
+    #[link_name = "jvm:static:org/rustlang/runtime/ThreadSupport:spawn"]
     fn jvm_spawn(init: *mut ThreadInit, stack_size: i64) -> u64;
 
-    #[link_name = "jvm:static:org/rustlang/runtime/ThreadSupport:join:(J)V"]
+    #[link_name = "jvm:static:org/rustlang/runtime/ThreadSupport:join"]
     fn jvm_join(handle: u64);
 
-    #[link_name = "jvm:static:org/rustlang/runtime/ThreadSupport:detach:(J)V"]
+    #[link_name = "jvm:static:org/rustlang/runtime/ThreadSupport:detach"]
     fn jvm_detach(handle: u64);
 
-    #[link_name = "jvm:static:org/rustlang/runtime/ThreadSupport:currentThreadId:()J"]
+    #[link_name = "jvm:static:org/rustlang/runtime/ThreadSupport:currentThreadId"]
     fn jvm_current_thread_id() -> u64;
 
-    #[link_name = "jvm:static:org/rustlang/runtime/ThreadSupport:availableProcessors:()I"]
+    #[link_name = "jvm:static:org/rustlang/runtime/ThreadSupport:availableProcessors"]
     fn jvm_available_processors() -> u32;
 
-    #[link_name = "jvm:static:org/rustlang/runtime/ThreadSupport:yieldCurrent:()V"]
+    #[link_name = "jvm:static:org/rustlang/runtime/ThreadSupport:yieldCurrent"]
     fn jvm_yield_now();
 
-    #[link_name = "jvm:static:org/rustlang/runtime/ThreadSupport:sleep:(JI)V"]
+    #[link_name = "jvm:static:org/rustlang/runtime/ThreadSupport:sleep"]
     fn jvm_sleep(seconds: i64, nanoseconds: u32);
 
-    #[link_name = "jvm:static:org/rustlang/runtime/ThreadSupport:setCurrentName:(Lorg/rustlang/runtime/Pointer;J)V"]
+    #[link_name = "jvm:static:org/rustlang/runtime/ThreadSupport:setCurrentName"]
     fn jvm_set_name(bytes: *const u8, length: usize);
 }
 

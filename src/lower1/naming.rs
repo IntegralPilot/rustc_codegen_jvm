@@ -29,7 +29,8 @@ pub struct FnNameData {
 pub struct JvmStaticImport {
     pub class_name: String,
     pub method_name: String,
-    pub descriptor: String,
+    /// Optional legacy descriptor used only to verify the inferred Rust ABI.
+    pub descriptor: Option<String>,
 }
 
 pub fn mono_owner_class<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> String {
@@ -79,18 +80,21 @@ pub fn parse_jvm_link_name(link_name: &str) -> Result<Option<JvmStaticImport>, S
     let invocation = parts.next().unwrap_or_default();
     let class_name = parts.next().unwrap_or_default();
     let method_name = parts.next().unwrap_or_default();
-    let descriptor = parts.next().unwrap_or_default();
+    let descriptor = parts.next();
 
     if invocation != "static" {
         return Err(format!(
             "unsupported JVM import invocation `{invocation}`; only `jvm:static` is supported"
         ));
     }
-    if class_name.is_empty() || method_name.is_empty() || descriptor.is_empty() {
+    if class_name.is_empty() || method_name.is_empty() {
         return Err(
-            "malformed JVM import; expected `jvm:static:<internal-class>:<method>:<descriptor>`"
+            "malformed JVM import; expected `jvm:static:<internal-class>:<method>[:<descriptor>]`"
                 .to_string(),
         );
+    }
+    if descriptor == Some("") {
+        return Err("malformed JVM import; an explicit descriptor cannot be empty".to_string());
     }
     if class_name.contains('.') || class_name.starts_with('/') || class_name.ends_with('/') {
         return Err(format!(
@@ -104,7 +108,7 @@ pub fn parse_jvm_link_name(link_name: &str) -> Result<Option<JvmStaticImport>, S
     Ok(Some(JvmStaticImport {
         class_name: class_name.to_string(),
         method_name: method_name.to_string(),
-        descriptor: descriptor.to_string(),
+        descriptor: descriptor.map(str::to_string),
     }))
 }
 
@@ -389,7 +393,19 @@ mod tests {
     }
 
     #[test]
-    fn parses_static_jvm_import() {
+    fn parses_static_jvm_import_with_inferred_descriptor() {
+        assert_eq!(
+            parse_jvm_link_name("jvm:static:org/rustlang/runtime/PanicSupport:raise"),
+            Ok(Some(JvmStaticImport {
+                class_name: "org/rustlang/runtime/PanicSupport".to_string(),
+                method_name: "raise".to_string(),
+                descriptor: None,
+            }))
+        );
+    }
+
+    #[test]
+    fn parses_legacy_static_jvm_import_with_explicit_descriptor() {
         assert_eq!(
             parse_jvm_link_name(
                 "jvm:static:org/rustlang/runtime/PanicSupport:raise:(Lorg/rustlang/runtime/Pointer;)V"
@@ -397,7 +413,7 @@ mod tests {
             Ok(Some(JvmStaticImport {
                 class_name: "org/rustlang/runtime/PanicSupport".to_string(),
                 method_name: "raise".to_string(),
-                descriptor: "(Lorg/rustlang/runtime/Pointer;)V".to_string(),
+                descriptor: Some("(Lorg/rustlang/runtime/Pointer;)V".to_string()),
             }))
         );
     }
@@ -417,7 +433,13 @@ mod tests {
 
     #[test]
     fn rejects_malformed_import() {
-        let error = parse_jvm_link_name("jvm:static:java/lang/System:exit").unwrap_err();
+        let error = parse_jvm_link_name("jvm:static:java/lang/System").unwrap_err();
         assert!(error.contains("malformed JVM import"));
+    }
+
+    #[test]
+    fn rejects_empty_explicit_descriptor() {
+        let error = parse_jvm_link_name("jvm:static:java/lang/System:exit:").unwrap_err();
+        assert!(error.contains("descriptor cannot be empty"));
     }
 }

@@ -2184,12 +2184,14 @@ pub(super) fn convert_basic_block<'tcx>(
                         method_signature.is_static = true;
                         let rust_descriptor =
                             method_signature.to_jvm_descriptor_with_explicit_params();
-                        if rust_descriptor != jvm_import.descriptor {
+                        if let Some(explicit_descriptor) = &jvm_import.descriptor
+                            && rust_descriptor != *explicit_descriptor
+                        {
                             tcx.dcx().span_fatal(
                                 terminator.source_info.span,
                                 format!(
                                     "JVM import descriptor `{}` does not match the lowered Rust signature `{rust_descriptor}`",
-                                    jvm_import.descriptor
+                                    explicit_descriptor
                                 ),
                             );
                         }

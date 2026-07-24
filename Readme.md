@@ -117,7 +117,7 @@ public class Main {
 ```rust
 unsafe extern "C" {
     // Link directly to the static method on the Java Main class
-    #[link_name = "jvm:static:Main:helloWorld:()V"]
+    #[link_name = "jvm:static:Main:helloWorld"]
     fn hello_world();
 }
 

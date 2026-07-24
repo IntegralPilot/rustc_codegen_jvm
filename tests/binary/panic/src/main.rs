@@ -22,7 +22,7 @@ struct FormattingFields {
 }
 
 unsafe extern "C" {
-    #[link_name = "jvm:static:java/lang/Math:addExact:(II)I"]
+    #[link_name = "jvm:static:java/lang/Math:addExact"]
     fn java_add_exact(left: i32, right: i32) -> i32;
 }
 

@@ -8,13 +8,13 @@ pub type SmallFutex = Atomic<SmallPrimitive>;
 pub type SmallPrimitive = u32;
 
 unsafe extern "C" {
-    #[link_name = "jvm:static:org/rustlang/runtime/ThreadSupport:futexWait:(Lorg/rustlang/runtime/Pointer;IJ)Z"]
+    #[link_name = "jvm:static:org/rustlang/runtime/ThreadSupport:futexWait"]
     fn jvm_futex_wait(address: *const u32, expected: u32, timeout_nanos: i64) -> bool;
 
-    #[link_name = "jvm:static:org/rustlang/runtime/ThreadSupport:futexWake:(Lorg/rustlang/runtime/Pointer;)Z"]
+    #[link_name = "jvm:static:org/rustlang/runtime/ThreadSupport:futexWake"]
     fn jvm_futex_wake(address: *const u32) -> bool;
 
-    #[link_name = "jvm:static:org/rustlang/runtime/ThreadSupport:futexWakeAll:(Lorg/rustlang/runtime/Pointer;)V"]
+    #[link_name = "jvm:static:org/rustlang/runtime/ThreadSupport:futexWakeAll"]
     fn jvm_futex_wake_all(address: *const u32);
 }
 

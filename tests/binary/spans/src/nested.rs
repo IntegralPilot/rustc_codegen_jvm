@@ -1,5 +1,5 @@
 unsafe extern "C" {
-    #[link_name = "jvm:static:org/rustlang/runtime/PanicSupport:raise:(Lorg/rustlang/runtime/Pointer;J)V"]
+    #[link_name = "jvm:static:org/rustlang/runtime/PanicSupport:raise"]
     fn raise(message: *const u8, length: usize) -> !;
 }
 

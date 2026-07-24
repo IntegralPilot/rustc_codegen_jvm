@@ -1,5 +1,5 @@
 unsafe extern "C" {
-    #[link_name = "jvm:static:org/rustlang/runtime/RuntimeSupport:fillRandom:(Lorg/rustlang/runtime/Pointer;J)V"]
+    #[link_name = "jvm:static:org/rustlang/runtime/RuntimeSupport:fillRandom"]
     fn fill_random(destination: *mut u8, length: usize);
 }
 

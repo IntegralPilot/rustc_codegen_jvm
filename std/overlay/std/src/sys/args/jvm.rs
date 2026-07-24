@@ -4,13 +4,13 @@ use crate::string::String;
 use crate::vec::Vec;
 
 unsafe extern "C" {
-    #[link_name = "jvm:static:org/rustlang/runtime/RuntimeSupport:argumentCount:()J"]
+    #[link_name = "jvm:static:org/rustlang/runtime/RuntimeSupport:argumentCount"]
     fn argument_count() -> usize;
 
-    #[link_name = "jvm:static:org/rustlang/runtime/RuntimeSupport:argumentLength:(J)J"]
+    #[link_name = "jvm:static:org/rustlang/runtime/RuntimeSupport:argumentLength"]
     fn argument_length(index: usize) -> usize;
 
-    #[link_name = "jvm:static:org/rustlang/runtime/RuntimeSupport:copyArgument:(JLorg/rustlang/runtime/Pointer;)V"]
+    #[link_name = "jvm:static:org/rustlang/runtime/RuntimeSupport:copyArgument"]
     fn copy_argument(index: usize, destination: *mut u8);
 }
 

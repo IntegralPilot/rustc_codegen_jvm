@@ -4,19 +4,19 @@ use core::any::Any;
 use core::slice;
 
 unsafe extern "C" {
-    #[link_name = "jvm:static:org/rustlang/runtime/PanicSupport:raisePayload:(Lorg/rustlang/runtime/Pointer;)V"]
+    #[link_name = "jvm:static:org/rustlang/runtime/PanicSupport:raisePayload"]
     fn raise_payload(payload: *mut u8);
 
-    #[link_name = "jvm:static:org/rustlang/runtime/PanicSupport:takePayload:(Lorg/rustlang/runtime/Pointer;)Lorg/rustlang/runtime/Pointer;"]
+    #[link_name = "jvm:static:org/rustlang/runtime/PanicSupport:takePayload"]
     fn take_payload(caught_exception: *mut u8) -> *mut u8;
 
-    #[link_name = "jvm:static:org/rustlang/runtime/PanicSupport:isRustPanic:(Lorg/rustlang/runtime/Pointer;)Z"]
+    #[link_name = "jvm:static:org/rustlang/runtime/PanicSupport:isRustPanic"]
     fn is_rust_panic(caught_exception: *mut u8) -> bool;
 
-    #[link_name = "jvm:static:org/rustlang/runtime/PanicSupport:foreignFailureMessage:(Lorg/rustlang/runtime/Pointer;)Lorg/rustlang/runtime/Pointer;"]
+    #[link_name = "jvm:static:org/rustlang/runtime/PanicSupport:foreignFailureMessage"]
     fn foreign_failure_message(caught_exception: *mut u8) -> *const u8;
 
-    #[link_name = "jvm:static:org/rustlang/runtime/PanicSupport:foreignFailureMessageLength:(Lorg/rustlang/runtime/Pointer;)J"]
+    #[link_name = "jvm:static:org/rustlang/runtime/PanicSupport:foreignFailureMessageLength"]
     fn foreign_failure_message_length(caught_exception: *mut u8) -> usize;
 }
 

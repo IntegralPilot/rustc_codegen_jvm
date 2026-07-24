@@ -1,10 +1,10 @@
 use crate::alloc::Layout;
 
 unsafe extern "C" {
-    #[link_name = "jvm:static:org/rustlang/runtime/Pointer:allocateBytes:(JJ)Lorg/rustlang/runtime/Pointer;"]
+    #[link_name = "jvm:static:org/rustlang/runtime/Pointer:allocateBytes"]
     fn allocate_bytes(size: usize, alignment: usize) -> *mut u8;
 
-    #[link_name = "jvm:static:org/rustlang/runtime/Pointer:reallocateBytes:(Lorg/rustlang/runtime/Pointer;JJJ)Lorg/rustlang/runtime/Pointer;"]
+    #[link_name = "jvm:static:org/rustlang/runtime/Pointer:reallocateBytes"]
     fn reallocate_bytes(
         pointer: *mut u8,
         old_size: usize,
@@ -12,7 +12,7 @@ unsafe extern "C" {
         new_size: usize,
     ) -> *mut u8;
 
-    #[link_name = "jvm:static:org/rustlang/runtime/Pointer:deallocateBytes:(Lorg/rustlang/runtime/Pointer;)V"]
+    #[link_name = "jvm:static:org/rustlang/runtime/Pointer:deallocateBytes"]
     fn deallocate_bytes(pointer: *mut u8);
 }
 
