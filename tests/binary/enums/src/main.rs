@@ -27,7 +27,50 @@ const CONSTANT_ENUMS: [ConstantArrayEnum; 4] = [
     ConstantArrayEnum::Seven,
 ];
 
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+static ENUM_WRAPPER_DROPS: AtomicUsize = AtomicUsize::new(0);
+static ENUM_PAYLOAD_DROPS: AtomicUsize = AtomicUsize::new(0);
+static ENUM_WRAPPER_RAN: AtomicBool = AtomicBool::new(false);
+
+struct DropTracer(u8);
+
+impl Drop for DropTracer {
+    fn drop(&mut self) {
+        assert!(ENUM_WRAPPER_RAN.swap(false, Ordering::SeqCst));
+        ENUM_PAYLOAD_DROPS.fetch_add(self.0 as usize, Ordering::SeqCst);
+    }
+}
+
+enum CustomDropEnum {
+    First(DropTracer),
+    Second(DropTracer),
+    Empty,
+}
+
+impl Drop for CustomDropEnum {
+    fn drop(&mut self) {
+        assert!(!ENUM_WRAPPER_RAN.swap(true, Ordering::SeqCst));
+        ENUM_WRAPPER_DROPS.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 fn main() {
+    drop(CustomDropEnum::First(DropTracer(1)));
+    assert!(ENUM_WRAPPER_DROPS.load(Ordering::SeqCst) == 1);
+    assert!(ENUM_PAYLOAD_DROPS.load(Ordering::SeqCst) == 1);
+
+    {
+        let _second = CustomDropEnum::Second(DropTracer(10));
+    }
+    assert!(ENUM_WRAPPER_DROPS.load(Ordering::SeqCst) == 2);
+    assert!(ENUM_PAYLOAD_DROPS.load(Ordering::SeqCst) == 11);
+
+    drop(CustomDropEnum::Empty);
+    assert!(ENUM_WRAPPER_RAN.swap(false, Ordering::SeqCst));
+    assert!(ENUM_WRAPPER_DROPS.load(Ordering::SeqCst) == 3);
+    assert!(ENUM_PAYLOAD_DROPS.load(Ordering::SeqCst) == 11);
+
     // Initialize with one variant
     let mut current_state = ComplexEnum::UserData {
         name: "Alice",

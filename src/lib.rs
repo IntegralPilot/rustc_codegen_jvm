@@ -337,14 +337,6 @@ fn place_or_insert_mono_function<'tcx>(
                     .copied()
                     .expect("a Rust method has a receiver")
             });
-            let has_enum_reference_receiver = receiver_ty.is_some_and(|receiver| {
-                matches!(
-                    receiver.kind(),
-                    TyKind::Ref(_, pointee, _)
-                        if matches!(pointee.kind(), TyKind::Adt(adt_def, _)
-                            if adt_def.is_enum())
-                )
-            });
             let has_arbitrary_self_receiver = receiver_ty.is_some_and(|receiver| {
                 let receiver_self = match receiver.kind() {
                     TyKind::Ref(_, pointee, _) => *pointee,
@@ -362,10 +354,7 @@ fn place_or_insert_mono_function<'tcx>(
                 instance,
             );
 
-            if !has_enum_reference_receiver
-                && !has_arbitrary_self_receiver
-                && let Type::Class(class_name) = self_oomir_ty
-            {
+            if !has_arbitrary_self_receiver && let Type::Class(class_name) = self_oomir_ty {
                 let can_extend_compiled_core_class = lower1::jvm_names::uses_compiled_core(tcx)
                     && (instance.def_id().is_local()
                         || lower1::jvm_names::compiles_external_core_instances(tcx));

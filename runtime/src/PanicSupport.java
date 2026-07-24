@@ -8,6 +8,8 @@ import java.nio.charset.StandardCharsets;
 public final class PanicSupport {
     private PanicSupport() {}
 
+    private static final ThreadLocal<RustPanic> ACTIVE_PANIC = new ThreadLocal<>();
+
     public static final class RustPanic extends RuntimeException {
         private Pointer payload;
 
@@ -40,18 +42,23 @@ public final class PanicSupport {
             utf8[index] = message.add(index).getI8();
         }
         String detail = new String(utf8, StandardCharsets.UTF_8);
-        throw new RustPanic(detail.isEmpty() ? "Rust panic" : "Rust panic: " + detail);
+        raiseTracked(new RustPanic(detail.isEmpty() ? "Rust panic" : "Rust panic: " + detail));
     }
 
     public static void raisePayload(Pointer payload) {
         if (payload == null) {
             throw new NullPointerException("Rust panic payload is null");
         }
-        throw new RustPanic(payload);
+        raiseTracked(new RustPanic(payload));
     }
 
     public static Pointer takePayload(Pointer caughtException) {
-        return ((RustPanic) caughtThrowable(caughtException)).takePayload();
+        RustPanic panic = (RustPanic) caughtThrowable(caughtException);
+        if (ACTIVE_PANIC.get() != panic) {
+            throw new IllegalStateException("caught Rust panic is not the active thread panic");
+        }
+        ACTIVE_PANIC.remove();
+        return panic.takePayload();
     }
 
     public static boolean isRustPanic(Pointer caughtException) {
@@ -73,6 +80,14 @@ public final class PanicSupport {
             throw new IllegalArgumentException("caught object is not a JVM throwable");
         }
         return (Throwable) value;
+    }
+
+    private static void raiseTracked(RustPanic panic) {
+        if (ACTIVE_PANIC.get() != null) {
+            Runtime.getRuntime().halt(134);
+        }
+        ACTIVE_PANIC.set(panic);
+        throw panic;
     }
 
     private static String describe(Throwable failure) {

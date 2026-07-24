@@ -665,6 +665,100 @@ pub(super) fn emit_rust_drop_value<'tcx>(
 
     match rust_ty.kind() {
         TyKind::Adt(adt_def, substs) if adt_def.is_struct() => {
+            if adt_def.is_box() {
+                let pointee_ty = substs.type_at(0);
+                if pointee_ty.needs_drop(tcx, TypingEnv::fully_monomorphized()) {
+                    let mut pointer = value.clone();
+                    let mut pointer_ty = oomir_ty.clone();
+                    let mut pointer_rust_ty = rust_ty;
+                    for depth in 0..3 {
+                        let class_name = pointer_ty
+                            .get_class_name()
+                            .expect("Box pointer carrier must be a JVM class")
+                            .to_string();
+                        let TyKind::Adt(carrier_def, carrier_args) = pointer_rust_ty.kind() else {
+                            panic!("Box pointer carrier {pointer_rust_ty:?} is not a struct");
+                        };
+                        let field = carrier_def
+                            .variant(rustc_abi::VariantIdx::from_usize(0))
+                            .fields
+                            .iter()
+                            .next()
+                            .expect("Box pointer carrier must have a field");
+                        let field_name = field.ident(tcx).to_string();
+                        let field_rust_ty = field.ty(tcx, carrier_args).skip_norm_wip();
+                        let field_ty = super::types::ty_to_oomir_type(
+                            field_rust_ty,
+                            tcx,
+                            data_types,
+                            instance,
+                        );
+                        let dest = format!("{temp_prefix}_box_pointer_{depth}");
+                        instructions.push(oomir::Instruction::GetField {
+                            dest: dest.clone(),
+                            object: pointer,
+                            field_name,
+                            field_ty: field_ty.clone(),
+                            owner_class: class_name,
+                        });
+                        pointer = oomir::Operand::Variable {
+                            name: dest,
+                            ty: field_ty.clone(),
+                        };
+                        pointer_ty = field_ty;
+                        pointer_rust_ty = field_rust_ty;
+                    }
+                    if matches!(pointee_ty.kind(), TyKind::Dynamic(..)) {
+                        let pointee = format!("{temp_prefix}_box_dyn_pointee");
+                        instructions.push(oomir::Instruction::InvokeVirtual {
+                            dest: Some(pointee.clone()),
+                            class_name: oomir::POINTER_CLASS.to_string(),
+                            method_name: "getObject".to_string(),
+                            method_ty: oomir::Signature {
+                                params: vec![("self".to_string(), pointer_ty)],
+                                ret: Box::new(oomir::Type::Class("java/lang/Object".to_string())),
+                                is_static: false,
+                            },
+                            args: Vec::new(),
+                            operand: pointer,
+                        });
+                        instructions.push(oomir::Instruction::InvokeStatic {
+                            class_name: oomir::POINTER_CLASS.to_string(),
+                            method_name: "dropRustValue".to_string(),
+                            method_ty: oomir::Signature {
+                                params: vec![(
+                                    "value".to_string(),
+                                    oomir::Type::Class("java/lang/Object".to_string()),
+                                )],
+                                ret: Box::new(oomir::Type::Void),
+                                is_static: true,
+                            },
+                            args: vec![oomir::Operand::Variable {
+                                name: pointee,
+                                ty: oomir::Type::Class("java/lang/Object".to_string()),
+                            }],
+                            dest: None,
+                        });
+                    } else {
+                        let drop_instance = Instance::resolve_drop_glue(tcx, pointee_ty);
+                        let target = super::naming::mono_fn_name_from_instance(tcx, drop_instance);
+                        instructions.push(oomir::Instruction::InvokeStatic {
+                            class_name: target
+                                .class_to_call_on
+                                .expect("Box pointee drop glue has a JVM owner"),
+                            method_name: target.method_name,
+                            method_ty: oomir::Signature {
+                                params: vec![("pointee".to_string(), pointer_ty)],
+                                ret: Box::new(oomir::Type::Void),
+                                is_static: true,
+                            },
+                            args: vec![pointer],
+                            dest: None,
+                        });
+                    }
+                }
+            }
+
             if adt_def.destructor(tcx).is_some() {
                 let class_name = oomir_ty
                     .get_class_name()
@@ -1998,6 +2092,41 @@ pub(super) fn convert_basic_block<'tcx>(
                             );
                         }
                     }
+                    if fn_inputs.len() > oomir_operands.len()
+                        && let Some(tuple_operand) = oomir_operands.last().cloned()
+                        && let Some(tuple_class) = tuple_operand
+                            .get_type()
+                            .and_then(|ty| ty.get_class_name().map(str::to_string))
+                    {
+                        let prefix_len = oomir_operands.len() - 1;
+                        let tuple_fields = match data_types.get(&tuple_class) {
+                            Some(oomir::DataType::Class { fields, .. })
+                                if fields.len() == fn_inputs.len() - prefix_len =>
+                            {
+                                Some(fields.clone())
+                            }
+                            _ => None,
+                        };
+                        if let Some(tuple_fields) = tuple_fields {
+                            oomir_operands.pop();
+                            for (field_index, (field_name, field_ty)) in
+                                tuple_fields.into_iter().enumerate()
+                            {
+                                let dest = format!("{label}_call_tuple_arg_{field_index}");
+                                instructions.push(oomir::Instruction::GetField {
+                                    dest: dest.clone(),
+                                    object: tuple_operand.clone(),
+                                    field_name,
+                                    field_ty: field_ty.clone(),
+                                    owner_class: tuple_class.clone(),
+                                });
+                                oomir_operands.push(oomir::Operand::Variable {
+                                    name: dest,
+                                    ty: field_ty,
+                                });
+                            }
+                        }
+                    }
 
                     let oomir_output_type =
                         super::types::ty_to_oomir_type(fn_output, tcx, data_types, instance);
@@ -2167,6 +2296,43 @@ pub(super) fn convert_basic_block<'tcx>(
                                 &method_signature,
                             );
                             let declared_method_name = item.name().as_str().to_string();
+                            let transparent_virtual_receiver =
+                                if matches!(func_instance.def, InstanceKind::Virtual(..)) {
+                                    match receiver_operand.get_type() {
+                                        Some(oomir::Type::Class(receiver_class)) => {
+                                            match data_types.get(&receiver_class) {
+                                                Some(oomir::DataType::Class { fields, .. })
+                                                    if fields.len() == 1
+                                                        && matches!(
+                                                            fields[0].1,
+                                                            oomir::Type::Interface(_)
+                                                        ) =>
+                                                {
+                                                    let (field_name, field_ty) = fields[0].clone();
+                                                    let dest =
+                                                        format!("{label}_virtual_trait_receiver");
+                                                    instructions.push(
+                                                        oomir::Instruction::GetField {
+                                                            dest: dest.clone(),
+                                                            object: receiver_operand.clone(),
+                                                            field_name,
+                                                            field_ty: field_ty.clone(),
+                                                            owner_class: receiver_class,
+                                                        },
+                                                    );
+                                                    Some(oomir::Operand::Variable {
+                                                        name: dest,
+                                                        ty: field_ty,
+                                                    })
+                                                }
+                                                _ => None,
+                                            }
+                                        }
+                                        _ => None,
+                                    }
+                                } else {
+                                    None
+                                };
 
                             if let Some(callable_abi) = super::types::callable_trait_object_abi(
                                 receiver_mir_ty,
@@ -2225,6 +2391,20 @@ pub(super) fn convert_basic_block<'tcx>(
                                     args: flattened_args,
                                     dest: effective_dest,
                                     operand: receiver_operand,
+                                });
+                            } else if let Some(interface_receiver) = transparent_virtual_receiver {
+                                let Some(oomir::Type::Interface(interface_name)) =
+                                    interface_receiver.get_type()
+                                else {
+                                    unreachable!("validated transparent trait receiver")
+                                };
+                                instructions.push(oomir::Instruction::InvokeInterface {
+                                    class_name: interface_name,
+                                    method_name: declared_method_name,
+                                    method_ty: method_signature,
+                                    args: method_args,
+                                    dest: effective_dest,
+                                    operand: interface_receiver,
                                 });
                             } else if let rustc_middle::ty::TyKind::Dynamic(preds, ..) =
                                 receiver_mir_ty.kind()
@@ -6404,7 +6584,54 @@ pub(super) fn convert_basic_block<'tcx>(
                                     method_signature.params[index].1 = pointer_ty;
                                 }
                             }
-                            let call_args = if is_closure_call && !oomir_operands.is_empty() {
+                            let flattened_closure_args = if is_closure_call
+                                && oomir_operands.len() == 2
+                                && method_signature.params.len() > 1
+                            {
+                                oomir_operands[1]
+                                    .get_type()
+                                    .and_then(|ty| ty.get_class_name().map(str::to_string))
+                                    .and_then(|tuple_class| {
+                                        let fields = match data_types.get(&tuple_class) {
+                                            Some(oomir::DataType::Class { fields, .. })
+                                                if fields.len()
+                                                    == method_signature.params.len() =>
+                                            {
+                                                fields.clone()
+                                            }
+                                            _ => return None,
+                                        };
+                                        let mut flattened = Vec::new();
+                                        for (field_index, (field_name, field_ty)) in
+                                            fields.into_iter().enumerate()
+                                        {
+                                            let dest = format!("{label}_closure_arg_{field_index}");
+                                            instructions.push(oomir::Instruction::GetField {
+                                                dest: dest.clone(),
+                                                object: oomir_operands[1].clone(),
+                                                field_name,
+                                                field_ty: field_ty.clone(),
+                                                owner_class: tuple_class.clone(),
+                                            });
+                                            flattened.push(oomir::Operand::Variable {
+                                                name: dest,
+                                                ty: field_ty,
+                                            });
+                                        }
+                                        Some(flattened)
+                                    })
+                            } else {
+                                None
+                            };
+                            let call_args = if let Some(flattened) = flattened_closure_args {
+                                if closure_has_captures {
+                                    std::iter::once(oomir_operands[0].clone())
+                                        .chain(flattened)
+                                        .collect()
+                                } else {
+                                    flattened
+                                }
+                            } else if is_closure_call && !oomir_operands.is_empty() {
                                 if closure_has_captures {
                                     oomir_operands.clone()
                                 } else {

@@ -190,6 +190,7 @@ The following example programs live in `tests/`, are compiled with the standard 
 | **[Alloc](tests/binary/alloc/src/main.rs)** | Complex allocations: binary trees, heaps, linked lists, vectors, strings, Arc/atomics, and drop/cleanup semantics. |
 | **[Threads](tests/binary/threads/src/main.rs)** | Multi-threading, scoped threads, mutexes (with poisoning), RWLocks, barriers, condition variables, and TLS. | 
 | **[Panic](tests/binary/panic/src/main.rs)** | Unwinding, catching static/dynamic panic payloads, resuming unwinds, and custom panic hooks. |
+| **[Async / Await](tests/binary/async_await/src/main.rs)** | Multi-poll futures, nested and recursive async work, async closures and trait methods, `dyn Future`, cross-thread execution, cancellation, and unwinding across suspension points. |
 | **[STD](tests/binary/std/src/main.rs)** | Command-line arguments, environment variables, standard I/O, and runtime context. |
 
 ### Standalone Rust Programs
@@ -219,7 +220,8 @@ The vast majority of the Rust language is supported, including generics, traits,
 | **Core** | **98.99%** | Passed via official upstream `coretests` suite in CI |
 | **Alloc** | **Supported** | Complex allocations, includes binary trees, heaps, linked lists, etc. |
 | **Threads & Sync** | **Supported** | Thread spawning, scoped threads, Mutex, RwLock, Condvar, TLS |
-| **Panic Unwinding** | **Supported** | Complete unwinding stack, catch_unwind, and panic hooks |
+| **Async & Futures** | **Supported** | Async functions, blocks, closures and trait methods; boxed/recursive `dyn Future`; cancellation |
+| **Panic Unwinding** | **Supported** | Complete unwinding stack, `catch_unwind`, panic hooks, and abort-on-double-panic semantics |
 | **Stdio & Env** | **Supported** | `println!`, `eprintln!`, `stdin`, `env::args`, `env::vars` |
 | **Time & Random** | **Supported** | `SystemTime`, `Instant`, standard entropy seeds |
 | **File System (`std::fs`)** | _Planned_ | PAL delegation in progress |
@@ -232,6 +234,7 @@ Compiled JAR files emit rich JVM metadata (`LineNumberTable`, parameter names, n
 * `std::fs` is currently non-functional due to pending PAL bindings.
 * Code that heavily relies on raw pointer arithmetic executes through the Virtual MMU translation layer, which introduces extra memory allocations and GC overhead compared to structured stack/heap access.
 * The backend relies heavily on HotSpot's JIT (C2) compiler for runtime optimisation rather than aggressive AOT passes during compilation.
+* The default stack size on the JVM is lower than typical native targets. Like on native, if you encounter a `StackOverflowError` with deeply recursive code, you should increase the per-thread stack size. This can be done with the `-Xss` flag (for example, `java -Xss16m ...`).
 * Although upstream `coretests` pass, niche compiler edge cases may still trigger Internal Compiler Errors (ICEs).
 * The `quote!()` proc macro is currently unsupported.
 * If you pass a Rust object to Java (or another JVM language) code, there's no guarantee it has to follow Rust's rules (i.e. ownership, borrowing, or drop semantics). This matches what happens on native targets when interacting with FFI, but potentially can be improved for the JVM in future.
@@ -333,6 +336,13 @@ If your crate is a binary, it can be executed directly:
 ```bash
 java -cp /path/to/rustc_codegen_jvm/runtime/build/classes:<app>.jar [crate_name].[crate_name]
 ```
+
+For workloads with intentionally deep recursion, pass a suitable per-thread JVM stack size:
+
+```bash
+java -Xss16m -cp /path/to/rustc_codegen_jvm/runtime/build/classes:<app>.jar [crate_name].[crate_name]
+```
+
 If your crate is a library, it will be located in a `deps/` subfolder within the `debug`/`release` folder, and named `[cratename]-[hash].jar`.
 
 ## Running Tests
