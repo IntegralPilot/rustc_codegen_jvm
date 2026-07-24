@@ -14,6 +14,7 @@ use super::super::{
     control_flow::rvalue::{
         ensure_closure_fn_pointer_adapter_class, ensure_fn_pointer_adapter_class, fn_pointer_target,
     },
+    control_flow::trait_objects::ensure_trait_object_adapter_class_for_pointees,
     jvm_names, ty_to_oomir_type,
     types::{
         UNION_BYTES_FIELD, UNION_OBJECTS_FIELD, ensure_fn_ptr_interface, ensure_union_data_type,
@@ -1275,6 +1276,80 @@ fn read_pointer_from_memory<'tcx>(
     }
 }
 
+fn read_trait_object_reference_from_memory<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    allocation: &ConstAllocation,
+    offset: Size,
+    dynamic_ty: Ty<'tcx>,
+    oomir_data_types: &mut HashMap<String, oomir::DataType>,
+    instance: Instance<'tcx>,
+) -> Result<oomir::Constant, String> {
+    let data_pointer = read_pointer_from_memory(tcx, allocation, offset)?;
+    let vtable_pointer =
+        read_pointer_from_memory(tcx, allocation, offset + tcx.data_layout.pointer_size())?;
+    let (vtable_provenance, _) = vtable_pointer.into_raw_parts();
+    let vtable_alloc_id = vtable_provenance.get_alloc_id().ok_or_else(|| {
+        format!("Trait-object vtable pointer {vtable_pointer:?} has no allocation id")
+    })?;
+    let GlobalAlloc::VTable(concrete_ty, _) = tcx.global_alloc(vtable_alloc_id) else {
+        return Err(format!(
+            "Trait-object metadata pointed to non-vtable allocation {:?}",
+            tcx.global_alloc(vtable_alloc_id)
+        ));
+    };
+    let concrete_ty = EarlyBinder::bind(tcx, concrete_ty)
+        .instantiate(tcx, instance.args)
+        .skip_norm_wip();
+    let concrete_ty = tcx
+        .try_normalize_erasing_regions(
+            TypingEnv::fully_monomorphized(),
+            Unnormalized::new_wip(concrete_ty),
+        )
+        .unwrap_or(concrete_ty);
+    if !matches!(dynamic_ty.kind(), TyKind::Dynamic(..)) {
+        return Err(format!(
+            "Trait-object reference requested for non-dynamic type {dynamic_ty:?}"
+        ));
+    }
+
+    let value = read_pointee_constant(tcx, data_pointer, concrete_ty, oomir_data_types, instance)?;
+    let concrete_pointer = if pointer_references_static(tcx, data_pointer) {
+        value
+    } else {
+        pointer_constant_for_pointee(
+            tcx,
+            data_pointer,
+            concrete_ty,
+            value,
+            oomir_data_types,
+            instance,
+        )?
+    };
+    let carrier_ty = oomir::Type::from_constant(&concrete_pointer);
+    let oomir::Type::Interface(interface_name) =
+        ty_to_oomir_type(dynamic_ty, tcx, oomir_data_types, instance)
+    else {
+        return Err(format!(
+            "Trait-object type {dynamic_ty:?} did not map to a JVM interface"
+        ));
+    };
+    let adapter_class = ensure_trait_object_adapter_class_for_pointees(
+        concrete_ty,
+        dynamic_ty,
+        &carrier_ty,
+        &interface_name,
+        oomir_data_types,
+        tcx,
+        instance,
+    )?;
+    Ok(oomir::Constant::Instance {
+        class_name: adapter_class,
+        fields: HashMap::new(),
+        params: vec![concrete_pointer],
+        param_types: vec![carrier_ty],
+    })
+}
+
 fn read_pointee_constant<'tcx>(
     tcx: TyCtxt<'tcx>,
     pointer: Pointer<CtfeProvenance>,
@@ -1696,6 +1771,15 @@ pub fn read_constant_value_from_memory<'tcx>(
                     oomir_data_types,
                     instance,
                 )
+            } else if matches!(inner_ty.kind(), TyKind::Dynamic(..)) {
+                read_trait_object_reference_from_memory(
+                    tcx,
+                    allocation,
+                    offset,
+                    *inner_ty,
+                    oomir_data_types,
+                    instance,
+                )
             } else {
                 let ptr = read_pointer_from_memory(tcx, allocation, offset)?;
                 let value = read_pointee_constant(tcx, ptr, *inner_ty, oomir_data_types, instance)?;
@@ -1721,9 +1805,6 @@ pub fn read_constant_value_from_memory<'tcx>(
                     // References whose allocation is the static itself already
                     // are its canonical stable Pointer. An ordinary allocation
                     // containing a reference still needs another Pointer layer.
-                    return Ok(value);
-                }
-                if matches!(inner_ty.kind(), TyKind::Dynamic(..)) {
                     return Ok(value);
                 }
                 pointer_constant_for_pointee(tcx, ptr, *inner_ty, value, oomir_data_types, instance)

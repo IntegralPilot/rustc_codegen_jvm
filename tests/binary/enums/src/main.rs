@@ -20,6 +20,13 @@ enum ConstantArrayEnum {
     Seven = 7,
 }
 
+enum RecursiveFormatItem<'a> {
+    Literal(&'a [u8]),
+    Compound(&'a [RecursiveFormatItem<'a>]),
+    Optional(&'a RecursiveFormatItem<'a>),
+    First(&'a [RecursiveFormatItem<'a>]),
+}
+
 const CONSTANT_ENUMS: [ConstantArrayEnum; 4] = [
     ConstantArrayEnum::Zero,
     ConstantArrayEnum::Seven,
@@ -208,4 +215,22 @@ fn main() {
     assert!(matches!(CONSTANT_ENUMS[1], ConstantArrayEnum::Seven));
     assert!(matches!(CONSTANT_ENUMS[2], ConstantArrayEnum::One));
     assert!(matches!(CONSTANT_ENUMS[3], ConstantArrayEnum::Seven));
+
+    let literal = RecursiveFormatItem::Literal(b"time");
+    let optional_literal = RecursiveFormatItem::Literal(b"time");
+    let optional = RecursiveFormatItem::Optional(&optional_literal);
+    let compound_items = [literal, optional];
+    let compound = RecursiveFormatItem::Compound(&compound_items);
+    let first_items = [compound];
+    let first = RecursiveFormatItem::First(&first_items);
+    match first {
+        RecursiveFormatItem::First([RecursiveFormatItem::Compound(items)]) => {
+            assert!(matches!(items[0], RecursiveFormatItem::Literal(b"time")));
+            assert!(matches!(
+                items[1],
+                RecursiveFormatItem::Optional(RecursiveFormatItem::Literal(b"time"))
+            ));
+        }
+        _ => panic!("recursive format item shape was not preserved"),
+    }
 }

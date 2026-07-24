@@ -21,10 +21,16 @@ thread_local! {
     /// their `TyKind` address is therefore an exact, compact identity key.
     static TYPE_LOWERING_CACHE: RefCell<HashMap<(usize, usize), oomir::Type>> =
         RefCell::new(HashMap::new());
+    /// Enum classes are installed as placeholders before their fields are
+    /// lowered. Recursive variants must reuse those placeholders instead of
+    /// trying to define the same enum again through `&Self` or `&[Self]`.
+    static ENUM_TYPES_IN_PROGRESS: RefCell<HashSet<(usize, String)>> =
+        RefCell::new(HashSet::new());
 }
 
 pub(crate) fn reset_type_lowering_cache() {
     TYPE_LOWERING_CACHE.with(|cache| cache.borrow_mut().clear());
+    ENUM_TYPES_IN_PROGRESS.with(|types| types.borrow_mut().clear());
 }
 
 pub const UNION_BYTES_FIELD: &str = "_bytes";
@@ -711,6 +717,16 @@ fn ensure_enum_data_types<'tcx>(
     data_types: &mut HashMap<String, oomir::DataType>,
     instance_context: rustc_middle::ty::Instance<'tcx>,
 ) {
+    let lowering_key = (
+        std::ptr::from_ref(data_types) as usize,
+        base_enum_name.to_string(),
+    );
+    let should_lower =
+        ENUM_TYPES_IN_PROGRESS.with(|types| types.borrow_mut().insert(lowering_key.clone()));
+    if !should_lower {
+        return;
+    }
+
     let mut created_placeholders = Vec::new();
 
     // 1. Insert a placeholder for the base enum class
@@ -887,6 +903,10 @@ fn ensure_enum_data_types<'tcx>(
         // while completing the concrete variant definition.
         existing_methods.extend(methods);
     }
+
+    ENUM_TYPES_IN_PROGRESS.with(|types| {
+        types.borrow_mut().remove(&lowering_key);
+    });
 }
 
 fn operand_var(name: impl Into<String>, ty: oomir::Type) -> oomir::Operand {

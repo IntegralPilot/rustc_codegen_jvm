@@ -58,6 +58,26 @@ pub(super) fn ensure_trait_object_adapter_class<'tcx>(
             ));
         }
     };
+    ensure_trait_object_adapter_class_for_pointees(
+        concrete_ty,
+        dynamic_ty,
+        carrier_ty,
+        interface_name,
+        data_types,
+        tcx,
+        instance_context,
+    )
+}
+
+pub(crate) fn ensure_trait_object_adapter_class_for_pointees<'tcx>(
+    concrete_ty: Ty<'tcx>,
+    dynamic_ty: Ty<'tcx>,
+    carrier_ty: &oomir::Type,
+    interface_name: &str,
+    data_types: &mut HashMap<String, oomir::DataType>,
+    tcx: TyCtxt<'tcx>,
+    instance_context: Instance<'tcx>,
+) -> Result<String, String> {
     let TyKind::Dynamic(predicates, _) = dynamic_ty.kind() else {
         return Err(format!(
             "trait-object target is not dynamic: {dynamic_ty:?}"
@@ -71,7 +91,7 @@ pub(super) fn ensure_trait_object_adapter_class<'tcx>(
         tcx.instantiate_bound_regions_with_erased(principal.with_self_ty(tcx, concrete_ty))
     });
     let callable_abi = super::super::types::callable_trait_object_abi(
-        target_mir_ty,
+        dynamic_ty,
         tcx,
         data_types,
         instance_context,
