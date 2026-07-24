@@ -85,6 +85,7 @@ public final class ThreadSupport {
             try {
                 start.invokeExact(init);
             } catch (Throwable failure) {
+                PanicSupport.abortIfStackOverflow(failure);
                 boolean report;
                 synchronized (record) {
                     report = record.detached;
@@ -108,6 +109,7 @@ public final class ThreadSupport {
             record.thread.start();
             return id;
         } catch (RuntimeException | Error failure) {
+            PanicSupport.abortIfStackOverflow(failure);
             THREADS.remove(id);
             return 0;
         }
@@ -343,6 +345,7 @@ public final class ThreadSupport {
                             start.await();
                             worker.invokeExact(context);
                         } catch (Throwable error) {
+                            PanicSupport.abortIfStackOverflow(error);
                             failures[workerIndex] = error;
                         }
                     },
@@ -382,6 +385,7 @@ public final class ThreadSupport {
     }
 
     private static void rethrowWorkerFailure(Throwable failure) {
+        PanicSupport.abortIfStackOverflow(failure);
         if (failure instanceof RuntimeException) {
             throw (RuntimeException) failure;
         }
@@ -392,6 +396,7 @@ public final class ThreadSupport {
     }
 
     private static void reportUncaughtFailure(Throwable failure) {
+        PanicSupport.abortIfStackOverflow(failure);
         Thread thread = Thread.currentThread();
         thread.getUncaughtExceptionHandler().uncaughtException(thread, failure);
     }

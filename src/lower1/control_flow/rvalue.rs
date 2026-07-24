@@ -377,7 +377,7 @@ fn struct_trait_tail_unsize<'tcx>(
     };
     let source_pointee = normalize_unsize_ty(pointee(source_pointer_ty)?, tcx, instance);
     let target_pointee = normalize_unsize_ty(pointee(target_pointer_ty)?, tcx, instance);
-    let (TyKind::Adt(source_def, _), TyKind::Adt(target_def, _)) =
+    let (TyKind::Adt(source_def, source_args), TyKind::Adt(target_def, target_args)) =
         (source_pointee.kind(), target_pointee.kind())
     else {
         return None;
@@ -386,22 +386,31 @@ fn struct_trait_tail_unsize<'tcx>(
         return None;
     }
     let typing_env = TypingEnv::fully_monomorphized();
-    let source_tail = tcx.struct_tail_for_codegen(source_pointee, typing_env);
-    let target_tail = tcx.struct_tail_for_codegen(target_pointee, typing_env);
-    if !matches!(target_tail.kind(), TyKind::Dynamic(..))
-        || matches!(source_tail.kind(), TyKind::Dynamic(..))
-    {
+    let tail_field = FieldIdx::from_usize(
+        source_def
+            .variant(0usize.into())
+            .fields
+            .len()
+            .checked_sub(1)?,
+    );
+    let field = &source_def.variant(0usize.into()).fields[tail_field];
+    let source_tail =
+        normalize_unsize_ty(field.ty(tcx, source_args).skip_norm_wip(), tcx, instance);
+    let target_tail =
+        normalize_unsize_ty(field.ty(tcx, target_args).skip_norm_wip(), tcx, instance);
+    if !matches!(
+        tcx.struct_tail_for_codegen(target_tail, typing_env).kind(),
+        TyKind::Dynamic(..)
+    ) || matches!(
+        tcx.struct_tail_for_codegen(source_tail, typing_env).kind(),
+        TyKind::Dynamic(..)
+    ) {
         return None;
     }
     let source_layout = tcx
         .layout_of(typing_env.as_query_input(source_pointee))
         .ok()?;
-    let tail_field = source_def
-        .variant(0usize.into())
-        .fields
-        .len()
-        .checked_sub(1)?;
-    let source_tail_offset = source_layout.fields.offset(tail_field).bytes();
+    let source_tail_offset = source_layout.fields.offset(tail_field.as_usize()).bytes();
     let oomir::Type::Pointer(target) = target_oomir_ty else {
         return None;
     };
@@ -484,7 +493,7 @@ fn emit_struct_trait_tail_pointer_unsize<'tcx>(
             },
         });
         let tail_trait_dest = format!("{dest}_tail_trait");
-        let tail_trait = emit_raw_array_pointer_unsize(
+        let tail_trait = emit_unsize_value(
             source_tail_pointer_ty,
             target_tail_pointer_ty,
             oomir::Operand::Variable {
@@ -1177,6 +1186,17 @@ fn emit_unsize_value<'tcx>(
                 ty: target_oomir_ty.clone(),
             }
         })
+    } else if let Some(result) = emit_struct_trait_tail_pointer_unsize(
+        source_ty,
+        target_ty,
+        source.clone(),
+        dest,
+        tcx,
+        instance,
+        data_types,
+        instructions,
+    ) {
+        Some(result)
     } else if let Some(target_class) = struct_tail_unsize_target_class(
         source_ty,
         target_ty,
@@ -3811,7 +3831,14 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                             pointer_pointee_ty(source_mir_ty).kind(),
                             TyKind::Dynamic(..)
                         )
-                        && matches!(target_mir_ty.kind(), TyKind::RawPtr(..) | TyKind::Ref(..))
+                        && matches!(
+                            resolved_target_mir_ty.kind(),
+                            TyKind::RawPtr(..) | TyKind::Ref(..)
+                        )
+                        && !matches!(
+                            pointer_pointee_ty(resolved_target_mir_ty).kind(),
+                            TyKind::Dynamic(..)
+                        )
                         && matches!(oomir_target_type, oomir::Type::Pointer(_))
                     {
                         instructions.push(oomir::Instruction::InvokeStatic {

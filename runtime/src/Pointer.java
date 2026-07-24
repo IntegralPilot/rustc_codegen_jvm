@@ -45,6 +45,7 @@ public final class Pointer {
             invokeRustFunction(tryFunction, data);
             return false;
         } catch (Throwable failure) {
+            PanicSupport.abortIfStackOverflow(failure);
             if (failure instanceof VirtualMachineError || failure instanceof ThreadDeath) {
                 rethrowUnchecked(failure);
             }
@@ -772,6 +773,7 @@ public final class Pointer {
         } catch (ReflectiveOperationException error) {
             throw new IllegalStateException("could not invoke Rust slice element drop glue", error);
         } catch (Throwable error) {
+            PanicSupport.abortIfStackOverflow(error);
             if (error instanceof RuntimeException) {
                 throw (RuntimeException) error;
             }
@@ -1988,21 +1990,28 @@ public final class Pointer {
         if (allocation == null) {
             return;
         }
+        long stateOffset;
         MemoryViewState state;
         Map<Object, NavigableMap<Long, MemoryViewState>> viewStripe =
                 stateStripe(MEMORY_VIEWS, allocation);
         synchronized (viewStripe) {
             NavigableMap<Long, MemoryViewState> views = viewStripe.get(allocation);
-            state = views == null ? null : views.get(origin.byteOffset);
+            Map.Entry<Long, MemoryViewState> enclosing =
+                    views == null ? null : views.floorEntry(origin.byteOffset);
+            stateOffset = enclosing == null ? -1 : enclosing.getKey();
+            state = enclosing == null ? null : enclosing.getValue();
         }
-        if (state == null || state.value != value || state.size != origin.viewSize) {
+        if (state == null
+                || stateOffset > origin.byteOffset
+                || Math.addExact(origin.byteOffset, origin.viewSize)
+                        > Math.addExact(stateOffset, (long) state.size)) {
             return;
         }
         Pointer pointer = new Pointer(
                         allocation,
                         origin.allocationElementSize,
-                        origin.byteOffset,
-                        origin.viewSize,
+                        stateOffset,
+                        state.size,
                         origin.allocationCodecClassName,
                         state.codecClassName,
                         -1)
@@ -3674,10 +3683,17 @@ public final class Pointer {
 
     /** Gives a struct-tail DST the vtable carried by its erased final field. */
     public static Pointer attachStructTailTraitMetadata(Pointer pointer, Pointer tailPointer) {
-        if (pointer == null || tailPointer == null || tailPointer.traitObjectCarrier == null) {
+        if (pointer == null || tailPointer == null) {
             throw new NullPointerException("struct-tail trait metadata requires a trait pointer");
         }
-        pointer.traitMetadataCarrier = tailPointer.traitObjectCarrier;
+        Object carrier = tailPointer.traitObjectCarrier != null
+                ? tailPointer.traitObjectCarrier
+                : tailPointer.traitMetadataCarrier;
+        if (carrier == null) {
+            throw new IllegalArgumentException(
+                    "struct-tail trait pointer does not carry dynamic metadata");
+        }
+        pointer.traitMetadataCarrier = carrier;
         pointer.traitMetadataMarker = tailPointer.traitMetadataMarker;
         pointer.traitPointeeSize = tailPointer.traitPointeeSize;
         pointer.traitPointeeAlignment = tailPointer.traitPointeeAlignment;
@@ -3963,6 +3979,70 @@ public final class Pointer {
         }
         long unalignedSize = Math.addExact(prefixSize, Math.multiplyExact(length, elementSize));
         return Math.addExact(unalignedSize, alignment - 1) & -alignment;
+    }
+
+    /** Computes the dynamic layout size of a trait object or trait-tailed DST. */
+    public static long sizeOfTraitTailed(
+            Object value, long prefixSize, long prefixAlignment) {
+        long pointeeSize = traitPointeeSize(value);
+        long alignment = Math.max(prefixAlignment, traitPointeeAlignment(value));
+        validateDynamicLayout(prefixSize, pointeeSize, alignment);
+        long unalignedSize = Math.addExact(prefixSize, pointeeSize);
+        return Math.addExact(unalignedSize, alignment - 1) & -alignment;
+    }
+
+    /** Computes the dynamic alignment of a trait object or trait-tailed DST. */
+    public static long alignOfTraitTailed(Object value, long prefixAlignment) {
+        long alignment = Math.max(prefixAlignment, traitPointeeAlignment(value));
+        validateDynamicLayout(0, 0, alignment);
+        return alignment;
+    }
+
+    private static long traitPointeeSize(Object value) {
+        if (value instanceof Pointer) {
+            Pointer pointer = (Pointer) value;
+            if (pointer.traitPointeeSize >= 0) {
+                return pointer.traitPointeeSize;
+            }
+            value = pointer.traitObjectCarrier != null
+                    ? pointer.traitObjectCarrier
+                    : pointer.traitMetadataCarrier;
+            if (value == null) {
+                Object direct = pointer.directCellValueOrSelf();
+                value = direct == pointer ? null : direct;
+            }
+        }
+        if (value instanceof TraitObjectCarrier) {
+            return ((TraitObjectCarrier) value).rustTraitObjectSize();
+        }
+        throw new IllegalArgumentException("Rust DST value does not carry trait-object size");
+    }
+
+    private static long traitPointeeAlignment(Object value) {
+        if (value instanceof Pointer) {
+            Pointer pointer = (Pointer) value;
+            if (pointer.traitPointeeAlignment > 0) {
+                return pointer.traitPointeeAlignment;
+            }
+            value = pointer.traitObjectCarrier != null
+                    ? pointer.traitObjectCarrier
+                    : pointer.traitMetadataCarrier;
+            if (value == null) {
+                Object direct = pointer.directCellValueOrSelf();
+                value = direct == pointer ? null : direct;
+            }
+        }
+        if (value instanceof TraitObjectCarrier) {
+            return ((TraitObjectCarrier) value).rustTraitObjectAlignment();
+        }
+        throw new IllegalArgumentException("Rust DST value does not carry trait-object alignment");
+    }
+
+    private static void validateDynamicLayout(long prefixSize, long pointeeSize, long alignment) {
+        if (prefixSize < 0 || pointeeSize < 0
+                || alignment <= 0 || (alignment & (alignment - 1)) != 0) {
+            throw new IllegalArgumentException("invalid Rust dynamically sized layout");
+        }
     }
 
     public Pointer offset(long elementCount) {

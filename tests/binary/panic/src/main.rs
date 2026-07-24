@@ -1,6 +1,18 @@
 use std::any::Any;
 use std::mem::ManuallyDrop;
 use std::panic::{AssertUnwindSafe, catch_unwind, panic_any, resume_unwind};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static PANICKING_DROP_RAN: AtomicBool = AtomicBool::new(false);
+
+struct PanicsOnDrop;
+
+impl Drop for PanicsOnDrop {
+    fn drop(&mut self) {
+        PANICKING_DROP_RAN.store(true, Ordering::SeqCst);
+        panic!("single panic from Drop");
+    }
+}
 
 #[repr(C)]
 struct FormattingFields {
@@ -66,6 +78,16 @@ fn main() {
     assert!(message.contains("java.lang.ArithmeticException"));
     assert!(message.contains("integer overflow"));
     assert_eq!(unsafe { java_add_exact(20, 22) }, 42);
+
+    let drop_panic = catch_unwind(|| {
+        let _value = PanicsOnDrop;
+    })
+    .expect_err("a single panic during normal Drop must remain catchable");
+    assert!(PANICKING_DROP_RAN.load(Ordering::SeqCst));
+    assert_eq!(
+        drop_panic.downcast_ref::<&'static str>().copied(),
+        Some("single panic from Drop")
+    );
 
     let hook = std::panic::take_hook();
     std::panic::set_hook(hook);

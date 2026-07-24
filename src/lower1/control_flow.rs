@@ -5492,7 +5492,44 @@ pub(super) fn convert_basic_block<'tcx>(
                                 TyKind::Str => Some(tcx.types.u8),
                                 _ => None,
                             };
-                            if let Some(element_ty) = tail_element {
+                            if matches!(tail.kind(), TyKind::Dynamic(..)) {
+                                let layout = tcx
+                                    .layout_of(
+                                        TypingEnv::fully_monomorphized()
+                                            .as_query_input(measured_ty),
+                                    )
+                                    .unwrap_or_else(|error| {
+                                        panic!(
+                                            "could not determine size_of_val trait DST layout for {measured_ty:?}: {error:?}"
+                                        )
+                                    });
+                                instructions.push(oomir::Instruction::InvokeStatic {
+                                    dest: Some(dest),
+                                    class_name: oomir::POINTER_CLASS.to_string(),
+                                    method_name: "sizeOfTraitTailed".to_string(),
+                                    method_ty: oomir::Signature {
+                                        params: vec![
+                                            (
+                                                "value".to_string(),
+                                                oomir::Type::Class("java/lang/Object".to_string()),
+                                            ),
+                                            ("prefix_size".to_string(), oomir::Type::U64),
+                                            ("prefix_alignment".to_string(), oomir::Type::U64),
+                                        ],
+                                        ret: Box::new(oomir_output_type.clone()),
+                                        is_static: true,
+                                    },
+                                    args: vec![
+                                        oomir_operands[0].clone(),
+                                        oomir::Operand::Constant(oomir::Constant::U64(
+                                            layout.size.bytes(),
+                                        )),
+                                        oomir::Operand::Constant(oomir::Constant::U64(
+                                            layout.align.abi.bytes(),
+                                        )),
+                                    ],
+                                });
+                            } else if let Some(element_ty) = tail_element {
                                 let layout = tcx
                                     .layout_of(
                                         TypingEnv::fully_monomorphized()
@@ -5561,24 +5598,63 @@ pub(super) fn convert_basic_block<'tcx>(
                                 .types()
                                 .next()
                                 .expect("align_of_val intrinsic has a type argument");
-                            let alignment = match measured_ty.kind() {
-                                TyKind::Slice(element_ty) => {
-                                    super::types::layout_align_bytes(tcx, *element_ty)
+                            let tail = tcx.struct_tail_for_codegen(
+                                measured_ty,
+                                TypingEnv::fully_monomorphized(),
+                            );
+                            if matches!(tail.kind(), TyKind::Dynamic(..)) {
+                                let layout = tcx
+                                    .layout_of(
+                                        TypingEnv::fully_monomorphized()
+                                            .as_query_input(measured_ty),
+                                    )
+                                    .unwrap_or_else(|error| {
+                                        panic!(
+                                            "could not determine align_of_val trait DST layout for {measured_ty:?}: {error:?}"
+                                        )
+                                    });
+                                instructions.push(oomir::Instruction::InvokeStatic {
+                                    dest: Some(dest),
+                                    class_name: oomir::POINTER_CLASS.to_string(),
+                                    method_name: "alignOfTraitTailed".to_string(),
+                                    method_ty: oomir::Signature {
+                                        params: vec![
+                                            (
+                                                "value".to_string(),
+                                                oomir::Type::Class("java/lang/Object".to_string()),
+                                            ),
+                                            ("prefix_alignment".to_string(), oomir::Type::U64),
+                                        ],
+                                        ret: Box::new(oomir_output_type.clone()),
+                                        is_static: true,
+                                    },
+                                    args: vec![
+                                        oomir_operands[0].clone(),
+                                        oomir::Operand::Constant(oomir::Constant::U64(
+                                            layout.align.abi.bytes(),
+                                        )),
+                                    ],
+                                });
+                            } else {
+                                let alignment = match measured_ty.kind() {
+                                    TyKind::Slice(element_ty) => {
+                                        super::types::layout_align_bytes(tcx, *element_ty)
+                                    }
+                                    TyKind::Str => Ok(1),
+                                    _ => super::types::layout_align_bytes(tcx, measured_ty),
                                 }
-                                TyKind::Str => Ok(1),
-                                _ => super::types::layout_align_bytes(tcx, measured_ty),
+                                .unwrap_or_else(|error| {
+                                    panic!(
+                                        "could not determine align_of_val layout for {measured_ty:?}: {error}"
+                                    )
+                                });
+                                instructions.push(oomir::Instruction::Move {
+                                    dest,
+                                    src: oomir::Operand::Constant(oomir::Constant::U64(
+                                        alignment as u64,
+                                    )),
+                                });
                             }
-                            .unwrap_or_else(|error| {
-                                panic!(
-                                    "could not determine align_of_val layout for {measured_ty:?}: {error}"
-                                )
-                            });
-                            instructions.push(oomir::Instruction::Move {
-                                dest,
-                                src: oomir::Operand::Constant(oomir::Constant::U64(
-                                    alignment as u64,
-                                )),
-                            });
                         } else if intrinsic_name.as_str() == "type_id_eq"
                             && is_compiler_intrinsic
                             && oomir_operands.len() == 2
@@ -6932,26 +7008,54 @@ pub(super) fn convert_basic_block<'tcx>(
                     debug_variables,
                     debug_variable_scopes,
                 ));
-                if let rustc_middle::mir::AssertKind::BoundsCheck { len, index } = &**msg {
-                    let index = convert_operand(
-                        index,
-                        tcx,
-                        instance,
-                        mir,
-                        data_types,
-                        &mut fail_instructions,
-                    );
-                    let len = convert_operand(
-                        len,
-                        tcx,
-                        instance,
-                        mir,
-                        data_types,
-                        &mut fail_instructions,
-                    );
+                let panic = match &**msg {
+                    rustc_middle::mir::AssertKind::BoundsCheck { len, index } => {
+                        let index = convert_operand(
+                            index,
+                            tcx,
+                            instance,
+                            mir,
+                            data_types,
+                            &mut fail_instructions,
+                        );
+                        let len = convert_operand(
+                            len,
+                            tcx,
+                            instance,
+                            mir,
+                            data_types,
+                            &mut fail_instructions,
+                        );
+                        Some((LangItem::PanicBoundsCheck, vec![index, len]))
+                    }
+                    rustc_middle::mir::AssertKind::Overflow(op, ..) => {
+                        let lang_item = match op {
+                            rustc_middle::mir::BinOp::Add => LangItem::PanicAddOverflow,
+                            rustc_middle::mir::BinOp::Sub => LangItem::PanicSubOverflow,
+                            rustc_middle::mir::BinOp::Mul => LangItem::PanicMulOverflow,
+                            rustc_middle::mir::BinOp::Div => LangItem::PanicDivOverflow,
+                            rustc_middle::mir::BinOp::Rem => LangItem::PanicRemOverflow,
+                            rustc_middle::mir::BinOp::Shl => LangItem::PanicShlOverflow,
+                            rustc_middle::mir::BinOp::Shr => LangItem::PanicShrOverflow,
+                            _ => unreachable!("unexpected overflowing MIR operation {op:?}"),
+                        };
+                        Some((lang_item, Vec::new()))
+                    }
+                    rustc_middle::mir::AssertKind::OverflowNeg(_) => {
+                        Some((LangItem::PanicNegOverflow, Vec::new()))
+                    }
+                    rustc_middle::mir::AssertKind::DivisionByZero(_) => {
+                        Some((LangItem::PanicDivZero, Vec::new()))
+                    }
+                    rustc_middle::mir::AssertKind::RemainderByZero(_) => {
+                        Some((LangItem::PanicRemZero, Vec::new()))
+                    }
+                    _ => None,
+                };
+                if let Some((lang_item, args)) = panic {
                     emit_panic_lang_item(
-                        LangItem::PanicBoundsCheck,
-                        vec![index, len],
+                        lang_item,
+                        args,
                         terminator.source_info,
                         tcx,
                         instance,

@@ -34,6 +34,7 @@ public final class RuntimeSupport {
     private RuntimeSupport() {}
 
     public static void initializeArgs(String[] javaArguments) {
+        PanicSupport.installMainThreadHandler();
         String[] initialized = new String[javaArguments.length + 1];
         initialized[0] = "rust-jvm";
         System.arraycopy(javaArguments, 0, initialized, 1, javaArguments.length);

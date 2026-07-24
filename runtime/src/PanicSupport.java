@@ -9,6 +9,7 @@ public final class PanicSupport {
     private PanicSupport() {}
 
     private static final ThreadLocal<RustPanic> ACTIVE_PANIC = new ThreadLocal<>();
+    private static final Object STACK_OVERFLOW_ABORT_LOCK = new Object();
 
     public static final class RustPanic extends RuntimeException {
         private Pointer payload;
@@ -96,8 +97,49 @@ public final class PanicSupport {
         return trace.toString();
     }
 
+    private static final class FatalExceptionHandler implements Thread.UncaughtExceptionHandler {
+        private final Thread.UncaughtExceptionHandler delegate;
+
+        private FatalExceptionHandler(Thread.UncaughtExceptionHandler delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public void uncaughtException(Thread thread, Throwable failure) {
+            abortIfStackOverflow(failure);
+            delegate.uncaughtException(thread, failure);
+        }
+    }
+
+    /** Installs Rust fatal-error handling at the generated JVM main boundary. */
+    public static void installMainThreadHandler() {
+        Thread thread = Thread.currentThread();
+        Thread.UncaughtExceptionHandler current = thread.getUncaughtExceptionHandler();
+        if (!(current instanceof FatalExceptionHandler)) {
+            thread.setUncaughtExceptionHandler(new FatalExceptionHandler(current));
+        }
+    }
+
+    /** Reports a JVM stack overflow using Rust's fatal diagnostic and aborts. */
+    public static void abortIfStackOverflow(Throwable failure) {
+        if (!(failure instanceof StackOverflowError)) {
+            return;
+        }
+        synchronized (STACK_OVERFLOW_ABORT_LOCK) {
+            String name = Thread.currentThread().getName();
+            if (name == null || name.isEmpty()) {
+                name = "<unnamed>";
+            }
+            System.err.println("thread '" + name + "' has overflowed its stack");
+            System.err.println("fatal runtime error: stack overflow, aborting");
+            System.err.flush();
+            Runtime.getRuntime().halt(134);
+        }
+    }
+
     /** Implements Rust's non-unwinding abort boundary. */
     public static void abort(Throwable failure) {
+        abortIfStackOverflow(failure);
         if (failure instanceof RustPanic) {
             Runtime.getRuntime().halt(134);
         }
