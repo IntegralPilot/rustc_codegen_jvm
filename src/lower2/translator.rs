@@ -4540,7 +4540,8 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 let method_ref_index = if matches!(
                     self.module.data_types.get(class_name),
                     Some(oomir::DataType::Interface { .. })
-                ) {
+                ) || self.module.external_interfaces.contains(class_name)
+                {
                     self.constant_pool.add_interface_method_ref(
                         class_index,
                         method_name,

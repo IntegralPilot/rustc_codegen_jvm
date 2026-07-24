@@ -427,6 +427,7 @@ pub fn mir_to_oomir<'tcx>(
     fn_name_override: Option<naming::FnNameData>,
     is_static: bool,
     data_types: &mut HashMap<String, oomir::DataType>,
+    external_interfaces: &mut HashSet<String>,
 ) -> oomir::Function {
     use rustc_middle::ty::TyKind;
 
@@ -659,6 +660,7 @@ pub fn mir_to_oomir<'tcx>(
             &return_oomir_ty,
             &mut basic_blocks,
             data_types,
+            external_interfaces,
             &mut mutable_borrows,
             &debug_variables,
             &debug_variable_scopes,

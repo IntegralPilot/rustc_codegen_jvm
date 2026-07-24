@@ -2267,6 +2267,22 @@ pub(crate) fn fn_pointer_target<'tcx>(
     target_instance: Instance<'tcx>,
     signature: &oomir::Signature,
 ) -> Option<FnPointerTarget> {
+    let jvm_import = super::super::naming::jvm_static_import_from_instance(tcx, target_instance)
+        .unwrap_or_else(|message| tcx.dcx().fatal(message));
+    if let Some(import) = jvm_import {
+        let rust_descriptor = signature.to_jvm_descriptor_with_explicit_params();
+        if let Some(explicit_descriptor) = import.descriptor
+            && rust_descriptor != explicit_descriptor
+        {
+            tcx.dcx().fatal(format!(
+                "JVM import descriptor `{explicit_descriptor}` does not match the lowered Rust signature `{rust_descriptor}`"
+            ));
+        }
+        return Some(FnPointerTarget::Static(super::super::naming::FnNameData {
+            class_to_call_on: Some(import.class_name),
+            method_name: import.method_name,
+        }));
+    }
     let static_name = super::super::naming::mono_fn_name_from_instance(tcx, target_instance);
     if !matches!(target_instance.def, InstanceKind::Virtual(..)) {
         return Some(FnPointerTarget::Static(static_name));
@@ -2630,6 +2646,7 @@ pub(crate) fn ensure_closure_fn_pointer_adapter_class<'tcx>(
 
 fn ensure_non_capturing_closure_fn_pointer_bridge<'tcx>(
     data_types: &mut HashMap<String, oomir::DataType>,
+    external_interfaces: &mut HashSet<String>,
     closure_instance: Instance<'tcx>,
     signature: &oomir::Signature,
     tcx: TyCtxt<'tcx>,
@@ -2679,6 +2696,7 @@ fn ensure_non_capturing_closure_fn_pointer_bridge<'tcx>(
             }),
             true,
             data_types,
+            external_interfaces,
         );
         let Some(oomir::DataType::Class { methods, .. }) = data_types.get_mut(&closure_class)
         else {
@@ -3278,6 +3296,7 @@ pub(super) fn convert_rvalue_to_operand<'a>(
     tcx: TyCtxt<'a>,
     instance: Instance<'a>,
     data_types: &mut HashMap<String, oomir::DataType>,
+    external_interfaces: &mut HashSet<String>,
     pointer_origins: &super::MutableBorrowMap<'a>,
     available_pointer_locals: &HashSet<rustc_middle::mir::Local>,
 ) -> (Vec<oomir::Instruction>, oomir::Operand) {
@@ -3656,6 +3675,7 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                     let (target_class_name, target_method_name) =
                         ensure_non_capturing_closure_fn_pointer_bridge(
                             data_types,
+                            external_interfaces,
                             closure_instance,
                             &signature,
                             tcx,

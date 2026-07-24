@@ -71,6 +71,29 @@ pub fn mono_owner_class<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> St
     }
 }
 
+/// Whether a static body belongs to a Java interface, including nested
+/// closures and coroutines whose immediate `DefId` is not an associated item.
+pub fn instance_is_trait_interface_owned<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
+    owner_class: &str,
+) -> bool {
+    let mut current = Some(instance.def_id());
+    while let Some(def_id) = current {
+        let trait_def_id = matches!(tcx.def_kind(def_id), DefKind::Trait)
+            .then_some(def_id)
+            .or_else(|| {
+                tcx.opt_associated_item(def_id)
+                    .and_then(|item| item.trait_container(tcx))
+            });
+        if let Some(trait_def_id) = trait_def_id {
+            return owner_class == jvm_names::class_for_def_id(tcx, trait_def_id);
+        }
+        current = tcx.opt_parent(def_id);
+    }
+    false
+}
+
 pub fn parse_jvm_link_name(link_name: &str) -> Result<Option<JvmStaticImport>, String> {
     let Some(import) = link_name.strip_prefix("jvm:") else {
         return Ok(None);

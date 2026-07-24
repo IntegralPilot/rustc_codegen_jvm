@@ -42,6 +42,8 @@ pub struct Module {
     pub source_file: Option<String>,
     pub functions: HashMap<FunctionKey, Function>,
     pub data_types: HashMap<String, DataType>,
+    /// JVM interfaces referenced by this shard but defined in another crate.
+    pub external_interfaces: HashSet<String>,
     pub statics: HashMap<String, Static>,
 }
 

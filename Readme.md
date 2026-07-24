@@ -11,7 +11,7 @@ A custom Rust compiler backend that compiles Rust directly to Java Virtual Machi
 
 This backend transparently compiles Rust constructs to Java classes and interfaces, enabling rich interop between JVM and Rust code at a level mostly unreachable by traditional FFI solutions. It also enables modern Rust code to run on older platforms outside the reach of current native targets, and has integrated upstream changes into OpenJDK's C2 JIT compiler which can make the JVM faster for everyone, including [~1.85x faster 128-bit multiplication on x86](https://github.com/openjdk/jdk/pull/30174).
 
-By leveraging a ["virtual MMU" translation layer](runtime/src/Pointer.java), it supports [raw pointers with complex pointer arithmetic](tests/binary/raw_ptrs/src/main.rs), [transmute](tests/binary/transmute/src/main.rs), and [unions](tests/binary/raw_ptrs/src/main.rs). It also supports key parts of the Rust standard library, including [async/await](tests/binary/async_await/src/main.rs), [threading](tests/binary/threads/src/main.rs), [unwinding](tests/binary/panic/src/main.rs), [allocation](tests/binary/alloc/src/main.rs), [STDIO, and more](tests/binary/std/src/main.rs).
+By leveraging a ["virtual MMU" translation layer](runtime/src/Pointer.java), it supports [raw pointers with complex pointer arithmetic](tests/binary/raw_ptrs/src/main.rs), [transmute](tests/binary/transmute/src/main.rs), and [unions](tests/binary/raw_ptrs/src/main.rs). It also supports key parts of the Rust standard library, including [async/await](tests/binary/async_await/src/main.rs), [threading](tests/binary/threads/src/main.rs), [unwinding](tests/binary/panic/src/main.rs), [allocation](tests/binary/alloc/src/main.rs), as well as [file system operations, STDIO, and more](tests/binary/std/src/main.rs).
 
 The official Rust [`coretests`](https://github.com/rust-lang/rust/tree/main/library/coretests) tests and benches all pass, with 98.99% of them (the missing 1.01% is 29 slow cases which are skipped on CI) verified [by CI](.github/workflows/ci.yml) on every commit.
 
@@ -37,7 +37,7 @@ cargo new hello_world --bin
 cd hello_world
 
 # 4. Build it using cargo (the script automatically provides the right args)
-../jvm_build.py # On Windows: python jvm_build.py
+../jvm_build.py # On Windows: python ..\jvm_build.py
 
 # 5. Run the resulting JAR
 # Replace : (inside `classes:target`) with ; if on Windows
@@ -191,7 +191,7 @@ The following example programs live in `tests/`, are compiled with the standard 
 | **[Threads](tests/binary/threads/src/main.rs)** | Multi-threading, scoped threads, mutexes (with poisoning), RWLocks, barriers, condition variables, and TLS. | 
 | **[Panic](tests/binary/panic/src/main.rs)** | Unwinding, catching static/dynamic panic payloads, resuming unwinds, and custom panic hooks. |
 | **[Async / Await](tests/binary/async_await/src/main.rs)** | Multi-poll futures, nested and recursive async work, async closures and trait methods, `dyn Future`, cross-thread execution, cancellation, and unwinding across suspension points. |
-| **[STD](tests/binary/std/src/main.rs)** | Command-line arguments, environment variables, standard I/O, and runtime context. |
+| **[STD](tests/binary/std/src/main.rs)** | File system operations,command-line arguments, environment variables, standard I/O, and runtime context. |
 
 ### Standalone Rust Programs
 | Example | Demonstrates |
@@ -224,14 +224,14 @@ The vast majority of the Rust language is supported, including generics, traits,
 | **Panic Unwinding** | **Supported** | Complete unwinding stack, `catch_unwind`, panic hooks, and abort-on-double-panic semantics |
 | **Stdio & Env** | **Supported** | `println!`, `eprintln!`, `stdin`, `env::args`, `env::vars` |
 | **Time & Random** | **Supported** | `SystemTime`, `Instant`, standard entropy seeds |
-| **File System (`std::fs`)** | _Planned_ | PAL delegation in progress |
+| **File System (`std::fs`)** | **Supported** | Java NIO files, directories, positional and vectored I/O, nanosecond timestamps, opaque file identity, atomic POSIX creation permissions, links, locks, and paths |
 | **Networking (`std::net`)** | _Planned_ | Socket integration planned for future release |
 
 Compiled JAR files emit rich JVM metadata (`LineNumberTable`, parameter names, nested class info), ensuring seamless IDE integration (autocomplete, tooltips, refactoring) in IntelliJ IDEA and detailed stack traces during debugging or profiling with JFR.
 
 ## Current Limitations
 
-* `std::fs` is currently non-functional due to pending PAL bindings.
+* Java NIO's `DirectoryStream` does not expose the native directory-entry type (`d_type`). `DirEntry::file_type` therefore performs a no-follow metadata lookup.
 * Code that heavily relies on raw pointer arithmetic executes through the Virtual MMU translation layer, which introduces extra memory allocations and GC overhead compared to structured stack/heap access.
 * The backend relies heavily on HotSpot's JIT (C2) compiler for runtime optimisation rather than aggressive AOT passes during compilation.
 * The default stack size on the JVM is lower than typical native targets. Like on native, if you encounter a `StackOverflowError` with deeply recursive code, you should increase the per-thread stack size. This can be done with the `-Xss` flag (for example, `java -Xss16m ...`).

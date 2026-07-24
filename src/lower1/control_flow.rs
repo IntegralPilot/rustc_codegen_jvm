@@ -1536,6 +1536,7 @@ pub(super) fn convert_basic_block<'tcx>(
     return_oomir_type: &oomir::Type, // Pass function return type
     basic_blocks: &mut HashMap<String, oomir::BasicBlock>,
     data_types: &mut HashMap<String, oomir::DataType>,
+    external_interfaces: &mut HashSet<String>,
     mutable_borrow_arrays: &mut MutableBorrowMap<'tcx>,
     debug_variables: &[oomir::DebugVariable],
     debug_variable_scopes: &[rustc_middle::mir::SourceScope],
@@ -1571,6 +1572,7 @@ pub(super) fn convert_basic_block<'tcx>(
                     tcx,
                     instance,
                     data_types,
+                    external_interfaces,
                     mutable_borrow_arrays,
                     &initialized_borrows,
                 );
@@ -6729,6 +6731,13 @@ pub(super) fn convert_basic_block<'tcx>(
                             }
                             method_signature.is_static = true;
 
+                            if super::naming::instance_is_trait_interface_owned(
+                                tcx,
+                                func_instance,
+                                &class_name,
+                            ) {
+                                external_interfaces.insert(class_name.clone());
+                            }
                             instructions.push(oomir::Instruction::InvokeStatic {
                                 class_name,
                                 method_name: function,

@@ -253,7 +253,7 @@ public final class RuntimeSupport {
         return new String(copyFromPointer(bytes, length), StandardCharsets.UTF_8);
     }
 
-    private static byte[] copyFromPointer(Pointer source, long length) {
+    static byte[] copyFromPointer(Pointer source, long length) {
         int checkedLength = Math.toIntExact(length);
         byte[] copy = new byte[checkedLength];
         for (int index = 0; index < checkedLength; index++) {
@@ -262,8 +262,15 @@ public final class RuntimeSupport {
         return copy;
     }
 
-    private static void copyBytes(byte[] source, Pointer destination) {
-        for (int index = 0; index < source.length; index++) {
+    static void copyBytes(byte[] source, Pointer destination) {
+        copyBytes(source, source.length, destination);
+    }
+
+    static void copyBytes(byte[] source, int length, Pointer destination) {
+        if (length < 0 || length > source.length) {
+            throw new IndexOutOfBoundsException("invalid byte copy length " + length);
+        }
+        for (int index = 0; index < length; index++) {
             destination.add(index).set(Byte.valueOf(source[index]));
         }
     }

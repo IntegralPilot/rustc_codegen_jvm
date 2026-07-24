@@ -1,0 +1,39 @@
+diff --git a/std/src/sys/fs/mod.rs b/std/src/sys/fs/mod.rs
+--- a/std/src/sys/fs/mod.rs
++++ b/std/src/sys/fs/mod.rs
+@@ -18,6 +18,11 @@ cfg_select! {
+         #[cfg(any(target_os = "linux", target_os = "android"))]
+         pub(super) use unix::CachedFileMetadata;
+         use crate::sys::helpers::run_path_with_cstr as with_native_path;
++    }
++    target_os = "jvm" => {
++        mod jvm;
++        use jvm as imp;
++        pub use jvm::FileKey;
+     }
+     target_os = "windows" => {
+         mod windows;
+diff --git a/std/src/sys/path/unix.rs b/std/src/sys/path/unix.rs
+--- a/std/src/sys/path/unix.rs
++++ b/std/src/sys/path/unix.rs
+@@ -58,7 +58,7 @@ pub(crate) fn absolute(path: &Path) -> io::Result<PathBuf> {
+ }
+ 
+ pub(crate) fn is_absolute(path: &Path) -> bool {
+-    if cfg!(any(unix, target_os = "hermit", target_os = "wasi", target_os = "motor")) {
++    if cfg!(any(unix, target_os = "hermit", target_os = "wasi", target_os = "motor", target_os = "jvm")) {
+         path.has_root()
+     } else {
+         path.has_root() && path.prefix().is_some()
+diff --git a/std/src/os/mod.rs b/std/src/os/mod.rs
+--- a/std/src/os/mod.rs
++++ b/std/src/os/mod.rs
+@@ -96,6 +96,8 @@ pub mod horizon;
+ pub mod hurd;
+ #[cfg(target_os = "illumos")]
+ pub mod illumos;
++#[cfg(target_os = "jvm")]
++pub mod jvm;
+ #[cfg(target_os = "ios")]
+ pub mod ios;
+ #[cfg(target_os = "l4re")]

@@ -753,6 +753,7 @@ fn lower_mono_function<'tcx>(
         Some(name.clone()),
         true,
         &mut oomir_module.data_types,
+        &mut oomir_module.external_interfaces,
     );
     if tcx.is_intrinsic(instance.def_id(), rustc_span::sym::const_allocate) {
         let result_ty = oomir_function.signature.ret.as_ref().clone();
@@ -1128,6 +1129,7 @@ fn empty_oomir_module(tcx: TyCtxt<'_>, name: &str) -> oomir::Module {
             .map(|file_name| rustc_span::FileName::Real(file_name).short().to_string()),
         functions: HashMap::new(),
         data_types: HashMap::new(),
+        external_interfaces: HashSet::new(),
         statics: HashMap::new(),
     }
 }

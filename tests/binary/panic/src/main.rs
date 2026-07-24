@@ -78,6 +78,8 @@ fn main() {
     assert!(message.contains("java.lang.ArithmeticException"));
     assert!(message.contains("integer overflow"));
     assert_eq!(unsafe { java_add_exact(20, 22) }, 42);
+    let add_exact: unsafe extern "C" fn(i32, i32) -> i32 = java_add_exact;
+    assert_eq!(unsafe { add_exact(19, 23) }, 42);
 
     let drop_panic = catch_unwind(|| {
         let _value = PanicsOnDrop;
