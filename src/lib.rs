@@ -15,20 +15,55 @@ extern crate rustc_ast;
 extern crate rustc_codegen_ssa;
 extern crate rustc_data_structures;
 extern crate rustc_driver;
+extern crate rustc_hashes;
 extern crate rustc_hir;
 extern crate rustc_metadata;
 extern crate rustc_middle;
 extern crate rustc_session;
 extern crate rustc_span;
 extern crate rustc_target;
+extern crate self as breadcrumbs;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum LogLevel {
+    Verbose,
+    Info,
+    Warn,
+    Error,
+    Critical,
+}
+
+const LISTENING_CHANNELS: &[&str] = &[];
+
+#[doc(hidden)]
+pub fn backend_log_enabled(level: LogLevel, channel: &str) -> bool {
+    level >= LogLevel::Error || LISTENING_CHANNELS.contains(&channel)
+}
+
+#[doc(hidden)]
+pub fn write_backend_log(level: LogLevel, channel: &str, message: impl std::fmt::Display) {
+    println!("[{channel}/{level:?}] {message}");
+}
+
+#[macro_export]
+macro_rules! log {
+    ($level:expr, $channel:expr, $message:expr) => {{
+        let level = $level;
+        let channel = $channel;
+        if $crate::backend_log_enabled(level, channel) {
+            $crate::write_backend_log(level, channel, $message);
+        }
+    }};
+}
 
 use oomir::Type;
 use rustc_codegen_ssa::back::archive::{ArArchiveBuilder, ArchiveBuilder, ArchiveBuilderBuilder};
 use rustc_codegen_ssa::{
     CompiledModule, CompiledModules, CrateInfo, ModuleKind, traits::CodegenBackend,
 };
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use rustc_hir::def::DefKind;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
 
 use rustc_data_structures::unord::UnordMap;
 use rustc_metadata::EncodedMetadata;
@@ -44,10 +79,8 @@ use rustc_session::{
 use rustc_span::def_id::{DefId, LOCAL_CRATE};
 use std::{
     any::Any,
-    ffi::OsString,
     io::{BufReader, BufWriter, Read, Write},
     path::{Path, PathBuf},
-    process::Command,
     sync::{Arc, Mutex, mpsc},
 };
 
@@ -87,125 +120,6 @@ fn combine_class_bundles(path: &Path, bundles: &[(String, PathBuf)]) -> std::io:
         std::io::copy(&mut bundle, &mut output)?;
     }
     output.flush()
-}
-
-fn write_linker_response_file(path: &Path, arguments: &[OsString]) -> std::io::Result<()> {
-    let mut contents = vec![0xff, 0xfe];
-    for argument in arguments {
-        let argument = argument.to_string_lossy();
-        if argument.contains('\r') || argument.contains('\n') {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "linker response-file arguments cannot contain newlines",
-            ));
-        }
-
-        let line = format!("\"{}\"\r\n", argument.replace('"', "\\\""));
-        for code_unit in line.encode_utf16() {
-            contents.extend_from_slice(&code_unit.to_le_bytes());
-        }
-    }
-
-    std::fs::write(path, contents)
-}
-
-fn emit_library_sidecar_jar(
-    sess: &Session,
-    outputs: &OutputFilenames,
-    crate_info: &CrateInfo,
-    compiled_modules: &[CompiledModule],
-) {
-    if !outputs.outputs.should_link() {
-        return;
-    }
-
-    if !crate_info
-        .crate_types
-        .iter()
-        .any(|crate_type| !matches!(crate_type, CrateType::Executable))
-    {
-        return;
-    }
-
-    let linker = sess.opts.cg.linker.clone().or_else(|| {
-        sess.target
-            .linker
-            .as_ref()
-            .map(|linker| PathBuf::from(linker.as_ref()))
-    });
-    let Some(linker) = linker else {
-        panic!("cannot emit JVM library sidecar jar: no linker was configured");
-    };
-
-    let class_files: Vec<_> = compiled_modules
-        .iter()
-        .filter_map(|module| module.object.as_ref())
-        .filter(|path| {
-            path.extension()
-                .is_some_and(|ext| ext == "class" || ext == "jvmbundle")
-        })
-        .collect();
-    if class_files.is_empty() {
-        return;
-    }
-
-    let jar_path = outputs.with_extension("jar");
-    if let Some(parent) = jar_path.parent() {
-        std::fs::create_dir_all(parent).unwrap_or_else(|e| {
-            panic!(
-                "Could not create JVM sidecar jar output directory {}: {}",
-                parent.display(),
-                e
-            )
-        });
-    }
-
-    let mut linker_arguments: Vec<OsString> = class_files
-        .iter()
-        .map(|class_file| class_file.as_os_str().to_os_string())
-        .collect();
-    for link_arg in &sess.opts.cg.link_args {
-        linker_arguments.push(OsString::from(link_arg));
-    }
-    linker_arguments.push(OsString::from("-o"));
-    linker_arguments.push(jar_path.as_os_str().to_os_string());
-
-    let response_path = jar_path.with_extension("jar.rsp");
-    write_linker_response_file(&response_path, &linker_arguments).unwrap_or_else(|e| {
-        panic!(
-            "Could not write JVM linker response file {} for library sidecar jar {}: {}",
-            response_path.display(),
-            jar_path.display(),
-            e
-        )
-    });
-
-    let mut response_argument = OsString::from("@");
-    response_argument.push(&response_path);
-    let output = Command::new(&linker).arg(response_argument).output();
-    let _ = std::fs::remove_file(&response_path);
-
-    let output = output.unwrap_or_else(|e| {
-        panic!(
-            "Could not run JVM linker {} for library sidecar jar {}: {}",
-            linker.display(),
-            jar_path.display(),
-            e
-        )
-    });
-    if !output.status.success() {
-        panic!(
-            "JVM linker exited with status {} while emitting library sidecar jar {}\nstdout:\n{}\nstderr:\n{}",
-            output.status,
-            jar_path.display(),
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    if sess.opts.json_artifact_notifications {
-        sess.dcx().emit_artifact_notification(&jar_path, "link");
-    }
 }
 
 fn mono_item_name<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> lower1::naming::FnNameData {
@@ -538,7 +452,7 @@ fn allocator_shim_source_signature(tcx: TyCtxt<'_>, source_name: &str) -> oomir:
         .type_of(declaration)
         .instantiate(tcx, instance.args)
         .skip_norm_wip();
-    lower1::types::fn_ptr_signature_from_ty(instance_ty, tcx, &mut HashMap::new(), instance)
+    lower1::types::fn_ptr_signature_from_ty(instance_ty, tcx, &mut HashMap::default(), instance)
 }
 
 fn allocator_shim_call(
@@ -657,7 +571,7 @@ fn emit_allocator_shims(tcx: TyCtxt<'_>, oomir_module: &mut oomir::Module) {
             debug_variables: Vec::new(),
             body: oomir::CodeBlock {
                 entry: entry.clone(),
-                basic_blocks: HashMap::from([(
+                basic_blocks: HashMap::from_iter([(
                     entry.clone(),
                     oomir::BasicBlock {
                         label: entry,
@@ -681,7 +595,7 @@ fn emit_allocator_shims(tcx: TyCtxt<'_>, oomir_module: &mut oomir::Module) {
         debug_variables: Vec::new(),
         body: oomir::CodeBlock {
             entry: entry.clone(),
-            basic_blocks: HashMap::from([(
+            basic_blocks: HashMap::from_iter([(
                 entry.clone(),
                 oomir::BasicBlock {
                     label: entry,
@@ -736,7 +650,7 @@ fn lower_mono_function<'tcx>(
     }
 
     let name = mono_item_name(tcx, instance);
-    let mut mir = tcx.instance_mir(instance.def).clone();
+    let mir = tcx.instance_mir(instance.def);
     breadcrumbs::log!(
         breadcrumbs::LogLevel::Info,
         "mono-lowering",
@@ -749,7 +663,7 @@ fn lower_mono_function<'tcx>(
     let mut oomir_function = lower1::mir_to_oomir(
         tcx,
         instance,
-        &mut mir,
+        mir,
         Some(name.clone()),
         true,
         &mut oomir_module.data_types,
@@ -761,7 +675,7 @@ fn lower_mono_function<'tcx>(
         let entry = "entry".to_string();
         oomir_function.body = oomir::CodeBlock {
             entry: entry.clone(),
-            basic_blocks: HashMap::from([(
+            basic_blocks: HashMap::from_iter([(
                 entry.clone(),
                 oomir::BasicBlock {
                     label: entry,
@@ -944,7 +858,7 @@ fn trait_interface_methods<'tcx>(
     interface_name: &str,
     data_types: &mut HashMap<String, oomir::DataType>,
 ) -> HashMap<String, oomir::Signature> {
-    let mut methods = HashMap::new();
+    let mut methods = HashMap::default();
 
     for assoc_item in tcx.associated_items(trait_def_id).in_definition_order() {
         let def_id = assoc_item.def_id;
@@ -1127,10 +1041,10 @@ fn empty_oomir_module(tcx: TyCtxt<'_>, name: &str) -> oomir::Module {
             .sess
             .local_crate_source_file()
             .map(|file_name| rustc_span::FileName::Real(file_name).short().to_string()),
-        functions: HashMap::new(),
-        data_types: HashMap::new(),
-        external_interfaces: HashSet::new(),
-        statics: HashMap::new(),
+        functions: HashMap::default(),
+        data_types: HashMap::default(),
+        external_interfaces: HashSet::default(),
+        statics: HashMap::default(),
     }
 }
 
@@ -1225,9 +1139,9 @@ impl CodegenBackend for MyBackend {
             let rust_crate = LOCAL_CRATE;
             let crate_name = tcx.crate_name(rust_crate).to_string();
             let crate_module_class = lower1::jvm_names::crate_module_class(tcx, rust_crate);
-            let mut lowered_instances = HashSet::new();
-            let mut claimed_mono_items = HashSet::new();
-            let mut scanned_instances = HashSet::new();
+            let mut lowered_instances = HashSet::default();
+            let mut claimed_mono_items = HashSet::default();
+            let mut scanned_instances = HashSet::default();
             let emitted_class_registry = lower2::EmittedClassRegistry::default();
             let debug_info = lower2::debug_info_options(tcx);
 
@@ -1437,7 +1351,6 @@ impl CodegenBackend for MyBackend {
     ) {
         breadcrumbs::log!(breadcrumbs::LogLevel::Info, "backend", "linking!");
         use rustc_codegen_ssa::back::link::link_binary;
-        emit_library_sidecar_jar(sess, outputs, &crate_info, &compiled_modules.modules);
         link_binary(
             sess,
             &RlibArchiveBuilder,
@@ -1450,26 +1363,9 @@ impl CodegenBackend for MyBackend {
     }
 }
 
-struct RustcCodegenJvmLogListener;
-
-const LISTENING_CHANNELS: &[&str] = &[];
-
-impl breadcrumbs::LogListener for RustcCodegenJvmLogListener {
-    fn on_log(&mut self, log: breadcrumbs::Log) {
-        if log.level.is_at_least(breadcrumbs::LogLevel::Error)
-            || LISTENING_CHANNELS.contains(&log.channel.as_str())
-        {
-            println!("{}", log);
-        } else {
-            log.remove();
-        }
-    }
-}
-
 #[unsafe(no_mangle)]
 pub extern "Rust" fn __rustc_codegen_backend() -> Box<dyn CodegenBackend> {
     std::alloc::set_alloc_error_hook(custom_alloc_error_hook);
-    breadcrumbs::init!(RustcCodegenJvmLogListener);
     Box::new(MyBackend)
 }
 

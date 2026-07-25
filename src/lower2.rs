@@ -18,9 +18,10 @@ use self::jvm::{
 };
 use constant_pool::{InternedConstantPool, verify_no_duplicate_constants};
 use consts::{get_int_const_instr, load_constant};
+use rustc_hash::FxHashMap as HashMap;
 use rustc_middle::ty::TyCtxt;
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet},
     io::{BufWriter, Write},
     path::{Path, PathBuf},
     sync::{
@@ -666,7 +667,7 @@ fn emit_generated_class(
 ) -> jvm::Result<()> {
     let hash = bytecode_hash(&bytecode);
     let bytecode_len = bytecode.len();
-    let mut checked = std::collections::HashSet::new();
+    let mut checked = rustc_hash::FxHashSet::default();
     loop {
         let (candidates, reservation) = {
             let mut variants =
@@ -969,9 +970,9 @@ pub fn oomir_to_jvm_bytecode(
 
         for mut function in functions {
             current_index += 1;
-            let instrumented_fn_name = format!("{class_name_jvm}::{}", function.name);
-            let _timer =
-                crate::instrumentation::Timer::function("lower2", None, &instrumented_fn_name);
+            let _timer = crate::instrumentation::Timer::function_lazy("lower2", None, || {
+                format!("{class_name_jvm}::{}", function.name)
+            });
 
             // Don't create a default constructor if the OOMIR provided one
             if function.name == "<init>" {
@@ -1135,9 +1136,9 @@ pub fn oomir_to_jvm_bytecode(
         .data_types
         .keys()
         .map(String::as_str)
-        .collect::<std::collections::HashSet<_>>();
-    let mut subclasses_by_host = HashMap::<String, Vec<String>>::new();
-    let mut nest_host_by_class = HashMap::<String, String>::new();
+        .collect::<rustc_hash::FxHashSet<_>>();
+    let mut subclasses_by_host = HashMap::<String, Vec<String>>::default();
+    let mut nest_host_by_class = HashMap::<String, String>::default();
     for class_name in module.data_types.keys() {
         for (separator, _) in class_name.match_indices('$') {
             let host = &class_name[..separator];

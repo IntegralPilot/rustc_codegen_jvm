@@ -3,10 +3,8 @@
 //! It is responsible for converting the MIR into a lower-level IR, called OOMIR (defined in this file).
 use breadcrumbs::LogLevel;
 use ristretto_classfile::attributes::Instruction as JVMInstruction;
-use std::{
-    collections::{HashMap, HashSet},
-    fmt,
-};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::fmt;
 
 pub mod interpret;
 
@@ -162,11 +160,11 @@ impl DataType {
                 interfaces: _,
             } => {
                 // Remove duplicate fields while preserving the original declaration order.
-                let mut seen_fields = HashSet::new();
+                let mut seen_fields = HashSet::default();
                 fields.retain(|(name, _)| seen_fields.insert(name.clone()));
 
                 // Remove duplicate methods
-                let mut unique_methods = HashMap::new();
+                let mut unique_methods = HashMap::default();
                 for (name, method) in methods.iter() {
                     unique_methods.insert(name.clone(), method.clone());
                 }
@@ -174,7 +172,7 @@ impl DataType {
             }
             DataType::Interface { methods } => {
                 // Remove duplicate methods
-                let mut unique_methods = HashMap::new();
+                let mut unique_methods = HashMap::default();
                 for (name, method) in methods.iter() {
                     unique_methods.insert(name.clone(), method.clone());
                 }
@@ -656,7 +654,7 @@ pub enum Constant {
         class_name: String,
         /// The constant values of the fields, keyed by field name.
         /// For enum variants using numbered fields, use "field0", "field1", etc.
-        fields: std::collections::HashMap<String, Constant>,
+        fields: HashMap<String, Constant>,
         /// Any parameters to the constructor.
         params: Vec<Constant>,
         /// The declared JVM type of each constructor parameter. This can differ

@@ -2,7 +2,7 @@
 use crate::oomir::{
     CodeBlock, Constant, DataType, DataTypeMethod, Function, Instruction, Operand, Signature, Type,
 };
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 
 pub fn get_intrinsic_function_name(
     operation: &str,
@@ -23,7 +23,7 @@ fn variable(name: &str, ty: &Type) -> Operand {
 fn integer_constants(ty: &Type) -> (Constant, Constant, Constant) {
     let wide = |class_name: &str, value: &str| Constant::Instance {
         class_name: class_name.to_string(),
-        fields: HashMap::new(),
+        fields: HashMap::default(),
         params: vec![Constant::String(value.to_string())],
         param_types: Vec::new(),
     };
@@ -248,7 +248,7 @@ pub fn emit_checked_arithmetic_intrinsic(
             is_static: true,
         },
         body: CodeBlock {
-            basic_blocks: HashMap::from([(
+            basic_blocks: HashMap::from_iter([(
                 "entry".to_string(),
                 crate::oomir::BasicBlock {
                     label: "entry".to_string(),
@@ -261,7 +261,7 @@ pub fn emit_checked_arithmetic_intrinsic(
 }
 
 pub fn emit_all_needed_intrinsics(needed_intrinsics: &[(String, String, String)]) -> DataType {
-    let mut intrinsic_methods = HashMap::new();
+    let mut intrinsic_methods = HashMap::default();
     for (operation, ty_suffix, result_struct_name) in needed_intrinsics {
         let ty = match ty_suffix.as_str() {
             "i8" => Type::I8,

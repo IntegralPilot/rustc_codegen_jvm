@@ -1,4 +1,3 @@
-use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::fs::OpenOptions;
@@ -7,13 +6,13 @@ use std::io::{self, BufReader, Cursor, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use rayon::prelude::*;
 use regex::Regex;
 use ristretto_classfile::attributes::{
     Attribute, BootstrapMethod, Instruction, StackFrame, VerificationType,
 };
-use ristretto_classfile::{
-    ClassAccessFlags, ClassFile, Constant, ConstantPool, MethodAccessFlags,
-};
+use ristretto_classfile::{ClassAccessFlags, ClassFile, Constant, ConstantPool, MethodAccessFlags};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use tempfile::tempdir;
 use zip::write::{SimpleFileOptions, ZipWriter};
 use zip::{CompressionMethod, ZipArchive};
@@ -311,23 +310,30 @@ fn import_constant(
     Ok(target_index)
 }
 
-fn import_constant_pool(
-    source: &ConstantPool<'static>,
-    target: &mut ConstantPool<'static>,
-    bootstrap_method_offset: u16,
-) -> io::Result<HashMap<u16, u16>> {
-    let mut indexes = HashMap::new();
-    let mut target_constants = HashMap::with_capacity(target.len() + source.len());
-    for raw_index in 1..=target.len() {
+fn constant_pool_index(constants: &ConstantPool<'static>) -> HashMap<ConstantKey, u16> {
+    let mut target_constants = HashMap::default();
+    target_constants.reserve(constants.len());
+    for raw_index in 1..=constants.len() {
         let Ok(index) = u16::try_from(raw_index) else {
             continue;
         };
-        if let Ok(constant) = target.try_get(index) {
+        if let Ok(constant) = constants.try_get(index) {
             target_constants
                 .entry(ConstantKey::from(constant))
                 .or_insert(index);
         }
     }
+    target_constants
+}
+
+fn import_constant_pool(
+    source: &ConstantPool<'static>,
+    target: &mut ConstantPool<'static>,
+    target_constants: &mut HashMap<ConstantKey, u16>,
+    bootstrap_method_offset: u16,
+) -> io::Result<HashMap<u16, u16>> {
+    let mut indexes = HashMap::default();
+    target_constants.reserve(source.len());
     for raw_index in 1..=source.len() {
         let index = u16::try_from(raw_index).map_err(|_| {
             io::Error::new(
@@ -340,7 +346,7 @@ fn import_constant_pool(
                 index,
                 source,
                 target,
-                &mut target_constants,
+                target_constants,
                 &mut indexes,
                 bootstrap_method_offset,
             )?;
@@ -624,19 +630,11 @@ fn interface_name(class_file: &ClassFile<'_>, interface_index: usize) -> io::Res
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
 }
 
-fn merge_class_data(base_data: &[u8], incoming_data: &[u8]) -> io::Result<Vec<u8>> {
-    let mut base = class_file_from_data(base_data).map_err(|error| {
-        io::Error::new(
-            error.kind(),
-            format!("could not parse the accumulated base fragment: {error}"),
-        )
-    })?;
-    let incoming = class_file_from_data(incoming_data).map_err(|error| {
-        io::Error::new(
-            error.kind(),
-            format!("could not parse the incoming fragment: {error}"),
-        )
-    })?;
+fn merge_class_files(
+    base: &mut ClassFile<'static>,
+    incoming: &ClassFile<'static>,
+    target_constants: &mut HashMap<ConstantKey, u16>,
+) -> io::Result<bool> {
     if base.class_name().ok() != incoming.class_name().ok() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -668,7 +666,7 @@ fn merge_class_data(base_data: &[u8], incoming_data: &[u8]) -> io::Result<Vec<u8
         base_changed |= base.methods.len() != original_method_count;
     }
 
-    let mut existing_methods = HashSet::new();
+    let mut existing_methods = HashSet::default();
     for index in 0..base.methods.len() {
         existing_methods.insert(method_identity(&base, index)?);
     }
@@ -681,7 +679,7 @@ fn merge_class_data(base_data: &[u8], incoming_data: &[u8]) -> io::Result<Vec<u8
         }
     }
 
-    let mut existing_interfaces = HashSet::new();
+    let mut existing_interfaces = HashSet::default();
     for index in 0..base.interfaces.len() {
         existing_interfaces.insert(interface_name(&base, index)?);
     }
@@ -693,17 +691,7 @@ fn merge_class_data(base_data: &[u8], incoming_data: &[u8]) -> io::Result<Vec<u8
     }
 
     if missing_method_indexes.is_empty() && missing_interface_indexes.is_empty() {
-        if !base_changed {
-            return Ok(base_data.to_vec());
-        }
-        let mut merged = Vec::new();
-        base.to_bytes(&mut merged).map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("failed to serialize merged JVM class: {error}"),
-            )
-        })?;
-        return Ok(merged);
+        return Ok(base_changed);
     }
 
     let base_bootstrap_count = base
@@ -734,6 +722,7 @@ fn merge_class_data(base_data: &[u8], incoming_data: &[u8]) -> io::Result<Vec<u8
     let constant_indexes = import_constant_pool(
         &incoming.constant_pool,
         &mut base.constant_pool,
+        target_constants,
         bootstrap_method_offset,
     )?;
 
@@ -784,18 +773,43 @@ fn merge_class_data(base_data: &[u8], incoming_data: &[u8]) -> io::Result<Vec<u8
         base.methods.push(method);
     }
 
-    let mut merged = Vec::new();
-    base.to_bytes(&mut merged).map_err(|error| {
+    Ok(true)
+}
+
+fn serialize_class_file(class_file: &ClassFile<'static>) -> io::Result<Vec<u8>> {
+    let mut data = Vec::new();
+    class_file.to_bytes(&mut data).map_err(|error| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("failed to serialize merged JVM class: {error}"),
         )
     })?;
-    Ok(merged)
+    Ok(data)
+}
+
+fn merge_class_data(base_data: &[u8], incoming_data: &[u8]) -> io::Result<Vec<u8>> {
+    let mut base = class_file_from_data(base_data).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("could not parse the accumulated base fragment: {error}"),
+        )
+    })?;
+    let incoming = class_file_from_data(incoming_data).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("could not parse the incoming fragment: {error}"),
+        )
+    })?;
+    let mut target_constants = constant_pool_index(&base.constant_pool);
+    if merge_class_files(&mut base, &incoming, &mut target_constants)? {
+        serialize_class_file(&base)
+    } else {
+        Ok(base_data.to_vec())
+    }
 }
 
 fn merge_duplicate_classes(classes: Vec<ClassInfo>) -> io::Result<Vec<ClassInfo>> {
-    let mut positions: HashMap<String, usize> = HashMap::new();
+    let mut positions: HashMap<String, usize> = HashMap::default();
     let mut groups: Vec<Vec<ClassInfo>> = Vec::new();
     for class_info in classes {
         if let Some(&index) = positions.get(&class_info.jar_entry_name) {
@@ -807,16 +821,55 @@ fn merge_duplicate_classes(classes: Vec<ClassInfo>) -> io::Result<Vec<ClassInfo>
     }
 
     groups
-        .into_iter()
+        .into_par_iter()
         .map(|mut fragments| {
+            if fragments.len() == 1 {
+                return Ok(fragments.pop().unwrap());
+            }
+
             // Preserve the largest fragment's compact constant indexes. This
             // avoids growing its near-limit methods through ldc-to-ldc_w remaps.
             if class_fragments_can_be_reordered(&fragments)? {
                 fragments.sort_by(|left, right| right.data.len().cmp(&left.data.len()));
             }
-            let mut merged = fragments.remove(0);
+
+            let mut fragments = fragments.into_iter();
+            let mut merged = fragments.next().unwrap();
+            let mut base = class_file_from_data(&merged.data).map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!(
+                        "failed to parse duplicate JVM class {}: {error}",
+                        merged.jar_entry_name
+                    ),
+                )
+            })?;
+            let mut target_constants = constant_pool_index(&base.constant_pool);
+            let mut changed = false;
             for fragment in fragments {
-                merged.data = merge_class_data(&merged.data, &fragment.data).map_err(|error| {
+                let incoming = class_file_from_data(&fragment.data).map_err(|error| {
+                    io::Error::new(
+                        error.kind(),
+                        format!(
+                            "failed to parse duplicate JVM class {}: {error}",
+                            fragment.jar_entry_name
+                        ),
+                    )
+                })?;
+                changed |= merge_class_files(&mut base, &incoming, &mut target_constants).map_err(
+                    |error| {
+                        io::Error::new(
+                            error.kind(),
+                            format!(
+                                "failed to merge duplicate JVM class {}: {error}",
+                                merged.jar_entry_name
+                            ),
+                        )
+                    },
+                )?;
+            }
+            if changed {
+                merged.data = serialize_class_file(&base).map_err(|error| {
                     io::Error::new(
                         error.kind(),
                         format!(
@@ -832,7 +885,7 @@ fn merge_duplicate_classes(classes: Vec<ClassInfo>) -> io::Result<Vec<ClassInfo>
 }
 
 fn class_fragments_can_be_reordered(fragments: &[ClassInfo]) -> io::Result<bool> {
-    let mut methods = HashSet::new();
+    let mut methods = HashSet::default();
     for fragment in fragments {
         let class_file = class_file_from_data(&fragment.data)?;
         if !class_file.fields.is_empty() {
@@ -1092,19 +1145,22 @@ fn main() -> Result<(), i32> {
 
     // Load generated classes once. They are retained for duplicate merging and
     // final JAR output, so scanning them again here only adds I/O and parsing.
-    let app_classes = collect_input_classes(
-        &input_class_files,
-        &input_class_bundles,
-        &input_rlib_files,
-    )
-    .map_err(|e| {
-        eprintln!("Error collecting JVM classes: {e}");
-        1
-    })?;
-    let main_classes = find_main_classes(&app_classes).map_err(|e| {
-        eprintln!("Error during main class scan: {}", e);
-        1
-    })?;
+    let app_classes = {
+        let _timer = InstrumentationTimer::new("java-linker-read-inputs");
+        collect_input_classes(&input_class_files, &input_class_bundles, &input_rlib_files).map_err(
+            |e| {
+                eprintln!("Error collecting JVM classes: {e}");
+                1
+            },
+        )?
+    };
+    let main_classes = {
+        let _timer = InstrumentationTimer::new("java-linker-find-main");
+        find_main_classes(&app_classes).map_err(|e| {
+            eprintln!("Error during main class scan: {}", e);
+            1
+        })?
+    };
     if main_classes.len() > 1 {
         eprintln!("Error: Multiple entry-point classes found:");
         for c in main_classes {
@@ -1137,11 +1193,9 @@ fn find_main_classes(classes: &[ClassInfo]) -> io::Result<Vec<String>> {
     let main_method_descriptor = "([Ljava/lang/String;)V";
 
     for class_info in classes {
-        if let Some(class_name) = check_class_data_for_main(
-            &class_info.data,
-            main_method_name,
-            main_method_descriptor,
-        )? {
+        if let Some(class_name) =
+            check_class_data_for_main(&class_info.data, main_method_name, main_method_descriptor)?
+        {
             main_classes.push(class_name);
         }
     }
@@ -1212,7 +1266,10 @@ fn create_jar(
     final_output_jar_path: &str,
     main_class_name: Option<&str>,
 ) -> io::Result<()> {
-    let app_classes = merge_duplicate_classes(app_classes)?;
+    let app_classes = {
+        let _timer = InstrumentationTimer::new("java-linker-merge-classes");
+        merge_duplicate_classes(app_classes)?
+    };
 
     // Input JARs are bundled into the final artifact alongside generated classes.
     let library_jar_paths: Vec<PathBuf> = input_jar_files.iter().map(PathBuf::from).collect();
@@ -1226,12 +1283,15 @@ fn create_jar(
 
     let temp_dir = tempdir()?;
     let final_jar_temp_path = temp_dir.path().join("output.jar");
-    write_final_jar(
-        &app_classes,
-        &library_jar_paths,
-        &final_jar_temp_path,
-        main_class_name,
-    )?;
+    {
+        let _timer = InstrumentationTimer::new("java-linker-write-jar");
+        write_final_jar(
+            &app_classes,
+            &library_jar_paths,
+            &final_jar_temp_path,
+            main_class_name,
+        )?;
+    }
 
     if let Some(parent_dir) = Path::new(final_output_jar_path).parent() {
         fs::create_dir_all(parent_dir)?;
@@ -1288,7 +1348,10 @@ fn collect_input_classes(
             .to_string_lossy();
         let base_name = re_strip_hash
             .captures(&file_name)
-            .and_then(|caps| caps.name("name").map(|name| format!("{}.class", name.as_str())))
+            .and_then(|caps| {
+                caps.name("name")
+                    .map(|name| format!("{}.class", name.as_str()))
+            })
             .unwrap_or_else(|| file_name.to_string());
         classes.push(class_info_from_class_data(fs::read(path)?, base_name));
     }
@@ -1321,8 +1384,11 @@ fn write_final_jar(
     let mut zip_writer = ZipWriter::new(output_file);
     let options = SimpleFileOptions::default()
         .compression_method(CompressionMethod::DEFLATE)
+        // Class files compress well even at the fastest DEFLATE level. Higher
+        // levels cost noticeably more during large links for little size gain.
+        .compression_level(Some(1))
         .unix_permissions(0o644);
-    let mut seen_entries = HashSet::new();
+    let mut seen_entries = HashSet::default();
 
     zip_writer.start_file("META-INF/MANIFEST.MF", options)?;
     zip_writer.write_all(create_manifest_content(main_class_name).as_bytes())?;
@@ -1475,10 +1541,7 @@ fn collect_class_bundle_bytes(data: &[u8], path: &Path) -> io::Result<Vec<ClassI
     collect_class_bundle_reader(Cursor::new(data), path)
 }
 
-fn collect_class_bundle_reader(
-    mut reader: impl Read,
-    path: &Path,
-) -> io::Result<Vec<ClassInfo>> {
+fn collect_class_bundle_reader(mut reader: impl Read, path: &Path) -> io::Result<Vec<ClassInfo>> {
     let mut magic = [0u8; CLASS_BUNDLE_MAGIC.len()];
     reader.read_exact(&mut magic)?;
     if &magic != CLASS_BUNDLE_MAGIC {
@@ -1501,7 +1564,10 @@ fn collect_class_bundle_reader(
         let class_len = usize::try_from(u64::from_le_bytes(class_len_bytes)).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("class length exceeds this host's address space in {}", path.display()),
+                format!(
+                    "class length exceeds this host's address space in {}",
+                    path.display()
+                ),
             )
         })?;
         let mut name = vec![0; name_len];
@@ -1662,7 +1728,7 @@ fn merge_input_jars(
 ) -> io::Result<()> {
     let output_file = fs::File::create(output_jar_path)?;
     let mut zip_writer = ZipWriter::new(output_file);
-    let mut seen_entries = HashSet::new();
+    let mut seen_entries = HashSet::default();
 
     // Compiled Rust classes are authoritative. In particular, a stale runtime
     // JAR must never shadow classes produced by compiling the real core crate.
@@ -2005,8 +2071,8 @@ mod tests {
         bundle.extend_from_slice(name);
         bundle.extend_from_slice(&class);
 
-        let classes = collect_class_bundle_bytes(&bundle, std::path::Path::new("test.jvmbundle"))
-            .unwrap();
+        let classes =
+            collect_class_bundle_bytes(&bundle, std::path::Path::new("test.jvmbundle")).unwrap();
         assert_eq!(classes.len(), 1);
         assert_eq!(classes[0].jar_entry_name, "test/Generic.class");
         assert_eq!(classes[0].data, class);
@@ -2055,7 +2121,10 @@ mod tests {
         ];
         let merged = merge_duplicate_classes(classes).unwrap();
         assert_eq!(merged.len(), 1);
-        assert_eq!(class_file_from_data(&merged[0].data).unwrap().methods.len(), 2);
+        assert_eq!(
+            class_file_from_data(&merged[0].data).unwrap().methods.len(),
+            2
+        );
     }
 
     #[test]
@@ -2128,7 +2197,7 @@ mod tests {
             .expect("merged BootstrapMethods attribute");
         assert_eq!(bootstrap_methods.len(), 2);
 
-        let mut bootstrap_indexes = HashSet::new();
+        let mut bootstrap_indexes = HashSet::default();
         for raw_index in 1..=class_file.constant_pool.len() {
             let Ok(index) = u16::try_from(raw_index) else {
                 continue;
@@ -2200,6 +2269,10 @@ mod tests {
             .unwrap()
             .read_to_end(&mut contents)
             .unwrap();
-        assert!(String::from_utf8(contents).unwrap().contains("Main-Class: test.Generic\r\n"));
+        assert!(
+            String::from_utf8(contents)
+                .unwrap()
+                .contains("Main-Class: test.Generic\r\n")
+        );
     }
 }

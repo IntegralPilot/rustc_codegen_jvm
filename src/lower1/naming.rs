@@ -1,11 +1,11 @@
 //! Naming helpers for functions and monomorphized instances
 
 use super::jvm_names;
+use rustc_hash::FxHashMap as HashMap;
 use rustc_hir::{LangItem, def::DefKind};
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 use rustc_middle::ty::{GenericArg, Instance, InstanceKind, TyCtxt, TypeVisitableExt};
-use rustc_span::{def_id::LOCAL_CRATE, sym};
-use std::collections::HashMap;
+use rustc_span::sym;
 
 const MAX_MONO_FN_NAME_LEN: usize = 128;
 const WEAK_LANG_ITEMS_CLASS: &str = "org/rustlang/runtime/WeakLangItems";
@@ -33,28 +33,30 @@ pub struct JvmStaticImport {
     pub descriptor: Option<String>,
 }
 
-pub fn mono_owner_class<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> String {
+fn is_external_runtime_generic<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> bool {
     let def_id = instance.def_id();
-    let external_runtime_generic = !def_id.is_local()
+    !def_id.is_local()
         && !matches!(instance.def, InstanceKind::Intrinsic(_))
         && jvm_names::is_runtime_crate(tcx, def_id.krate)
         && jvm_names::compiles_external_core_instances(tcx)
         && tcx.generics_of(def_id).requires_monomorphization(tcx)
         && !instance.args.has_param()
-        && !instance.args.has_escaping_bound_vars();
-    let mono_owner_crate = match instance.upstream_monomorphization(tcx) {
-        None => Some(LOCAL_CRATE),
-        Some(exporter) if exporter != def_id.krate => Some(exporter),
-        Some(_) => None,
-    };
-    if external_runtime_generic && let Some(owner_crate) = mono_owner_crate {
-        // Runtime generics are emitted by the first downstream crate that
-        // needs them. Later crates must call that exporter's mono bucket.
-        let instance_key = tcx.symbol_name(instance).name;
+        && !instance.args.has_escaping_bound_vars()
+}
+
+pub fn mono_owner_class<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> String {
+    let def_id = instance.def_id();
+    let external_runtime_generic = is_external_runtime_generic(tcx, instance);
+    if external_runtime_generic {
+        // Synthetic helpers can reference an instance without adding it to
+        // the current crate's mono-item set. Give every runtime instance one
+        // definition-crate owner so all downstream callers and exporters
+        // agree even when the runtime crate has a different local alias.
+        let instance_key = super::types::stable_instance_identity(tcx, def_id, instance.args);
         let bucket = super::types::short_hash(&instance_key, 1);
         format!(
             "{}/mono/MonoBucket_{}",
-            jvm_names::crate_root(tcx, owner_crate),
+            jvm_names::crate_root(tcx, def_id.krate),
             bucket
         )
     } else if let Some(trait_def_id) = tcx
@@ -264,7 +266,7 @@ fn associated_specialization_name<'tcx>(
     args: &[GenericArg<'tcx>],
 ) -> String {
     let method = jvm_names::method_for_function(tcx, canonical_def_id);
-    let mut data_types = HashMap::new();
+    let mut data_types = HashMap::default();
     let mut generic_tokens = Vec::new();
     for arg in args {
         if let Some(token) =
@@ -273,7 +275,7 @@ fn associated_specialization_name<'tcx>(
             generic_tokens.push(super::types::sanitize_name_token(&token));
         }
     }
-    let identity = super::types::stable_def_path(tcx, canonical_def_id);
+    let identity = super::types::stable_def_identity(tcx, canonical_def_id);
     crate::stable_hash::readable_or_hashed_name(
         &method,
         &generic_tokens.join("_"),
@@ -310,7 +312,26 @@ pub fn mono_fn_name_from_instance<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'t
 
     let class = Some(mono_owner_class(tcx, instance));
 
-    let mut safe_base = jvm_names::method_for_function(tcx, instance.def_id());
+    let external_runtime_generic = is_external_runtime_generic(tcx, instance);
+    let needs_definition_suffix =
+        external_runtime_generic && matches!(instance.def, InstanceKind::Item(_));
+    let mut safe_base = if needs_definition_suffix {
+        // Upstream generic bodies are grouped into a small number of
+        // downstream MonoBucket classes. Their definition identity is the one
+        // place a suffix is required: otherwise unrelated functions such as
+        // slice::from_mut and array::from_mut can acquire the same JVM name
+        // and descriptor.
+        format!(
+            "{}_{}",
+            jvm_names::method_for_function(tcx, instance.def_id()),
+            super::types::short_hash(
+                &super::types::stable_def_identity(tcx, instance.def_id()),
+                10,
+            ),
+        )
+    } else {
+        jvm_names::method_for_function(tcx, instance.def_id())
+    };
     if instance.args.has_param() || instance.args.has_escaping_bound_vars() {
         let hash = super::types::short_hash(
             &format!(
@@ -325,9 +346,12 @@ pub fn mono_fn_name_from_instance<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'t
             method_name: format!("{}_{}", safe_base, hash),
         };
     }
-    let mut data_types = HashMap::new();
+    let mut data_types = HashMap::default();
     let mut generic_tokens = Vec::new();
-    if let Some(item) = tcx.opt_associated_item(instance.def_id()) {
+    if needs_definition_suffix {
+        // The complete definition path above already identifies traits,
+        // impls, and nested items without adding redundant prefixes.
+    } else if let Some(item) = tcx.opt_associated_item(instance.def_id()) {
         if let Some(trait_def_id) = item.trait_container(tcx) {
             safe_base = format!(
                 "{}_{}",
@@ -389,7 +413,7 @@ pub fn mono_fn_name_from_instance<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'t
 
     // Upstream generic symbols include the instantiating crate, so use the
     // definition path plus the complete suffix as the cross-crate JVM identity.
-    let identity = super::types::stable_def_path(tcx, instance.def_id());
+    let identity = super::types::stable_def_identity(tcx, instance.def_id());
     FnNameData {
         class_to_call_on: class,
         method_name: crate::stable_hash::readable_or_hashed_name(

@@ -4,7 +4,7 @@ use super::*;
 // Merges information from multiple predecessors.
 // A variable is constant only if it has the same constant value coming from all paths.
 fn meet_constants(map1: &ConstantMap, map2: &ConstantMap) -> ConstantMap {
-    let mut result = ConstantMap::new();
+    let mut result = ConstantMap::default();
     // Consider variables present in map1
     for (var, const1) in map1 {
         match map2.get(var) {
@@ -33,7 +33,7 @@ pub fn analyze_constant_propagation(
     let mut worklist = VecDeque::new();
 
     if cfg.contains_key(entry_label) {
-        block_in_state.insert(entry_label.clone(), Some(ConstantMap::new()));
+        block_in_state.insert(entry_label.clone(), Some(ConstantMap::default()));
         worklist.push_back(entry_label.clone());
     }
 
@@ -1371,9 +1371,14 @@ pub fn process_block_instructions(
 fn calculate_block_output_state(info: &BasicBlockInfo, in_state: &ConstantMap) -> ConstantMap {
     // For analysis, we only need the state, not the instructions.
     // Pass dummy data_types if not needed for state calculation itself.
-    let dummy_data_types = HashMap::new();
-    let (out_state, _) =
-        process_block_instructions(info, in_state, false, &dummy_data_types, &HashSet::new());
+    let dummy_data_types = HashMap::default();
+    let (out_state, _) = process_block_instructions(
+        info,
+        in_state,
+        false,
+        &dummy_data_types,
+        &HashSet::default(),
+    );
     out_state
 }
 
@@ -1510,10 +1515,10 @@ mod tests {
                 label: label.to_string(),
                 instructions,
             },
-            predecessors: HashSet::new(),
-            successors: HashSet::new(),
+            predecessors: HashSet::default(),
+            successors: HashSet::default(),
         };
-        let mut cfg = HashMap::from([
+        let mut cfg = HashMap::from_iter([
             (
                 "entry".to_string(),
                 block(
@@ -1583,10 +1588,10 @@ mod tests {
         };
         let info = BasicBlockInfo {
             original_block: block,
-            predecessors: HashSet::new(),
-            successors: HashSet::new(),
+            predecessors: HashSet::default(),
+            successors: HashSet::default(),
         };
-        let state = ConstantMap::from([
+        let state = ConstantMap::from_iter([
             (
                 "array".to_string(),
                 Constant::Array(
@@ -1597,8 +1602,13 @@ mod tests {
             ("index".to_string(), Constant::U64(2)),
         ]);
 
-        let (_, instructions) =
-            process_block_instructions(&info, &state, true, &HashMap::new(), &HashSet::new());
+        let (_, instructions) = process_block_instructions(
+            &info,
+            &state,
+            true,
+            &HashMap::default(),
+            &HashSet::default(),
+        );
 
         assert_eq!(
             instructions,
@@ -1630,11 +1640,11 @@ mod tests {
         };
         let info = BasicBlockInfo {
             original_block: block,
-            predecessors: HashSet::new(),
-            successors: HashSet::new(),
+            predecessors: HashSet::default(),
+            successors: HashSet::default(),
         };
         let nested = Constant::Array(Box::new(Type::I32), vec![Constant::I32(1)]);
-        let state = ConstantMap::from([
+        let state = ConstantMap::from_iter([
             (
                 "array".to_string(),
                 Constant::Array(Box::new(element_ty), vec![nested]),
@@ -1642,8 +1652,13 @@ mod tests {
             ("index".to_string(), Constant::U64(0)),
         ]);
 
-        let (_, instructions) =
-            process_block_instructions(&info, &state, true, &HashMap::new(), &HashSet::new());
+        let (_, instructions) = process_block_instructions(
+            &info,
+            &state,
+            true,
+            &HashMap::default(),
+            &HashSet::default(),
+        );
 
         assert_eq!(
             instructions,
@@ -1670,13 +1685,18 @@ mod tests {
         };
         let info = BasicBlockInfo {
             original_block: block,
-            predecessors: HashSet::new(),
-            successors: HashSet::new(),
+            predecessors: HashSet::default(),
+            successors: HashSet::default(),
         };
-        let state = ConstantMap::from([("value".to_string(), Constant::I32(-2))]);
+        let state = ConstantMap::from_iter([("value".to_string(), Constant::I32(-2))]);
 
-        let (_, instructions) =
-            process_block_instructions(&info, &state, true, &HashMap::new(), &HashSet::new());
+        let (_, instructions) = process_block_instructions(
+            &info,
+            &state,
+            true,
+            &HashMap::default(),
+            &HashSet::default(),
+        );
 
         assert_eq!(
             instructions,
@@ -1696,11 +1716,11 @@ mod tests {
         let owner_ty = Type::Class("example/Owner".to_string());
         let owner = Constant::Instance {
             class_name: "example/Owner".to_string(),
-            fields: HashMap::from([(
+            fields: HashMap::from_iter([(
                 "value".to_string(),
                 Constant::Instance {
                     class_name: "example/Base$Variant".to_string(),
-                    fields: HashMap::new(),
+                    fields: HashMap::default(),
                     params: Vec::new(),
                     param_types: Vec::new(),
                 },
@@ -1729,16 +1749,16 @@ mod tests {
         };
         let info = BasicBlockInfo {
             original_block: block,
-            predecessors: HashSet::new(),
-            successors: HashSet::new(),
+            predecessors: HashSet::default(),
+            successors: HashSet::default(),
         };
 
         let (_, instructions) = process_block_instructions(
             &info,
-            &HashMap::new(),
+            &HashMap::default(),
             true,
-            &HashMap::new(),
-            &HashSet::new(),
+            &HashMap::default(),
+            &HashSet::default(),
         );
 
         assert!(matches!(

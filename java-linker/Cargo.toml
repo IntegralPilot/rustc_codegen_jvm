@@ -5,7 +5,9 @@ edition = "2024"
 
 [dependencies]
 regex = "1.11.1"
+rayon = "1.10.0"
 ristretto_classfile = "0.31.0"
+rustc-hash = "2.1.1"
 tempfile = "3.19.1"
 zip = "2.5.0"
 

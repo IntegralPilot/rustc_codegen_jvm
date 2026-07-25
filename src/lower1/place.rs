@@ -8,11 +8,12 @@ use super::{
     },
 };
 use crate::oomir::{self, DataTypeMethod, Instruction, Operand};
+use rustc_hash::FxHashMap as HashMap;
 use rustc_middle::{
     mir::{Body, Local, Operand as MirOperand, Place, ProjectionElem, Rvalue, StatementKind},
     ty::{AdtDef, EarlyBinder, GenericArgsRef, Instance, Ty, TyCtxt, TyKind, TypingEnv},
 };
-use std::{cell::RefCell, collections::HashMap};
+use std::cell::RefCell;
 
 pub(crate) fn has_slice_or_str_struct_tail<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {
     if !matches!(ty.kind(), TyKind::Adt(adt_def, _) if adt_def.is_struct()) {
@@ -1388,7 +1389,7 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
                         }
                     }
 
-                    let mut methods = HashMap::new();
+                    let mut methods = HashMap::default();
                     methods.insert(
                         "getVariantIdx".to_string(),
                         DataTypeMethod::SimpleConstantReturn(

@@ -20,7 +20,9 @@ TARGET_SPEC = ROOT / "jvm-unknown-unknown.json"
 TEST_TARGET_DIR = ROOT / "target" / "test-suite"
 TEST_CONFIG = ROOT / "config.toml"
 CORE_BUILD_MANIFEST = ROOT / "tests" / "support" / "core_build" / "Cargo.toml"
-TEST_TYPES = ("binary", "multicrate", "integration")
+# Library crates now remain rlibs until an explicit JVM packaging command is
+# requested. Java integration cases require that future packaging command.
+TEST_TYPES = ("binary", "multicrate")
 CACHE_TAG = (
     "Signature: 8a477f597d28d172789f06886806bc55\n"
     "# This file is a cache directory tag created by rustc_codegen_jvm.\n"

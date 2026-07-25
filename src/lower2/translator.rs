@@ -15,7 +15,8 @@ use super::jvm::{
         ArrayType, BootstrapMethod, ExceptionTableEntry, Instruction, LookupSwitch, TableSwitch,
     },
 };
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::convert::TryInto;
 use std::io::Cursor;
 use std::rc::Rc;
@@ -94,12 +95,12 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             module,
             constant_pool,
             bootstrap_methods,
-            local_var_map: HashMap::new(),
-            local_var_types: HashMap::new(),
-            typed_local_var_map: HashMap::new(),
+            local_var_map: HashMap::default(),
+            local_var_types: HashMap::default(),
+            typed_local_var_map: HashMap::default(),
             next_local_index: if is_static { 0 } else { 1 },
             jvm_instructions: Vec::new(),
-            label_to_instr_index: HashMap::new(),
+            label_to_instr_index: HashMap::default(),
             branch_fixups: Vec::new(),
             switch_fixups: Vec::new(),
             current_oomir_block_label: String::new(),
@@ -109,7 +110,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 is_static,
                 owner_class_name,
             ),
-            direct_this_aliases: HashSet::new(),
+            direct_this_aliases: HashSet::default(),
             jvm_metadata: Vec::new(),
             current_source_location: None,
             current_active_variables: Rc::new(Vec::new()),
@@ -462,7 +463,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
 
     fn layout_block_order(&self) -> Result<Vec<String>, jvm::Error> {
         let mut order = Vec::new();
-        let mut visited = HashSet::new();
+        let mut visited = HashSet::default();
         let mut stack = vec![self.oomir_func.body.entry.clone()];
 
         while let Some(block_label) = stack.pop() {
@@ -502,7 +503,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             .iter()
             .map(|region| region.target.clone())
             .collect::<BTreeSet<_>>();
-        let mut handlers = HashMap::new();
+        let mut handlers = HashMap::default();
         let exception_ty = oomir::Type::Class("java/lang/Throwable".to_string());
         for target in targets {
             let handler = u16::try_from(self.jvm_instructions.len()).map_err(|_| {
@@ -4818,7 +4819,7 @@ fn conditional_branch_target(instruction: &Instruction) -> Option<u16> {
 
 fn layout_successors(block: &oomir::BasicBlock) -> Vec<String> {
     let mut successors = Vec::new();
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::default();
     let mut push_unique = |target: &String| {
         if seen.insert(target.clone()) {
             successors.push(target.clone());

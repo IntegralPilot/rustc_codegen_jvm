@@ -5,7 +5,8 @@ use super::jvm::{
 use super::stackmaps::FrameValue;
 use crate::oomir::SourceLocation;
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    cmp::Reverse,
+    collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque},
     rc::Rc,
 };
 
@@ -56,11 +57,69 @@ struct LiveRange {
 
 #[derive(Debug)]
 struct LocalLiveness {
-    widths: BTreeMap<u16, u16>,
-    uses: Vec<Vec<u16>>,
-    defs: Vec<Vec<u16>>,
+    widths: Vec<u16>,
+    uses: Vec<Option<u16>>,
+    defs: Vec<Option<u16>>,
     live_in: LocalBitMatrix,
     live_out: LocalBitMatrix,
+}
+
+#[derive(Debug, Default)]
+enum CompactSuccessors {
+    #[default]
+    None,
+    One(usize),
+    Two(usize, usize),
+    Many(Vec<usize>),
+}
+
+impl CompactSuccessors {
+    fn push(&mut self, successor: usize) {
+        *self = match std::mem::take(self) {
+            Self::None => Self::One(successor),
+            Self::One(first) => Self::Two(first, successor),
+            Self::Two(first, second) => Self::Many(vec![first, second, successor]),
+            Self::Many(mut successors) => {
+                successors.push(successor);
+                Self::Many(successors)
+            }
+        };
+    }
+
+    fn retain_below(&mut self, upper_bound: usize) {
+        *self = match std::mem::take(self) {
+            Self::None => Self::None,
+            Self::One(first) if first < upper_bound => Self::One(first),
+            Self::One(_) => Self::None,
+            Self::Two(first, second) => match (first < upper_bound, second < upper_bound) {
+                (true, true) => Self::Two(first, second),
+                (true, false) => Self::One(first),
+                (false, true) => Self::One(second),
+                (false, false) => Self::None,
+            },
+            Self::Many(mut successors) => {
+                successors.retain(|successor| *successor < upper_bound);
+                match successors.len() {
+                    0 => Self::None,
+                    1 => Self::One(successors[0]),
+                    2 => Self::Two(successors[0], successors[1]),
+                    _ => Self::Many(successors),
+                }
+            }
+        };
+    }
+
+    fn for_each(&self, mut visitor: impl FnMut(usize)) {
+        match self {
+            Self::None => {}
+            Self::One(first) => visitor(*first),
+            Self::Two(first, second) => {
+                visitor(*first);
+                visitor(*second);
+            }
+            Self::Many(successors) => successors.iter().copied().for_each(visitor),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -163,14 +222,6 @@ pub(super) fn optimise(
         fold_branch_over_goto(instructions, source_locations, exception_table)?;
     let (instructions, source_locations) =
         remove_unreachable_instructions(instructions, source_locations, exception_table)?;
-    let local_slot_map = allocate_local_slots(
-        &instructions,
-        max_locals,
-        fixed_prefix_slots,
-        pinned_local_slots,
-        exception_table,
-    );
-    let (instructions, _) = rewrite_locals(instructions, &local_slot_map);
     let (instructions, source_locations) =
         rewrite_store_load_pairs(instructions, source_locations, exception_table);
     let (instructions, source_locations) =
@@ -202,6 +253,14 @@ pub(super) fn optimise(
         remove_unreachable_instructions(instructions, source_locations, exception_table)?;
     let (instructions, source_locations) =
         remove_redundant_instructions(instructions, source_locations, exception_table)?;
+    let local_slot_map = allocate_local_slots(
+        &instructions,
+        max_locals,
+        fixed_prefix_slots,
+        pinned_local_slots,
+        exception_table,
+    );
+    let (instructions, _) = rewrite_locals(instructions, &local_slot_map);
     let max_locals = compute_max_locals(&instructions);
     let max_locals = max_locals.max(fixed_prefix_slots);
 
@@ -367,13 +426,13 @@ fn has_boolean_branch_materialization(instructions: &[Instruction]) -> bool {
 fn incoming_branch_sources(instructions: &[Instruction]) -> Vec<BTreeSet<usize>> {
     let mut incoming = vec![BTreeSet::new(); instructions.len()];
     for (source, instruction) in instructions.iter().enumerate() {
-        for target in branch_targets(source, instruction) {
+        visit_branch_targets(source, instruction, |target| {
             if target >= 0
                 && let Some(target_incoming) = incoming.get_mut(target as usize)
             {
                 target_incoming.insert(source);
             }
-        }
+        });
     }
     incoming
 }
@@ -770,80 +829,102 @@ fn remove_unreachable_instructions(
 
 fn thread_jump_targets(mut instructions: Vec<Instruction>) -> jvm::Result<Vec<Instruction>> {
     for index in 0..instructions.len() {
-        let replacement = match instructions[index].clone() {
-            Instruction::Ifeq(target) => {
-                Instruction::Ifeq(thread_u16_target(&instructions, target)?)
-            }
-            Instruction::Ifne(target) => {
-                Instruction::Ifne(thread_u16_target(&instructions, target)?)
-            }
-            Instruction::Iflt(target) => {
-                Instruction::Iflt(thread_u16_target(&instructions, target)?)
-            }
-            Instruction::Ifge(target) => {
-                Instruction::Ifge(thread_u16_target(&instructions, target)?)
-            }
-            Instruction::Ifgt(target) => {
-                Instruction::Ifgt(thread_u16_target(&instructions, target)?)
-            }
-            Instruction::Ifle(target) => {
-                Instruction::Ifle(thread_u16_target(&instructions, target)?)
-            }
-            Instruction::If_icmpeq(target) => {
-                Instruction::If_icmpeq(thread_u16_target(&instructions, target)?)
-            }
-            Instruction::If_icmpne(target) => {
-                Instruction::If_icmpne(thread_u16_target(&instructions, target)?)
-            }
-            Instruction::If_icmplt(target) => {
-                Instruction::If_icmplt(thread_u16_target(&instructions, target)?)
-            }
-            Instruction::If_icmpge(target) => {
-                Instruction::If_icmpge(thread_u16_target(&instructions, target)?)
-            }
-            Instruction::If_icmpgt(target) => {
-                Instruction::If_icmpgt(thread_u16_target(&instructions, target)?)
-            }
-            Instruction::If_icmple(target) => {
-                Instruction::If_icmple(thread_u16_target(&instructions, target)?)
-            }
-            Instruction::If_acmpeq(target) => {
-                Instruction::If_acmpeq(thread_u16_target(&instructions, target)?)
-            }
-            Instruction::If_acmpne(target) => {
-                Instruction::If_acmpne(thread_u16_target(&instructions, target)?)
-            }
-            Instruction::Goto(target) => {
-                Instruction::Goto(thread_u16_target(&instructions, target)?)
-            }
-            Instruction::Ifnull(target) => {
-                Instruction::Ifnull(thread_u16_target(&instructions, target)?)
-            }
-            Instruction::Ifnonnull(target) => {
-                Instruction::Ifnonnull(thread_u16_target(&instructions, target)?)
-            }
-            Instruction::Goto_w(target) => {
-                Instruction::Goto_w(thread_i32_target(&instructions, target)?)
-            }
-            Instruction::Tableswitch(mut table_switch) => {
+        let replacement = match &instructions[index] {
+            Instruction::Ifeq(target) => Some(Instruction::Ifeq(thread_u16_target(
+                &instructions,
+                *target,
+            )?)),
+            Instruction::Ifne(target) => Some(Instruction::Ifne(thread_u16_target(
+                &instructions,
+                *target,
+            )?)),
+            Instruction::Iflt(target) => Some(Instruction::Iflt(thread_u16_target(
+                &instructions,
+                *target,
+            )?)),
+            Instruction::Ifge(target) => Some(Instruction::Ifge(thread_u16_target(
+                &instructions,
+                *target,
+            )?)),
+            Instruction::Ifgt(target) => Some(Instruction::Ifgt(thread_u16_target(
+                &instructions,
+                *target,
+            )?)),
+            Instruction::Ifle(target) => Some(Instruction::Ifle(thread_u16_target(
+                &instructions,
+                *target,
+            )?)),
+            Instruction::If_icmpeq(target) => Some(Instruction::If_icmpeq(thread_u16_target(
+                &instructions,
+                *target,
+            )?)),
+            Instruction::If_icmpne(target) => Some(Instruction::If_icmpne(thread_u16_target(
+                &instructions,
+                *target,
+            )?)),
+            Instruction::If_icmplt(target) => Some(Instruction::If_icmplt(thread_u16_target(
+                &instructions,
+                *target,
+            )?)),
+            Instruction::If_icmpge(target) => Some(Instruction::If_icmpge(thread_u16_target(
+                &instructions,
+                *target,
+            )?)),
+            Instruction::If_icmpgt(target) => Some(Instruction::If_icmpgt(thread_u16_target(
+                &instructions,
+                *target,
+            )?)),
+            Instruction::If_icmple(target) => Some(Instruction::If_icmple(thread_u16_target(
+                &instructions,
+                *target,
+            )?)),
+            Instruction::If_acmpeq(target) => Some(Instruction::If_acmpeq(thread_u16_target(
+                &instructions,
+                *target,
+            )?)),
+            Instruction::If_acmpne(target) => Some(Instruction::If_acmpne(thread_u16_target(
+                &instructions,
+                *target,
+            )?)),
+            Instruction::Goto(target) => Some(Instruction::Goto(thread_u16_target(
+                &instructions,
+                *target,
+            )?)),
+            Instruction::Ifnull(target) => Some(Instruction::Ifnull(thread_u16_target(
+                &instructions,
+                *target,
+            )?)),
+            Instruction::Ifnonnull(target) => Some(Instruction::Ifnonnull(thread_u16_target(
+                &instructions,
+                *target,
+            )?)),
+            Instruction::Goto_w(target) => Some(Instruction::Goto_w(thread_i32_target(
+                &instructions,
+                *target,
+            )?)),
+            Instruction::Tableswitch(table_switch) => {
+                let mut table_switch = table_switch.clone();
                 table_switch.default =
                     thread_switch_target(&instructions, index, table_switch.default)?;
                 for target in &mut table_switch.offsets {
                     *target = thread_switch_target(&instructions, index, *target)?;
                 }
-                Instruction::Tableswitch(table_switch)
+                Some(Instruction::Tableswitch(table_switch))
             }
-            Instruction::Lookupswitch(mut lookup_switch) => {
+            Instruction::Lookupswitch(lookup_switch) => {
+                let mut lookup_switch = lookup_switch.clone();
                 lookup_switch.default =
                     thread_switch_target(&instructions, index, lookup_switch.default)?;
                 for target in lookup_switch.pairs.values_mut() {
                     *target = thread_switch_target(&instructions, index, *target)?;
                 }
-                Instruction::Lookupswitch(lookup_switch)
+                Some(Instruction::Lookupswitch(lookup_switch))
             }
-            other => other,
+            _ => None,
         };
-        instructions[index] = replacement;
+        if let Some(replacement) = replacement {
+            instructions[index] = replacement;
+        }
     }
 
     Ok(instructions)
@@ -1059,11 +1140,11 @@ fn protected_instruction_indices(
 ) -> BTreeSet<usize> {
     let mut protected = BTreeSet::from([0usize]);
     for (index, instruction) in instructions.iter().enumerate() {
-        for target in branch_targets(index, instruction) {
+        visit_branch_targets(index, instruction, |target| {
             if target >= 0 {
                 protected.insert(target as usize);
             }
-        }
+        });
     }
     for entry in exception_table {
         protected.insert(usize::from(entry.range_pc.start));
@@ -1081,6 +1162,10 @@ fn compact_instructions(
     keep: &[bool],
     exception_table: &mut Vec<ExceptionTableEntry>,
 ) -> jvm::Result<LocatedInstructions> {
+    if keep.iter().all(|keep| *keep) {
+        return Ok((instructions, source_locations));
+    }
+
     let mut old_to_new = vec![None; keep.len()];
     let mut next_index = 0usize;
     for (old_index, should_keep) in keep.iter().copied().enumerate() {
@@ -1261,72 +1346,175 @@ fn allocate_local_slots(
         slot_map.insert(old_slot, old_slot);
     }
 
-    let mut active: Vec<(u16, u16, usize)> = pinned_local_slots
+    let mut occupied = vec![false; usize::from(max_locals).saturating_add(2)];
+    for slot in 0..fixed_prefix_slots.min(max_locals) {
+        occupied[usize::from(slot)] = true;
+    }
+    for old_slot in pinned_local_slots
         .iter()
-        .filter(|slot| **slot >= fixed_prefix_slots)
-        .filter_map(|slot| {
-            live_ranges.get(slot).map(|range| {
-                slot_map.insert(*slot, *slot);
-                (*slot, range.width, usize::MAX)
-            })
-        })
-        .collect();
+        .copied()
+        .filter(|slot| *slot >= fixed_prefix_slots)
+    {
+        let Some(range) = live_ranges
+            .get(usize::from(old_slot))
+            .and_then(Option::as_ref)
+        else {
+            continue;
+        };
+        slot_map.insert(old_slot, old_slot);
+        set_slot_occupancy(&mut occupied, old_slot, range.width, true);
+    }
 
     let mut intervals: Vec<(u16, LiveRange)> = live_ranges
         .into_iter()
-        .filter(|(old_slot, _)| {
-            *old_slot >= fixed_prefix_slots && !pinned_local_slots.contains(old_slot)
+        .enumerate()
+        .filter_map(|(old_slot, range)| {
+            let old_slot = u16::try_from(old_slot).ok()?;
+            range
+                .filter(|_| {
+                    old_slot >= fixed_prefix_slots && !pinned_local_slots.contains(&old_slot)
+                })
+                .map(|range| (old_slot, range))
         })
         .collect();
     intervals.sort_by_key(|(old_slot, range)| (range.first, range.last, *old_slot));
 
+    let mut active = BinaryHeap::<Reverse<(usize, u16, u16)>>::new();
     for (old_slot, range) in intervals {
-        active.retain(|(_, _, last)| *last == usize::MAX || *last >= range.first);
-        let mut candidate = fixed_prefix_slots;
-        while active.iter().any(|(physical_slot, width, _)| {
-            ranges_overlap(candidate, range.width, *physical_slot, *width)
-        }) {
-            candidate += 1;
+        while let Some(Reverse((last, physical_slot, width))) = active.peek().copied() {
+            if last >= range.first {
+                break;
+            }
+            active.pop();
+            set_slot_occupancy(&mut occupied, physical_slot, width, false);
         }
 
+        let candidate = first_available_slot(&mut occupied, fixed_prefix_slots, range.width);
+        set_slot_occupancy(&mut occupied, candidate, range.width, true);
         slot_map.insert(old_slot, candidate);
-        active.push((candidate, range.width, range.last));
+        active.push(Reverse((range.last, candidate, range.width)));
     }
 
     slot_map
 }
 
+fn set_slot_occupancy(occupied: &mut Vec<bool>, slot: u16, width: u16, value: bool) {
+    let start = usize::from(slot);
+    let end = start + usize::from(width);
+    if end > occupied.len() {
+        occupied.resize(end, false);
+    }
+    occupied[start..end].fill(value);
+}
+
+fn first_available_slot(occupied: &mut Vec<bool>, first_slot: u16, width: u16) -> u16 {
+    let width = usize::from(width);
+    let mut candidate = usize::from(first_slot);
+    loop {
+        let end = candidate + width;
+        if end > occupied.len() {
+            occupied.resize(end.max(occupied.len().saturating_mul(2)), false);
+        }
+        match occupied[candidate..end]
+            .iter()
+            .position(|occupied| *occupied)
+        {
+            Some(offset) => candidate += offset + 1,
+            None => {
+                return u16::try_from(candidate)
+                    .expect("JVM local-slot allocation exceeded the u16 slot range");
+            }
+        }
+    }
+}
+
 fn compute_live_ranges(
     instructions: &[Instruction],
     exception_table: &[ExceptionTableEntry],
-) -> BTreeMap<u16, LiveRange> {
+) -> Vec<Option<LiveRange>> {
+    if !has_backward_control_flow(instructions, exception_table) {
+        return compute_linear_live_ranges(instructions);
+    }
+
     let liveness = analyze_local_liveness(instructions, exception_table);
-    let mut ranges = BTreeMap::new();
+    let mut ranges: Vec<Option<LiveRange>> = vec![None; liveness.widths.len()];
 
     for index in 0..instructions.len() {
         for local in liveness
             .live_in
             .iter(index)
             .chain(liveness.live_out.iter(index))
-            .chain(liveness.uses[index].iter().copied())
-            .chain(liveness.defs[index].iter().copied())
+            .chain(liveness.uses[index])
+            .chain(liveness.defs[index])
         {
-            let width = liveness.widths.get(&local).copied().unwrap_or(1);
-            ranges
-                .entry(local)
-                .and_modify(|range: &mut LiveRange| {
+            let width = liveness
+                .widths
+                .get(usize::from(local))
+                .copied()
+                .unwrap_or(1);
+            let range = &mut ranges[usize::from(local)];
+            match range {
+                Some(range) => {
                     range.first = range.first.min(index);
                     range.last = range.last.max(index);
                     range.width = range.width.max(width);
-                })
-                .or_insert(LiveRange {
-                    width,
-                    first: index,
-                    last: index,
-                });
+                }
+                None => {
+                    *range = Some(LiveRange {
+                        width,
+                        first: index,
+                        last: index,
+                    });
+                }
+            }
         }
     }
 
+    ranges
+}
+
+fn has_backward_control_flow(
+    instructions: &[Instruction],
+    exception_table: &[ExceptionTableEntry],
+) -> bool {
+    for (index, instruction) in instructions.iter().enumerate() {
+        let mut backward = false;
+        visit_instruction_successors(index, instruction, instructions.len(), |successor| {
+            backward |= successor <= index;
+        });
+        if backward {
+            return true;
+        }
+    }
+    exception_table.iter().any(|entry| {
+        usize::from(entry.handler_pc) <= usize::from(entry.range_pc.end).min(instructions.len())
+    })
+}
+
+fn compute_linear_live_ranges(instructions: &[Instruction]) -> Vec<Option<LiveRange>> {
+    let mut ranges: Vec<Option<LiveRange>> = Vec::new();
+    for (index, instruction) in instructions.iter().enumerate() {
+        for local in local_reads(instruction)
+            .into_iter()
+            .chain(local_writes(instruction))
+        {
+            let slot = usize::from(local.index);
+            ranges.resize(ranges.len().max(slot + 1), None);
+            match &mut ranges[slot] {
+                Some(range) => {
+                    range.last = index;
+                    range.width = range.width.max(local.width);
+                }
+                range @ None => {
+                    *range = Some(LiveRange {
+                        width: local.width,
+                        first: index,
+                        last: index,
+                    });
+                }
+            }
+        }
+    }
     ranges
 }
 
@@ -1334,30 +1522,24 @@ fn analyze_local_liveness(
     instructions: &[Instruction],
     exception_table: &[ExceptionTableEntry],
 ) -> LocalLiveness {
-    let mut widths = BTreeMap::new();
-    let mut uses = vec![Vec::new(); instructions.len()];
-    let mut defs = vec![Vec::new(); instructions.len()];
+    let mut widths = Vec::new();
+    let mut uses = vec![None; instructions.len()];
+    let mut defs = vec![None; instructions.len()];
     let mut highest_local = None;
 
     for (index, instruction) in instructions.iter().enumerate() {
-        for local in local_reads(instruction) {
-            widths
-                .entry(local.index)
-                .and_modify(|width: &mut u16| *width = (*width).max(local.width))
-                .or_insert(local.width);
-            if !uses[index].contains(&local.index) {
-                uses[index].push(local.index);
-            }
+        if let Some(local) = local_reads(instruction) {
+            let required_len = usize::from(local.index) + 1;
+            widths.resize(widths.len().max(required_len), 1);
+            widths[usize::from(local.index)] = widths[usize::from(local.index)].max(local.width);
+            uses[index] = Some(local.index);
             highest_local = Some(highest_local.unwrap_or(0).max(local.index));
         }
-        for local in local_writes(instruction) {
-            widths
-                .entry(local.index)
-                .and_modify(|width: &mut u16| *width = (*width).max(local.width))
-                .or_insert(local.width);
-            if !defs[index].contains(&local.index) {
-                defs[index].push(local.index);
-            }
+        if let Some(local) = local_writes(instruction) {
+            let required_len = usize::from(local.index) + 1;
+            widths.resize(widths.len().max(required_len), 1);
+            widths[usize::from(local.index)] = widths[usize::from(local.index)].max(local.width);
+            defs[index] = Some(local.index);
             highest_local = Some(highest_local.unwrap_or(0).max(local.index));
         }
     }
@@ -1368,7 +1550,13 @@ fn analyze_local_liveness(
     let mut successors = instructions
         .iter()
         .enumerate()
-        .map(|(index, instruction)| instruction_successors(index, instruction, instructions.len()))
+        .map(|(index, instruction)| {
+            let mut successors = CompactSuccessors::default();
+            visit_instruction_successors(index, instruction, instructions.len(), |successor| {
+                successors.push(successor);
+            });
+            successors
+        })
         .collect::<Vec<_>>();
     for entry in exception_table {
         let handler = usize::from(entry.handler_pc);
@@ -1386,12 +1574,10 @@ fn analyze_local_liveness(
     }
     let mut predecessors = vec![Vec::new(); instructions.len()];
     for (index, instruction_successors) in successors.iter_mut().enumerate() {
-        instruction_successors.retain(|successor| *successor < instructions.len());
-        instruction_successors.sort_unstable();
-        instruction_successors.dedup();
-        for successor in instruction_successors.iter().copied() {
+        instruction_successors.retain_below(instructions.len());
+        instruction_successors.for_each(|successor| {
             predecessors[successor].push(index);
-        }
+        });
     }
 
     let mut queue = (0..instructions.len()).rev().collect::<VecDeque<_>>();
@@ -1401,18 +1587,18 @@ fn analyze_local_liveness(
     while let Some(index) = queue.pop_front() {
         queued[index] = false;
         next_out.fill(0);
-        for successor in successors[index].iter().copied() {
+        successors[index].for_each(|successor| {
             for (word, successor_word) in next_out.iter_mut().zip(live_in.row(successor)) {
                 *word |= successor_word;
             }
-        }
+        });
         next_in.copy_from_slice(&next_out);
-        for local in &defs[index] {
-            let local = usize::from(*local);
+        if let Some(local) = defs[index] {
+            let local = usize::from(local);
             next_in[local / u64::BITS as usize] &= !(1 << (local % u64::BITS as usize));
         }
-        for local in &uses[index] {
-            let local = usize::from(*local);
+        if let Some(local) = uses[index] {
+            let local = usize::from(local);
             next_in[local / u64::BITS as usize] |= 1 << (local % u64::BITS as usize);
         }
 
@@ -1848,9 +2034,9 @@ fn thread_switch_target(
 
 fn resolve_goto_chain(instructions: &[Instruction], target: usize) -> usize {
     let mut current = target;
-    let mut seen = BTreeSet::new();
-
-    while seen.insert(current) {
+    // A chain cannot visit more instructions without either ending or
+    // cycling. Bounding the walk avoids allocating a set for every branch.
+    for _ in 0..instructions.len() {
         let Some(next) = instructions.get(current).and_then(goto_target) else {
             break;
         };
@@ -1863,42 +2049,38 @@ fn resolve_goto_chain(instructions: &[Instruction], target: usize) -> usize {
     current
 }
 
-fn local_reads(instruction: &Instruction) -> Vec<LocalRef> {
-    let mut reads = Vec::new();
+fn local_reads(instruction: &Instruction) -> Option<LocalRef> {
     if let Some((_, local)) = local_load(instruction) {
-        reads.push(local);
+        return Some(local);
     }
     match instruction {
-        Instruction::Iinc(index, _) | Instruction::Ret(index) => reads.push(LocalRef {
+        Instruction::Iinc(index, _) | Instruction::Ret(index) => Some(LocalRef {
             index: u16::from(*index),
             width: 1,
         }),
-        Instruction::Iinc_w(index, _) | Instruction::Ret_w(index) => reads.push(LocalRef {
+        Instruction::Iinc_w(index, _) | Instruction::Ret_w(index) => Some(LocalRef {
             index: *index,
             width: 1,
         }),
-        _ => {}
+        _ => None,
     }
-    reads
 }
 
-fn local_writes(instruction: &Instruction) -> Vec<LocalRef> {
-    let mut writes = Vec::new();
+fn local_writes(instruction: &Instruction) -> Option<LocalRef> {
     if let Some((_, local)) = local_store(instruction) {
-        writes.push(local);
+        return Some(local);
     }
     match instruction {
-        Instruction::Iinc(index, _) => writes.push(LocalRef {
+        Instruction::Iinc(index, _) => Some(LocalRef {
             index: u16::from(*index),
             width: 1,
         }),
-        Instruction::Iinc_w(index, _) => writes.push(LocalRef {
+        Instruction::Iinc_w(index, _) => Some(LocalRef {
             index: *index,
             width: 1,
         }),
-        _ => {}
+        _ => None,
     }
-    writes
 }
 
 pub(super) fn instruction_uses_local(instruction: &Instruction, index: u16) -> bool {
@@ -2014,14 +2196,6 @@ fn frame_value_width(value: &FrameValue) -> u16 {
     }
 }
 
-fn ranges_overlap(left_start: u16, left_width: u16, right_start: u16, right_width: u16) -> bool {
-    let left_start = u32::from(left_start);
-    let left_end = left_start + u32::from(left_width);
-    let right_start = u32::from(right_start);
-    let right_end = right_start + u32::from(right_width);
-    left_start < right_end && right_start < left_end
-}
-
 fn bool_branch_target(instruction: &Instruction) -> Option<(bool, u16)> {
     match instruction {
         Instruction::Ifne(target) => Some((true, *target)),
@@ -2109,15 +2283,22 @@ pub(super) fn instruction_successors(
     instruction: &Instruction,
     instruction_count: usize,
 ) -> Vec<usize> {
+    let mut successors = Vec::new();
+    visit_instruction_successors(index, instruction, instruction_count, |successor| {
+        successors.push(successor);
+    });
+    successors
+}
+
+fn visit_instruction_successors(
+    index: usize,
+    instruction: &Instruction,
+    instruction_count: usize,
+    mut visitor: impl FnMut(usize),
+) {
     use Instruction as I;
 
-    let next = || {
-        if index + 1 < instruction_count {
-            vec![index + 1]
-        } else {
-            Vec::new()
-        }
-    };
+    let next = (index + 1 < instruction_count).then_some(index + 1);
 
     match instruction {
         I::Ifeq(target)
@@ -2136,48 +2317,47 @@ pub(super) fn instruction_successors(
         | I::If_acmpne(target)
         | I::Ifnull(target)
         | I::Ifnonnull(target) => {
-            let mut successors = vec![usize::from(*target)];
-            successors.extend(next());
-            successors
+            visitor(usize::from(*target));
+            if let Some(next) = next {
+                visitor(next);
+            }
         }
-        I::Goto(target) => vec![usize::from(*target)],
-        I::Goto_w(target) if *target >= 0 => vec![*target as usize],
+        I::Goto(target) => visitor(usize::from(*target)),
+        I::Goto_w(target) if *target >= 0 => visitor(*target as usize),
         I::Tableswitch(table_switch) => {
-            let mut successors = Vec::with_capacity(table_switch.offsets.len() + 1);
             let default = index as i32 + table_switch.default;
             if default >= 0 {
-                successors.push(default as usize);
+                visitor(default as usize);
             }
             for target in &table_switch.offsets {
                 let target = index as i32 + *target;
                 if target >= 0 {
-                    successors.push(target as usize);
+                    visitor(target as usize);
                 }
             }
-            successors
         }
         I::Lookupswitch(lookup_switch) => {
-            let mut successors = Vec::with_capacity(lookup_switch.pairs.len() + 1);
             let default = index as i32 + lookup_switch.default;
             if default >= 0 {
-                successors.push(default as usize);
+                visitor(default as usize);
             }
             for target in lookup_switch.pairs.values() {
                 let target = index as i32 + *target;
                 if target >= 0 {
-                    successors.push(target as usize);
+                    visitor(target as usize);
                 }
             }
-            successors
         }
-        I::Ireturn | I::Lreturn | I::Freturn | I::Dreturn | I::Areturn | I::Return | I::Athrow => {
-            Vec::new()
+        I::Ireturn | I::Lreturn | I::Freturn | I::Dreturn | I::Areturn | I::Return | I::Athrow => {}
+        _ => {
+            if let Some(next) = next {
+                visitor(next);
+            }
         }
-        _ => next(),
     }
 }
 
-fn branch_targets(index: usize, instruction: &Instruction) -> Vec<i32> {
+fn visit_branch_targets(index: usize, instruction: &Instruction, mut visitor: impl FnMut(i32)) {
     use Instruction as I;
 
     match instruction {
@@ -2198,31 +2378,21 @@ fn branch_targets(index: usize, instruction: &Instruction) -> Vec<i32> {
         | I::Goto(target)
         | I::Jsr(target)
         | I::Ifnull(target)
-        | I::Ifnonnull(target) => vec![i32::from(*target)],
-        I::Goto_w(target) | I::Jsr_w(target) => vec![*target],
+        | I::Ifnonnull(target) => visitor(i32::from(*target)),
+        I::Goto_w(target) | I::Jsr_w(target) => visitor(*target),
         I::Tableswitch(table_switch) => {
-            let mut targets = Vec::with_capacity(table_switch.offsets.len() + 1);
-            targets.push(index as i32 + table_switch.default);
-            targets.extend(
-                table_switch
-                    .offsets
-                    .iter()
-                    .map(|target| index as i32 + *target),
-            );
-            targets
+            visitor(index as i32 + table_switch.default);
+            for target in &table_switch.offsets {
+                visitor(index as i32 + *target);
+            }
         }
         I::Lookupswitch(lookup_switch) => {
-            let mut targets = Vec::with_capacity(lookup_switch.pairs.len() + 1);
-            targets.push(index as i32 + lookup_switch.default);
-            targets.extend(
-                lookup_switch
-                    .pairs
-                    .values()
-                    .map(|target| index as i32 + *target),
-            );
-            targets
+            visitor(index as i32 + lookup_switch.default);
+            for target in lookup_switch.pairs.values() {
+                visitor(index as i32 + *target);
+            }
         }
-        _ => Vec::new(),
+        _ => {}
     }
 }
 
@@ -2242,5 +2412,56 @@ mod tests {
         assert!(matrix.contains(1, 129));
         assert_eq!(matrix.iter(0).collect::<Vec<_>>(), vec![0, 70]);
         assert!(!matrix.contains(1, 70));
+    }
+
+    #[test]
+    fn local_slot_allocator_reuses_only_non_overlapping_ranges() {
+        let sequential = vec![
+            Instruction::Istore(4),
+            Instruction::Iload(4),
+            Instruction::Pop,
+            Instruction::Istore(5),
+            Instruction::Iload(5),
+            Instruction::Pop,
+            Instruction::Return,
+        ];
+        let map = allocate_local_slots(&sequential, 6, 0, &BTreeSet::new(), &[]);
+        assert_eq!(map.get(&4), Some(&0));
+        assert_eq!(map.get(&5), Some(&0));
+
+        let overlapping = vec![
+            Instruction::Istore(4),
+            Instruction::Istore(5),
+            Instruction::Iload(4),
+            Instruction::Pop,
+            Instruction::Iload(5),
+            Instruction::Pop,
+            Instruction::Return,
+        ];
+        let map = allocate_local_slots(&overlapping, 6, 0, &BTreeSet::new(), &[]);
+        assert_eq!(map.get(&4), Some(&0));
+        assert_eq!(map.get(&5), Some(&1));
+    }
+
+    #[test]
+    fn local_slot_allocator_respects_widths_and_pinned_slots() {
+        let instructions = vec![
+            Instruction::Lstore(10),
+            Instruction::Istore(12),
+            Instruction::Istore(14),
+            Instruction::Lload(10),
+            Instruction::Pop2,
+            Instruction::Iload(12),
+            Instruction::Pop,
+            Instruction::Iload(14),
+            Instruction::Pop,
+            Instruction::Return,
+        ];
+        let pinned = BTreeSet::from([12]);
+        let map = allocate_local_slots(&instructions, 15, 0, &pinned, &[]);
+
+        assert_eq!(map.get(&10), Some(&0));
+        assert_eq!(map.get(&12), Some(&12));
+        assert_eq!(map.get(&14), Some(&2));
     }
 }

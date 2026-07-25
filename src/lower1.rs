@@ -9,6 +9,7 @@
 
 use crate::oomir;
 use control_flow::convert_basic_block;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use rustc_middle::{
     mir::{
         BasicBlock, Body, Local, OUTERMOST_SOURCE_SCOPE, Place, ProjectionElem, SourceScope,
@@ -17,7 +18,7 @@ use rustc_middle::{
     ty::{EarlyBinder, Instance, TyCtxt},
 };
 use rustc_span::{Span, hygiene};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
 use types::ty_to_oomir_type;
 
 mod closures;
@@ -78,7 +79,7 @@ impl DebugScopeCache {
     ) -> Self {
         let mut visible_without_references = Vec::with_capacity(mir.source_scopes.len());
         for scope in mir.source_scopes.indices() {
-            let mut visible_by_name = HashMap::<String, (usize, SourceScope)>::new();
+            let mut visible_by_name = HashMap::<String, (usize, SourceScope)>::default();
             for (index, variable_scope) in debug_variable_scopes.iter().copied().enumerate() {
                 if !source_scope_contains(mir, variable_scope, scope) {
                     continue;
@@ -106,7 +107,7 @@ impl DebugScopeCache {
             visible_without_references.push(visible);
         }
 
-        let mut variables_by_local = HashMap::<usize, Vec<usize>>::new();
+        let mut variables_by_local = HashMap::<usize, Vec<usize>>::default();
         for (index, variable) in debug_variables.iter().enumerate() {
             let local = variable
                 .oomir_name
@@ -132,7 +133,7 @@ pub(crate) fn local_variable_scope(
     debug_variables: &[oomir::DebugVariable],
     debug_variable_scopes: &[SourceScope],
 ) -> oomir::Instruction {
-    let mut visible_by_name = HashMap::<String, (usize, SourceScope)>::new();
+    let mut visible_by_name = HashMap::<String, (usize, SourceScope)>::default();
     for index in cache
         .visible_without_references
         .get(scope.index())
@@ -185,9 +186,9 @@ fn available_pointer_locals_at_block_entries<'tcx>(
     pointer_origins: &control_flow::MutableBorrowMap<'tcx>,
 ) -> HashMap<BasicBlock, HashSet<Local>> {
     let all_pointer_locals = pointer_origins.keys().copied().collect::<HashSet<_>>();
-    let mut generated = HashMap::<BasicBlock, HashSet<Local>>::new();
-    let mut predecessors = HashMap::<BasicBlock, Vec<BasicBlock>>::new();
-    let mut reachable = HashSet::new();
+    let mut generated = HashMap::<BasicBlock, HashSet<Local>>::default();
+    let mut predecessors = HashMap::<BasicBlock, Vec<BasicBlock>>::default();
+    let mut reachable = HashSet::default();
     let mut queue = VecDeque::from([BasicBlock::from_usize(0)]);
 
     for (block, data) in mir.basic_blocks.iter_enumerated() {
@@ -221,7 +222,7 @@ fn available_pointer_locals_at_block_entries<'tcx>(
         .indices()
         .map(|block| {
             let initial = if block == entry || !reachable.contains(&block) {
-                HashSet::new()
+                HashSet::default()
             } else {
                 all_pointer_locals.clone()
             };
@@ -304,8 +305,8 @@ fn class_locals_needing_initial_carriers(mir: &Body<'_>) -> HashSet<Local> {
     let argument_locals = (1..=mir.arg_count)
         .map(Local::from_usize)
         .collect::<HashSet<_>>();
-    let mut predecessors = HashMap::<BasicBlock, Vec<BasicBlock>>::new();
-    let mut reachable = HashSet::new();
+    let mut predecessors = HashMap::<BasicBlock, Vec<BasicBlock>>::default();
+    let mut reachable = HashSet::default();
     let mut queue = VecDeque::from([entry]);
 
     for (block, data) in mir.basic_blocks.iter_enumerated() {
@@ -329,7 +330,7 @@ fn class_locals_needing_initial_carriers(mir: &Body<'_>) -> HashSet<Local> {
             } else if reachable.contains(&block) {
                 all_locals.clone()
             } else {
-                HashSet::new()
+                HashSet::default()
             };
             (block, initial)
         })
@@ -363,7 +364,7 @@ fn class_locals_needing_initial_carriers(mir: &Body<'_>) -> HashSet<Local> {
         }
     }
 
-    let mut needs_initial_carrier = HashSet::new();
+    let mut needs_initial_carrier = HashSet::default();
     for block in mir.basic_blocks.indices() {
         if !reachable.contains(&block) {
             continue;
@@ -423,7 +424,7 @@ fn jvm_default_operand(ty: &oomir::Type) -> oomir::Operand {
 pub fn mir_to_oomir<'tcx>(
     tcx: TyCtxt<'tcx>,
     instance: Instance<'tcx>,
-    mir: &mut Body<'tcx>,
+    mir: &Body<'tcx>,
     fn_name_override: Option<naming::FnNameData>,
     is_static: bool,
     data_types: &mut HashMap<String, oomir::DataType>,
@@ -436,12 +437,13 @@ pub fn mir_to_oomir<'tcx>(
     let fn_name_data =
         fn_name_override.unwrap_or_else(|| naming::mono_fn_name_from_instance(tcx, instance));
     let fn_name = fn_name_data.method_name.clone();
-    let instrumented_fn_name = fn_name_data
-        .class_to_call_on
-        .as_deref()
-        .map(|owner| format!("{owner}::{fn_name}"))
-        .unwrap_or_else(|| fn_name.clone());
-    let _timer = crate::instrumentation::Timer::function("lower1", None, &instrumented_fn_name);
+    let _timer = crate::instrumentation::Timer::function_lazy("lower1", None, || {
+        fn_name_data
+            .class_to_call_on
+            .as_deref()
+            .map(|owner| format!("{owner}::{fn_name}"))
+            .unwrap_or_else(|| fn_name.clone())
+    });
     let _stable_cell_analysis = place::enter_stable_cell_analysis(mir);
 
     // Extract function signature
@@ -566,7 +568,7 @@ pub fn mir_to_oomir<'tcx>(
 
     let mut debug_variables = Vec::new();
     let mut debug_variable_scopes = Vec::new();
-    let mut seen_debug_variables = HashSet::new();
+    let mut seen_debug_variables = HashSet::default();
     for variable in &mir.var_debug_info {
         let VarDebugInfoContents::Place(debug_place) = &variable.value else {
             continue;
@@ -639,24 +641,20 @@ pub fn mir_to_oomir<'tcx>(
     let debug_scope_cache = DebugScopeCache::new(mir, &debug_variables, &debug_variable_scopes);
 
     // Build a CodeBlock from the MIR basic blocks.
-    let mut basic_blocks = HashMap::new();
+    let mut basic_blocks = HashMap::default();
     // MIR guarantees that the start block is BasicBlock 0.
     let entry_label = "bb0".to_string();
 
-    let mir_cloned = mir.clone();
-    let mut mutable_borrows =
-        control_flow::collect_pointer_origins(&mir_cloned, tcx, instance, data_types);
-    let available_pointer_locals =
-        available_pointer_locals_at_block_entries(&mir_cloned, &mutable_borrows);
+    let mut mutable_borrows = control_flow::collect_pointer_origins(mir, tcx, instance, data_types);
+    let available_pointer_locals = available_pointer_locals_at_block_entries(mir, &mutable_borrows);
 
-    // Need read-only access to mir for local_decls inside the loop
-    for (bb, bb_data) in mir.basic_blocks_mut().iter_enumerated() {
+    for (bb, bb_data) in mir.basic_blocks.iter_enumerated() {
         let bb_ir = convert_basic_block(
             bb,
             bb_data,
             tcx,
             instance,
-            &mir_cloned,
+            mir,
             &return_oomir_ty,
             &mut basic_blocks,
             data_types,
@@ -695,7 +693,7 @@ pub fn mir_to_oomir<'tcx>(
         });
     }
 
-    if matches!(instance_ty.kind(), TyKind::Closure(..)) && mir_cloned.arg_count > 0 {
+    if matches!(instance_ty.kind(), TyKind::Closure(..)) && mir.arg_count > 0 {
         // For closures: local 0 = return place, local 1 = tuple argument
         // MIR expects: local 0 = return, local 1 = first arg, local 2 = second arg, etc.
         // But we receive: local 1 = tuple containing all args
@@ -730,17 +728,17 @@ pub fn mir_to_oomir<'tcx>(
         }
     }
 
-    let mut carrier_locals = class_locals_needing_initial_carriers(&mir_cloned)
+    let mut carrier_locals = class_locals_needing_initial_carriers(mir)
         .into_iter()
         .collect::<Vec<_>>();
     carrier_locals.sort_by_key(|local| local.index());
     for local in carrier_locals {
-        if place::local_uses_stable_cell(local, &mir_cloned) {
+        if place::local_uses_stable_cell(local, mir) {
             continue;
         }
         let oomir::Type::Class(class_name) = place::get_place_type(
             &rustc_middle::mir::Place::from(local),
-            &mir_cloned,
+            mir,
             tcx,
             instance,
             data_types,
@@ -767,40 +765,38 @@ pub fn mir_to_oomir<'tcx>(
         });
     }
 
-    for (local, _) in mir_cloned.local_decls.iter_enumerated() {
-        if !place::local_uses_stable_cell(local, &mir_cloned) {
+    for (local, _) in mir.local_decls.iter_enumerated() {
+        if !place::local_uses_stable_cell(local, mir) {
             continue;
         }
         let value_type = place::get_place_type(
             &rustc_middle::mir::Place::from(local),
-            &mir_cloned,
+            mir,
             tcx,
             instance,
             data_types,
         );
         let implicit_zst = value_repr::materialize_implicit_zst(
-            mir_cloned.local_decls[local].ty,
+            mir.local_decls[local].ty,
             &format!("{}_initial", place::local_cell_name(local)),
             tcx,
             instance,
             data_types,
             &mut instrs,
         );
-        let initial_value = if local.index() > 0
-            && local.index() <= mir_cloned.arg_count
-            && value_type.has_jvm_value()
-        {
-            oomir::Operand::Variable {
-                name: format!("_{}", local.index()),
-                ty: value_type.clone(),
-            }
-        } else if let Some(value) = implicit_zst {
-            value
-        } else {
-            oomir::Operand::Constant(oomir::Constant::Null(oomir::Type::Class(
-                "java/lang/Object".to_string(),
-            )))
-        };
+        let initial_value =
+            if local.index() > 0 && local.index() <= mir.arg_count && value_type.has_jvm_value() {
+                oomir::Operand::Variable {
+                    name: format!("_{}", local.index()),
+                    ty: value_type.clone(),
+                }
+            } else if let Some(value) = implicit_zst {
+                value
+            } else {
+                oomir::Operand::Constant(oomir::Constant::Null(oomir::Type::Class(
+                    "java/lang/Object".to_string(),
+                )))
+            };
         instrs.push(oomir::Instruction::InvokeStatic {
             dest: Some(place::local_cell_name(local)),
             class_name: oomir::POINTER_CLASS.to_string(),
@@ -824,7 +820,7 @@ pub fn mir_to_oomir<'tcx>(
                     i32::try_from(
                         types::layout_size_bytes(
                             tcx,
-                            EarlyBinder::bind(tcx, mir_cloned.local_decls[local].ty)
+                            EarlyBinder::bind(tcx, mir.local_decls[local].ty)
                                 .instantiate(tcx, instance.args)
                                 .skip_norm_wip(),
                         )
@@ -835,7 +831,7 @@ pub fn mir_to_oomir<'tcx>(
                     .expect("stable local layout exceeds the JVM runtime address space"),
                 )),
                 types::pointer_memory_codec_operand(
-                    EarlyBinder::bind(tcx, mir_cloned.local_decls[local].ty)
+                    EarlyBinder::bind(tcx, mir.local_decls[local].ty)
                         .instantiate(tcx, instance.args)
                         .skip_norm_wip(),
                     tcx,
@@ -846,7 +842,7 @@ pub fn mir_to_oomir<'tcx>(
                     i32::try_from(
                         types::layout_align_bytes(
                             tcx,
-                            EarlyBinder::bind(tcx, mir_cloned.local_decls[local].ty)
+                            EarlyBinder::bind(tcx, mir.local_decls[local].ty)
                                 .instantiate(tcx, instance.args)
                                 .skip_norm_wip(),
                         )
@@ -860,10 +856,10 @@ pub fn mir_to_oomir<'tcx>(
         });
     }
 
-    if let Some(location) = source_location(tcx, mir_cloned.span, mir_cloned.span) {
+    if let Some(location) = source_location(tcx, mir.span, mir.span) {
         instrs.insert(0, oomir::Instruction::SourceLocation(location));
     }
-    let no_referenced_debug_locals = HashSet::new();
+    let no_referenced_debug_locals = HashSet::default();
     instrs.insert(
         usize::from(matches!(
             instrs.first(),

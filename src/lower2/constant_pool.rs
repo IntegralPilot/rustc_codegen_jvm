@@ -1,5 +1,6 @@
 use super::jvm::{self, ClassFile, Constant, ConstantPool, ReferenceKind};
-use std::{collections::HashMap, ops::Deref};
+use rustc_hash::FxHashMap as HashMap;
+use std::ops::Deref;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum ConstantKey {
@@ -119,7 +120,7 @@ impl Default for InternedConstantPool {
     fn default() -> Self {
         Self {
             pool: ConstantPool::default(),
-            constants: HashMap::new(),
+            constants: HashMap::default(),
         }
     }
 }
@@ -288,7 +289,7 @@ impl InternedConstantPool {
 }
 
 pub(super) fn verify_no_duplicate_constants(class_file: &ClassFile<'_>) -> jvm::Result<()> {
-    let mut seen = HashMap::<ConstantKey, u16>::new();
+    let mut seen = HashMap::<ConstantKey, u16>::default();
     for index in 1..=class_file.constant_pool.len() {
         let index = index as u16;
         let Ok(constant) = class_file.constant_pool.try_get(index) else {

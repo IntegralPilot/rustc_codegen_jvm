@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 
 use rustc_middle::ty::{Instance, Ty, TyCtxt, TyKind, TypingEnv, VtblEntry};
 
@@ -119,8 +119,8 @@ pub(crate) fn ensure_trait_object_adapter_class_for_pointees<'tcx>(
         return Ok(class_name);
     }
 
-    let mut adapter_methods = HashMap::new();
-    let mut interface_methods = HashMap::new();
+    let mut adapter_methods = HashMap::default();
+    let mut interface_methods = HashMap::default();
     for entry in trait_ref
         .into_iter()
         .flat_map(|trait_ref| tcx.vtable_entries(trait_ref).iter())
@@ -253,7 +253,7 @@ pub(crate) fn ensure_trait_object_adapter_class_for_pointees<'tcx>(
                     },
                     body: oomir::CodeBlock {
                         entry: "bb0".to_string(),
-                        basic_blocks: HashMap::from([(
+                        basic_blocks: HashMap::from_iter([(
                             "bb0".to_string(),
                             oomir::BasicBlock {
                                 label: "bb0".to_string(),
@@ -488,7 +488,7 @@ pub(crate) fn ensure_trait_object_adapter_class_for_pointees<'tcx>(
                 },
                 body: oomir::CodeBlock {
                     entry: "bb0".to_string(),
-                    basic_blocks: HashMap::from([(
+                    basic_blocks: HashMap::from_iter([(
                         "bb0".to_string(),
                         oomir::BasicBlock {
                             label: "bb0".to_string(),
@@ -515,7 +515,7 @@ pub(crate) fn ensure_trait_object_adapter_class_for_pointees<'tcx>(
             },
             body: oomir::CodeBlock {
                 entry: "bb0".to_string(),
-                basic_blocks: HashMap::from([(
+                basic_blocks: HashMap::from_iter([(
                     "bb0".to_string(),
                     oomir::BasicBlock {
                         label: "bb0".to_string(),
@@ -569,7 +569,7 @@ pub(crate) fn ensure_trait_object_adapter_class_for_pointees<'tcx>(
                 },
                 body: oomir::CodeBlock {
                     entry: "bb0".to_string(),
-                    basic_blocks: HashMap::from([(
+                    basic_blocks: HashMap::from_iter([(
                         "bb0".to_string(),
                         oomir::BasicBlock {
                             label: "bb0".to_string(),
@@ -628,7 +628,7 @@ pub(crate) fn ensure_trait_object_adapter_class_for_pointees<'tcx>(
                 },
                 body: oomir::CodeBlock {
                     entry: "bb0".to_string(),
-                    basic_blocks: HashMap::from([(
+                    basic_blocks: HashMap::from_iter([(
                         "bb0".to_string(),
                         oomir::BasicBlock {
                             label: "bb0".to_string(),

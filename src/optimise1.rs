@@ -1,5 +1,6 @@
 use crate::{lower1::operand::extract_number_from_operand, oomir::*};
-use std::collections::{HashMap, HashSet, VecDeque};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::collections::VecDeque;
 
 mod copyprop;
 mod dataflow;
@@ -33,8 +34,8 @@ fn build_cfg(code_block: &CodeBlock) -> HashMap<String, BasicBlockInfo> {
                 label.clone(),
                 BasicBlockInfo {
                     original_block: block.clone(),
-                    predecessors: HashSet::new(),
-                    successors: HashSet::new(),
+                    predecessors: HashSet::default(),
+                    successors: HashSet::default(),
                 },
             )
         })
@@ -44,7 +45,7 @@ fn build_cfg(code_block: &CodeBlock) -> HashMap<String, BasicBlockInfo> {
         return cfg;
     }
 
-    let mut all_successors: HashMap<String, Vec<String>> = HashMap::new();
+    let mut all_successors: HashMap<String, Vec<String>> = HashMap::default();
     let cfg_keys: HashSet<String> = cfg.keys().cloned().collect();
 
     for (label, info) in &cfg {
@@ -99,8 +100,8 @@ fn transform_function(
     analysis_result: &DataflowResult,
     data_types: &HashMap<String, DataType>,
 ) {
-    let mut optimized_blocks_intermediate: HashMap<String, BasicBlock> = HashMap::new();
-    let mut optimized_successors: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut optimized_blocks_intermediate: HashMap<String, BasicBlock> = HashMap::default();
+    let mut optimized_successors: HashMap<String, HashSet<String>> = HashMap::default();
     let debug_locals = function
         .debug_variables
         .iter()
@@ -125,7 +126,7 @@ fn transform_function(
         // Store the potentially optimized block using its original label
         optimized_blocks_intermediate.insert(label.clone(), optimized_block);
 
-        let mut current_successors = HashSet::new();
+        let mut current_successors = HashSet::default();
         // Get the block we just inserted to find its *new* terminator
         if let Some(opt_block) = optimized_blocks_intermediate.get(label) {
             if !opt_block.instructions.is_empty() {
@@ -160,7 +161,7 @@ fn transform_function(
     );
 
     // (Keep the previous fix - don't remove empty reachable blocks)
-    let mut final_basic_blocks = HashMap::new();
+    let mut final_basic_blocks = HashMap::default();
     for label in &reachable_labels {
         // Get the block from the intermediate results using the reachable label
         if let Some(block) = optimized_blocks_intermediate.get(label) {
@@ -244,12 +245,13 @@ pub fn optimise_function(
     mut function: Function,
     data_types: &HashMap<String, DataType>,
 ) -> Function {
-    let instrumented_fn_name = function
-        .owner_class
-        .as_deref()
-        .map(|owner| format!("{owner}::{}", function.name))
-        .unwrap_or_else(|| function.name.clone());
-    let _timer = crate::instrumentation::Timer::function("optimise1", None, &instrumented_fn_name);
+    let _timer = crate::instrumentation::Timer::function_lazy("optimise1", None, || {
+        function
+            .owner_class
+            .as_deref()
+            .map(|owner| format!("{owner}::{}", function.name))
+            .unwrap_or_else(|| function.name.clone())
+    });
 
     if function.body.basic_blocks.is_empty() {
         breadcrumbs::log!(
@@ -321,7 +323,7 @@ pub fn optimise_function(
 
 pub fn optimise_module(module: Module) -> Module {
     let old_funcs = module.functions;
-    let mut new_funcs = HashMap::new();
+    let mut new_funcs = HashMap::default();
     breadcrumbs::log!(
         breadcrumbs::LogLevel::Info,
         "optimisation",

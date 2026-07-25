@@ -35,7 +35,9 @@ struct TimingEvent<'a> {
 
 static RECORDER: OnceLock<Option<Recorder>> = OnceLock::new();
 
-pub(crate) struct Timer {
+pub(crate) struct Timer(Option<ActiveTimer>);
+
+struct ActiveTimer {
     kind: &'static str,
     stage: &'static str,
     crate_name: Option<String>,
@@ -48,8 +50,21 @@ impl Timer {
         Self::new("phase", stage, crate_name, None)
     }
 
-    pub(crate) fn function(stage: &'static str, crate_name: Option<&str>, item: &str) -> Self {
-        Self::new("function", stage, crate_name, Some(item))
+    pub(crate) fn function_lazy(
+        stage: &'static str,
+        crate_name: Option<&str>,
+        item: impl FnOnce() -> String,
+    ) -> Self {
+        if recorder().is_none() {
+            return Self(None);
+        }
+        Self(Some(ActiveTimer {
+            kind: "function",
+            stage,
+            crate_name: crate_name.map(ToOwned::to_owned),
+            item: Some(item()),
+            start: Instant::now(),
+        }))
     }
 
     fn new(
@@ -58,24 +73,30 @@ impl Timer {
         crate_name: Option<&str>,
         item: Option<&str>,
     ) -> Self {
-        Self {
+        if recorder().is_none() {
+            return Self(None);
+        }
+        Self(Some(ActiveTimer {
             kind,
             stage,
             crate_name: crate_name.map(ToOwned::to_owned),
             item: item.map(ToOwned::to_owned),
             start: Instant::now(),
-        }
+        }))
     }
 }
 
 impl Drop for Timer {
     fn drop(&mut self) {
+        let Some(active) = &self.0 else {
+            return;
+        };
         record_duration(
-            self.kind,
-            self.stage,
-            self.crate_name.as_deref(),
-            self.item.as_deref(),
-            self.start.elapsed(),
+            active.kind,
+            active.stage,
+            active.crate_name.as_deref(),
+            active.item.as_deref(),
+            active.start.elapsed(),
         );
     }
 }

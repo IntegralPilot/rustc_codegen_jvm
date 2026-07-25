@@ -1,8 +1,8 @@
 use crate::oomir;
 use rustc_abi::Size;
+use rustc_hash::FxHashMap as HashMap;
 use rustc_middle::ty::{Instance, TyCtxt};
 use rustc_span::def_id::DefId;
-use std::collections::HashMap;
 
 use super::{
     jvm_names, operand::const_eval::read_constant_value_from_memory, types::ty_to_oomir_type,

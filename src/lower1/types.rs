@@ -2,6 +2,9 @@ use super::jvm_names;
 use crate::oomir::{self, DataType, DataTypeMethod};
 
 use rustc_abi::{FieldIdx, TagEncoding, VariantIdx, Variants};
+use rustc_data_structures::stable_hash::{StableHash, StableHasher};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use rustc_hashes::Hash64;
 use rustc_middle::ty::layout::TyAndLayout;
 use rustc_middle::ty::print::{with_no_trimmed_paths, with_resolve_crate_name};
 use rustc_middle::ty::{
@@ -11,7 +14,6 @@ use rustc_middle::ty::{
 use rustc_span::{def_id::DefId, sym};
 use std::{
     cell::RefCell,
-    collections::{HashMap, HashSet},
     sync::{LazyLock, Mutex},
 };
 
@@ -20,12 +22,12 @@ thread_local! {
     /// exactly the same lifetime. `Ty` values are interned for the compilation;
     /// their `TyKind` address is therefore an exact, compact identity key.
     static TYPE_LOWERING_CACHE: RefCell<HashMap<(usize, usize), oomir::Type>> =
-        RefCell::new(HashMap::new());
+        RefCell::new(HashMap::default());
     /// Enum classes are installed as placeholders before their fields are
     /// lowered. Recursive variants must reuse those placeholders instead of
     /// trying to define the same enum again through `&Self` or `&[Self]`.
     static ENUM_TYPES_IN_PROGRESS: RefCell<HashSet<(usize, String)>> =
-        RefCell::new(HashSet::new());
+        RefCell::new(HashSet::default());
 }
 
 pub(crate) fn reset_type_lowering_cache() {
@@ -121,7 +123,7 @@ pub fn ensure_fn_ptr_interface<'tcx>(
             data_types.insert(
                 interface_name.clone(),
                 oomir::DataType::Interface {
-                    methods: HashMap::from([("call".to_string(), method_signature)]),
+                    methods: HashMap::from_iter([("call".to_string(), method_signature)]),
                 },
             );
         }
@@ -487,7 +489,7 @@ fn enum_from_union_discriminant_function<'tcx>(
     base_enum_name: &str,
     tcx: TyCtxt<'tcx>,
 ) -> oomir::Function {
-    let mut basic_blocks = HashMap::new();
+    let mut basic_blocks = HashMap::default();
     let mut targets = Vec::new();
 
     for (variant_idx, discriminant) in adt_def.discriminants(tcx) {
@@ -638,7 +640,7 @@ fn enum_variant_drop_glue_function<'tcx>(
         },
         body: oomir::CodeBlock {
             entry: "entry".to_string(),
-            basic_blocks: HashMap::from([(
+            basic_blocks: HashMap::from_iter([(
                 "entry".to_string(),
                 oomir::BasicBlock {
                     label: "entry".to_string(),
@@ -698,7 +700,7 @@ fn managed_drop_glue_function<'tcx>(
         },
         body: oomir::CodeBlock {
             entry: "entry".to_string(),
-            basic_blocks: HashMap::from([(
+            basic_blocks: HashMap::from_iter([(
                 "entry".to_string(),
                 oomir::BasicBlock {
                     label: "entry".to_string(),
@@ -736,7 +738,7 @@ fn ensure_enum_data_types<'tcx>(
             oomir::DataType::Class {
                 fields: vec![],
                 is_abstract: true,
-                methods: HashMap::new(),
+                methods: HashMap::default(),
                 super_class: None,
                 interfaces: vec![],
             },
@@ -757,7 +759,7 @@ fn ensure_enum_data_types<'tcx>(
                 oomir::DataType::Class {
                     fields: vec![],
                     is_abstract: false,
-                    methods: HashMap::new(),
+                    methods: HashMap::default(),
                     super_class: Some(base_enum_name.to_string()),
                     interfaces: vec![],
                 },
@@ -855,7 +857,7 @@ fn ensure_enum_data_types<'tcx>(
             .enumerate()
             .map(|(field_idx, field_ty)| (format!("field{}", field_idx), field_ty))
             .collect();
-        let mut methods = HashMap::new();
+        let mut methods = HashMap::default();
         methods.insert(
             "getVariantIdx".to_string(),
             DataTypeMethod::SimpleConstantReturn(
@@ -1271,7 +1273,7 @@ fn union_aggregate_layout<'tcx>(
         Some(oomir::DataType::Class { fields, .. }) => {
             fields.iter().cloned().collect::<HashMap<_, _>>()
         }
-        _ => HashMap::new(),
+        _ => HashMap::default(),
     };
     let mut fields = Vec::new();
     for (rust_ty, jvm_name, offset) in raw_fields {
@@ -1892,7 +1894,7 @@ fn enum_union_reader<'tcx>(
     instance_context: rustc_middle::ty::Instance<'tcx>,
 ) -> Result<oomir::Function, String> {
     let storage = JvmUnionStorage::at_offset("_1", "_2", operand_var("_3", oomir::Type::I32));
-    let mut basic_blocks = HashMap::new();
+    let mut basic_blocks = HashMap::default();
 
     for variant_index in 0..adt_def.variants().len() {
         let variant_idx = VariantIdx::from_usize(variant_index);
@@ -3716,7 +3718,7 @@ pub(super) fn ensure_exact_transmute_helper<'tcx>(
     // Optimized downstream MIR can materialize a dependency-private ADT by
     // transmuting its scalar representation instead of constructing it. Emit
     // only the named dependency types reached by this generated helper.
-    let mut visited = HashSet::new();
+    let mut visited = HashSet::default();
     force_define_transmute_adts(source_ty, tcx, data_types, instance_context, &mut visited);
     force_define_transmute_adts(target_ty, tcx, data_types, instance_context, &mut visited);
 
@@ -4038,7 +4040,10 @@ pub(super) fn ensure_exact_transmute_helper<'tcx>(
                 oomir::DataType::Class {
                     fields: Vec::new(),
                     is_abstract: false,
-                    methods: HashMap::from([(method_name, DataTypeMethod::Function(function))]),
+                    methods: HashMap::from_iter([(
+                        method_name,
+                        DataTypeMethod::Function(function),
+                    )]),
                     super_class: Some("java/lang/Object".to_string()),
                     interfaces: Vec::new(),
                 },
@@ -4155,7 +4160,7 @@ fn coroutine_memory_layout<'tcx>(
     }
 
     let mut saved = Vec::new();
-    let mut saved_indices = HashMap::new();
+    let mut saved_indices = HashMap::default();
     for (saved_local, saved_ty) in coroutine.field_tys.iter_enumerated() {
         let rust_ty = resolve_union_ty(
             tcx,
@@ -4234,7 +4239,7 @@ fn coroutine_codec_function(
         targets,
         otherwise: "invalid_state".to_string(),
     });
-    let mut basic_blocks = HashMap::from([
+    let mut basic_blocks = HashMap::from_iter([
         (
             "entry".to_string(),
             oomir::BasicBlock {
@@ -4509,7 +4514,7 @@ fn coroutine_pointer_codec_methods<'tcx>(
         bind_entry,
         bind_variants,
     );
-    Ok(HashMap::from([
+    Ok(HashMap::from_iter([
         ("encode".to_string(), DataTypeMethod::Function(encode)),
         ("decode".to_string(), DataTypeMethod::Function(decode)),
         ("bind".to_string(), DataTypeMethod::Function(bind)),
@@ -4590,7 +4595,7 @@ pub(super) fn ensure_pointer_memory_codec<'tcx>(
         oomir::DataType::Class {
             fields: Vec::new(),
             is_abstract: false,
-            methods: HashMap::new(),
+            methods: HashMap::default(),
             super_class: Some("java/lang/Object".to_string()),
             interfaces: Vec::new(),
         },
@@ -4742,7 +4747,7 @@ pub(super) fn ensure_pointer_memory_codec<'tcx>(
         body: simple_body(bind_instructions),
     };
 
-    let methods = HashMap::from([
+    let methods = HashMap::from_iter([
         ("encode".to_string(), DataTypeMethod::Function(encode)),
         ("decode".to_string(), DataTypeMethod::Function(decode)),
         ("bind".to_string(), DataTypeMethod::Function(bind)),
@@ -4968,7 +4973,7 @@ fn pointer_builtin_codec_operand<'tcx>(
 fn unsupported_union_body(message: String) -> oomir::CodeBlock {
     oomir::CodeBlock {
         entry: "bb0".to_string(),
-        basic_blocks: HashMap::from([(
+        basic_blocks: HashMap::from_iter([(
             "bb0".to_string(),
             oomir::BasicBlock {
                 label: "bb0".to_string(),
@@ -4984,7 +4989,7 @@ fn unsupported_union_body(message: String) -> oomir::CodeBlock {
 fn simple_body(instructions: Vec<oomir::Instruction>) -> oomir::CodeBlock {
     oomir::CodeBlock {
         entry: "bb0".to_string(),
-        basic_blocks: HashMap::from([(
+        basic_blocks: HashMap::from_iter([(
             "bb0".to_string(),
             oomir::BasicBlock {
                 label: "bb0".to_string(),
@@ -5268,7 +5273,7 @@ pub fn ensure_union_data_type<'tcx>(
                 (UNION_OBJECTS_FIELD.to_string(), object_array_type()),
             ],
             is_abstract: false,
-            methods: HashMap::new(),
+            methods: HashMap::default(),
             super_class: Some("java/lang/Object".to_string()),
             interfaces: vec![],
         },
@@ -5284,7 +5289,7 @@ pub fn ensure_union_data_type<'tcx>(
     let union_size = layout_size_bytes(tcx, union_ty).unwrap_or(1);
 
     let variant = adt_def.variant(0usize.into());
-    let mut methods = HashMap::new();
+    let mut methods = HashMap::default();
     for field_def in variant.fields.iter() {
         let field_name = field_def.ident(tcx).to_string();
         let raw_field_ty = field_def.ty(tcx, substs).skip_norm_wip();
@@ -5455,7 +5460,7 @@ fn ensure_adt_data_type<'tcx>(
                 oomir::DataType::Class {
                     fields: vec![],
                     is_abstract: false,
-                    methods: HashMap::new(),
+                    methods: HashMap::default(),
                     super_class: None,
                     interfaces: vec![],
                 },
@@ -5484,7 +5489,7 @@ fn ensure_adt_data_type<'tcx>(
                         .then_some((field_name, field_oomir_type))
                 })
                 .collect::<Vec<_>>();
-            let methods = HashMap::from([(
+            let methods = HashMap::from_iter([(
                 "eq".to_string(),
                 DataTypeMethod::AdtHelperMethod {
                     kind: oomir::AdtHelperKind::PartialEqClass {
@@ -5768,7 +5773,7 @@ fn ty_to_oomir_type_resolved<'tcx>(
                     })
                     .collect::<Vec<_>>();
 
-                let mut methods = HashMap::new();
+                let mut methods = HashMap::default();
                 methods.insert(
                     "eq".to_string(),
                     DataTypeMethod::AdtHelperMethod {
@@ -5982,7 +5987,7 @@ fn ty_to_oomir_type_resolved<'tcx>(
                         if should_define_named_data_type(tcx, trait_ref.def_id) {
                             data_types.entry(safe_name.clone()).or_insert_with(|| {
                                 oomir::DataType::Interface {
-                                    methods: HashMap::new(),
+                                    methods: HashMap::default(),
                                 }
                             });
                         }
@@ -5994,7 +5999,7 @@ fn ty_to_oomir_type_resolved<'tcx>(
                         if should_define_named_data_type(tcx, def_id) {
                             data_types.entry(safe_name.clone()).or_insert_with(|| {
                                 oomir::DataType::Interface {
-                                    methods: HashMap::new(),
+                                    methods: HashMap::default(),
                                 }
                             });
                         }
@@ -6039,7 +6044,7 @@ fn ty_to_oomir_type_resolved<'tcx>(
                     oomir::DataType::Class {
                         fields,
                         is_abstract: false,
-                        methods: HashMap::new(), // 'call' is handled via MIR lowering logic
+                        methods: HashMap::default(), // 'call' is handled via MIR lowering logic
                         super_class: Some("java/lang/Object".to_string()),
                         interfaces: vec![],
                     },
@@ -6062,7 +6067,7 @@ fn ty_to_oomir_type_resolved<'tcx>(
                 oomir::DataType::Class {
                     fields: vec![("__state".to_string(), oomir::Type::I32)],
                     is_abstract: false,
-                    methods: HashMap::new(),
+                    methods: HashMap::default(),
                     super_class: Some("java/lang/Object".to_string()),
                     interfaces: vec![],
                 },
@@ -6123,7 +6128,7 @@ fn ty_to_oomir_type_resolved<'tcx>(
                     oomir::DataType::Class {
                         fields: vec![], // No state
                         is_abstract: false,
-                        methods: HashMap::new(),
+                        methods: HashMap::default(),
                         super_class: Some("java/lang/Object".to_string()),
                         interfaces: vec![],
                     },
@@ -6158,6 +6163,37 @@ pub fn stable_def_path(tcx: TyCtxt<'_>, def_id: DefId) -> String {
     path.strip_prefix(&format!("{crate_name}::"))
         .unwrap_or(&path)
         .to_string()
+}
+
+/// Returns an identifier for a definition that is stable across crate aliases.
+///
+/// Pretty-printed paths are unsuitable for ABI names because the same `core`
+/// definition can be rendered through aliases such as `std` or
+/// `rustc_std_workspace_core` in different rustc invocations.
+pub fn stable_def_identity(tcx: TyCtxt<'_>, def_id: DefId) -> String {
+    let raw_hash = tcx.def_path_hash(def_id).to_raw_def_path_hash();
+    crate::stable_hash::short_hash_bytes(&raw_hash.0, 16)
+}
+
+/// Returns a crate-alias-independent identity for a concrete instance.
+pub fn stable_instance_identity<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: DefId,
+    args: GenericArgsRef<'tcx>,
+) -> String {
+    let args = tcx
+        .try_normalize_erasing_regions(
+            TypingEnv::fully_monomorphized(),
+            rustc_middle::ty::Unnormalized::new_wip(args),
+        )
+        .unwrap_or(args);
+    let hash = tcx.with_stable_hashing_context(|mut hcx| {
+        let mut hasher = StableHasher::new();
+        def_id.stable_hash(&mut hcx, &mut hasher);
+        args.stable_hash(&mut hcx, &mut hasher);
+        hasher.finish::<Hash64>()
+    });
+    format!("{hash:016x}")
 }
 
 fn readable_qualified_def_path(tcx: TyCtxt<'_>, def_id: DefId) -> String {
@@ -6211,7 +6247,7 @@ const MAX_TUPLE_NAME_LEN: usize = 180;
 // Shards need one crate-wide view of readable names to avoid assigning the
 // same JVM class name to ABI-incompatible tuples in different units.
 static TUPLE_ABIS_BY_READABLE_NAME: LazyLock<Mutex<HashMap<String, Vec<oomir::Type>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+    LazyLock::new(|| Mutex::new(HashMap::default()));
 
 // Produce a compact, human readable token for an OOMIR type to use in tuple class names.
 pub fn readable_oomir_type_name(t: &oomir::Type) -> String {
@@ -6723,7 +6759,7 @@ pub fn mir_int_to_oomir_const<'tcx>(
                 // MIR carries integer bits in a u128; preserve the signed
                 // two's-complement interpretation for i128 constants.
                 params: vec![oomir::Constant::String((value as i128).to_string())],
-                fields: HashMap::new(),
+                fields: HashMap::default(),
                 param_types: Vec::new(),
             }, // Handle large integers
         },
@@ -6735,7 +6771,7 @@ pub fn mir_int_to_oomir_const<'tcx>(
             UintTy::U128 => oomir::Constant::Instance {
                 class_name: crate::lower2::U128_CLASS.to_string(),
                 params: vec![oomir::Constant::String(value.to_string())],
-                fields: HashMap::new(),
+                fields: HashMap::default(),
                 param_types: Vec::new(),
             },
         },

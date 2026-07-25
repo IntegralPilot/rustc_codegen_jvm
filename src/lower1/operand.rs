@@ -2,6 +2,7 @@ use super::place::{get_place_type, place_to_string};
 use crate::oomir;
 
 use super::place::emit_instructions_to_get_on_own;
+use rustc_hash::FxHashMap as HashMap;
 use rustc_middle::{
     mir::{
         Body, Const, ConstOperand, ConstValue, Operand as MirOperand, Place,
@@ -9,7 +10,6 @@ use rustc_middle::{
     },
     ty::{ConstKind, EarlyBinder, Instance, Ty, TyCtxt, TyKind, TypingEnv},
 };
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static COPY_OPERAND_COUNTER: AtomicUsize = AtomicUsize::new(0);

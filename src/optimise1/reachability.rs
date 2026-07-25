@@ -45,7 +45,7 @@ pub fn find_reachable_blocks(
     // Needed to know which block labels *exist* in the optimized set
     all_block_labels: &HashSet<String>,
 ) -> HashSet<String> {
-    let mut reachable: HashSet<String> = HashSet::new();
+    let mut reachable: HashSet<String> = HashSet::default();
     let mut worklist: VecDeque<String> = VecDeque::new();
 
     if all_block_labels.contains(entry_label) {

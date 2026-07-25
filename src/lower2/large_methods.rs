@@ -1,5 +1,6 @@
 use crate::oomir::{self, BasicBlock, CodeBlock, Constant, Function, Operand, Type};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::collections::BTreeSet;
 
 use super::jvm;
 
@@ -104,7 +105,7 @@ fn outline_function(function: Function, owner: &str) -> jvm::Result<Vec<Function
 
     let variable_types = collect_variable_types(&function)?;
     let live_in = live_variables(&function.body, &successors, &variable_types);
-    let mut block_to_chunk = HashMap::new();
+    let mut block_to_chunk = HashMap::default();
     let mut chunk_blocks = Vec::new();
     for (chunk_index, component_indices) in component_chunks.iter().enumerate() {
         let mut blocks = BTreeSet::new();
@@ -169,7 +170,7 @@ fn outline_function(function: Function, owner: &str) -> jvm::Result<Vec<Function
                     )
                 }));
             } else {
-                let mut parameters = HashSet::new();
+                let mut parameters = HashSet::default();
                 for entry in &chunk_entries {
                     parameters.extend(live_in[entry].iter().cloned());
                 }
@@ -228,7 +229,7 @@ fn outline_function(function: Function, owner: &str) -> jvm::Result<Vec<Function
             }
         }
 
-        let mut trampolines = HashMap::new();
+        let mut trampolines = HashMap::default();
         for target in external_targets {
             let target_chunk = block_to_chunk[&target];
             let trampoline = format!(
@@ -383,7 +384,7 @@ fn carrier_category(ty: &Type) -> (usize, Type) {
 }
 
 fn build_carrier_plan(entries: &[BTreeSet<String>], live_in: &LiveVariables) -> CarrierPlan {
-    let mut categories = vec![HashSet::new(); 12];
+    let mut categories = vec![HashSet::default(); 12];
     for entry in entries.iter().skip(1).flatten() {
         for variable in &live_in[entry] {
             categories[carrier_category(&variable.ty).0].insert(variable.clone());
@@ -601,11 +602,11 @@ fn live_variables(
     successors: &HashMap<String, Vec<String>>,
     variable_types: &VariableTypes,
 ) -> LiveVariables {
-    let mut uses = HashMap::new();
-    let mut definitions = HashMap::new();
+    let mut uses = HashMap::default();
+    let mut definitions = HashMap::default();
     for (label, block) in &body.basic_blocks {
-        let mut block_uses = HashSet::new();
-        let mut block_definitions = HashSet::new();
+        let mut block_uses = HashSet::default();
+        let mut block_definitions = HashSet::default();
         for instruction in &block.instructions {
             for variable in instruction_uses(instruction, variable_types) {
                 if !block_definitions.contains(&variable) {
@@ -621,7 +622,7 @@ fn live_variables(
     let mut live_in = body
         .basic_blocks
         .keys()
-        .map(|label| (label.clone(), HashSet::new()))
+        .map(|label| (label.clone(), HashSet::default()))
         .collect::<HashMap<_, _>>();
     loop {
         let mut changed = false;
@@ -629,7 +630,7 @@ fn live_variables(
         labels.sort();
         labels.reverse();
         for label in labels {
-            let mut live_out = HashSet::new();
+            let mut live_out = HashSet::default();
             for successor in &successors[&label] {
                 live_out.extend(live_in[successor].iter().cloned());
             }
@@ -649,7 +650,7 @@ fn live_variables(
 }
 
 fn collect_variable_types(function: &Function) -> jvm::Result<VariableTypes> {
-    let mut types = HashMap::new();
+    let mut types = HashMap::default();
     for (index, (name, ty)) in function.signature.params.iter().enumerate() {
         let oomir_name = if name == oomir::CALLER_LOCATION_PARAM_NAME {
             name.clone()
@@ -914,7 +915,7 @@ fn topological_components(
     }
 
     let mut order = Vec::new();
-    let mut visited = HashSet::new();
+    let mut visited = HashSet::default();
     visit(&body.entry, successors, &mut visited, &mut order);
     if visited.len() != body.basic_blocks.len() {
         return Err(verification_error(
@@ -935,7 +936,7 @@ fn topological_components(
                 .push(source.clone());
         }
     }
-    let mut assigned = HashSet::new();
+    let mut assigned = HashSet::default();
     let mut components = Vec::new();
     while let Some(node) = order.pop() {
         if assigned.contains(&node) {
@@ -986,7 +987,7 @@ fn topological_components(
         order.push(component);
     }
     let mut component_order = Vec::new();
-    let mut visited_components = HashSet::new();
+    let mut visited_components = HashSet::default();
     topo_visit(
         component_for[&body.entry],
         &dag,

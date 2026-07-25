@@ -1,4 +1,5 @@
 use rustc_abi::{BackendRepr, FieldIdx, FieldsShape, Size, TagEncoding, VariantIdx, Variants};
+use rustc_hash::FxHashMap as HashMap;
 use rustc_middle::mir::interpret::{
     AllocId, AllocRange, Allocation, CtfeProvenance, GlobalAlloc, Pointer, Provenance, Scalar,
 };
@@ -8,7 +9,6 @@ use rustc_middle::ty::{
     PseudoCanonicalInput, ScalarInt, ShimKind, Ty, TyCtxt, TyKind, TypingEnv, UintTy, Unnormalized,
 };
 use rustc_span::def_id::LOCAL_CRATE;
-use std::collections::HashMap;
 
 use super::super::{
     control_flow::rvalue::{
@@ -366,7 +366,7 @@ fn read_slice_backed_value<'tcx>(
                     ));
                 }
             };
-            let mut fields = HashMap::new();
+            let mut fields = HashMap::default();
             fields.insert(field.ident(tcx).to_string(), inner.clone());
             Ok(oomir::Constant::Instance {
                 class_name,
@@ -425,7 +425,7 @@ pub fn read_scalar_int_constant<'tcx>(
                 ));
             }
         };
-        let mut fields = HashMap::new();
+        let mut fields = HashMap::default();
         let mut params = Vec::new();
         let mut param_types = Vec::new();
         let mut non_zst_captures = 0usize;
@@ -682,7 +682,7 @@ pub fn read_zero_sized_constant<'tcx>(
             );
             Ok(oomir::Constant::Instance {
                 class_name,
-                fields: HashMap::from([
+                fields: HashMap::from_iter([
                     (UNION_BYTES_FIELD.to_string(), bytes.clone()),
                     (UNION_OBJECTS_FIELD.to_string(), objects.clone()),
                 ]),
@@ -989,7 +989,7 @@ fn pointer_constant_for_pointee<'tcx>(
     };
     Ok(oomir::Constant::Instance {
         class_name: oomir::POINTER_CLASS.to_string(),
-        fields: HashMap::new(),
+        fields: HashMap::default(),
         params: vec![
             if oomir::Type::from_constant(&value).has_jvm_value() {
                 value
@@ -1344,7 +1344,7 @@ fn read_trait_object_reference_from_memory<'tcx>(
     )?;
     Ok(oomir::Constant::Instance {
         class_name: adapter_class,
-        fields: HashMap::new(),
+        fields: HashMap::default(),
         params: vec![concrete_pointer],
         param_types: vec![carrier_ty],
     })
@@ -2088,7 +2088,7 @@ pub fn read_constant_value_from_memory<'tcx>(
                 );
                 Ok(oomir::Constant::Instance {
                     class_name,
-                    fields: HashMap::from([
+                    fields: HashMap::from_iter([
                         (UNION_BYTES_FIELD.to_string(), bytes.clone()),
                         (UNION_OBJECTS_FIELD.to_string(), objects.clone()),
                     ]),
@@ -2104,7 +2104,7 @@ pub fn read_constant_value_from_memory<'tcx>(
             if field_tys.is_empty() {
                 return Ok(oomir::Constant::Unit);
             }
-            let mut fields_map = HashMap::new();
+            let mut fields_map = HashMap::default();
             let mut params = Vec::new();
             let mut param_types = Vec::new();
             match layout.fields {
@@ -2151,7 +2151,7 @@ pub fn read_constant_value_from_memory<'tcx>(
                 }
             };
             let capture_tys = closure_args.as_closure().upvar_tys();
-            let mut fields = HashMap::new();
+            let mut fields = HashMap::default();
             let mut params = Vec::new();
             let mut param_types = Vec::new();
             for (index, capture_ty) in capture_tys.iter().enumerate() {
@@ -2214,7 +2214,7 @@ fn handle_constant_struct<'tcx>(
     instance: Instance<'tcx>,
 ) -> Result<oomir::Constant, String> {
     let variant = adt_def.variant(VariantIdx::from_usize(0)); // Structs have one variant
-    let mut fields_map = HashMap::new();
+    let mut fields_map = HashMap::default();
     let mut params = Vec::new();
     let mut param_types = Vec::new();
 
@@ -2515,7 +2515,7 @@ fn handle_constant_enum<'tcx>(
 
     let variant_def = adt_def.variant(active_variant_idx);
 
-    let mut fields_map = HashMap::new();
+    let mut fields_map = HashMap::default();
     let mut params = Vec::new();
     let mut param_types = Vec::new();
     for (i, field_def) in variant_def.fields.iter().enumerate() {
@@ -2581,7 +2581,7 @@ fn handle_constant_enum<'tcx>(
 
     // the enum in general
     if should_define_data_type && !oomir_data_types.contains_key(&base_enum_name) {
-        let mut methods = HashMap::new();
+        let mut methods = HashMap::default();
         methods.insert(
             "getVariantIdx".to_string(),
             DataTypeMethod::SimpleConstantReturn(oomir::Type::I32, None),
@@ -2614,7 +2614,7 @@ fn handle_constant_enum<'tcx>(
             }
         }
 
-        let mut methods = HashMap::new();
+        let mut methods = HashMap::default();
         methods.insert(
             "getVariantIdx".to_string(),
             DataTypeMethod::SimpleConstantReturn(
@@ -2668,7 +2668,7 @@ pub fn scalar_int_to_oomir_constant<'tcx>(
                 let param = oomir::Constant::String(signed.to_string());
                 oomir::Constant::Instance {
                     class_name: crate::lower2::I128_CLASS.into(),
-                    fields: HashMap::new(),
+                    fields: HashMap::default(),
                     params: vec![param],
                     param_types: Vec::new(),
                 }
@@ -2683,7 +2683,7 @@ pub fn scalar_int_to_oomir_constant<'tcx>(
                 let param = oomir::Constant::String(bits.to_string());
                 oomir::Constant::Instance {
                     class_name: crate::lower2::U128_CLASS.into(),
-                    fields: HashMap::new(),
+                    fields: HashMap::default(),
                     params: vec![param],
                     param_types: Vec::new(),
                 }
@@ -2699,7 +2699,7 @@ pub fn scalar_int_to_oomir_constant<'tcx>(
                 let bits = scalar_int.to_u128();
                 oomir::Constant::Instance {
                     class_name: crate::lower2::F128_CLASS.into(),
-                    fields: HashMap::new(),
+                    fields: HashMap::default(),
                     params: vec![
                         oomir::Constant::I64((bits >> 64) as i64),
                         oomir::Constant::I64(bits as i64),

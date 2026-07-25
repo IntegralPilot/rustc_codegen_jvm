@@ -21,7 +21,7 @@ pub fn convert_labels_to_basic_blocks_in_function(function: &mut Function) {
 
     while needs_another_pass {
         needs_another_pass = false;
-        let mut new_blocks_this_pass: HashMap<String, BasicBlock> = HashMap::new();
+        let mut new_blocks_this_pass: HashMap<String, BasicBlock> = HashMap::default();
         // Collect keys first to iterate over, allowing mutation of the map's values
         let block_names: HashSet<String> = function.body.basic_blocks.keys().cloned().collect();
 
@@ -142,7 +142,7 @@ pub fn eliminate_duplicate_basic_blocks(func: &mut Function) {
     // 1. Group blocks by their instruction sequences.
     //    Key: The vector of instructions (cloned).
     //    Value: A vector of labels of blocks having this exact instruction sequence.
-    let mut instruction_groups: HashMap<Vec<Instruction>, Vec<String>> = HashMap::new();
+    let mut instruction_groups: HashMap<Vec<Instruction>, Vec<String>> = HashMap::default();
     for (label, block) in &func.body.basic_blocks {
         // Clone instructions to use as a key. Consider hashing if performance is critical
         // and instruction vectors are very large, but direct comparison is safer.
@@ -155,8 +155,8 @@ pub fn eliminate_duplicate_basic_blocks(func: &mut Function) {
     // 2. Identify duplicates and choose canonical blocks.
     //    Build a redirection map: duplicate_label -> canonical_label
     //    Keep track of labels to preserve (non-duplicates or canonical ones).
-    let mut redirects: HashMap<String, String> = HashMap::new();
-    let mut preserved_labels: HashSet<String> = HashSet::new();
+    let mut redirects: HashMap<String, String> = HashMap::default();
+    let mut preserved_labels: HashSet<String> = HashSet::default();
 
     for labels in instruction_groups.values() {
         if labels.len() > 1 {

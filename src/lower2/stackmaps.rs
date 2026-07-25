@@ -6,7 +6,8 @@ use super::jvm::{
     },
 };
 use crate::oomir::{self, Type};
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use rustc_hash::FxHashMap as HashMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -287,7 +288,7 @@ pub(super) fn build_stack_map_attributes_from_analysis(
     let name_index = constant_pool.add_utf8("StackMapTable")?;
     let mut previous_instruction_offset: Option<u16> = None;
     let mut frames = Vec::new();
-    let mut verification_class_cache = HashMap::new();
+    let mut verification_class_cache = HashMap::default();
     let mut previous_locals =
         locals_for_stack_map(initial_locals, constant_pool, &mut verification_class_cache)?;
     for target in target_offsets {
@@ -604,7 +605,7 @@ fn locals_loaded_before_definite_store(
             continue;
         };
         let mut loads = BTreeMap::new();
-        let mut last_handler_assignments = HashMap::<usize, Vec<u64>>::new();
+        let mut last_handler_assignments = HashMap::<usize, Vec<u64>>::default();
         for index in block_starts[block]..block_ends[block] {
             for &target in &handlers_by_instruction[index] {
                 if last_handler_assignments.get(&target) == Some(&assigned) {
@@ -908,7 +909,7 @@ fn solve_frame_states(
             continue;
         };
 
-        let mut last_handler_locals = HashMap::<usize, Arc<Vec<FrameValue>>>::new();
+        let mut last_handler_locals = HashMap::<usize, Arc<Vec<FrameValue>>>::default();
         for index in block_starts[block]..block_ends[block] {
             for &target in &handlers_by_instruction[index] {
                 let unchanged = last_handler_locals

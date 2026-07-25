@@ -89,7 +89,7 @@ pub fn closure_class_for_args<'tcx>(
     instance_context: Instance<'tcx>,
 ) -> String {
     let base = disambiguated_def_path_token(tcx, def_id);
-    let mut data_types = std::collections::HashMap::new();
+    let mut data_types = rustc_hash::FxHashMap::default();
     let generic_tokens = args
         .as_closure()
         .parent_args()
@@ -122,7 +122,7 @@ pub fn coroutine_class_for_args<'tcx>(
     instance_context: Instance<'tcx>,
 ) -> String {
     let base = disambiguated_def_path_token(tcx, def_id);
-    let mut data_types = std::collections::HashMap::new();
+    let mut data_types = rustc_hash::FxHashMap::default();
     let generic_tokens = args
         .as_coroutine()
         .parent_args()

@@ -9,35 +9,6 @@ struct AliasValue {
 
 type AliasMap = HashMap<usize, AliasValue>;
 
-struct AliasScratch {
-    invalidated: Vec<bool>,
-    touched: Vec<usize>,
-}
-
-impl AliasScratch {
-    fn new(local_count: usize) -> Self {
-        Self {
-            invalidated: vec![false; local_count],
-            touched: Vec::new(),
-        }
-    }
-
-    fn mark_invalid(&mut self, local: usize) -> bool {
-        if self.invalidated[local] {
-            return false;
-        }
-        self.invalidated[local] = true;
-        self.touched.push(local);
-        true
-    }
-
-    fn clear(&mut self) {
-        for local in self.touched.drain(..) {
-            self.invalidated[local] = false;
-        }
-    }
-}
-
 #[derive(Debug)]
 struct LocalInterner {
     names: Vec<String>,
@@ -46,7 +17,7 @@ struct LocalInterner {
 
 impl LocalInterner {
     fn for_function(function: &Function) -> Self {
-        let mut names = HashSet::new();
+        let mut names = HashSet::default();
         for variable in &function.debug_variables {
             names.insert(variable.oomir_name.as_str());
         }
@@ -100,22 +71,14 @@ fn propagate_copies(
     debug_locals: &HashSet<usize>,
 ) {
     let (labels, block_entry_aliases) = analyze_copy_aliases(function, locals, debug_locals);
-    let mut scratch = AliasScratch::new(locals.len());
-    for (block_index, label) in labels.into_iter().enumerate() {
+    for (label, mut aliases) in labels.into_iter().zip(block_entry_aliases) {
         let Some(block) = function.body.basic_blocks.get_mut(&label) else {
             continue;
         };
-        let mut aliases = block_entry_aliases[block_index].clone();
 
         for instruction in &mut block.instructions {
             rewrite_instruction_uses(instruction, &aliases, locals);
-            transfer_aliases_through_instruction(
-                instruction,
-                &mut aliases,
-                locals,
-                debug_locals,
-                &mut scratch,
-            );
+            transfer_aliases_through_instruction(instruction, &mut aliases, locals, debug_locals);
         }
     }
 }
@@ -148,32 +111,31 @@ fn analyze_copy_aliases(
         }
     }
 
-    let mut entry_aliases = vec![AliasMap::new(); labels.len()];
+    let mut entry_aliases = vec![AliasMap::default(); labels.len()];
     let mut exit_aliases = entry_aliases.clone();
     let mut queue = (0..labels.len()).collect::<VecDeque<_>>();
     let mut queued = vec![true; labels.len()];
-    let mut scratch = AliasScratch::new(locals.len());
+    let mut next_exit = AliasMap::default();
     while let Some(index) = queue.pop_front() {
         queued[index] = false;
-        let next_entry = if Some(index) == entry {
-            AliasMap::new()
+        if Some(index) == entry {
+            entry_aliases[index].clear();
         } else {
-            meet_predecessor_aliases(&predecessors[index], &exit_aliases)
-        };
-        let next_exit = if let Some(block) = function.body.basic_blocks.get(&labels[index]) {
-            transfer_aliases_through_block(
-                block,
-                next_entry.clone(),
-                locals,
-                debug_locals,
-                &mut scratch,
-            )
+            meet_predecessor_aliases(
+                &predecessors[index],
+                &exit_aliases,
+                &mut entry_aliases[index],
+            );
+        }
+
+        next_exit.clone_from(&entry_aliases[index]);
+        if let Some(block) = function.body.basic_blocks.get(&labels[index]) {
+            transfer_aliases_through_block(block, &mut next_exit, locals, debug_locals);
         } else {
-            AliasMap::new()
-        };
-        entry_aliases[index] = next_entry;
+            next_exit.clear();
+        }
         if exit_aliases[index] != next_exit {
-            exit_aliases[index] = next_exit;
+            std::mem::swap(&mut exit_aliases[index], &mut next_exit);
             for successor in successors[index].iter().copied() {
                 if !queued[successor] {
                     queue.push_back(successor);
@@ -181,20 +143,26 @@ fn analyze_copy_aliases(
                 }
             }
         }
+        next_exit.clear();
     }
 
     (labels, entry_aliases)
 }
 
-fn meet_predecessor_aliases(predecessors: &[usize], exit_aliases: &[AliasMap]) -> AliasMap {
+fn meet_predecessor_aliases(
+    predecessors: &[usize],
+    exit_aliases: &[AliasMap],
+    aliases: &mut AliasMap,
+) {
     let Some(first_predecessor) = predecessors
         .iter()
         .min_by_key(|predecessor| exit_aliases[**predecessor].len())
     else {
-        return AliasMap::new();
+        aliases.clear();
+        return;
     };
 
-    let mut aliases = exit_aliases[*first_predecessor].clone();
+    aliases.clone_from(&exit_aliases[*first_predecessor]);
     for predecessor in predecessors {
         if predecessor == first_predecessor {
             continue;
@@ -202,26 +170,17 @@ fn meet_predecessor_aliases(predecessors: &[usize], exit_aliases: &[AliasMap]) -
         let predecessor_aliases = &exit_aliases[*predecessor];
         aliases.retain(|dest, alias| predecessor_aliases.get(dest) == Some(alias));
     }
-    aliases
 }
 
 fn transfer_aliases_through_block(
     block: &BasicBlock,
-    mut aliases: AliasMap,
+    aliases: &mut AliasMap,
     locals: &LocalInterner,
     debug_locals: &HashSet<usize>,
-    scratch: &mut AliasScratch,
-) -> AliasMap {
+) {
     for instruction in &block.instructions {
-        transfer_aliases_through_instruction(
-            instruction,
-            &mut aliases,
-            locals,
-            debug_locals,
-            scratch,
-        );
+        transfer_aliases_through_instruction(instruction, aliases, locals, debug_locals);
     }
-    aliases
 }
 
 fn transfer_aliases_through_instruction(
@@ -229,34 +188,39 @@ fn transfer_aliases_through_instruction(
     aliases: &mut AliasMap,
     locals: &LocalInterner,
     debug_locals: &HashSet<usize>,
-    scratch: &mut AliasScratch,
 ) {
     let rewritten_move_src = if let Instruction::Move { src, .. } = instruction {
-        let mut src = src.clone();
-        rewrite_operand(&mut src, aliases, locals);
-        Some(src)
+        move_alias(src, aliases, locals)
     } else {
         None
     };
 
     if let Some(def) = instruction_def(instruction).and_then(|name| locals.id(name)) {
-        kill_aliases_touching(def, aliases, scratch);
+        kill_aliases_touching(def, aliases);
     }
 
-    if let (Instruction::Move { dest, .. }, Some(Operand::Variable { name, ty })) =
-        (instruction, rewritten_move_src)
-        && let (Some(dest), Some(source)) = (locals.id(dest), locals.id(&name))
-        && dest != source
+    if let (Instruction::Move { dest, .. }, Some(alias)) = (instruction, rewritten_move_src)
+        && let Some(dest) = locals.id(dest)
+        && dest != alias.source
         && !debug_locals.contains(&dest)
     {
-        aliases.insert(
-            dest,
-            AliasValue {
-                source,
-                ty: Arc::new(ty),
-            },
-        );
+        aliases.insert(dest, alias);
     }
+}
+
+fn move_alias(operand: &Operand, aliases: &AliasMap, locals: &LocalInterner) -> Option<AliasValue> {
+    let Operand::Variable { name, ty } = operand else {
+        return None;
+    };
+    if let Some(alias) = resolve_alias(name, aliases, locals)
+        && alias.ty.as_ref() == ty
+    {
+        return Some(alias.clone());
+    }
+    Some(AliasValue {
+        source: locals.id(name)?,
+        ty: Arc::new(ty.clone()),
+    })
 }
 
 fn eliminate_dead_moves(
@@ -514,10 +478,7 @@ fn rewrite_operand(operand: &mut Operand, aliases: &AliasMap, locals: &LocalInte
     if let Some(alias) = resolve_alias(name, aliases, locals)
         && alias.ty.as_ref() == expected_ty
     {
-        *operand = Operand::Variable {
-            name: locals.name(alias.source).to_string(),
-            ty: alias.ty.as_ref().clone(),
-        };
+        *name = locals.name(alias.source).to_string();
     }
 }
 
@@ -528,36 +489,19 @@ fn rewrite_variable_name(name: &mut String, aliases: &AliasMap, locals: &LocalIn
     *name = locals.name(alias.source).to_string();
 }
 
-fn resolve_alias(name: &str, aliases: &AliasMap, locals: &LocalInterner) -> Option<AliasValue> {
-    let mut current = locals.id(name)?;
-    let mut resolved = None;
-    // One more edge than the map contains proves a cycle, avoiding a visited
-    // set allocation for every operand rewrite.
-    for _ in 0..=aliases.len() {
-        let Some(alias) = aliases.get(&current) else {
-            return resolved;
-        };
-        resolved = Some(alias.clone());
-        current = alias.source;
-    }
-    None
+fn resolve_alias<'a>(
+    name: &str,
+    aliases: &'a AliasMap,
+    locals: &LocalInterner,
+) -> Option<&'a AliasValue> {
+    // `move_alias` stores only ultimate sources, so every lookup is one hop.
+    aliases.get(&locals.id(name)?)
 }
 
-fn kill_aliases_touching(local: usize, aliases: &mut AliasMap, scratch: &mut AliasScratch) {
-    scratch.clear();
-    scratch.mark_invalid(local);
-    loop {
-        let mut changed = false;
-        for (dest, alias) in aliases.iter() {
-            if scratch.invalidated[alias.source] {
-                changed |= scratch.mark_invalid(*dest);
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-    aliases.retain(|dest, alias| !scratch.invalidated[*dest] && !scratch.invalidated[alias.source]);
+fn kill_aliases_touching(local: usize, aliases: &mut AliasMap) {
+    // `move_alias` flattens every alias to its ultimate source. Redefinition
+    // therefore needs one pass over direct destinations and root sources.
+    aliases.retain(|dest, alias| *dest != local && alias.source != local);
 }
 
 #[cfg(test)]
@@ -567,11 +511,11 @@ mod tests {
     #[test]
     fn redefining_alias_source_invalidates_transitive_dependants() {
         let slice_ty = Type::Slice(Box::new(Type::U8));
-        let mut aliases = AliasMap::from([
+        let mut aliases = AliasMap::from_iter([
             (
                 0,
                 AliasValue {
-                    source: 1,
+                    source: 2,
                     ty: Arc::new(slice_ty.clone()),
                 },
             ),
@@ -584,8 +528,7 @@ mod tests {
             ),
         ]);
 
-        let mut scratch = AliasScratch::new(3);
-        kill_aliases_touching(2, &mut aliases, &mut scratch);
+        kill_aliases_touching(2, &mut aliases);
 
         assert!(aliases.is_empty());
     }

@@ -81,6 +81,10 @@ pub fn provider_result_identity() -> Result<(), u32> {
     shared_result_identity(Ok(()))
 }
 
+pub fn owned_io_error() -> std::io::Error {
+    std::io::Error::other(String::from("owned provider error"))
+}
+
 struct PrivateToken {
     value: u32,
 }

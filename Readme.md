@@ -343,11 +343,13 @@ For workloads with intentionally deep recursion, pass a suitable per-thread JVM 
 java -Xss16m -cp /path/to/rustc_codegen_jvm/runtime/build/classes:<app>.jar [crate_name].[crate_name]
 ```
 
-If your crate is a library, it will be located in a `deps/` subfolder within the `debug`/`release` folder, and named `[cratename]-[hash].jar`.
+Library crates currently remain `.rlib` artifacts. Automatic library JAR
+packaging was removed to avoid running the linker for every dependency; an
+explicit `cargo-jvm` packaging command is planned.
 
 ## Running Tests
 
-Run the integration and binary test suite:
+Run the binary and multi-crate self-test suite:
 
 ```bash
 python3 Tester.py             # Debug build testing

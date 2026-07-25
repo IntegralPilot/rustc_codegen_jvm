@@ -1,4 +1,5 @@
 use rustc_abi::FieldIdx;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use rustc_middle::{
     mir::{
         BinOp, Body, BorrowKind as MirBorrowKind, CastKind, Operand as MirOperand, Place,
@@ -9,7 +10,6 @@ use rustc_middle::{
         adjustment::PointerCoercion,
     },
 };
-use std::collections::{HashMap, HashSet};
 
 use super::{
     super::{
@@ -2436,7 +2436,7 @@ pub(crate) fn ensure_fn_pointer_adapter_class<'tcx>(
         },
         body: oomir::CodeBlock {
             entry: "bb0".to_string(),
-            basic_blocks: HashMap::from([(
+            basic_blocks: HashMap::from_iter([(
                 "bb0".to_string(),
                 oomir::BasicBlock {
                     label: "bb0".to_string(),
@@ -2476,7 +2476,7 @@ pub(crate) fn ensure_fn_pointer_adapter_class<'tcx>(
                 oomir::DataType::Class {
                     fields: vec![],
                     is_abstract: false,
-                    methods: HashMap::from([("call".to_string(), call_method)]),
+                    methods: HashMap::from_iter([("call".to_string(), call_method)]),
                     super_class: Some("java/lang/Object".to_string()),
                     interfaces: vec![interface_name.to_string()],
                 },
@@ -2603,7 +2603,7 @@ pub(crate) fn ensure_closure_fn_pointer_adapter_class<'tcx>(
         },
         body: oomir::CodeBlock {
             entry: "bb0".to_string(),
-            basic_blocks: HashMap::from([(
+            basic_blocks: HashMap::from_iter([(
                 "bb0".to_string(),
                 oomir::BasicBlock {
                     label: "bb0".to_string(),
@@ -2633,7 +2633,7 @@ pub(crate) fn ensure_closure_fn_pointer_adapter_class<'tcx>(
                 oomir::DataType::Class {
                     fields: Vec::new(),
                     is_abstract: false,
-                    methods: HashMap::from([("call".to_string(), call_method)]),
+                    methods: HashMap::from_iter([("call".to_string(), call_method)]),
                     super_class: Some("java/lang/Object".to_string()),
                     interfaces: vec![interface_name.to_string()],
                 },
@@ -2685,11 +2685,11 @@ fn ensure_non_capturing_closure_fn_pointer_bridge<'tcx>(
             if methods.contains_key(&implementation_method_name)
     );
     if !implementation_already_defined {
-        let mut closure_mir = tcx.instance_mir(closure_instance.def).clone();
+        let closure_mir = tcx.instance_mir(closure_instance.def);
         let implementation = super::super::mir_to_oomir(
             tcx,
             closure_instance,
-            &mut closure_mir,
+            closure_mir,
             Some(super::super::naming::FnNameData {
                 class_to_call_on: Some(closure_class.clone()),
                 method_name: implementation_method_name.clone(),
@@ -2775,7 +2775,7 @@ fn ensure_non_capturing_closure_fn_pointer_bridge<'tcx>(
         debug_variables: Vec::new(),
         body: oomir::CodeBlock {
             entry: "bb0".to_string(),
-            basic_blocks: HashMap::from([(
+            basic_blocks: HashMap::from_iter([(
                 "bb0".to_string(),
                 oomir::BasicBlock {
                     label: "bb0".to_string(),
@@ -2971,7 +2971,7 @@ fn ensure_closure_callable_bridge<'tcx>(
         },
         body: oomir::CodeBlock {
             entry: "bb0".to_string(),
-            basic_blocks: HashMap::from([(
+            basic_blocks: HashMap::from_iter([(
                 "bb0".to_string(),
                 oomir::BasicBlock {
                     label: "bb0".to_string(),
@@ -3258,7 +3258,7 @@ fn ensure_erased_receiver_fn_pointer_bridge<'tcx>(
         },
         body: oomir::CodeBlock {
             entry: "bb0".to_string(),
-            basic_blocks: HashMap::from([(
+            basic_blocks: HashMap::from_iter([(
                 "bb0".to_string(),
                 oomir::BasicBlock {
                     label: "bb0".to_string(),
@@ -3276,7 +3276,7 @@ fn ensure_erased_receiver_fn_pointer_bridge<'tcx>(
                 oomir::Type::Interface(source_interface.to_string()),
             )],
             is_abstract: false,
-            methods: HashMap::from([("call".to_string(), call_method)]),
+            methods: HashMap::from_iter([("call".to_string(), call_method)]),
             super_class: Some("java/lang/Object".to_string()),
             interfaces: vec![target_interface.to_string()],
         },
@@ -5578,7 +5578,7 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                             })
                             .collect();
                         if should_define_data_type && !data_types.contains_key(&jvm_class_name) {
-                            let mut methods = HashMap::new();
+                            let mut methods = HashMap::default();
                             methods.insert(
                                 "eq".to_string(),
                                 DataTypeMethod::AdtHelperMethod {
@@ -5690,7 +5690,7 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                                 .collect();
 
                             if !data_types.contains_key(&base_enum_name) {
-                                let mut methods = HashMap::new();
+                                let mut methods = HashMap::default();
                                 methods.insert(
                                     "getVariantIdx".to_string(),
                                     DataTypeMethod::SimpleConstantReturn(oomir::Type::I32, None),
@@ -5794,7 +5794,7 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                                 }
                             }
 
-                            let mut methods = HashMap::new();
+                            let mut methods = HashMap::default();
                             methods.insert(
                                 "getVariantIdx".to_string(),
                                 DataTypeMethod::SimpleConstantReturn(

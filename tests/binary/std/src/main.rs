@@ -1,4 +1,4 @@
-use std::collections::{hash_map::DefaultHasher, HashSet};
+use std::collections::{HashSet, hash_map::DefaultHasher};
 use std::env;
 use std::fs::{self, File, FileTimes, OpenOptions};
 use std::hash::{Hash, Hasher};
@@ -14,6 +14,7 @@ fn main() {
     test_arguments();
     test_environment();
     test_stdin();
+    test_provided_trait_method_on_trait_object();
     test_pointer_formatting();
     test_ipv6_formatting();
     test_filesystem();
@@ -36,9 +37,11 @@ fn test_environment() {
     assert_eq!(env::var(KEY).unwrap(), "value=with=equals");
 
     let entries = env::vars().collect::<Vec<_>>();
-    assert!(entries
-        .iter()
-        .any(|(key, value)| { key == KEY && value == "value=with=equals" }));
+    assert!(
+        entries
+            .iter()
+            .any(|(key, value)| { key == KEY && value == "value=with=equals" })
+    );
     assert!(env::vars_os().any(|(key, value)| { key == KEY && value == "value=with=equals" }));
 
     unsafe { env::remove_var(KEY) };
@@ -50,6 +53,21 @@ fn test_stdin() {
     let mut input = String::new();
     io::stdin().read_to_string(&mut input).unwrap();
     assert_eq!(input, "first line\nsecond café line\n");
+}
+
+fn test_provided_trait_method_on_trait_object() {
+    fn read_prefix(reader: &mut dyn Read) -> Vec<u8> {
+        let mut limited = reader.take(3);
+        let mut bytes = Vec::new();
+        limited.read_to_end(&mut bytes).unwrap();
+        bytes
+    }
+
+    let mut input = &b"abcdef"[..];
+    assert_eq!(read_prefix(&mut input), b"abc");
+
+    let mut input = &b"xyz"[..];
+    assert_eq!(input.bytes().next().unwrap().unwrap(), b'x');
 }
 
 fn test_pointer_formatting() {
@@ -400,10 +418,12 @@ fn test_links(root: &Path) {
     let symbolic = root.join("symbolic-link.txt");
     match fs::soft_link(Path::new("link-source.txt"), &symbolic) {
         Ok(()) => {
-            assert!(fs::symlink_metadata(&symbolic)
-                .unwrap()
-                .file_type()
-                .is_symlink());
+            assert!(
+                fs::symlink_metadata(&symbolic)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
             assert_eq!(
                 fs::read_link(&symbolic).unwrap(),
                 Path::new("link-source.txt")

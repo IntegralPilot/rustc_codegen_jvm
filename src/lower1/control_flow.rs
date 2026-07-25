@@ -9,6 +9,7 @@ use super::{
 };
 use crate::oomir;
 
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use rustc_hir::{LangItem, def::DefKind};
 use rustc_middle::{
     mir::{
@@ -19,7 +20,6 @@ use rustc_middle::{
     ty::{EarlyBinder, Instance, InstanceKind, ShimKind, Ty, TyCtxt, TyKind, TypingEnv},
 };
 use rustc_span::{Symbol, sym};
-use std::collections::{HashMap, HashSet};
 
 mod checked_intrinsic_registry;
 pub mod checked_intrinsics;
@@ -41,6 +41,18 @@ fn is_core_ptr_metadata_api(tcx: TyCtxt<'_>, def_id: rustc_span::def_id::DefId) 
         && tcx.opt_item_name(def_id) == Some(metadata)
         && tcx.opt_item_name(metadata_module) == Some(metadata)
         && tcx.opt_item_name(ptr_module) == Some(sym::ptr)
+}
+
+fn is_core_ptr_free_function(
+    tcx: TyCtxt<'_>,
+    def_id: rustc_span::def_id::DefId,
+    name: Symbol,
+) -> bool {
+    tcx.crate_name(def_id.krate) == sym::core
+        && tcx.opt_item_name(def_id) == Some(name)
+        && tcx
+            .opt_parent(def_id)
+            .is_some_and(|parent| tcx.opt_item_name(parent) == Some(sym::ptr))
 }
 
 fn caller_location_operand<'tcx>(
@@ -1021,7 +1033,7 @@ pub(super) fn collect_pointer_origins<'tcx>(
     instance: Instance<'tcx>,
     data_types: &mut HashMap<String, oomir::DataType>,
 ) -> MutableBorrowMap<'tcx> {
-    let mut origins = MutableBorrowMap::new();
+    let mut origins = MutableBorrowMap::default();
     let assignment_count = mir
         .basic_blocks
         .iter()
@@ -1336,7 +1348,7 @@ fn emit_selected_mutable_borrow_writebacks<'tcx>(
     data_types: &mut HashMap<String, oomir::DataType>,
 ) -> Vec<oomir::Instruction> {
     let mut instructions = Vec::new();
-    let mut visited = HashSet::new();
+    let mut visited = HashSet::default();
     for borrow_local in borrow_locals {
         instructions.extend(emit_mutable_borrow_writeback(
             borrow_local,
@@ -2300,8 +2312,19 @@ pub(super) fn convert_basic_block<'tcx>(
                                 &method_signature,
                             );
                             let declared_method_name = item.name().as_str().to_string();
+                            let is_provided_trait_method =
+                                item.trait_container(tcx).is_some_and(|trait_def_id| {
+                                    tcx.provided_trait_methods(trait_def_id).any(|provided| {
+                                        provided.def_id == item.def_id
+                                            || item.trait_item_def_id() == Some(provided.def_id)
+                                    })
+                                });
+                            let method_requires_sized_self =
+                                tcx.generics_require_sized_self(item.def_id);
                             let transparent_virtual_receiver =
-                                if matches!(func_instance.def, InstanceKind::Virtual(..)) {
+                                if matches!(func_instance.def, InstanceKind::Virtual(..))
+                                    && !method_requires_sized_self
+                                {
                                     match receiver_operand.get_type() {
                                         Some(oomir::Type::Class(receiver_class)) => {
                                             match data_types.get(&receiver_class) {
@@ -2441,12 +2464,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                     _ => false,
                                 };
                                 let uses_concrete_trait_default =
-                                    trait_container.is_some_and(|trait_def_id| {
-                                        tcx.provided_trait_methods(trait_def_id).any(|provided| {
-                                            provided.def_id == item.def_id
-                                                || item.trait_item_def_id() == Some(provided.def_id)
-                                        })
-                                    }) && !has_concrete_receiver_method;
+                                    is_provided_trait_method && !has_concrete_receiver_method;
 
                                 // Use InvokeInterface if:
                                 // 1. The receiver type is explicitly an Interface type, OR
@@ -2531,6 +2549,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                         || has_enum_reference_receiver
                                         || has_arbitrary_self_receiver
                                         || trait_impl_self_requires_static_dispatch
+                                        || method_requires_sized_self
                                         || matches!(
                                             receiver_value_mir_ty.kind(),
                                             TyKind::Closure(..)
@@ -5818,9 +5837,12 @@ pub(super) fn convert_basic_block<'tcx>(
                                     &mut instructions,
                                 );
                             }
-                        } else if (is_diagnostic_item(sym::ptr_from_ref)
-                            || intrinsic_name.as_str() == "from_mut")
-                            && is_core_ptr
+                        } else if is_diagnostic_item(sym::ptr_from_ref)
+                            || is_core_ptr_free_function(
+                                tcx,
+                                called_def_id,
+                                Symbol::intern("from_mut"),
+                            )
                         {
                             if let Some(dest) = effective_dest.clone() {
                                 instructions.push(oomir::Instruction::Move {
@@ -6837,7 +6859,7 @@ pub(super) fn convert_basic_block<'tcx>(
                     }
                 }
 
-                let mut writeback_locals = HashSet::new();
+                let mut writeback_locals = HashSet::default();
                 for arg in args {
                     if let MirOperand::Move(place) | MirOperand::Copy(place) = &arg.node
                         && place.projection.is_empty()

@@ -15,7 +15,7 @@ use super::jvm::{
         Attribute, BootstrapMethod, InnerClass, Instruction, MaxStack, NestedClassAccessFlags,
     },
 };
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 fn code_attribute_with_stack_maps(
     cp: &mut InternedConstantPool,
@@ -1361,7 +1361,7 @@ pub(super) fn create_data_type_classfile_for_class(
 
     let super_class_index = cp.add_class(super_class_name_jvm)?;
 
-    let mut seen_interfaces = HashSet::new();
+    let mut seen_interfaces = HashSet::default();
     let mut interface_indices: Vec<u16> = Vec::with_capacity(implements_interfaces.len());
     for interface_name in &implements_interfaces {
         if !seen_interfaces.insert(interface_name.as_str()) {
@@ -1456,9 +1456,9 @@ pub(super) fn create_data_type_classfile_for_class(
                         "Failed after creating {next_factory} constant factories: {error:?}"
                     ),
                 })?;
-                let instrumented_fn_name = format!("{class_name_jvm}::{method_name}");
-                let _timer =
-                    crate::instrumentation::Timer::function("lower2", None, &instrumented_fn_name);
+                let _timer = crate::instrumentation::Timer::function_lazy("lower2", None, || {
+                    format!("{class_name_jvm}::{method_name}")
+                });
 
                 // Translate the function body using its own constant pool reference
                 let owner_class = if !function.signature.is_static {
