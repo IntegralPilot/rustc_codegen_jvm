@@ -9,35 +9,54 @@ use super::{
 };
 use crate::oomir::{self, Type};
 
+fn immediate_int_const_instr(val: i32) -> Option<Instruction> {
+    match val {
+        -1 => Some(Instruction::Iconst_m1),
+        0 => Some(Instruction::Iconst_0),
+        1 => Some(Instruction::Iconst_1),
+        2 => Some(Instruction::Iconst_2),
+        3 => Some(Instruction::Iconst_3),
+        4 => Some(Instruction::Iconst_4),
+        5 => Some(Instruction::Iconst_5),
+        v @ -128..=-2 | v @ 6..=127 => Some(Instruction::Bipush(v as i8)),
+        v @ -32768..=-129 | v @ 128..=32767 => Some(Instruction::Sipush(v as i16)),
+        _ => None,
+    }
+}
+
 // Helper to get the appropriate integer constant loading instruction
 pub fn get_int_const_instr(cp: &mut InternedConstantPool, val: i32) -> Instruction {
-    match val {
-        // Direct iconst mapping
-        -1 => Instruction::Iconst_m1,
-        0 => Instruction::Iconst_0,
-        1 => Instruction::Iconst_1,
-        2 => Instruction::Iconst_2,
-        3 => Instruction::Iconst_3,
-        4 => Instruction::Iconst_4,
-        5 => Instruction::Iconst_5,
-
-        // Bipush range (-128 to 127), excluding the iconst values already handled
-        v @ -128..=-2 | v @ 6..=127 => Instruction::Bipush(v as i8),
-
-        // Sipush range (-32768 to 32767), excluding the bipush range
-        v @ -32768..=-129 | v @ 128..=32767 => Instruction::Sipush(v as i16),
-
-        // Use LDC for values outside the -32768 to 32767 range
-        v => {
-            let index = cp
-                .add_integer(v)
-                .expect("Failed to add integer to constant pool");
-            if let Ok(idx8) = u8::try_from(index) {
-                Instruction::Ldc(idx8)
-            } else {
-                Instruction::Ldc_w(index)
-            }
+    immediate_int_const_instr(val).unwrap_or_else(|| {
+        let index = cp
+            .add_integer(val)
+            .expect("Failed to add integer to constant pool");
+        if let Ok(idx8) = u8::try_from(index) {
+            Instruction::Ldc(idx8)
+        } else {
+            Instruction::Ldc_w(index)
         }
+    })
+}
+
+/// Appends an integer without consuming a constant-pool entry. Generated array
+/// indices have high cardinality, so pooled indices can exhaust large classes.
+pub fn append_unpooled_int_const(instructions: &mut Vec<Instruction>, val: i32) {
+    if let Some(instruction) = immediate_int_const_instr(val) {
+        instructions.push(instruction);
+        return;
+    }
+
+    instructions.push(Instruction::Bipush((val >> 24) as i8));
+    for shift in [16, 8, 0] {
+        instructions.push(Instruction::Bipush(8));
+        instructions.push(Instruction::Ishl);
+        let byte = ((val >> shift) & 0xff) as i16;
+        instructions.push(if byte <= i16::from(i8::MAX) {
+            Instruction::Bipush(byte as i8)
+        } else {
+            Instruction::Sipush(byte)
+        });
+        instructions.push(Instruction::Ior);
     }
 }
 

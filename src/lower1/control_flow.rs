@@ -3017,7 +3017,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                 ) && is_pointer_cast_method
                                     && matches!(oomir_output_type, oomir::Type::Pointer(_))
                                 {
-                                    let source_pointee = match receiver_mir_ty.kind() {
+                                    let source_pointee = match resolved_receiver_mir_ty.kind() {
                                         TyKind::RawPtr(pointee, _) | TyKind::Ref(_, pointee, _) => {
                                             if pointee.is_slice() {
                                                 pointee.sequence_element_type(tcx)

@@ -19,6 +19,23 @@ static OPERATION: fn(i32) -> i32 = add_one;
 const PROMOTED_VALUE: &&str = &"promoted value";
 const PROMOTED_ARRAY: &[&str; 1] = core::array::from_ref(PROMOTED_VALUE);
 
+#[repr(C, align(16))]
+struct AssociatedConstArray {
+    data: [u8; if Self::ENABLED { 16 } else { 0 }],
+}
+
+impl AssociatedConstArray {
+    const ENABLED: bool = false;
+
+    const fn new() -> Self {
+        Self {
+            data: [0; if Self::ENABLED { 16 } else { 0 }],
+        }
+    }
+}
+
+static ASSOCIATED_CONST_ARRAY: AssociatedConstArray = AssociatedConstArray::new();
+
 trait StaticOperation: Sync {
     fn apply(&self, value: i32) -> i32;
 }
@@ -48,4 +65,6 @@ fn main() {
     assert!(DYNAMIC_OPERATION.apply(41) == ANSWER);
     assert!(*PROMOTED_VALUE == PROMOTED_ARRAY[0]);
     assert!(core::ptr::eq(PROMOTED_VALUE, &PROMOTED_ARRAY[0]));
+    assert!(ASSOCIATED_CONST_ARRAY.data.is_empty());
+    assert!(core::mem::size_of_val(&ASSOCIATED_CONST_ARRAY) == 0);
 }

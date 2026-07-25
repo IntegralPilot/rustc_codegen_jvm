@@ -601,6 +601,9 @@ pub fn read_zero_sized_constant<'tcx>(
     let ty = EarlyBinder::bind(tcx, ty)
         .instantiate(tcx, instance.args)
         .skip_norm_wip();
+    let ty = tcx
+        .try_normalize_erasing_regions(TypingEnv::fully_monomorphized(), Unnormalized::new_wip(ty))
+        .unwrap_or(ty);
     let layout = tcx
         .layout_of(TypingEnv::fully_monomorphized().as_query_input(ty))
         .map_err(|error| format!("Could not determine ZST layout for {ty:?}: {error:?}"))?;

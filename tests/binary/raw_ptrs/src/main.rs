@@ -1,6 +1,50 @@
 #![allow(internal_features, dead_code)]
 #![feature(core_intrinsics, f16, f128, ptr_internals, ptr_metadata, set_ptr_value, layout_for_ptr)]
 
+use core::mem::MaybeUninit;
+
+fn generic_uninit_slice_data<T>(values: &mut [MaybeUninit<T>]) -> *mut T {
+    values.as_mut_ptr().cast::<T>()
+}
+
+fn boxed_uninit_slice_data<T>(length: usize) -> *mut T {
+    Box::into_raw(
+        (0..length)
+            .map(|_| MaybeUninit::<T>::uninit())
+            .collect::<Box<[_]>>(),
+    )
+    .cast::<T>()
+}
+
+fn generic_fat_pointer_casts() {
+    let mut values = [
+        MaybeUninit::<u32>::uninit(),
+        MaybeUninit::<u32>::uninit(),
+        MaybeUninit::<u32>::uninit(),
+    ];
+    let data = generic_uninit_slice_data(&mut values);
+    unsafe {
+        data.write(11);
+        data.add(1).write(22);
+        data.add(2).write(33);
+        assert_eq!(data.read(), 11);
+        assert_eq!(data.add(1).read(), 22);
+        assert_eq!(data.add(2).read(), 33);
+    }
+
+    let boxed_data = boxed_uninit_slice_data::<u32>(3);
+    unsafe {
+        boxed_data.write(44);
+        boxed_data.add(1).write(55);
+        boxed_data.add(2).write(66);
+        assert_eq!(boxed_data.add(1).read(), 55);
+        drop(Box::from_raw(core::ptr::slice_from_raw_parts_mut(
+            boxed_data.cast::<MaybeUninit<u32>>(),
+            3,
+        )));
+    }
+}
+
 fn basic_raw_pointer_round_trip() {
     let mut value = 41_i32;
     let pointer = &mut value as *mut i32;
@@ -2231,6 +2275,7 @@ fn exposed_allocation_churn() {
 }
 
 fn main() {
+    generic_fat_pointer_casts();
     basic_raw_pointer_round_trip();
     array_pointer_arithmetic();
     pointer_identity_and_casts();

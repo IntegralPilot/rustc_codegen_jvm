@@ -17,7 +17,7 @@ use self::jvm::{
     attributes::{ArrayType, Attribute, BootstrapMethod, Instruction, MaxStack},
 };
 use constant_pool::{InternedConstantPool, verify_no_duplicate_constants};
-use consts::{get_int_const_instr, load_constant};
+use consts::{append_unpooled_int_const, get_int_const_instr, load_constant};
 use rustc_hash::FxHashMap as HashMap;
 use rustc_middle::ty::TyCtxt;
 use std::{
@@ -210,13 +210,13 @@ fn create_chunked_array_factory(
                     });
                 }
                 instructions.push(Instruction::Aload_0);
-                instructions.push(get_int_const_instr(
-                    cp,
+                append_unpooled_int_const(
+                    &mut instructions,
                     i32::try_from(absolute_index).map_err(|_| jvm::Error::VerificationError {
                         context: "constant array fill".to_string(),
                         message: "Constant array index exceeds the JVM address space".to_string(),
                     })?,
-                ));
+                );
                 load_constant(&mut instructions, cp, element)?;
                 instructions.push(store_instruction.clone());
             }

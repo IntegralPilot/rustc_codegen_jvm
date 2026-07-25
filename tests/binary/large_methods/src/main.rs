@@ -12,6 +12,20 @@ static LARGE_CONSTANT_TABLE: [ConstantEntry; 17_000] = [
     17_000
 ];
 
+const LARGE_BYTE_COUNT: usize = 100_000;
+
+const fn large_bytes() -> [u8; LARGE_BYTE_COUNT] {
+    let mut result = [0; LARGE_BYTE_COUNT];
+    let mut index = 0;
+    while index < result.len() {
+        result[index] = index.wrapping_mul(37) as u8;
+        index += 1;
+    }
+    result
+}
+
+static LARGE_BYTES: [u8; LARGE_BYTE_COUNT] = large_bytes();
+
 macro_rules! repeat_2 {
     ($($body:tt)*) => {
         $($body)*
@@ -688,6 +702,10 @@ fn main() {
     assert_eq!(LARGE_CONSTANT_TABLE.len(), 17_000);
     assert_eq!(LARGE_CONSTANT_TABLE[0].value, 37);
     assert!(LARGE_CONSTANT_TABLE[16_999].enabled);
+    assert_eq!(LARGE_BYTES.len(), LARGE_BYTE_COUNT);
+    assert_eq!(LARGE_BYTES[0], 0);
+    assert_eq!(LARGE_BYTES[32_768], 0);
+    assert_eq!(LARGE_BYTES[99_999], 251);
     outlined_with_retyped_locals();
 
     for seed in [0, 1, 7, u32::MAX as u64, u64::MAX - 300] {
