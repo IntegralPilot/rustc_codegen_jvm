@@ -1074,7 +1074,19 @@ fn git_output(root: &Path, arguments: &[&str]) -> DynResult<String> {
 }
 
 fn print_doctor(backend: &Backend) -> DynResult<()> {
+    print!("cargo-jvm: {}", env!("CARGO_PKG_VERSION"));
+    if let Some(commit) = option_env!("CARGO_JVM_GIT_HASH") {
+        print!(" (commit {commit})");
+    }
+    if option_env!("CARGO_JVM_GIT_DIRTY").is_some() {
+        print!(" (dirty)");
+    }
+    println!();
     println!("rustc_codegen_jvm: {}", backend.root.display());
+    match git_output(&backend.root, &["log", "-1", "--format=%H%x09%s"]) {
+        Ok(commit) => println!("rustc_codegen_jvm HEAD: {}", commit.trim()),
+        Err(_) => println!("rustc_codegen_jvm HEAD: unavailable (not a Git checkout)"),
+    }
     for (name, executable, version_argument) in [
         ("cargo", cargo_executable(), "--version"),
         (
@@ -1385,7 +1397,10 @@ mod tests {
         let artifact = parse_artifact(&value).unwrap();
         assert!(artifact.is_cdylib());
         assert!(artifact.is_library());
-        assert_eq!(artifact.linked_library, Some(PathBuf::from("/tmp/demo.jar")));
+        assert_eq!(
+            artifact.linked_library,
+            Some(PathBuf::from("/tmp/demo.jar"))
+        );
     }
 
     #[test]

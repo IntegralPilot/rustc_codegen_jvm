@@ -368,7 +368,9 @@ This compiles Cargo's test targets with `--no-run`, then launches every reported
 
 ### Other
 
-`cargo jvm doctor` reports the selected backend, Java, Cargo, target and runtime paths. Please run this if you are reporting a bug.
+`cargo jvm doctor` reports the `cargo-jvm` version and source commit (when
+available), the configured backend's current Git commit, Java, Cargo, rustc,
+target and runtime paths. Please run this if you are reporting a bug.
 
 `cargo jvm update` pulls and rebuilds the backend. 
 

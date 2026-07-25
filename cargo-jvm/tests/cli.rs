@@ -44,6 +44,37 @@ fn fake_python(temp: &TempDir) -> (PathBuf, PathBuf) {
     (python, capture)
 }
 
+fn commit_fake_backend(backend: &Path, subject: &str) -> String {
+    let git = |arguments: &[&str]| {
+        Command::new("git")
+            .arg("-C")
+            .arg(backend)
+            .args(arguments)
+            .output()
+            .unwrap()
+    };
+    assert!(git(&["init", "--quiet"]).status.success());
+    assert!(git(&["add", "."]).status.success());
+    assert!(
+        git(&[
+            "-c",
+            "user.name=cargo-jvm tests",
+            "-c",
+            "user.email=cargo-jvm@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            subject,
+        ])
+        .status
+        .success()
+    );
+    String::from_utf8(git(&["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_string()
+}
+
 #[test]
 fn setup_persists_the_backend_path() {
     let temp = TempDir::new().unwrap();
@@ -66,6 +97,43 @@ fn setup_persists_the_backend_path() {
     );
     let contents = fs::read_to_string(config).unwrap();
     assert!(contents.contains(&backend.canonicalize().unwrap().display().to_string()));
+}
+
+#[test]
+fn doctor_reports_tool_and_backend_versions() {
+    let temp = TempDir::new().unwrap();
+    let backend = fake_backend(&temp);
+    let subject = "backend commit shown by doctor";
+    let commit = commit_fake_backend(&backend, subject);
+
+    let cargo = temp.path().join("cargo");
+    let rustc = temp.path().join("rustc");
+    let java = temp.path().join("java");
+    executable(&cargo, "#!/bin/sh\nprintf 'cargo test-version\\n'\n");
+    executable(&rustc, "#!/bin/sh\nprintf 'rustc test-version\\n'\n");
+    executable(&java, "#!/bin/sh\nprintf 'java test-version\\n' >&2\n");
+
+    let output = cargo_jvm()
+        .env("CARGO", cargo)
+        .env("RUSTC", rustc)
+        .env("JAVA", java)
+        .arg("--backend-path")
+        .arg(&backend)
+        .arg("doctor")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains(&format!("cargo-jvm: {}", env!("CARGO_PKG_VERSION"))));
+    assert!(stdout.contains(&format!("rustc_codegen_jvm HEAD: {commit}\t{subject}")));
+    assert!(stdout.contains("cargo: cargo test-version"));
+    assert!(stdout.contains("rustc: rustc test-version"));
+    assert!(stdout.contains("java: java test-version"));
 }
 
 #[test]

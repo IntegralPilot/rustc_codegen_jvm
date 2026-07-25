@@ -96,7 +96,9 @@ cargo jvm package --lib --output dist/my-library.jar
 
 Binary packages are directly executable with `java -jar`.
 
-You can use `cargo jvm doctor` to help debug issues.
+You can use `cargo jvm doctor` to report the installed `cargo-jvm` version and
+source commit (when available), the configured backend's current Git commit,
+and other environment details. Please run this if you are reporting a bug.
 
 The backend checkout can be overridden without changing saved configuration
 using `--backend-path PATH` or `CARGO_JVM_BACKEND_PATH`. `CARGO_JVM_HOME`
