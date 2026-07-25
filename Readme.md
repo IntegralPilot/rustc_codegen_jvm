@@ -318,9 +318,9 @@ cargo jvm build --workspace -j 8
 
 Build artifacts are placed under `target/jvm-unknown-unknown/debug` or `release`, just as with an explicit Cargo target. 
 
-Binary artifacts are JARs (but dependent upon `org.rustlang.runtime` being in the classpath) and libraries remain Rust `.rlib` inputs. 
+Binary and `cdylib` artifacts are JARs, but ordinary Rust libraries remain `.rlib` inputs.
 
-Both types of projects can be packaged into fully self-contained JARs using `cargo jvm package` (see below).
+Binaries, `cdylib` and ordinary libraries can all be packaged into fully self-contained JARs using `cargo jvm package` (see below).
 
 ### Running
 

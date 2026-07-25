@@ -92,6 +92,7 @@ struct Artifact {
     target_name: String,
     kinds: Vec<String>,
     executable: Option<PathBuf>,
+    linked_library: Option<PathBuf>,
     rlibs: Vec<PathBuf>,
     is_test: bool,
 }
@@ -109,11 +110,17 @@ impl Artifact {
         self.is_binary() || self.is_example()
     }
 
+    fn is_cdylib(&self) -> bool {
+        self.kinds.iter().any(|kind| kind == "cdylib")
+    }
+
     fn is_library(&self) -> bool {
-        self.kinds
+        (self
+            .kinds
             .iter()
             .any(|kind| matches!(kind.as_str(), "lib" | "rlib"))
-            && !self.rlibs.is_empty()
+            && !self.rlibs.is_empty())
+            || (self.is_cdylib() && self.linked_library.is_some())
     }
 }
 
@@ -619,6 +626,7 @@ fn run_package(backend: &Backend, options: PackageOptions) -> DynResult<i32> {
     selected.dedup_by(|left, right| {
         left.target_name == right.target_name
             && left.executable == right.executable
+            && left.linked_library == right.linked_library
             && left.rlibs == right.rlibs
     });
     if selected.is_empty() {
@@ -656,10 +664,20 @@ fn run_package(backend: &Backend, options: PackageOptions) -> DynResult<i32> {
             fs::create_dir_all(parent)?;
         }
 
-        if let Some(executable) = &artifact.executable
-            && artifact.is_executable()
+        if let Some(jar) = artifact
+            .executable
+            .as_ref()
+            .filter(|_| artifact.is_executable())
+            .or(artifact.linked_library.as_ref())
         {
-            fs::copy(executable, &output)?;
+            let same_file = jar == &output
+                || matches!(
+                    (fs::canonicalize(jar), fs::canonicalize(&output)),
+                    (Ok(source), Ok(destination)) if source == destination
+                );
+            if !same_file {
+                fs::copy(jar, &output)?;
+            }
         } else {
             package_library(backend, &build.all_rlibs, &output)?;
         }
@@ -781,6 +799,17 @@ fn parse_artifact(message: &Value) -> Option<Artifact> {
         .and_then(Value::as_str)
         .map(PathBuf::from)
         .filter(|path| path.extension().is_some_and(|extension| extension == "jar"));
+    let linked_library = if kinds.iter().any(|kind| kind == "cdylib") {
+        message
+            .get("filenames")?
+            .as_array()?
+            .iter()
+            .filter_map(Value::as_str)
+            .map(PathBuf::from)
+            .find(|path| path.extension().is_some_and(|extension| extension == "jar"))
+    } else {
+        None
+    };
     let rlibs = message
         .get("filenames")?
         .as_array()?
@@ -801,6 +830,7 @@ fn parse_artifact(message: &Value) -> Option<Artifact> {
         target_name,
         kinds,
         executable,
+        linked_library,
         rlibs,
         is_test,
     })
@@ -1339,6 +1369,23 @@ mod tests {
         let artifact = parse_artifact(&value).unwrap();
         assert!(artifact.is_library());
         assert_eq!(artifact.rlibs, [PathBuf::from("/tmp/libdemo.rlib")]);
+        assert!(artifact.linked_library.is_none());
+    }
+
+    #[test]
+    fn parses_linked_cdylib_artifacts() {
+        let value = serde_json::json!({
+            "reason": "compiler-artifact",
+            "package_id": "path+file:///demo#0.1.0",
+            "target": {"name": "demo", "kind": ["cdylib"]},
+            "profile": {"test": false},
+            "filenames": ["/tmp/demo.jar"],
+            "executable": null
+        });
+        let artifact = parse_artifact(&value).unwrap();
+        assert!(artifact.is_cdylib());
+        assert!(artifact.is_library());
+        assert_eq!(artifact.linked_library, Some(PathBuf::from("/tmp/demo.jar")));
     }
 
     #[test]
@@ -1348,6 +1395,7 @@ mod tests {
             target_name: "demo".to_string(),
             kinds: vec!["bin".to_string()],
             executable: Some(PathBuf::from("demo.jar")),
+            linked_library: None,
             rlibs: Vec::new(),
             is_test: false,
         };
@@ -1356,6 +1404,7 @@ mod tests {
             target_name: "demo".to_string(),
             kinds: vec!["lib".to_string()],
             executable: None,
+            linked_library: None,
             rlibs: vec![PathBuf::from("libdemo.rlib")],
             is_test: false,
         };

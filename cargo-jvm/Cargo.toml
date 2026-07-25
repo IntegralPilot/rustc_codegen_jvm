@@ -1,6 +1,6 @@
 [package]
 name = "cargo-jvm"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Cargo subcommand for building, running, testing, and packaging Rust code for the JVM"
 license = "MIT OR Apache-2.0"
