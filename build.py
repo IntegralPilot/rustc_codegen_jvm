@@ -25,6 +25,7 @@ class Config:
     IS_CI = os.getenv("IS_CI") == "1"
 
     # Subproject Directories
+    CARGO_JVM_DIR = ROOT_DIR / "cargo-jvm"
     JAVA_LINKER_DIR = ROOT_DIR / "java-linker"
     RUNTIME_DIR = ROOT_DIR / "runtime"
 
@@ -41,6 +42,10 @@ class Config:
         JAVA_LINKER_DIR / "Cargo.toml",
         JAVA_LINKER_DIR / "Cargo.lock",
     ] + list(JAVA_LINKER_DIR.glob("src/**/*.rs"))
+    CARGO_JVM_RUST_SOURCES = [
+        CARGO_JVM_DIR / "Cargo.toml",
+        CARGO_JVM_DIR / "Cargo.lock",
+    ] + list(CARGO_JVM_DIR.glob("src/**/*.rs"))
 
     # Key Target Files
     RUNTIME_JAR = RUNTIME_DIR / f"build/libs/runtime-{RUNTIME_VERSION}.jar"
@@ -60,7 +65,11 @@ class Config:
         DYLIB_SUFFIX = ".so"
         
     RUST_BACKEND_DYLIB = ROOT_DIR / "target/release" / f"{DYLIB_PREFIX}rustc_codegen_jvm{DYLIB_SUFFIX}"
+    RUST_BACKEND_TOOLCHAIN = ROOT_DIR / "target/release/.rustc_codegen_jvm-toolchain"
     JAVA_LINKER_EXE = JAVA_LINKER_DIR / "target/release/java-linker"
+    CARGO_JVM_EXE = CARGO_JVM_DIR / "target/release" / (
+        "cargo-jvm.exe" if platform.system() == "Windows" else "cargo-jvm"
+    )
 
     RUNTIME_CLASS_PREFIX = "org/rustlang/runtime/"
 
@@ -101,6 +110,18 @@ def is_stale(target: Path, sources: List[Path]) -> bool:
             return True
     return False
 
+def rustc_toolchain_fingerprint() -> str:
+    """Returns the exact compiler identity that the rustc-private backend uses."""
+    try:
+        return subprocess.check_output(
+            ["rustc", "--version", "--verbose"],
+            cwd=Config.ROOT_DIR,
+            text=True,
+        ).strip()
+    except (FileNotFoundError, subprocess.CalledProcessError) as error:
+        print(f"{Colors.RED}❌ Could not query the active Rust compiler: {error}{Colors.RESET}")
+        sys.exit(1)
+
 def contains_non_runtime_classes(jar_path: Path) -> bool:
     """Checks whether a runtime JAR contains classes outside its owned package."""
     if not jar_path.exists():
@@ -125,6 +146,7 @@ def clean():
     
     # Subproject cargo clean
     run_command(["cargo", "clean"], cwd=Config.JAVA_LINKER_DIR)
+    run_command(["cargo", "clean"], cwd=Config.CARGO_JVM_DIR)
 
     # Remove specific files and directories
     for path in [
@@ -194,7 +216,16 @@ def build_runtime():
 def build_rust_backend():
     """Builds the main rustc_codegen_jvm backend."""
     sources = Config.BACKEND_RUST_SOURCES
-    if not is_stale(Config.RUST_BACKEND_DYLIB, sources):
+    toolchain = rustc_toolchain_fingerprint()
+    recorded_toolchain = (
+        Config.RUST_BACKEND_TOOLCHAIN.read_text()
+        if Config.RUST_BACKEND_TOOLCHAIN.exists()
+        else None
+    )
+    if (
+        not is_stale(Config.RUST_BACKEND_DYLIB, sources)
+        and recorded_toolchain == toolchain
+    ):
         print(f"{Colors.GREEN}✅ Rust codegen backend is up to date.{Colors.RESET}")
         return
     
@@ -203,6 +234,7 @@ def build_rust_backend():
     env = os.environ.copy()
     env["RUSTFLAGS"] = "-Awarnings"
     subprocess.run(["cargo", "build", "--release"], cwd=Config.ROOT_DIR, check=True, env=env)
+    Config.RUST_BACKEND_TOOLCHAIN.write_text(toolchain)
     print(f"{Colors.GREEN}   Rust codegen backend built successfully.{Colors.RESET}")
 
 def build_java_linker():
@@ -216,6 +248,16 @@ def build_java_linker():
     env["RUSTFLAGS"] = "-Awarnings"
     subprocess.run(["cargo", "build", "--release"], cwd=Config.JAVA_LINKER_DIR, check=True, env=env)
     print(f"{Colors.GREEN}   Java linker built successfully.{Colors.RESET}")
+
+def build_cargo_jvm():
+    """Builds the cargo-jvm Cargo subcommand."""
+    if not is_stale(Config.CARGO_JVM_EXE, Config.CARGO_JVM_RUST_SOURCES):
+        print(f"{Colors.GREEN}✅ cargo-jvm is up to date.{Colors.RESET}")
+        return
+
+    print(f"{Colors.CYAN}📦 Building cargo-jvm...{Colors.RESET}")
+    subprocess.run(["cargo", "build", "--release"], cwd=Config.CARGO_JVM_DIR, check=True)
+    print(f"{Colors.GREEN}   cargo-jvm built successfully.{Colors.RESET}")
     
 def generate_config_files():
     """Generates config.toml and jvm-unknown-unknown.json from templates."""
@@ -249,6 +291,7 @@ def all_tasks():
     build_runtime()
     build_rust_backend()
     build_java_linker()
+    build_cargo_jvm()
 
     print(f"\n{Colors.GREEN}✨ Build complete! ✨{Colors.RESET}")
 
@@ -269,6 +312,7 @@ TARGETS = {
     "rust-components": (install_rust_components, "Install needed Rust components."),
     "rust": (build_rust_backend, "Build the Rust root project."),
     "java-linker": (build_java_linker, "Build the Java Linker subproject."),
+    "cargo-jvm": (build_cargo_jvm, "Build the cargo-jvm Cargo subcommand."),
     "runtime": (build_runtime, "Build the Java runtime support JAR."),
     "gen-files": (generate_config_files, "Generate necessary files from templates."),
     "help": (help_message, "Show this help message."),

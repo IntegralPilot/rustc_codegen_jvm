@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -20,9 +21,7 @@ TARGET_SPEC = ROOT / "jvm-unknown-unknown.json"
 TEST_TARGET_DIR = ROOT / "target" / "test-suite"
 TEST_CONFIG = ROOT / "config.toml"
 CORE_BUILD_MANIFEST = ROOT / "tests" / "support" / "core_build" / "Cargo.toml"
-# Library crates now remain rlibs until an explicit JVM packaging command is
-# requested. Java integration cases require that future packaging command.
-TEST_TYPES = ("binary", "multicrate")
+TEST_TYPES = ("binary", "multicrate", "integration", "cargo_jvm")
 CACHE_TAG = (
     "Signature: 8a477f597d28d172789f06886806bc55\n"
     "# This file is a cache directory tag created by rustc_codegen_jvm.\n"
@@ -135,6 +134,9 @@ def prepare_shared_cache() -> bool:
         ROOT / "java-linker" / "target" / "release" / (
             "java-linker.exe" if os.name == "nt" else "java-linker"
         ),
+        ROOT / "cargo-jvm" / "target" / "release" / (
+            "cargo-jvm.exe" if os.name == "nt" else "cargo-jvm"
+        ),
     ]
     inputs.extend(path for path in STDLIB_OVERLAY_ROOT.rglob("*") if path.is_file())
     inputs.extend(path for path in STDLIB_PATCH_ROOT.rglob("*.patch") if path.is_file())
@@ -239,6 +241,48 @@ def build_test(
     *,
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    if test.kind == "cargo_jvm":
+        cargo_jvm = ROOT / "cargo-jvm" / "target" / "release" / (
+            "cargo-jvm.exe" if os.name == "nt" else "cargo-jvm"
+        )
+        command = [
+            sys.executable,
+            str(test.directory / "run.py"),
+            "--cargo-jvm",
+            str(cargo_jvm),
+            "--backend",
+            str(ROOT),
+            "--target-dir",
+            str(TEST_TARGET_DIR),
+        ]
+        if release:
+            command.append("--release")
+        return run_command(command, env=stdlib_build_environment(env))
+
+    if test.kind == "integration":
+        cargo_jvm = ROOT / "cargo-jvm" / "target" / "release" / (
+            "cargo-jvm.exe" if os.name == "nt" else "cargo-jvm"
+        )
+        command = [
+            str(cargo_jvm),
+            "package",
+            "--manifest-path",
+            str(test.directory / "Cargo.toml"),
+            "--target-dir",
+            str(TEST_TARGET_DIR),
+            "--jobs",
+            str(jobs),
+            "--output",
+            str(jar_path(test, release)),
+        ]
+        if release:
+            command.extend(
+                ["--release", "--config", 'profile.release.debug="line-tables-only"']
+            )
+        environment = stdlib_build_environment(env)
+        environment["CARGO_JVM_BACKEND_PATH"] = str(ROOT)
+        return run_command(command, env=environment)
+
     return run_command(
         cargo_build_command(test.directory / "Cargo.toml", release, jobs),
         env=stdlib_build_environment(env),

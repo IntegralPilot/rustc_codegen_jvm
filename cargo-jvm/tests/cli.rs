@@ -1,0 +1,350 @@
+#![cfg(unix)]
+
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use tempfile::TempDir;
+
+fn cargo_jvm() -> Command {
+    Command::new(env!("CARGO_BIN_EXE_cargo-jvm"))
+}
+
+fn executable(path: &Path, contents: &str) {
+    fs::write(path, contents).unwrap();
+    let mut permissions = fs::metadata(path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).unwrap();
+}
+
+fn fake_backend(temp: &TempDir) -> PathBuf {
+    let root = temp.path().join("backend");
+    fs::create_dir_all(root.join("java-linker/target/release")).unwrap();
+    fs::create_dir_all(root.join("runtime/build/libs")).unwrap();
+    fs::write(root.join("jvm-unknown-unknown.json"), "{}").unwrap();
+    fs::write(root.join("config.toml"), "").unwrap();
+    fs::write(root.join("Cargo.toml"), "[package]\nname = \"backend\"\n").unwrap();
+    fs::write(root.join("stdlib_overlay.py"), "").unwrap();
+    fs::write(root.join("build.py"), "").unwrap();
+    fs::write(root.join("runtime/build/libs/runtime-0.1.0.jar"), "").unwrap();
+    executable(
+        &root.join("java-linker/target/release/java-linker"),
+        "#!/bin/sh\nexit 0\n",
+    );
+    root
+}
+
+fn fake_python(temp: &TempDir) -> (PathBuf, PathBuf) {
+    let capture = temp.path().join("python-arguments");
+    let python = temp.path().join("python");
+    executable(
+        &python,
+        "#!/bin/sh\nif [ \"$1\" = --version ]; then exit 0; fi\nprintf '%s\\n' \"$@\" > \"$PYTHON_CAPTURE\"\n",
+    );
+    (python, capture)
+}
+
+#[test]
+fn setup_persists_the_backend_path() {
+    let temp = TempDir::new().unwrap();
+    let backend = fake_backend(&temp);
+    let config = temp.path().join("config/config.toml");
+    let (python, capture) = fake_python(&temp);
+    let output = cargo_jvm()
+        .env("CARGO_JVM_CONFIG", &config)
+        .env("PYTHON", python)
+        .env("PYTHON_CAPTURE", capture)
+        .arg("setup")
+        .arg(&backend)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let contents = fs::read_to_string(config).unwrap();
+    assert!(contents.contains(&backend.canonicalize().unwrap().display().to_string()));
+}
+
+#[test]
+fn build_forwards_cargo_arguments_and_adds_the_jvm_toolchain() {
+    let temp = TempDir::new().unwrap();
+    let backend = fake_backend(&temp);
+    let overlay = temp.path().join("overlay");
+    fs::create_dir(&overlay).unwrap();
+    let capture = temp.path().join("cargo-arguments");
+    let cargo = temp.path().join("cargo");
+    executable(
+        &cargo,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$CARGO_CAPTURE\"\n",
+    );
+
+    let status = cargo_jvm()
+        .env("CARGO", cargo)
+        .env("CARGO_CAPTURE", &capture)
+        .env("__CARGO_TESTS_ONLY_SRC_ROOT", overlay)
+        .arg("--backend-path")
+        .arg(&backend)
+        .args(["build", "--release", "--features", "demo"])
+        .status()
+        .unwrap();
+
+    assert!(status.success());
+    let arguments = fs::read_to_string(capture).unwrap();
+    assert!(arguments.starts_with("build\n--target\n"));
+    assert!(arguments.contains("-Zbuild-std=std,panic_unwind\n"));
+    assert!(arguments.ends_with("--release\n--features\ndemo\n"));
+}
+
+#[test]
+fn run_launches_the_reported_binary_jar_with_java_options() {
+    let temp = TempDir::new().unwrap();
+    let backend = fake_backend(&temp);
+    let overlay = temp.path().join("overlay");
+    fs::create_dir(&overlay).unwrap();
+    let jar = temp.path().join("demo.jar");
+    fs::write(&jar, "").unwrap();
+    let cargo = temp.path().join("cargo");
+    executable(
+        &cargo,
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' '{}'\n",
+            serde_json::json!({
+                "reason": "compiler-artifact",
+                "package_id": "path+file:///demo#0.1.0",
+                "target": {"name": "demo", "kind": ["bin"]},
+                "profile": {"test": false},
+                "filenames": [jar],
+                "executable": jar,
+            })
+        ),
+    );
+    let java_capture = temp.path().join("java-arguments");
+    let java = temp.path().join("java");
+    executable(
+        &java,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$JAVA_CAPTURE\"\n",
+    );
+
+    let status = cargo_jvm()
+        .env("CARGO", cargo)
+        .env("JAVA", java)
+        .env("JAVA_CAPTURE", &java_capture)
+        .env("__CARGO_TESTS_ONLY_SRC_ROOT", overlay)
+        .arg("--backend-path")
+        .arg(&backend)
+        .args([
+            "run",
+            "--stack",
+            "8m",
+            "--java-arg=-ea",
+            "--release",
+            "--",
+            "hello",
+        ])
+        .status()
+        .unwrap();
+
+    assert!(status.success());
+    let arguments = fs::read_to_string(java_capture).unwrap();
+    assert_eq!(
+        arguments,
+        format!("-Xss8m\n-ea\n-jar\n{}\nhello\n", jar.display())
+    );
+}
+
+#[test]
+fn package_links_library_rlibs_and_the_runtime_into_the_output_jar() {
+    let temp = TempDir::new().unwrap();
+    let backend = fake_backend(&temp);
+    let overlay = temp.path().join("overlay");
+    fs::create_dir(&overlay).unwrap();
+    let rlib = temp.path().join("libdemo.rlib");
+    fs::write(&rlib, "").unwrap();
+    let target = temp.path().join("target");
+    let cargo = temp.path().join("cargo");
+    executable(
+        &cargo,
+        &format!(
+            "#!/bin/sh\nif [ \"$1\" = metadata ]; then\n  printf '%s\\n' '{}'\nelse\n  printf '%s\\n' '{}'\nfi\n",
+            serde_json::json!({
+                "workspace_members": ["path+file:///demo#0.1.0"],
+                "target_directory": target,
+            }),
+            serde_json::json!({
+                "reason": "compiler-artifact",
+                "package_id": "path+file:///demo#0.1.0",
+                "target": {"name": "demo", "kind": ["lib"]},
+                "profile": {"test": false},
+                "filenames": [rlib],
+                "executable": null,
+            }),
+        ),
+    );
+    let linker_capture = temp.path().join("linker-arguments");
+    executable(
+        &backend.join("java-linker/target/release/java-linker"),
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$LINKER_CAPTURE\"\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = -o ]; then\n    shift\n    : > \"$1\"\n    exit 0\n  fi\n  shift\ndone\nexit 1\n",
+    );
+    let output = temp.path().join("dist/demo.jar");
+
+    let status = cargo_jvm()
+        .env("CARGO", cargo)
+        .env("LINKER_CAPTURE", &linker_capture)
+        .env("__CARGO_TESTS_ONLY_SRC_ROOT", overlay)
+        .arg("--backend-path")
+        .arg(&backend)
+        .args(["package", "--output"])
+        .arg(&output)
+        .status()
+        .unwrap();
+
+    assert!(status.success());
+    assert!(output.is_file());
+    let arguments = fs::read_to_string(linker_capture).unwrap();
+    assert!(arguments.contains(&rlib.display().to_string()));
+    assert!(arguments.contains("runtime-0.1.0.jar"));
+    assert!(arguments.ends_with(&format!("-o\n{}\n", output.display())));
+}
+
+#[test]
+fn test_launches_each_cargo_test_artifact() {
+    let temp = TempDir::new().unwrap();
+    let backend = fake_backend(&temp);
+    let overlay = temp.path().join("overlay");
+    fs::create_dir(&overlay).unwrap();
+    let jar = temp.path().join("demo-test.jar");
+    fs::write(&jar, "").unwrap();
+    let cargo = temp.path().join("cargo");
+    executable(
+        &cargo,
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' '{}'\n",
+            serde_json::json!({
+                "reason": "compiler-artifact",
+                "package_id": "path+file:///demo#0.1.0",
+                "target": {"name": "demo", "kind": ["lib"]},
+                "profile": {"test": true},
+                "filenames": [jar],
+                "executable": jar,
+            })
+        ),
+    );
+    let java_capture = temp.path().join("java-arguments");
+    let java = temp.path().join("java");
+    executable(
+        &java,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$JAVA_CAPTURE\"\n",
+    );
+
+    let status = cargo_jvm()
+        .env("CARGO", cargo)
+        .env("JAVA", java)
+        .env("JAVA_CAPTURE", &java_capture)
+        .env("__CARGO_TESTS_ONLY_SRC_ROOT", overlay)
+        .arg("--backend-path")
+        .arg(&backend)
+        .args(["test", "--", "--nocapture"])
+        .status()
+        .unwrap();
+
+    assert!(status.success());
+    assert_eq!(
+        fs::read_to_string(java_capture).unwrap(),
+        format!("-Xss16m\n-jar\n{}\n--nocapture\n", jar.display())
+    );
+}
+
+#[test]
+fn update_pulls_and_rebuilds_the_configured_checkout() {
+    let temp = TempDir::new().unwrap();
+    let backend = fake_backend(&temp);
+    fs::create_dir(backend.join(".git")).unwrap();
+    let config = temp.path().join("config/config.toml");
+    let (python, python_capture) = fake_python(&temp);
+    assert!(
+        cargo_jvm()
+            .env("CARGO_JVM_CONFIG", &config)
+            .env("PYTHON", &python)
+            .env("PYTHON_CAPTURE", &python_capture)
+            .arg("setup")
+            .arg(&backend)
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let git_capture = temp.path().join("git-arguments");
+    let git = temp.path().join("git");
+    executable(
+        &git,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$GIT_CAPTURE\"\n",
+    );
+    let status = cargo_jvm()
+        .env("CARGO_JVM_CONFIG", &config)
+        .env("GIT", git)
+        .env("GIT_CAPTURE", &git_capture)
+        .env("PYTHON", python)
+        .env("PYTHON_CAPTURE", &python_capture)
+        .arg("update")
+        .status()
+        .unwrap();
+
+    assert!(status.success());
+    let git_arguments = fs::read_to_string(git_capture).unwrap();
+    assert!(git_arguments.contains("-C\n"));
+    assert!(git_arguments.ends_with("pull\n--ff-only\n"));
+    assert!(
+        fs::read_to_string(python_capture)
+            .unwrap()
+            .contains("build.py\nall\n")
+    );
+}
+
+#[test]
+fn setup_without_arguments_clones_builds_and_configures_a_backend() {
+    let temp = TempDir::new().unwrap();
+    let source = fake_backend(&temp);
+    let destination = temp.path().join("installed-backend");
+    let config = temp.path().join("config/config.toml");
+    let git_capture = temp.path().join("git-arguments");
+    let git = temp.path().join("git");
+    executable(
+        &git,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$GIT_CAPTURE\"\ncp -R \"$FAKE_SOURCE\" \"$3\"\n",
+    );
+    let (python, python_capture) = fake_python(&temp);
+
+    let status = cargo_jvm()
+        .env("CARGO_JVM_CONFIG", &config)
+        .env("GIT", git)
+        .env("GIT_CAPTURE", &git_capture)
+        .env("FAKE_SOURCE", &source)
+        .env("CARGO_JVM_HOME", &destination)
+        .env("PYTHON", python)
+        .env("PYTHON_CAPTURE", &python_capture)
+        .arg("setup")
+        .status()
+        .unwrap();
+
+    assert!(status.success());
+    assert_eq!(
+        fs::read_to_string(git_capture).unwrap(),
+        format!(
+            "clone\nhttps://github.com/IntegralPilot/rustc_codegen_jvm.git\n{}\n",
+            destination.display()
+        )
+    );
+    assert!(
+        fs::read_to_string(python_capture)
+            .unwrap()
+            .contains("build.py\nall\n")
+    );
+    assert!(
+        fs::read_to_string(config)
+            .unwrap()
+            .contains(&destination.canonicalize().unwrap().display().to_string())
+    );
+}

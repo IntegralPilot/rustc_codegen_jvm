@@ -1,0 +1,23 @@
+[package]
+name = "cargo-jvm"
+version = "0.1.0"
+edition = "2024"
+description = "Cargo subcommand for building, running, testing, and packaging Rust code for the JVM"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/IntegralPilot/rustc_codegen_jvm"
+readme = "README.md"
+keywords = ["cargo", "jvm", "java", "rustc-codegen"]
+categories = ["development-tools::cargo-plugins", "compilers"]
+
+[dependencies]
+directories = "6.0.0"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+toml = "0.9.8"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[[bin]]
+name = "cargo-jvm"
+path = "src/main.rs"

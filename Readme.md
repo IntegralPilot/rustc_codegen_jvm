@@ -22,29 +22,28 @@ The official Rust [`coretests`](https://github.com/rust-lang/rust/tree/main/libr
 
 ## Quickstart
 
-Get up and running quickly:
-
+### Clone the repo and install `cargo-jvm`
+If on Windows, please use PowerShell so `$PWD` will work.
 ```bash
-# 1. Clone the repository
 git clone https://github.com/IntegralPilot/rustc_codegen_jvm
 cd rustc_codegen_jvm
+cargo install --path cargo-jvm
+cargo jvm setup "$PWD"
+```
 
-# 2. Build the backend toolchain
-./build.py all   # On Windows: python build.py all
+### Make a new hello_world project
 
-# 3. Make a new hello_world project
+```bash
 cargo new hello_world --bin
 cd hello_world
-
-# 4. Build it using cargo (the script automatically provides the right args)
-../jvm_build.py # On Windows: python ..\jvm_build.py
-
-# 5. Run the resulting JAR
-# Replace : (inside `classes:target`) with ; if on Windows
-java -cp ../runtime/build/classes:target/jvm-unknown-unknown/debug/hello_world.jar hello_world.hello_world
-
-# You should see "Hello, world!" printed to the console.
 ```
+
+### Build and run on JVM
+```bash
+cargo jvm run
+```
+
+You should see "Hello, world!" printed to the console.
 
 Then, head down to [Usage](#usage) to learn how to integrate it into your project.
 
@@ -56,12 +55,11 @@ Then, head down to [Usage](#usage) to learn how to integrate it into your projec
 5. [How It Works](#how-it-works)
 6. [Interop Model](#interop-model)
 7. [Prerequisites](#prerequisites)
-8. [Installation & Build](#installation--build)
-9. [Usage](#usage)
-10. [Running Tests](#running-tests)
-11. [Project Structure](#project-structure)
-12. [Contributing](#contributing)
-13. [License](#license)
+8. [Usage](#usage)
+9. [Running Tests](#running-tests)
+10. [Project Structure](#project-structure)
+11. [Contributing](#contributing)
+12. [License](#license)
 
 ## Why is this useful?
 
@@ -191,7 +189,7 @@ The following example programs live in `tests/`, are compiled with the standard 
 | **[Threads](tests/binary/threads/src/main.rs)** | Multi-threading, scoped threads, mutexes (with poisoning), RWLocks, barriers, condition variables, and TLS. | 
 | **[Panic](tests/binary/panic/src/main.rs)** | Unwinding, catching static/dynamic panic payloads, resuming unwinds, and custom panic hooks. |
 | **[Async / Await](tests/binary/async_await/src/main.rs)** | Multi-poll futures, nested and recursive async work, async closures and trait methods, `dyn Future`, cross-thread execution, cancellation, and unwinding across suspension points. |
-| **[STD](tests/binary/std/src/main.rs)** | File system operations,command-line arguments, environment variables, standard I/O, and runtime context. |
+| **[STD](tests/binary/std/src/main.rs)** | File system operations, command-line arguments, environment variables, standard I/O, and runtime context. |
 
 ### Standalone Rust Programs
 | Example | Demonstrates |
@@ -234,7 +232,6 @@ Compiled JAR files emit rich JVM metadata (`LineNumberTable`, parameter names, n
 * Java NIO's `DirectoryStream` does not expose the native directory-entry type (`d_type`). `DirEntry::file_type` therefore performs a no-follow metadata lookup.
 * Code that heavily relies on raw pointer arithmetic executes through the Virtual MMU translation layer, which introduces extra memory allocations and GC overhead compared to structured stack/heap access.
 * The backend relies heavily on HotSpot's JIT (C2) compiler for runtime optimisation rather than aggressive AOT passes during compilation.
-* The default stack size on the JVM is lower than typical native targets. Like on native, if you encounter a `StackOverflowError` with deeply recursive code, you should increase the per-thread stack size. This can be done with the `-Xss` flag (for example, `java -Xss16m ...`).
 * Although upstream `coretests` pass, niche compiler edge cases may still trigger Internal Compiler Errors (ICEs).
 * The `quote!()` proc macro is currently unsupported.
 * If you pass a Rust object to Java (or another JVM language) code, there's no guarantee it has to follow Rust's rules (i.e. ownership, borrowing, or drop semantics). This matches what happens on native targets when interacting with FFI, but potentially can be improved for the JVM in future.
@@ -300,56 +297,84 @@ Rust constructs map directly to JVM structures without requiring JNI wrapper cod
 - **Rust Nightly** (configured automatically via `rust-toolchain.toml`)
 - **JDK 8+** (`java`, `javac`, and `jar` must be available on `PATH`)
 - **Python 3.8+**
-
-## Installation & Build
-
-Clone the repository and build all toolchain components using the orchestration script:
-
-**Linux / macOS:**
-```bash
-git clone https://github.com/IntegralPilot/rustc_codegen_jvm
-cd rustc_codegen_jvm
-./build.py all
-```
-
-**Windows:**
-```powershell
-git clone https://github.com/IntegralPilot/rustc_codegen_jvm.git
-cd rustc_codegen_jvm
-python build.py all
-```
-
-Subsequent runs of `build.py` check file timestamps and only rebuild modified components.
+- **Git**
+- **cargo-jvm** - see install instructions in [its README](cargo-jvm/README.md)
 
 ## Usage
 
-1. Copy the generated `config.toml` from the root of this repository into your target Rust project's `.cargo/config.toml`.
-2. Compile your crate targeting the JVM:
+[`cargo-jvm`](cargo-jvm/README.md) is used to make building and running Rust projects on the JVM as seamless as possible. It wraps the standard Cargo workflow, forwarding all ordinary Cargo selection and feature arguments. For instructions on installing `cargo-jvm`, see [its README](cargo-jvm/README.md).
+
+The following commands assume you are within a Rust project directory that you wish to compile/run using the JVM.
+
+### Building
 
 ```bash
-/path/to/rustc_codegen_jvm/jvm_build.py   # On Windows: python \path\to\rustc_codegen_jvm\jvm_build.py
+cargo jvm build
+cargo jvm build --release --features serde
+cargo jvm build --workspace -j 8
 ```
 
-Add `--release` for optimised artifacts. Output `.jar` files are placed in `target/jvm-unknown-unknown/debug` or `release`. 
+Build artifacts are placed under `target/jvm-unknown-unknown/debug` or `release`, just as with an explicit Cargo target. 
 
-If your crate is a binary, it can be executed directly: 
+Binary artifacts are JARs (but dependent upon `org.rustlang.runtime` being in the classpath) and libraries remain Rust `.rlib` inputs. 
+
+Both types of projects can be packaged into fully self-contained JARs using `cargo jvm package` (see below).
+
+### Running
+
+Build and launch a binary with the correct JAR and classpath automatically:
+
 ```bash
-java -cp /path/to/rustc_codegen_jvm/runtime/build/classes:<app>.jar [crate_name].[crate_name]
+cargo jvm run
+cargo jvm run --release
 ```
 
-For workloads with intentionally deep recursion, pass a suitable per-thread JVM stack size:
+The launcher defaults to a 16 MiB JVM thread stack. It can be adjusted, and arbitrary Java options and program arguments can be provided:
 
 ```bash
-java -Xss16m -cp /path/to/rustc_codegen_jvm/runtime/build/classes:<app>.jar [crate_name].[crate_name]
+cargo jvm run --stack 32m --java-arg=-ea -- program-argument
 ```
 
-Library crates currently remain `.rlib` artifacts. Automatic library JAR
-packaging was removed to avoid running the linker for every dependency; an
-explicit `cargo-jvm` packaging command is planned.
+### Packaging into self-contained JARs
+
+Create a self-contained distributable JAR with all required `org.rustlang.runtime` classes. 
+
+```bash
+cargo jvm package --release
+cargo jvm package --output dist/my-app.jar
+```
+
+Default outputs go to `target/jvm-package/<profile>`. 
+
+Use `--bin` or `--lib` when a package contains both and a single `--output` is requested:
+```
+cargo jvm package --lib --output dist/my-library.jar
+cargo jvm package --bin my-app --output dist/my-app.jar
+```
+
+### Tests
+
+Rust test targets can also run on the JVM:
+
+```bash
+cargo jvm test`
+cargo jvm test --release --workspace
+cargo jvm test -- --nocapture
+```
+
+This compiles Cargo's test targets with `--no-run`, then launches every reported test JAR on the JVM. 
+
+### Other
+
+`cargo jvm doctor` reports the selected backend, Java, Cargo, target and runtime paths. Please run this if you are reporting a bug.
+
+`cargo jvm update` pulls and rebuilds the backend. 
+
+Run `cargo jvm --help` for all options.
 
 ## Running Tests
 
-Run the binary and multi-crate self-test suite:
+Run the binary, multi-crate, Rust/Java integration, and `cargo-jvm` workflow self-test suite:
 
 ```bash
 python3 Tester.py             # Debug build testing
@@ -373,9 +398,11 @@ python3 Coretests.py --release   # Release mode
 │   ├── lower2/               # OOMIR -> Bytecode generator
 │   └── oomir.rs              # OOMIR definitions
 ├── java-linker/              # JAR packaging and manifest utility
+├── cargo-jvm/                # `cargo jvm` build, run, test and package command
 ├── runtime/                  # Core Java runtime support library
 ├── std/                      # Standard library JVM patch overlays
 ├── tests/                    # Integration, binary, and multicrate tests
+│   └── cargo_jvm/            # Real build/run/test/package demo projects
 ├── build.py                  # Master build script
 ├── test_harness.py           # Shared test execution utilities
 ├── Tester.py                 # Main test suite runner
@@ -386,9 +413,9 @@ python3 Coretests.py --release   # Release mode
 
 Contributions, bug reports, and feature requests are welcome!
 
-If you are interested in contributing:
-* Check out active discussions on the [Discussions](https://github.com/IntegralPilot/rustc_codegen_jvm/discussions) board.
-* For significant changes or architecture proposals, please open an issue first to discuss the design.
+If you are interested in contributing but unsure where to start, feel free to open a thread on the [Discussions](https://github.com/IntegralPilot/rustc_codegen_jvm/discussions) board and I can point you in the right direction about what's useful right now.
+
+For significant changes or architecture proposals, please open an issue and/or discussion first to discuss the design.
 
 ## License
 

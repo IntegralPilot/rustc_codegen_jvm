@@ -54,9 +54,9 @@ diff --git a/std/src/sys/time/mod.rs b/std/src/sys/time/mod.rs
 diff --git a/std/src/sys/sync/mutex/mod.rs b/std/src/sys/sync/mutex/mod.rs
 --- a/std/src/sys/sync/mutex/mod.rs
 +++ b/std/src/sys/sync/mutex/mod.rs
-@@ -9,5 +9,6 @@ cfg_select! {
-         all(target_family = "wasm", target_feature = "atomics"),
+@@ -12,5 +12,6 @@ cfg_select! {
          target_os = "hermit",
+         all(target_os = "wasi", target_env = "p3"),
 +        target_os = "jvm",
      ) => {
          mod futex;
@@ -64,9 +64,10 @@ diff --git a/std/src/sys/sync/mutex/mod.rs b/std/src/sys/sync/mutex/mod.rs
 diff --git a/std/src/sys/sync/rwlock/mod.rs b/std/src/sys/sync/rwlock/mod.rs
 --- a/std/src/sys/sync/rwlock/mod.rs
 +++ b/std/src/sys/sync/rwlock/mod.rs
-@@ -9,5 +9,6 @@ cfg_select! {
+@@ -13,5 +13,6 @@ cfg_select! {
          target_os = "hermit",
-        target_os = "motor",
+         target_os = "motor",
+         all(target_os = "wasi", target_env = "p3"),
 +        target_os = "jvm",
      ) => {
          mod futex;
@@ -74,9 +75,9 @@ diff --git a/std/src/sys/sync/rwlock/mod.rs b/std/src/sys/sync/rwlock/mod.rs
 diff --git a/std/src/sys/sync/condvar/mod.rs b/std/src/sys/sync/condvar/mod.rs
 --- a/std/src/sys/sync/condvar/mod.rs
 +++ b/std/src/sys/sync/condvar/mod.rs
-@@ -10,5 +10,6 @@ cfg_select! {
-         all(target_family = "wasm", target_feature = "atomics"),
+@@ -13,5 +13,6 @@ cfg_select! {
          target_os = "hermit",
+         all(target_os = "wasi", target_env = "p3"),
 +        target_os = "jvm",
      ) => {
          mod futex;
@@ -84,9 +85,9 @@ diff --git a/std/src/sys/sync/condvar/mod.rs b/std/src/sys/sync/condvar/mod.rs
 diff --git a/std/src/sys/sync/once/mod.rs b/std/src/sys/sync/once/mod.rs
 --- a/std/src/sys/sync/once/mod.rs
 +++ b/std/src/sys/sync/once/mod.rs
-@@ -16,5 +16,6 @@ cfg_select! {
-         target_os = "fuchsia",
+@@ -20,5 +20,6 @@ cfg_select! {
          target_os = "hermit",
+         all(target_os = "wasi", target_env = "p3"),
 +        target_os = "jvm",
      ) => {
          mod futex;
@@ -196,9 +197,9 @@ diff --git a/std/src/sys/thread/mod.rs b/std/src/sys/thread/mod.rs
 diff --git a/std/src/sys/sync/thread_parking/mod.rs b/std/src/sys/sync/thread_parking/mod.rs
 --- a/std/src/sys/sync/thread_parking/mod.rs
 +++ b/std/src/sys/sync/thread_parking/mod.rs
-@@ -12,5 +12,6 @@ cfg_select! {
-         target_os = "motor",
+@@ -15,5 +15,6 @@ cfg_select! {
          target_os = "hermit",
+         all(target_os = "wasi", target_env = "p3"),
 +        target_os = "jvm",
      ) => {
          mod futex;

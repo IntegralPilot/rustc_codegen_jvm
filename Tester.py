@@ -249,9 +249,15 @@ def run_test(test: TestCase, release: bool, build_jobs: int) -> tuple[bool, list
     proc = build_test(test, release, build_jobs)
     if proc.returncode != 0:
         write_failure(test.directory / "cargo-build-fail.generated", proc)
-        logs.append(f"|---- ❌ cargo build exited with code {proc.returncode}")
+        operation = "cargo-jvm workflow" if test.kind == "cargo_jvm" else "cargo build"
+        logs.append(f"|---- ❌ {operation} exited with code {proc.returncode}")
         ci_diagnostic(logs, f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}")
         return False, logs
+
+    if test.kind == "cargo_jvm":
+        logs.append("|--- 🧰 Exercised build, run, test, and package workflows")
+        logs.append("|--- ✅ Test passed!")
+        return True, logs
 
     jar = jar_path(test, release)
     if not jar.exists():
