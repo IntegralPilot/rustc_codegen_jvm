@@ -89,6 +89,42 @@ macro_rules! repeat_2048 {
     };
 }
 
+macro_rules! assert_all_slice_indexes {
+    ($arr:expr, $range:expr, $expected:expr) => {
+        let mut arr = $arr;
+        let mut expected = $expected;
+        {
+            let slice: &[_] = &arr;
+            let expected: &[_] = &expected;
+            assert_eq!(&slice[$range], expected);
+            assert_eq!(slice.get($range), Some(expected));
+            unsafe {
+                assert_eq!(slice.get_unchecked($range), expected);
+            }
+        }
+        {
+            let slice: &mut [_] = &mut arr;
+            let expected: &mut [_] = &mut expected;
+            assert_eq!(&mut slice[$range], expected);
+            assert_eq!(slice.get_mut($range), Some(&mut expected[..]));
+            unsafe {
+                assert_eq!(slice.get_unchecked_mut($range), expected);
+            }
+        }
+    };
+}
+
+#[inline(never)]
+fn outlined_with_retyped_locals() {
+    let values = [0, 1, 2, 3, 4, 5];
+    assert_all_slice_indexes!(values, .., [0, 1, 2, 3, 4, 5]);
+    assert_all_slice_indexes!(values, ..2, [0, 1]);
+    assert_all_slice_indexes!(values, ..=1, [0, 1]);
+    assert_all_slice_indexes!(values, 2.., [2, 3, 4, 5]);
+    assert_all_slice_indexes!(values, 1..4, [1, 2, 3]);
+    assert_all_slice_indexes!(values, 1..=3, [1, 2, 3]);
+}
+
 #[inline(never)]
 fn outlined_with_many_live_values(seed: u64) -> u64 {
     let value_0 = seed.wrapping_add(0);
@@ -652,6 +688,7 @@ fn main() {
     assert_eq!(LARGE_CONSTANT_TABLE.len(), 17_000);
     assert_eq!(LARGE_CONSTANT_TABLE[0].value, 37);
     assert!(LARGE_CONSTANT_TABLE[16_999].enabled);
+    outlined_with_retyped_locals();
 
     for seed in [0, 1, 7, u32::MAX as u64, u64::MAX - 300] {
         assert_eq!(outlined_with_many_live_values(seed), reference(seed));

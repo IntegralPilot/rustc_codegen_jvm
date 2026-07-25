@@ -632,7 +632,7 @@ def write_report(report: dict[str, Any], path: Path) -> None:
     summary = markdown_summary(report)
     path.with_suffix(".md").write_text(summary, encoding="utf-8")
     github_summary = os.environ.get("GITHUB_STEP_SUMMARY")
-    if github_summary:
+    if github_summary and report.get("status") != "running":
         with Path(github_summary).open("a", encoding="utf-8") as destination:
             destination.write(summary)
 

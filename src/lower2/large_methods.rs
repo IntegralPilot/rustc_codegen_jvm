@@ -609,11 +609,15 @@ fn live_variables(
         let mut block_definitions = HashSet::default();
         for instruction in &block.instructions {
             for variable in instruction_uses(instruction, variable_types) {
-                if !block_definitions.contains(&variable) {
+                if !block_definitions.contains(&variable.name) {
                     block_uses.insert(variable);
                 }
             }
-            block_definitions.extend(instruction_definitions(instruction));
+            block_definitions.extend(
+                instruction_definitions(instruction)
+                    .into_iter()
+                    .map(|variable| variable.name),
+            );
         }
         uses.insert(label.clone(), block_uses);
         definitions.insert(label.clone(), block_definitions);
@@ -634,9 +638,7 @@ fn live_variables(
             for successor in &successors[&label] {
                 live_out.extend(live_in[successor].iter().cloned());
             }
-            for definition in &definitions[&label] {
-                live_out.remove(definition);
-            }
+            live_out.retain(|variable: &Variable| !definitions[&label].contains(&variable.name));
             live_out.extend(uses[&label].iter().cloned());
             if live_out != live_in[&label] {
                 live_in.insert(label, live_out);
