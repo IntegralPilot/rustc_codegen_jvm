@@ -1,0 +1,28 @@
+diff --git a/std/src/sys/net/connection/mod.rs b/std/src/sys/net/connection/mod.rs
+--- a/std/src/sys/net/connection/mod.rs
++++ b/std/src/sys/net/connection/mod.rs
+@@ -31,6 +31,10 @@ cfg_select! {
+         mod uefi;
+         pub use uefi::*;
+     }
++    target_os = "jvm" => {
++        mod jvm;
++        pub use jvm::*;
++    }
+     _ => {
+         mod unsupported;
+         pub use unsupported::*;
+diff --git a/std/src/sys/net/hostname/mod.rs b/std/src/sys/net/hostname/mod.rs
+--- a/std/src/sys/net/hostname/mod.rs
++++ b/std/src/sys/net/hostname/mod.rs
+@@ -8,6 +8,10 @@ cfg_select! {
+         mod windows;
+         pub use windows::hostname;
+     }
++    target_os = "jvm" => {
++        mod jvm;
++        pub use jvm::hostname;
++    }
+     _ => {
+         mod unsupported;
+         pub use unsupported::hostname;
