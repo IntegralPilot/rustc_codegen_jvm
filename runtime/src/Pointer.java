@@ -3339,6 +3339,11 @@ public final class Pointer {
         pointer.commitMemoryView();
     }
 
+    /** Propagates a direct generated-field write through a decoded memory view. */
+    public static void commitFieldOwner(Object owner) {
+        commitOriginMemoryView(owner);
+    }
+
     /** Commits direct field mutations made through the current decoded view. */
     public void commitMemoryView() {
         discardProjectedFieldViews(managedViewObject());
@@ -6671,6 +6676,30 @@ public final class Pointer {
                 addressOriginOffset());
     }
 
+    private ExposedTarget exposedTargetAt(long displacement) {
+        return new ExposedTarget(
+                allocation,
+                allocationElementSize,
+                Math.addExact(byteOffset, displacement),
+                allocation == null
+                        ? Math.addExact(exposedAddress, displacement)
+                        : exposedAddress,
+                allocationCodecClassName,
+                viewSize,
+                viewCodecClassName,
+                metadata,
+                zeroSizedSourceViewSize(),
+                zeroSizedSourceViewCodecClassName(),
+                traitObjectCarrier,
+                traitMetadataCarrier,
+                traitMetadataMarker,
+                traitPointeeSize,
+                traitPointeeAlignment,
+                traitAdapterClassName,
+                addressOrigin(),
+                Math.addExact(addressOriginOffset(), displacement));
+    }
+
     /** Exposes this pointer's provenance so its numeric address can be recovered later. */
     public long address() {
         Pointer origin = addressOrigin();
@@ -6700,6 +6729,62 @@ public final class Pointer {
     /** Returns a Rust pointer's address, including Java {@code null} as address zero. */
     public static long address(Pointer pointer) {
         return pointer == null ? 0L : pointer.address();
+    }
+
+    public static long addressRelative(
+            Pointer base, long elementOffset, long byteOffset) {
+        if (base == null) {
+            return 0L;
+        }
+        long displacement = Math.addExact(
+                Math.multiplyExact(elementOffset, base.viewSize), byteOffset);
+        if (displacement == 0) {
+            return base.address();
+        }
+        Pointer origin = base.addressOrigin();
+        if (origin != null) {
+            return Math.addExact(
+                    origin.address(),
+                    Math.addExact(base.addressOriginOffset(), displacement));
+        }
+        if (base.allocation == null) {
+            return Math.addExact(base.exposedAddress, displacement);
+        }
+        synchronized (ALLOCATIONS) {
+            AllocationInfo info = allocationInfo(base.allocation);
+            long address = Math.addExact(
+                    base.publishAllocationRange(info),
+                    Math.addExact(base.byteOffset, displacement));
+            registerExposedTarget(address, base.exposedTargetAt(displacement));
+            return address;
+        }
+    }
+
+    public static long addrRelative(
+            Pointer base, long elementOffset, long byteOffset) {
+        if (base == null) {
+            return 0L;
+        }
+        long displacement = Math.addExact(
+                Math.multiplyExact(elementOffset, base.viewSize), byteOffset);
+        return Math.addExact(base.numericAddress(), displacement);
+    }
+
+    public static boolean isNullRelative(
+            Pointer base, long elementOffset, long byteOffset) {
+        return base == null || addrRelative(base, elementOffset, byteOffset) == 0;
+    }
+
+    public static boolean isAlignedRelative(
+            Pointer base,
+            long elementOffset,
+            long byteOffset,
+            long alignment) {
+        if (alignment <= 0 || (alignment & (alignment - 1)) != 0) {
+            throw new IllegalArgumentException(
+                    "is_aligned_to: align is not a power-of-two");
+        }
+        return (addrRelative(base, elementOffset, byteOffset) & (alignment - 1)) == 0;
     }
 
     /**
@@ -6923,22 +7008,26 @@ public final class Pointer {
     }
 
     private long loadUnsigned(int byteCount) {
+        return loadUnsignedAt(byteOffset, byteCount);
+    }
+
+    private long loadUnsignedAt(long absoluteByteOffset, int byteCount) {
         if (byteCount < 0 || byteCount > 8) {
             throw new IllegalArgumentException("scalar loads support at most eight bytes");
         }
         if (byteCount == 0) {
             return 0;
         }
-        Long embedded = loadEmbeddedArrayBits(byteOffset, byteCount);
+        Long embedded = loadEmbeddedArrayBits(absoluteByteOffset, byteCount);
         if (embedded != null) {
             return embedded.longValue();
         }
         if (allocation != null && allocationElementSize > 0) {
-            int withinElement = (int) Math.floorMod(byteOffset, allocationElementSize);
+            int withinElement = (int) Math.floorMod(absoluteByteOffset, allocationElementSize);
             if (withinElement + byteCount <= allocationElementSize) {
                 int elementIndex = Math.toIntExact(
-                        Math.floorDiv(byteOffset, allocationElementSize));
-                flushMemoryViewsOverlapping(byteOffset, byteCount);
+                        Math.floorDiv(absoluteByteOffset, allocationElementSize));
+                flushMemoryViewsOverlapping(absoluteByteOffset, byteCount);
                 Object value = readElement(elementIndex);
                 if (value instanceof BigInteger
                         || value instanceof I128
@@ -6993,7 +7082,7 @@ public final class Pointer {
         }
         long result = 0;
         for (int index = 0; index < byteCount; index++) {
-            result |= ((long) loadByte(byteOffset + index)) << (index * 8);
+            result |= ((long) loadByte(absoluteByteOffset + index)) << (index * 8);
         }
         return result;
     }
@@ -7579,6 +7668,94 @@ public final class Pointer {
         throw new IllegalStateException(
                 scalarType + " load requires a " + expectedSize + "-byte view, but pointer has a "
                         + viewSize + "-byte view" + sourceView);
+    }
+
+    private long relativeByteOffset(long elementOffset, long additionalByteOffset) {
+        return Math.addExact(
+                byteOffset,
+                Math.addExact(
+                        Math.multiplyExact(elementOffset, viewSize),
+                        additionalByteOffset));
+    }
+
+    /**
+     * Materializes a compiler-deferred derived pointer at an ABI or semantic boundary.
+     * A zero displacement preserves object identity and allocates nothing.
+     */
+    public static Pointer materializeRelative(
+            Pointer base, long elementOffset, long byteOffset) {
+        if (elementOffset == 0 && byteOffset == 0) {
+            return base;
+        }
+        long displacement = Math.addExact(
+                Math.multiplyExact(elementOffset, base.viewSize), byteOffset);
+        return base.byte_offset(displacement);
+    }
+
+    /** Retypes a deferred derived pointer with a single allocation. */
+    public static Pointer retypeRelative(
+            Pointer base,
+            long elementOffset,
+            long byteOffset,
+            long newViewSize,
+            String newViewCodecClassName) {
+        long displacement = Math.addExact(
+                Math.multiplyExact(elementOffset, base.viewSize), byteOffset);
+        if (displacement == 0) {
+            return base.retype(newViewSize, newViewCodecClassName);
+        }
+        return base.byteOffsetRetype(
+                displacement, newViewSize, newViewCodecClassName);
+    }
+
+    public static boolean getBooleanRelative(
+            Pointer base, long elementOffset, long byteOffset) {
+        base.requireScalarViewSize(1, "bool");
+        return base.loadUnsignedAt(
+                        base.relativeByteOffset(elementOffset, byteOffset), 1)
+                != 0;
+    }
+
+    public static byte getI8Relative(
+            Pointer base, long elementOffset, long byteOffset) {
+        base.requireScalarViewSize(1, "i8/u8");
+        return (byte) base.loadUnsignedAt(
+                base.relativeByteOffset(elementOffset, byteOffset), 1);
+    }
+
+    public static short getI16Relative(
+            Pointer base, long elementOffset, long byteOffset) {
+        base.requireScalarViewSize(2, "i16/u16/f16");
+        return (short) base.loadUnsignedAt(
+                base.relativeByteOffset(elementOffset, byteOffset), 2);
+    }
+
+    public static int getI32Relative(
+            Pointer base, long elementOffset, long byteOffset) {
+        base.requireScalarViewSize(4, "i32/u32/char");
+        return (int) base.loadUnsignedAt(
+                base.relativeByteOffset(elementOffset, byteOffset), 4);
+    }
+
+    public static long getI64Relative(
+            Pointer base, long elementOffset, long byteOffset) {
+        base.requireScalarViewSize(8, "i64/u64");
+        return base.loadUnsignedAt(
+                base.relativeByteOffset(elementOffset, byteOffset), 8);
+    }
+
+    public static float getF32Relative(
+            Pointer base, long elementOffset, long byteOffset) {
+        base.requireScalarViewSize(4, "f32");
+        return Float.intBitsToFloat((int) base.loadUnsignedAt(
+                base.relativeByteOffset(elementOffset, byteOffset), 4));
+    }
+
+    public static double getF64Relative(
+            Pointer base, long elementOffset, long byteOffset) {
+        base.requireScalarViewSize(8, "f64");
+        return Double.longBitsToDouble(base.loadUnsignedAt(
+                base.relativeByteOffset(elementOffset, byteOffset), 8));
     }
 
     public boolean getBoolean() {
