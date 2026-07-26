@@ -67,6 +67,11 @@ fn fat_pointer_games() {
     let total: f64 = shapes.iter().map(|shape| shape.area()).sum();
     println!("total area={total:.4}");
     assert!((total - (std::f64::consts::PI + 4.0)).abs() < 1e-10);
+
+    let debug: &dyn std::fmt::Debug = &42i32;
+    assert!(format!("{debug:?}") == "42");
+    let any: &dyn std::any::Any = &42i32;
+    assert!(format!("{any:?}") == "Any { .. }");
 }
 
 fn swap_replace_games() {

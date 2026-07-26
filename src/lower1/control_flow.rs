@@ -720,54 +720,72 @@ pub(super) fn emit_rust_drop_value<'tcx>(
                         pointer_ty = field_ty;
                         pointer_rust_ty = field_rust_ty;
                     }
-                    if matches!(pointee_ty.kind(), TyKind::Dynamic(..)) {
-                        let pointee = format!("{temp_prefix}_box_dyn_pointee");
-                        instructions.push(oomir::Instruction::InvokeVirtual {
-                            dest: Some(pointee.clone()),
-                            class_name: oomir::POINTER_CLASS.to_string(),
-                            method_name: "getObject".to_string(),
-                            method_ty: oomir::Signature {
-                                params: vec![("self".to_string(), pointer_ty)],
-                                ret: Box::new(oomir::Type::Class("java/lang/Object".to_string())),
-                                is_static: false,
-                            },
-                            args: Vec::new(),
-                            operand: pointer,
-                        });
-                        instructions.push(oomir::Instruction::InvokeStatic {
-                            class_name: oomir::POINTER_CLASS.to_string(),
-                            method_name: "dropRustValue".to_string(),
-                            method_ty: oomir::Signature {
-                                params: vec![(
-                                    "value".to_string(),
+                    let drop_instance = Instance::resolve_drop_glue(tcx, pointee_ty);
+                    let target = super::naming::mono_fn_name_from_instance(tcx, drop_instance);
+                    let pointee_signature = oomir::Signature {
+                        params: vec![("pointee".to_string(), pointer_ty)],
+                        ret: Box::new(oomir::Type::Void),
+                        is_static: true,
+                    };
+                    let box_class = oomir_ty
+                        .get_class_name()
+                        .expect("Box has a JVM class")
+                        .to_string();
+                    let box_signature = oomir::Signature {
+                        params: vec![("self".to_string(), oomir_ty.clone())],
+                        ret: Box::new(oomir::Type::Void),
+                        is_static: true,
+                    };
+                    let (pointee_owner, pointee_method, pointee_descriptor) =
+                        if matches!(pointee_ty.kind(), TyKind::Dynamic(..)) {
+                            (String::new(), String::new(), String::new())
+                        } else {
+                            (
+                                target
+                                    .class_to_call_on
+                                    .expect("Box pointee drop glue has a JVM owner"),
+                                target.method_name,
+                                pointee_signature.to_jvm_descriptor_with_explicit_params(),
+                            )
+                        };
+                    instructions.push(oomir::Instruction::InvokeStatic {
+                        class_name: oomir::POINTER_CLASS.to_string(),
+                        method_name: "dropBoxWithCleanup".to_string(),
+                        method_ty: oomir::Signature {
+                            params: vec![
+                                (
+                                    "pointee".to_string(),
                                     oomir::Type::Class("java/lang/Object".to_string()),
-                                )],
-                                ret: Box::new(oomir::Type::Void),
-                                is_static: true,
-                            },
-                            args: vec![oomir::Operand::Variable {
-                                name: pointee,
-                                ty: oomir::Type::Class("java/lang/Object".to_string()),
-                            }],
-                            dest: None,
-                        });
-                    } else {
-                        let drop_instance = Instance::resolve_drop_glue(tcx, pointee_ty);
-                        let target = super::naming::mono_fn_name_from_instance(tcx, drop_instance);
-                        instructions.push(oomir::Instruction::InvokeStatic {
-                            class_name: target
-                                .class_to_call_on
-                                .expect("Box pointee drop glue has a JVM owner"),
-                            method_name: target.method_name,
-                            method_ty: oomir::Signature {
-                                params: vec![("pointee".to_string(), pointer_ty)],
-                                ret: Box::new(oomir::Type::Void),
-                                is_static: true,
-                            },
-                            args: vec![pointer],
-                            dest: None,
-                        });
-                    }
+                                ),
+                                (
+                                    "box".to_string(),
+                                    oomir::Type::Class("java/lang/Object".to_string()),
+                                ),
+                                ("pointee_owner".to_string(), oomir::Type::java_string()),
+                                ("pointee_method".to_string(), oomir::Type::java_string()),
+                                ("pointee_descriptor".to_string(), oomir::Type::java_string()),
+                                ("box_owner".to_string(), oomir::Type::java_string()),
+                                ("box_method".to_string(), oomir::Type::java_string()),
+                                ("box_descriptor".to_string(), oomir::Type::java_string()),
+                            ],
+                            ret: Box::new(oomir::Type::Void),
+                            is_static: true,
+                        },
+                        args: vec![
+                            pointer,
+                            value,
+                            oomir::Operand::Constant(oomir::Constant::String(pointee_owner)),
+                            oomir::Operand::Constant(oomir::Constant::String(pointee_method)),
+                            oomir::Operand::Constant(oomir::Constant::String(pointee_descriptor)),
+                            oomir::Operand::Constant(oomir::Constant::String(box_class)),
+                            oomir::Operand::Constant(oomir::Constant::String("drop".to_string())),
+                            oomir::Operand::Constant(oomir::Constant::String(
+                                box_signature.to_jvm_descriptor_with_explicit_params(),
+                            )),
+                        ],
+                        dest: None,
+                    });
+                    return;
                 }
             }
 
@@ -776,6 +794,44 @@ pub(super) fn emit_rust_drop_value<'tcx>(
                     .get_class_name()
                     .expect("a Rust Drop ADT has a JVM class")
                     .to_string();
+                if !adt_def.is_box() {
+                    let drop_signature = oomir::Signature {
+                        params: vec![("self".to_string(), oomir_ty.clone())],
+                        ret: Box::new(oomir::Type::Void),
+                        is_static: true,
+                    };
+                    instructions.push(oomir::Instruction::InvokeStatic {
+                        class_name: oomir::POINTER_CLASS.to_string(),
+                        method_name: "dropAdtWithCleanup".to_string(),
+                        method_ty: oomir::Signature {
+                            params: vec![
+                                (
+                                    "value".to_string(),
+                                    oomir::Type::Class("java/lang/Object".to_string()),
+                                ),
+                                ("owner".to_string(), oomir::Type::java_string()),
+                                ("drop_method".to_string(), oomir::Type::java_string()),
+                                ("drop_descriptor".to_string(), oomir::Type::java_string()),
+                                ("fields_method".to_string(), oomir::Type::java_string()),
+                            ],
+                            ret: Box::new(oomir::Type::Void),
+                            is_static: true,
+                        },
+                        args: vec![
+                            value,
+                            oomir::Operand::Constant(oomir::Constant::String(class_name)),
+                            oomir::Operand::Constant(oomir::Constant::String("drop".to_string())),
+                            oomir::Operand::Constant(oomir::Constant::String(
+                                drop_signature.to_jvm_descriptor_with_explicit_params(),
+                            )),
+                            oomir::Operand::Constant(oomir::Constant::String(
+                                "_rust_drop_fields".to_string(),
+                            )),
+                        ],
+                        dest: None,
+                    });
+                    return;
+                }
                 instructions.push(oomir::Instruction::InvokeStatic {
                     class_name,
                     method_name: "drop".to_string(),
@@ -948,6 +1004,20 @@ pub(super) fn emit_rust_drop_value<'tcx>(
             }
             let drop_instance = Instance::resolve_drop_glue(tcx, *element_ty);
             let target = super::naming::mono_fn_name_from_instance(tcx, drop_instance);
+            let drop_mir = tcx.instance_mir(drop_instance.def);
+            let drop_param_ty = EarlyBinder::bind(
+                tcx,
+                drop_mir.local_decls[rustc_middle::mir::Local::from_usize(1)].ty,
+            )
+            .instantiate(tcx, drop_instance.args)
+            .skip_norm_wip();
+            let element_oomir_ty =
+                super::types::ty_to_oomir_type(drop_param_ty, tcx, data_types, drop_instance);
+            let drop_signature = oomir::Signature {
+                params: vec![("element".to_string(), element_oomir_ty)],
+                ret: Box::new(oomir::Type::Void),
+                is_static: true,
+            };
             instructions.push(oomir::Instruction::InvokeStatic {
                 class_name: oomir::POINTER_CLASS.to_string(),
                 method_name: "dropSlice".to_string(),
@@ -959,6 +1029,9 @@ pub(super) fn emit_rust_drop_value<'tcx>(
                         ),
                         ("owner".to_string(), oomir::Type::java_string()),
                         ("method".to_string(), oomir::Type::java_string()),
+                        ("descriptor".to_string(), oomir::Type::java_string()),
+                        ("element_size".to_string(), oomir::Type::U64),
+                        ("element_codec".to_string(), oomir::Type::java_string()),
                     ],
                     ret: Box::new(oomir::Type::Void),
                     is_static: true,
@@ -969,6 +1042,25 @@ pub(super) fn emit_rust_drop_value<'tcx>(
                         target.class_to_call_on.expect("drop glue has a JVM owner"),
                     )),
                     oomir::Operand::Constant(oomir::Constant::String(target.method_name)),
+                    oomir::Operand::Constant(oomir::Constant::String(
+                        drop_signature.to_jvm_descriptor_with_explicit_params(),
+                    )),
+                    oomir::Operand::Constant(oomir::Constant::U64(
+                        u64::try_from(
+                            super::types::layout_size_bytes(tcx, *element_ty).unwrap_or_else(
+                                |error| {
+                                    panic!("could not determine slice drop element size: {error}")
+                                },
+                            ),
+                        )
+                        .expect("slice drop element size exceeds the JVM address space"),
+                    )),
+                    super::types::pointer_view_codec_operand(
+                        *element_ty,
+                        tcx,
+                        data_types,
+                        instance,
+                    ),
                 ],
                 dest: None,
             });
@@ -998,17 +1090,42 @@ pub(super) fn emit_rust_drop_value<'tcx>(
                 .expect("a Rust enum has a JVM class")
                 .to_string();
             if adt_def.destructor(tcx).is_some() {
+                let drop_signature = oomir::Signature {
+                    params: vec![("self".to_string(), oomir_ty.clone())],
+                    ret: Box::new(oomir::Type::Void),
+                    is_static: true,
+                };
                 instructions.push(oomir::Instruction::InvokeStatic {
-                    class_name: class_name.clone(),
-                    method_name: "drop".to_string(),
+                    class_name: oomir::POINTER_CLASS.to_string(),
+                    method_name: "dropAdtWithCleanup".to_string(),
                     method_ty: oomir::Signature {
-                        params: vec![("self".to_string(), oomir_ty.clone())],
+                        params: vec![
+                            (
+                                "value".to_string(),
+                                oomir::Type::Class("java/lang/Object".to_string()),
+                            ),
+                            ("owner".to_string(), oomir::Type::java_string()),
+                            ("drop_method".to_string(), oomir::Type::java_string()),
+                            ("drop_descriptor".to_string(), oomir::Type::java_string()),
+                            ("fields_method".to_string(), oomir::Type::java_string()),
+                        ],
                         ret: Box::new(oomir::Type::Void),
                         is_static: true,
                     },
-                    args: vec![value.clone()],
+                    args: vec![
+                        value,
+                        oomir::Operand::Constant(oomir::Constant::String(class_name)),
+                        oomir::Operand::Constant(oomir::Constant::String("drop".to_string())),
+                        oomir::Operand::Constant(oomir::Constant::String(
+                            drop_signature.to_jvm_descriptor_with_explicit_params(),
+                        )),
+                        oomir::Operand::Constant(oomir::Constant::String(
+                            "_rust_drop_fields".to_string(),
+                        )),
+                    ],
                     dest: None,
                 });
+                return;
             }
             instructions.push(oomir::Instruction::InvokeVirtual {
                 class_name,
@@ -2361,12 +2478,27 @@ pub(super) fn convert_basic_block<'tcx>(
                                     None
                                 };
 
-                            if let Some(callable_abi) = super::types::callable_trait_object_abi(
-                                receiver_mir_ty,
-                                tcx,
-                                data_types,
-                                instance,
-                            ) {
+                            let callable_trait_method =
+                                item.trait_container(tcx).is_some_and(|trait_def_id| {
+                                    let lang_items = tcx.lang_items();
+                                    [
+                                        lang_items.fn_trait(),
+                                        lang_items.fn_mut_trait(),
+                                        lang_items.fn_once_trait(),
+                                    ]
+                                    .contains(&Some(trait_def_id))
+                                });
+                            if let Some(callable_abi) = callable_trait_method
+                                .then(|| {
+                                    super::types::callable_trait_object_abi(
+                                        receiver_mir_ty,
+                                        tcx,
+                                        data_types,
+                                        instance,
+                                    )
+                                })
+                                .flatten()
+                            {
                                 let mut flattened_args = Vec::new();
                                 if !callable_abi.signature.params.is_empty() {
                                     let tuple_operand = method_args
@@ -2597,19 +2729,23 @@ pub(super) fn convert_basic_block<'tcx>(
                                         _ => false,
                                     }
                                 };
-                                // Upstream core passes the zero-sized `Clone::clone` function
-                                // item through `FnOnce` in helpers such as `Option::cloned`.
-                                // Lower its single tuple argument directly because a JVM
-                                // function-item carrier has no captured receiver state.
-                                let direct_fn_def_clone = match resolved_receiver_mir_ty.kind() {
-                                    TyKind::FnDef(def_id, _) => tcx
-                                        .opt_item_name(*def_id)
-                                        .is_some_and(|name| name == sym::clone),
-                                    _ => false,
-                                } && matches!(
-                                    declared_method_name.as_str(),
-                                    "call" | "call_mut" | "call_once"
-                                ) && explicit_method_args.len() == 1;
+                                let direct_fn_def_instance = match resolved_receiver_mir_ty.kind() {
+                                    TyKind::FnDef(def_id, args)
+                                        if matches!(
+                                            declared_method_name.as_str(),
+                                            "call" | "call_mut" | "call_once"
+                                        ) && explicit_method_args.len() == 1 =>
+                                    {
+                                        Instance::resolve_for_fn_ptr(
+                                            tcx,
+                                            typing_env,
+                                            *def_id,
+                                            args.no_bound_vars().unwrap(),
+                                        )
+                                        .filter(|target| tcx.is_mir_available(target.def_id()))
+                                    }
+                                    _ => None,
+                                };
                                 let is_pointer_cast_method = [
                                     sym::const_ptr_cast,
                                     sym::ptr_cast,
@@ -2879,55 +3015,122 @@ pub(super) fn convert_basic_block<'tcx>(
                                             instructions.push(instruction);
                                         }
                                     }
-                                } else if direct_fn_def_clone {
-                                    if let Some(dest) = effective_dest {
-                                        let tuple_operand = explicit_method_args[0].clone();
+                                } else if let Some(function_item) = direct_fn_def_instance {
+                                    let tuple_operand = explicit_method_args[0].clone();
+                                    let function_ty = function_item.ty(tcx, typing_env);
+                                    let function_sig = function_ty.fn_sig(tcx).skip_binder();
+                                    let value_input_count = function_sig
+                                        .inputs()
+                                        .iter()
+                                        .filter(|ty| {
+                                            super::types::ty_to_oomir_type(
+                                                **ty,
+                                                tcx,
+                                                data_types,
+                                                function_item,
+                                            )
+                                            .has_jvm_value()
+                                        })
+                                        .count();
+                                    let (tuple_class, tuple_fields) = if value_input_count == 0 {
+                                        (None, Vec::new())
+                                    } else {
                                         let tuple_class = tuple_operand
                                             .get_type()
                                             .and_then(|ty| ty.get_class_name().map(str::to_string))
-                                            .expect("FnOnce argument tuple must be a JVM class");
-                                        let tuple_mir_ty = EarlyBinder::bind(tcx, fn_inputs[1])
-                                            .instantiate(tcx, instance.args)
-                                            .skip_norm_wip();
-                                        let TyKind::Tuple(tuple_fields) = tuple_mir_ty.kind()
-                                        else {
-                                            panic!(
-                                                "FnOnce argument is not a Rust tuple: {tuple_mir_ty:?}"
-                                            )
+                                            .expect("non-empty Fn argument tuple has a JVM class");
+                                        let fields = match data_types.get(&tuple_class) {
+                                            Some(oomir::DataType::Class { fields, .. }) => {
+                                                fields.clone()
+                                            }
+                                            _ => panic!(
+                                                "Fn argument tuple class {tuple_class} was not defined"
+                                            ),
                                         };
-                                        let field_mir_ty = tuple_fields[0];
-                                        let field_ty = super::types::ty_to_oomir_type(
-                                            field_mir_ty,
+                                        (Some(tuple_class), fields)
+                                    };
+                                    let mut function_args = Vec::new();
+                                    let mut tuple_fields = tuple_fields.into_iter();
+                                    for (index, input_ty) in
+                                        function_sig.inputs().iter().enumerate()
+                                    {
+                                        let input_oomir_ty = super::types::ty_to_oomir_type(
+                                            *input_ty,
                                             tcx,
                                             data_types,
-                                            instance,
+                                            function_item,
                                         );
-                                        let field_name = format!("{label}_fn_def_clone_arg");
-                                        instructions.push(oomir::Instruction::GetField {
-                                            dest: field_name.clone(),
-                                            object: tuple_operand,
-                                            field_name: "field0".to_string(),
-                                            field_ty: field_ty.clone(),
-                                            owner_class: tuple_class,
-                                        });
-                                        let field = oomir::Operand::Variable {
-                                            name: field_name,
-                                            ty: field_ty.clone(),
-                                        };
-                                        if let oomir::Type::Pointer(inner) = field_ty {
-                                            super::place::emit_pointer_read(
-                                                field,
-                                                &inner,
-                                                &dest,
-                                                &mut instructions,
-                                            );
-                                        } else {
-                                            instructions.push(oomir::Instruction::Move {
-                                                dest,
-                                                src: field,
-                                            });
+                                        if !input_oomir_ty.has_jvm_value() {
+                                            function_args.push(oomir::Operand::Constant(
+                                                oomir::Constant::Unit,
+                                            ));
+                                            continue;
                                         }
+                                        let (field_name, field_ty) = tuple_fields.next().expect(
+                                            "Fn argument tuple has one field per JVM argument",
+                                        );
+                                        let field_dest = format!("{label}_fn_def_arg_{index}");
+                                        instructions.push(oomir::Instruction::GetField {
+                                            dest: field_dest.clone(),
+                                            object: tuple_operand.clone(),
+                                            field_name,
+                                            field_ty: field_ty.clone(),
+                                            owner_class: tuple_class
+                                                .clone()
+                                                .expect("value-bearing Fn tuple has a class"),
+                                        });
+                                        function_args.push(
+                                            super::value_repr::adapt_operand_to_rust_type(
+                                                oomir::Operand::Variable {
+                                                    name: field_dest,
+                                                    ty: field_ty,
+                                                },
+                                                *input_ty,
+                                                &format!("{label}_fn_def_arg_{index}_adapted"),
+                                                tcx,
+                                                instance,
+                                                data_types,
+                                                &mut instructions,
+                                            ),
+                                        );
                                     }
+                                    let target = super::naming::mono_fn_name_from_instance(
+                                        tcx,
+                                        function_item,
+                                    );
+                                    instructions.push(oomir::Instruction::InvokeStatic {
+                                        class_name: target
+                                            .class_to_call_on
+                                            .expect("function item has a JVM owner"),
+                                        method_name: target.method_name,
+                                        method_ty: oomir::Signature {
+                                            params: function_sig
+                                                .inputs()
+                                                .iter()
+                                                .enumerate()
+                                                .map(|(index, ty)| {
+                                                    (
+                                                        format!("arg{index}"),
+                                                        super::types::ty_to_oomir_type(
+                                                            *ty,
+                                                            tcx,
+                                                            data_types,
+                                                            function_item,
+                                                        ),
+                                                    )
+                                                })
+                                                .collect(),
+                                            ret: Box::new(super::types::ty_to_oomir_type(
+                                                function_sig.output(),
+                                                tcx,
+                                                data_types,
+                                                function_item,
+                                            )),
+                                            is_static: true,
+                                        },
+                                        args: function_args,
+                                        dest: effective_dest,
+                                    });
                                 } else if declared_method_name == "with_metadata_of"
                                     && matches!(&dispatch_receiver_ty, oomir::Type::Pointer(_))
                                     && matches!(
@@ -3989,14 +4192,53 @@ pub(super) fn convert_basic_block<'tcx>(
                                                     ),
                                                     _ => false,
                                                 };
+                                            let target_has_trait_object_tail =
+                                                match fn_output.kind() {
+                                                    TyKind::RawPtr(pointee, _)
+                                                    | TyKind::Ref(_, pointee, _) => {
+                                                        matches!(
+                                                            pointee.kind(),
+                                                            TyKind::Adt(adt_def, _)
+                                                                if adt_def.is_struct()
+                                                        ) && matches!(
+                                                            tcx.struct_tail_for_codegen(
+                                                                *pointee,
+                                                                TypingEnv::fully_monomorphized(),
+                                                            )
+                                                            .kind(),
+                                                            TyKind::Dynamic(..)
+                                                        )
+                                                    }
+                                                    _ => false,
+                                                };
+                                            let target_pointee_is_sized = match fn_output.kind() {
+                                                TyKind::RawPtr(pointee, _)
+                                                | TyKind::Ref(_, pointee, _) => pointee.is_sized(
+                                                    tcx,
+                                                    TypingEnv::fully_monomorphized(),
+                                                ),
+                                                _ => false,
+                                            };
                                             Some((
                                                 oomir::POINTER_CLASS.to_string(),
-                                                if is_pointer_cast_method && source_is_trait_object
+                                                if is_pointer_cast_method
+                                                    && source_is_trait_object
+                                                    && target_has_trait_object_tail
+                                                {
+                                                    "retypeStructTailFromTraitPointer".to_string()
+                                                } else if is_pointer_cast_method
+                                                    && source_is_trait_object
+                                                    && target_pointee_is_sized
                                                 {
                                                     "traitObjectDataPointer".to_string()
-                                                } else if is_pointer_cast_method
-                                                    || declared_method_name == "with_metadata_of"
+                                                } else if declared_method_name == "with_metadata_of"
+                                                    && target_has_trait_object_tail
                                                 {
+                                                    "retypeStructTailWithMetadataOf".to_string()
+                                                } else if declared_method_name == "with_metadata_of"
+                                                {
+                                                    "retypeWithMetadataOf".to_string()
+                                                } else if is_pointer_cast_method {
                                                     "retype".to_string()
                                                 } else {
                                                     declared_method_name.clone()
@@ -4083,13 +4325,13 @@ pub(super) fn convert_basic_block<'tcx>(
                                         } else if class_name == oomir::POINTER_CLASS
                                             && matches!(
                                                 static_method_name.as_str(),
-                                                "retype" | "traitObjectDataPointer"
+                                                "retype"
+                                                    | "retypeWithMetadataOf"
+                                                    | "retypeStructTailWithMetadataOf"
+                                                    | "retypeStructTailFromTraitPointer"
+                                                    | "traitObjectDataPointer"
                                             )
                                         {
-                                            if declared_method_name == "with_metadata_of" {
-                                                static_signature.params.truncate(1);
-                                                static_args.truncate(1);
-                                            }
                                             static_signature
                                                 .params
                                                 .push(("view_size".to_string(), oomir::Type::U64));

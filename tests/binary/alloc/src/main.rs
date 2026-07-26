@@ -1,4 +1,4 @@
-#![feature(ptr_metadata, type_info)]
+#![feature(iter_advance_by, iter_next_chunk, ptr_metadata, thin_box, type_info)]
 
 use core::cell::{Ref, RefCell, RefMut};
 use core::any::TypeId;
@@ -9,12 +9,14 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use std::alloc::Layout;
 use std::alloc::{alloc_zeroed, dealloc, realloc};
 use std::borrow::Cow;
-use std::boxed::Box;
+use std::boxed::{Box, ThinBox};
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, LinkedList, VecDeque};
+use std::ffi::CStr;
 use std::format;
 use std::rc::{Rc, Weak};
 use std::string::{String, ToString};
 use std::sync::{Arc, Weak as ArcWeak};
+use std::task::{Wake, Waker};
 use std::vec;
 use std::vec::Vec;
 
@@ -208,6 +210,9 @@ fn main() {
     test_drain_partial_drop();
     test_arc_basics();
     test_arc_concurrent_clone_drop();
+    test_arc_unsized_clone_on_write();
+    test_rc_arc_unsized_conversions();
+    test_waker_clone_identity();
     test_zst_collection_behavior();
     test_manual_realloc_shrink();
     test_vec_from_raw_parts();
@@ -218,6 +223,216 @@ fn main() {
     test_boxed_self_receiver();
     test_vec_aggregate_with_function_pointer();
     test_refcell_borrow_guards_drop();
+    test_c_str_from_pointer();
+    test_thin_box_zsts();
+    test_vec_null_pointer_roundtrip();
+    test_vec_into_iter_regressions();
+}
+
+fn test_waker_clone_identity() {
+    struct Noop;
+    impl Wake for Noop {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    let waker = Waker::from(Arc::new(Noop));
+    let cloned = waker.clone();
+    assert_eq!(waker.data(), cloned.data());
+    assert!(core::ptr::eq(waker.vtable(), cloned.vtable()));
+    assert!(waker.will_wake(&cloned));
+    assert!(cloned.will_wake(&waker));
+}
+
+fn test_thin_box_zsts() {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    static DROPS: AtomicUsize = AtomicUsize::new(0);
+
+    #[derive(Debug)]
+    struct Align1Zst;
+
+    impl Drop for Align1Zst {
+        fn drop(&mut self) {
+            assert!((self as *const Self).is_aligned());
+            DROPS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[repr(align(2))]
+    #[derive(Debug)]
+    struct Align2Zst;
+
+    impl Drop for Align2Zst {
+        fn drop(&mut self) {
+            assert!((self as *const Self).is_aligned());
+            DROPS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[repr(align(64))]
+    #[derive(Debug)]
+    struct OveralignedZst;
+
+    impl Drop for OveralignedZst {
+        fn drop(&mut self) {
+            assert!((self as *const Self).is_aligned());
+        }
+    }
+
+    let sized = ThinBox::new(OveralignedZst);
+    assert!((&*sized as *const OveralignedZst).is_aligned());
+    drop(sized);
+
+    let erased: ThinBox<dyn core::fmt::Debug> = ThinBox::new_unsize(OveralignedZst);
+    let data = &*erased as *const dyn core::fmt::Debug as *const OveralignedZst;
+    assert!(data.is_aligned());
+    drop(erased);
+
+    let sized = ThinBox::new(Align1Zst);
+    assert!((&*sized as *const Align1Zst).is_aligned());
+    drop(sized);
+    let erased: ThinBox<dyn core::fmt::Debug> = ThinBox::new_unsize(Align1Zst);
+    assert!((&*erased as *const dyn core::fmt::Debug as *const Align1Zst).is_aligned());
+    drop(erased);
+
+    let sized = ThinBox::new(Align2Zst);
+    assert!((&*sized as *const Align2Zst).is_aligned());
+    drop(sized);
+    let erased: ThinBox<dyn core::fmt::Debug> = ThinBox::new_unsize(Align2Zst);
+    assert!((&*erased as *const dyn core::fmt::Debug as *const Align2Zst).is_aligned());
+    drop(erased);
+
+    assert_eq!(DROPS.load(Ordering::Relaxed), 4);
+}
+
+fn test_vec_null_pointer_roundtrip() {
+    let value = 42;
+    let pointer = core::ptr::from_ref(&value);
+    let without_address = pointer.with_addr(0);
+    let roundtripped = vec![without_address].pop().unwrap();
+    let restored = roundtripped.with_addr(pointer.addr());
+    assert_eq!(unsafe { restored.read() }, value);
+}
+
+fn test_vec_into_iter_regressions() {
+    let iter = vec!['a', 'b', 'c'].into_iter();
+    assert_eq!(format!("{iter:?}"), "IntoIter(['a', 'b', 'c'])");
+
+    const EMPTY: String = String::new();
+    let nested = vec![[EMPTY, "Hello World!".into()], [EMPTY, EMPTY]];
+    let mut flattened = nested.into_iter().flatten();
+    drop(flattened.next());
+    assert_eq!(
+        flattened.clone().collect::<Vec<_>>(),
+        ["Hello World!", "", ""]
+    );
+
+    #[derive(Clone, Debug)]
+    struct AlignedZst([u64; 0]);
+    impl Drop for AlignedZst {
+        fn drop(&mut self) {
+            let address = (self as *mut Self).addr();
+            assert_eq!(
+                core::hint::black_box(address) % core::mem::align_of::<u64>(),
+                0
+            );
+        }
+    }
+    const ZST: AlignedZst = AlignedZst([]);
+
+    for _ in vec![ZST].into_iter() {}
+    for _ in vec![ZST; 5].into_iter().rev() {}
+    let mut iter = vec![ZST, ZST].into_iter();
+    assert_eq!(iter.advance_by(1), Ok(()));
+    drop(iter);
+    let mut iter = vec![ZST, ZST].into_iter();
+    assert!(iter.next_chunk::<1>().is_ok());
+    drop(iter);
+    let mut iter = vec![ZST, ZST].into_iter();
+    assert!(iter.next_chunk::<4>().is_err());
+    drop(iter);
+    let mut iter = vec![ZST, ZST].into_iter();
+    assert!(iter.next_chunk_back::<1>().is_ok());
+    drop(iter);
+    let mut iter = vec![ZST, ZST].into_iter();
+    assert!(iter.next_chunk_back::<4>().is_err());
+    drop(iter);
+}
+
+fn test_c_str_from_pointer() {
+    let bytes = b"hello\0ignored";
+    let value = unsafe { CStr::from_ptr(bytes.as_ptr().cast()) };
+    assert_eq!(value.to_bytes(), b"hello");
+    assert_eq!(value.to_bytes_with_nul(), b"hello\0");
+}
+
+fn test_arc_unsized_clone_on_write() {
+    let mut values: Arc<[i32]> = Arc::new([10, 20, 30]);
+    let original = Arc::clone(&values);
+    Arc::make_mut(&mut values)[1] += 1;
+    assert_eq!(&*values, &[10, 21, 30]);
+    assert_eq!(&*original, &[10, 20, 30]);
+}
+
+fn test_rc_arc_unsized_conversions() {
+    use core::any::Any;
+    use core::fmt::{Debug, Display};
+
+    let boxed = String::from("foo").into_boxed_str();
+    let rc: Rc<str> = Rc::from(boxed);
+    assert_eq!(&*rc, "foo");
+
+    let arc: Arc<str> = Arc::from("bar");
+    assert_eq!(&*arc, "bar");
+
+    let boxed: Box<dyn Display> = Box::new(123);
+    let rc: Rc<dyn Display> = Rc::from(boxed);
+    assert_eq!(rc.to_string(), "123");
+
+    let boxed: Box<dyn Debug> = Box::new(());
+    let arc: Arc<dyn Debug> = Arc::from(boxed);
+    assert_eq!(format!("{arc:?}"), "()");
+
+    let rc: Rc<dyn Any> = Rc::new(4_u32);
+    let weak = Rc::downgrade(&rc);
+    assert!(weak.clone().upgrade().is_some());
+    let empty: Weak<u32> = Weak::new();
+    let empty: Weak<dyn Any> = empty;
+    assert!(empty.clone().upgrade().is_none());
+
+    let arc: Arc<dyn Any + Send + Sync> = Arc::new(4_u32);
+    let weak = Arc::downgrade(&arc);
+    assert!(weak.clone().upgrade().is_some());
+    let empty: ArcWeak<u32> = ArcWeak::new();
+    let empty: ArcWeak<dyn Any + Send + Sync> = empty;
+    assert!(empty.clone().upgrade().is_none());
+
+    let rc: Rc<str> = Rc::from("raw rc");
+    let raw = Rc::into_raw(rc.clone());
+    let restored = unsafe { Rc::from_raw(raw) };
+    assert_eq!(unsafe { &*raw }, "raw rc");
+    assert_eq!(rc, restored);
+
+    let arc: Arc<dyn Display> = Arc::new(456);
+    let raw = Arc::into_raw(arc.clone());
+    let restored = unsafe { Arc::from_raw(raw) };
+    assert_eq!(unsafe { &*raw }.to_string(), "456");
+    assert_eq!(restored.to_string(), "456");
+
+    let c_str = CStr::from_bytes_with_nul(b"swordfish\0").unwrap();
+    let rc: Rc<CStr> = Rc::from(c_str);
+    assert_eq!(rc.to_bytes(), b"swordfish");
+    let weak = Rc::downgrade(&rc);
+    drop(rc);
+    assert!(weak.upgrade().is_none());
+    drop(weak);
+
+    let arc: Arc<CStr> = Arc::from(c_str);
+    assert_eq!(arc.to_bytes(), b"swordfish");
+    let weak = Arc::downgrade(&arc);
+    drop(arc);
+    assert!(weak.upgrade().is_none());
+    drop(weak);
 }
 
 fn test_owned_and_pinned_unsizing() {
@@ -500,6 +715,24 @@ fn test_aggregate_clone_shims() {
     let cloned_closure = closure.clone();
     assert!(closure() == 8);
     assert!(cloned_closure() == 8);
+
+    static CLONE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static CLONE_SUM: AtomicUsize = AtomicUsize::new(0);
+    struct CustomClone(u32);
+    impl Clone for CustomClone {
+        fn clone(&self) -> Self {
+            CLONE_CALLS.fetch_add(1, Ordering::SeqCst);
+            CLONE_SUM.fetch_add(self.0 as usize, Ordering::SeqCst);
+            Self(self.0)
+        }
+    }
+
+    CLONE_CALLS.store(0, Ordering::SeqCst);
+    CLONE_SUM.store(0, Ordering::SeqCst);
+    let values = [CustomClone(10), CustomClone(20), CustomClone(30)];
+    values.iter().cloned().for_each(drop);
+    assert!(CLONE_CALLS.load(Ordering::SeqCst) == 3);
+    assert!(CLONE_SUM.load(Ordering::SeqCst) == 60);
 }
 
 fn test_string_utf_conversions() {
@@ -567,6 +800,13 @@ fn test_vecdeque_ring_wrapping() {
 
     let items: Vec<i32> = dq.iter().copied().collect();
     assert!(items == vec![4, 5, 6, 7, 8, 9, 10, 11]);
+
+    let nested = [[3, 4, 5, 2, 2, 3, 4, 5]; 2];
+    let flattened = nested.as_flattened();
+    assert!(flattened.len() == 16);
+    assert!(flattened[2] == 5);
+    assert!(flattened[10] == 5);
+    assert!(flattened == [3, 4, 5, 2, 2, 3, 4, 5, 3, 4, 5, 2, 2, 3, 4, 5]);
 }
 
 fn test_btreemap() {

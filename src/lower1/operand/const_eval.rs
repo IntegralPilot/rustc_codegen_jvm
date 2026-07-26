@@ -9,6 +9,7 @@ use rustc_middle::ty::{
     PseudoCanonicalInput, ScalarInt, ShimKind, Ty, TyCtxt, TyKind, TypingEnv, UintTy, Unnormalized,
 };
 use rustc_span::def_id::LOCAL_CRATE;
+use std::sync::{LazyLock, Mutex};
 
 use super::super::{
     control_flow::rvalue::{
@@ -26,6 +27,51 @@ use super::super::{
 use crate::oomir::{self, DataTypeMethod};
 
 type ConstAllocation = Allocation<CtfeProvenance>;
+
+static CONSTANT_ALLOCATION_IDENTITIES: LazyLock<Mutex<HashMap<(String, AllocId), String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::default()));
+
+fn canonical_allocation_identity(tcx: TyCtxt<'_>, alloc_id: AllocId, candidate: String) -> String {
+    let key = (tcx.crate_name(LOCAL_CRATE).to_string(), alloc_id);
+    CONSTANT_ALLOCATION_IDENTITIES
+        .lock()
+        .expect("constant allocation identity cache was poisoned")
+        .entry(key)
+        .or_insert(candidate)
+        .clone()
+}
+
+fn anonymous_allocation_identity(
+    tcx: TyCtxt<'_>,
+    value: &oomir::Constant,
+    view_size: u64,
+    alignment: u64,
+    view_codec: &oomir::Constant,
+    pointee: &oomir::Type,
+) -> String {
+    let hash = crate::stable_hash::short_hash_value(
+        &(value, view_size, alignment, view_codec, pointee),
+        16,
+    );
+    format!("{}::constant::{hash}", tcx.crate_name(LOCAL_CRATE))
+}
+
+fn anonymous_memory_identity(
+    tcx: TyCtxt<'_>,
+    allocation: &ConstAllocation,
+    instance: Instance<'_>,
+) -> Option<String> {
+    if !allocation.provenance().ptrs().is_empty() {
+        return None;
+    }
+    let bytes = allocation
+        .inspect_with_uninit_and_ptr_outside_interpreter(0..allocation.size().bytes_usize());
+    let hash = crate::stable_hash::short_hash_value(
+        &(format!("{instance:?}"), bytes, allocation.align.bytes()),
+        16,
+    );
+    Some(format!("{}::memory::{hash}", tcx.crate_name(LOCAL_CRATE)))
+}
 
 /// Decode the optimized `ConstValue::Slice` representation. Rust uses that
 /// representation for every reference whose pointee has a slice tail, not
@@ -236,6 +282,11 @@ fn preserve_slice_allocation<'tcx>(
     // Keep CTFE slice data in the same allocation cache as sized references.
     // In particular, `const S: &[T] = from_ref(const R: &T)` must give
     // `R` and `&S[0]` exactly the same runtime address.
+    let identity_value = if elements.len() == 1 {
+        elements[0].clone()
+    } else {
+        oomir::Constant::Array(element_type.clone(), elements.clone())
+    };
     let allocation_value = oomir::Constant::Array(element_type.clone(), elements);
     let view_codec =
         match pointer_memory_codec_operand(*element_ty, tcx, oomir_data_types, instance) {
@@ -246,10 +297,25 @@ fn preserve_slice_allocation<'tcx>(
                 ));
             }
         };
+    let pointee = element_type.clone();
+    let identity_candidate =
+        anonymous_memory_identity(tcx, allocation, instance).unwrap_or_else(|| {
+            anonymous_allocation_identity(
+                tcx,
+                &identity_value,
+                element_layout.size.bytes(),
+                allocation.align.bytes(),
+                &view_codec,
+                &pointee,
+            )
+        });
+    let identity = canonical_allocation_identity(tcx, alloc_id, identity_candidate);
     let backing = oomir::Constant::InternedPointer {
-        identity: format!("{}::{alloc_id:?}", tcx.crate_name(LOCAL_CRATE)),
+        identity,
         value: Box::new(allocation_value),
         array_backed: true,
+        allocation_size: allocation.size().bytes(),
+        offset: 0,
         view_size: element_layout.size.bytes(),
         alignment: allocation.align.bytes(),
         view_codec: Box::new(view_codec),
@@ -930,13 +996,32 @@ fn anonymous_memory_pointer_constant<'tcx>(
             ));
         }
     };
-    let identity = format!("{}::{alloc_id:?}", tcx.crate_name(LOCAL_CRATE));
     let pointee = Box::new(ty_to_oomir_type(
         pointee_ty,
         tcx,
         oomir_data_types,
         instance,
     ));
+    let identity_value = oomir::Constant::Array(
+        Box::new(oomir::Type::U8),
+        bytes.iter().copied().map(oomir::Constant::U8).collect(),
+    );
+    let identity_codec = view_codec.as_ref().map_or(
+        oomir::Constant::Null(oomir::Type::Class("java/lang/String".to_string())),
+        |codec| oomir::Constant::String(codec.clone()),
+    );
+    let identity_candidate =
+        anonymous_memory_identity(tcx, allocation, instance).unwrap_or_else(|| {
+            anonymous_allocation_identity(
+                tcx,
+                &identity_value,
+                pointee_layout.size.bytes(),
+                allocation.align.bytes(),
+                &identity_codec,
+                &pointee,
+            )
+        });
+    let identity = canonical_allocation_identity(tcx, alloc_id, identity_candidate);
     if bytes.iter().all(|candidate| *candidate == byte) {
         Ok(Some(oomir::Constant::RepeatedBytePointer {
             identity,
@@ -979,6 +1064,16 @@ fn pointer_constant_for_pointee<'tcx>(
     )? {
         return Ok(pointer);
     }
+    if let Some(pointer) = interned_pointer_for_memory_view(
+        tcx,
+        pointer,
+        pointee_ty,
+        value.clone(),
+        oomir_data_types,
+        instance,
+    )? {
+        return Ok(pointer);
+    }
     let pointee_layout = tcx
         .layout_of(TypingEnv::fully_monomorphized().as_query_input(pointee_ty))
         .map_err(|error| format!("Could not determine constant reference layout: {error:?}"))?;
@@ -1007,6 +1102,79 @@ fn pointer_constant_for_pointee<'tcx>(
         ],
         param_types: Vec::new(),
     })
+}
+
+fn interned_pointer_for_memory_view<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    pointer: Pointer<CtfeProvenance>,
+    pointee_ty: Ty<'tcx>,
+    value: oomir::Constant,
+    oomir_data_types: &mut HashMap<String, oomir::DataType>,
+    instance: Instance<'tcx>,
+) -> Result<Option<oomir::Constant>, String> {
+    let (provenance, offset) = pointer.into_raw_parts();
+    let Some(alloc_id) = provenance.get_alloc_id() else {
+        return Ok(None);
+    };
+    let GlobalAlloc::Memory(const_allocation) = tcx.global_alloc(alloc_id) else {
+        return Ok(None);
+    };
+    let allocation = const_allocation.inner();
+    let layout = tcx
+        .layout_of(TypingEnv::fully_monomorphized().as_query_input(pointee_ty))
+        .map_err(|error| format!("Could not determine constant pointee layout: {error:?}"))?;
+    let end = offset
+        .checked_add(layout.size, &tcx.data_layout)
+        .ok_or_else(|| {
+            format!(
+                "constant pointer range overflow: offset {}, size {}",
+                offset.bytes(),
+                layout.size.bytes()
+            )
+        })?;
+    if end > allocation.size() {
+        return Err(format!(
+            "constant pointer range {}..{} exceeds allocation size {}",
+            offset.bytes(),
+            end.bytes(),
+            allocation.size().bytes()
+        ));
+    }
+    let view_codec = match pointer_memory_codec_operand(pointee_ty, tcx, oomir_data_types, instance)
+    {
+        oomir::Operand::Constant(codec) => codec,
+        other => {
+            return Err(format!(
+                "Constant reference codec was not constant: {other:?}"
+            ));
+        }
+    };
+    let pointee = ty_to_oomir_type(pointee_ty, tcx, oomir_data_types, instance);
+    let identity_candidate =
+        anonymous_memory_identity(tcx, allocation, instance).unwrap_or_else(|| {
+            let hash = crate::stable_hash::short_hash_value(
+                &(
+                    format!("{instance:?}"),
+                    format!("{alloc_id:?}"),
+                    allocation.size().bytes(),
+                    allocation.align.bytes(),
+                ),
+                16,
+            );
+            format!("{}::allocation::{hash}", tcx.crate_name(LOCAL_CRATE))
+        });
+    let identity = canonical_allocation_identity(tcx, alloc_id, identity_candidate);
+    Ok(Some(oomir::Constant::InternedPointer {
+        identity,
+        value: Box::new(value),
+        array_backed: false,
+        allocation_size: allocation.size().bytes(),
+        offset: offset.bytes(),
+        view_size: layout.size.bytes(),
+        alignment: allocation.align.bytes(),
+        view_codec: Box::new(view_codec),
+        pointee: Box::new(pointee),
+    }))
 }
 
 fn interned_pointer_for_full_allocation<'tcx>(
@@ -1040,19 +1208,29 @@ fn interned_pointer_for_full_allocation<'tcx>(
             ));
         }
     };
+    let pointee = ty_to_oomir_type(pointee_ty, tcx, oomir_data_types, instance);
+    let identity_candidate =
+        anonymous_memory_identity(tcx, allocation, instance).unwrap_or_else(|| {
+            anonymous_allocation_identity(
+                tcx,
+                &value,
+                layout.size.bytes(),
+                allocation.align.bytes(),
+                &view_codec,
+                &pointee,
+            )
+        });
+    let identity = canonical_allocation_identity(tcx, alloc_id, identity_candidate);
     Ok(Some(oomir::Constant::InternedPointer {
-        identity: format!("{}::{alloc_id:?}", tcx.crate_name(LOCAL_CRATE)),
+        identity,
         value: Box::new(value),
         array_backed: false,
+        allocation_size: allocation.size().bytes(),
+        offset: 0,
         view_size: layout.size.bytes(),
         alignment: allocation.align.bytes(),
         view_codec: Box::new(view_codec),
-        pointee: Box::new(ty_to_oomir_type(
-            pointee_ty,
-            tcx,
-            oomir_data_types,
-            instance,
-        )),
+        pointee: Box::new(pointee),
     }))
 }
 
@@ -1410,9 +1588,40 @@ fn read_pointee_constant<'tcx>(
             let concrete_ty = EarlyBinder::bind(tcx, concrete_ty)
                 .instantiate(tcx, instance.args)
                 .skip_norm_wip();
+            let dynamic_predicates = EarlyBinder::bind(tcx, dyn_ty)
+                .instantiate(tcx, instance.args)
+                .skip_norm_wip();
+            let dyn_ty = Ty::new_dynamic(tcx, dynamic_predicates, tcx.lifetimes.re_erased);
             let layout = tcx
                 .layout_of(TypingEnv::fully_monomorphized().as_query_input(concrete_ty))
                 .map_err(|error| format!("Could not determine vtable layout: {error:?}"))?;
+            let concrete_oomir_ty = ty_to_oomir_type(concrete_ty, tcx, oomir_data_types, instance);
+            let pointer_oomir_ty = oomir::Type::Pointer(Box::new(concrete_oomir_ty));
+            let oomir::Type::Interface(interface_name) =
+                ty_to_oomir_type(dyn_ty, tcx, oomir_data_types, instance)
+            else {
+                return Err(format!(
+                    "Vtable dynamic type does not lower to a JVM interface: {dyn_ty:?}"
+                ));
+            };
+            let adapter_class = ensure_trait_object_adapter_class_for_pointees(
+                concrete_ty,
+                dyn_ty,
+                &pointer_oomir_ty,
+                &interface_name,
+                oomir_data_types,
+                tcx,
+                instance,
+            )?;
+            let pointee_codec =
+                match pointer_memory_codec_operand(concrete_ty, tcx, oomir_data_types, instance) {
+                    oomir::Operand::Constant(codec) => codec,
+                    other => {
+                        return Err(format!(
+                            "Constant vtable pointee codec was not constant: {other:?}"
+                        ));
+                    }
+                };
             Ok(oomir::Constant::StaticCall {
                 owner_class: oomir::POINTER_CLASS.to_string(),
                 method_name: "constantVtableMarker".to_string(),
@@ -1420,6 +1629,8 @@ fn read_pointee_constant<'tcx>(
                     oomir::Constant::String(format!("{concrete_ty:?}:{dyn_ty:?}")),
                     oomir::Constant::U64(layout.size.bytes()),
                     oomir::Constant::U64(layout.align.abi.bytes()),
+                    oomir::Constant::String(adapter_class),
+                    pointee_codec,
                 ],
                 param_types: Vec::new(),
                 ty: oomir::Type::Pointer(Box::new(ty_to_oomir_type(

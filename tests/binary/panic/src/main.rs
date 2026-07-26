@@ -4,10 +4,28 @@ use std::panic::{AssertUnwindSafe, catch_unwind, panic_any, resume_unwind};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 static PANICKING_DROP_RAN: AtomicBool = AtomicBool::new(false);
+static FIELD_AFTER_PANIC_DROPPED: AtomicBool = AtomicBool::new(false);
 
 struct PanicsOnDrop;
 
 impl Drop for PanicsOnDrop {
+    fn drop(&mut self) {
+        PANICKING_DROP_RAN.store(true, Ordering::SeqCst);
+        panic!("single panic from Drop");
+    }
+}
+
+struct RecordsDrop;
+
+impl Drop for RecordsDrop {
+    fn drop(&mut self) {
+        FIELD_AFTER_PANIC_DROPPED.store(true, Ordering::SeqCst);
+    }
+}
+
+struct PanickingAggregate(RecordsDrop);
+
+impl Drop for PanickingAggregate {
     fn drop(&mut self) {
         PANICKING_DROP_RAN.store(true, Ordering::SeqCst);
         panic!("single panic from Drop");
@@ -90,6 +108,21 @@ fn main() {
         drop_panic.downcast_ref::<&'static str>().copied(),
         Some("single panic from Drop")
     );
+
+    PANICKING_DROP_RAN.store(false, Ordering::SeqCst);
+    FIELD_AFTER_PANIC_DROPPED.store(false, Ordering::SeqCst);
+    let aggregate_drop_panic = catch_unwind(|| {
+        drop(PanickingAggregate(RecordsDrop));
+    })
+    .expect_err("an aggregate field panic must unwind after later fields are dropped");
+    assert_eq!(
+        aggregate_drop_panic
+            .downcast_ref::<&'static str>()
+            .copied(),
+        Some("single panic from Drop")
+    );
+    assert!(PANICKING_DROP_RAN.load(Ordering::SeqCst));
+    assert!(FIELD_AFTER_PANIC_DROPPED.load(Ordering::SeqCst));
 
     let hook = std::panic::take_hook();
     std::panic::set_hook(hook);

@@ -30,6 +30,23 @@ public final class Pointer {
     public static void dropRustValue(Object value) {
         if (value instanceof RustDrop) {
             ((RustDrop) value).rustDrop();
+        } else if (value != null && value.getClass().isArray()) {
+            Throwable pendingDropFailure = null;
+            int length = Array.getLength(value);
+            for (int index = 0; index < length; index++) {
+                try {
+                    dropRustValue(Array.get(value, index));
+                } catch (Throwable failure) {
+                    PanicSupport.abortIfStackOverflow(failure);
+                    if (pendingDropFailure != null) {
+                        Runtime.getRuntime().halt(134);
+                    }
+                    pendingDropFailure = failure;
+                }
+            }
+            if (pendingDropFailure != null) {
+                rethrowUnchecked(pendingDropFailure);
+            }
         } else if (value instanceof TraitObjectCarrier) {
             dropRustValue(((TraitObjectCarrier) value).rustTraitObjectPayload());
         } else if (value instanceof Pointer) {
@@ -38,6 +55,43 @@ public final class Pointer {
                 dropRustValue(pointee);
             }
         }
+    }
+
+    private static void dropTraitPointer(Object pointer) {
+        if (pointer == null) {
+            return;
+        }
+        if (pointer instanceof TraitObjectCarrier) {
+            dropRustValue(((TraitObjectCarrier) pointer).rustTraitObjectPayload());
+            return;
+        }
+        if (pointer instanceof Pointer) {
+            Object payload = ((Pointer) pointer).getObject();
+            if (payload != pointer) {
+                dropRustValue(payload);
+            }
+            return;
+        }
+        if (isSliceViewCarrierType(pointer.getClass())) {
+            try {
+                Object backing = instanceField(pointer.getClass(), "array").get(pointer);
+                int offset = instanceField(pointer.getClass(), "offset").getInt(pointer);
+                if (backing instanceof Pointer) {
+                    Object payload = ((Pointer) backing).add(offset).directCellValueOrSelf();
+                    if (payload != backing) {
+                        dropRustValue(payload);
+                    }
+                    return;
+                }
+                if (backing != null && backing.getClass().isArray()) {
+                    dropRustValue(Array.get(backing, offset));
+                    return;
+                }
+            } catch (ReflectiveOperationException error) {
+                throw new IllegalStateException("invalid Rust trait-object pointer", error);
+            }
+        }
+        dropRustValue(pointer);
     }
 
     public static boolean catchUnwind(Object tryFunction, Pointer data, Object catchFunction) {
@@ -109,6 +163,7 @@ public final class Pointer {
     private static final String STRUCTURAL_VIEW_CODEC_PREFIX = "@structural-view:";
     private static final String STRUCT_TAIL_VIEW_CODEC_PREFIX = "@struct-tail-view:";
     private static final String SLICE_VIEW_CLASS_NAME = "org.rustlang.runtime.SliceView";
+    private static final String UTF8_VIEW_CLASS_NAME = "org.rustlang.runtime.Utf8View";
     private static final AtomicLong NEXT_ADDRESS = new AtomicLong(0x1_0000_0000L);
     private static final Map<IdentityWeakReference, AllocationInfo> ALLOCATIONS = new HashMap<>();
     private static final ReferenceQueue<Object> ALLOCATION_INFO_QUEUE = new ReferenceQueue<>();
@@ -126,6 +181,10 @@ public final class Pointer {
     private static final ReferenceQueue<Object> ALLOCATION_RANGE_QUEUE =
             new ReferenceQueue<>();
     private static final ConcurrentHashMap<String, Method[]> CODEC_METHODS =
+            new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<String, MethodHandle> DROP_METHOD_HANDLES =
+            new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<String, MethodHandle> DROP_FIELDS_METHOD_HANDLES =
             new ConcurrentHashMap<>();
     private static final ConcurrentHashMap<String, String[]> CODEC_DESCRIPTORS =
             new ConcurrentHashMap<>();
@@ -252,6 +311,8 @@ public final class Pointer {
             new AtomicLongArray(REPEATED_ARRAY_FILTER_WORDS);
     private static final AtomicLongArray ENCODED_REFERENCE_FILTER =
             new AtomicLongArray(REPEATED_ARRAY_FILTER_WORDS);
+    private static final AtomicLongArray ENCODED_POINTER_FILTER =
+            new AtomicLongArray(REPEATED_ARRAY_FILTER_WORDS);
     private static final Map<Object, Map<Long, StructuralViewState>>[] STRUCTURAL_VIEWS =
             createWeakMapStripes();
     private static final Map<Object, NavigableMap<Long, MemoryViewState>>[] MEMORY_VIEWS =
@@ -264,6 +325,8 @@ public final class Pointer {
             createWeakMapStripes();
     private static final Map<Object, Object>[] ENCODED_REFERENCES =
             createWeakMapStripes();
+    private static final Map<Object, NavigableMap<Long, EncodedPointerState>>[]
+            ENCODED_POINTERS = createWeakMapStripes();
     private static final ThreadLocal<Integer> MEMORY_VIEW_WRITEBACK_DEPTH =
             ThreadLocal.withInitial(() -> 0);
     private static final Map<Object, Map<String, WeakReference<FieldCell>>>[] FIELD_CELLS =
@@ -378,6 +441,7 @@ public final class Pointer {
         synchronized (stripe) {
             stripe.remove(owner);
         }
+        discardEncodedPointers(owner);
     }
 
     private static final class EncodedReferenceSet {
@@ -385,6 +449,221 @@ public final class Pointer {
 
         private EncodedReferenceSet(Object first) {
             allocations.put(first, Boolean.TRUE);
+        }
+    }
+
+    private static final class EncodedPointerToken {
+        private final long address;
+        private final String codec;
+        private final ExposedTarget target;
+
+        private EncodedPointerToken(long address, String codec, ExposedTarget target) {
+            this.address = address;
+            this.codec = codec;
+            this.target = target;
+        }
+    }
+
+    private static final class EncodedPointerState {
+        private final int size;
+        private final String codec;
+        private final ExposedTarget target;
+
+        private EncodedPointerState(int size, String codec, ExposedTarget target) {
+            this.size = size;
+            this.codec = codec;
+            this.target = target;
+        }
+    }
+
+    private static void rememberEncodedPointer(
+            Object owner,
+            long offset,
+            int size,
+            String codec,
+            Pointer pointer) {
+        if (owner == null || pointer == null || size <= 0 || codec == null) {
+            return;
+        }
+        markIdentityFilter(ENCODED_POINTER_FILTER, owner);
+        Map<Object, NavigableMap<Long, EncodedPointerState>> stripe =
+                stateStripe(ENCODED_POINTERS, owner);
+        synchronized (stripe) {
+            NavigableMap<Long, EncodedPointerState> pointers =
+                    stripe.computeIfAbsent(owner, ignored -> new TreeMap<>());
+            removeOverlappingEncodedPointers(pointers, offset, size);
+            pointers.put(offset, new EncodedPointerState(size, codec, pointer.exposedTarget()));
+        }
+    }
+
+    private static Pointer encodedPointer(
+            Object owner, long offset, int size, String codec, long address) {
+        if (owner != null
+                && codec != null
+                && mayBeInIdentityFilter(ENCODED_POINTER_FILTER, owner)) {
+            Map<Object, NavigableMap<Long, EncodedPointerState>> stripe =
+                    stateStripe(ENCODED_POINTERS, owner);
+            EncodedPointerState state;
+            synchronized (stripe) {
+                NavigableMap<Long, EncodedPointerState> pointers = stripe.get(owner);
+                state = pointers == null ? null : pointers.get(offset);
+            }
+            if (state != null
+                    && state.size == size
+                    && codec.equals(state.codec)) {
+                Pointer pointer = pointerFromExposedTarget(state.target);
+                if (pointer.numericAddress() == address) {
+                    return pointer;
+                }
+            }
+        }
+        return encodedPointerFromRetainedReference(owner, codec, address);
+    }
+
+    private static Pointer encodedPointerFromRetainedReference(
+            Object owner, String codec, long address) {
+        owner = encodedReferenceOwner(owner);
+        if (owner == null
+                || codec == null
+                || !mayBeInIdentityFilter(ENCODED_REFERENCE_FILTER, owner)) {
+            return null;
+        }
+        Map<Object, Object> stripe = stateStripe(ENCODED_REFERENCES, owner);
+        Object references;
+        synchronized (stripe) {
+            references = stripe.get(owner);
+        }
+        if (references == null) {
+            return null;
+        }
+        Object[] candidates = references instanceof EncodedReferenceSet
+                ? ((EncodedReferenceSet) references).allocations.keySet().toArray()
+                : new Object[] {references};
+        Pointer match = null;
+        for (Object candidate : candidates) {
+            if (!(candidate instanceof EncodedPointerToken)) {
+                continue;
+            }
+            EncodedPointerToken token = (EncodedPointerToken) candidate;
+            if (token.address != address || !codec.equals(token.codec)) {
+                continue;
+            }
+            Pointer pointer = pointerFromExposedTarget(token.target);
+            if (match != null
+                    && (match.provenanceAllocation() != pointer.provenanceAllocation()
+                            || match.provenanceByteOffset()
+                                    != pointer.provenanceByteOffset())) {
+                return null;
+            }
+            match = pointer;
+        }
+        return match;
+    }
+
+    private static void transferEncodedPointers(
+            Object sourceOwner,
+            long sourceOffset,
+            Object targetOwner,
+            long targetOffset,
+            int length,
+            boolean move) {
+        if (sourceOwner == null
+                || targetOwner == null
+                || length <= 0
+                || !mayBeInIdentityFilter(ENCODED_POINTER_FILTER, sourceOwner)) {
+            return;
+        }
+        Map<Object, NavigableMap<Long, EncodedPointerState>> sourceStripe =
+                stateStripe(ENCODED_POINTERS, sourceOwner);
+        java.util.List<Map.Entry<Long, EncodedPointerState>> copied =
+                new java.util.ArrayList<>();
+        synchronized (sourceStripe) {
+            NavigableMap<Long, EncodedPointerState> pointers = sourceStripe.get(sourceOwner);
+            if (pointers == null) {
+                return;
+            }
+            long sourceEnd = Math.addExact(sourceOffset, (long) length);
+            for (Map.Entry<Long, EncodedPointerState> entry
+                    : pointers.subMap(sourceOffset, true, sourceEnd, false).entrySet()) {
+                if (Math.addExact(entry.getKey(), (long) entry.getValue().size) <= sourceEnd) {
+                    copied.add(new java.util.AbstractMap.SimpleImmutableEntry<>(
+                            entry.getKey(), entry.getValue()));
+                }
+            }
+            if (move) {
+                removeOverlappingEncodedPointers(pointers, sourceOffset, length);
+                if (pointers.isEmpty()) {
+                    sourceStripe.remove(sourceOwner);
+                }
+            }
+        }
+        if (copied.isEmpty()) {
+            return;
+        }
+        markIdentityFilter(ENCODED_POINTER_FILTER, targetOwner);
+        Map<Object, NavigableMap<Long, EncodedPointerState>> targetStripe =
+                stateStripe(ENCODED_POINTERS, targetOwner);
+        synchronized (targetStripe) {
+            NavigableMap<Long, EncodedPointerState> pointers =
+                    targetStripe.computeIfAbsent(targetOwner, ignored -> new TreeMap<>());
+            removeOverlappingEncodedPointers(pointers, targetOffset, length);
+            for (Map.Entry<Long, EncodedPointerState> entry : copied) {
+                pointers.put(
+                        Math.addExact(
+                                targetOffset,
+                                Math.subtractExact(entry.getKey(), sourceOffset)),
+                        entry.getValue());
+            }
+        }
+    }
+
+    private static void removeOverlappingEncodedPointers(
+            NavigableMap<Long, EncodedPointerState> pointers, long offset, int size) {
+        long end = Math.addExact(offset, (long) size);
+        Map.Entry<Long, EncodedPointerState> entry = pointers.floorEntry(offset);
+        if (entry == null) {
+            entry = pointers.ceilingEntry(offset);
+        }
+        while (entry != null && entry.getKey() < end) {
+            long entryOffset = entry.getKey();
+            EncodedPointerState state = entry.getValue();
+            Map.Entry<Long, EncodedPointerState> next = pointers.higherEntry(entryOffset);
+            if (offset < Math.addExact(entryOffset, (long) state.size)
+                    && entryOffset < end) {
+                pointers.remove(entryOffset);
+            }
+            entry = next;
+        }
+    }
+
+    private static void discardEncodedPointers(Object owner) {
+        if (owner == null || !mayBeInIdentityFilter(ENCODED_POINTER_FILTER, owner)) {
+            return;
+        }
+        Map<Object, NavigableMap<Long, EncodedPointerState>> stripe =
+                stateStripe(ENCODED_POINTERS, owner);
+        synchronized (stripe) {
+            stripe.remove(owner);
+        }
+    }
+
+    private static void discardEncodedPointers(Object owner, long offset, int size) {
+        if (owner == null
+                || size <= 0
+                || !mayBeInIdentityFilter(ENCODED_POINTER_FILTER, owner)) {
+            return;
+        }
+        Map<Object, NavigableMap<Long, EncodedPointerState>> stripe =
+                stateStripe(ENCODED_POINTERS, owner);
+        synchronized (stripe) {
+            NavigableMap<Long, EncodedPointerState> pointers = stripe.get(owner);
+            if (pointers == null) {
+                return;
+            }
+            removeOverlappingEncodedPointers(pointers, offset, size);
+            if (pointers.isEmpty()) {
+                stripe.remove(owner);
+            }
         }
     }
 
@@ -735,8 +1014,137 @@ public final class Pointer {
         copyStructuralFields(replacement, target);
     }
 
+    /** Drops a Box pointee and always runs the Box deallocator during unwinding. */
+    public static void dropBoxWithCleanup(
+            Object pointee,
+            Object box,
+            String pointeeOwner,
+            String pointeeMethod,
+            String pointeeDescriptor,
+            String boxOwner,
+            String boxMethod,
+            String boxDescriptor) {
+        Throwable pendingDropFailure = null;
+        try {
+            if (pointeeOwner.isEmpty()) {
+                dropTraitPointer(pointee);
+            } else {
+                invokeDropMethod(pointee, pointeeOwner, pointeeMethod, pointeeDescriptor);
+            }
+        } catch (Throwable failure) {
+            PanicSupport.abortIfStackOverflow(failure);
+            if (Boolean.getBoolean("org.rustlang.debugUnwind")) {
+                failure.printStackTrace(System.err);
+            }
+            pendingDropFailure = failure;
+        }
+        try {
+            invokeDropMethod(box, boxOwner, boxMethod, boxDescriptor);
+        } catch (Throwable failure) {
+            PanicSupport.abortIfStackOverflow(failure);
+            if (Boolean.getBoolean("org.rustlang.debugUnwind")) {
+                failure.printStackTrace(System.err);
+            }
+            if (pendingDropFailure != null) {
+                Runtime.getRuntime().halt(134);
+            }
+            pendingDropFailure = failure;
+        }
+        if (pendingDropFailure != null) {
+            rethrowUnchecked(pendingDropFailure);
+        }
+    }
+
+    /** Runs a custom destructor and always drops the value's fields afterward. */
+    public static void dropAdtWithCleanup(
+            Object value,
+            String owner,
+            String dropMethod,
+            String dropDescriptor,
+            String fieldsMethod) {
+        Throwable pendingDropFailure = null;
+        try {
+            invokeDropMethod(value, owner, dropMethod, dropDescriptor);
+        } catch (Throwable failure) {
+            PanicSupport.abortIfStackOverflow(failure);
+            if (Boolean.getBoolean("org.rustlang.debugUnwind")) {
+                failure.printStackTrace(System.err);
+            }
+            pendingDropFailure = failure;
+        }
+        try {
+            String key = value.getClass().getName() + '\0' + fieldsMethod;
+            MethodHandle handle = DROP_FIELDS_METHOD_HANDLES.get(key);
+            if (handle == null) {
+                MethodHandle resolved = MethodHandles.publicLookup().findVirtual(
+                        value.getClass(), fieldsMethod, MethodType.methodType(void.class));
+                MethodHandle previous = DROP_FIELDS_METHOD_HANDLES.putIfAbsent(key, resolved);
+                handle = previous == null ? resolved : previous;
+            }
+            handle.invokeWithArguments(value);
+        } catch (Throwable failure) {
+            PanicSupport.abortIfStackOverflow(failure);
+            if (Boolean.getBoolean("org.rustlang.debugUnwind")) {
+                failure.printStackTrace(System.err);
+            }
+            if (pendingDropFailure != null) {
+                Runtime.getRuntime().halt(134);
+            }
+            pendingDropFailure = failure;
+        }
+        if (pendingDropFailure != null) {
+            rethrowUnchecked(pendingDropFailure);
+        }
+    }
+
+    private static void invokeDropMethod(
+            Object value, String ownerName, String methodName, String descriptor)
+            throws Throwable {
+        String key = ownerName + '\0' + methodName + '\0' + descriptor;
+        MethodHandle handle = DROP_METHOD_HANDLES.get(key);
+        if (handle == null) {
+            Class<?> owner = resolvedRuntimeClass(ownerName);
+            MethodType methodType =
+                    MethodType.fromMethodDescriptorString(descriptor, owner.getClassLoader());
+            MethodHandle resolved =
+                    MethodHandles.publicLookup().findStatic(owner, methodName, methodType);
+            MethodHandle previous = DROP_METHOD_HANDLES.putIfAbsent(key, resolved);
+            handle = previous == null ? resolved : previous;
+        }
+        Class<?> parameterType = handle.type().parameterType(0);
+        Object argument = parameterType.isInstance(value)
+                ? value
+                : parameterType == Pointer.class && isSliceViewCarrierType(value.getClass())
+                        ? fromSlice(value)
+                        : adaptStructuralField(value, parameterType);
+        handle.invokeWithArguments(argument);
+    }
+
     /** Runs generated Rust element drop glue over a dynamically sized slice. */
     public static void dropSlice(Object slice, String ownerClassName, String methodName) {
+        dropSlice(
+                slice,
+                ownerClassName,
+                methodName,
+                "(Lorg/rustlang/runtime/Pointer;)V",
+                -1,
+                null);
+    }
+
+    /** Runs generated Rust element drop glue using its actual JVM carrier ABI. */
+    public static void dropSlice(
+            Object slice, String ownerClassName, String methodName, String descriptor) {
+        dropSlice(slice, ownerClassName, methodName, descriptor, -1, null);
+    }
+
+    /** Runs slice drop glue through the element type's logical memory view. */
+    public static void dropSlice(
+            Object slice,
+            String ownerClassName,
+            String methodName,
+            String descriptor,
+            long elementViewSize,
+            String elementViewCodec) {
         if (slice == null) {
             return;
         }
@@ -752,23 +1160,66 @@ public final class Pointer {
                 throw new IllegalArgumentException("Rust slice drop requires array-backed storage");
             }
             MethodHandle drop = null;
+            Throwable pendingDropFailure = null;
             for (int index = 0; index < length; index++) {
-                Pointer element = data == null
-                        ? Pointer.cell(Array.get(array, offset + index))
-                        : data.add(index);
-                Object managed = element.getObject();
-                if (managed instanceof RustDrop) {
-                    ((RustDrop) managed).rustDrop();
-                } else {
-                    if (drop == null) {
-                        Class<?> owner = resolvedRuntimeClass(ownerClassName);
-                        drop = MethodHandles.publicLookup().findStatic(
-                                owner,
-                                methodName,
-                                MethodType.methodType(void.class, Pointer.class));
+                Object stored = data == null ? Array.get(array, offset + index) : null;
+                boolean alreadyTyped = stored != null
+                        && elementViewSize >= 0
+                        && isGeneratedAggregateCodec(elementViewCodec)
+                        && codecMethods(elementViewCodec)[0]
+                                .getParameterTypes()[0]
+                                .isInstance(stored);
+                Pointer element = alreadyTyped
+                        ? Pointer.cell(stored, elementViewSize, elementViewCodec)
+                        : data == null ? Pointer.cell(stored) : data.add(index);
+                if (!alreadyTyped && (elementViewSize >= 0 || elementViewCodec != null)) {
+                    element = element.retype(
+                            elementViewSize >= 0 ? elementViewSize : element.viewSize,
+                            elementViewCodec);
+                    if (elementViewSize == 0 && elementViewCodec != null) {
+                        // `MaybeUninit<T>` slice drop is an explicit initialized
+                        // `T` view. Do not let the erased ZST source wrapper win
+                        // over the target codec merely because both occupy zero bytes.
+                        element.zeroSizedSourceViewSize = -1;
+                        element.zeroSizedSourceViewCodecClassName = null;
                     }
-                    drop.invokeExact(element);
                 }
+                Object managed = element.getObject();
+                try {
+                    if (managed instanceof RustDrop) {
+                        ((RustDrop) managed).rustDrop();
+                    } else {
+                        if (drop == null) {
+                            Class<?> owner = resolvedRuntimeClass(ownerClassName);
+                            MethodType methodType = MethodType.fromMethodDescriptorString(
+                                    descriptor, owner.getClassLoader());
+                            drop = MethodHandles.publicLookup().findStatic(
+                                    owner,
+                                    methodName,
+                                    methodType);
+                        }
+                        Class<?> parameterType = drop.type().parameterType(0);
+                        Object argument = parameterType == Pointer.class
+                                ? element
+                                : adaptStructuralField(element.getObject(), parameterType);
+                        drop.invokeWithArguments(argument);
+                    }
+                } catch (Throwable failure) {
+                    PanicSupport.abortIfStackOverflow(failure);
+                    if (pendingDropFailure != null) {
+                        Runtime.getRuntime().halt(134);
+                    }
+                    pendingDropFailure = failure;
+                }
+            }
+            if (pendingDropFailure instanceof RuntimeException) {
+                throw (RuntimeException) pendingDropFailure;
+            }
+            if (pendingDropFailure instanceof Error) {
+                throw (Error) pendingDropFailure;
+            }
+            if (pendingDropFailure != null) {
+                throw new IllegalStateException("Rust slice element drop failed", pendingDropFailure);
             }
         } catch (ReflectiveOperationException error) {
             throw new IllegalStateException("could not invoke Rust slice element drop glue", error);
@@ -795,6 +1246,13 @@ public final class Pointer {
             Object copy = Array.newInstance(valueClass.getComponentType(), length);
             if (valueClass.getComponentType().isPrimitive()) {
                 System.arraycopy(value, 0, copy, 0, length);
+                transferEncodedPointers(
+                        value,
+                        0,
+                        copy,
+                        0,
+                        Math.multiplyExact(length, inferredArrayElementSize(value)),
+                        false);
                 transferEncodedReferences(value, copy);
             } else {
                 Object[] sourceElements = (Object[]) value;
@@ -860,7 +1318,13 @@ public final class Pointer {
     }
 
     private static Object independentRepeatedArrayElement(Object array, int index) {
-        if (Array.getLength(array) < LAZY_ARRAY_REPEAT_THRESHOLD
+        int length = Array.getLength(array);
+        if (index < 0 || index >= length) {
+            throw new ArrayIndexOutOfBoundsException(
+                    "Rust pointer selected element " + index + " of " + length
+                            + " in " + array.getClass().getName());
+        }
+        if (length < LAZY_ARRAY_REPEAT_THRESHOLD
                 || !mayBeRepeatedArray(array)) {
             return Array.get(array, index);
         }
@@ -875,6 +1339,106 @@ public final class Pointer {
             Array.set(array, index, copy);
             return copy;
         }
+    }
+
+    private static long nestedPrimitiveArrayByteSize(Object array) {
+        if (array == null || !array.getClass().isArray()) {
+            return -1;
+        }
+        Class<?> component = array.getClass().getComponentType();
+        int length = Array.getLength(array);
+        if (component.isPrimitive()) {
+            return Math.multiplyExact((long) length, inferredArrayElementSize(array));
+        }
+        if (!component.isArray()) {
+            return -1;
+        }
+        long size = 0;
+        for (int index = 0; index < length; index++) {
+            long elementSize = nestedPrimitiveArrayByteSize(Array.get(array, index));
+            if (elementSize < 0) {
+                return -1;
+            }
+            size = Math.addExact(size, elementSize);
+        }
+        return size;
+    }
+
+    private static long nestedPrimitiveArrayElementByteSize(Object array) {
+        if (array == null
+                || !array.getClass().isArray()
+                || !array.getClass().getComponentType().isArray()
+                || Array.getLength(array) == 0) {
+            return -1;
+        }
+        long elementSize = nestedPrimitiveArrayByteSize(Array.get(array, 0));
+        if (elementSize < 0) {
+            return -1;
+        }
+        for (int index = 1; index < Array.getLength(array); index++) {
+            if (nestedPrimitiveArrayByteSize(Array.get(array, index)) != elementSize) {
+                return -1;
+            }
+        }
+        return elementSize;
+    }
+
+    private static Object nestedPrimitiveArrayElement(
+            Object array, long byteOffset, int logicalElementSize) {
+        Class<?> component = array.getClass().getComponentType();
+        if (!component.isArray()) {
+            int physicalElementSize = inferredArrayElementSize(array);
+            if (logicalElementSize != physicalElementSize
+                    || byteOffset % physicalElementSize != 0) {
+                throw new IllegalStateException(
+                        "flattened Rust array view does not match its primitive backing");
+            }
+            return independentRepeatedArrayElement(
+                    array, Math.toIntExact(byteOffset / physicalElementSize));
+        }
+        long outerElementSize = nestedPrimitiveArrayElementByteSize(array);
+        if (outerElementSize <= 0) {
+            throw new IllegalStateException(
+                    "could not determine nested primitive-array element layout");
+        }
+        int outerIndex = Math.toIntExact(byteOffset / outerElementSize);
+        long withinOuter = byteOffset % outerElementSize;
+        Object outer = independentRepeatedArrayElement(array, outerIndex);
+        if (withinOuter == 0 && logicalElementSize == outerElementSize) {
+            return outer;
+        }
+        return nestedPrimitiveArrayElement(outer, withinOuter, logicalElementSize);
+    }
+
+    private static void writeNestedPrimitiveArrayElement(
+            Object array, long byteOffset, int logicalElementSize, Object value) {
+        Class<?> component = array.getClass().getComponentType();
+        if (!component.isArray()) {
+            int physicalElementSize = inferredArrayElementSize(array);
+            if (logicalElementSize != physicalElementSize
+                    || byteOffset % physicalElementSize != 0) {
+                throw new IllegalStateException(
+                        "flattened Rust array view does not match its primitive backing");
+            }
+            Array.set(array, Math.toIntExact(byteOffset / physicalElementSize), value);
+            return;
+        }
+        long outerElementSize = nestedPrimitiveArrayElementByteSize(array);
+        if (outerElementSize <= 0) {
+            throw new IllegalStateException(
+                    "could not determine nested primitive-array element layout");
+        }
+        int outerIndex = Math.toIntExact(byteOffset / outerElementSize);
+        long withinOuter = byteOffset % outerElementSize;
+        if (withinOuter == 0 && logicalElementSize == outerElementSize) {
+            Array.set(array, outerIndex, value);
+            return;
+        }
+        writeNestedPrimitiveArrayElement(
+                independentRepeatedArrayElement(array, outerIndex),
+                withinOuter,
+                logicalElementSize,
+                value);
     }
 
     private static void markRepeatedArray(Object array) {
@@ -936,6 +1500,13 @@ public final class Pointer {
             byte[] element = encodeMemoryValue(Array.get(array, index), elementSize, elementCodec);
             System.arraycopy(element, 0, bytes, offset + index * elementSize, elementSize);
             if (elementCodec != null) {
+                transferEncodedPointers(
+                        element,
+                        0,
+                        bytes,
+                        offset + (long) index * elementSize,
+                        elementSize,
+                        false);
                 moveEncodedReferences(element, bytes);
             }
         }
@@ -995,7 +1566,9 @@ public final class Pointer {
         if (MANAGED_OBJECT_VIEW_CODEC.equals(codec)) {
             bits = managedObjectAddress(value);
         } else if (isRawPointerCodec(codec)) {
-            bits = encodedAddress(rawPointerCarrier(value, codec), encoded, codec);
+            Pointer pointer = rawPointerCarrier(value, codec);
+            bits = encodedAddress(pointer, encoded, codec);
+            rememberEncodedPointer(encoded, 0, size, codec, pointer);
         } else {
             bits = incomingBits(value, size);
         }
@@ -1017,6 +1590,7 @@ public final class Pointer {
                 && !F128_CODEC.equals(codec)) {
             byte[] encoded = new byte[size];
             System.arraycopy(bytes, offset, encoded, 0, size);
+            transferEncodedPointers(bytes, offset, encoded, 0, size, false);
             transferEncodedReferences(bytes, encoded);
             return decodeAggregate(codec, encoded);
         }
@@ -1039,10 +1613,16 @@ public final class Pointer {
             return managedObjectFromAddress(bits);
         }
         if (isRawPointerCodec(codec)) {
+            Pointer pointer = encodedPointer(bytes, offset, size, codec, bits);
             if (isArrayReferenceCodec(codec)) {
-                return decodeArrayReference(bits, codec, componentType);
+                return decodeArrayReference(
+                        pointer == null ? typedPointerObjectFromAddress(bits, codec) : pointer,
+                        codec,
+                        componentType);
             }
-            return decodedRawPointer(bits, codec);
+            return decodedRawPointer(
+                    pointer == null ? typedPointerObjectFromAddress(bits, codec) : pointer,
+                    codec);
         }
         return carrierFromBits(defaultValue(componentType), bits, size);
     }
@@ -1160,6 +1740,7 @@ public final class Pointer {
             String elementCodec = descriptor[2].isEmpty() ? null : descriptor[2];
             Pointer data = fromSlice(value, elementSize, elementCodec);
             dataAddress = encodedAddress(data, image, codec);
+            rememberEncodedPointer(image, 0, wordSize, codec, data);
             try {
                 pointerMetadata = sliceLogicalLength(value);
             } catch (ReflectiveOperationException error) {
@@ -1172,6 +1753,7 @@ public final class Pointer {
             }
             Pointer pointer = (Pointer) value;
             dataAddress = encodedAddress(pointer, image, codec);
+            rememberEncodedPointer(image, 0, wordSize, codec, pointer);
             pointerMetadata = pointer.metadata();
         } else {
             if (!(value instanceof Pointer)) {
@@ -1182,6 +1764,7 @@ public final class Pointer {
             String metadataClass = codec.substring(TRAIT_POINTER_VIEW_CODEC_PREFIX.length());
             Pointer marker = traitMetadataMarker(pointer, metadataClass);
             dataAddress = erasedAddress(pointer);
+            rememberEncodedPointer(image, 0, wordSize, codec, pointer);
             pointerMetadata = marker.address();
         }
 
@@ -1196,15 +1779,36 @@ public final class Pointer {
         long dataAddress = readMemoryWord(bytes, offset, wordSize);
         long pointerMetadata = readMemoryWord(bytes, offset + wordSize, wordSize);
         if (codec.startsWith(TRAIT_POINTER_VIEW_CODEC_PREFIX)) {
-            return pointerObjectFromAddress(dataAddress);
+            Pointer data = encodedPointer(bytes, offset, wordSize, codec, dataAddress);
+            if (data == null) {
+                data = pointerObjectFromAddress(dataAddress);
+            }
+            Pointer marker = pointerObjectFromAddress(pointerMetadata);
+            TraitMetadataInfo info = TRAIT_METADATA_INFO.get(marker.numericAddress());
+            data.traitMetadataMarker = marker;
+            if (info != null) {
+                data.traitPointeeSize = info.size;
+                data.traitPointeeAlignment = info.alignment;
+                data.traitAdapterClassName = info.adapterClassName;
+                data.traitPointeeCodecClassName = info.pointeeCodecClassName;
+            } else {
+                data.traitPointeeSize = marker.traitPointeeSize;
+                data.traitPointeeAlignment = marker.traitPointeeAlignment;
+                data.traitAdapterClassName = marker.traitAdapterClassName;
+                data.traitPointeeCodecClassName = marker.traitPointeeCodecClassName;
+            }
+            return data;
         }
 
         if (codec.startsWith(STRUCT_TAIL_POINTER_VIEW_CODEC_PREFIX)) {
             String[] descriptor = structTailPointerDescriptor(codec);
             int elementSize = structTailPointerElementSize(descriptor);
             String elementCodec = descriptor[4].isEmpty() ? null : descriptor[4];
-            Pointer data =
-                    typedPointerObjectFromAddress(dataAddress, codec).retype(elementSize, elementCodec);
+            Pointer data = encodedPointer(bytes, offset, wordSize, codec, dataAddress);
+            if (data == null) {
+                data = typedPointerObjectFromAddress(dataAddress, codec);
+            }
+            data = data.retype(elementSize, elementCodec);
             return data.retype(
                             structTailPointerPrefixSize(descriptor),
                             STRUCT_TAIL_VIEW_CODEC_PREFIX
@@ -1219,8 +1823,11 @@ public final class Pointer {
         String[] descriptor = slicePointerDescriptor(codec);
         int elementSize = slicePointerElementSize(descriptor);
         String elementCodec = descriptor[2].isEmpty() ? null : descriptor[2];
-        Pointer data =
-                typedPointerObjectFromAddress(dataAddress, codec).retype(elementSize, elementCodec);
+        Pointer data = encodedPointer(bytes, offset, wordSize, codec, dataAddress);
+        if (data == null) {
+            data = typedPointerObjectFromAddress(dataAddress, codec);
+        }
+        data = data.retype(elementSize, elementCodec);
         try {
             Class<?> viewClass = resolvedRuntimeClass(descriptor[0]);
             return LONG_SLICE_VIEW_CONSTRUCTORS
@@ -1236,6 +1843,7 @@ public final class Pointer {
             Object value, byte[] bytes, int offset, int size, String codec) {
         byte[] image = encodeFatPointer(value, size, codec);
         System.arraycopy(image, 0, bytes, offset, size);
+        transferEncodedPointers(image, 0, bytes, offset, size, false);
         moveEncodedReferences(image, bytes);
     }
 
@@ -1375,6 +1983,14 @@ public final class Pointer {
         }
         Object result = Array.newInstance(targetArrayType.getComponentType(), length);
         System.arraycopy(backing, offset, result, 0, length);
+        int componentSize = inferredArrayElementSize(backing);
+        transferEncodedPointers(
+                backing,
+                (long) offset * componentSize,
+                result,
+                0,
+                Math.multiplyExact(length, componentSize),
+                false);
         transferEncodedReferences(backing, result);
         return result;
     }
@@ -1440,6 +2056,14 @@ public final class Pointer {
                 }
                 Object result = Array.newInstance(targetArrayType.getComponentType(), length);
                 System.arraycopy(directBacking, offset, result, 0, length);
+                int componentSize = inferredArrayElementSize(directBacking);
+                transferEncodedPointers(
+                        directBacking,
+                        (long) offset * componentSize,
+                        result,
+                        0,
+                        Math.multiplyExact(length, componentSize),
+                        false);
                 transferEncodedReferences(directBacking, result);
                 return result;
             }
@@ -1833,7 +2457,11 @@ public final class Pointer {
         for (int index = 0; index < materializedSize; index++) {
             image[index] = (byte) loadByte(byteOffset + index);
         }
+        transferEncodedPointers(
+                allocation, byteOffset, image, 0, materializedSize, false);
+        transferEncodedReferences(allocation, image);
         Object decoded = decodeAggregate(viewCodecClassName, image);
+        attachDecodedTraitTail(decoded);
         Object transparent = transparentManagedView(decoded.getClass());
         if (transparent != null) {
             registerMemoryViewOrigin(transparent);
@@ -1850,6 +2478,25 @@ public final class Pointer {
         registerMemoryViewOrigin(decoded);
         bindDecodedMemoryView(decoded);
         return decoded;
+    }
+
+    private void attachDecodedTraitTail(Object decoded) {
+        if (decoded == null || traitMetadataCarrier == null) {
+            return;
+        }
+        Field[] fields = PUBLIC_INSTANCE_FIELDS.get(decoded.getClass());
+        if (fields.length == 0) {
+            return;
+        }
+        Field tail = fields[fields.length - 1];
+        if (!tail.getType().isInstance(traitMetadataCarrier)) {
+            return;
+        }
+        try {
+            tail.set(decoded, traitMetadataCarrier);
+        } catch (IllegalAccessException error) {
+            throw new IllegalStateException("could not attach Rust trait-object tail", error);
+        }
     }
 
     private void registerMemoryViewOrigin(Object value) {
@@ -2701,13 +3348,16 @@ public final class Pointer {
             long fieldSize,
             String fieldCodecClassName) {
         boolean managedField = fieldSize == 0;
-        if (!managedField) {
+        Class<?> fieldType = null;
+        if (!managedField || traitMetadataCarrier != null) {
             try {
                 Class<?> ownerClass = resolvedRuntimeClass(ownerClassName);
-                Class<?> fieldType = instanceField(ownerClass, fieldName).getType();
-                managedField = !fieldType.isPrimitive()
-                        && fieldType != Pointer.class
-                        && !isSliceViewType(fieldType);
+                fieldType = instanceField(ownerClass, fieldName).getType();
+                if (!managedField) {
+                    managedField = !fieldType.isPrimitive()
+                            && fieldType != Pointer.class
+                            && !isSliceViewType(fieldType);
+                }
             } catch (ClassNotFoundException error) {
                 throw new IllegalArgumentException(
                         "unknown Rust aggregate class " + ownerClassName, error);
@@ -2724,7 +3374,14 @@ public final class Pointer {
                         .inheritAddressOrigin(this, fieldOffset);
             }
         }
-        return byte_offset(fieldOffset).retype(fieldSize, fieldCodecClassName);
+        Pointer projected = byte_offset(fieldOffset).retype(fieldSize, fieldCodecClassName);
+        if (traitMetadataCarrier != null
+                && fieldType != null
+                && fieldType.isInstance(traitMetadataCarrier)) {
+            projected.traitObjectCarrier = traitMetadataCarrier;
+            projected.traitMetadataCarrier = null;
+        }
+        return projected;
     }
 
     public Object projectStructSliceField(
@@ -2766,6 +3423,30 @@ public final class Pointer {
                     .newInstance(data, 0, metadata());
         } catch (ReflectiveOperationException error) {
             throw new IllegalStateException("could not construct Rust DST slice view", error);
+        }
+    }
+
+    public Object projectStructStrField(
+            String ownerClassName, String fieldName, long fieldOffset) {
+        if (hasStableManagedCarrier()) {
+            Object owner = compatibleStructView(ownerClassName);
+            if (owner != null) {
+                try {
+                    return instanceField(owner.getClass(), fieldName).get(owner);
+                } catch (ReflectiveOperationException error) {
+                    throw new IllegalStateException("could not read Rust DST string field", error);
+                }
+            }
+        }
+
+        Pointer data = byte_offset(fieldOffset).retype(1, null);
+        try {
+            Class<?> utf8View = resolvedRuntimeClass(UTF8_VIEW_CLASS_NAME);
+            return LONG_SLICE_VIEW_CONSTRUCTORS
+                    .get(utf8View)
+                    .newInstance(data, 0, metadata());
+        } catch (ReflectiveOperationException error) {
+            throw new IllegalStateException("could not construct Rust DST string view", error);
         }
     }
 
@@ -2935,6 +3616,16 @@ public final class Pointer {
                     // remain individually addressable after pointer casts.
                     // Keeping the JVM array as the allocation preserves that
                     // storage instead of turning it into one scalar Cell.
+                    if (value instanceof byte[]) {
+                        synchronized (CONSTANT_ALLOCATIONS) {
+                            byte[] existing = CONSTANT_ALLOCATIONS.get(identity);
+                            if (existing == null) {
+                                existing = (byte[]) value;
+                                CONSTANT_ALLOCATIONS.put(identity, existing);
+                            }
+                            value = existing;
+                        }
+                    }
                     recordAlignment(value, checkedAlignment);
                     pointer = new Pointer(
                             value,
@@ -2966,6 +3657,75 @@ public final class Pointer {
                 return pointer.sliceStorageView(checkedSize, viewCodecClassName);
             }
             return pointer.retype(checkedSize, viewCodecClassName);
+        }
+    }
+
+    /**
+     * Materializes an interior typed view of a shared CTFE allocation.
+     *
+     * <p>Unlike {@link #constantCell}, the value occupies only one range of
+     * the allocation. Keeping the complete byte storage is important for
+     * pointer arithmetic and for alignments larger than the view itself.
+     */
+    public static Pointer constantCellAt(
+            String identity,
+            Object value,
+            long allocationSize,
+            long offset,
+            long viewSize,
+            String viewCodecClassName,
+            long alignment) {
+        int checkedAllocationSize = checkedArrayLength(allocationSize);
+        int checkedOffset = checkedArrayLength(offset);
+        int checkedViewSize = checkedArrayLength(viewSize);
+        int checkedAlignment = checkedAlignment(alignment);
+        int end;
+        try {
+            end = Math.addExact(checkedOffset, checkedViewSize);
+        } catch (ArithmeticException error) {
+            throw new IndexOutOfBoundsException("constant pointer range overflows");
+        }
+        if (end > checkedAllocationSize) {
+            throw new IndexOutOfBoundsException(
+                    "constant pointer range exceeds its allocation");
+        }
+
+        String viewIdentity = identity
+                + "\0view:"
+                + checkedOffset
+                + ":"
+                + checkedViewSize
+                + ":"
+                + String.valueOf(viewCodecClassName);
+        synchronized (CONSTANT_CELLS) {
+            Pointer pointer = CONSTANT_CELLS.get(viewIdentity);
+            if (pointer == null) {
+                byte[] allocation;
+                synchronized (CONSTANT_ALLOCATIONS) {
+                    allocation = CONSTANT_ALLOCATIONS.get(identity);
+                    if (allocation == null) {
+                        allocation = new byte[checkedAllocationSize];
+                        CONSTANT_ALLOCATIONS.put(identity, allocation);
+                        recordAlignment(allocation, checkedAlignment);
+                    } else if (allocation.length != checkedAllocationSize) {
+                        throw new IllegalStateException(
+                                "constant allocation was materialized with a different size");
+                    }
+                }
+                pointer = new Pointer(
+                        allocation,
+                        1,
+                        checkedOffset,
+                        checkedViewSize,
+                        null,
+                        viewCodecClassName,
+                        -1);
+                if (value != null && checkedViewSize != 0) {
+                    pointer.set(value);
+                }
+                CONSTANT_CELLS.put(viewIdentity, pointer);
+            }
+            return pointer.retype(checkedViewSize, viewCodecClassName);
         }
     }
 
@@ -3269,18 +4029,35 @@ public final class Pointer {
     /** Materializes the symbolic vtable emitted by rustc's constant evaluator. */
     public static Pointer constantVtableMarker(
             String identity, long pointeeSize, long pointeeAlignment) {
+        return constantVtableMarker(
+                identity, pointeeSize, pointeeAlignment, null, null);
+    }
+
+    /** Materializes a vtable together with the JVM adapter used for raw reconstruction. */
+    public static Pointer constantVtableMarker(
+            String identity,
+            long pointeeSize,
+            long pointeeAlignment,
+            String adapterClassName,
+            String pointeeCodecClassName) {
         String key = "@const-vtable\0" + identity;
         synchronized (TRAIT_METADATA_MARKERS) {
             Pointer marker = TRAIT_METADATA_MARKERS.get(key);
             if (marker == null) {
                 marker = cell(null, 0, null);
-                marker.traitPointeeSize = pointeeSize;
-                marker.traitPointeeAlignment = pointeeAlignment;
                 TRAIT_METADATA_MARKERS.put(key, marker);
             }
+            marker.traitPointeeSize = pointeeSize;
+            marker.traitPointeeAlignment = pointeeAlignment;
+            marker.traitAdapterClassName = adapterClassName;
+            marker.traitPointeeCodecClassName = pointeeCodecClassName;
             TRAIT_METADATA_INFO.put(
                     marker.numericAddress(),
-                    new TraitMetadataInfo(pointeeSize, pointeeAlignment, null, null));
+                    new TraitMetadataInfo(
+                            pointeeSize,
+                            pointeeAlignment,
+                            adapterClassName,
+                            pointeeCodecClassName));
             return marker;
         }
     }
@@ -3456,15 +4233,15 @@ public final class Pointer {
     }
 
     private static Pointer typedPointerObjectFromAddress(long address, String pointerCodec) {
-        if (address == 0) {
-            return nullPointer();
-        }
         synchronized (ALLOCATIONS) {
             Map<String, ExposedTarget> typed = TYPED_EXPOSED_ADDRESSES.get(address);
             ExposedTarget target = typed == null ? null : typed.get(pointerCodec);
             if (target != null) {
                 return pointerFromExposedTarget(target);
             }
+        }
+        if (address == 0) {
+            return nullPointer();
         }
         return pointerObjectFromAddress(address);
     }
@@ -3507,6 +4284,12 @@ public final class Pointer {
             String pointerCodec) {
         return typedPointerObjectFromAddress(address, pointerCodec)
                 .retype(viewSize, viewCodecClassName);
+    }
+
+    /** Decodes an integer-to-pointer transmute without acquiring exposed provenance. */
+    public static Pointer fromUnprovenancedAddress(
+            long address, long viewSize, String viewCodecClassName) {
+        return withoutProvenance(address, 1).retype(viewSize, viewCodecClassName);
     }
 
     public static Pointer withoutProvenance(long address, int viewSize) {
@@ -3588,23 +4371,17 @@ public final class Pointer {
                 newViewSize,
                 resultAllocationCodecClassName,
                 newViewCodecClassName,
-                resultExposedAddress).withMetadata(metadata).copyAddressOrigin(this, 0);
-        result.traitObjectCarrier = traitObjectCarrier;
-        result.traitMetadataCarrier = traitMetadataCarrier;
-        result.traitMetadataMarker = traitMetadataMarker;
-        result.traitPointeeSize = traitPointeeSize;
-        result.traitPointeeAlignment = traitPointeeAlignment;
-        result.traitAdapterClassName = traitAdapterClassName;
-        result.traitPointeeCodecClassName = traitPointeeCodecClassName;
-        if (newViewSize == 0 && newViewCodecClassName == null) {
-            if (viewSize == 0 && zeroSizedSourceViewSize >= 0) {
-                result.zeroSizedSourceViewSize = zeroSizedSourceViewSize;
-                result.zeroSizedSourceViewCodecClassName =
-                        zeroSizedSourceViewCodecClassName;
-            } else {
-                result.zeroSizedSourceViewSize = viewSize;
-                result.zeroSizedSourceViewCodecClassName = viewCodecClassName;
-            }
+                resultExposedAddress).withMetadata(metadata)
+                .copyDynamicMetadata(this)
+                .copyAddressOrigin(this, 0);
+        if (zeroSizedSourceViewSize >= 0) {
+            result.zeroSizedSourceViewSize = zeroSizedSourceViewSize;
+            result.zeroSizedSourceViewCodecClassName =
+                    zeroSizedSourceViewCodecClassName;
+        } else if ((newViewSize == 0 && newViewCodecClassName == null)
+                || (viewSize == 0 && viewCodecClassName != null)) {
+            result.zeroSizedSourceViewSize = viewSize;
+            result.zeroSizedSourceViewCodecClassName = viewCodecClassName;
         }
         return result;
     }
@@ -3689,16 +4466,44 @@ public final class Pointer {
         Object carrier = tailPointer.traitObjectCarrier != null
                 ? tailPointer.traitObjectCarrier
                 : tailPointer.traitMetadataCarrier;
+        Object direct = tailPointer.directCellValueOrSelf();
+        while (carrier == null && direct instanceof Pointer && direct != tailPointer) {
+            Pointer nested = (Pointer) direct;
+            carrier = nested.traitObjectCarrier != null
+                    ? nested.traitObjectCarrier
+                    : nested.traitMetadataCarrier;
+            Object next = nested.directCellValueOrSelf();
+            if (next == direct) {
+                break;
+            }
+            direct = next;
+        }
+        if (carrier == null && direct instanceof TraitObjectCarrier) {
+            carrier = direct;
+        }
         if (carrier == null) {
             throw new IllegalArgumentException(
                     "struct-tail trait pointer does not carry dynamic metadata");
         }
+        TraitObjectCarrier traitCarrier = (TraitObjectCarrier) carrier;
         pointer.traitMetadataCarrier = carrier;
         pointer.traitMetadataMarker = tailPointer.traitMetadataMarker;
-        pointer.traitPointeeSize = tailPointer.traitPointeeSize;
-        pointer.traitPointeeAlignment = tailPointer.traitPointeeAlignment;
-        pointer.traitAdapterClassName = tailPointer.traitAdapterClassName;
+        pointer.traitPointeeSize = tailPointer.traitPointeeSize >= 0
+                ? tailPointer.traitPointeeSize
+                : traitCarrier.rustTraitObjectSize();
+        pointer.traitPointeeAlignment = tailPointer.traitPointeeAlignment > 0
+                ? tailPointer.traitPointeeAlignment
+                : traitCarrier.rustTraitObjectAlignment();
+        pointer.traitAdapterClassName = tailPointer.traitAdapterClassName != null
+                ? tailPointer.traitAdapterClassName
+                : carrier.getClass().getName();
         pointer.traitPointeeCodecClassName = tailPointer.traitPointeeCodecClassName;
+        if (pointer.traitPointeeCodecClassName == null) {
+            Object payload = traitCarrier.rustTraitObjectPayload();
+            if (payload instanceof Pointer) {
+                pointer.traitPointeeCodecClassName = ((Pointer) payload).viewCodecClassName;
+            }
+        }
         return pointer;
     }
 
@@ -3721,6 +4526,57 @@ public final class Pointer {
             String newViewCodecClassName,
             long metadata) {
         return pointer.retype(newViewSize, newViewCodecClassName).withMetadata(metadata);
+    }
+
+    /** Retypes a data pointer while copying the metadata word of another wide pointer. */
+    public static Pointer retypeWithMetadataOf(
+            Pointer pointer,
+            Pointer metadataSource,
+            long newViewSize,
+            String newViewCodecClassName) {
+        Pointer result = pointer.retype(newViewSize, newViewCodecClassName);
+        result.metadata = metadataSource.metadata;
+        result.traitObjectCarrier = metadataSource.traitObjectCarrier;
+        result.traitMetadataCarrier = metadataSource.traitMetadataCarrier;
+        result.traitMetadataMarker = metadataSource.traitMetadataMarker;
+        result.traitPointeeSize = metadataSource.traitPointeeSize;
+        result.traitPointeeAlignment = metadataSource.traitPointeeAlignment;
+        result.traitAdapterClassName = metadataSource.traitAdapterClassName;
+        result.traitPointeeCodecClassName = metadataSource.traitPointeeCodecClassName;
+        return result;
+    }
+
+    /** Retypes a struct-tail data pointer and attaches the source trait vtable. */
+    public static Pointer retypeStructTailWithMetadataOf(
+            Pointer pointer,
+            Pointer metadataSource,
+            long newViewSize,
+            String newViewCodecClassName) {
+        Pointer result = attachStructTailTraitMetadata(
+                pointer.retype(newViewSize, newViewCodecClassName), metadataSource);
+        if (result.traitAdapterClassName == null) {
+            return result;
+        }
+        try {
+            Pointer tailData = result.byte_offset(newViewSize).retype(
+                    result.traitPointeeSize, result.traitPointeeCodecClassName);
+            Class<?> adapter = resolvedRuntimeClass(result.traitAdapterClassName);
+            result.traitMetadataCarrier = constructorWithArity(adapter, 1).newInstance(tailData);
+            return result;
+        } catch (ReflectiveOperationException error) {
+            throw new IllegalStateException("could not retarget Rust trait-object tail", error);
+        }
+    }
+
+    /** Retypes a trait-object data pointer as its enclosing trait-tailed struct. */
+    public static Pointer retypeStructTailFromTraitPointer(
+            Pointer pointer,
+            long newViewSize,
+            String newViewCodecClassName) {
+        Pointer result = pointer.retype(newViewSize, newViewCodecClassName);
+        result.traitObjectCarrier = null;
+        result.traitMetadataCarrier = null;
+        return attachStructTailTraitMetadata(result, pointer);
     }
 
     /** Creates a coherent JVM carrier view for a Rust struct-tail unsizing coercion. */
@@ -3749,6 +4605,9 @@ public final class Pointer {
                 newViewSize,
                 STRUCTURAL_VIEW_CODEC_PREFIX
                         + targetClassName + "\n" + pointer.viewSize + "\n" + sourceCodec);
+        if (pointer.allocation == null) {
+            return result;
+        }
         try {
             Object source = pointer.getObject();
             Class<?> targetClass = resolvedRuntimeClass(targetClassName);
@@ -3922,6 +4781,17 @@ public final class Pointer {
         return this;
     }
 
+    private Pointer copyDynamicMetadata(Pointer source) {
+        traitObjectCarrier = source.traitObjectCarrier;
+        traitMetadataCarrier = source.traitMetadataCarrier;
+        traitMetadataMarker = source.traitMetadataMarker;
+        traitPointeeSize = source.traitPointeeSize;
+        traitPointeeAlignment = source.traitPointeeAlignment;
+        traitAdapterClassName = source.traitAdapterClassName;
+        traitPointeeCodecClassName = source.traitPointeeCodecClassName;
+        return this;
+    }
+
     private Pointer inheritAddressOrigin(Pointer source, long additionalOffset) {
         if (source.addressOrigin == null) {
             addressOrigin = source;
@@ -4056,6 +4926,7 @@ public final class Pointer {
                     allocationCodecClassName,
                     viewCodecClassName,
                     Math.addExact(exposedAddress, delta)).withMetadata(metadata)
+                    .copyDynamicMetadata(this)
                     .copyAddressOrigin(this, delta);
         }
         return new Pointer(
@@ -4065,7 +4936,7 @@ public final class Pointer {
                 viewSize,
                 allocationCodecClassName,
                 viewCodecClassName,
-                -1).withMetadata(metadata).copyAddressOrigin(this, delta);
+                -1).withMetadata(metadata).copyDynamicMetadata(this).copyAddressOrigin(this, delta);
     }
 
     public Pointer offset(int elementCount) { return offset((long) elementCount); }
@@ -4110,6 +4981,7 @@ public final class Pointer {
                     allocationCodecClassName,
                     viewCodecClassName,
                     Math.addExact(exposedAddress, byteCount)).withMetadata(metadata)
+                    .copyDynamicMetadata(this)
                     .copyAddressOrigin(this, byteCount);
         }
         return new Pointer(
@@ -4119,7 +4991,8 @@ public final class Pointer {
                 viewSize,
                 allocationCodecClassName,
                 viewCodecClassName,
-                -1).withMetadata(metadata).copyAddressOrigin(this, byteCount);
+                -1).withMetadata(metadata).copyDynamicMetadata(this)
+                .copyAddressOrigin(this, byteCount);
     }
 
     public Pointer byte_offset(int byteCount) { return byte_offset((long) byteCount); }
@@ -4170,6 +5043,7 @@ public final class Pointer {
                     allocationCodecClassName,
                     viewCodecClassName,
                     exposedAddress + byteCount).withMetadata(metadata)
+                    .copyDynamicMetadata(this)
                     .copyAddressOrigin(this, byteCount);
         }
         return new Pointer(
@@ -4179,7 +5053,8 @@ public final class Pointer {
                 viewSize,
                 allocationCodecClassName,
                 viewCodecClassName,
-                -1).withMetadata(metadata).copyAddressOrigin(this, byteCount);
+                -1).withMetadata(metadata).copyDynamicMetadata(this)
+                .copyAddressOrigin(this, byteCount);
     }
 
     public long align_offset(long alignment) {
@@ -4231,7 +5106,7 @@ public final class Pointer {
                     viewSize,
                     allocationCodecClassName,
                     viewCodecClassName,
-                    address).withMetadata(metadata);
+                    address).withMetadata(metadata).copyDynamicMetadata(this);
         }
         long currentAddress = numericAddress();
         long base = currentAddress - byteOffset;
@@ -4243,6 +5118,7 @@ public final class Pointer {
                 allocationCodecClassName,
                 viewCodecClassName,
                 -1).withMetadata(metadata)
+                .copyDynamicMetadata(this)
                 .copyAddressOrigin(this, address - currentAddress);
     }
 
@@ -4285,6 +5161,7 @@ public final class Pointer {
                     allocationCodecClassName,
                     viewCodecClassName,
                     exposedAddress + delta).withMetadata(metadata)
+                    .copyDynamicMetadata(this)
                     .copyAddressOrigin(this, delta);
         }
         return new Pointer(
@@ -4294,7 +5171,7 @@ public final class Pointer {
                 viewSize,
                 allocationCodecClassName,
                 viewCodecClassName,
-                -1).withMetadata(metadata).copyAddressOrigin(this, delta);
+                -1).withMetadata(metadata).copyDynamicMetadata(this).copyAddressOrigin(this, delta);
     }
 
     private Object provenanceAllocation() {
@@ -4528,9 +5405,12 @@ public final class Pointer {
     }
 
     private static long allocationCapacity(Object allocation, int elementSize) {
-        return allocation.getClass().isArray()
-                ? Math.multiplyExact((long) Array.getLength(allocation), elementSize)
-                : elementSize;
+        if (!allocation.getClass().isArray()) {
+            return elementSize;
+        }
+        long direct = Math.multiplyExact((long) Array.getLength(allocation), elementSize);
+        long nested = nestedPrimitiveArrayByteSize(allocation);
+        return Math.max(direct, nested);
     }
 
     /** Must be called while holding {@link #ALLOCATIONS}. */
@@ -4692,6 +5572,9 @@ public final class Pointer {
         if (pointer == null || pointerCodec == null) {
             return address;
         }
+        retainEncodedReference(
+                owner,
+                new EncodedPointerToken(address, pointerCodec, pointer.exposedTarget()));
         synchronized (ALLOCATIONS) {
             registerTypedExposedTarget(address, pointerCodec, pointer.exposedTarget());
         }
@@ -4826,6 +5709,16 @@ public final class Pointer {
                 throw new IndexOutOfBoundsException("pointer arithmetic escaped field storage");
             }
             return ((FieldCell) allocation).get();
+        }
+        if (allocation.getClass().isArray()
+                && allocation.getClass().getComponentType().isArray()) {
+            long nestedElementSize = nestedPrimitiveArrayElementByteSize(allocation);
+            if (nestedElementSize > allocationElementSize) {
+                return nestedPrimitiveArrayElement(
+                        allocation,
+                        Math.multiplyExact((long) elementIndex, allocationElementSize),
+                        allocationElementSize);
+            }
         }
         return independentRepeatedArrayElement(allocation, elementIndex);
     }
@@ -5157,6 +6050,8 @@ public final class Pointer {
                             "aggregate codec returned a short memory image");
                 }
                 System.arraycopy(image, withinElement, result, consumed, chunk);
+                transferEncodedPointers(
+                        image, withinElement, result, consumed, chunk, false);
                 transferEncodedReferences(image, result);
                 discardEncodedReferences(image);
             } else {
@@ -5166,6 +6061,9 @@ public final class Pointer {
             }
             consumed += chunk;
         }
+        transferEncodedPointers(
+                allocation, byteOffset, result, 0, byteCount, false);
+        transferEncodedReferences(allocation, result);
         return result;
     }
 
@@ -5247,7 +6145,17 @@ public final class Pointer {
         int elementIndex = Math.toIntExact(Math.floorDiv(absoluteByteOffset, allocationElementSize));
         int withinElement = (int) Math.floorMod(absoluteByteOffset, allocationElementSize);
         Object current;
-        current = readElement(elementIndex);
+        try {
+            current = readElement(elementIndex);
+        } catch (ArrayIndexOutOfBoundsException error) {
+            throw new ArrayIndexOutOfBoundsException(
+                    error.getMessage() + ": absolute_byte_offset=" + absoluteByteOffset
+                            + ", pointer_byte_offset=" + byteOffset
+                            + ", allocation_element_size=" + allocationElementSize
+                            + ", view_size=" + viewSize
+                            + ", allocation_codec=" + allocationCodecClassName
+                            + ", view_codec=" + viewCodecClassName);
+        }
         int primitiveArrayElementSize =
                 primitiveArrayElementSize(current, allocationElementSize);
         if (primitiveArrayElementSize != 0) {
@@ -5678,10 +6586,21 @@ public final class Pointer {
         }
         if (isRawPointerCodec(viewCodecClassName)
                 && !isDirectAllocationView()) {
+            int encodedSize = (int) Math.min(viewSize, 8);
+            long address = loadUnsigned(encodedSize);
+            Pointer pointer = encodedPointer(
+                    allocation,
+                    byteOffset,
+                    encodedSize,
+                    viewCodecClassName,
+                    address);
             if (isArrayReferenceCodec(viewCodecClassName)) {
                 try {
                     return decodeArrayReference(
-                            loadUnsigned((int) Math.min(viewSize, 8)),
+                            pointer == null
+                                    ? typedPointerObjectFromAddress(
+                                            address, viewCodecClassName)
+                                    : pointer,
                             viewCodecClassName,
                             resolvedRuntimeClass(SLICE_VIEW_CLASS_NAME));
                 } catch (ClassNotFoundException error) {
@@ -5690,7 +6609,10 @@ public final class Pointer {
                 }
             }
             return decodedRawPointer(
-                    loadUnsigned((int) Math.min(viewSize, 8)), viewCodecClassName);
+                    pointer == null
+                            ? typedPointerObjectFromAddress(address, viewCodecClassName)
+                            : pointer,
+                    viewCodecClassName);
         }
         if (isBigIntegerCodec(viewCodecClassName) && !isDirectAllocationView()) {
             BigInteger bits = bigIntegerFromPointerBytes(materializedViewSize(), false);
@@ -5707,6 +6629,9 @@ public final class Pointer {
             for (int index = 0; index < materializedSize; index++) {
                 image[index] = (byte) loadByte(byteOffset + index);
             }
+            transferEncodedPointers(
+                    allocation, byteOffset, image, 0, materializedSize, false);
+            transferEncodedReferences(allocation, image);
             return decodeFatPointer(image, 0, materializedSize, viewCodecClassName);
         }
         if (isStructuralViewCodec(viewCodecClassName)) {
@@ -5755,13 +6680,34 @@ public final class Pointer {
         if (targetClassName == null || targetClassName.isEmpty()) {
             return getObject();
         }
+        if (viewSize == 0
+                && zeroSizedSourceViewSize >= 0
+                && isGeneratedAggregateCodec(viewCodecClassName)
+                && !viewCodecClassName.equals(zeroSizedSourceViewCodecClassName)) {
+            Object requestedView = decodedMemoryView();
+            if (requestedView != null
+                    && requestedView.getClass().getName().equals(binaryClassName(targetClassName))) {
+                return requestedView;
+            }
+        }
         if (SLICE_VIEW_CLASS_NAME.equals(binaryClassName(targetClassName))
                 && isArrayReferenceCodec(viewCodecClassName)
                 && !isDirectAllocationView()) {
             try {
+                int encodedSize = (int) Math.min(viewSize, 8);
+                long address = loadUnsigned(encodedSize);
+                Pointer pointer = encodedPointer(
+                        allocation,
+                        byteOffset,
+                        encodedSize,
+                        viewCodecClassName,
+                        address);
                 Class<?> targetClass = resolvedRuntimeClass(targetClassName);
                 return decodeArrayReference(
-                        loadUnsigned((int) Math.min(viewSize, 8)),
+                        pointer == null
+                                ? typedPointerObjectFromAddress(
+                                        address, viewCodecClassName)
+                                : pointer,
                         viewCodecClassName,
                         targetClass);
             } catch (ClassNotFoundException error) {
@@ -5819,6 +6765,13 @@ public final class Pointer {
             int remaining = Array.getLength(allocation) - elementOffset;
             Object tail = Array.newInstance(allocation.getClass().getComponentType(), remaining);
             System.arraycopy(allocation, elementOffset, tail, 0, remaining);
+            transferEncodedPointers(
+                    allocation,
+                    (long) elementOffset * allocationElementSize,
+                    tail,
+                    0,
+                    Math.multiplyExact(remaining, allocationElementSize),
+                    false);
             transferEncodedReferences(allocation, tail);
             return tail;
         }
@@ -5854,6 +6807,10 @@ public final class Pointer {
             return false;
         }
         if (allocationElementSize != viewSize) {
+            return false;
+        }
+        if (allocation.getClass().getComponentType().isArray()
+                && nestedPrimitiveArrayElementByteSize(allocation) > allocationElementSize) {
             return false;
         }
         return allocationCodecClassName == null
@@ -5968,10 +6925,10 @@ public final class Pointer {
             }
             if (isRawPointerCodec(viewCodecClassName)) {
                 byte[] image = new byte[materializedSize];
-                long address = encodedAddress(
-                        rawPointerCarrier(value, viewCodecClassName),
-                        image,
-                        viewCodecClassName);
+                Pointer pointer = rawPointerCarrier(value, viewCodecClassName);
+                long address = encodedAddress(pointer, image, viewCodecClassName);
+                rememberEncodedPointer(
+                        image, 0, materializedSize, viewCodecClassName, pointer);
                 for (int index = 0; index < Math.min(materializedSize, 8); index++) {
                     image[index] = (byte) (address >>> (index * 8));
                 }
@@ -6364,32 +7321,50 @@ public final class Pointer {
     }
 
     private void storeRange(byte[] source) {
-        moveEncodedReferences(source, allocation);
         prepareMemoryWrite(byteOffset, source.length);
+        discardEncodedPointers(allocation, byteOffset, source.length);
         if (allocationCodecClassName == null || isBuiltInCodec(allocationCodecClassName)) {
             for (int index = 0; index < source.length; index++) {
                 storeByte(byteOffset + index, source[index] & 0xff);
             }
-            return;
+        } else {
+            int consumed = 0;
+            while (consumed < source.length) {
+                long absoluteOffset = byteOffset + consumed;
+                int elementIndex =
+                        Math.toIntExact(Math.floorDiv(absoluteOffset, allocationElementSize));
+                int withinElement = (int) Math.floorMod(absoluteOffset, allocationElementSize);
+                Object current = readElement(elementIndex);
+                byte[] image = encodeAggregate(allocationCodecClassName, current);
+                transferEncodedPointers(
+                        allocation,
+                        (long) elementIndex * allocationElementSize,
+                        image,
+                        0,
+                        image.length,
+                        false);
+                transferEncodedPointers(
+                        source,
+                        consumed,
+                        image,
+                        withinElement,
+                        Math.min(source.length - consumed, image.length - withinElement),
+                        false);
+                transferEncodedReferences(allocation, image);
+                transferEncodedReferences(source, image);
+                int chunk = Math.min(source.length - consumed, image.length - withinElement);
+                System.arraycopy(source, consumed, image, withinElement, chunk);
+                Object decoded = decodeAggregate(allocationCodecClassName, image);
+                discardEncodedReferences(image);
+                writeElementPreservingIdentity(
+                        elementIndex,
+                        decoded);
+                consumed += chunk;
+            }
         }
-        int consumed = 0;
-        while (consumed < source.length) {
-            long absoluteOffset = byteOffset + consumed;
-            int elementIndex = Math.toIntExact(Math.floorDiv(absoluteOffset, allocationElementSize));
-            int withinElement = (int) Math.floorMod(absoluteOffset, allocationElementSize);
-            Object current = readElement(elementIndex);
-            byte[] image = encodeAggregate(allocationCodecClassName, current);
-            transferEncodedReferences(allocation, image);
-            transferEncodedReferences(source, image);
-            int chunk = Math.min(source.length - consumed, image.length - withinElement);
-            System.arraycopy(source, consumed, image, withinElement, chunk);
-            Object decoded = decodeAggregate(allocationCodecClassName, image);
-            discardEncodedReferences(image);
-            writeElementPreservingIdentity(
-                    elementIndex,
-                    decoded);
-            consumed += chunk;
-        }
+        transferEncodedPointers(
+                source, 0, allocation, byteOffset, source.length, false);
+        moveEncodedReferences(source, allocation);
     }
 
     private void writeElement(int elementIndex, Object value) {
@@ -6413,6 +7388,17 @@ public final class Pointer {
             }
             ((FieldCell) allocation).set(value);
             return;
+        }
+        if (allocation.getClass().getComponentType().isArray()) {
+            long nestedElementSize = nestedPrimitiveArrayElementByteSize(allocation);
+            if (nestedElementSize > allocationElementSize) {
+                writeNestedPrimitiveArrayElement(
+                        allocation,
+                        Math.multiplyExact((long) elementIndex, allocationElementSize),
+                        allocationElementSize,
+                        value);
+                return;
+            }
         }
         Array.set(allocation, elementIndex, value);
     }
@@ -6506,6 +7492,8 @@ public final class Pointer {
             int size) {
         System.arraycopy(sourceBytes, sourceOffset, targetBytes, targetOffset, size);
         System.arraycopy(sourceObjects, sourceOffset, targetObjects, targetOffset, size);
+        transferEncodedPointers(
+                sourceBytes, sourceOffset, targetBytes, targetOffset, size, false);
         transferEncodedReferences(sourceBytes, targetBytes);
     }
 
@@ -6676,7 +7664,10 @@ public final class Pointer {
     }
 
     private static Pointer decodedRawPointer(long address, String codec) {
-        Pointer pointer = typedPointerObjectFromAddress(address, codec);
+        return decodedRawPointer(typedPointerObjectFromAddress(address, codec), codec);
+    }
+
+    private static Pointer decodedRawPointer(Pointer pointer, String codec) {
         if (RAW_POINTER_VIEW_CODEC.equals(codec)) {
             return pointer;
         }
@@ -6690,7 +7681,13 @@ public final class Pointer {
     }
 
     private static Object decodeArrayReference(long address, String codec, Class<?> targetClass) {
-        Pointer data = decodedRawPointer(address, codec);
+        return decodeArrayReference(
+                typedPointerObjectFromAddress(address, codec), codec, targetClass);
+    }
+
+    private static Object decodeArrayReference(
+            Pointer pointer, String codec, Class<?> targetClass) {
+        Pointer data = decodedRawPointer(pointer, codec);
         try {
             return LONG_SLICE_VIEW_CONSTRUCTORS
                     .get(targetClass)

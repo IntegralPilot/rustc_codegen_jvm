@@ -153,6 +153,11 @@ fn call_erased<T>(value: &T, formatter: fn(&T, &mut i32) -> i32, initial: i32) -
 
 fn dummy() {}
 
+#[inline(never)]
+fn function_pointer_slot_is_null(pointer: *const fn()) -> bool {
+    pointer.is_null()
+}
+
 struct Ops {
     unary: fn(i32) -> i32,
     binary: fn(i32, i32) -> i32,
@@ -306,6 +311,29 @@ fn main() {
     assert!(!raw_addr.is_null());
     let back_again: fn() = unsafe { core::mem::transmute(raw_addr) };
     back_again();
+
+    let raw_function_pointer: *const fn() = &fn_ptr;
+    assert!(!function_pointer_slot_is_null(raw_function_pointer));
+    let null_function_pointer = core::ptr::null::<fn()>();
+    assert!(function_pointer_slot_is_null(null_function_pointer));
+
+    let mut callable_value: fn() = dummy;
+    let callable: &mut dyn Fn() = &mut callable_value;
+    let raw_dyn_function = callable as *mut dyn Fn();
+    assert!(!raw_dyn_function.is_null());
+    #[repr(C)]
+    struct DynFunctionPointer {
+        data: *mut (),
+        vtable: *mut (),
+    }
+    let raw_parts: DynFunctionPointer = unsafe { core::mem::transmute(raw_dyn_function) };
+    let null_dyn_function: *mut dyn Fn() = unsafe {
+        core::mem::transmute(DynFunctionPointer {
+            data: core::ptr::null_mut(),
+            vtable: raw_parts.vtable,
+        })
+    };
+    assert!(null_dyn_function.is_null());
 
     // Credit from this point on: AnuthaDev
 

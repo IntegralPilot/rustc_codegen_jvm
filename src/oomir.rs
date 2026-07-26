@@ -616,6 +616,8 @@ pub enum Constant {
         identity: String,
         value: Box<Constant>,
         array_backed: bool,
+        allocation_size: u64,
+        offset: u64,
         view_size: u64,
         alignment: u64,
         view_codec: Box<Constant>,
@@ -692,6 +694,7 @@ impl Constant {
 
 impl std::hash::Hash for Constant {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
         match self {
             Constant::Unit => 0.hash(state),
             Constant::StaticRef {
@@ -783,6 +786,8 @@ impl std::hash::Hash for Constant {
                 identity,
                 value,
                 array_backed,
+                allocation_size,
+                offset,
                 view_size,
                 alignment,
                 view_codec,
@@ -791,6 +796,8 @@ impl std::hash::Hash for Constant {
                 identity.hash(state);
                 value.hash(state);
                 array_backed.hash(state);
+                allocation_size.hash(state);
+                offset.hash(state);
                 view_size.hash(state);
                 alignment.hash(state);
                 view_codec.hash(state);
@@ -841,7 +848,8 @@ impl std::hash::Hash for Constant {
                 param_types,
             } => {
                 class_name.hash(state);
-                // iterate over the fields and hash them
+                let mut fields = fields.iter().collect::<Vec<_>>();
+                fields.sort_unstable_by_key(|(key, _)| *key);
                 for (key, value) in fields {
                     key.hash(state);
                     value.hash(state);

@@ -70,7 +70,10 @@ use rustc_metadata::EncodedMetadata;
 use rustc_middle::{
     dep_graph::{WorkProduct, WorkProductId},
     mono::MonoItem,
-    ty::{EarlyBinder, GenericArgs, Instance, InstanceKind, ShimKind, TyCtxt, TyKind, TypingEnv},
+    ty::{
+        EarlyBinder, GenericArgs, Instance, InstanceKind, ShimKind, TyCtxt, TyKind, TypingEnv,
+        Unnormalized, VtblEntry,
+    },
 };
 use rustc_session::{
     Session,
@@ -778,6 +781,98 @@ fn lower_supplemental_instance_closure<'tcx>(
     }
 }
 
+fn normalized_instance_ty<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
+    ty: rustc_middle::ty::Ty<'tcx>,
+) -> rustc_middle::ty::Ty<'tcx> {
+    let instantiated = EarlyBinder::bind(tcx, ty)
+        .instantiate(tcx, instance.args)
+        .skip_norm_wip();
+    tcx.try_normalize_erasing_regions(
+        TypingEnv::fully_monomorphized(),
+        Unnormalized::new_wip(instantiated),
+    )
+    .unwrap_or(instantiated)
+}
+
+fn unsize_vtable_callees<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
+    source_ty: rustc_middle::ty::Ty<'tcx>,
+    target_ty: rustc_middle::ty::Ty<'tcx>,
+) -> Vec<Instance<'tcx>> {
+    let source_ty = normalized_instance_ty(tcx, instance, source_ty);
+    let target_ty = normalized_instance_ty(tcx, instance, target_ty);
+    let pointees = match (source_ty.kind(), target_ty.kind()) {
+        (
+            TyKind::Ref(_, source, _) | TyKind::RawPtr(source, _),
+            TyKind::Ref(_, target, _) | TyKind::RawPtr(target, _),
+        ) => Some((*source, *target)),
+        _ => None,
+    };
+    let Some((source_pointee, target_pointee)) = pointees else {
+        return Vec::new();
+    };
+    let typing_env = TypingEnv::fully_monomorphized();
+    let source_tail = tcx.struct_tail_for_codegen(
+        normalized_instance_ty(tcx, instance, source_pointee),
+        typing_env,
+    );
+    let target_tail = tcx.struct_tail_for_codegen(
+        normalized_instance_ty(tcx, instance, target_pointee),
+        typing_env,
+    );
+    let TyKind::Dynamic(predicates, _) = target_tail.kind() else {
+        return Vec::new();
+    };
+    let Some(principal) = predicates.principal() else {
+        return Vec::new();
+    };
+    let trait_ref =
+        tcx.instantiate_bound_regions_with_erased(principal.with_self_ty(tcx, source_tail));
+    let mut callees = tcx
+        .vtable_entries(trait_ref)
+        .iter()
+        .filter_map(|entry| match entry {
+            VtblEntry::Method(target) if tcx.is_mir_available(target.def_id()) => Some(*target),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if source_tail.needs_drop(tcx, typing_env) {
+        callees.push(Instance::resolve_drop_glue(tcx, source_tail));
+    }
+    callees
+}
+
+fn synthetic_drop_callees_for_ty<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    ty: rustc_middle::ty::Ty<'tcx>,
+) -> Vec<Instance<'tcx>> {
+    let typing_env = TypingEnv::fully_monomorphized();
+    ty.walk()
+        .filter_map(|arg| {
+            let ty = arg.as_type()?;
+            match ty.kind() {
+                TyKind::FnDef(def_id, args) => {
+                    Instance::resolve_for_fn_ptr(tcx, typing_env, *def_id, args.no_bound_vars()?)
+                        .filter(|target| tcx.is_mir_available(target.def_id()))
+                }
+                TyKind::Slice(element) if element.needs_drop(tcx, typing_env) => {
+                    Some(Instance::resolve_drop_glue(tcx, *element))
+                }
+                TyKind::Adt(def, args) if def.is_box() => {
+                    let pointee = args.type_at(0);
+                    pointee
+                        .needs_drop(tcx, typing_env)
+                        .then(|| Instance::resolve_drop_glue(tcx, pointee))
+                }
+                _ => None,
+            }
+        })
+        .collect()
+}
+
 fn direct_mir_callees<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> Vec<Instance<'tcx>> {
     let has_callable_mir = match instance.def {
         InstanceKind::Item(_) => tcx.is_mir_available(instance.def_id()),
@@ -792,7 +887,8 @@ fn direct_mir_callees<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> Vec<
 
     let mir = tcx.instance_mir(instance.def);
     let typing_env = TypingEnv::post_analysis(tcx, mir.source.def_id());
-    mir.basic_blocks
+    let mut callees = mir
+        .basic_blocks
         .iter()
         .filter_map(|block| {
             let terminator = block.terminator();
@@ -819,7 +915,44 @@ fn direct_mir_callees<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> Vec<
                 | InstanceKind::Virtual(..) => None,
             }
         })
-        .collect()
+        .collect::<Vec<_>>();
+
+    for local in &mir.local_decls {
+        let ty = normalized_instance_ty(tcx, instance, local.ty);
+        callees.extend(synthetic_drop_callees_for_ty(tcx, ty));
+    }
+
+    for block in mir.basic_blocks.iter() {
+        if let rustc_middle::mir::TerminatorKind::Drop { place, .. } = &block.terminator().kind {
+            let dropped_ty = normalized_instance_ty(tcx, instance, place.ty(mir, tcx).ty);
+            if dropped_ty.needs_drop(tcx, typing_env) {
+                callees.push(Instance::resolve_drop_glue(tcx, dropped_ty));
+            }
+        }
+        for statement in &block.statements {
+            let rustc_middle::mir::StatementKind::Assign(box (_, rvalue)) = &statement.kind else {
+                continue;
+            };
+            let rustc_middle::mir::Rvalue::Cast(
+                rustc_middle::mir::CastKind::PointerCoercion(
+                    rustc_middle::ty::adjustment::PointerCoercion::Unsize,
+                    _,
+                ),
+                source,
+                target_ty,
+            ) = rvalue
+            else {
+                continue;
+            };
+            callees.extend(unsize_vtable_callees(
+                tcx,
+                instance,
+                source.ty(mir, tcx),
+                *target_ty,
+            ));
+        }
+    }
+    callees
 }
 
 fn ensure_trait_interface<'tcx>(

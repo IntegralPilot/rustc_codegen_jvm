@@ -5,7 +5,9 @@ use rustc_middle::ty::{Instance, Ty, TyCtxt, TyKind, TypingEnv, VtblEntry};
 use super::super::{
     jvm_names,
     naming::{mono_fn_name_from_instance, mono_owner_class},
-    types::{readable_rust_type_name, sanitize_name_token, ty_to_oomir_type},
+    types::{
+        pointer_view_codec_operand, readable_rust_type_name, sanitize_name_token, ty_to_oomir_type,
+    },
 };
 use crate::oomir;
 
@@ -319,6 +321,94 @@ pub(crate) fn ensure_trait_object_adapter_class_for_pointees<'tcx>(
             == carrier_ty.to_jvm_descriptor()
         {
             (Vec::new(), payload_operand.clone())
+        } else if matches!(carrier_ty, oomir::Type::Pointer(_))
+            && matches!(target_receiver_ty, oomir::Type::Slice(_))
+            && let TyKind::Array(element_ty, length) = concrete_ty.kind()
+        {
+            let length = length.try_to_target_usize(tcx).ok_or_else(|| {
+                format!("trait-object array length is not concrete: {concrete_ty:?}")
+            })?;
+            let element_ty = *element_ty;
+            let element_oomir_ty = ty_to_oomir_type(element_ty, tcx, data_types, instance_context);
+            let element_pointer_ty = oomir::Type::Pointer(Box::new(element_oomir_ty));
+            let element_pointer_name = "_trait_object_array_data".to_string();
+            let receiver_object_name = "_trait_object_receiver_object".to_string();
+            let receiver_name = "_trait_object_receiver".to_string();
+            (
+                vec![
+                    oomir::Instruction::InvokeStatic {
+                        dest: Some(element_pointer_name.clone()),
+                        class_name: oomir::POINTER_CLASS.to_string(),
+                        method_name: "retype".to_string(),
+                        method_ty: oomir::Signature {
+                            params: vec![
+                                ("pointer".to_string(), carrier_ty.clone()),
+                                ("view_size".to_string(), oomir::Type::U64),
+                                ("view_codec".to_string(), oomir::Type::java_string()),
+                            ],
+                            ret: Box::new(element_pointer_ty.clone()),
+                            is_static: true,
+                        },
+                        args: vec![
+                            payload_operand,
+                            oomir::Operand::Constant(oomir::Constant::U64(
+                                super::super::types::layout_size_bytes(tcx, element_ty)?
+                                    .try_into()
+                                    .map_err(|_| {
+                                        format!(
+                                            "trait-object array element is too large: {element_ty:?}"
+                                        )
+                                    })?,
+                            )),
+                            pointer_view_codec_operand(
+                                element_ty,
+                                tcx,
+                                data_types,
+                                instance_context,
+                            ),
+                        ],
+                    },
+                    oomir::Instruction::ConstructObject {
+                        dest: receiver_object_name.clone(),
+                        class_name: oomir::SLICE_VIEW_CLASS.to_string(),
+                        args: vec![
+                            (
+                                oomir::Operand::Variable {
+                                    name: element_pointer_name,
+                                    ty: element_pointer_ty,
+                                },
+                                oomir::Type::Class("java/lang/Object".to_string()),
+                            ),
+                            (
+                                oomir::Operand::Constant(oomir::Constant::I32(0)),
+                                oomir::Type::I32,
+                            ),
+                            (
+                                oomir::Operand::Constant(oomir::Constant::U64(
+                                    length.try_into().map_err(|_| {
+                                        format!(
+                                            "trait-object array length exceeds u64: {concrete_ty:?}"
+                                        )
+                                    })?,
+                                )),
+                                oomir::Type::U64,
+                            ),
+                        ],
+                    },
+                    oomir::Instruction::Cast {
+                        op: oomir::Operand::Variable {
+                            name: receiver_object_name,
+                            ty: oomir::Type::Class(oomir::SLICE_VIEW_CLASS.to_string()),
+                        },
+                        ty: target_receiver_ty.clone(),
+                        dest: receiver_name.clone(),
+                    },
+                ],
+                oomir::Operand::Variable {
+                    name: receiver_name,
+                    ty: target_receiver_ty.clone(),
+                },
+            )
         } else if let oomir::Type::Class(receiver_class) = &target_receiver_ty
             && matches!(
                 data_types.get(receiver_class),

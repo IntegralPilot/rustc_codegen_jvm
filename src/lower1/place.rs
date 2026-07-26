@@ -844,7 +844,44 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
                         u64::try_from(field_offset).expect("Rust DST field offset exceeds u64"),
                     ));
 
-                    if let TyKind::Slice(element_rust_ty) = field_rust_ty.kind() {
+                    if field_rust_ty.is_str() {
+                        current_type = oomir::Type::Str;
+                        let object_name = format!("{current_var}_str_object");
+                        instructions.push(Instruction::InvokeVirtual {
+                            dest: Some(object_name.clone()),
+                            class_name: oomir::POINTER_CLASS.to_string(),
+                            method_name: "projectStructStrField".to_string(),
+                            method_ty: oomir::Signature {
+                                params: vec![
+                                    ("self".to_string(), base_pointer_ty.clone()),
+                                    ("owner_class".to_string(), oomir::Type::java_string()),
+                                    ("field_name".to_string(), oomir::Type::java_string()),
+                                    ("field_offset".to_string(), oomir::Type::U64),
+                                ],
+                                ret: Box::new(oomir::Type::Class("java/lang/Object".to_string())),
+                                is_static: false,
+                            },
+                            args: vec![
+                                Operand::Constant(oomir::Constant::String(owner_class)),
+                                Operand::Constant(oomir::Constant::String(field_name)),
+                                field_offset,
+                            ],
+                            operand: Operand::Variable {
+                                name: base_pointer_name,
+                                ty: base_pointer_ty,
+                            },
+                        });
+                        let next_var = format!("{current_var}_{}", field_index.index());
+                        instructions.push(Instruction::Cast {
+                            dest: next_var.clone(),
+                            op: Operand::Variable {
+                                name: object_name,
+                                ty: oomir::Type::Class("java/lang/Object".to_string()),
+                            },
+                            ty: current_type.clone(),
+                        });
+                        current_var = next_var;
+                    } else if let TyKind::Slice(element_rust_ty) = field_rust_ty.kind() {
                         let element_oomir_ty =
                             ty_to_oomir_type(*element_rust_ty, tcx, data_types, instance);
                         current_type = oomir::Type::Slice(Box::new(element_oomir_ty));

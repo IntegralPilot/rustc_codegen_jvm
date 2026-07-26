@@ -283,6 +283,8 @@ pub fn load_constant(
             identity,
             value,
             array_backed,
+            allocation_size,
+            offset,
             view_size,
             alignment,
             view_codec,
@@ -306,22 +308,46 @@ pub fn load_constant(
                     cp,
                 )?);
             }
-            instructions_to_add.push(get_long_const_instr(cp, *view_size as i64));
-            load_constant(&mut instructions_to_add, cp, view_codec)?;
-            instructions_to_add.push(get_long_const_instr(cp, *alignment as i64));
             let pointer_class = cp.add_class(oomir::POINTER_CLASS)?;
-            let factory = cp.add_method_ref(
-                pointer_class,
-                if *array_backed {
-                    "constantArray"
-                } else {
-                    "constantCell"
-                },
-                &format!(
-                    "(Ljava/lang/String;Ljava/lang/Object;JLjava/lang/String;J)L{};",
-                    oomir::POINTER_CLASS
-                ),
-            )?;
+            let factory = if *array_backed {
+                instructions_to_add.push(get_long_const_instr(cp, *view_size as i64));
+                load_constant(&mut instructions_to_add, cp, view_codec)?;
+                instructions_to_add.push(get_long_const_instr(cp, *alignment as i64));
+                cp.add_method_ref(
+                    pointer_class,
+                    "constantArray",
+                    &format!(
+                        "(Ljava/lang/String;Ljava/lang/Object;JLjava/lang/String;J)L{};",
+                        oomir::POINTER_CLASS
+                    ),
+                )?
+            } else if *offset == 0 && *allocation_size == *view_size {
+                instructions_to_add.push(get_long_const_instr(cp, *view_size as i64));
+                load_constant(&mut instructions_to_add, cp, view_codec)?;
+                instructions_to_add.push(get_long_const_instr(cp, *alignment as i64));
+                cp.add_method_ref(
+                    pointer_class,
+                    "constantCell",
+                    &format!(
+                        "(Ljava/lang/String;Ljava/lang/Object;JLjava/lang/String;J)L{};",
+                        oomir::POINTER_CLASS
+                    ),
+                )?
+            } else {
+                instructions_to_add.push(get_long_const_instr(cp, *allocation_size as i64));
+                instructions_to_add.push(get_long_const_instr(cp, *offset as i64));
+                instructions_to_add.push(get_long_const_instr(cp, *view_size as i64));
+                load_constant(&mut instructions_to_add, cp, view_codec)?;
+                instructions_to_add.push(get_long_const_instr(cp, *alignment as i64));
+                cp.add_method_ref(
+                    pointer_class,
+                    "constantCellAt",
+                    &format!(
+                        "(Ljava/lang/String;Ljava/lang/Object;JJJLjava/lang/String;J)L{};",
+                        oomir::POINTER_CLASS
+                    ),
+                )?
+            };
             instructions_to_add.push(JI::Invokestatic(factory));
         }
         OC::I8(v) => instructions_to_add.push(get_int_const_instr(cp, *v as i32)),
