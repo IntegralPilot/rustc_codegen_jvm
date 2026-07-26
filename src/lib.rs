@@ -71,8 +71,8 @@ use rustc_middle::{
     dep_graph::{WorkProduct, WorkProductId},
     mono::MonoItem,
     ty::{
-        EarlyBinder, GenericArgs, Instance, InstanceKind, ShimKind, TyCtxt, TyKind, TypingEnv,
-        Unnormalized, VtblEntry,
+        EarlyBinder, GenericArgs, Instance, InstanceKind, ShimKind, TyCtxt, TyKind,
+        TypeVisitableExt, TypingEnv, Unnormalized, VtblEntry,
     },
 };
 use rustc_session::{
@@ -839,7 +839,7 @@ fn unsize_vtable_callees<'tcx>(
             _ => None,
         })
         .collect::<Vec<_>>();
-    if source_tail.needs_drop(tcx, typing_env) {
+    if !source_tail.has_escaping_bound_vars() && source_tail.needs_drop(tcx, typing_env) {
         callees.push(Instance::resolve_drop_glue(tcx, source_tail));
     }
     callees
@@ -858,13 +858,15 @@ fn synthetic_drop_callees_for_ty<'tcx>(
                     Instance::resolve_for_fn_ptr(tcx, typing_env, *def_id, args.no_bound_vars()?)
                         .filter(|target| tcx.is_mir_available(target.def_id()))
                 }
-                TyKind::Slice(element) if element.needs_drop(tcx, typing_env) => {
+                TyKind::Slice(element)
+                    if !element.has_escaping_bound_vars()
+                        && element.needs_drop(tcx, typing_env) =>
+                {
                     Some(Instance::resolve_drop_glue(tcx, *element))
                 }
                 TyKind::Adt(def, args) if def.is_box() => {
                     let pointee = args.type_at(0);
-                    pointee
-                        .needs_drop(tcx, typing_env)
+                    (!pointee.has_escaping_bound_vars() && pointee.needs_drop(tcx, typing_env))
                         .then(|| Instance::resolve_drop_glue(tcx, pointee))
                 }
                 _ => None,
@@ -925,7 +927,7 @@ fn direct_mir_callees<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> Vec<
     for block in mir.basic_blocks.iter() {
         if let rustc_middle::mir::TerminatorKind::Drop { place, .. } = &block.terminator().kind {
             let dropped_ty = normalized_instance_ty(tcx, instance, place.ty(mir, tcx).ty);
-            if dropped_ty.needs_drop(tcx, typing_env) {
+            if !dropped_ty.has_escaping_bound_vars() && dropped_ty.needs_drop(tcx, typing_env) {
                 callees.push(Instance::resolve_drop_glue(tcx, dropped_ty));
             }
         }

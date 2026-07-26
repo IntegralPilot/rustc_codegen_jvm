@@ -313,6 +313,8 @@ public final class Pointer {
             new AtomicLongArray(REPEATED_ARRAY_FILTER_WORDS);
     private static final AtomicLongArray ENCODED_POINTER_FILTER =
             new AtomicLongArray(REPEATED_ARRAY_FILTER_WORDS);
+    private static final AtomicLongArray FIELD_CELL_FILTER =
+            new AtomicLongArray(REPEATED_ARRAY_FILTER_WORDS);
     private static final Map<Object, Map<Long, StructuralViewState>>[] STRUCTURAL_VIEWS =
             createWeakMapStripes();
     private static final Map<Object, NavigableMap<Long, MemoryViewState>>[] MEMORY_VIEWS =
@@ -452,18 +454,6 @@ public final class Pointer {
         }
     }
 
-    private static final class EncodedPointerToken {
-        private final long address;
-        private final String codec;
-        private final ExposedTarget target;
-
-        private EncodedPointerToken(long address, String codec, ExposedTarget target) {
-            this.address = address;
-            this.codec = codec;
-            this.target = target;
-        }
-    }
-
     private static final class EncodedPointerState {
         private final int size;
         private final String codec;
@@ -517,47 +507,7 @@ public final class Pointer {
                 }
             }
         }
-        return encodedPointerFromRetainedReference(owner, codec, address);
-    }
-
-    private static Pointer encodedPointerFromRetainedReference(
-            Object owner, String codec, long address) {
-        owner = encodedReferenceOwner(owner);
-        if (owner == null
-                || codec == null
-                || !mayBeInIdentityFilter(ENCODED_REFERENCE_FILTER, owner)) {
-            return null;
-        }
-        Map<Object, Object> stripe = stateStripe(ENCODED_REFERENCES, owner);
-        Object references;
-        synchronized (stripe) {
-            references = stripe.get(owner);
-        }
-        if (references == null) {
-            return null;
-        }
-        Object[] candidates = references instanceof EncodedReferenceSet
-                ? ((EncodedReferenceSet) references).allocations.keySet().toArray()
-                : new Object[] {references};
-        Pointer match = null;
-        for (Object candidate : candidates) {
-            if (!(candidate instanceof EncodedPointerToken)) {
-                continue;
-            }
-            EncodedPointerToken token = (EncodedPointerToken) candidate;
-            if (token.address != address || !codec.equals(token.codec)) {
-                continue;
-            }
-            Pointer pointer = pointerFromExposedTarget(token.target);
-            if (match != null
-                    && (match.provenanceAllocation() != pointer.provenanceAllocation()
-                            || match.provenanceByteOffset()
-                                    != pointer.provenanceByteOffset())) {
-                return null;
-            }
-            match = pointer;
-        }
-        return match;
+        return null;
     }
 
     private static void transferEncodedPointers(
@@ -2729,7 +2679,7 @@ public final class Pointer {
     }
 
     private static void discardProjectedFieldViews(Object owner) {
-        if (owner == null) {
+        if (owner == null || !mayBeInIdentityFilter(FIELD_CELL_FILTER, owner)) {
             return;
         }
         java.util.List<FieldCell> projected = new java.util.ArrayList<>();
@@ -2767,7 +2717,7 @@ public final class Pointer {
     }
 
     private static boolean hasProjectedFieldCells(Object owner) {
-        if (owner == null) {
+        if (owner == null || !mayBeInIdentityFilter(FIELD_CELL_FILTER, owner)) {
             return false;
         }
         Map<Object, Map<String, WeakReference<FieldCell>>> stripe =
@@ -3300,6 +3250,7 @@ public final class Pointer {
                 }
                 fields.put(fieldName, new WeakReference<>(cell));
             }
+            markIdentityFilter(FIELD_CELL_FILTER, owner);
         }
         return new Pointer(cell, size, 0, size, codecClassName);
     }
@@ -5572,14 +5523,33 @@ public final class Pointer {
         if (pointer == null || pointerCodec == null) {
             return address;
         }
-        retainEncodedReference(
-                owner,
-                new EncodedPointerToken(address, pointerCodec, pointer.exposedTarget()));
         synchronized (ALLOCATIONS) {
             registerTypedExposedTarget(address, pointerCodec, pointer.exposedTarget());
         }
         if (pointer.allocation != null) {
             retainEncodedReference(owner, pointer.allocation);
+        }
+        return address;
+    }
+
+    /**
+     * Encodes a typed pointer into a known byte range and preserves its exact
+     * provenance independently of unrelated pointers retained by the owner.
+     */
+    public static long encodedAddress(
+            Pointer pointer,
+            Object owner,
+            int ownerOffset,
+            int encodedSize,
+            String pointerCodec) {
+        long address = encodedAddress(pointer, owner, pointerCodec);
+        if (pointer != null && pointerCodec != null) {
+            rememberEncodedPointer(
+                    owner,
+                    ownerOffset,
+                    encodedSize,
+                    pointerCodec,
+                    pointer);
         }
         return address;
     }
@@ -7121,14 +7091,45 @@ public final class Pointer {
                 : null;
     }
 
+    /**
+     * Finds a slice carried through transparent single-field Rust wrappers,
+     * such as {@code UnsafeCell<[T]>}.
+     */
+    private static Object transparentSliceView(Pointer storage, Object value) {
+        if (value == storage
+                || (storage.allocationElementSize != 0
+                        && (value == null || !isSliceViewType(value.getClass())))) {
+            return null;
+        }
+        try {
+            for (int depth = 0; value != null && depth < 16; depth++) {
+                if (isSliceViewType(value.getClass())) {
+                    return value;
+                }
+                Field[] fields = PUBLIC_INSTANCE_FIELDS.get(value.getClass());
+                if (fields.length != 1) {
+                    return null;
+                }
+                Object next = fields[0].get(value);
+                if (next == value) {
+                    return null;
+                }
+                value = next;
+            }
+            return null;
+        } catch (IllegalAccessException error) {
+            throw new IllegalStateException(
+                    "could not inspect transparent Rust slice wrapper", error);
+        }
+    }
+
     private Pointer sliceElementView() {
         Pointer storage = sliceStorageView();
         Object direct = storage.directCellValueOrSelf();
-        return direct != null
-                        && direct != storage
-                        && isSliceViewType(direct.getClass())
-                ? storage.sliceStorageView(storage.viewSize, storage.viewCodecClassName)
-                : storage;
+        Object slice = transparentSliceView(storage, direct);
+        return slice == null
+                ? storage
+                : fromSlice(slice, storage.viewSize, storage.viewCodecClassName);
     }
 
     private Pointer sliceStorageView() {
@@ -7146,18 +7147,17 @@ public final class Pointer {
         Pointer storage = sliceStorageView();
         int checkedElementSize = checkedArrayLength(elementSize);
         Object direct = storage.directCellValueOrSelf();
-        if (direct != null
-                && direct != storage
-                && isSliceViewType(direct.getClass())) {
+        Object slice = transparentSliceView(storage, direct);
+        if (slice != null) {
             try {
-                Object backing = instanceField(direct.getClass(), "array").get(direct);
+                Object backing = instanceField(slice.getClass(), "array").get(slice);
                 boolean selfBacked = backing == storage || backing == this;
                 if (backing instanceof Pointer) {
                     Pointer pointerBacking = (Pointer) backing;
                     selfBacked |= pointerBacking.allocation == storage.allocation;
                 }
                 if (!selfBacked) {
-                    return fromSlice(direct, checkedElementSize, elementCodecClassName);
+                    return fromSlice(slice, checkedElementSize, elementCodecClassName);
                 }
             } catch (ReflectiveOperationException error) {
                 throw new IllegalArgumentException("invalid Rust slice view", error);

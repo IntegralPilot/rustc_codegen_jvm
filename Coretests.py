@@ -644,7 +644,13 @@ def main() -> int:
     parser.add_argument("--release", action="store_true", help="Build in release mode")
     parser.add_argument("--filter", help="Only run test names containing this text")
     parser.add_argument("--list", action="store_true", help="List target tests without running them")
-    parser.add_argument("-j", "--jobs", type=int, default=min(os.cpu_count() or 1, 4))
+    parser.add_argument(
+        "-j",
+        "--jobs",
+        type=int,
+        default=1,
+        help="libtest worker threads (defaults to 1 to avoid pointer-allocation GC thrashing)",
+    )
     parser.add_argument(
         "--timeout",
         type=float,

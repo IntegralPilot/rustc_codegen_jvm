@@ -226,7 +226,24 @@ fn type_name_of<T>(_: T) -> &'static str {
     core::any::type_name::<T>()
 }
 
+struct BorrowedPart<'a>(&'a u8);
+
+fn consume_maybe_uninit_parts<'a>(parts: &'a [core::mem::MaybeUninit<BorrowedPart<'a>>]) -> usize {
+    parts.len()
+}
+
+fn higher_ranked_maybe_uninit_slice() {
+    let callback: for<'a> fn(&'a [core::mem::MaybeUninit<BorrowedPart<'a>>]) -> usize =
+        consume_maybe_uninit_parts;
+    let value = 42;
+    let parts = [core::mem::MaybeUninit::new(BorrowedPart(&value))];
+    assert!(callback(&parts) == 1);
+    assert!(unsafe { *parts[0].assume_init_ref().0 } == 42);
+}
+
 fn main() {
+    higher_ranked_maybe_uninit_slice();
+
     let res_const = derivative(constant, 10.0, 0.125);
     assert!(res_const == 0.0);
 

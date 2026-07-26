@@ -487,6 +487,14 @@ fn test_refcell_borrow_guards_drop() {
         slice[2] = 5;
     }
     assert!(*mutable_array.borrow() == [4, 2, 5]);
+
+    let unsized_cell: &RefCell<[i32]> = &RefCell::new([1, 2, 3]);
+    {
+        let values = &mut *unsized_cell.borrow_mut();
+        values[0] = 4;
+        values[2] = 5;
+    }
+    assert!(&*unsized_cell.borrow() == [4, 2, 5]);
 }
 
 fn test_vec_in_place_collect_relinquishes_source() {

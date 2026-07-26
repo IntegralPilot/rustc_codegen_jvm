@@ -2998,6 +2998,8 @@ fn emit_ty_to_union_bytes<'tcx>(
             let pointer_codec =
                 pointer_builtin_codec_operand(ty, tcx, data_types, instance_context)
                     .expect("fixed-array reference must have a pointer codec");
+            let encoded_size = layout_size_bytes(tcx, ty)?;
+            let storage_offset = storage.byte_index(base_offset, instructions, temp_counter);
             instructions.push(oomir::Instruction::InvokeStatic {
                 dest: Some(address_dest.clone()),
                 class_name: oomir::POINTER_CLASS.to_string(),
@@ -3009,6 +3011,8 @@ fn emit_ty_to_union_bytes<'tcx>(
                             "owner".to_string(),
                             oomir::Type::Class("java/lang/Object".to_string()),
                         ),
+                        ("owner_offset".to_string(), oomir::Type::I32),
+                        ("encoded_size".to_string(), oomir::Type::I32),
                         ("pointer_codec".to_string(), oomir::Type::java_string()),
                     ],
                     ret: Box::new(oomir::Type::U64),
@@ -3025,13 +3029,18 @@ fn emit_ty_to_union_bytes<'tcx>(
                         ))),
                     ),
                     operand_var(storage.bytes_var.clone(), byte_array_type()),
+                    storage_offset,
+                    oomir::Operand::Constant(oomir::Constant::I32(
+                        i32::try_from(encoded_size)
+                            .map_err(|_| "pointer layout exceeds JVM address space")?,
+                    )),
                     pointer_codec,
                 ],
             });
             emit_bits_to_union_bytes(
                 operand_var(address_dest, oomir::Type::U64),
                 oomir::Type::U64,
-                layout_size_bytes(tcx, ty)?,
+                encoded_size,
                 storage,
                 base_offset,
                 instructions,
@@ -3049,6 +3058,9 @@ fn emit_ty_to_union_bytes<'tcx>(
                 pointer_builtin_codec_operand(ty, tcx, data_types, instance_context);
             let uses_typed_address =
                 !matches!(pointee.kind(), TyKind::Dynamic(..)) && pointer_codec.is_some();
+            let encoded_size = layout_size_bytes(tcx, ty)?;
+            let storage_offset = uses_typed_address
+                .then(|| storage.byte_index(base_offset, instructions, temp_counter));
             let address_dest = next_union_temp("union_pointer_address", temp_counter);
             instructions.push(oomir::Instruction::InvokeStatic {
                 dest: Some(address_dest.clone()),
@@ -3068,6 +3080,8 @@ fn emit_ty_to_union_bytes<'tcx>(
                                 "owner".to_string(),
                                 oomir::Type::Class("java/lang/Object".to_string()),
                             ),
+                            ("owner_offset".to_string(), oomir::Type::I32),
+                            ("encoded_size".to_string(), oomir::Type::I32),
                             ("pointer_codec".to_string(), oomir::Type::java_string()),
                         ]
                     } else {
@@ -3088,6 +3102,11 @@ fn emit_ty_to_union_bytes<'tcx>(
                     vec![
                         source,
                         operand_var(storage.bytes_var.clone(), byte_array_type()),
+                        storage_offset.expect("typed pointer storage offset disappeared"),
+                        oomir::Operand::Constant(oomir::Constant::I32(
+                            i32::try_from(encoded_size)
+                                .map_err(|_| "pointer layout exceeds JVM address space")?,
+                        )),
                         pointer_codec.expect("typed pointer codec disappeared"),
                     ]
                 } else {
@@ -3100,7 +3119,7 @@ fn emit_ty_to_union_bytes<'tcx>(
             emit_bits_to_union_bytes(
                 operand_var(address_dest, oomir::Type::U64),
                 oomir::Type::U64,
-                layout_size_bytes(tcx, ty)?,
+                encoded_size,
                 storage,
                 base_offset,
                 instructions,

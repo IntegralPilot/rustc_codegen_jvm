@@ -5,6 +5,7 @@
 #![feature(disjoint_bitor)]
 #![feature(funnel_shifts)]
 #![feature(signed_bigint_helpers)]
+#![feature(try_trait_v2)]
 #![feature(uint_carryless_mul)]
 #![feature(ergonomic_clones)]
 
@@ -993,7 +994,20 @@ const fn const_write_bytes_preserves_unwritten_elements() {
     assert!(FILLED_PREFIX[2] == 3);
 }
 
+fn test_try_branch_zst_residual() {
+    use core::num::NonZero;
+    use core::ops::ControlFlow::{Break, Continue};
+    use core::ops::Try;
+
+    let one = NonZero::new(1_u32).unwrap();
+    assert!(Ok::<(), NonZero<u32>>(()).branch() == Continue(()));
+    assert!(Err::<(), NonZero<u32>>(one).branch() == Break(Err(one)));
+    assert!(Ok::<NonZero<u32>, ()>(one).branch() == Continue(one));
+    assert!(Err::<NonZero<u32>, ()>(()).branch() == Break(Err(())));
+}
+
 fn main() {
+    test_try_branch_zst_residual();
     fixed_array_pattern_checks_every_element();
     runtime_integer_ops();
     runtime_division_intrinsics();
