@@ -182,6 +182,8 @@ public final class Pointer {
             new ReferenceQueue<>();
     private static final ConcurrentHashMap<String, Method[]> CODEC_METHODS =
             new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<String, Object> SHARED_CONSTANTS =
+            new ConcurrentHashMap<>();
     private static final ConcurrentHashMap<String, MethodHandle> DROP_METHOD_HANDLES =
             new ConcurrentHashMap<>();
     private static final ConcurrentHashMap<String, MethodHandle> DROP_FIELDS_METHOD_HANDLES =
@@ -1229,6 +1231,43 @@ public final class Pointer {
         }
     }
 
+    /**
+     * Lazily materializes a constant which codegen proved is only read.
+     * Large Rust lookup tables otherwise rebuild their complete object graph
+     * on every use because ordinary array constants require value semantics.
+     */
+    public static Object sharedConstant(
+            String identity, String ownerClassName, String factoryMethodName) {
+        Object cached = SHARED_CONSTANTS.get(identity);
+        if (cached != null) {
+            return cached;
+        }
+        synchronized (SHARED_CONSTANTS) {
+            cached = SHARED_CONSTANTS.get(identity);
+            if (cached != null) {
+                return cached;
+            }
+            try {
+                Method factory = resolvedRuntimeClass(ownerClassName)
+                        .getDeclaredMethod(factoryMethodName);
+                factory.setAccessible(true);
+                Object value = factory.invoke(null);
+                if (value == null) {
+                    throw new IllegalStateException(
+                            "shared Rust constant factory returned null");
+                }
+                SHARED_CONSTANTS.put(identity, value);
+                return value;
+            } catch (InvocationTargetException error) {
+                rethrowUnchecked(error.getCause());
+                return null;
+            } catch (ReflectiveOperationException error) {
+                throw new IllegalStateException(
+                        "could not materialize shared Rust constant " + identity, error);
+            }
+        }
+    }
+
     private static boolean isManagedValueImmutable(Object value, Class<?> valueClass) {
         return valueClass.isPrimitive()
                 || value instanceof Number
@@ -1517,8 +1556,7 @@ public final class Pointer {
             bits = managedObjectAddress(value);
         } else if (isRawPointerCodec(codec)) {
             Pointer pointer = rawPointerCarrier(value, codec);
-            bits = encodedAddress(pointer, encoded, codec);
-            rememberEncodedPointer(encoded, 0, size, codec, pointer);
+            bits = encodedAddress(pointer, encoded, 0, size, codec);
         } else {
             bits = incomingBits(value, size);
         }
@@ -1689,8 +1727,7 @@ public final class Pointer {
             int elementSize = slicePointerElementSize(descriptor);
             String elementCodec = descriptor[2].isEmpty() ? null : descriptor[2];
             Pointer data = fromSlice(value, elementSize, elementCodec);
-            dataAddress = encodedAddress(data, image, codec);
-            rememberEncodedPointer(image, 0, wordSize, codec, data);
+            dataAddress = encodedAddress(data, image, 0, wordSize, codec);
             try {
                 pointerMetadata = sliceLogicalLength(value);
             } catch (ReflectiveOperationException error) {
@@ -1702,8 +1739,7 @@ public final class Pointer {
                         "Rust struct-tail pointer requires a Pointer carrier");
             }
             Pointer pointer = (Pointer) value;
-            dataAddress = encodedAddress(pointer, image, codec);
-            rememberEncodedPointer(image, 0, wordSize, codec, pointer);
+            dataAddress = encodedAddress(pointer, image, 0, wordSize, codec);
             pointerMetadata = pointer.metadata();
         } else {
             if (!(value instanceof Pointer)) {
@@ -5313,6 +5349,30 @@ public final class Pointer {
 
     /** Implements the compiler's byte-wise comparison intrinsic. */
     public static int compareBytes(Pointer left, Pointer right, long length) {
+        if (length < 0) {
+            throw new IllegalArgumentException("byte comparison length must not be negative");
+        }
+        if (left.allocation instanceof byte[] && right.allocation instanceof byte[]
+                && left.allocationElementSize == 1 && right.allocationElementSize == 1) {
+            byte[] leftBytes = (byte[]) left.allocation;
+            byte[] rightBytes = (byte[]) right.allocation;
+            int leftOffset = Math.toIntExact(left.byteOffset);
+            int rightOffset = Math.toIntExact(right.byteOffset);
+            int byteCount = checkedArrayLength(length);
+            if (leftOffset < 0 || rightOffset < 0
+                    || byteCount > leftBytes.length - leftOffset
+                    || byteCount > rightBytes.length - rightOffset) {
+                throw new IndexOutOfBoundsException("byte comparison exceeds its allocation");
+            }
+            for (int index = 0; index < byteCount; index++) {
+                int leftByte = leftBytes[leftOffset + index] & 0xff;
+                int rightByte = rightBytes[rightOffset + index] & 0xff;
+                if (leftByte != rightByte) {
+                    return leftByte - rightByte;
+                }
+            }
+            return 0;
+        }
         for (long index = 0; index < length; index++) {
             int leftByte = left.loadByte(Math.addExact(left.byteOffset, index)) & 0xff;
             int rightByte = right.loadByte(Math.addExact(right.byteOffset, index)) & 0xff;
@@ -5542,7 +5602,15 @@ public final class Pointer {
             int ownerOffset,
             int encodedSize,
             String pointerCodec) {
-        long address = encodedAddress(pointer, owner, pointerCodec);
+        // The exact range state below retains the target. Adding the same
+        // allocation to the owner's broad reference set makes temporary
+        // aggregate copies inherit every pointer the owner ever contained.
+        long address = encodedAddress(pointer, (Object) null);
+        if (pointer != null && pointerCodec != null) {
+            synchronized (ALLOCATIONS) {
+                registerTypedExposedTarget(address, pointerCodec, pointer.exposedTarget());
+            }
+        }
         if (pointer != null && pointerCodec != null) {
             rememberEncodedPointer(
                     owner,
@@ -6896,9 +6964,12 @@ public final class Pointer {
             if (isRawPointerCodec(viewCodecClassName)) {
                 byte[] image = new byte[materializedSize];
                 Pointer pointer = rawPointerCarrier(value, viewCodecClassName);
-                long address = encodedAddress(pointer, image, viewCodecClassName);
-                rememberEncodedPointer(
-                        image, 0, materializedSize, viewCodecClassName, pointer);
+                long address = encodedAddress(
+                        pointer,
+                        image,
+                        0,
+                        materializedSize,
+                        viewCodecClassName);
                 for (int index = 0; index < Math.min(materializedSize, 8); index++) {
                     image[index] = (byte) (address >>> (index * 8));
                 }
@@ -7202,6 +7273,9 @@ public final class Pointer {
     }
 
     public static boolean sliceGetBoolean(Object backing, int index) {
+        if (backing instanceof boolean[]) {
+            return ((boolean[]) backing)[index];
+        }
         Pointer pointer = slicePointer(backing, index);
         return pointer != null
                 ? pointer.getBoolean()
@@ -7209,6 +7283,9 @@ public final class Pointer {
     }
 
     public static byte sliceGetI8(Object backing, int index) {
+        if (backing instanceof byte[]) {
+            return ((byte[]) backing)[index];
+        }
         Pointer pointer = slicePointer(backing, index);
         return pointer != null
                 ? pointer.getI8()
@@ -7225,6 +7302,9 @@ public final class Pointer {
     }
 
     public static short sliceGetI16(Object backing, int index) {
+        if (backing instanceof short[]) {
+            return ((short[]) backing)[index];
+        }
         Pointer pointer = slicePointer(backing, index);
         return pointer != null
                 ? pointer.getI16()
@@ -7232,6 +7312,12 @@ public final class Pointer {
     }
 
     public static int sliceGetI32(Object backing, int index) {
+        if (backing instanceof int[]) {
+            return ((int[]) backing)[index];
+        }
+        if (backing instanceof char[]) {
+            return ((char[]) backing)[index];
+        }
         Pointer pointer = slicePointer(backing, index);
         Object value = pointer != null ? Integer.valueOf(pointer.getI32()) : Array.get(backing, index);
         return value instanceof Character
@@ -7240,6 +7326,9 @@ public final class Pointer {
     }
 
     public static long sliceGetI64(Object backing, int index) {
+        if (backing instanceof long[]) {
+            return ((long[]) backing)[index];
+        }
         Pointer pointer = slicePointer(backing, index);
         return pointer != null
                 ? pointer.getI64()
@@ -7247,6 +7336,9 @@ public final class Pointer {
     }
 
     public static float sliceGetF32(Object backing, int index) {
+        if (backing instanceof float[]) {
+            return ((float[]) backing)[index];
+        }
         Pointer pointer = slicePointer(backing, index);
         return pointer != null
                 ? pointer.getF32()
@@ -7254,6 +7346,9 @@ public final class Pointer {
     }
 
     public static double sliceGetF64(Object backing, int index) {
+        if (backing instanceof double[]) {
+            return ((double[]) backing)[index];
+        }
         Pointer pointer = slicePointer(backing, index);
         return pointer != null
                 ? pointer.getF64()
@@ -7261,6 +7356,9 @@ public final class Pointer {
     }
 
     public static Object sliceGetObject(Object backing, int index) {
+        if (backing instanceof Object[]) {
+            return independentRepeatedArrayElement(backing, index);
+        }
         Pointer pointer = slicePointer(backing, index);
         return pointer != null
                 ? pointer.getObject()
@@ -7268,18 +7366,38 @@ public final class Pointer {
     }
 
     public static void sliceSetBoolean(Object backing, int index, boolean value) {
+        if (backing instanceof boolean[]) {
+            ((boolean[]) backing)[index] = value;
+            return;
+        }
         sliceSetObject(backing, index, Boolean.valueOf(value));
     }
 
     public static void sliceSetI8(Object backing, int index, byte value) {
+        if (backing instanceof byte[]) {
+            ((byte[]) backing)[index] = value;
+            return;
+        }
         sliceSetObject(backing, index, Byte.valueOf(value));
     }
 
     public static void sliceSetI16(Object backing, int index, short value) {
+        if (backing instanceof short[]) {
+            ((short[]) backing)[index] = value;
+            return;
+        }
         sliceSetObject(backing, index, Short.valueOf(value));
     }
 
     public static void sliceSetI32(Object backing, int index, int value) {
+        if (backing instanceof int[]) {
+            ((int[]) backing)[index] = value;
+            return;
+        }
+        if (backing instanceof char[]) {
+            ((char[]) backing)[index] = (char) value;
+            return;
+        }
         Pointer pointer = slicePointer(backing, index);
         if (pointer != null) {
             pointer.set(Integer.valueOf(value));
@@ -7300,18 +7418,34 @@ public final class Pointer {
     }
 
     public static void sliceSetI64(Object backing, int index, long value) {
+        if (backing instanceof long[]) {
+            ((long[]) backing)[index] = value;
+            return;
+        }
         sliceSetObject(backing, index, Long.valueOf(value));
     }
 
     public static void sliceSetF32(Object backing, int index, float value) {
+        if (backing instanceof float[]) {
+            ((float[]) backing)[index] = value;
+            return;
+        }
         sliceSetObject(backing, index, Float.valueOf(value));
     }
 
     public static void sliceSetF64(Object backing, int index, double value) {
+        if (backing instanceof double[]) {
+            ((double[]) backing)[index] = value;
+            return;
+        }
         sliceSetObject(backing, index, Double.valueOf(value));
     }
 
     public static void sliceSetObject(Object backing, int index, Object value) {
+        if (backing instanceof Object[]) {
+            ((Object[]) backing)[index] = value;
+            return;
+        }
         Pointer pointer = slicePointer(backing, index);
         if (pointer != null) {
             pointer.set(value);

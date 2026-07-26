@@ -534,7 +534,10 @@ mod tests {
     }
 }
 
-fn visit_instruction_uses<'a>(instruction: &'a Instruction, visitor: &mut impl FnMut(&'a str)) {
+pub(crate) fn visit_instruction_uses<'a>(
+    instruction: &'a Instruction,
+    visitor: &mut impl FnMut(&'a str),
+) {
     match instruction {
         Instruction::Add { op1, op2, .. }
         | Instruction::Sub { op1, op2, .. }
@@ -636,7 +639,7 @@ fn visit_operand_use<'a>(operand: &'a Operand, visitor: &mut impl FnMut(&'a str)
     }
 }
 
-fn instruction_def(instruction: &Instruction) -> Option<&str> {
+pub(crate) fn instruction_def(instruction: &Instruction) -> Option<&str> {
     match instruction {
         Instruction::Add { dest, .. }
         | Instruction::Sub { dest, .. }

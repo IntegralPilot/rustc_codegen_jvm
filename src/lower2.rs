@@ -18,7 +18,7 @@ use self::jvm::{
 };
 use constant_pool::{InternedConstantPool, verify_no_duplicate_constants};
 use consts::{append_unpooled_int_const, get_int_const_instr, load_constant};
-use rustc_hash::FxHashMap as HashMap;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use rustc_middle::ty::TyCtxt;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -257,6 +257,66 @@ fn create_chunked_array_factory(
     })
 }
 
+fn create_shared_array_factory(
+    cp: &mut InternedConstantPool,
+    owner_class: &str,
+    element_type: &oomir::Type,
+    elements: &[oomir::Constant],
+    methods: &mut Vec<jvm::Method>,
+    next_factory: &mut usize,
+) -> jvm::Result<oomir::Constant> {
+    let builder = create_chunked_array_factory(
+        cp,
+        owner_class,
+        element_type,
+        elements,
+        methods,
+        next_factory,
+    )?;
+    let oomir::Constant::FactoryCall {
+        method_name: builder_method,
+        ty,
+        ..
+    } = builder
+    else {
+        unreachable!("chunked array construction always returns a factory call");
+    };
+
+    let method_name = format!("_constant_factory_{}", *next_factory);
+    *next_factory += 1;
+    let descriptor = format!("(){}", ty.to_jvm_descriptor());
+    let identity = format!("{owner_class}#{builder_method}");
+    let mut instructions = Vec::new();
+    for value in [&identity, owner_class, &builder_method] {
+        load_constant(
+            &mut instructions,
+            cp,
+            &oomir::Constant::String(value.to_string()),
+        )?;
+    }
+    let pointer_class = cp.add_class(oomir::POINTER_CLASS)?;
+    let shared_constant = cp.add_method_ref(
+        pointer_class,
+        "sharedConstant",
+        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/Object;",
+    )?;
+    instructions.push(Instruction::Invokestatic(shared_constant));
+    instructions.extend(get_cast_instructions(
+        &method_name,
+        &oomir::Type::Class("java/lang/Object".to_string()),
+        &ty,
+        cp,
+    )?);
+    instructions.push(Instruction::Areturn);
+    add_constant_helper_method(cp, methods, &method_name, &descriptor, 0, instructions)?;
+
+    Ok(oomir::Constant::FactoryCall {
+        owner_class: owner_class.to_string(),
+        method_name,
+        ty,
+    })
+}
+
 fn create_constant_factory(
     cp: &mut InternedConstantPool,
     owner_class: &str,
@@ -482,14 +542,141 @@ fn prepare_constant_operand(
     owner_class: &str,
     methods: &mut Vec<jvm::Method>,
     next_factory: &mut usize,
+    shared_array: bool,
 ) -> jvm::Result<()> {
     let oomir::Operand::Constant(constant) = operand else {
         return Ok(());
     };
     if constant_instruction_cost(constant) > MAX_INLINE_CONSTANT_INSTRUCTIONS {
-        *constant = create_constant_factory(cp, owner_class, constant, methods, next_factory)?;
+        *constant = if shared_array {
+            let oomir::Constant::Array(element_type, elements) = constant else {
+                unreachable!("only array constants can be shared");
+            };
+            create_shared_array_factory(
+                cp,
+                owner_class,
+                element_type,
+                elements,
+                methods,
+                next_factory,
+            )?
+        } else {
+            create_constant_factory(cp, owner_class, constant, methods, next_factory)?
+        };
     }
     Ok(())
+}
+
+fn operand_variable_name(operand: &oomir::Operand) -> Option<&str> {
+    let oomir::Operand::Variable { name, .. } = operand else {
+        return None;
+    };
+    Some(name)
+}
+
+fn primitive_array_element(element_type: &oomir::Type) -> bool {
+    matches!(
+        element_type,
+        oomir::Type::I8
+            | oomir::Type::U8
+            | oomir::Type::I16
+            | oomir::Type::U16
+            | oomir::Type::F16
+            | oomir::Type::I32
+            | oomir::Type::U32
+            | oomir::Type::Boolean
+            | oomir::Type::Char
+            | oomir::Type::I64
+            | oomir::Type::U64
+            | oomir::Type::F32
+            | oomir::Type::F64
+    )
+}
+
+fn read_only_large_array_variables(function: &oomir::Function) -> HashSet<String> {
+    let mut candidates = HashMap::default();
+    for block in function.body.basic_blocks.values() {
+        for instruction in &block.instructions {
+            let oomir::Instruction::Move {
+                dest,
+                src: oomir::Operand::Constant(constant @ oomir::Constant::Array(element_type, _)),
+            } = instruction
+            else {
+                continue;
+            };
+            if constant_instruction_cost(constant) > MAX_INLINE_CONSTANT_INSTRUCTIONS {
+                candidates.insert(dest.clone(), element_type.clone());
+            }
+        }
+    }
+
+    candidates.retain(|candidate, element_type| {
+        let mut definitions = 0usize;
+        let mut array_get_results = Vec::new();
+        let mut valid = true;
+        for block in function.body.basic_blocks.values() {
+            for instruction in &block.instructions {
+                if crate::optimise1::copyprop::instruction_def(instruction)
+                    == Some(candidate.as_str())
+                {
+                    definitions += 1;
+                }
+                let mut uses_candidate = false;
+                crate::optimise1::copyprop::visit_instruction_uses(instruction, &mut |used| {
+                    uses_candidate |= used == candidate
+                });
+                if !uses_candidate {
+                    continue;
+                }
+                match instruction {
+                    oomir::Instruction::ArrayGet { dest, array, index }
+                        if operand_variable_name(array) == Some(candidate.as_str())
+                            && operand_variable_name(index) != Some(candidate.as_str()) =>
+                    {
+                        array_get_results.push(dest.clone());
+                    }
+                    oomir::Instruction::Length { array, .. }
+                        if operand_variable_name(array) == Some(candidate.as_str()) => {}
+                    _ => valid = false,
+                }
+            }
+        }
+        if !valid || definitions != 1 || primitive_array_element(element_type) {
+            return valid && definitions == 1;
+        }
+
+        // JVM object arrays contain mutable carrier objects. Sharing the
+        // constant is safe only when each selected element is itself observed
+        // through field reads and never escapes or receives a field write.
+        array_get_results.into_iter().all(|result| {
+            let mut result_definitions = 0usize;
+            let mut result_valid = true;
+            for block in function.body.basic_blocks.values() {
+                for instruction in &block.instructions {
+                    if crate::optimise1::copyprop::instruction_def(instruction)
+                        == Some(result.as_str())
+                    {
+                        result_definitions += 1;
+                    }
+                    let mut uses_result = false;
+                    crate::optimise1::copyprop::visit_instruction_uses(instruction, &mut |used| {
+                        uses_result |= used == result
+                    });
+                    if uses_result
+                        && !matches!(
+                            instruction,
+                            oomir::Instruction::GetField { object, .. }
+                                if operand_variable_name(object) == Some(result.as_str())
+                        )
+                    {
+                        result_valid = false;
+                    }
+                }
+            }
+            result_valid && result_definitions == 1
+        })
+    });
+    candidates.into_keys().collect()
 }
 
 fn prepare_function_constants(
@@ -500,10 +687,18 @@ fn prepare_function_constants(
     next_factory: &mut usize,
 ) -> jvm::Result<()> {
     use oomir::Instruction as I;
+    let shared_arrays = read_only_large_array_variables(function);
     for block in function.body.basic_blocks.values_mut() {
         for instruction in &mut block.instructions {
-            let mut prepare = |operand: &mut oomir::Operand| {
-                prepare_constant_operand(operand, cp, owner_class, methods, next_factory)
+            let mut prepare = |operand: &mut oomir::Operand, shared_array| {
+                prepare_constant_operand(
+                    operand,
+                    cp,
+                    owner_class,
+                    methods,
+                    next_factory,
+                    shared_array,
+                )
             };
             match instruction {
                 I::Add { op1, op2, .. }
@@ -522,56 +717,57 @@ fn prepare_function_constants(
                 | I::BitXor { op1, op2, .. }
                 | I::Shl { op1, op2, .. }
                 | I::Shr { op1, op2, .. } => {
-                    prepare(op1)?;
-                    prepare(op2)?;
+                    prepare(op1, false)?;
+                    prepare(op2, false)?;
                 }
-                I::Not { src, .. } | I::Neg { src, .. } | I::Move { src, .. } => prepare(src)?,
-                I::Branch { condition, .. } => prepare(condition)?,
+                I::Not { src, .. } | I::Neg { src, .. } => prepare(src, false)?,
+                I::Move { dest, src } => prepare(src, shared_arrays.contains(dest))?,
+                I::Branch { condition, .. } => prepare(condition, false)?,
                 I::Return { operand } => {
                     if let Some(operand) = operand {
-                        prepare(operand)?;
+                        prepare(operand, false)?;
                     }
                 }
                 I::CallIndirect {
                     function_ptr, args, ..
                 } => {
-                    prepare(function_ptr)?;
+                    prepare(function_ptr, false)?;
                     for argument in args {
-                        prepare(argument)?;
+                        prepare(argument, false)?;
                     }
                 }
                 I::InvokeInterface { args, operand, .. }
                 | I::InvokeVirtual { args, operand, .. } => {
-                    prepare(operand)?;
+                    prepare(operand, false)?;
                     for argument in args {
-                        prepare(argument)?;
+                        prepare(argument, false)?;
                     }
                 }
                 I::InvokeStatic { args, .. } => {
                     for argument in args {
-                        prepare(argument)?;
+                        prepare(argument, false)?;
                     }
                 }
-                I::NewArray { size, .. } => prepare(size)?,
+                I::NewArray { size, .. } => prepare(size, false)?,
                 I::ArrayStore { index, value, .. } => {
-                    prepare(index)?;
-                    prepare(value)?;
+                    prepare(index, false)?;
+                    prepare(value, false)?;
                 }
-                I::ArrayFill { value, .. } => prepare(value)?,
+                I::ArrayFill { value, .. } => prepare(value, false)?,
                 I::ArrayGet { array, index, .. } => {
-                    prepare(array)?;
-                    prepare(index)?;
+                    prepare(array, false)?;
+                    prepare(index, false)?;
                 }
-                I::Length { array, .. } => prepare(array)?,
+                I::Length { array, .. } => prepare(array, false)?,
                 I::ConstructObject { args, .. } => {
                     for (argument, _) in args {
-                        prepare(argument)?;
+                        prepare(argument, false)?;
                     }
                 }
-                I::SetField { value, .. } => prepare(value)?,
-                I::GetField { object, .. } => prepare(object)?,
-                I::Cast { op, .. } => prepare(op)?,
-                I::Switch { discr, .. } => prepare(discr)?,
+                I::SetField { value, .. } => prepare(value, false)?,
+                I::GetField { object, .. } => prepare(object, false)?,
+                I::Cast { op, .. } => prepare(op, false)?,
+                I::Switch { discr, .. } => prepare(discr, false)?,
                 I::SourceLocation(_)
                 | I::LocalVariableScope(_)
                 | I::UnwindStart { .. }

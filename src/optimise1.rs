@@ -2,7 +2,7 @@ use crate::{lower1::operand::extract_number_from_operand, oomir::*};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::collections::VecDeque;
 
-mod copyprop;
+pub(crate) mod copyprop;
 mod dataflow;
 mod reachability;
 mod reorganisation;
