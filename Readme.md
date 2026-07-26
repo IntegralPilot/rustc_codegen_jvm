@@ -13,7 +13,7 @@ This backend transparently compiles Rust constructs to Java classes and interfac
 
 By leveraging a ["virtual MMU" translation layer](runtime/src/Pointer.java), it supports [raw pointers with complex pointer arithmetic](tests/binary/raw_ptrs/src/main.rs), [transmute](tests/binary/transmute/src/main.rs), and [unions](tests/binary/raw_ptrs/src/main.rs). It also supports key parts of the Rust standard library, including [networking](tests/binary/network/src/main.rs), [async/await](tests/binary/async_await/src/main.rs), [threading](tests/binary/threads/src/main.rs), [unwinding](tests/binary/panic/src/main.rs), [allocation](tests/binary/alloc/src/main.rs), as well as [file system operations, STDIO, and more](tests/binary/std/src/main.rs).
 
-The official Rust [`coretests`](https://github.com/rust-lang/rust/tree/main/library/coretests) tests and benches all pass, with 98.99% of them (the missing 1.01% is 29 slow cases which are skipped on CI) verified [by CI](.github/workflows/ci.yml) on every commit.
+The official Rust [`coretests`](https://github.com/rust-lang/rust/tree/main/library/coretests) tests and benches all pass, with 99.6% of them (the missing 0.4% is 11 slow cases which are skipped on CI) verified [by CI](.github/workflows/ci.yml) on every commit.
 
 > [!NOTE]
 > This project is in an active mid-stage of development. While it supports the vast majority of the Rust language, edge-case bugs are continually being ironed out. The ultimate goal is potential upstreaming into main `rustc`.
@@ -216,7 +216,7 @@ The vast majority of the Rust language is supported, including generics, traits,
 
 | Subsystem | Status | Details |
 | :--- | :---: | :--- |
-| **Core** | **98.99%** | Passed via official upstream `coretests` suite in CI |
+| **Core** | **99.6%** | Passed via official upstream `coretests` suite in CI |
 | **Alloc** | **Supported** | Complex allocations, includes binary trees, heaps, linked lists, etc. |
 | **Threads & Sync** | **Supported** | Thread spawning, scoped threads, Mutex, RwLock, Condvar, TLS |
 | **Async & Futures** | **Supported** | Async functions, blocks, closures and trait methods; boxed/recursive `dyn Future`; cancellation |

@@ -5,7 +5,11 @@ use rustc_middle::ty::{Instance, TyCtxt};
 use rustc_span::def_id::DefId;
 
 use super::{
-    jvm_names, operand::const_eval::read_constant_value_from_memory, types::ty_to_oomir_type,
+    jvm_names,
+    operand::const_eval::read_constant_value_from_memory,
+    types::{
+        layout_align_bytes, layout_size_bytes, pointer_memory_codec_operand, ty_to_oomir_type,
+    },
 };
 
 fn identity(tcx: TyCtxt<'_>, def_id: DefId) -> (String, String) {
@@ -60,12 +64,23 @@ pub fn lower_static<'tcx>(
         &mut module.data_types,
         instance,
     )?;
+    let allocation_size = layout_size_bytes(tcx, rust_ty)?;
+    let allocation_alignment = layout_align_bytes(tcx, rust_ty)?;
+    let allocation_codec_class_name = matches!(storage_type, oomir::Type::Pointer(_))
+        .then(|| pointer_memory_codec_operand(rust_ty, tcx, &mut module.data_types, instance))
+        .and_then(|codec| match codec {
+            oomir::Operand::Constant(oomir::Constant::String(class_name)) => Some(class_name),
+            _ => None,
+        });
     let (owner_class, field_name) = identity(tcx, def_id);
     let static_value = oomir::Static {
         owner_class,
         field_name,
         storage_type,
         initializer,
+        allocation_size,
+        allocation_alignment,
+        allocation_codec_class_name,
         is_thread_local: tcx.is_thread_local_static(def_id),
     };
     module.statics.insert(static_value.key(), static_value);

@@ -179,6 +179,48 @@ fn check_slice_to_array_conversions() {
     assert!(<[u8; 3]>::try_from(too_short).is_err());
 }
 
+fn check_disjoint_mut_empty_edges() {
+    let mut workers = Vec::new();
+    for _ in 0..4 {
+        workers.push(std::thread::spawn(|| {
+            for _ in 0..2_000 {
+                let mut values = vec![1, 2, 3, 4, 5];
+                let [empty_start, whole, empty_end] =
+                    values.get_disjoint_mut([0..0, 0..5, 5..5]).unwrap();
+                assert!(empty_start.is_empty());
+                assert!(whole == [1, 2, 3, 4, 5]);
+                assert!(empty_end.is_empty());
+
+                let pieces = values
+                    .get_disjoint_mut([
+                        0..0,
+                        0..1,
+                        1..1,
+                        1..2,
+                        2..2,
+                        2..3,
+                        3..3,
+                        3..4,
+                        4..4,
+                        4..5,
+                        5..5,
+                    ])
+                    .unwrap();
+                for (index, piece) in pieces.iter().enumerate() {
+                    if index % 2 == 0 {
+                        assert!(piece.is_empty());
+                    } else {
+                        assert!(piece == &[(index / 2 + 1) as i32]);
+                    }
+                }
+            }
+        }));
+    }
+    for worker in workers {
+        worker.join().unwrap();
+    }
+}
+
 fn main() {
     let values = [10, 20, 30, 40, 50];
     let whole: &[i32] = &values;
@@ -194,4 +236,5 @@ fn main() {
     check_utf8_byte_contents();
     check_slice_to_str_view();
     check_slice_to_array_conversions();
+    check_disjoint_mut_empty_edges();
 }

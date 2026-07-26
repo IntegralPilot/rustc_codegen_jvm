@@ -4,6 +4,7 @@
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher, Hasher, RandomState};
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Condvar, Mutex, Once, OnceLock, RwLock, mpsc};
 use std::thread;
@@ -38,6 +39,7 @@ fn main() {
     random_state_thread_local_cleanup();
     hash_maps_across_threads();
     concurrent_spawn_hook_lifetimes();
+    concurrent_stdout_locking();
 }
 
 fn random_state_thread_local_cleanup() {
@@ -149,6 +151,22 @@ fn rwlock_and_once() {
         worker.join().unwrap();
     }
     assert!(ONCE_CALLS.load(Ordering::SeqCst) == 1);
+}
+
+fn concurrent_stdout_locking() {
+    let mut workers = Vec::new();
+    for _ in 0..8 {
+        workers.push(thread::spawn(|| {
+            for _ in 0..1_000 {
+                let mut output = std::io::stdout().lock();
+                output.write_all(&[]).unwrap();
+                output.flush().unwrap();
+            }
+        }));
+    }
+    for worker in workers {
+        worker.join().unwrap();
+    }
 }
 
 fn condvar_and_barrier() {

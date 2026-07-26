@@ -111,6 +111,9 @@ pub struct Static {
     pub field_name: String,
     pub storage_type: Type,
     pub initializer: Constant,
+    pub allocation_size: usize,
+    pub allocation_alignment: usize,
+    pub allocation_codec_class_name: Option<String>,
     pub is_thread_local: bool,
 }
 

@@ -3,6 +3,12 @@ struct Settings {
     enabled: bool,
 }
 
+#[repr(C)]
+struct StaticBytes {
+    low: u32,
+    high: u32,
+}
+
 fn add_one(value: i32) -> i32 {
     value + 1
 }
@@ -12,6 +18,10 @@ static ANSWER_REF: &i32 = &ANSWER;
 static SETTINGS: Settings = Settings {
     base: 40,
     enabled: true,
+};
+static STATIC_BYTES: StaticBytes = StaticBytes {
+    low: 0x1122_3344,
+    high: 0x5566_7788,
 };
 static VALUES: [i32; 4] = [3, 5, 8, 13];
 static MESSAGE: &str = "static value";
@@ -59,6 +69,13 @@ fn main() {
     assert!(*ANSWER_REF == ANSWER);
     assert!(SETTINGS.enabled);
     assert!(SETTINGS.base + nested::OFFSET == ANSWER);
+    let words = unsafe {
+        core::slice::from_raw_parts(
+            (&raw const STATIC_BYTES).cast::<u32>(),
+            core::mem::size_of::<StaticBytes>() / core::mem::size_of::<u32>(),
+        )
+    };
+    assert!(words == [0x1122_3344, 0x5566_7788]);
     assert!(VALUES[0] + VALUES[1] + VALUES[2] + VALUES[3] == 29);
     assert!(MESSAGE == "static value");
     assert!(OPERATION(41) == ANSWER);

@@ -1816,6 +1816,18 @@ public final class Pointer {
                 || isRustFunctionPointer(valueClass);
     }
 
+    private static boolean cannotCarryMemoryViewOrigin(Object value) {
+        return value == null
+                || value instanceof Number
+                || value instanceof Boolean
+                || value instanceof Character
+                || value instanceof String
+                || value instanceof I128
+                || value instanceof U128
+                || value instanceof F128
+                || value.getClass().isEnum();
+    }
+
     /**
      * Implements a Rust array-repeat initializer without requiring the
      * compiler to emit one bytecode store for every element.
@@ -8099,6 +8111,9 @@ public final class Pointer {
     // A decoded view assigned back to its source already aliases that storage.
     // Flush it with its own codec instead of reinterpreting its JVM carrier.
     private boolean flushSameOriginMemoryView(Object value, int size) {
+        if (cannotCarryMemoryViewOrigin(value)) {
+            return false;
+        }
         if (!mayBeInIdentityFilter(MEMORY_VIEW_ORIGIN_FILTER, value)) {
             return false;
         }

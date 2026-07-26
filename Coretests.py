@@ -45,20 +45,11 @@ HARNESS_STARTUP_GRACE_SECONDS = 15.0
 # generation avoids hundreds of collections without approaching CI limits.
 CORETESTS_MAX_HEAP = "2g"
 DEFAULT_IGNORED_TESTS = {
-    "char::at_most_one_case": (
-        "exhaustive Unicode case validation takes over seventy-five CPU-seconds"
-    ),
-    "char::test_char_case": (
-        "exhaustive Unicode case validation takes over seventy-five CPU-seconds"
-    ),
     "fmt::num::test_format_int_exp_precision": (
         "takes over three CPU-minutes in JVM integer-formatting pointer operations"
     ),
     "num::flt2dec::random::exact_f32_random_equivalence_test": (
-        "takes over ninety CPU-seconds in JVM aggregate pointer-view synchronization"
-    ),
-    "num::flt2dec::random::exact_f16_random_equivalence_test": (
-        "takes over sixty CPU-seconds in JVM aggregate pointer-view synchronization"
+        "takes over a minute when run concurrently with the complete coretests suite"
     ),
     "num::flt2dec::random::exact_f64_random_equivalence_test": (
         "takes several CPU-minutes in JVM aggregate pointer-view synchronization"
@@ -67,7 +58,7 @@ DEFAULT_IGNORED_TESTS = {
         "takes several CPU-minutes in JVM aggregate pointer-view synchronization"
     ),
     "num::flt2dec::random::shortest_f16_exhaustive_equivalence_test": (
-        "takes over ninety CPU-seconds in JVM aggregate pointer-view synchronization"
+        "takes over a minute when run concurrently with the complete coretests suite"
     ),
     "num::flt2dec::strategy::dragon::exact_sanity_test": (
         "takes more than six CPU-minutes in JVM Big32x40 pointer-view synchronization"
@@ -75,34 +66,12 @@ DEFAULT_IGNORED_TESTS = {
     "num::flt2dec::strategy::grisu::exact_sanity_test": (
         "takes more than six CPU-minutes in JVM Big32x40 pointer-view synchronization"
     ),
-    "slice::brute_force_rotate_test_0": (
-        "takes over a minute through repeated addressable slice operations"
-    ),
     "slice::select_nth_unstable": (
         "performs cubic validation through billions of addressable slice element reads"
     ),
-    **{
-        f"unicode::{name}": (
-            "exhaustively scans Unicode code points and is pointer-bound on the JVM"
-        )
-        for name in (
-            "alphabetic",
-            "case_ignorable",
-            "cf",
-            "cn_planes_0_3",
-            "default_ignorable_code_point",
-            "grapheme_extend",
-            "lowercase",
-            "lt",
-            "n",
-            "uppercase",
-            "white_space",
-            "to_lowercase",
-            "to_uppercase",
-            "to_titlecase",
-            "to_casefold",
-        )
-    },
+    "unicode::to_casefold": (
+        "exhaustively scans Unicode code points and is pointer-bound on the JVM"
+    ),
 }
 
 

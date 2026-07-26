@@ -850,11 +850,52 @@ fn create_static_initializer_method(
             } else {
                 instructions.push(Instruction::Aconst_null);
             }
+            load_constant(
+                &mut instructions,
+                cp,
+                &oomir::Constant::I32(i32::try_from(static_value.allocation_size).map_err(
+                    |_| jvm::Error::VerificationError {
+                        context: format!(
+                            "Static {}::{}",
+                            static_value.owner_class, static_value.field_name
+                        ),
+                        message:
+                            "allocation size exceeds the JVM runtime address space".to_string(),
+                    },
+                )?),
+            )?;
+            load_constant(
+                &mut instructions,
+                cp,
+                &match &static_value.allocation_codec_class_name {
+                    Some(class_name) => oomir::Constant::String(class_name.clone()),
+                    None => oomir::Constant::Null(oomir::Type::java_string()),
+                },
+            )?;
+            load_constant(
+                &mut instructions,
+                cp,
+                &oomir::Constant::I32(
+                    i32::try_from(static_value.allocation_alignment).map_err(|_| {
+                        jvm::Error::VerificationError {
+                            context: format!(
+                                "Static {}::{}",
+                                static_value.owner_class, static_value.field_name
+                            ),
+                            message: "allocation alignment exceeds the JVM runtime address space"
+                                .to_string(),
+                        }
+                    })?,
+                ),
+            )?;
             let pointer_class = cp.add_class(oomir::POINTER_CLASS)?;
             let cell = cp.add_method_ref(
                 pointer_class,
-                "cell",
-                &format!("(Ljava/lang/Object;)L{};", oomir::POINTER_CLASS),
+                "cellAligned",
+                &format!(
+                    "(Ljava/lang/Object;ILjava/lang/String;I)L{};",
+                    oomir::POINTER_CLASS
+                ),
             )?;
             instructions.push(Instruction::Invokestatic(cell));
         }
