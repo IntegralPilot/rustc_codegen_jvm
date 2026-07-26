@@ -41,7 +41,9 @@ MAX_CAPTURE_CHARS = 64 * 1024
 CORETESTS_BUILD_SCHEMA = "coretests-build-v2"
 MAX_BUILD_CACHE_ENTRIES = 2
 HARNESS_STARTUP_GRACE_SECONDS = 15.0
-CORETESTS_MAX_HEAP = "1g"
+# Coretests is a short allocation-heavy throughput workload; a larger young
+# generation avoids hundreds of collections without approaching CI limits.
+CORETESTS_MAX_HEAP = "2g"
 DEFAULT_IGNORED_TESTS = {
     "char::at_most_one_case": (
         "exhaustive Unicode case validation takes over seventy-five CPU-seconds"
@@ -382,6 +384,7 @@ def listed_tests(jar: Path, timeout: float, *, ignored: bool = False) -> list[st
     command = [
         "java",
         f"-Xmx{CORETESTS_MAX_HEAP}",
+        "-XX:+UseParallelGC",
         "-jar",
         str(jar),
         "--list",
@@ -449,6 +452,7 @@ def run_test_harness(
     command = [
         "java",
         f"-Xmx{CORETESTS_MAX_HEAP}",
+        "-XX:+UseParallelGC",
         "-jar",
         str(jar),
         "--format",
@@ -648,8 +652,8 @@ def main() -> int:
         "-j",
         "--jobs",
         type=int,
-        default=1,
-        help="libtest worker threads (defaults to 1 to avoid pointer-allocation GC thrashing)",
+        default=min(os.cpu_count() or 1, 4),
+        help="Cargo and libtest worker threads (defaults to the smaller of CPU count and 4)",
     )
     parser.add_argument(
         "--timeout",

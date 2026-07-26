@@ -4,7 +4,9 @@ use super::{
     DebugInfoOptions, FunctionTranslator,
     constant_pool::{InternedConstantPool, verify_no_duplicate_constants},
     consts::{get_int_const_instr, load_constant},
-    helpers::{get_load_instruction, get_type_size, oomir_function_stack_floor},
+    helpers::{
+        get_cast_instructions, get_load_instruction, get_type_size, oomir_function_stack_floor,
+    },
     optimise2, stackmaps,
 };
 use crate::oomir::{self, AdtHelperKind, DataTypeMethod, Signature, Type};
@@ -255,8 +257,12 @@ pub(super) fn create_slice_view_classfile() -> jvm::Result<Vec<u8>> {
     let utf8 = cp.add_field_ref(standard_charsets, "UTF_8", "Ljava/nio/charset/Charset;")?;
     let string_class = cp.add_class("java/lang/String")?;
     let pointer_class = cp.add_class(oomir::POINTER_CLASS)?;
-    let utf8_bytes = cp.add_method_ref(pointer_class, "utf8Bytes", "(Ljava/lang/String;)[B")?;
-    let slice_constructor = cp.add_method_ref(this_class, "<init>", "(Ljava/lang/Object;II)V")?;
+    let string_view = cp.add_method_ref(
+        pointer_class,
+        "stringView",
+        "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/Object;",
+    )?;
+    let slice_view_name = cp.add_string(oomir::SLICE_VIEW_CLASS)?;
     let from_string_descriptor = format!("(Ljava/lang/String;)L{};", oomir::SLICE_VIEW_CLASS);
     let from_string = jvm::Method {
         access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
@@ -264,19 +270,13 @@ pub(super) fn create_slice_view_classfile() -> jvm::Result<Vec<u8>> {
         descriptor_index: cp.add_utf8(&from_string_descriptor)?,
         attributes: vec![code_attribute_for_descriptor(
             &mut cp,
-            5,
             2,
+            1,
             vec![
                 Instruction::Aload_0,
-                Instruction::Invokestatic(utf8_bytes),
-                Instruction::Astore_1,
-                Instruction::New(this_class),
-                Instruction::Dup,
-                Instruction::Aload_1,
-                Instruction::Iconst_0,
-                Instruction::Aload_1,
-                Instruction::Arraylength,
-                Instruction::Invokespecial(slice_constructor),
+                Instruction::Ldc_w(slice_view_name),
+                Instruction::Invokestatic(string_view),
+                Instruction::Checkcast(this_class),
                 Instruction::Areturn,
             ],
             &from_string_descriptor,
@@ -675,9 +675,13 @@ pub(super) fn create_utf8_view_classfile() -> jvm::Result<Vec<u8>> {
         )?],
     };
 
-    let slice_from_string_descriptor = format!("(Ljava/lang/String;)L{};", oomir::SLICE_VIEW_CLASS);
-    let slice_from_string =
-        cp.add_method_ref(slice_class, "fromString", &slice_from_string_descriptor)?;
+    let pointer_class = cp.add_class(oomir::POINTER_CLASS)?;
+    let string_view = cp.add_method_ref(
+        pointer_class,
+        "stringView",
+        "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/Object;",
+    )?;
+    let utf8_view_name = cp.add_string(oomir::UTF8_VIEW_CLASS)?;
     let from_java_descriptor = format!("(Ljava/lang/String;)L{};", oomir::UTF8_VIEW_CLASS);
     let from_java = jvm::Method {
         access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
@@ -685,21 +689,13 @@ pub(super) fn create_utf8_view_classfile() -> jvm::Result<Vec<u8>> {
         descriptor_index: cp.add_utf8(&from_java_descriptor)?,
         attributes: vec![code_attribute_for_descriptor(
             &mut cp,
-            5,
             2,
+            1,
             vec![
                 Instruction::Aload_0,
-                Instruction::Invokestatic(slice_from_string),
-                Instruction::Astore_1,
-                Instruction::New(this_class),
-                Instruction::Dup,
-                Instruction::Aload_1,
-                Instruction::Getfield(array_field),
-                Instruction::Aload_1,
-                Instruction::Getfield(offset_field),
-                Instruction::Aload_1,
-                Instruction::Getfield(length_field),
-                Instruction::Invokespecial(utf8_constructor),
+                Instruction::Ldc_w(utf8_view_name),
+                Instruction::Invokestatic(string_view),
+                Instruction::Checkcast(this_class),
                 Instruction::Areturn,
             ],
             &from_java_descriptor,
@@ -1025,6 +1021,67 @@ fn create_field_constructor(
                 parameters,
             },
         ],
+    })
+}
+
+fn create_managed_copy_method(
+    cp: &mut InternedConstantPool,
+    this_class_index: u16,
+    class_name: &str,
+    fields: &[(String, Type)],
+) -> jvm::Result<jvm::Method> {
+    let descriptor = "()Ljava/lang/Object;";
+    let constructor_descriptor = format!(
+        "({})V",
+        fields
+            .iter()
+            .map(|(_, ty)| ty.to_jvm_descriptor())
+            .collect::<String>()
+    );
+    let constructor = cp.add_method_ref(this_class_index, "<init>", &constructor_descriptor)?;
+    let pointer_class = cp.add_class(oomir::POINTER_CLASS)?;
+    let copy_managed_value = cp.add_method_ref(
+        pointer_class,
+        "copyManagedValue",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+    )?;
+    let object_type = Type::Class("java/lang/Object".to_string());
+    let mut instructions = vec![Instruction::New(this_class_index), Instruction::Dup];
+    let mut argument_slots = 0u16;
+
+    for (field_name, field_ty) in fields {
+        let field =
+            cp.add_field_ref(this_class_index, field_name, &field_ty.to_jvm_descriptor())?;
+        instructions.push(Instruction::Aload_0);
+        instructions.push(Instruction::Getfield(field));
+        if field_ty.is_jvm_reference_type() {
+            instructions.push(Instruction::Invokestatic(copy_managed_value));
+            instructions.extend(get_cast_instructions(
+                "rustCopy",
+                &object_type,
+                field_ty,
+                cp,
+            )?);
+        }
+        argument_slots = argument_slots.saturating_add(get_type_size(field_ty));
+    }
+    instructions.push(Instruction::Invokespecial(constructor));
+    instructions.push(Instruction::Areturn);
+
+    Ok(jvm::Method {
+        access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::FINAL,
+        name_index: cp.add_utf8("rustCopy")?,
+        descriptor_index: cp.add_utf8(descriptor)?,
+        attributes: vec![code_attribute_for_descriptor(
+            cp,
+            2u16.saturating_add(argument_slots),
+            1,
+            instructions,
+            descriptor,
+            false,
+            Some(class_name),
+            "rustCopy",
+        )?],
     })
 }
 
@@ -1371,6 +1428,12 @@ pub(super) fn create_data_type_classfile_for_class(
         let interface_index = cp.add_class(interface_name)?;
         interface_indices.push(interface_index);
     }
+    if !is_abstract {
+        let rust_copy_interface = "org/rustlang/runtime/RustCopy";
+        if seen_interfaces.insert(rust_copy_interface) {
+            interface_indices.push(cp.add_class(rust_copy_interface)?);
+        }
+    }
 
     let mut jvm_fields: Vec<jvm::Field> = Vec::new();
     for (field_name, field_ty) in &fields {
@@ -1401,6 +1464,14 @@ pub(super) fn create_data_type_classfile_for_class(
         create_field_constructor(&mut cp, this_class_index, super_class_index, &fields)?
     };
     let mut jvm_methods = vec![constructor];
+    if !is_abstract {
+        jvm_methods.push(create_managed_copy_method(
+            &mut cp,
+            this_class_index,
+            class_name_jvm,
+            &fields,
+        )?);
+    }
     let mut class_attributes = Vec::new();
     let mut bootstrap_methods: Vec<BootstrapMethod> = Vec::new();
     let mut next_factory = 0;

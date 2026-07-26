@@ -77,6 +77,44 @@ fn opaque_f128(value: f128) -> f128 {
     value
 }
 
+#[derive(Clone, Copy)]
+struct LookupPair(u8, u8);
+
+const fn build_lookup_table() -> [LookupPair; 256] {
+    let mut table = [LookupPair(0, 0); 256];
+    let mut index = 0;
+    while index < table.len() {
+        table[index] = LookupPair(index as u8, (index as u8).wrapping_mul(3));
+        index += 1;
+    }
+    table
+}
+
+const LOOKUP_TABLE: [LookupPair; 256] = build_lookup_table();
+
+#[inline(never)]
+fn read_large_constant(index: usize) -> (u8, u8) {
+    (LOOKUP_TABLE[index].0, LOOKUP_TABLE[index].1)
+}
+
+#[inline(never)]
+fn mutate_large_constant_copy(index: usize) -> u8 {
+    let mut table = LOOKUP_TABLE;
+    assert!(table[index].0 == index as u8);
+    table[index].0 = 211;
+    table[index].0
+}
+
+fn large_constant_value_semantics() {
+    assert!(read_large_constant(37) == (37, 111));
+    assert!(mutate_large_constant_copy(37) == 211);
+    assert!(mutate_large_constant_copy(37) == 211);
+    assert!(
+        read_large_constant(37) == (37, 111),
+        "a mutable constant copy must not modify a shared read-only table"
+    );
+}
+
 fn fixed_array_pattern_checks_every_element() {
     let bytes = [0_u8, 0xae, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 1, 2, 3, 4];
     assert!(!matches!(
@@ -1007,6 +1045,7 @@ fn test_try_branch_zst_residual() {
 }
 
 fn main() {
+    large_constant_value_semantics();
     test_try_branch_zst_residual();
     fixed_array_pattern_checks_every_element();
     runtime_integer_ops();

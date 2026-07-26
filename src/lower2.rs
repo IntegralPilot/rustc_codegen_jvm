@@ -574,23 +574,75 @@ fn operand_variable_name(operand: &oomir::Operand) -> Option<&str> {
     Some(name)
 }
 
-fn primitive_array_element(element_type: &oomir::Type) -> bool {
-    matches!(
-        element_type,
-        oomir::Type::I8
-            | oomir::Type::U8
-            | oomir::Type::I16
-            | oomir::Type::U16
-            | oomir::Type::F16
-            | oomir::Type::I32
-            | oomir::Type::U32
-            | oomir::Type::Boolean
-            | oomir::Type::Char
-            | oomir::Type::I64
-            | oomir::Type::U64
-            | oomir::Type::F32
-            | oomir::Type::F64
-    )
+fn object_array_elements_are_read_only(function: &oomir::Function, array: &str) -> bool {
+    let mut elements = HashSet::default();
+    for block in function.body.basic_blocks.values() {
+        for instruction in &block.instructions {
+            if let oomir::Instruction::ArrayGet {
+                dest,
+                array: operand,
+                ..
+            } = instruction
+                && operand_variable_name(operand) == Some(array)
+            {
+                elements.insert(dest.clone());
+            }
+        }
+    }
+
+    // Follow representation-only aliases introduced between an array load
+    // and a field projection.
+    loop {
+        let mut changed = false;
+        for block in function.body.basic_blocks.values() {
+            for instruction in &block.instructions {
+                let alias = match instruction {
+                    oomir::Instruction::Move { dest, src }
+                        if operand_variable_name(src)
+                            .is_some_and(|source| elements.contains(source)) =>
+                    {
+                        Some(dest)
+                    }
+                    oomir::Instruction::Cast { dest, op, .. }
+                        if operand_variable_name(op)
+                            .is_some_and(|source| elements.contains(source)) =>
+                    {
+                        Some(dest)
+                    }
+                    _ => None,
+                };
+                if let Some(alias) = alias {
+                    changed |= elements.insert(alias.clone());
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    for block in function.body.basic_blocks.values() {
+        for instruction in &block.instructions {
+            let mut uses_element = false;
+            crate::optimise1::copyprop::visit_instruction_uses(instruction, &mut |used| {
+                uses_element |= elements.contains(used);
+            });
+            if !uses_element {
+                continue;
+            }
+            match instruction {
+                oomir::Instruction::Move { src, .. }
+                    if operand_variable_name(src).is_some_and(|name| elements.contains(name)) => {}
+                oomir::Instruction::Cast { op, .. }
+                    if operand_variable_name(op).is_some_and(|name| elements.contains(name)) => {}
+                oomir::Instruction::GetField { object, .. }
+                    if operand_variable_name(object)
+                        .is_some_and(|name| elements.contains(name)) => {}
+                _ => return false,
+            }
+        }
+    }
+    true
 }
 
 fn read_only_large_array_variables(function: &oomir::Function) -> HashSet<String> {
@@ -610,9 +662,8 @@ fn read_only_large_array_variables(function: &oomir::Function) -> HashSet<String
         }
     }
 
-    candidates.retain(|candidate, element_type| {
+    candidates.retain(|candidate, _element_type| {
         let mut definitions = 0usize;
-        let mut array_get_results = Vec::new();
         let mut valid = true;
         for block in function.body.basic_blocks.values() {
             for instruction in &block.instructions {
@@ -629,54 +680,29 @@ fn read_only_large_array_variables(function: &oomir::Function) -> HashSet<String
                     continue;
                 }
                 match instruction {
-                    oomir::Instruction::ArrayGet { dest, array, index }
+                    oomir::Instruction::ArrayGet { array, index, .. }
                         if operand_variable_name(array) == Some(candidate.as_str())
-                            && operand_variable_name(index) != Some(candidate.as_str()) =>
-                    {
-                        array_get_results.push(dest.clone());
-                    }
+                            && operand_variable_name(index) != Some(candidate.as_str()) => {}
                     oomir::Instruction::Length { array, .. }
                         if operand_variable_name(array) == Some(candidate.as_str()) => {}
                     _ => valid = false,
                 }
             }
         }
-        if !valid || definitions != 1 || primitive_array_element(element_type) {
-            return valid && definitions == 1;
-        }
-
-        // JVM object arrays contain mutable carrier objects. Sharing the
-        // constant is safe only when each selected element is itself observed
-        // through field reads and never escapes or receives a field write.
-        array_get_results.into_iter().all(|result| {
-            let mut result_definitions = 0usize;
-            let mut result_valid = true;
-            for block in function.body.basic_blocks.values() {
-                for instruction in &block.instructions {
-                    if crate::optimise1::copyprop::instruction_def(instruction)
-                        == Some(result.as_str())
-                    {
-                        result_definitions += 1;
-                    }
-                    let mut uses_result = false;
-                    crate::optimise1::copyprop::visit_instruction_uses(instruction, &mut |used| {
-                        uses_result |= used == result
-                    });
-                    if uses_result
-                        && !matches!(
-                            instruction,
-                            oomir::Instruction::GetField { object, .. }
-                                if operand_variable_name(object) == Some(result.as_str())
-                        )
-                    {
-                        result_valid = false;
-                    }
-                }
-            }
-            result_valid && result_definitions == 1
-        })
+        valid && definitions == 1
     });
-    candidates.into_keys().collect()
+
+    candidates
+        .into_iter()
+        .filter_map(|(candidate, element_type)| {
+            // Primitive elements cannot contain an independently mutable
+            // place. Object elements must only be projected for reads: an
+            // indexed field write currently mutates the loaded element copy.
+            (element_type.is_jvm_primitive()
+                || object_array_elements_are_read_only(function, &candidate))
+            .then_some(candidate)
+        })
+        .collect()
 }
 
 fn prepare_function_constants(
