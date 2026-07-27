@@ -1,4 +1,12 @@
-#![feature(iter_advance_by, iter_next_chunk, ptr_metadata, thin_box, type_info)]
+#![feature(
+    iter_advance_by,
+    iter_next_chunk,
+    ptr_metadata,
+    thin_box,
+    try_reserve_kind,
+    try_with_capacity,
+    type_info
+)]
 
 use core::cell::{Ref, RefCell, RefMut};
 use core::any::TypeId;
@@ -317,6 +325,16 @@ fn test_vec_null_pointer_roundtrip() {
 fn test_vec_into_iter_regressions() {
     let iter = vec!['a', 'b', 'c'].into_iter();
     assert_eq!(format!("{iter:?}"), "IntoIter(['a', 'b', 'c'])");
+
+    let mut iter = vec![1, 2, 3, 4, 5].into_iter();
+    assert_eq!(iter.advance_by(1), Ok(()));
+    assert_eq!(iter.advance_back_by(1), Ok(()));
+    assert_eq!(iter.as_slice(), &[2, 3, 4]);
+
+    let mut iter = b"lorem".to_vec().into_iter();
+    assert_eq!(iter.next_chunk_back::<2>().unwrap(), *b"em");
+    assert_eq!(iter.next_chunk_back::<3>().unwrap(), *b"lor");
+    assert_eq!(iter.next(), None);
 
     const EMPTY: String = String::new();
     let nested = vec![[EMPTY, "Hello World!".into()], [EMPTY, EMPTY]];
@@ -1112,14 +1130,39 @@ fn test_vec_resize_and_leak() {
 }
 
 fn test_try_reserve() {
+    use std::collections::TryReserveErrorKind::{AllocError, CapacityOverflow};
+
     let mut v: Vec<u8> = Vec::new();
     let result = v.try_reserve(1024);
     assert!(result.is_ok());
     assert!(v.capacity() >= 1024);
 
-    let huge = usize::MAX / 2;
-    let failure = v.try_reserve(huge);
-    assert!(failure.is_err());
+    let mut empty = Vec::<u8>::new();
+    let allocation_failure = empty.try_reserve(isize::MAX as usize).unwrap_err();
+    assert!(matches!(allocation_failure.kind(), AllocError { .. }));
+    assert!(empty.is_empty());
+    assert!(empty.capacity() == 0);
+
+    let capacity_overflow = empty
+        .try_reserve(isize::MAX as usize + 1)
+        .unwrap_err();
+    assert!(matches!(capacity_overflow.kind(), CapacityOverflow));
+
+    let mut text = String::from("0123456789");
+    let allocation_failure = text
+        .try_reserve(isize::MAX as usize - text.len())
+        .unwrap_err();
+    assert!(matches!(allocation_failure.kind(), AllocError { .. }));
+    assert_eq!(text, "0123456789");
+    let capacity_overflow = text
+        .try_reserve(isize::MAX as usize - text.len() + 1)
+        .unwrap_err();
+    assert!(matches!(capacity_overflow.kind(), CapacityOverflow));
+    assert_eq!(text, "0123456789");
+
+    let deque_failure = VecDeque::<u16>::try_with_capacity(isize::MAX as usize + 1)
+        .unwrap_err();
+    assert!(matches!(deque_failure.kind(), CapacityOverflow));
 }
 
 fn test_closures_as_trait_objects() {
@@ -1246,6 +1289,19 @@ fn test_overaligned_allocations() {
 
             dealloc(ptr, layout);
         }
+    }
+
+    #[repr(align(256))]
+    struct Reallocated(usize);
+
+    let mut values = vec![Reallocated(273)];
+    for additional in 0..4096 {
+        values.reserve_exact(additional);
+        assert!(values[0].0 == 273);
+        assert!(values.as_ptr().addr() & 0xff == 0);
+        values.shrink_to_fit();
+        assert!(values[0].0 == 273);
+        assert!(values.as_ptr().addr() & 0xff == 0);
     }
 }
 

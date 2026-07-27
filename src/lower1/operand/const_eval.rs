@@ -58,9 +58,9 @@ fn anonymous_allocation_identity(
 
 fn anonymous_memory_identity(
     tcx: TyCtxt<'_>,
-    alloc_id: AllocId,
     allocation: &ConstAllocation,
     instance: Instance<'_>,
+    storage_value: &oomir::Constant,
 ) -> Option<String> {
     if !allocation.provenance().ptrs().is_empty() {
         return None;
@@ -70,9 +70,9 @@ fn anonymous_memory_identity(
     let hash = crate::stable_hash::short_hash_value(
         &(
             format!("{instance:?}"),
-            format!("{alloc_id:?}"),
             bytes,
             allocation.align.bytes(),
+            storage_value,
         ),
         16,
     );
@@ -304,17 +304,19 @@ fn preserve_slice_allocation<'tcx>(
             }
         };
     let pointee = element_type.clone();
-    let identity_candidate = anonymous_memory_identity(tcx, alloc_id, allocation, instance)
-        .unwrap_or_else(|| {
-            anonymous_allocation_identity(
-                tcx,
-                &identity_value,
-                element_layout.size.bytes(),
-                allocation.align.bytes(),
-                &view_codec,
-                &pointee,
-            )
-        });
+    let identity_candidate =
+        anonymous_memory_identity(tcx, allocation, instance, &allocation_value).unwrap_or_else(
+            || {
+                anonymous_allocation_identity(
+                    tcx,
+                    &identity_value,
+                    element_layout.size.bytes(),
+                    allocation.align.bytes(),
+                    &view_codec,
+                    &pointee,
+                )
+            },
+        );
     let identity = canonical_allocation_identity(tcx, alloc_id, identity_candidate);
     let backing = oomir::Constant::InternedPointer {
         identity,
@@ -1016,7 +1018,7 @@ fn anonymous_memory_pointer_constant<'tcx>(
         oomir::Constant::Null(oomir::Type::Class("java/lang/String".to_string())),
         |codec| oomir::Constant::String(codec.clone()),
     );
-    let identity_candidate = anonymous_memory_identity(tcx, alloc_id, allocation, instance)
+    let identity_candidate = anonymous_memory_identity(tcx, allocation, instance, &identity_value)
         .unwrap_or_else(|| {
             anonymous_allocation_identity(
                 tcx,
@@ -1156,7 +1158,7 @@ fn interned_pointer_for_memory_view<'tcx>(
         }
     };
     let pointee = ty_to_oomir_type(pointee_ty, tcx, oomir_data_types, instance);
-    let identity_candidate = anonymous_memory_identity(tcx, alloc_id, allocation, instance)
+    let identity_candidate = anonymous_memory_identity(tcx, allocation, instance, &value)
         .unwrap_or_else(|| {
             let hash = crate::stable_hash::short_hash_value(
                 &(
@@ -1215,7 +1217,7 @@ fn interned_pointer_for_full_allocation<'tcx>(
         }
     };
     let pointee = ty_to_oomir_type(pointee_ty, tcx, oomir_data_types, instance);
-    let identity_candidate = anonymous_memory_identity(tcx, alloc_id, allocation, instance)
+    let identity_candidate = anonymous_memory_identity(tcx, allocation, instance, &value)
         .unwrap_or_else(|| {
             anonymous_allocation_identity(
                 tcx,

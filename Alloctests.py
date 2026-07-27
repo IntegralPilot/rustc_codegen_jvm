@@ -5,36 +5,62 @@ from stdlib_test_harness import ROOT, SuiteConfig, run_suite
 
 
 DEFAULT_IGNORED_TESTS = {
-    "str::slice_index::simple_big": "upstream marks this allocation stress test too slow for Miri",
-    "str::strslice_issue_16589": "upstream marks this exhaustive substring test too slow for Miri",
-    "str::test_chars_decoding": "exhaustively checks every Unicode scalar value",
-    "str::test_chars_rev_decoding": "exhaustively checks every Unicode scalar value",
+    "sort::tests::stable::correct_dyn_val_ascending": (
+        "sorting fat trait-object values currently aborts"
+    ),
+    "sort::tests::stable::correct_dyn_val_descending": (
+        "sorting fat trait-object values currently aborts"
+    ),
+    "sort::tests::stable::correct_dyn_val_random": (
+        "sorting fat trait-object values currently aborts"
+    ),
+    "sort::tests::stable::correct_dyn_val_random_d2": (
+        "sorting fat trait-object values currently aborts"
+    ),
+    "sort::tests::stable::correct_dyn_val_random_d20": (
+        "sorting fat trait-object values currently aborts"
+    ),
+    "sort::tests::stable::correct_dyn_val_random_s95": (
+        "sorting fat trait-object values currently aborts"
+    ),
+    "sort::tests::stable::correct_dyn_val_random_z1": (
+        "sorting fat trait-object values currently aborts"
+    ),
+    "sort::tests::stable::correct_dyn_val_saw_mixed": (
+        "sorting fat trait-object values currently aborts"
+    ),
+    "sort::tests::stable::stability_legacy": (
+        "the legacy stable-sort stability check currently fails"
+    ),
+    "sort::tests::unstable::correct_dyn_val_ascending": (
+        "sorting fat trait-object values currently aborts"
+    ),
+    "sort::tests::unstable::correct_dyn_val_descending": (
+        "sorting fat trait-object values currently aborts"
+    ),
+    "sort::tests::unstable::correct_dyn_val_random": (
+        "sorting fat trait-object values currently aborts"
+    ),
+    "sort::tests::unstable::correct_dyn_val_random_d2": (
+        "sorting fat trait-object values currently aborts"
+    ),
+    "sort::tests::unstable::correct_dyn_val_random_d20": (
+        "sorting fat trait-object values currently aborts"
+    ),
+    "sort::tests::unstable::correct_dyn_val_random_s95": (
+        "sorting fat trait-object values currently aborts"
+    ),
+    "sort::tests::unstable::correct_dyn_val_random_z1": (
+        "sorting fat trait-object values currently aborts"
+    ),
+    "sort::tests::unstable::correct_dyn_val_saw_mixed": (
+        "sorting fat trait-object values currently aborts"
+    ),
+    "str::strslice_issue_16589": (
+        "upstream marks this exhaustive substring test too slow for Miri"
+    ),
     "str::test_strslice_contains": (
         "upstream marks this substring permutation test too slow for Miri"
-    ),
-    "str::test_unsafe_slice": "upstream marks this test too slow for Miri",
-    "string::test_try_reserve": "requires signalling an intentionally enormous allocation failure",
-    "string::test_try_reserve_exact": (
-        "requires signalling an intentionally enormous allocation failure"
-    ),
-    "string::test_try_with_capacity": (
-        "requires signalling an intentionally enormous allocation failure"
-    ),
-    "vec::test_try_reserve": "requires signalling an intentionally enormous allocation failure",
-    "vec::test_try_reserve_exact": (
-        "requires signalling an intentionally enormous allocation failure"
-    ),
-    "vec::test_try_with_capacity": (
-        "requires signalling an intentionally enormous allocation failure"
-    ),
-    "vec_deque::test_try_reserve": (
-        "requires signalling an intentionally enormous allocation failure"
-    ),
-    "vec_deque::test_try_reserve_exact": (
-        "requires signalling an intentionally enormous allocation failure"
-    ),
-    "vec_deque::test_try_with_capacity": (
-        "requires signalling an intentionally enormous allocation failure"
     ),
 }
 

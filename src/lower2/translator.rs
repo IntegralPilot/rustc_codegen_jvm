@@ -684,6 +684,16 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         Ok(true)
     }
 
+    fn load_pointer_components(&mut self, operand: &oomir::Operand) -> Result<(), jvm::Error> {
+        if self.load_deferred_pointer_components(operand)? {
+            return Ok(());
+        }
+        self.load_operand(operand)?;
+        self.jvm_instructions.push(Instruction::Lconst_0);
+        self.jvm_instructions.push(Instruction::Lconst_0);
+        Ok(())
+    }
+
     fn load_pointer_offset_component(
         &mut self,
         slots: Option<(u16, u16)>,
@@ -895,6 +905,28 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         self.jvm_instructions.push(Instruction::Invokestatic(query));
         self.store_result(dest, result_ty)?;
         Ok(true)
+    }
+
+    fn translate_deferred_pointer_copy(
+        &mut self,
+        method_name: &str,
+        args: &[oomir::Operand],
+    ) -> Result<(), jvm::Error> {
+        self.load_pointer_components(&args[0])?;
+        self.load_pointer_components(&args[1])?;
+        self.load_pointer_arithmetic_amount(&args[2])?;
+        let pointer_class = self.constant_pool.add_class(oomir::POINTER_CLASS)?;
+        let copy = self.constant_pool.add_method_ref(
+            pointer_class,
+            &format!("{method_name}Relative"),
+            &format!(
+                "(L{};JJL{};JJJ)V",
+                oomir::POINTER_CLASS,
+                oomir::POINTER_CLASS
+            ),
+        )?;
+        self.jvm_instructions.push(Instruction::Invokestatic(copy));
+        Ok(())
     }
 
     fn load_string_constant(&mut self, value: &str) -> Result<(), jvm::Error> {
@@ -5371,6 +5403,27 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 }
             }
             OI::InvokeStatic {
+                dest: None,
+                class_name,
+                method_name,
+                args,
+                ..
+            } if class_name == oomir::POINTER_CLASS
+                && is_pointer_copy(method_name)
+                && args.len() == 3
+                && args[..2].iter().any(|operand| {
+                    matches!(
+                        operand,
+                        OO::Variable {
+                            name,
+                            ty: Type::Pointer(_)
+                        } if self.deferred_pointer_variables.contains(name)
+                    )
+                }) =>
+            {
+                self.translate_deferred_pointer_copy(method_name, args)?;
+            }
+            OI::InvokeStatic {
                 dest: Some(dest),
                 class_name,
                 method_name,
@@ -6401,6 +6454,13 @@ fn is_primitive_pointer_getter(method_name: &str) -> bool {
     matches!(
         method_name,
         "getBoolean" | "getI8" | "getI16" | "getI32" | "getI64" | "getF32" | "getF64"
+    )
+}
+
+fn is_pointer_copy(method_name: &str) -> bool {
+    matches!(
+        method_name,
+        "copy" | "copyElements" | "copyNonOverlapping" | "copyNonOverlappingElements"
     )
 }
 

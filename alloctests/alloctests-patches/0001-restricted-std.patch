@@ -30,7 +30,7 @@ diff --git a/tests/collections/binary_heap.rs b/tests/collections/binary_heap.rs
      const DATASZ: usize = 32;
      // Miri is too slow
 -    let ntest = if cfg!(miri) { 1 } else { 10 };
-+    let ntest = if cfg!(any(miri, target_os = "jvm")) { 1 } else { 10 };
++    let ntest = if cfg!(target_os = "jvm") { 1 } else if cfg!(miri) { 1 } else { 10 };
  
      // don't use 0 in the data -- we want to catch the zeroed-out case.
      let data = (1..=DATASZ).collect::<Vec<_>>();
@@ -42,30 +42,81 @@ diff --git a/tests/sort/partial.rs b/tests/sort/partial.rs
  
      // Longer tests would take hours to run under Miri.
 -    if !cfg!(miri) {
-+    if !cfg!(any(miri, target_os = "jvm")) {
++    if !cfg!(miri) && !cfg!(target_os = "jvm") {
          check_is_partial_sorted_ranges(&patterns::random(100));
          check_is_partial_sorted_ranges(&patterns::random(1000));
      }
 diff --git a/tests/sort/tests.rs b/tests/sort/tests.rs
 --- a/tests/sort/tests.rs
 +++ b/tests/sort/tests.rs
-@@ -927,6 +927,7 @@ macro_rules! instantiate_sort_test_inner {
- macro_rules! instantiate_sort_test_inner {
-     ($sort_impl:ty, miri_yes, $test_fn_name:ident) => {
-         #[test]
-+        #[cfg_attr(target_os = "jvm", ignore)]
-         fn $test_fn_name() {
-             $crate::sort::tests::$test_fn_name::<$sort_impl>();
-         }
-@@ -935,7 +936,7 @@ macro_rules! instantiate_sort_test_inner {
-     };
-     ($sort_impl:ty, miri_no, $test_fn_name:ident) => {
-         #[test]
--        #[cfg_attr(miri, ignore)]
-+        #[cfg_attr(any(miri, target_os = "jvm"), ignore)]
-         fn $test_fn_name() {
-             $crate::sort::tests::$test_fn_name::<$sort_impl>();
-         }
+@@ -9,6 +9,9 @@
+ use crate::sort::{Sort, known_good_stable_sort, patterns};
+-
++
+ #[cfg(miri)]
++const TEST_LENGTHS: &[usize] = &[2, 3, 4, 7, 10, 15, 20, 24, 33, 50, 100, 171, 300];
++
++#[cfg(target_os = "jvm")]
+ const TEST_LENGTHS: &[usize] = &[2, 3, 4, 7, 10, 15, 20, 24, 33, 50, 100, 171, 300];
+-
++
+ // node.js gives out of memory error to use with length 1_100_000
+@@ -18,7 +21,7 @@
+     2_048, 5_000, 10_000, 100_000,
+ ];
+-
++
+-#[cfg(all(not(miri), not(target_os = "emscripten")))]
++#[cfg(all(not(miri), not(target_os = "emscripten"), not(target_os = "jvm")))]
+ const TEST_LENGTHS: &[usize] = &[
+     2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 16, 17, 20, 24, 30, 32, 33, 35, 50, 100, 200, 500, 1_000,
+     2_048, 5_000, 10_000, 100_000, 1_100_000,
+@@ -454,8 +457,13 @@
+         return;
+     }
+-
++
+-    let large_range = if cfg!(miri) { 100..110 } else { 3000..3010 };
+-    let rounds = if cfg!(miri) { 1 } else { 10 };
++    let (large_range, rounds) = if cfg!(target_os = "jvm") {
++        (100..110, 1)
++    } else if cfg!(miri) {
++        (100..110, 1)
++    } else {
++        (3000..3010, 10)
++    };
+-
++
+     let rand_vals = patterns::random_uniform(5_000, 0..=9);
+     let mut rand_idx = 0;
+@@ -773,7 +781,13 @@
+     // Ord implies a strict total order see https://en.wikipedia.org/wiki/Total_order.
+-
++
+     // Generating random numbers with miri is quite expensive.
+-    let random_orderings_len = if cfg!(miri) { 200 } else { 10_000 };
++    let random_orderings_len = if cfg!(target_os = "jvm") {
++        200
++    } else if cfg!(miri) {
++        200
++    } else {
++        10_000
++    };
+-
++
+     // Make sure we get a good distribution of random orderings, that are repeatable with the seed.
+     // Just using random_uniform with the same len and range will always yield the same value.
+@@ -911,6 +925,9 @@
+         let sum_after: i64 = test_data.iter().map(|x| type_from_fn(x) as i64).sum();
+         assert_eq!(sum_before, sum_after);
+-
++
++        if cfg!(target_os = "jvm") {
++            break;
++        }
+         if cfg!(miri) {
+             // This test is prohibitively expensive in miri, so only run one of the comparison
+             // functions. This test is not expected to yield direct UB, but rather surface potential
 diff --git a/tests/str.rs b/tests/str.rs
 --- a/tests/str.rs
 +++ b/tests/str.rs
@@ -74,19 +125,19 @@ diff --git a/tests/str.rs b/tests/str.rs
  fn utf8_char_counts() {
      let strs = [("e", 1), ("é", 1), ("€", 1), ("\u{10000}", 1), ("eé€\u{10000}", 4)];
 -    let spread = if cfg!(miri) { 4 } else { 8 };
-+    let spread = if cfg!(any(miri, target_os = "jvm")) { 4 } else { 8 };
++    let spread = if cfg!(target_os = "jvm") { 4 } else if cfg!(miri) { 4 } else { 8 };
      let mut reps = [8, 64, 256, 512]
          .iter()
          .copied()
          .flat_map(|n| n - spread..=n + spread)
          .collect::<Vec<usize>>();
 -    if cfg!(not(miri)) {
-+    if cfg!(not(any(miri, target_os = "jvm"))) {
++    if !cfg!(miri) && !cfg!(target_os = "jvm") {
          // Miri is too slow
          reps.extend([1024, 1 << 16].iter().copied().flat_map(|n| n - spread..=n + spread));
      }
 -    let counts = if cfg!(miri) { 0..1 } else { 0..8 };
-+    let counts = if cfg!(any(miri, target_os = "jvm")) { 0..1 } else { 0..8 };
++    let counts = if cfg!(target_os = "jvm") { 0..1 } else if cfg!(miri) { 0..1 } else { 0..8 };
      let padding = counts.map(|len| " ".repeat(len)).collect::<Vec<String>>();
  
      for repeat in reps {
@@ -98,7 +149,7 @@ diff --git a/tests/sync.rs b/tests/sync.rs
      let t = thread::spawn(move || {
          // Miri is too slow
 -        let count = if cfg!(miri) { 1000 } else { 1000000 };
-+        let count = if cfg!(any(miri, target_os = "jvm")) { 1000 } else { 1000000 };
++        let count = if cfg!(target_os = "jvm") { 1000 } else if cfg!(miri) { 1000 } else { 1000000 };
          for _i in 0..count {
              Arc::get_mut(&mut a);
          }
@@ -110,7 +161,7 @@ diff --git a/tests/vec_deque.rs b/tests/vec_deque.rs
  
      // Miri is too slow
 -    let max = if cfg!(miri) { 3 } else { 5 };
-+    let max = if cfg!(any(miri, target_os = "jvm")) { 3 } else { 5 };
++    let max = if cfg!(target_os = "jvm") { 3 } else if cfg!(miri) { 3 } else { 5 };
  
      // Many different permutations of both the `VecDeque` getting appended to
      // and the one getting appended are generated to check `append`.

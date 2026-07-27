@@ -2107,9 +2107,15 @@ const CONST_POINTER_ERROR: ConstPointerError = ConstPointerError {
 };
 
 fn const_pointer_operations() {
+    const BYTES: [u8; 2] = *b"hi";
+    const BORROWED: &'static [u8; 2] = &BYTES;
+    const POINTER: *const u8 = BORROWED.as_ptr();
+
     unsafe {
         assert_eq!(*OFFSET_PTR, 30);
+        assert_eq!(*POINTER, b'h');
     }
+    assert_eq!(&BYTES as *const u8, POINTER);
     assert!(!PTR_ADDR_IS_NULL);
     assert_eq!(
         CONST_NON_NULL_UNIT.as_ptr(),

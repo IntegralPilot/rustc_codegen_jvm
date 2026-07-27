@@ -412,6 +412,7 @@ public final class Pointer {
             new RebuildableIdentityFilter();
     private static final RebuildableIdentityFilter MEMORY_VIEW_ORIGIN_FILTER =
             new RebuildableIdentityFilter();
+    private static final AtomicLong MEMORY_VIEW_EPOCH = new AtomicLong();
     private static final AtomicLongArray ENCODED_REFERENCE_FILTER =
             new AtomicLongArray(REPEATED_ARRAY_FILTER_WORDS);
     private static final AtomicLongArray ENCODED_POINTER_FILTER =
@@ -436,6 +437,8 @@ public final class Pointer {
             ENCODED_POINTERS = createWeakMapStripes();
     private static final ThreadLocal<Integer> MEMORY_VIEW_WRITEBACK_DEPTH =
             ThreadLocal.withInitial(() -> 0);
+    private static final ThreadLocal<MemoryViewAbsenceCache> MEMORY_VIEW_ABSENCE =
+            ThreadLocal.withInitial(MemoryViewAbsenceCache::new);
     private static final Map<Object, Map<String, WeakReference<FieldCell>>>[] FIELD_CELLS =
             createWeakMapStripes();
     private static final int ATOMIC_STRIPE_COUNT = 64;
@@ -951,12 +954,13 @@ public final class Pointer {
         private static final class OpenWeakReference extends WeakReference<Object> {
             private final int identityHash;
 
-            private OpenWeakReference(Object key) {
-                super(key);
+            private OpenWeakReference(Object key, ReferenceQueue<Object> queue) {
+                super(key, queue);
                 identityHash = System.identityHashCode(key);
             }
         }
 
+        private final ReferenceQueue<Object> collectedKeys = new ReferenceQueue<>();
         private OpenWeakReference[] keys;
         private Object[] values;
         private int size;
@@ -1017,9 +1021,27 @@ public final class Pointer {
             values = new Object[16];
             size = 0;
             used = 0;
+            while (collectedKeys.poll() != null) {
+                // Entries no longer exist after reset.
+            }
+        }
+
+        private void discardCollectedKeys() {
+            OpenWeakReference collected;
+            while ((collected = (OpenWeakReference) collectedKeys.poll()) != null) {
+                int index = tableIndex(collected.identityHash, keys.length);
+                while (keys[index] != null) {
+                    if (keys[index] == collected) {
+                        deleteEntry(index);
+                        break;
+                    }
+                    index = (index + 1) & (keys.length - 1);
+                }
+            }
         }
 
         private void rehashForInsert() {
+            discardCollectedKeys();
             int newLength =
                     size * 4 >= keys.length * 3
                             ? keys.length << 1
@@ -1054,6 +1076,7 @@ public final class Pointer {
 
         @Override
         public V get(Object key) {
+            discardCollectedKeys();
             int index = tableIndex(System.identityHashCode(key), keys.length);
             while (true) {
                 OpenWeakReference reference = keys[index];
@@ -1073,6 +1096,7 @@ public final class Pointer {
 
         @Override
         public V put(Object key, V value) {
+            discardCollectedKeys();
             if (used * 4 >= keys.length * 3) {
                 rehashForInsert();
             }
@@ -1081,7 +1105,7 @@ public final class Pointer {
                 OpenWeakReference reference = keys[index];
                 if (reference == null) {
                     used++;
-                    keys[index] = new OpenWeakReference(key);
+                    keys[index] = new OpenWeakReference(key, collectedKeys);
                     values[index] = value;
                     size++;
                     return null;
@@ -1101,6 +1125,7 @@ public final class Pointer {
 
         @Override
         public V remove(Object key) {
+            discardCollectedKeys();
             int index = tableIndex(System.identityHashCode(key), keys.length);
             while (true) {
                 OpenWeakReference reference = keys[index];
@@ -1125,6 +1150,7 @@ public final class Pointer {
 
         @Override
         public int size() {
+            discardCollectedKeys();
             for (int index = 0; index < keys.length; ) {
                 OpenWeakReference reference = keys[index];
                 if (reference != null && reference.get() == null) {
@@ -1138,6 +1164,7 @@ public final class Pointer {
 
         @Override
         public boolean isEmpty() {
+            discardCollectedKeys();
             if (size == 0) {
                 return true;
             }
@@ -1158,6 +1185,7 @@ public final class Pointer {
 
         @Override
         public Set<Map.Entry<Object, V>> entrySet() {
+            discardCollectedKeys();
             Set<Map.Entry<Object, V>> entries = new HashSet<>();
             for (int index = 0; index < keys.length; ) {
                 OpenWeakReference reference = keys[index];
@@ -1177,6 +1205,7 @@ public final class Pointer {
         }
 
         private long markLiveKeys(AtomicLongArray filter) {
+            discardCollectedKeys();
             long count = 0;
             for (int index = 0; index < keys.length; ) {
                 OpenWeakReference reference = keys[index];
@@ -1290,6 +1319,20 @@ public final class Pointer {
         private MemoryViewWriteback(long offset, MemoryViewState state) {
             this.offset = offset;
             this.state = state;
+        }
+    }
+
+    private static final class MemoryViewAbsenceCache {
+        private WeakReference<Object> allocation = new WeakReference<>(null);
+        private long epoch = Long.MIN_VALUE;
+
+        private boolean matches(Object candidate, long currentEpoch) {
+            return allocation.get() == candidate && epoch == currentEpoch;
+        }
+
+        private void remember(Object candidate, long currentEpoch) {
+            allocation = new WeakReference<>(candidate);
+            epoch = currentEpoch;
         }
     }
 
@@ -1863,6 +1906,7 @@ public final class Pointer {
                             + " in " + array.getClass().getName());
         }
         if (length < LAZY_ARRAY_REPEAT_THRESHOLD
+                || array.getClass().getComponentType().isPrimitive()
                 || !mayBeRepeatedArray(array)) {
             return arrayGet(array, index);
         }
@@ -2991,17 +3035,26 @@ public final class Pointer {
         if (!mayBeInIdentityFilter(MEMORY_VIEW_FILTER, allocation)) {
             return;
         }
+        long observedEpoch = MEMORY_VIEW_EPOCH.get();
+        MemoryViewAbsenceCache absence = MEMORY_VIEW_ABSENCE.get();
+        if (absence.matches(allocation, observedEpoch)) {
+            return;
+        }
         java.util.ArrayList<MemoryViewWriteback> pending;
         Map<Object, LongRangeMap<MemoryViewState>> stripe =
                 stateStripe(MEMORY_VIEWS, allocation);
         synchronized (stripe) {
             LongRangeMap<MemoryViewState> views = stripe.get(allocation);
             if (views == null) {
+                if (MEMORY_VIEW_EPOCH.get() == observedEpoch) {
+                    absence.remember(allocation, observedEpoch);
+                }
                 return;
             }
             pending = removeOverlappingMemoryViews(views, offset, size);
             if (views.isEmpty()) {
                 stripe.remove(allocation);
+                absence.remember(allocation, MEMORY_VIEW_EPOCH.get());
             }
         }
         if (pending == null) {
@@ -3035,16 +3088,25 @@ public final class Pointer {
         if (!mayBeInIdentityFilter(MEMORY_VIEW_FILTER, allocation)) {
             return;
         }
+        long observedEpoch = MEMORY_VIEW_EPOCH.get();
+        MemoryViewAbsenceCache absence = MEMORY_VIEW_ABSENCE.get();
+        if (absence.matches(allocation, observedEpoch)) {
+            return;
+        }
         Map<Object, LongRangeMap<MemoryViewState>> stripe =
                 stateStripe(MEMORY_VIEWS, allocation);
         synchronized (stripe) {
             LongRangeMap<MemoryViewState> views = stripe.get(allocation);
             if (views == null) {
+                if (MEMORY_VIEW_EPOCH.get() == observedEpoch) {
+                    absence.remember(allocation, observedEpoch);
+                }
                 return;
             }
             removeOverlappingMemoryViews(views, offset, size);
             if (views.isEmpty()) {
                 stripe.remove(allocation);
+                absence.remember(allocation, MEMORY_VIEW_EPOCH.get());
             }
         }
     }
@@ -3132,6 +3194,7 @@ public final class Pointer {
         }
         MemoryViewState state =
                 new MemoryViewState(materializedSize, viewCodecClassName, decoded, image);
+        MEMORY_VIEW_EPOCH.incrementAndGet();
         markIdentityFilter(MEMORY_VIEW_FILTER, allocation);
         synchronized (stripe) {
             LongRangeMap<MemoryViewState> views = stripe.get(allocation);
@@ -3141,6 +3204,7 @@ public final class Pointer {
             }
             views.put(byteOffset, state);
         }
+        MEMORY_VIEW_EPOCH.incrementAndGet();
         // Mark again after publishing the map entry so a concurrent filter
         // rebuild cannot miss an insertion whose stripe it already scanned.
         markIdentityFilter(MEMORY_VIEW_FILTER, allocation);
@@ -3352,9 +3416,16 @@ public final class Pointer {
     /** Commits direct field mutations made through the current decoded view. */
     public void commitMemoryView() {
         discardProjectedFieldViews(managedViewObject());
-        if (boundMemoryViewState() == null
-                || allocation == null
-                || viewCodecClassName == null) {
+        if (boundMemoryViewState() == null) {
+            // Direct JVM aggregate carriers are already authoritative. Drop
+            // byte-projected field views decoded before the mutation so a
+            // later load cannot reuse stale pointer or scalar field state.
+            if (allocation != null && viewSize > 0 && hasStableManagedCarrier()) {
+                discardMemoryViewsOverlapping(byteOffset, materializedViewSize());
+            }
+            return;
+        }
+        if (allocation == null || viewCodecClassName == null) {
             return;
         }
         synchronized (atomicStripe(this)) {
@@ -3382,6 +3453,7 @@ public final class Pointer {
         // ordinary store path, which invalidates overlapping decoded views.
         // This object is still the live Rust receiver, so keep it authoritative
         // for references derived from the call that just completed.
+        MEMORY_VIEW_EPOCH.incrementAndGet();
         synchronized (stripe) {
             LongRangeMap<MemoryViewState> views = stripe.get(allocation);
             if (views == null) {
@@ -3392,6 +3464,7 @@ public final class Pointer {
                 views.put(byteOffset, state);
             }
         }
+        MEMORY_VIEW_EPOCH.incrementAndGet();
         registerMemoryViewOrigin(state.value);
         bindDecodedMemoryView(state.value);
     }
@@ -4131,12 +4204,15 @@ public final class Pointer {
                 origin = originStripe.get(value);
             }
         }
+        MemoryViewState activeView = origin == null
+                ? null
+                : activeMemoryViewState(value, origin);
         if (origin != null
                 && origin.viewSize == size
-                && activeMemoryViewMatches(value, origin)) {
+                && activeView != null) {
             Object allocation = origin.allocation.get();
             if (allocation != null) {
-                return new Pointer(
+                Pointer pointer = new Pointer(
                                 allocation,
                                 origin.allocationElementSize,
                                 origin.byteOffset,
@@ -4145,6 +4221,8 @@ public final class Pointer {
                                 codecClassName,
                                 -1)
                         .withMetadata(origin.metadata);
+                pointer.setBoundMemoryViewState(activeView);
+                return pointer;
             }
         }
         if (size == 0) {
@@ -8128,9 +8206,14 @@ public final class Pointer {
     }
 
     private static boolean activeMemoryViewMatches(Object value, MemoryViewOrigin origin) {
+        return activeMemoryViewState(value, origin) != null;
+    }
+
+    private static MemoryViewState activeMemoryViewState(
+            Object value, MemoryViewOrigin origin) {
         Object allocation = origin.allocation.get();
         if (allocation == null) {
-            return false;
+            return null;
         }
         MemoryViewState active;
         Map<Object, LongRangeMap<MemoryViewState>> stripe =
@@ -8139,11 +8222,11 @@ public final class Pointer {
             LongRangeMap<MemoryViewState> views = stripe.get(allocation);
             active = views == null ? null : views.get(origin.byteOffset);
             if (active == null || active.size != origin.viewSize) {
-                return false;
+                return null;
             }
         }
         if (active.value == value) {
-            return true;
+            return active;
         }
         Pointer pointer = new Pointer(
                 allocation,
@@ -8153,7 +8236,9 @@ public final class Pointer {
                 origin.allocationCodecClassName,
                 active.codecClassName,
                 -1);
-        return pointer.transparentManagedView(active.value.getClass()) == value;
+        return pointer.transparentManagedView(active.value.getClass()) == value
+                ? active
+                : null;
     }
 
     public void set(Object value) {
@@ -8241,9 +8326,51 @@ public final class Pointer {
     }
 
     public static void copy(Pointer source, Pointer destination, int byteCount) {
+        if (tryCopyPrimitiveArrayRange(
+                source, source.byteOffset, destination, destination.byteOffset, byteCount)) {
+            return;
+        }
         byte[] temporary = source.loadRange(byteCount);
         transferEncodedReferences(source.allocation, temporary);
         destination.storeRange(temporary);
+    }
+
+    private static boolean tryCopyPrimitiveArrayRange(
+            Pointer source,
+            long sourceByteOffset,
+            Pointer destination,
+            long destinationByteOffset,
+            int byteCount) {
+        if (byteCount < 0
+                || source.allocation == null
+                || destination.allocation == null
+                || !source.allocation.getClass().isArray()
+                || source.allocation.getClass() != destination.allocation.getClass()
+                || !source.allocation.getClass().getComponentType().isPrimitive()) {
+            return false;
+        }
+        int elementSize = inferredArrayElementSize(source.allocation);
+        if (elementSize <= 0
+                || source.allocationElementSize != elementSize
+                || destination.allocationElementSize != elementSize
+                || Math.floorMod(sourceByteOffset, elementSize) != 0
+                || Math.floorMod(destinationByteOffset, elementSize) != 0
+                || byteCount % elementSize != 0
+                || mayBeInIdentityFilter(ENCODED_POINTER_FILTER, source.allocation)
+                || mayBeInIdentityFilter(ENCODED_POINTER_FILTER, destination.allocation)
+                || mayBeInIdentityFilter(ENCODED_REFERENCE_FILTER, source.allocation)
+                || mayBeInIdentityFilter(ENCODED_REFERENCE_FILTER, destination.allocation)) {
+            return false;
+        }
+        source.flushMemoryViewsOverlapping(sourceByteOffset, byteCount);
+        destination.prepareMemoryWrite(destinationByteOffset, byteCount);
+        System.arraycopy(
+                source.allocation,
+                Math.toIntExact(sourceByteOffset / elementSize),
+                destination.allocation,
+                Math.toIntExact(destinationByteOffset / elementSize),
+                byteCount / elementSize);
+        return true;
     }
 
     public static void copy(Pointer source, Pointer destination, long byteCount) {
@@ -8253,6 +8380,84 @@ public final class Pointer {
     public static void copyElements(
             Pointer source, Pointer destination, long elementCount) {
         copy(source, destination, checkedElementByteCount(source, elementCount));
+    }
+
+    private static void copyRelativeBytes(
+            Pointer source,
+            long sourceElementOffset,
+            long sourceByteOffset,
+            Pointer destination,
+            long destinationElementOffset,
+            long destinationByteOffset,
+            int byteCount,
+            boolean nonOverlapping) {
+        long absoluteSourceByteOffset =
+                source.relativeByteOffset(sourceElementOffset, sourceByteOffset);
+        long absoluteDestinationByteOffset =
+                destination.relativeByteOffset(destinationElementOffset, destinationByteOffset);
+        if (nonOverlapping && source.allocation == destination.allocation) {
+            long sourceEnd = Math.addExact(absoluteSourceByteOffset, byteCount);
+            long destinationEnd = Math.addExact(absoluteDestinationByteOffset, byteCount);
+            if (absoluteSourceByteOffset < destinationEnd
+                    && absoluteDestinationByteOffset < sourceEnd) {
+                throw new IllegalArgumentException("copy_nonoverlapping regions overlap");
+            }
+        }
+        if (tryCopyPrimitiveArrayRange(
+                source,
+                absoluteSourceByteOffset,
+                destination,
+                absoluteDestinationByteOffset,
+                byteCount)) {
+            return;
+        }
+        Pointer materializedSource =
+                materializeRelative(source, sourceElementOffset, sourceByteOffset);
+        Pointer materializedDestination =
+                materializeRelative(destination, destinationElementOffset, destinationByteOffset);
+        if (nonOverlapping) {
+            copyNonOverlapping(materializedSource, materializedDestination, byteCount);
+        } else {
+            copy(materializedSource, materializedDestination, byteCount);
+        }
+    }
+
+    public static void copyRelative(
+            Pointer source,
+            long sourceElementOffset,
+            long sourceByteOffset,
+            Pointer destination,
+            long destinationElementOffset,
+            long destinationByteOffset,
+            long byteCount) {
+        copyRelativeBytes(
+                source,
+                sourceElementOffset,
+                sourceByteOffset,
+                destination,
+                destinationElementOffset,
+                destinationByteOffset,
+                checkedArrayLength(byteCount),
+                false);
+    }
+
+    public static void copyElementsRelative(
+            Pointer source,
+            long sourceElementOffset,
+            long sourceByteOffset,
+            Pointer destination,
+            long destinationElementOffset,
+            long destinationByteOffset,
+            long elementCount) {
+        copyRelativeBytes(
+                source,
+                sourceElementOffset,
+                sourceByteOffset,
+                destination,
+                destinationElementOffset,
+                destinationByteOffset,
+                checkedElementByteCount(source, elementCount),
+                false);
     }
 
     public static void copyNonOverlapping(Pointer source, Pointer destination, int byteCount) {
@@ -8275,6 +8480,44 @@ public final class Pointer {
             Pointer source, Pointer destination, long elementCount) {
         copyNonOverlapping(
                 source, destination, checkedElementByteCount(source, elementCount));
+    }
+
+    public static void copyNonOverlappingRelative(
+            Pointer source,
+            long sourceElementOffset,
+            long sourceByteOffset,
+            Pointer destination,
+            long destinationElementOffset,
+            long destinationByteOffset,
+            long byteCount) {
+        copyRelativeBytes(
+                source,
+                sourceElementOffset,
+                sourceByteOffset,
+                destination,
+                destinationElementOffset,
+                destinationByteOffset,
+                checkedArrayLength(byteCount),
+                true);
+    }
+
+    public static void copyNonOverlappingElementsRelative(
+            Pointer source,
+            long sourceElementOffset,
+            long sourceByteOffset,
+            Pointer destination,
+            long destinationElementOffset,
+            long destinationByteOffset,
+            long elementCount) {
+        copyRelativeBytes(
+                source,
+                sourceElementOffset,
+                sourceByteOffset,
+                destination,
+                destinationElementOffset,
+                destinationByteOffset,
+                checkedElementByteCount(source, elementCount),
+                true);
     }
 
     private static void swapBytes(Pointer left, Pointer right, int byteCount) {
