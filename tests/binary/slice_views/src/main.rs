@@ -185,6 +185,39 @@ fn check_disjoint_mut_empty_edges() {
         workers.push(std::thread::spawn(|| {
             for _ in 0..2_000 {
                 let mut values = vec![1, 2, 3, 4, 5];
+                assert_eq!(
+                    values.get_disjoint_mut([0..0, 0..5, 5..5]),
+                    Ok([&mut [][..], &mut [1, 2, 3, 4, 5], &mut []]),
+                );
+                assert_eq!(
+                    values.get_disjoint_mut([
+                        0..0,
+                        0..1,
+                        1..1,
+                        1..2,
+                        2..2,
+                        2..3,
+                        3..3,
+                        3..4,
+                        4..4,
+                        4..5,
+                        5..5,
+                    ]),
+                    Ok([
+                        &mut [][..],
+                        &mut [1],
+                        &mut [],
+                        &mut [2],
+                        &mut [],
+                        &mut [3],
+                        &mut [],
+                        &mut [4],
+                        &mut [],
+                        &mut [5],
+                        &mut [],
+                    ]),
+                );
+
                 let [empty_start, whole, empty_end] =
                     values.get_disjoint_mut([0..0, 0..5, 5..5]).unwrap();
                 assert!(empty_start.is_empty());

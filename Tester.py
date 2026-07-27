@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -95,7 +96,101 @@ def java_process_inputs(test: TestCase) -> tuple[list[str], str | None]:
     return arguments, stdin
 
 
-def run_java(test: TestCase, jar: Path, release: bool, logs: list[str]) -> bool:
+def jvm_timeout_diagnostics(pid: int) -> str:
+    def decoded(value: str | bytes | None) -> str:
+        if value is None:
+            return ""
+        return value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value
+
+    sections: list[str] = []
+    for command in (["Thread.print", "-l"], ["VM.command_line"], ["GC.heap_info"]):
+        label = " ".join(command)
+        try:
+            result = subprocess.run(
+                ["jcmd", str(pid), *command],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=15,
+            )
+            sections.append(f"===== jcmd {label} =====\n{result.stdout}")
+        except FileNotFoundError:
+            sections.append("jcmd is unavailable; no JVM diagnostic could be captured.")
+            break
+        except subprocess.TimeoutExpired as error:
+            partial = decoded(error.stdout)
+            sections.append(f"===== jcmd {label} timed out =====\n{partial}")
+        except OSError as error:
+            sections.append(f"===== jcmd {label} failed =====\n{error}")
+    return "\n".join(sections)
+
+
+def terminate_process_tree(process: subprocess.Popen[bytes]) -> None:
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    else:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+
+
+def run_java_command(
+    command: list[str],
+    *,
+    timeout: float,
+    cwd: Path | None = None,
+    input_text: str | None = None,
+) -> tuple[subprocess.CompletedProcess[str], str | None]:
+    process = subprocess.Popen(
+        command,
+        cwd=cwd or Path(__file__).resolve().parent,
+        stdin=subprocess.PIPE if input_text is not None else None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = process.communicate(
+            None if input_text is None else input_text.encode("utf-8"),
+            timeout=timeout,
+        )
+        diagnostics = None
+    except subprocess.TimeoutExpired:
+        diagnostics = jvm_timeout_diagnostics(process.pid)
+        terminate_process_tree(process)
+        try:
+            stdout, stderr = process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            stdout, stderr = process.communicate()
+        returncode = 124
+    else:
+        returncode = process.returncode
+    return (
+        subprocess.CompletedProcess(
+            command,
+            returncode,
+            stdout.decode("utf-8", errors="replace"),
+            stderr.decode("utf-8", errors="replace"),
+        ),
+        diagnostics,
+    )
+
+
+def run_java(
+    test: TestCase,
+    jar: Path,
+    release: bool,
+    logs: list[str],
+    java_timeout: float,
+) -> bool:
     try:
         java_arguments, stdin = java_process_inputs(test)
     except (json.JSONDecodeError, ValueError) as error:
@@ -104,7 +199,7 @@ def run_java(test: TestCase, jar: Path, release: bool, logs: list[str]) -> bool:
 
     if test.kind != "integration":
         logs.append("|--- 🤖 Running with Java...")
-        proc = run_command(
+        proc, diagnostics = run_java_command(
             [
                 "java",
                 "-cp",
@@ -112,8 +207,20 @@ def run_java(test: TestCase, jar: Path, release: bool, logs: list[str]) -> bool:
                 f"{test.artifact_name}.{test.artifact_name}",
                 *java_arguments,
             ],
+            timeout=java_timeout,
             input_text=stdin,
         )
+        if diagnostics is not None:
+            output = (
+                f"Java process exceeded the {java_timeout:g}s timeout.\n\n"
+                f"{diagnostics}\n\nSTDOUT:\n{proc.stdout}\n\nSTDERR:\n{proc.stderr}"
+            )
+            (test.directory / "java-timeout.generated").write_text(
+                output, encoding="utf-8"
+            )
+            logs.append(f"|---- ❌ Java process timed out after {java_timeout:g}s")
+            ci_diagnostic(logs, output)
+            return False
         return check_results(proc, test, release, logs)
 
     java_files = sorted(path.name for path in test.directory.glob("*.java"))
@@ -134,11 +241,23 @@ def run_java(test: TestCase, jar: Path, release: bool, logs: list[str]) -> bool:
         return False
 
     logs.append("|--- 🤖 Running with Java...")
-    proc = run_command(
+    proc, diagnostics = run_java_command(
         ["java", "-cp", classpath, "Main", *java_arguments],
+        timeout=java_timeout,
         cwd=test.directory,
         input_text=stdin,
     )
+    if diagnostics is not None:
+        output = (
+            f"Java process exceeded the {java_timeout:g}s timeout.\n\n"
+            f"{diagnostics}\n\nSTDOUT:\n{proc.stdout}\n\nSTDERR:\n{proc.stderr}"
+        )
+        (test.directory / "java-timeout.generated").write_text(
+            output, encoding="utf-8"
+        )
+        logs.append(f"|---- ❌ Java process timed out after {java_timeout:g}s")
+        ci_diagnostic(logs, output)
+        return False
     return check_results(proc, test, release, logs)
 
 
@@ -244,7 +363,12 @@ def check_javap_debug_info(
     return False
 
 
-def run_test(test: TestCase, release: bool, build_jobs: int) -> tuple[bool, list[str]]:
+def run_test(
+    test: TestCase,
+    release: bool,
+    build_jobs: int,
+    java_timeout: float,
+) -> tuple[bool, list[str]]:
     logs = [f"|-- Test '{test.name}' ({test.kind})"]
     proc = build_test(test, release, build_jobs)
     if proc.returncode != 0:
@@ -263,7 +387,7 @@ def run_test(test: TestCase, release: bool, build_jobs: int) -> tuple[bool, list
     if not jar.exists():
         logs.append(f"|---- ❌ JAR not found at expected target path: {jar}")
         return False, logs
-    if not run_java(test, jar, release, logs):
+    if not run_java(test, jar, release, logs, java_timeout):
         return False, logs
     if not check_javap_debug_info(test, jar, release, logs):
         return False, logs
@@ -283,9 +407,17 @@ def main() -> int:
     parser.add_argument("--only-run", help="Comma-separated test names to run")
     parser.add_argument("--dont-run", help="Comma-separated test names to exclude")
     parser.add_argument("-j", "--jobs", type=int, help="Maximum concurrent test builds")
+    parser.add_argument(
+        "--java-timeout",
+        type=float,
+        default=180,
+        help="Seconds allowed for each Java self-test process (default: 180)",
+    )
     args = parser.parse_args()
 
     try:
+        if args.java_timeout <= 0:
+            raise ValueError("--java-timeout must be greater than zero")
         workers = resolve_workers(args.jobs)
         validate_configuration()
         cache_invalidated = prepare_shared_cache()
@@ -302,6 +434,7 @@ def main() -> int:
     print("🧪 rustc_codegen_jvm test suite")
     print(f"|- Target: {mode} jvm-unknown-unknown with real std")
     print(f"|- Parallelism: {workers} test worker(s), {per_build_jobs} Cargo job(s) each")
+    print(f"|- Java process timeout: {args.java_timeout:g}s")
     if cache_invalidated:
         print("|- Compiler inputs changed; reset the shared test cache")
     print("|- Building the shared standard-library cache once...")
@@ -317,7 +450,14 @@ def main() -> int:
     success = True
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {
-            executor.submit(run_test, test, args.release, per_build_jobs): test for test in tests
+            executor.submit(
+                run_test,
+                test,
+                args.release,
+                per_build_jobs,
+                args.java_timeout,
+            ): test
+            for test in tests
         }
         for future in as_completed(futures):
             passed, logs = future.result()

@@ -2293,12 +2293,12 @@ public final class Pointer {
             int elementSize = slicePointerElementSize(descriptor);
             String elementCodec = descriptor[2].isEmpty() ? null : descriptor[2];
             Pointer data = fromSlice(value, elementSize, elementCodec);
-            dataAddress = encodedAddress(data, image, 0, wordSize, codec);
             try {
                 pointerMetadata = sliceLogicalLength(value);
             } catch (ReflectiveOperationException error) {
                 throw new IllegalArgumentException("invalid Rust slice fat pointer", error);
             }
+            dataAddress = encodedAddress(data, image, 0, wordSize, codec);
         } else if (codec.startsWith(STRUCT_TAIL_POINTER_VIEW_CODEC_PREFIX)) {
             if (!(value instanceof Pointer)) {
                 throw new IllegalArgumentException(
@@ -3122,14 +3122,7 @@ public final class Pointer {
             }
         }
 
-        flushMemoryViewsOverlapping(byteOffset, materializedSize);
-        byte[] image = new byte[materializedSize];
-        for (int index = 0; index < materializedSize; index++) {
-            image[index] = (byte) loadByte(byteOffset + index);
-        }
-        transferEncodedPointers(
-                allocation, byteOffset, image, 0, materializedSize, false);
-        transferEncodedReferences(allocation, image);
+        byte[] image = loadRange(materializedSize);
         Object decoded = decodeAggregate(viewCodecClassName, image);
         attachDecodedTraitTail(decoded);
         Object transparent = transparentManagedView(decoded.getClass());
@@ -7428,12 +7421,12 @@ public final class Pointer {
         return ATOMIC_STRIPES[atomicStripeIndex(pointer)];
     }
 
-    /** Shared monitor used by JVM futex wait/wake and Rust atomic operations. */
-    static Object atomicMonitor(Pointer pointer) {
+    /** Stable address key used by the JVM futex wait queues. */
+    static long atomicAddress(Pointer pointer) {
         if (pointer == null) {
             throw new NullPointerException("a futex address cannot be null");
         }
-        return atomicStripe(pointer);
+        return pointer.numericAddress();
     }
 
     private static int atomicStripeIndex(Pointer pointer) {
@@ -7889,14 +7882,12 @@ public final class Pointer {
         }
         if (isFatPointerCodec(viewCodecClassName) && !isDirectAllocationView()) {
             int materializedSize = materializedViewSize();
-            byte[] image = new byte[materializedSize];
-            for (int index = 0; index < materializedSize; index++) {
-                image[index] = (byte) loadByte(byteOffset + index);
+            byte[] image = loadRange(materializedSize);
+            try {
+                return decodeFatPointer(image, 0, materializedSize, viewCodecClassName);
+            } finally {
+                discardEncodedReferences(image);
             }
-            transferEncodedPointers(
-                    allocation, byteOffset, image, 0, materializedSize, false);
-            transferEncodedReferences(allocation, image);
-            return decodeFatPointer(image, 0, materializedSize, viewCodecClassName);
         }
         if (isStructuralViewCodec(viewCodecClassName)) {
             return structuralViewObject();

@@ -773,6 +773,38 @@ fn runtime_casts() {
     );
 }
 
+fn runtime_i64_isqrt_extended() {
+    let check = |n: i64, expected: i64| {
+        let n = opaque_i64(n);
+        assert!(n.isqrt() == expected);
+        assert!(n.checked_isqrt() == Some(expected));
+    };
+
+    let mut n = 0_i64;
+    for sqrt_n in 0..1_024_i64 {
+        check(n, sqrt_n);
+        n += sqrt_n;
+        check(n, sqrt_n);
+        n += sqrt_n;
+        check(n, sqrt_n);
+        n += 1;
+    }
+
+    let maximum_sqrt = i64::MAX.isqrt();
+    let mut n = maximum_sqrt * maximum_sqrt;
+    for sqrt_n in (maximum_sqrt - 1_024..maximum_sqrt).rev() {
+        check(n, sqrt_n + 1);
+        n -= 1;
+        check(n, sqrt_n);
+        n -= sqrt_n;
+        check(n, sqrt_n);
+        n -= sqrt_n;
+    }
+
+    assert!(opaque_i64(-1).checked_isqrt().is_none());
+    assert!(opaque_i64(i64::MIN).checked_isqrt().is_none());
+}
+
 fn runtime_pointer_width() {
     type Huge = [u8; 0x8000_0000];
     const HIGH_ADDRESS: usize = 0x1_0000_0000;
@@ -1054,6 +1086,7 @@ fn main() {
     runtime_float_ops();
     runtime_new_integer_intrinsics();
     runtime_casts();
+    runtime_i64_isqrt_extended();
     runtime_pointer_width();
     forwarded_reference_ops();
     copied_arrays_are_independent();

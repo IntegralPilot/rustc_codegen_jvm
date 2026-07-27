@@ -40,6 +40,7 @@ fn main() {
     hash_maps_across_threads();
     concurrent_spawn_hook_lifetimes();
     concurrent_stdout_locking();
+    concurrent_caught_panics();
 }
 
 fn random_state_thread_local_cleanup() {
@@ -166,6 +167,34 @@ fn concurrent_stdout_locking() {
     }
     for worker in workers {
         worker.join().unwrap();
+    }
+}
+
+fn concurrent_caught_panics() {
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let workers = (0..4)
+        .map(|worker| {
+            thread::spawn(move || {
+                for offset in 0..64 {
+                    let positive = (worker * 64 + offset + 1) as i64;
+                    assert!(positive.checked_isqrt() == Some(positive.isqrt()));
+                    assert!((-positive).checked_isqrt().is_none());
+                    assert!(
+                        std::panic::catch_unwind(|| (-positive).isqrt()).is_err(),
+                        "negative i64 isqrt must unwind on every worker"
+                    );
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    let results = workers
+        .into_iter()
+        .map(|worker| worker.join())
+        .collect::<Vec<_>>();
+    std::panic::set_hook(previous_hook);
+    for result in results {
+        result.unwrap();
     }
 }
 

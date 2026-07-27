@@ -25,9 +25,17 @@ public final class ThreadSupport {
             new ConcurrentHashMap<>();
     private static final ConcurrentHashMap<Long, Object> TLS_DESTRUCTORS =
             new ConcurrentHashMap<>();
+    // A striped monitor can notify a waiter for a different Rust address and
+    // permanently miss the intended wake, so contended futexes need exact keys.
+    private static final ConcurrentHashMap<Long, FutexQueue> FUTEX_QUEUES =
+            new ConcurrentHashMap<>();
     private static final ThreadLocal<Map<Long, Pointer>> TLS =
             ThreadLocal.withInitial(HashMap::new);
     private static volatile MethodHandle rustThreadStart;
+
+    private static final class FutexQueue {
+        private int references;
+    }
 
     private static final class ThreadRecord {
         private Thread thread;
@@ -196,67 +204,68 @@ public final class ThreadSupport {
 
     /** Returns true unless the wait reached its timeout. */
     public static boolean futexWait(Pointer address, int expected, long timeoutNanos) {
-        Object monitor = Pointer.atomicMonitor(address);
+        long key = Pointer.atomicAddress(address);
+        FutexQueue monitor = retainFutexQueue(key);
         boolean interrupted = false;
-        synchronized (monitor) {
-            if ((int) Pointer.atomicLoad(address, 4, 0) != expected) {
-                return true;
-            }
-            if (timeoutNanos == 0) {
-                return false;
-            }
-            long remaining = timeoutNanos;
-            for (;;) {
-                long started = System.nanoTime();
-                try {
-                    if (timeoutNanos < 0) {
-                        monitor.wait();
-                        if (interrupted) {
-                            Thread.currentThread().interrupt();
+        try {
+            synchronized (monitor) {
+                if ((int) Pointer.atomicLoad(address, 4, 0) != expected) {
+                    return true;
+                }
+                if (timeoutNanos == 0) {
+                    return false;
+                }
+                long remaining = timeoutNanos;
+                for (;;) {
+                    long started = System.nanoTime();
+                    try {
+                        if (timeoutNanos < 0) {
+                            monitor.wait();
+                            if (interrupted) {
+                                Thread.currentThread().interrupt();
+                            }
+                            return true;
                         }
-                        return true;
-                    }
-                    if (remaining <= 0) {
-                        if (interrupted) {
-                            Thread.currentThread().interrupt();
+                        if (remaining <= 0) {
+                            if (interrupted) {
+                                Thread.currentThread().interrupt();
+                            }
+                            return false;
                         }
-                        return false;
-                    }
-                    monitor.wait(remaining / 1_000_000, (int) (remaining % 1_000_000));
-                    long elapsed = Math.max(0, System.nanoTime() - started);
-                    remaining = Math.max(0, remaining - elapsed);
-                    // wait() can return early with no real notify (a spurious
-                    // wakeup, and Windows JVMs in particular are prone to this
-                    // due to coarser timer/scheduling granularity than Linux).
-                    // Only report "woken" if the watched value actually
-                    // changed; otherwise keep waiting out the remaining
-                    // budget, and only report a genuine timeout once that
-                    // budget is exhausted.
-                    if ((int) Pointer.atomicLoad(address, 4, 0) != expected) {
-                        if (interrupted) {
-                            Thread.currentThread().interrupt();
+                        monitor.wait(remaining / 1_000_000, (int) (remaining % 1_000_000));
+                        long elapsed = Math.max(0, System.nanoTime() - started);
+                        remaining = Math.max(0, remaining - elapsed);
+                        // Timed Object.wait may wake spuriously. Only report
+                        // success after the watched Rust value changes.
+                        if ((int) Pointer.atomicLoad(address, 4, 0) != expected) {
+                            if (interrupted) {
+                                Thread.currentThread().interrupt();
+                            }
+                            return true;
                         }
-                        return true;
-                    }
-                    if (remaining <= 0) {
-                        if (interrupted) {
-                            Thread.currentThread().interrupt();
+                        if (remaining <= 0) {
+                            if (interrupted) {
+                                Thread.currentThread().interrupt();
+                            }
+                            return false;
                         }
-                        return false;
+                    } catch (InterruptedException error) {
+                        interrupted = true;
+                        long elapsed = Math.max(0, System.nanoTime() - started);
+                        remaining = Math.max(0, remaining - elapsed);
                     }
-                    // Value unchanged and time remains: loop and wait again.
-                    continue;
-                } catch (InterruptedException error) {
-                    interrupted = true;
-                    long elapsed = Math.max(0, System.nanoTime() - started);
-                    remaining = Math.max(0, remaining - elapsed);
                 }
             }
+        } finally {
+            releaseFutexQueue(key, monitor);
         }
     }
 
     public static boolean futexWake(Pointer address) {
-        Object monitor = Pointer.atomicMonitor(address);
+        FutexQueue monitor = FUTEX_QUEUES.get(Pointer.atomicAddress(address));
+        if (monitor == null) {
+            return false;
+        }
         synchronized (monitor) {
             monitor.notify();
         }
@@ -265,10 +274,31 @@ public final class ThreadSupport {
     }
 
     public static void futexWakeAll(Pointer address) {
-        Object monitor = Pointer.atomicMonitor(address);
+        FutexQueue monitor = FUTEX_QUEUES.get(Pointer.atomicAddress(address));
+        if (monitor == null) {
+            return;
+        }
         synchronized (monitor) {
             monitor.notifyAll();
         }
+    }
+
+    private static FutexQueue retainFutexQueue(long key) {
+        return FUTEX_QUEUES.compute(key, (ignored, current) -> {
+            FutexQueue queue = current == null ? new FutexQueue() : current;
+            queue.references++;
+            return queue;
+        });
+    }
+
+    private static void releaseFutexQueue(long key, FutexQueue queue) {
+        FUTEX_QUEUES.computeIfPresent(key, (ignored, current) -> {
+            if (current != queue) {
+                return current;
+            }
+            queue.references--;
+            return queue.references == 0 ? null : queue;
+        });
     }
 
     public static Pointer tlsGet(long key) {
