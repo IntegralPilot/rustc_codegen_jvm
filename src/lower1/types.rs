@@ -5482,7 +5482,26 @@ fn fat_pointer_codec_operand<'tcx>(
             .to_string();
         format!("{TRAIT_POINTER_VIEW_CODEC_PREFIX}{interface}")
     } else {
+        if !matches!(pointee.kind(), TyKind::Adt(..)) {
+            return None;
+        }
         let tail = tcx.struct_tail_for_codegen(pointee, TypingEnv::fully_monomorphized());
+        let target_class = ty_to_oomir_type(pointee, tcx, data_types, instance_context)
+            .get_class_name()?
+            .to_string();
+        let prefix_size = layout_size_bytes(tcx, pointee).ok()?;
+        if matches!(tail.kind(), TyKind::Dynamic(..)) {
+            let interface = ty_to_oomir_type(tail, tcx, data_types, instance_context)
+                .get_class_name()?
+                .to_string();
+            let prefix_codec =
+                ensure_pointer_memory_codec(pointee, tcx, data_types, instance_context)
+                    .ok()??
+                    .class_name;
+            return Some(oomir::Operand::Constant(oomir::Constant::String(format!(
+                "{STRUCT_TAIL_POINTER_VIEW_CODEC_PREFIX}{target_class}\n{prefix_size}\n@trait:{interface}\n0\n{prefix_codec}"
+            ))));
+        }
         let (carrier_class, element) = if tail.is_slice() {
             (oomir::SLICE_VIEW_CLASS, tail.sequence_element_type(tcx))
         } else if tail.is_str() {
@@ -5490,10 +5509,6 @@ fn fat_pointer_codec_operand<'tcx>(
         } else {
             return None;
         };
-        let target_class = ty_to_oomir_type(pointee, tcx, data_types, instance_context)
-            .get_class_name()?
-            .to_string();
-        let prefix_size = layout_size_bytes(tcx, pointee).ok()?;
         let element_size = layout_size_bytes(tcx, element).ok()?;
         let element_codec = pointer_view_codec_operand(element, tcx, data_types, instance_context);
         let element_codec = match element_codec {

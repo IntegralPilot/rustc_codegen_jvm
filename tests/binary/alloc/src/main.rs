@@ -1270,6 +1270,69 @@ fn test_sort_and_dedup_custom() {
     for pair in wide.windows(2) {
         assert!(pair[0] < pair[1]);
     }
+
+    trait SortValue {
+        fn value(&self) -> i32;
+    }
+
+    struct Small(i32);
+    struct Wide(i32, u64);
+
+    impl SortValue for Small {
+        fn value(&self) -> i32 {
+            self.0
+        }
+    }
+
+    impl SortValue for Wide {
+        fn value(&self) -> i32 {
+            self.0 + (self.1 == u64::MAX) as i32
+        }
+    }
+
+    impl PartialEq for dyn SortValue {
+        fn eq(&self, other: &Self) -> bool {
+            self.value() == other.value()
+        }
+    }
+
+    impl Eq for dyn SortValue {}
+
+    impl PartialOrd for dyn SortValue {
+        fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+
+    impl Ord for dyn SortValue {
+        fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+            self.value().cmp(&other.value())
+        }
+    }
+
+    let mut dynamic: Vec<Rc<dyn SortValue>> = Vec::new();
+    for value in (0..64).rev() {
+        if value % 2 == 0 {
+            dynamic.push(Rc::new(Small(value)));
+        } else {
+            dynamic.push(Rc::new(Wide(value, 0)));
+        }
+    }
+    let mut unstable = dynamic.clone();
+    dynamic.sort();
+    unstable.sort_unstable();
+    assert!(dynamic.iter().map(|value| value.value()).eq(0..64));
+    assert!(unstable.iter().map(|value| value.value()).eq(0..64));
+
+    let bytes = [
+        0x0102_0304_i32.to_le_bytes(),
+        0x0506_0708_i32.to_le_bytes(),
+    ]
+    .concat();
+    assert_eq!(
+        u64::from_le_bytes(bytes.try_into().unwrap()),
+        0x0506_0708_0102_0304
+    );
 }
 
 fn test_overaligned_allocations() {

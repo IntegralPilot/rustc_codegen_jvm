@@ -17,7 +17,7 @@ use rustc_middle::{
         Operand as MirOperand, Place, SourceInfo, StatementKind, TerminatorKind, UnwindAction,
         visit::{PlaceContext, Visitor},
     },
-    ty::{EarlyBinder, Instance, InstanceKind, ShimKind, Ty, TyCtxt, TyKind, TypingEnv},
+    ty::{EarlyBinder, Instance, InstanceKind, ShimKind, Ty, TyCtxt, TyKind, TypingEnv, VtblEntry},
 };
 use rustc_span::{Symbol, sym};
 
@@ -2565,10 +2565,11 @@ pub(super) fn convert_basic_block<'tcx>(
                                     dest: effective_dest,
                                     operand: interface_receiver,
                                 });
-                            } else if let rustc_middle::ty::TyKind::Dynamic(preds, ..) =
-                                receiver_mir_ty.kind()
+                            } else if matches!(func_instance.def, InstanceKind::Virtual(..))
+                                && let rustc_middle::ty::TyKind::Dynamic(predicates, ..) =
+                                    receiver_mir_ty.kind()
                             {
-                                let principal = preds.principal().unwrap().skip_binder();
+                                let principal = predicates.principal().unwrap().skip_binder();
                                 let interface_name = match receiver_operand.get_type() {
                                     Some(oomir::Type::Interface(interface_name)) => interface_name,
                                     _ => jvm_names::class_for_def_id(tcx, principal.def_id),
@@ -2661,6 +2662,30 @@ pub(super) fn convert_basic_block<'tcx>(
                                 {
                                     receiver_value_mir_ty = *pointee;
                                 }
+                                let trait_object_method_requires_static_dispatch =
+                                    if let TyKind::Dynamic(predicates, _) =
+                                        receiver_value_mir_ty.kind()
+                                        && let Some(principal) = predicates.principal()
+                                        && item.trait_container(tcx).is_some()
+                                    {
+                                        let trait_ref = tcx.instantiate_bound_regions_with_erased(
+                                            principal.with_self_ty(tcx, receiver_value_mir_ty),
+                                        );
+                                        !tcx.vtable_entries(trait_ref).iter().any(|entry| {
+                                            let VtblEntry::Method(method) = entry else {
+                                                return false;
+                                            };
+                                            method.def_id() == item.def_id
+                                                || tcx
+                                                    .opt_associated_item(method.def_id())
+                                                    .and_then(|method_item| {
+                                                        method_item.trait_item_def_id()
+                                                    })
+                                                    == Some(item.def_id)
+                                        })
+                                    } else {
+                                        false
+                                    };
                                 let has_enum_reference_receiver = matches!(
                                     resolved_receiver_mir_ty.kind(),
                                     TyKind::Ref(_, pointee, _)
@@ -2681,6 +2706,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                         || has_enum_reference_receiver
                                         || has_arbitrary_self_receiver
                                         || trait_impl_self_requires_static_dispatch
+                                        || trait_object_method_requires_static_dispatch
                                         || method_requires_sized_self
                                         || matches!(
                                             receiver_value_mir_ty.kind(),

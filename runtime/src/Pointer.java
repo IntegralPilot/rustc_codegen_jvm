@@ -224,6 +224,7 @@ public final class Pointer {
     private static final String SLICE_POINTER_VIEW_CODEC_PREFIX = "@slice-pointer\n";
     private static final String STRUCT_TAIL_POINTER_VIEW_CODEC_PREFIX =
             "@struct-tail-pointer\n";
+    private static final String STRUCT_TRAIT_TAIL_CARRIER_PREFIX = "@trait:";
     private static final String TRAIT_POINTER_VIEW_CODEC_PREFIX = "@trait-pointer\n";
     private static final String SIGNED_BIG_INTEGER_CODEC = "@signed-big-integer";
     private static final String UNSIGNED_BIG_INTEGER_CODEC = "@unsigned-big-integer";
@@ -2323,6 +2324,13 @@ public final class Pointer {
         }
     }
 
+    private static String structTailPointerTraitInterface(String[] descriptor) {
+        String carrier = descriptor[2];
+        return carrier.startsWith(STRUCT_TRAIT_TAIL_CARRIER_PREFIX)
+                ? carrier.substring(STRUCT_TRAIT_TAIL_CARRIER_PREFIX.length())
+                : null;
+    }
+
     private static byte[] encodeFatPointer(Object value, int size, String codec) {
         int wordSize = fatPointerWordSize(size);
         byte[] image = new byte[size];
@@ -2349,8 +2357,12 @@ public final class Pointer {
                         "Rust struct-tail pointer requires a Pointer carrier");
             }
             Pointer pointer = (Pointer) value;
+            String[] descriptor = structTailPointerDescriptor(codec);
             dataAddress = encodedAddress(pointer, image, 0, wordSize, codec);
-            pointerMetadata = pointer.metadata();
+            String traitInterface = structTailPointerTraitInterface(descriptor);
+            pointerMetadata = traitInterface == null
+                    ? pointer.metadata()
+                    : traitMetadataMarker(pointer, traitInterface).address();
         } else {
             if (!(value instanceof Pointer)) {
                 throw new IllegalArgumentException(
@@ -2404,7 +2416,39 @@ public final class Pointer {
             if (data == null) {
                 data = typedPointerObjectFromAddress(dataAddress, codec);
             }
-            data = data.retype(elementSize, elementCodec);
+            String traitInterface = structTailPointerTraitInterface(descriptor);
+            if (traitInterface == null) {
+                data = data.retype(elementSize, elementCodec);
+            } else {
+                Pointer marker = pointerObjectFromAddress(pointerMetadata);
+                TraitMetadataInfo info = TRAIT_METADATA_INFO.get(marker.numericAddress());
+                data.traitMetadataMarker = marker;
+                if (info != null) {
+                    data.traitPointeeSize = info.size;
+                    data.traitPointeeAlignment = info.alignment;
+                    data.traitAdapterClassName = info.adapterClassName;
+                    data.traitPointeeCodecClassName = info.pointeeCodecClassName;
+                    if (data.traitMetadataCarrier == null && info.adapterClassName != null) {
+                        try {
+                            Pointer tailData = data.byteOffsetRetype(
+                                    structTailPointerPrefixSize(descriptor),
+                                    info.size,
+                                    info.pointeeCodecClassName);
+                            Class<?> adapter = resolvedRuntimeClass(info.adapterClassName);
+                            data.traitMetadataCarrier =
+                                    constructorWithArity(adapter, 1).newInstance(tailData);
+                        } catch (ReflectiveOperationException error) {
+                            throw new IllegalStateException(
+                                    "could not reconstruct Rust trait-object tail", error);
+                        }
+                    }
+                } else {
+                    data.traitPointeeSize = marker.traitPointeeSize;
+                    data.traitPointeeAlignment = marker.traitPointeeAlignment;
+                    data.traitAdapterClassName = marker.traitAdapterClassName;
+                    data.traitPointeeCodecClassName = marker.traitPointeeCodecClassName;
+                }
+            }
             return data.retype(
                             structTailPointerPrefixSize(descriptor),
                             STRUCT_TAIL_VIEW_CODEC_PREFIX
@@ -3608,7 +3652,23 @@ public final class Pointer {
     }
 
     private Object structTailSourceObject(String[] descriptor) {
+        String traitInterface = structTailPointerTraitInterface(descriptor);
         Object managed = managedViewObject();
+        if (traitInterface != null) {
+            try {
+                Class<?> targetClass = resolvedRuntimeClass(descriptor[0]);
+                Object prefix = managed;
+                if (prefix == null || isSliceViewCarrierType(prefix.getClass())) {
+                    long prefixSize = structTailPointerPrefixSize(descriptor);
+                    String prefixCodec = descriptor[4].isEmpty() ? null : descriptor[4];
+                    prefix = retype(prefixSize, prefixCodec).getObject();
+                }
+                return constructStructuralView(prefix, targetClass, traitMetadataCarrier);
+            } catch (ClassNotFoundException error) {
+                throw new IllegalStateException(
+                        "could not load Rust trait-tailed view " + descriptor[0], error);
+            }
+        }
         if (managed != null && !isSliceViewCarrierType(managed.getClass())) {
             try {
                 Class<?> targetClass = resolvedClass(descriptor[0], managed.getClass().getClassLoader());
@@ -3817,6 +3877,7 @@ public final class Pointer {
         private final long traitPointeeSize;
         private final long traitPointeeAlignment;
         private final String traitAdapterClassName;
+        private final String traitPointeeCodecClassName;
         private final Pointer addressOrigin;
         private final long addressOriginOffset;
 
@@ -3837,6 +3898,7 @@ public final class Pointer {
                 long traitPointeeSize,
                 long traitPointeeAlignment,
                 String traitAdapterClassName,
+                String traitPointeeCodecClassName,
                 Pointer addressOrigin,
                 long addressOriginOffset) {
             this.allocation = allocation;
@@ -3855,6 +3917,7 @@ public final class Pointer {
             this.traitPointeeSize = traitPointeeSize;
             this.traitPointeeAlignment = traitPointeeAlignment;
             this.traitAdapterClassName = traitAdapterClassName;
+            this.traitPointeeCodecClassName = traitPointeeCodecClassName;
             this.addressOrigin = addressOrigin;
             this.addressOriginOffset = addressOriginOffset;
         }
@@ -3879,6 +3942,8 @@ public final class Pointer {
                     && traitPointeeAlignment == pointer.traitPointeeAlignment
                     && java.util.Objects.equals(
                             traitAdapterClassName, pointer.traitAdapterClassName)
+                    && java.util.Objects.equals(
+                            traitPointeeCodecClassName, pointer.traitPointeeCodecClassName)
                     && addressOrigin == pointer.addressOrigin()
                     && addressOriginOffset == pointer.addressOriginOffset();
         }
@@ -5126,6 +5191,7 @@ public final class Pointer {
                 pointer.traitPointeeSize = target.traitPointeeSize;
                 pointer.traitPointeeAlignment = target.traitPointeeAlignment;
                 pointer.traitAdapterClassName = target.traitAdapterClassName;
+                pointer.traitPointeeCodecClassName = target.traitPointeeCodecClassName;
                 pointer.setAddressOrigin(target.addressOrigin, target.addressOriginOffset);
                 return pointer;
             }
@@ -5298,6 +5364,7 @@ public final class Pointer {
         pointer.traitPointeeSize = target.traitPointeeSize;
         pointer.traitPointeeAlignment = target.traitPointeeAlignment;
         pointer.traitAdapterClassName = target.traitAdapterClassName;
+        pointer.traitPointeeCodecClassName = target.traitPointeeCodecClassName;
         if (target.addressOrigin != null) {
             pointer.setAddressOrigin(target.addressOrigin, target.addressOriginOffset);
         }
@@ -6755,6 +6822,7 @@ public final class Pointer {
                 traitPointeeSize,
                 traitPointeeAlignment,
                 traitAdapterClassName,
+                traitPointeeCodecClassName,
                 addressOrigin(),
                 addressOriginOffset());
     }
@@ -6779,6 +6847,7 @@ public final class Pointer {
                 traitPointeeSize,
                 traitPointeeAlignment,
                 traitAdapterClassName,
+                traitPointeeCodecClassName,
                 addressOrigin(),
                 Math.addExact(addressOriginOffset(), displacement));
     }
@@ -7276,9 +7345,33 @@ public final class Pointer {
             int chunk = Math.min(byteCount - consumed, allocationElementSize - withinElement);
             Object value = readElement(elementIndex);
             byte[] image = null;
-            if (isFatPointerCodec(allocationCodecClassName)) {
+            boolean directNestedPrimitiveElement =
+                    nestedPrimitiveArrayElementByteSize(allocation) > allocationElementSize;
+            int directAggregateElementSize = isGeneratedAggregateCodec(allocationCodecClassName)
+                            && allocation.getClass().isArray()
+                            && allocation.getClass().getComponentType().isPrimitive()
+                    ? inferredArrayElementSize(allocation)
+                    : 0;
+            boolean directPrimitiveArray = allocation.getClass().isArray()
+                    && allocation.getClass().getComponentType().isPrimitive()
+                    && allocationElementSize == inferredArrayElementSize(allocation);
+            if (directNestedPrimitiveElement) {
+                long bits = valueBits(value, allocationElementSize);
+                for (int index = 0; index < chunk; index++) {
+                    result[consumed + index] =
+                            (byte) (bits >>> ((withinElement + index) * 8));
+                }
+            } else if (directAggregateElementSize > 0) {
+                for (int index = 0; index < chunk; index++) {
+                    result[consumed + index] = (byte) loadPrimitiveArrayByte(
+                            allocation,
+                            Math.toIntExact(absoluteOffset + index),
+                            directAggregateElementSize);
+                }
+            } else if (!directPrimitiveArray && isFatPointerCodec(allocationCodecClassName)) {
                 image = encodeFatPointer(value, allocationElementSize, allocationCodecClassName);
-            } else if (isGeneratedAggregateCodec(allocationCodecClassName)) {
+            } else if (!directPrimitiveArray
+                    && isGeneratedAggregateCodec(allocationCodecClassName)) {
                 image = encodeAggregate(allocationCodecClassName, value);
             }
             if (image != null) {
@@ -7292,7 +7385,8 @@ public final class Pointer {
                         image, withinElement, result, consumed, chunk, false);
                 transferEncodedReferences(image, result);
                 discardEncodedReferences(image);
-            } else {
+            } else if (directAggregateElementSize == 0
+                    && !directNestedPrimitiveElement) {
                 for (int index = 0; index < chunk; index++) {
                     result[consumed + index] = (byte) loadByte(absoluteOffset + index);
                 }
@@ -8749,10 +8843,14 @@ public final class Pointer {
                         "reference-array slice backing has an unaligned storage offset");
             }
             long elementOffset = storage.byteOffset / storage.allocationElementSize;
+            long retypedByteOffset =
+                    nestedPrimitiveArrayElementByteSize(storage.allocation) > 0
+                            ? storage.byteOffset
+                            : Math.multiplyExact(elementOffset, elementSize);
             return new Pointer(
                             storage.allocation,
                             checkedElementSize,
-                            Math.multiplyExact(elementOffset, elementSize),
+                            retypedByteOffset,
                             checkedElementSize,
                             allocationCodec,
                             elementCodecClassName,

@@ -5,63 +5,8 @@ from stdlib_test_harness import ROOT, SuiteConfig, run_suite
 
 
 DEFAULT_IGNORED_TESTS = {
-    "sort::tests::stable::correct_dyn_val_ascending": (
-        "sorting fat trait-object values currently aborts"
-    ),
-    "sort::tests::stable::correct_dyn_val_descending": (
-        "sorting fat trait-object values currently aborts"
-    ),
-    "sort::tests::stable::correct_dyn_val_random": (
-        "sorting fat trait-object values currently aborts"
-    ),
-    "sort::tests::stable::correct_dyn_val_random_d2": (
-        "sorting fat trait-object values currently aborts"
-    ),
-    "sort::tests::stable::correct_dyn_val_random_d20": (
-        "sorting fat trait-object values currently aborts"
-    ),
-    "sort::tests::stable::correct_dyn_val_random_s95": (
-        "sorting fat trait-object values currently aborts"
-    ),
-    "sort::tests::stable::correct_dyn_val_random_z1": (
-        "sorting fat trait-object values currently aborts"
-    ),
-    "sort::tests::stable::correct_dyn_val_saw_mixed": (
-        "sorting fat trait-object values currently aborts"
-    ),
-    "sort::tests::stable::stability_legacy": (
-        "the legacy stable-sort stability check currently fails"
-    ),
-    "sort::tests::unstable::correct_dyn_val_ascending": (
-        "sorting fat trait-object values currently aborts"
-    ),
-    "sort::tests::unstable::correct_dyn_val_descending": (
-        "sorting fat trait-object values currently aborts"
-    ),
-    "sort::tests::unstable::correct_dyn_val_random": (
-        "sorting fat trait-object values currently aborts"
-    ),
-    "sort::tests::unstable::correct_dyn_val_random_d2": (
-        "sorting fat trait-object values currently aborts"
-    ),
-    "sort::tests::unstable::correct_dyn_val_random_d20": (
-        "sorting fat trait-object values currently aborts"
-    ),
-    "sort::tests::unstable::correct_dyn_val_random_s95": (
-        "sorting fat trait-object values currently aborts"
-    ),
-    "sort::tests::unstable::correct_dyn_val_random_z1": (
-        "sorting fat trait-object values currently aborts"
-    ),
-    "sort::tests::unstable::correct_dyn_val_saw_mixed": (
-        "sorting fat trait-object values currently aborts"
-    ),
-    "str::strslice_issue_16589": (
-        "upstream marks this exhaustive substring test too slow for Miri"
-    ),
-    "str::test_strslice_contains": (
-        "upstream marks this substring permutation test too slow for Miri"
-    ),
+    "str::strslice_issue_16589": "prohibitively slow exhaustive substring stress test",
+    "str::test_strslice_contains": "prohibitively slow substring permutation stress test",
 }
 
 
