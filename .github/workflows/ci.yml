@@ -140,3 +140,66 @@ jobs:
           steps.coretests_release.outcome != 'success'
         )
       run: python -c "raise SystemExit('debug and release coretests must both pass completely')"
+
+  alloctests:
+    name: alloctests (Ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      PYTHONUTF8: '1'
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Rust (nightly)
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: nightly
+        components: rustc-dev rust-src llvm-tools cargo
+
+    - name: Set up Java
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: '25'
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.x'
+
+    - name: Cache Cargo dependencies
+      uses: Swatinem/rust-cache@v2
+
+    - name: Build backend and tools
+      run: python build.py ci
+
+    - name: Run alloctests (debug)
+      id: alloctests_debug
+      continue-on-error: true
+      run: python Alloctests.py --timeout 120 --build-timeout 1200
+
+    - name: Run alloctests (release)
+      id: alloctests_release
+      continue-on-error: true
+      run: python Alloctests.py --release --timeout 120 --build-timeout 1200
+
+    - name: Upload alloctests reports
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: alloctests
+        path: |
+          target/alloctests/reports/
+          target/alloctests/logs/
+        if-no-files-found: error
+
+    - name: Require 100% alloctests pass rate
+      if: >-
+        always() &&
+        (
+          steps.alloctests_debug.outcome != 'success' ||
+          steps.alloctests_release.outcome != 'success'
+        )
+      run: python -c "raise SystemExit('debug and release alloctests must both pass completely')"

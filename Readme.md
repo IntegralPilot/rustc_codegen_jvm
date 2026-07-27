@@ -13,7 +13,7 @@ This backend transparently compiles Rust constructs to Java classes and interfac
 
 By leveraging a ["virtual MMU" translation layer](runtime/src/Pointer.java), it supports [raw pointers with complex pointer arithmetic](tests/binary/raw_ptrs/src/main.rs), [transmute](tests/binary/transmute/src/main.rs), and [unions](tests/binary/raw_ptrs/src/main.rs). It also supports key parts of the Rust standard library, including [networking](tests/binary/network/src/main.rs), [async/await](tests/binary/async_await/src/main.rs), [threading](tests/binary/threads/src/main.rs), [unwinding](tests/binary/panic/src/main.rs), [allocation](tests/binary/alloc/src/main.rs), as well as [file system operations, STDIO, and more](tests/binary/std/src/main.rs).
 
-The official Rust [`coretests`](https://github.com/rust-lang/rust/tree/main/library/coretests) tests and benches all pass, with 99.6% of them (the missing 0.4% is 11 slow cases which are skipped on CI) verified [by CI](.github/workflows/ci.yml) on every commit. The official [`alloctests`](https://github.com/rust-lang/rust/tree/main/library/alloctests) suite has 99.9% verified coverage (1,345 of 1,347 tests) through [`Alloctests.py`](Alloctests.py); the only two exclusions are prohibitively expensive exhaustive substring stress tests.
+The official Rust [`coretests`](https://github.com/rust-lang/rust/tree/main/library/coretests) tests and benches all pass, with 99.6% of them (the missing 0.4% is 11 slow cases which are skipped on CI) verified [by CI](.github/workflows/ci.yml) on every commit. The official [`alloctests`](https://github.com/rust-lang/rust/tree/main/library/alloctests) suite has 99.9% verified coverage (1,345 of 1,347 tests) through [`Alloctests.py`](Alloctests.py). CI requires every enabled alloctest to pass in both debug and release; the only two exclusions are prohibitively expensive exhaustive substring stress tests.
 
 > [!NOTE]
 > This project is in an active mid-stage of development. While it supports the vast majority of the Rust language, edge-case bugs are continually being ironed out. The ultimate goal is potential upstreaming into main `rustc`.
@@ -217,7 +217,7 @@ The vast majority of the Rust language is supported, including generics, traits,
 | Subsystem | Status | Details |
 | :--- | :---: | :--- |
 | **Core** | **99.6%** | Passed via the official upstream [`coretests`](https://github.com/rust-lang/rust/tree/main/library/coretests) suite in CI |
-| **Alloc** | **99.9%** | 1,345 of 1,347 tests pass in the official upstream [`alloctests`](https://github.com/rust-lang/rust/tree/main/library/alloctests) suite via [`Alloctests.py`](Alloctests.py); the other two are exhaustive slow tests |
+| **Alloc** | **99.9%** | 1,345 of 1,347 tests pass in the official upstream [`alloctests`](https://github.com/rust-lang/rust/tree/main/library/alloctests) suite; CI requires a 100% pass rate among enabled tests in debug and release on Ubuntu, while the other two are exhaustive slow tests |
 | **Threads & Sync** | **Supported** | Thread spawning, scoped threads, Mutex, RwLock, Condvar, TLS |
 | **Async & Futures** | **Supported** | Async functions, blocks, closures and trait methods; boxed/recursive `dyn Future`; cancellation |
 | **Panic Unwinding** | **Supported** | Complete unwinding stack, `catch_unwind`, panic hooks, and abort-on-double-panic semantics |
