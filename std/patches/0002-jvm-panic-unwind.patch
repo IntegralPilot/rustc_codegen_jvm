@@ -14,10 +14,9 @@ diff --git a/panic_unwind/src/lib.rs b/panic_unwind/src/lib.rs
 diff --git a/std/src/sys/personality/mod.rs b/std/src/sys/personality/mod.rs
 --- a/std/src/sys/personality/mod.rs
 +++ b/std/src/sys/personality/mod.rs
-@@ -16,7 +16,7 @@ cfg_select! {
-     target_os = "emscripten" => {
-         mod emcc;
-     }
+@@ -15,6 +15,6 @@ mod dwarf;
+ #[cfg(not(any(test, doctest)))]
+ cfg_select! {
 -    any(target_env = "msvc", target_family = "wasm", target_os = "motor") => {
 +    any(target_os = "jvm", target_env = "msvc", target_family = "wasm", target_os = "motor") => {
          // This is required by the compiler to exist (e.g., it's a lang item),
