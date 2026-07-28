@@ -79,6 +79,15 @@ struct DirectFieldProjection {
     owner_class: String,
     field_name: String,
     field_ty: Type,
+    view_ty: Type,
+    wrappers: Vec<TransparentFieldWrapper>,
+}
+
+#[derive(Clone, PartialEq)]
+struct TransparentFieldWrapper {
+    class_name: String,
+    field_name: String,
+    inner_ty: Type,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -119,7 +128,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
     ) -> Self {
         let deferred_pointer_variables = deferred_pointer_variables(oomir_func);
         let direct_field_projections =
-            direct_field_projections(oomir_func, &deferred_pointer_variables);
+            direct_field_projections(oomir_func, module, &deferred_pointer_variables);
         let direct_cell_projections = direct_cell_projections(oomir_func);
         let mut translator = FunctionTranslator {
             oomir_func,
@@ -971,6 +980,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
     fn translate_direct_field_get(
         &mut self,
         dest: &str,
+        result_ty: &Type,
         projection: &DirectFieldProjection,
     ) -> Result<(), jvm::Error> {
         self.load_direct_field_owner(projection)?;
@@ -981,7 +991,20 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             &projection.field_ty.to_jvm_descriptor(),
         )?;
         self.jvm_instructions.push(Instruction::Getfield(field));
-        self.store_result(dest, &projection.field_ty)
+        for wrapper in &projection.wrappers {
+            let wrapper_class = self.constant_pool.add_class(&wrapper.class_name)?;
+            let constructor = self.constant_pool.add_method_ref(
+                wrapper_class,
+                "<init>",
+                &format!("({})V", wrapper.inner_ty.to_jvm_descriptor()),
+            )?;
+            self.jvm_instructions.push(Instruction::New(wrapper_class));
+            self.jvm_instructions.push(Instruction::Dup_x1);
+            self.jvm_instructions.push(Instruction::Swap);
+            self.jvm_instructions
+                .push(Instruction::Invokespecial(constructor));
+        }
+        self.store_result(dest, result_ty)
     }
 
     fn translate_direct_field_set(
@@ -990,7 +1013,16 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         value: &oomir::Operand,
     ) -> Result<(), jvm::Error> {
         let is_direct_this = self.load_direct_field_owner(projection)?;
-        self.load_operand_as(value, &projection.field_ty)?;
+        self.load_operand_as(value, &projection.view_ty)?;
+        for wrapper in projection.wrappers.iter().rev() {
+            let wrapper_class = self.constant_pool.add_class(&wrapper.class_name)?;
+            let field = self.constant_pool.add_field_ref(
+                wrapper_class,
+                &wrapper.field_name,
+                &wrapper.inner_ty.to_jvm_descriptor(),
+            )?;
+            self.jvm_instructions.push(Instruction::Getfield(field));
+        }
         let owner_class = self.constant_pool.add_class(&projection.owner_class)?;
         let field = self.constant_pool.add_field_ref(
             owner_class,
@@ -4114,18 +4146,19 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             }
             | OI::InvokeStatic {
                 dest: Some(dest), ..
-            } if primitive_pointer_retype_alias(instr).is_some_and(|(source, alias)| {
+            } if (primitive_pointer_retype_alias(instr).is_some_and(|(source, alias)| {
                 alias == dest
-                    && ((self.direct_cell_projections.contains_key(source)
-                        && self.direct_cell_projections.get(source)
-                            == self.direct_cell_projections.get(dest))
-                        || (self.direct_field_projections.contains_key(source)
-                            && self.direct_field_projections.get(source)
-                                == self.direct_field_projections.get(dest)))
-            }) =>
+                    && self.direct_cell_projections.contains_key(source)
+                    && self.direct_cell_projections.get(source)
+                        == self.direct_cell_projections.get(dest)
+            }) || pointer_retype_pointees(instr).is_some_and(|(source, _, alias, _)| {
+                alias == dest
+                    && self.direct_field_projections.contains_key(source)
+                    && self.direct_field_projections.contains_key(dest)
+            })) =>
             {
-                // An exact primitive retype remains the same unescaped JVM
-                // local or field; no runtime Pointer needs to be created.
+                // An escape-checked retype remains the same scalar local or
+                // structurally proven field view, so no Pointer is needed.
             }
             OI::NewArray {
                 dest,
@@ -4979,20 +5012,24 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 dest: Some(dest),
                 class_name,
                 method_name,
+                method_ty,
                 args,
                 operand: OO::Variable { name, .. },
                 ..
             } if class_name == oomir::POINTER_CLASS
-                && is_primitive_pointer_getter(method_name)
-                && args.is_empty()
-                && self.direct_field_projections.contains_key(name) =>
+                && self
+                    .direct_field_projections
+                    .get(name)
+                    .is_some_and(|projection| {
+                        is_direct_field_getter(method_name, args, projection)
+                    }) =>
             {
                 let projection = self
                     .direct_field_projections
                     .get(name)
                     .cloned()
-                    .expect("guard checked the primitive field projection");
-                self.translate_direct_field_get(dest, &projection)?;
+                    .expect("guard checked the direct field projection");
+                self.translate_direct_field_get(dest, &method_ty.ret, &projection)?;
             }
             OI::InvokeVirtual {
                 dest: Some(dest),
@@ -5960,6 +5997,44 @@ fn primitive_pointer_retype_alias(instruction: &oomir::Instruction) -> Option<(&
     .then_some((source.as_str(), dest.as_str()))
 }
 
+fn pointer_retype_pointees(instruction: &oomir::Instruction) -> Option<(&str, &Type, &str, &Type)> {
+    let (source, source_ty, dest, result_ty) = match instruction {
+        oomir::Instruction::InvokeVirtual {
+            dest: Some(dest),
+            class_name,
+            method_name,
+            method_ty,
+            args,
+            operand: oomir::Operand::Variable { name, ty },
+        } if class_name == oomir::POINTER_CLASS && method_name == "retype" && args.len() == 2 => {
+            (name, ty, dest, method_ty.ret.as_ref())
+        }
+        oomir::Instruction::InvokeStatic {
+            dest: Some(dest),
+            class_name,
+            method_name,
+            method_ty,
+            args,
+        } if class_name == oomir::POINTER_CLASS && method_name == "retype" && args.len() == 3 => {
+            let oomir::Operand::Variable { name, ty } = &args[0] else {
+                return None;
+            };
+            (name, ty, dest, method_ty.ret.as_ref())
+        }
+        _ => return None,
+    };
+    let (Type::Pointer(source_pointee), Type::Pointer(result_pointee)) = (source_ty, result_ty)
+    else {
+        return None;
+    };
+    Some((
+        source.as_str(),
+        source_pointee.as_ref(),
+        dest.as_str(),
+        result_pointee.as_ref(),
+    ))
+}
+
 fn direct_cell_projections(function: &oomir::Function) -> HashMap<String, DirectCellProjection> {
     let mut projections = HashMap::default();
     let mut rejected = HashSet::default();
@@ -6132,6 +6207,7 @@ fn is_allowed_direct_cell_use(
 
 fn direct_field_projections(
     function: &oomir::Function,
+    module: &oomir::Module,
     deferred_pointers: &HashSet<String>,
 ) -> HashMap<String, DirectFieldProjection> {
     let mut projections = HashMap::default();
@@ -6161,7 +6237,7 @@ fn direct_field_projections(
                     if class_name != oomir::POINTER_CLASS
                         || method_name != "projectStructField"
                         || args.len() != 5
-                        || !field_ty.is_jvm_primitive()
+                        || !field_ty.has_jvm_value()
                         || operand
                             .get_name()
                             .is_some_and(|name| deferred_pointers.contains(name))
@@ -6176,6 +6252,8 @@ fn direct_field_projections(
                             owner_class: owner_class.clone(),
                             field_name: field_name.clone(),
                             field_ty: field_ty.as_ref().clone(),
+                            view_ty: field_ty.as_ref().clone(),
+                            wrappers: Vec::new(),
                         },
                     ))
                 }
@@ -6202,7 +6280,7 @@ fn direct_field_projections(
                     if class_name != oomir::POINTER_CLASS
                         || method_name != "field"
                         || args.len() != 4
-                        || !field_ty.is_jvm_primitive()
+                        || !field_ty.has_jvm_value()
                         || owner_class == "java/lang/Object"
                     {
                         continue;
@@ -6215,6 +6293,8 @@ fn direct_field_projections(
                             owner_class,
                             field_name: field_name.clone(),
                             field_ty: field_ty.as_ref().clone(),
+                            view_ty: field_ty.as_ref().clone(),
+                            wrappers: Vec::new(),
                         },
                     ))
                 }
@@ -6234,19 +6314,28 @@ fn direct_field_projections(
         let mut changed = false;
         for block in function.body.basic_blocks.values() {
             for instruction in &block.instructions {
-                let (source, dest) = match instruction {
+                let (source, dest, retype) = match instruction {
                     oomir::Instruction::Move {
                         dest,
                         src: oomir::Operand::Variable { name: source, .. },
-                    } => (source.as_str(), dest.as_str()),
-                    _ => match primitive_pointer_retype_alias(instruction) {
-                        Some(alias) => alias,
+                    } => (source.as_str(), dest.as_str(), None),
+                    _ => match pointer_retype_pointees(instruction) {
+                        Some((source, source_view, dest, target_view)) => {
+                            (source, dest, Some((source_view, target_view)))
+                        }
                         None => continue,
                     },
                 };
-                let Some(projection) = projections.get(source).cloned() else {
+                let Some(mut projection) = projections.get(source).cloned() else {
                     continue;
                 };
+                if let Some((source_view, target_view)) = retype {
+                    if source_view != &projection.view_ty
+                        || !adapt_direct_field_view(&mut projection, target_view, module)
+                    {
+                        continue;
+                    }
+                }
                 if rejected.contains(dest) {
                     continue;
                 }
@@ -6268,6 +6357,18 @@ fn direct_field_projections(
             break;
         }
     }
+
+    let wrapped_fields = projections
+        .values()
+        .filter(|projection| !projection.wrappers.is_empty())
+        .cloned()
+        .collect::<Vec<_>>();
+    projections.retain(|_, projection| {
+        projection.field_ty.is_jvm_primitive()
+            || wrapped_fields
+                .iter()
+                .any(|wrapped| same_direct_field_storage(projection, wrapped))
+    });
 
     loop {
         let mut removed = false;
@@ -6295,6 +6396,47 @@ fn direct_field_projections(
     projections
 }
 
+fn same_direct_field_storage(left: &DirectFieldProjection, right: &DirectFieldProjection) -> bool {
+    left.source == right.source
+        && left.source_kind == right.source_kind
+        && left.owner_class == right.owner_class
+        && left.field_name == right.field_name
+        && left.field_ty == right.field_ty
+}
+
+fn adapt_direct_field_view(
+    projection: &mut DirectFieldProjection,
+    target_view: &Type,
+    module: &oomir::Module,
+) -> bool {
+    if &projection.view_ty == target_view {
+        return true;
+    }
+    if !projection.view_ty.is_jvm_reference_type() {
+        return false;
+    }
+    let Type::Class(class_name) = target_view else {
+        return false;
+    };
+    let Some(oomir::DataType::Class { fields, .. }) = module.data_types.get(class_name) else {
+        return false;
+    };
+    let mut visible_fields = fields.iter().filter(|(_, ty)| ty.has_jvm_value());
+    let Some((field_name, inner_ty)) = visible_fields.next() else {
+        return false;
+    };
+    if visible_fields.next().is_some() || inner_ty != &projection.view_ty {
+        return false;
+    }
+    projection.wrappers.push(TransparentFieldWrapper {
+        class_name: class_name.clone(),
+        field_name: field_name.clone(),
+        inner_ty: inner_ty.clone(),
+    });
+    projection.view_ty = target_view.clone();
+    true
+}
+
 fn is_direct_field_definition(
     instruction: &oomir::Instruction,
     name: &str,
@@ -6320,8 +6462,8 @@ fn is_direct_field_definition(
         } if dest == name
             && class_name == oomir::POINTER_CLASS
             && method_name == "field"
-    ) || primitive_pointer_retype_alias(instruction).is_some_and(|(source, dest)| {
-        dest == name && projections.get(source) == projections.get(name)
+    ) || pointer_retype_pointees(instruction).is_some_and(|(source, _, dest, _)| {
+        dest == name && projections.contains_key(source) && projections.contains_key(dest)
     }) || matches!(
         instruction,
         oomir::Instruction::Move {
@@ -6447,6 +6589,9 @@ fn is_allowed_direct_field_use(
     name: &str,
     projections: &HashMap<String, DirectFieldProjection>,
 ) -> bool {
+    let Some(projection) = projections.get(name) else {
+        return false;
+    };
     matches!(
         instruction,
         oomir::Instruction::InvokeVirtual {
@@ -6457,12 +6602,12 @@ fn is_allowed_direct_field_use(
             ..
         } if receiver == name
             && class_name == oomir::POINTER_CLASS
-            && ((is_primitive_pointer_getter(method_name) && args.is_empty())
+            && ((is_direct_field_getter(method_name, args, projection))
                 || (method_name == "set"
                     && args.len() == 1
-                    && get_operand_type(&args[0]).is_jvm_primitive()))
-    ) || primitive_pointer_retype_alias(instruction).is_some_and(|(source, dest)| {
-        source == name && projections.get(source) == projections.get(dest)
+                    && get_operand_type(&args[0]) == projection.view_ty))
+    ) || pointer_retype_pointees(instruction).is_some_and(|(source, _, dest, _)| {
+        source == name && projections.contains_key(source) && projections.contains_key(dest)
     }) || matches!(
         instruction,
         oomir::Instruction::Move {
@@ -6471,6 +6616,26 @@ fn is_allowed_direct_field_use(
         } if source == name
             && projections.get(dest) == projections.get(name)
     )
+}
+
+fn is_direct_field_getter(
+    method_name: &str,
+    args: &[oomir::Operand],
+    projection: &DirectFieldProjection,
+) -> bool {
+    if is_primitive_pointer_getter(method_name)
+        && args.is_empty()
+        && projection.view_ty.is_jvm_primitive()
+    {
+        return true;
+    }
+    let Some(oomir::Operand::Constant(oomir::Constant::String(requested_class))) = args.first()
+    else {
+        return false;
+    };
+    method_name == "getObjectAs"
+        && args.len() == 1
+        && projection.view_ty.to_jvm_internal_name().as_ref() == Some(requested_class)
 }
 
 fn deferred_pointer_variables(function: &oomir::Function) -> HashSet<String> {
