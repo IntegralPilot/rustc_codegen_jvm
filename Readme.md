@@ -9,7 +9,9 @@ A custom Rust compiler backend that compiles Rust directly to Java Virtual Machi
 
 ![Demo](demo.gif)
 
-This backend transparently compiles Rust constructs to Java classes and interfaces, enabling rich interop between JVM and Rust code at a level mostly unreachable by traditional FFI solutions. It also enables modern Rust code to run on older platforms outside the reach of current native targets, and has integrated upstream changes into OpenJDK's C2 JIT compiler which can make the JVM faster for everyone, including [~1.85x faster 128-bit multiplication on x86](https://github.com/openjdk/jdk/pull/30174).
+This backend transparently compiles Rust constructs to Java classes and interfaces, enabling rich interop between JVM and Rust code at a level mostly unreachable by traditional FFI solutions. 
+
+It also enables modern Rust code to run on older platforms outside the reach of current native targets, and has integrated upstream changes into OpenJDK's C2 JIT compiler which can make the JVM faster for everyone, including [~1.85x faster 128-bit multiplication on x86](https://github.com/openjdk/jdk/pull/30174).
 
 By leveraging a ["virtual MMU" translation layer](runtime/src/Pointer.java), it supports [raw pointers with complex pointer arithmetic](tests/binary/raw_ptrs/src/main.rs), [transmute](tests/binary/transmute/src/main.rs), and [unions](tests/binary/raw_ptrs/src/main.rs). It also supports key parts of the Rust standard library, including [networking](tests/binary/network/src/main.rs), [async/await](tests/binary/async_await/src/main.rs), [threading](tests/binary/threads/src/main.rs), [unwinding](tests/binary/panic/src/main.rs), [allocation](tests/binary/alloc/src/main.rs), as well as [file system operations, STDIO, and more](tests/binary/std/src/main.rs).
 
