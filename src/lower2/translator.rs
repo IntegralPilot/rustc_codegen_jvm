@@ -4109,6 +4109,24 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
 
                 self.store_result(dest, &value_type)?;
             }
+            OI::InvokeVirtual {
+                dest: Some(dest), ..
+            }
+            | OI::InvokeStatic {
+                dest: Some(dest), ..
+            } if primitive_pointer_retype_alias(instr).is_some_and(|(source, alias)| {
+                alias == dest
+                    && ((self.direct_cell_projections.contains_key(source)
+                        && self.direct_cell_projections.get(source)
+                            == self.direct_cell_projections.get(dest))
+                        || (self.direct_field_projections.contains_key(source)
+                            && self.direct_field_projections.get(source)
+                                == self.direct_field_projections.get(dest)))
+            }) =>
+            {
+                // An exact primitive retype remains the same unescaped JVM
+                // local or field; no runtime Pointer needs to be created.
+            }
             OI::NewArray {
                 dest,
                 element_type,
@@ -5876,6 +5894,72 @@ fn shift_exception_table_after_insert(
     Ok(())
 }
 
+fn primitive_pointer_view_size(ty: &oomir::Type) -> Option<u64> {
+    let oomir::Type::Pointer(pointee) = ty else {
+        return None;
+    };
+    match pointee.as_ref() {
+        oomir::Type::Boolean | oomir::Type::I8 | oomir::Type::U8 => Some(1),
+        oomir::Type::I16 | oomir::Type::U16 | oomir::Type::F16 => Some(2),
+        oomir::Type::I32 | oomir::Type::U32 | oomir::Type::Char | oomir::Type::F32 => Some(4),
+        oomir::Type::I64 | oomir::Type::U64 | oomir::Type::F64 => Some(8),
+        _ => None,
+    }
+}
+
+fn constant_nonnegative_u64(operand: &oomir::Operand) -> Option<u64> {
+    let oomir::Operand::Constant(constant) = operand else {
+        return None;
+    };
+    match constant {
+        oomir::Constant::U8(value) => Some(u64::from(*value)),
+        oomir::Constant::U16(value) => Some(u64::from(*value)),
+        oomir::Constant::U32(value) => Some(u64::from(*value)),
+        oomir::Constant::U64(value) => Some(*value),
+        oomir::Constant::I8(value) => u64::try_from(*value).ok(),
+        oomir::Constant::I16(value) => u64::try_from(*value).ok(),
+        oomir::Constant::I32(value) => u64::try_from(*value).ok(),
+        oomir::Constant::I64(value) => u64::try_from(*value).ok(),
+        _ => None,
+    }
+}
+
+/// Returns the source and destination of a retype which preserves an exact
+/// primitive pointer view. Such a view can remain scalar-replaced while every
+/// use stays within the direct cell/field analysis.
+fn primitive_pointer_retype_alias(instruction: &oomir::Instruction) -> Option<(&str, &str)> {
+    let (source, source_ty, dest, result_ty, view_size, codec) = match instruction {
+        oomir::Instruction::InvokeVirtual {
+            dest: Some(dest),
+            class_name,
+            method_name,
+            method_ty,
+            args,
+            operand: oomir::Operand::Variable { name, ty },
+        } if class_name == oomir::POINTER_CLASS && method_name == "retype" && args.len() == 2 => {
+            (name, ty, dest, method_ty.ret.as_ref(), &args[0], &args[1])
+        }
+        oomir::Instruction::InvokeStatic {
+            dest: Some(dest),
+            class_name,
+            method_name,
+            method_ty,
+            args,
+        } if class_name == oomir::POINTER_CLASS && method_name == "retype" && args.len() == 3 => {
+            let oomir::Operand::Variable { name, ty } = &args[0] else {
+                return None;
+            };
+            (name, ty, dest, method_ty.ret.as_ref(), &args[1], &args[2])
+        }
+        _ => return None,
+    };
+    let expected_size = primitive_pointer_view_size(source_ty)?;
+    (source_ty == result_ty
+        && constant_nonnegative_u64(view_size) == Some(expected_size)
+        && matches!(codec, oomir::Operand::Constant(oomir::Constant::Null(_))))
+    .then_some((source.as_str(), dest.as_str()))
+}
+
 fn direct_cell_projections(function: &oomir::Function) -> HashMap<String, DirectCellProjection> {
     let mut projections = HashMap::default();
     let mut rejected = HashSet::default();
@@ -5929,12 +6013,15 @@ fn direct_cell_projections(function: &oomir::Function) -> HashMap<String, Direct
         let mut changed = false;
         for block in function.body.basic_blocks.values() {
             for instruction in &block.instructions {
-                let oomir::Instruction::Move {
-                    dest,
-                    src: oomir::Operand::Variable { name: source, .. },
-                } = instruction
-                else {
-                    continue;
+                let (source, dest) = match instruction {
+                    oomir::Instruction::Move {
+                        dest,
+                        src: oomir::Operand::Variable { name: source, .. },
+                    } => (source.as_str(), dest.as_str()),
+                    _ => match primitive_pointer_retype_alias(instruction) {
+                        Some(alias) => alias,
+                        None => continue,
+                    },
                 };
                 let Some(projection) = projections.get(source).cloned() else {
                     continue;
@@ -5944,12 +6031,12 @@ fn direct_cell_projections(function: &oomir::Function) -> HashMap<String, Direct
                 }
                 match projections.get(dest) {
                     None => {
-                        projections.insert(dest.clone(), projection);
+                        projections.insert(dest.to_string(), projection);
                         changed = true;
                     }
                     Some(existing) if existing != &projection => {
                         projections.remove(dest);
-                        rejected.insert(dest.clone());
+                        rejected.insert(dest.to_string());
                         changed = true;
                     }
                     Some(_) => {}
@@ -6000,7 +6087,9 @@ fn is_direct_cell_definition(
         } if dest == name
             && class_name == oomir::POINTER_CLASS
             && matches!(method_name.as_str(), "cell" | "cellAligned")
-    ) || matches!(
+    ) || primitive_pointer_retype_alias(instruction).is_some_and(|(source, dest)| {
+        dest == name && projections.get(source) == projections.get(name)
+    }) || matches!(
         instruction,
         oomir::Instruction::Move {
             dest,
@@ -6029,7 +6118,9 @@ fn is_allowed_direct_cell_use(
                 || (method_name == "set"
                     && args.len() == 1
                     && get_operand_type(&args[0]).is_jvm_primitive()))
-    ) || matches!(
+    ) || primitive_pointer_retype_alias(instruction).is_some_and(|(source, dest)| {
+        source == name && projections.get(source) == projections.get(dest)
+    }) || matches!(
         instruction,
         oomir::Instruction::Move {
             dest,
@@ -6143,12 +6234,15 @@ fn direct_field_projections(
         let mut changed = false;
         for block in function.body.basic_blocks.values() {
             for instruction in &block.instructions {
-                let oomir::Instruction::Move {
-                    dest,
-                    src: oomir::Operand::Variable { name: source, .. },
-                } = instruction
-                else {
-                    continue;
+                let (source, dest) = match instruction {
+                    oomir::Instruction::Move {
+                        dest,
+                        src: oomir::Operand::Variable { name: source, .. },
+                    } => (source.as_str(), dest.as_str()),
+                    _ => match primitive_pointer_retype_alias(instruction) {
+                        Some(alias) => alias,
+                        None => continue,
+                    },
                 };
                 let Some(projection) = projections.get(source).cloned() else {
                     continue;
@@ -6158,12 +6252,12 @@ fn direct_field_projections(
                 }
                 match projections.get(dest) {
                     None => {
-                        projections.insert(dest.clone(), projection);
+                        projections.insert(dest.to_string(), projection);
                         changed = true;
                     }
                     Some(existing) if existing != &projection => {
                         projections.remove(dest);
-                        rejected.insert(dest.clone());
+                        rejected.insert(dest.to_string());
                         changed = true;
                     }
                     Some(_) => {}
@@ -6226,7 +6320,9 @@ fn is_direct_field_definition(
         } if dest == name
             && class_name == oomir::POINTER_CLASS
             && method_name == "field"
-    ) || matches!(
+    ) || primitive_pointer_retype_alias(instruction).is_some_and(|(source, dest)| {
+        dest == name && projections.get(source) == projections.get(name)
+    }) || matches!(
         instruction,
         oomir::Instruction::Move {
             dest,
@@ -6365,7 +6461,9 @@ fn is_allowed_direct_field_use(
                 || (method_name == "set"
                     && args.len() == 1
                     && get_operand_type(&args[0]).is_jvm_primitive()))
-    ) || matches!(
+    ) || primitive_pointer_retype_alias(instruction).is_some_and(|(source, dest)| {
+        source == name && projections.get(source) == projections.get(dest)
+    }) || matches!(
         instruction,
         oomir::Instruction::Move {
             dest,

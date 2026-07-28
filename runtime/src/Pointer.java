@@ -253,6 +253,13 @@ public final class Pointer {
             new ReferenceQueue<>();
     private static final ConcurrentHashMap<String, CodecPlan> CODEC_METHODS =
             new ConcurrentHashMap<>();
+    private static final ThreadLocal<CodecPlanCache> RECENT_CODEC_PLANS =
+            new ThreadLocal<CodecPlanCache>() {
+                @Override
+                protected CodecPlanCache initialValue() {
+                    return new CodecPlanCache();
+                }
+            };
     private static final ConcurrentHashMap<String, Object> SHARED_CONSTANTS =
             new ConcurrentHashMap<>();
     private static final Map<Object, Boolean> SHARED_CONSTANT_ARRAYS =
@@ -966,6 +973,7 @@ public final class Pointer {
         private Object[] values;
         private int size;
         private int used;
+        private int readsUntilCleanup = 256;
 
         private WeakIdentityMap() {
             this(16);
@@ -1022,6 +1030,7 @@ public final class Pointer {
             values = new Object[16];
             size = 0;
             used = 0;
+            readsUntilCleanup = 256;
             while (collectedKeys.poll() != null) {
                 // Entries no longer exist after reset.
             }
@@ -1041,8 +1050,16 @@ public final class Pointer {
             }
         }
 
+        private void maybeDiscardCollectedKeys() {
+            if (--readsUntilCleanup == 0) {
+                discardCollectedKeys();
+                readsUntilCleanup = 256;
+            }
+        }
+
         private void rehashForInsert() {
             discardCollectedKeys();
+            readsUntilCleanup = 256;
             int newLength =
                     size * 4 >= keys.length * 3
                             ? keys.length << 1
@@ -1077,7 +1094,7 @@ public final class Pointer {
 
         @Override
         public V get(Object key) {
-            discardCollectedKeys();
+            maybeDiscardCollectedKeys();
             int index = tableIndex(System.identityHashCode(key), keys.length);
             while (true) {
                 OpenWeakReference reference = keys[index];
@@ -1086,8 +1103,8 @@ public final class Pointer {
                 }
                 Object live = reference.get();
                 if (live == null) {
-                    deleteEntry(index);
-                    continue;
+                    // The key can be collected after the batched queue drain;
+                    // leave a tombstone until the next maintenance pass.
                 } else if (live == key) {
                     return valueAt(index);
                 }
@@ -1098,6 +1115,7 @@ public final class Pointer {
         @Override
         public V put(Object key, V value) {
             discardCollectedKeys();
+            readsUntilCleanup = 256;
             if (used * 4 >= keys.length * 3) {
                 rehashForInsert();
             }
@@ -1127,6 +1145,7 @@ public final class Pointer {
         @Override
         public V remove(Object key) {
             discardCollectedKeys();
+            readsUntilCleanup = 256;
             int index = tableIndex(System.identityHashCode(key), keys.length);
             while (true) {
                 OpenWeakReference reference = keys[index];
@@ -1430,6 +1449,7 @@ public final class Pointer {
         private final CodecEncoder encode;
         private final CodecDecoder decode;
         private final CodecBinder bind;
+        private final MethodHandle unionBytes;
 
         private CodecPlan(Method encode, Method decode, Method bind)
                 throws IllegalAccessException {
@@ -1468,10 +1488,69 @@ public final class Pointer {
                                                 void.class,
                                                 Pointer.class,
                                                 bind.getParameterTypes()[1]));
+                MethodHandle directUnionBytes = null;
+                try {
+                    Field bytes = encodeParameterType.getField("_bytes");
+                    Field objects = encodeParameterType.getField("_objects");
+                    if (bytes.getType() == byte[].class
+                            && objects.getType() == Object[].class) {
+                        directUnionBytes = lookup.unreflectGetter(bytes).asType(
+                                MethodType.methodType(byte[].class, Object.class));
+                    }
+                } catch (NoSuchFieldException ignored) {
+                    // Ordinary generated aggregates use their encode/decode methods.
+                }
+                unionBytes = directUnionBytes;
             } catch (Throwable error) {
                 throw new IllegalAccessException(
                         "could not create pointer codec call adapter: " + error);
             }
+        }
+
+        private byte[] directUnionBytes(Object value) {
+            if (unionBytes == null || value == null
+                    || !encodeParameterType.isInstance(value)) {
+                return null;
+            }
+            try {
+                return (byte[]) unionBytes.invokeExact(value);
+            } catch (RuntimeException | Error error) {
+                throw error;
+            } catch (Throwable error) {
+                throw new IllegalStateException(
+                        "could not access generated Rust union storage", error);
+            }
+        }
+    }
+
+    /** Two-entry per-thread cache for the codecs used by tight pointer loops. */
+    private static final class CodecPlanCache {
+        private String firstName;
+        private CodecPlan firstPlan;
+        private String secondName;
+        private CodecPlan secondPlan;
+
+        private CodecPlan get(String name) {
+            if (name == firstName || (firstName != null && firstName.equals(name))) {
+                return firstPlan;
+            }
+            if (name == secondName || (secondName != null && secondName.equals(name))) {
+                String previousName = firstName;
+                CodecPlan previousPlan = firstPlan;
+                firstName = secondName;
+                firstPlan = secondPlan;
+                secondName = previousName;
+                secondPlan = previousPlan;
+                return firstPlan;
+            }
+            return null;
+        }
+
+        private void remember(String name, CodecPlan plan) {
+            secondName = firstName;
+            secondPlan = firstPlan;
+            firstName = name;
+            firstPlan = plan;
         }
     }
 
@@ -2087,8 +2166,21 @@ public final class Pointer {
                 Math.multiplyExact(length, elementSize),
                 elementCodec)
                 .flushAllMemoryViews();
+        CodecPlan aggregatePlan = isGeneratedAggregateCodec(elementCodec)
+                ? codecPlan(elementCodec)
+                : null;
         for (int index = 0; index < length; index++) {
-            byte[] element = encodeMemoryValue(arrayGet(array, index), elementSize, elementCodec);
+            Object value = arrayGet(array, index);
+            byte[] direct = aggregatePlan == null
+                    ? null
+                    : aggregatePlan.directUnionBytes(value);
+            byte[] element = direct == null
+                    ? encodeMemoryValue(value, elementSize, elementCodec)
+                    : direct;
+            if (element.length < elementSize) {
+                throw new IllegalStateException("Rust aggregate storage contains "
+                        + element.length + " bytes, expected " + elementSize);
+            }
             System.arraycopy(element, 0, bytes, offset + index * elementSize, elementSize);
             if (elementCodec != null) {
                 transferEncodedPointers(
@@ -2098,7 +2190,11 @@ public final class Pointer {
                         offset + (long) index * elementSize,
                         elementSize,
                         false);
-                moveEncodedReferences(element, bytes);
+                if (direct == null) {
+                    moveEncodedReferences(element, bytes);
+                } else {
+                    transferEncodedReferences(element, bytes);
+                }
             }
         }
     }
@@ -7207,11 +7303,16 @@ public final class Pointer {
                     return (bits >>> (withinElement * 8)) & atomicMask(byteCount);
                 }
                 byte[] encoded = null;
+                byte[] directUnionBytes = null;
                 if (isFatPointerCodec(allocationCodecClassName)) {
                     encoded = encodeFatPointer(
                             value, allocationElementSize, allocationCodecClassName);
                 } else if (isGeneratedAggregateCodec(allocationCodecClassName)) {
-                    encoded = encodeAggregate(allocationCodecClassName, value);
+                    CodecPlan plan = codecPlan(allocationCodecClassName);
+                    directUnionBytes = plan.directUnionBytes(value);
+                    encoded = directUnionBytes == null
+                            ? plan.encode.encode(value)
+                            : directUnionBytes;
                 }
                 if (encoded != null) {
                     if (withinElement + byteCount > encoded.length) {
@@ -7223,7 +7324,9 @@ public final class Pointer {
                         result |= ((long) encoded[withinElement + index] & 0xffL)
                                 << (index * 8);
                     }
-                    discardEncodedReferences(encoded);
+                    if (directUnionBytes == null) {
+                        discardEncodedReferences(encoded);
+                    }
                     return result;
                 }
                 if (withinElement + byteCount <= 8) {
@@ -7292,13 +7395,19 @@ public final class Pointer {
             return result;
         }
         if (isGeneratedAggregateCodec(allocationCodecClassName)) {
-            byte[] bytes = encodeAggregate(allocationCodecClassName, value);
+            CodecPlan plan = codecPlan(allocationCodecClassName);
+            byte[] direct = plan.directUnionBytes(value);
+            byte[] bytes = direct == null ? plan.encode.encode(value) : direct;
             if (withinElement >= bytes.length) {
-                discardEncodedReferences(bytes);
+                if (direct == null) {
+                    discardEncodedReferences(bytes);
+                }
                 throw new IndexOutOfBoundsException("aggregate codec returned a short memory image");
             }
             int result = bytes[withinElement] & 0xff;
-            discardEncodedReferences(bytes);
+            if (direct == null) {
+                discardEncodedReferences(bytes);
+            }
             return result;
         }
         try {
@@ -7372,7 +7481,21 @@ public final class Pointer {
                 image = encodeFatPointer(value, allocationElementSize, allocationCodecClassName);
             } else if (!directPrimitiveArray
                     && isGeneratedAggregateCodec(allocationCodecClassName)) {
-                image = encodeAggregate(allocationCodecClassName, value);
+                CodecPlan plan = codecPlan(allocationCodecClassName);
+                byte[] direct = plan.directUnionBytes(value);
+                if (direct != null) {
+                    if (withinElement + chunk > direct.length) {
+                        throw new IndexOutOfBoundsException(
+                                "aggregate storage contains a short memory image");
+                    }
+                    System.arraycopy(direct, withinElement, result, consumed, chunk);
+                    transferEncodedPointers(
+                            direct, withinElement, result, consumed, chunk, false);
+                    transferEncodedReferences(direct, result);
+                    consumed += chunk;
+                    continue;
+                }
+                image = plan.encode.encode(value);
             }
             if (image != null) {
                 if (withinElement + chunk > image.length) {
@@ -7434,7 +7557,16 @@ public final class Pointer {
                     encoded = encodeFatPointer(
                             current, allocationElementSize, allocationCodecClassName);
                 } else if (isGeneratedAggregateCodec(allocationCodecClassName)) {
-                    encoded = encodeAggregate(allocationCodecClassName, current);
+                    CodecPlan plan = codecPlan(allocationCodecClassName);
+                    byte[] direct = plan.directUnionBytes(current);
+                    if (direct != null && direct.length == 1
+                            && withinElement == 0 && byteCount == 1) {
+                        discardEncodedPointers(direct, 0, 1);
+                        discardEncodedPointers(allocation, byteOffset, 1);
+                        direct[0] = (byte) bits;
+                        return;
+                    }
+                    encoded = plan.encode.encode(current);
                 }
                 if (encoded != null) {
                     if (withinElement + byteCount > encoded.length) {
@@ -7547,7 +7679,16 @@ public final class Pointer {
             return;
         }
         if (isGeneratedAggregateCodec(allocationCodecClassName)) {
-            byte[] bytes = encodeAggregate(allocationCodecClassName, current);
+            CodecPlan plan = codecPlan(allocationCodecClassName);
+            byte[] direct = plan.directUnionBytes(current);
+            if (direct != null && direct.length == 1 && withinElement == 0) {
+                prepareMemoryWrite(absoluteByteOffset, 1);
+                discardEncodedPointers(direct, 0, 1);
+                discardEncodedPointers(allocation, absoluteByteOffset, 1);
+                direct[0] = (byte) value;
+                return;
+            }
+            byte[] bytes = plan.encode.encode(current);
             if (withinElement >= bytes.length) {
                 throw new IndexOutOfBoundsException("aggregate codec returned a short memory image");
             }
@@ -9144,8 +9285,14 @@ public final class Pointer {
         if (codecClassName == null) {
             throw new IllegalStateException("pointer view has no aggregate codec");
         }
+        CodecPlanCache recent = RECENT_CODEC_PLANS.get();
+        CodecPlan local = recent.get(codecClassName);
+        if (local != null) {
+            return local;
+        }
         CodecPlan cached = CODEC_METHODS.get(codecClassName);
         if (cached != null) {
+            recent.remember(codecClassName, cached);
             return cached;
         }
         try {
@@ -9175,7 +9322,9 @@ public final class Pointer {
             }
             CodecPlan plan = new CodecPlan(encode, decode, bind);
             CodecPlan previous = CODEC_METHODS.putIfAbsent(codecClassName, plan);
-            return previous == null ? plan : previous;
+            CodecPlan result = previous == null ? plan : previous;
+            recent.remember(codecClassName, result);
+            return result;
         } catch (ReflectiveOperationException error) {
             throw new IllegalStateException("could not load Rust pointer codec " + codecClassName, error);
         }
