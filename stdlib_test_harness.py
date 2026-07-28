@@ -44,7 +44,6 @@ class SuiteConfig:
     build_schema: str
     default_ignored_tests: dict[str, str]
     dependency_packages: tuple[str, ...] = ("rand", "rand_core", "rand_xorshift")
-    max_heap: str = "1g"
     java_options: tuple[str, ...] = ()
     include_upstream_ignored_with_defaults: bool = False
     default_jobs: int | None = None
@@ -350,7 +349,6 @@ def listed_tests(
 ) -> list[str]:
     command = [
         "java",
-        f"-Xmx{config.max_heap}",
         *config.java_options,
         "-jar",
         str(jar),
@@ -422,7 +420,6 @@ def run_test_harness(
     """Run all selected tests in one JVM and decode libtest's output."""
     command = [
         "java",
-        f"-Xmx{config.max_heap}",
         *config.java_options,
         "-jar",
         str(jar),

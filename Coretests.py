@@ -44,7 +44,6 @@ CONFIG = SuiteConfig(
     patch_root=ROOT / "coretests" / "coretests-patches",
     build_schema="coretests-build-v2",
     default_ignored_tests=DEFAULT_IGNORED_TESTS,
-    max_heap="2g",
     java_options=("-XX:+UseParallelGC",),
 )
 
