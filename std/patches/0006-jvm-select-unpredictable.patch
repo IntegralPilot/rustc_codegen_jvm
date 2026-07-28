@@ -1,0 +1,14 @@
+diff --git a/core/src/hint.rs b/core/src/hint.rs
+--- a/core/src/hint.rs
++++ b/core/src/hint.rs
+@@ -834,6 +834,10 @@ pub const fn select_unpredictable<T>(condition: bool, true_val: T, false_val: T
+ where
+     T: [const] Destruct,
+ {
++    if cfg!(target_os = "jvm") && !crate::mem::needs_drop::<T>() {
++        return if condition { true_val } else { false_val };
++    }
++
+     // FIXME(https://github.com/rust-lang/unsafe-code-guidelines/issues/245):
+     // Change this to use ManuallyDrop instead.
+     let mut true_val = MaybeUninit::new(true_val);
