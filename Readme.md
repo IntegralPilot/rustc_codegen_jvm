@@ -13,9 +13,8 @@ This backend transparently compiles Rust constructs to Java classes and interfac
 
 By leveraging a ["virtual MMU" translation layer](runtime/src/Pointer.java), it supports [raw pointers with complex pointer arithmetic](tests/binary/raw_ptrs/src/main.rs), [transmute](tests/binary/transmute/src/main.rs), and [unions](tests/binary/raw_ptrs/src/main.rs). It also supports key parts of the Rust standard library, including [networking](tests/binary/network/src/main.rs), [async/await](tests/binary/async_await/src/main.rs), [threading](tests/binary/threads/src/main.rs), [unwinding](tests/binary/panic/src/main.rs), [allocation](tests/binary/alloc/src/main.rs), as well as [file system operations, STDIO, and more](tests/binary/std/src/main.rs).
 
-The official Rust [`coretests`](https://github.com/rust-lang/rust/tree/main/library/coretests) tests and benches all pass, with 99.6% of them (the missing 0.4% is 11 slow cases which are skipped on CI) verified [by CI](.github/workflows/ci.yml) on every commit. 
+All official Rust [`coretests`](https://github.com/rust-lang/rust/tree/main/library/coretests) pass, with 99.6% verified [by CI](.github/workflows/ci.yml) on every commit (11 slow cases are skipped). Similarly, 99.9% of [`alloctests`](https://github.com/rust-lang/rust/tree/main/library/alloctests) pass on the [same CI](.github/workflows/ci.yml), with only 2 cases skipped due to slowness.
 
-It is the same for the official Rust [`alloctests`](https://github.com/rust-lang/rust/tree/main/library/alloctests) tests and benches, which has 99.9% verified coverage (1,345 of 1,347 tests and benches, the missing 2 are  exhaustive substring stress tests which are too slow for CI) verified [by CI](.github/workflows/ci.yml) on every commit.
 > [!NOTE]
 > This project is in an active mid-stage of development. While it supports the vast majority of the Rust language, edge-case bugs are continually being ironed out. The ultimate goal is potential upstreaming into main `rustc`.
 
@@ -33,7 +32,7 @@ cargo jvm setup "$PWD"
 ```
 
 ### Make a new hello_world project
-
+Please make sure you are on the latest Rust nightly. If it isn't your default toolchain, you might have to use `cargo +nightly`.
 ```bash
 cargo new hello_world --bin
 cd hello_world
@@ -213,12 +212,21 @@ The following example programs live in `tests/`, are compiled with the standard 
 
 The vast majority of the Rust language is supported, including generics, traits, coroutines, closures, control flow, data structures, and `unsafe` features (raw pointer arithmetic, transmutes, and unions).
 
+### Official upstream test suites
+
+The following pass rates are a quality gate enforced [by CI](.github/workflows/ci.yml), in both debug and release mode.
+
+| Suite | Tests passed | Tests skipped (too slow) | Total tests | Pass % |
+|---|---|---|---|---|
+| [`coretests`](https://github.com/rust-lang/rust/tree/main/library/coretests) tests & benches | 2799 | 11 | 2810 | **99.61%** |
+| [`alloctests`](https://github.com/rust-lang/rust/tree/main/library/alloctests) tests & benches | 1347 | 2 | 1349 | **99.85%** |
+
 ### Standard Library Support Matrix
 
+Beyond `core` and `alloc`, a large amount of the `std` is supported too, though a JVM OS implementation which is overlayed on top of upstream.
+
 | Subsystem | Status | Details |
-| :--- | :---: | :--- |
-| **Core** | **99.6%** | Passed via the official upstream [`coretests`](https://github.com/rust-lang/rust/tree/main/library/coretests) suite in CI |
-| **Alloc** | **99.9%** | 1,345 of 1,347 tests pass in the official upstream [`alloctests`](https://github.com/rust-lang/rust/tree/main/library/alloctests) suite; CI requires a 100% pass rate among enabled tests in debug and release on Ubuntu, while the other two are exhaustive slow tests |
+|---|---|---|
 | **Threads & Sync** | **Supported** | Thread spawning, scoped threads, Mutex, RwLock, Condvar, TLS |
 | **Async & Futures** | **Supported** | Async functions, blocks, closures and trait methods; boxed/recursive `dyn Future`; cancellation |
 | **Panic Unwinding** | **Supported** | Complete unwinding stack, `catch_unwind`, panic hooks, and abort-on-double-panic semantics |
@@ -226,6 +234,7 @@ The vast majority of the Rust language is supported, including generics, traits,
 | **Time & Random** | **Supported** | `SystemTime`, `Instant`, standard entropy seeds |
 | **File System (`std::fs`)** | **Supported** | Java NIO files, directories, positional and vectored I/O, nanosecond timestamps, opaque file identity, atomic POSIX creation permissions, links, locks, and paths |
 | **Networking (`std::net`)** | **Supported** | Java NIO TCP/UDP, IPv4/IPv6, DNS, timeouts, nonblocking sockets, vectored I/O, peeking, multicast, and socket cloning |
+| **Processes (`std::process`)** | *Planned* | Spawning, managing, interacting with, and terminating child processes |
 
 Compiled JAR files emit rich JVM metadata (`LineNumberTable`, parameter names, nested class info), ensuring seamless IDE integration (autocomplete, tooltips, refactoring) in IntelliJ IDEA and detailed stack traces during debugging or profiling with JFR.
 
@@ -307,7 +316,7 @@ Rust constructs map directly to JVM structures without requiring JNI wrapper cod
 
 [`cargo-jvm`](cargo-jvm/README.md) is used to make building and running Rust projects on the JVM as seamless as possible. It wraps the standard Cargo workflow, forwarding all ordinary Cargo selection and feature arguments. For instructions on installing `cargo-jvm`, see [its README](cargo-jvm/README.md).
 
-The following commands assume you are within a Rust project directory that you wish to compile/run using the JVM.
+The following commands assume you are within a Rust project directory that you wish to compile/run using the JVM, and which is configured to use the latest nightly toolchain.
 
 ### Building
 
@@ -360,7 +369,7 @@ cargo jvm package --bin my-app --output dist/my-app.jar
 Rust test targets can also run on the JVM:
 
 ```bash
-cargo jvm test`
+cargo jvm test
 cargo jvm test --release --workspace
 cargo jvm test -- --nocapture
 ```
