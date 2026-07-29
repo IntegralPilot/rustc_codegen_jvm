@@ -4388,7 +4388,7 @@ pub(super) fn ensure_exact_transmute_helper<'tcx>(
     };
     let target_pointer = match target_ty.kind() {
         TyKind::RawPtr(pointee, _) | TyKind::Ref(_, pointee, _)
-            if matches!(target_oomir_ty, oomir::Type::Pointer(_)) =>
+            if target_oomir_ty.has_jvm_value() =>
         {
             Some((target_oomir_ty.clone(), *pointee, None))
         }
@@ -4398,9 +4398,7 @@ pub(super) fn ensure_exact_transmute_helper<'tcx>(
             };
             fields
                 .iter()
-                .find(|(field_name, field_ty)| {
-                    field_name == "pointer" && matches!(field_ty, oomir::Type::Pointer(_))
-                })
+                .find(|(field_name, field_ty)| field_name == "pointer" && field_ty.has_jvm_value())
                 .map(|(_, field_ty)| (field_ty.clone(), *pointee, Some(class_name.clone())))
         }),
     };
@@ -4422,7 +4420,7 @@ pub(super) fn ensure_exact_transmute_helper<'tcx>(
         Some((target_class.clone(), tail_view.to_string()))
     });
     let mut pointer_instructions = Vec::new();
-    let source_pointer = if matches!(source_oomir_ty, oomir::Type::Pointer(_)) {
+    let source_pointer = if source_pointee.is_some() && source_oomir_ty.has_jvm_value() {
         Some((
             operand_var("_1", source_oomir_ty.clone()),
             source_oomir_ty.clone(),
@@ -4433,7 +4431,7 @@ pub(super) fn ensure_exact_transmute_helper<'tcx>(
                 return None;
             };
             let (_, field_ty) = fields.iter().find(|(field_name, field_ty)| {
-                field_name == "pointer" && matches!(field_ty, oomir::Type::Pointer(_))
+                field_name == "pointer" && field_ty.has_jvm_value()
             })?;
             let field_ty = field_ty.clone();
             let pointer_name = "_source_pointer".to_string();
@@ -4456,6 +4454,11 @@ pub(super) fn ensure_exact_transmute_helper<'tcx>(
                 let retyped = if source_pointer_pointee == Some(pointee) {
                     source_pointer
                 } else if let Some((target_class, tail_view_class)) = &target_struct_tail_view {
+                    if !matches!(source_pointer_ty, oomir::Type::Pointer(_))
+                        || !matches!(target_pointer_ty, oomir::Type::Pointer(_))
+                    {
+                        return Ok(None);
+                    }
                     let retyped_name = "_retargeted_struct_tail_pointer".to_string();
                     pointer_instructions.push(oomir::Instruction::InvokeStatic {
                         dest: Some(retyped_name.clone()),
@@ -4479,9 +4482,13 @@ pub(super) fn ensure_exact_transmute_helper<'tcx>(
                         ],
                     });
                     operand_var(retyped_name, target_pointer_ty.clone())
-                } else if source_pointer_ty == target_pointer_ty {
+                } else if source_pointer_ty == target_pointer_ty
+                    && matches!(source_pointer_ty, oomir::Type::Pointer(_))
+                {
                     source_pointer
-                } else {
+                } else if matches!(source_pointer_ty, oomir::Type::Pointer(_))
+                    && matches!(target_pointer_ty, oomir::Type::Pointer(_))
+                {
                     let retyped_name = "_retyped_pointer".to_string();
                     pointer_instructions.push(oomir::Instruction::InvokeVirtual {
                         dest: Some(retyped_name.clone()),
@@ -4506,6 +4513,8 @@ pub(super) fn ensure_exact_transmute_helper<'tcx>(
                         operand: source_pointer,
                     });
                     operand_var(retyped_name, target_pointer_ty.clone())
+                } else {
+                    return Ok(None);
                 };
                 if let Some(wrapper_class) = wrapper {
                     let result_name = "_pointer_wrapper".to_string();
@@ -4522,10 +4531,11 @@ pub(super) fn ensure_exact_transmute_helper<'tcx>(
                         operand: Some(retyped),
                     });
                 }
-                Ok::<_, String>(pointer_instructions)
+                Ok::<_, String>(Some(pointer_instructions))
             },
         )
-        .transpose()?;
+        .transpose()?
+        .flatten();
 
     let instructions = if let Some(instructions) = direct_pointer_instructions {
         instructions

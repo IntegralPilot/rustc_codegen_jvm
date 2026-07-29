@@ -8076,6 +8076,55 @@ public final class Pointer {
                 base.relativeByteOffset(elementOffset, byteOffset), 8));
     }
 
+    /**
+     * Loads a reference-valued pointee without allocating its derived pointer
+     * when the JVM allocation already stores the requested Rust value directly.
+     */
+    public static Object getObjectRelative(
+            Pointer base,
+            long elementOffset,
+            long byteOffset,
+            String targetClassName) {
+        if (base == null) {
+            throw new NullPointerException("attempted to dereference a null Rust pointer");
+        }
+        long absoluteByteOffset =
+                base.relativeByteOffset(elementOffset, byteOffset);
+        boolean sameCodec = base.allocationCodecClassName == null
+                ? base.viewCodecClassName == null
+                : base.allocationCodecClassName.equals(base.viewCodecClassName);
+        if (base.allocation != null
+                && base.allocationElementSize > 0
+                && absoluteByteOffset % base.allocationElementSize == 0
+                && base.viewSize == base.allocationElementSize
+                && sameCodec
+                && !mayHaveStructuralView(base.allocation)) {
+            base.flushMemoryViewsOverlapping(
+                    absoluteByteOffset, base.allocationElementSize);
+            int elementIndex = Math.toIntExact(
+                    Math.floorDiv(absoluteByteOffset, base.allocationElementSize));
+            Object value = base.readElement(elementIndex);
+            if (targetClassName == null || targetClassName.isEmpty() || value == null) {
+                return value;
+            }
+            try {
+                Class<?> targetClass =
+                        resolvedClass(targetClassName, value.getClass().getClassLoader());
+                if (targetClass.isInstance(value)) {
+                    return value;
+                }
+            } catch (ClassNotFoundException error) {
+                throw new IllegalStateException(
+                        "could not load requested Rust value " + targetClassName,
+                        error);
+            }
+        }
+        Pointer pointer = materializeRelative(base, elementOffset, byteOffset);
+        return targetClassName == null || targetClassName.isEmpty()
+                ? pointer.getObject()
+                : pointer.getObjectAs(targetClassName);
+    }
+
     public boolean getBoolean() {
         requireScalarViewSize(1, "bool");
         return loadUnsigned(1) != 0;

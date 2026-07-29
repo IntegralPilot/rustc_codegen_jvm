@@ -93,6 +93,7 @@ struct TransparentFieldWrapper {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DirectFieldSource {
     PointerView,
+    DeferredPointerView,
     Object,
 }
 
@@ -959,17 +960,37 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     if self.direct_this_aliases.contains(name)
                         && !self.oomir_func.signature.is_static
             );
-        self.load_operand(&projection.source)?;
-        if projection.source_kind == DirectFieldSource::PointerView && !is_direct_this {
-            self.load_string_constant(&projection.owner_class)?;
-            let pointer_class = self.constant_pool.add_class(oomir::POINTER_CLASS)?;
-            let get_object_as = self.constant_pool.add_method_ref(
-                pointer_class,
-                "getObjectAs",
-                "(Ljava/lang/String;)Ljava/lang/Object;",
-            )?;
-            self.jvm_instructions
-                .push(Instruction::Invokevirtual(get_object_as));
+        match projection.source_kind {
+            DirectFieldSource::Object => self.load_operand(&projection.source)?,
+            DirectFieldSource::PointerView => {
+                self.load_operand(&projection.source)?;
+                if !is_direct_this {
+                    self.load_string_constant(&projection.owner_class)?;
+                    let pointer_class = self.constant_pool.add_class(oomir::POINTER_CLASS)?;
+                    let get_object_as = self.constant_pool.add_method_ref(
+                        pointer_class,
+                        "getObjectAs",
+                        "(Ljava/lang/String;)Ljava/lang/Object;",
+                    )?;
+                    self.jvm_instructions
+                        .push(Instruction::Invokevirtual(get_object_as));
+                }
+            }
+            DirectFieldSource::DeferredPointerView => {
+                self.load_pointer_components(&projection.source)?;
+                self.load_string_constant(&projection.owner_class)?;
+                let pointer_class = self.constant_pool.add_class(oomir::POINTER_CLASS)?;
+                let get_object = self.constant_pool.add_method_ref(
+                    pointer_class,
+                    "getObjectRelative",
+                    &format!(
+                        "(L{};JJLjava/lang/String;)Ljava/lang/Object;",
+                        oomir::POINTER_CLASS
+                    ),
+                )?;
+                self.jvm_instructions
+                    .push(Instruction::Invokestatic(get_object));
+            }
         }
         let owner_class = self.constant_pool.add_class(&projection.owner_class)?;
         self.jvm_instructions
@@ -1048,6 +1069,11 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             )?;
             self.jvm_instructions
                 .push(Instruction::Invokestatic(commit));
+        } else if projection.source_kind == DirectFieldSource::DeferredPointerView {
+            return Err(jvm::Error::VerificationError {
+                context: format!("Function {}", self.oomir_func.name),
+                message: "a deferred direct field write escaped analysis".to_string(),
+            });
         }
         Ok(())
     }
@@ -1063,7 +1089,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         slot
     }
 
-    fn load_primitive_default(&mut self, ty: &Type) -> Result<(), jvm::Error> {
+    fn load_direct_cell_default(&mut self, ty: &Type) -> Result<(), jvm::Error> {
         self.jvm_instructions.push(match ty {
             Type::Boolean
             | Type::I8
@@ -1077,10 +1103,11 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             Type::I64 | Type::U64 => Instruction::Lconst_0,
             Type::F32 => Instruction::Fconst_0,
             Type::F64 => Instruction::Dconst_0,
+            _ if ty.is_jvm_reference_type() => Instruction::Aconst_null,
             _ => {
                 return Err(jvm::Error::VerificationError {
                     context: format!("Function {}", self.oomir_func.name),
-                    message: format!("direct pointer cell has non-primitive type {ty:?}"),
+                    message: format!("direct pointer cell has no JVM value type: {ty:?}"),
                 });
             }
         });
@@ -1093,7 +1120,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
     ) -> Result<(), jvm::Error> {
         let slot = self.direct_cell_slot(projection);
         if is_null_operand(&projection.initial_value) {
-            self.load_primitive_default(&projection.value_ty)?;
+            self.load_direct_cell_default(&projection.value_ty)?;
         } else {
             self.load_operand_as(&projection.initial_value, &projection.value_ty)?;
         }
@@ -2161,11 +2188,44 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
 
     /// Dereferences a compiler-visible `(base pointer, element offset, byte
     /// offset)` without allocating a derived `Pointer`.
-    fn dereference_relative_pointer(&mut self, pointee_ty: &oomir::Type) -> Result<(), jvm::Error> {
+    fn dereference_relative_pointer(
+        &mut self,
+        pointee_ty: &oomir::Type,
+        requested_class: Option<&oomir::Operand>,
+    ) -> Result<(), jvm::Error> {
         if !pointee_ty.has_jvm_value() {
             self.jvm_instructions.push(Instruction::Pop2);
             self.jvm_instructions.push(Instruction::Pop2);
             self.jvm_instructions.push(Instruction::Pop);
+            return Ok(());
+        }
+
+        if pointee_ty.is_jvm_reference_type() {
+            if let Some(requested_class) = requested_class {
+                self.load_call_argument_as(requested_class, &oomir::Type::java_string())?;
+            } else {
+                self.jvm_instructions.push(Instruction::Aconst_null);
+            }
+            let pointer_class = self.constant_pool.add_class(oomir::POINTER_CLASS)?;
+            let getter_ref = self.constant_pool.add_method_ref(
+                pointer_class,
+                "getObjectRelative",
+                &format!(
+                    "(L{};JJLjava/lang/String;)Ljava/lang/Object;",
+                    oomir::POINTER_CLASS
+                ),
+            )?;
+            self.jvm_instructions
+                .push(Instruction::Invokestatic(getter_ref));
+            let object_ty = oomir::Type::Class("java/lang/Object".to_string());
+            if *pointee_ty != object_ty {
+                self.jvm_instructions.extend(get_cast_instructions(
+                    &self.oomir_func.name,
+                    &object_ty,
+                    pointee_ty,
+                    self.constant_pool,
+                )?);
+            }
             return Ok(());
         }
 
@@ -4441,24 +4501,11 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             }
             OI::ArrayGet { dest, array, index } => {
                 if let oomir::Type::Pointer(element_type) = get_operand_type(array) {
-                    if element_type.is_jvm_primitive() {
-                        self.load_operand(array)?;
-                        self.load_jvm_int_operand(index)?;
-                        self.jvm_instructions.push(JI::I2l);
-                        self.jvm_instructions.push(JI::Lconst_0);
-                        self.dereference_relative_pointer(&element_type)?;
-                    } else {
-                        self.load_operand(array)?;
-                        self.load_jvm_int_operand(index)?;
-                        let pointer_class = self.constant_pool.add_class(oomir::POINTER_CLASS)?;
-                        let offset = self.constant_pool.add_method_ref(
-                            pointer_class,
-                            "offset",
-                            &format!("(I)L{};", oomir::POINTER_CLASS),
-                        )?;
-                        self.jvm_instructions.push(JI::Invokevirtual(offset));
-                        self.dereference_loaded_pointer(&element_type)?;
-                    }
+                    self.load_operand(array)?;
+                    self.load_jvm_int_operand(index)?;
+                    self.jvm_instructions.push(JI::I2l);
+                    self.jvm_instructions.push(JI::Lconst_0);
+                    self.dereference_relative_pointer(&element_type, None)?;
                     self.store_result(dest, &element_type)?;
                     return Ok(());
                 }
@@ -4997,9 +5044,12 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 operand: OO::Variable { name, .. },
                 ..
             } if class_name == oomir::POINTER_CLASS
-                && is_primitive_pointer_getter(method_name)
-                && args.is_empty()
-                && self.direct_cell_projections.contains_key(name) =>
+                && self
+                    .direct_cell_projections
+                    .get(name)
+                    .is_some_and(|projection| {
+                        is_direct_cell_getter(method_name, args, projection)
+                    }) =>
             {
                 let projection = self
                     .direct_cell_projections
@@ -5131,8 +5181,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                         ty: Type::Pointer(_),
                     },
             } if class_name == oomir::POINTER_CLASS
-                && is_primitive_pointer_getter(method_name)
-                && args.is_empty()
+                && is_deferred_pointer_getter(method_name, args)
                 && self.deferred_pointer_variables.contains(source_name) =>
             {
                 if !self.load_deferred_pointer_components(operand)? {
@@ -5143,7 +5192,10 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                         ),
                     });
                 }
-                self.dereference_relative_pointer(&method_ty.ret)?;
+                self.dereference_relative_pointer(
+                    &method_ty.ret,
+                    (method_name == "getObjectAs").then(|| &args[0]),
+                )?;
                 self.store_result(dest, &method_ty.ret)?;
             }
             OI::InvokeVirtual {
@@ -6066,9 +6118,9 @@ fn direct_cell_projections(function: &oomir::Function) -> HashMap<String, Direct
             };
             if class_name != oomir::POINTER_CLASS
                 || args.len() != expected_args
-                || !value_ty.is_jvm_primitive()
-                || (!get_operand_type(initial_value).is_jvm_primitive()
-                    && !is_null_operand(initial_value))
+                || !value_ty.has_jvm_value()
+                || (!is_null_operand(initial_value)
+                    && get_operand_type(initial_value) != **value_ty)
             {
                 continue;
             }
@@ -6174,6 +6226,25 @@ fn is_direct_cell_definition(
     )
 }
 
+fn is_direct_cell_value_compatible(value: &oomir::Operand, value_ty: &Type) -> bool {
+    is_null_operand(value) && value_ty.is_jvm_reference_type()
+        || get_operand_type(value) == *value_ty
+        || (value_ty.is_jvm_reference_type() && get_operand_type(value).is_jvm_reference_type())
+}
+
+fn is_direct_cell_getter(
+    method_name: &str,
+    args: &[oomir::Operand],
+    projection: &DirectCellProjection,
+) -> bool {
+    if projection.value_ty.is_jvm_primitive() {
+        return is_primitive_pointer_getter(method_name) && args.is_empty();
+    }
+    projection.value_ty.is_jvm_reference_type()
+        && ((method_name == "getObject" && args.is_empty())
+            || (method_name == "getObjectAs" && args.len() == 1))
+}
+
 fn is_allowed_direct_cell_use(
     instruction: &oomir::Instruction,
     name: &str,
@@ -6189,10 +6260,12 @@ fn is_allowed_direct_cell_use(
             ..
         } if receiver == name
             && class_name == oomir::POINTER_CLASS
-            && ((is_primitive_pointer_getter(method_name) && args.is_empty())
+            && (is_direct_cell_getter(method_name, args, projections.get(name).unwrap())
                 || (method_name == "set"
                     && args.len() == 1
-                    && get_operand_type(&args[0]).is_jvm_primitive()))
+                    && is_direct_cell_value_compatible(
+                        &args[0],
+                        &projections.get(name).unwrap().value_ty)))
     ) || primitive_pointer_retype_alias(instruction).is_some_and(|(source, dest)| {
         source == name && projections.get(source) == projections.get(dest)
     }) || matches!(
@@ -6238,17 +6311,22 @@ fn direct_field_projections(
                         || method_name != "projectStructField"
                         || args.len() != 5
                         || !field_ty.has_jvm_value()
-                        || operand
-                            .get_name()
-                            .is_some_and(|name| deferred_pointers.contains(name))
                     {
                         continue;
                     }
+                    let source_kind = if operand
+                        .get_name()
+                        .is_some_and(|name| deferred_pointers.contains(name))
+                    {
+                        DirectFieldSource::DeferredPointerView
+                    } else {
+                        DirectFieldSource::PointerView
+                    };
                     Some((
                         dest,
                         DirectFieldProjection {
                             source: operand.clone(),
-                            source_kind: DirectFieldSource::PointerView,
+                            source_kind,
                             owner_class: owner_class.clone(),
                             field_name: field_name.clone(),
                             field_ty: field_ty.as_ref().clone(),
@@ -6365,6 +6443,10 @@ fn direct_field_projections(
         .collect::<Vec<_>>();
     projections.retain(|_, projection| {
         projection.field_ty.is_jvm_primitive()
+            || matches!(
+                projection.field_ty,
+                Type::Pointer(_) | Type::Slice(_) | Type::Str
+            )
             || wrapped_fields
                 .iter()
                 .any(|wrapped| same_direct_field_storage(projection, wrapped))
@@ -6605,6 +6687,7 @@ fn is_allowed_direct_field_use(
             && ((is_direct_field_getter(method_name, args, projection))
                 || (method_name == "set"
                     && args.len() == 1
+                    && projection.source_kind != DirectFieldSource::DeferredPointerView
                     && get_operand_type(&args[0]) == projection.view_ty))
     ) || pointer_retype_pointees(instruction).is_some_and(|(source, _, dest, _)| {
         source == name && projections.contains_key(source) && projections.contains_key(dest)
@@ -6627,6 +6710,9 @@ fn is_direct_field_getter(
         && args.is_empty()
         && projection.view_ty.is_jvm_primitive()
     {
+        return true;
+    }
+    if method_name == "getObject" && args.is_empty() && projection.view_ty.is_jvm_reference_type() {
         return true;
     }
     let Some(oomir::Operand::Constant(oomir::Constant::String(requested_class))) = args.first()
@@ -6718,6 +6804,12 @@ fn is_primitive_pointer_getter(method_name: &str) -> bool {
         method_name,
         "getBoolean" | "getI8" | "getI16" | "getI32" | "getI64" | "getF32" | "getF64"
     )
+}
+
+fn is_deferred_pointer_getter(method_name: &str, args: &[oomir::Operand]) -> bool {
+    is_primitive_pointer_getter(method_name) && args.is_empty()
+        || method_name == "getObject" && args.is_empty()
+        || method_name == "getObjectAs" && args.len() == 1
 }
 
 fn is_pointer_copy(method_name: &str) -> bool {
