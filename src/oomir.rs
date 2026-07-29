@@ -14,6 +14,7 @@ pub const POINTER_CLASS: &str = "org/rustlang/runtime/Pointer";
 pub const JAVA_STRING_CLASS: &str = "java/lang/String";
 pub const CALLER_LOCATION_PARAM_NAME: &str = "__caller_location";
 pub const INSTANCE_RECEIVER_POINTER_LOCAL: &str = "__instance_receiver_pointer";
+pub const RELATIVE_POINTER_METHOD_SUFFIX: &str = "$relative";
 
 /// A Rust source position attached to generated code.
 ///
@@ -259,6 +260,50 @@ impl Signature {
             ret: self.ret.clone(),
             is_static: false,
         }
+    }
+
+    /// Internal generated methods may carry a thin pointer as its stable base
+    /// plus deferred element and byte offsets. Public/JVM-facing entry points
+    /// retain the ordinary `Pointer` descriptor and bridge into this ABI.
+    pub fn relative_pointer_abi_signature(&self) -> Signature {
+        let implicit_receiver = self.has_implicit_jvm_receiver();
+        let mut params = Vec::with_capacity(self.params.len() * 3);
+        for (index, (name, ty)) in self.params.iter().enumerate() {
+            params.push((name.clone(), ty.clone()));
+            if !(implicit_receiver && index == 0) && matches!(ty, Type::Pointer(_)) {
+                params.push((format!("{name}$element_offset"), Type::I64));
+                params.push((format!("{name}$byte_offset"), Type::I64));
+            }
+        }
+        Signature {
+            params,
+            ret: self.ret.clone(),
+            is_static: self.is_static,
+        }
+    }
+
+    pub fn supports_relative_pointer_abi(&self) -> bool {
+        let implicit_receiver = self.has_implicit_jvm_receiver();
+        let mut has_pointer = false;
+        let slots = self
+            .params
+            .iter()
+            .enumerate()
+            .filter(|(index, (_, ty))| !(implicit_receiver && *index == 0) && ty.has_jvm_value())
+            .map(|(_, (_, ty))| {
+                if matches!(ty, Type::Pointer(_)) {
+                    has_pointer = true;
+                    5u16
+                } else if matches!(ty, Type::I64 | Type::U64 | Type::F64) {
+                    2
+                } else {
+                    1
+                }
+            })
+            .sum::<u16>();
+        // JVMS 4.3.3 limits a method descriptor to 255 parameter units;
+        // instance methods also consume one unit for the receiver.
+        has_pointer && slots + u16::from(!self.is_static) <= 255
     }
 
     /// Replaces all occurrences of `Type::Class(old_name)` with `Type::Class(new_name)`
@@ -527,6 +572,15 @@ pub enum Instruction {
         method_name: String,  // Name of the static method to call
         method_ty: Signature, // Signature of the method (input/output types)
         args: Vec<Operand>,   // Arguments to the function
+    },
+    /// A generated Rust-to-Rust static call. Unlike exact JVM imports, lower2
+    /// may use the component-carrying internal pointer ABI for this edge.
+    InvokeRustStatic {
+        dest: Option<String>,
+        class_name: String,
+        method_name: String,
+        method_ty: Signature,
+        args: Vec<Operand>,
     },
 }
 

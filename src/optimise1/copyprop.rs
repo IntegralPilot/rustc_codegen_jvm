@@ -418,7 +418,7 @@ fn rewrite_instruction_uses(
                 rewrite_operand(operand, aliases, locals);
             }
         }
-        Instruction::InvokeStatic { args, .. } => {
+        Instruction::InvokeStatic { args, .. } | Instruction::InvokeRustStatic { args, .. } => {
             rewrite_operands(args, aliases, locals);
         }
         Instruction::CallIndirect {
@@ -629,7 +629,7 @@ pub(crate) fn visit_instruction_uses<'a>(
                 visit_operand_use(operand, visitor);
             }
         }
-        Instruction::InvokeStatic { args, .. } => {
+        Instruction::InvokeStatic { args, .. } | Instruction::InvokeRustStatic { args, .. } => {
             visit_operand_uses(args, visitor);
         }
         Instruction::CallIndirect {
@@ -732,7 +732,8 @@ pub(crate) fn instruction_def(instruction: &Instruction) -> Option<&str> {
         Instruction::CallIndirect { dest, .. }
         | Instruction::InvokeInterface { dest, .. }
         | Instruction::InvokeVirtual { dest, .. }
-        | Instruction::InvokeStatic { dest, .. } => dest.as_deref(),
+        | Instruction::InvokeStatic { dest, .. }
+        | Instruction::InvokeRustStatic { dest, .. } => dest.as_deref(),
         Instruction::SourceLocation(_)
         | Instruction::LocalVariableScope(_)
         | Instruction::UnwindStart { .. }

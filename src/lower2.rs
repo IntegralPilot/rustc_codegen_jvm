@@ -3,11 +3,13 @@
 //! This module converts OOMIR into JVM bytecode.
 
 use crate::oomir::{self, DataType};
-use helpers::{get_cast_instructions, oomir_function_stack_floor};
+use helpers::{
+    get_cast_instructions, oomir_function_stack_floor, relative_pointer_call_stack_extra,
+};
 use jvm_gen::{
     create_data_type_classfile_for_class, create_data_type_classfile_for_interface,
-    create_default_constructor, create_slice_view_classfile, create_utf8_view_classfile,
-    oomir_type_to_ristretto_field_type,
+    create_default_constructor, create_relative_pointer_bridge, create_slice_view_classfile,
+    create_utf8_view_classfile, oomir_type_to_ristretto_field_type,
 };
 pub(crate) use translator::DebugInfoOptions;
 use translator::FunctionTranslator;
@@ -769,7 +771,7 @@ fn prepare_function_constants(
                         prepare(argument, false)?;
                     }
                 }
-                I::InvokeStatic { args, .. } => {
+                I::InvokeStatic { args, .. } | I::InvokeRustStatic { args, .. } => {
                     for argument in args {
                         prepare(argument, false)?;
                     }
@@ -1110,6 +1112,42 @@ pub fn oomir_to_jvm_bytecode(
     registry: &EmittedClassRegistry,
 ) -> jvm::Result<Vec<(String, PathBuf)>> {
     large_methods::outline_large_functions(&mut module)?;
+    let mut relative_static_methods = module
+        .functions
+        .values()
+        .filter(|function| {
+            function.signature.is_static
+                && function.name != "<init>"
+                && function.signature.supports_relative_pointer_abi()
+        })
+        .map(|function| {
+            oomir::FunctionKey::new(
+                module.owner_class_for_function(function),
+                &function.name,
+                &function.signature,
+            )
+        })
+        .collect::<HashSet<_>>();
+    for (class_name, data_type) in &module.data_types {
+        let oomir::DataType::Class { methods, .. } = data_type else {
+            continue;
+        };
+        for (method_name, method) in methods {
+            let oomir::DataTypeMethod::Function(function) = method else {
+                continue;
+            };
+            if function.signature.is_static
+                && method_name != "<init>"
+                && function.signature.supports_relative_pointer_abi()
+            {
+                relative_static_methods.insert(oomir::FunctionKey::new(
+                    class_name,
+                    method_name,
+                    &function.signature,
+                ));
+            }
+        }
+    }
     let output_ordinal = OUTPUT_DIRECTORY_COUNTER.fetch_add(1, Ordering::Relaxed);
     let output_directory = std::env::temp_dir().join(format!(
         "rustc-codegen-jvm-{}-{}-{output_ordinal}",
@@ -1248,6 +1286,9 @@ pub fn oomir_to_jvm_bytecode(
 
             let name_index = main_cp.add_utf8(&function.name)?;
             let descriptor_index = main_cp.add_utf8(&function.signature.to_string())?;
+            let use_relative_pointer_abi = relative_static_methods.contains(
+                &oomir::FunctionKey::new(&class_name_jvm, &function.name, &function.signature),
+            );
             prepare_function_constants(
                 &mut function,
                 &mut main_cp,
@@ -1269,9 +1310,11 @@ pub fn oomir_to_jvm_bytecode(
                 &mut main_cp, // Use the main class's constant pool
                 &mut bootstrap_methods,
                 &module,
+                &relative_static_methods,
                 true,
                 None, // No owner class for free functions
                 debug_info,
+                use_relative_pointer_abi,
             );
             let (jvm_code, max_locals_val, code_attributes, exception_table) = translator
                 .translate()
@@ -1283,7 +1326,8 @@ pub fn oomir_to_jvm_bytecode(
                     message: format!("Failed to translate function: {error:?}"),
                 })?;
 
-            let stack_floor = oomir_function_stack_floor(&function);
+            let stack_floor = oomir_function_stack_floor(&function)
+                .saturating_add(relative_pointer_call_stack_extra(&function));
             let max_stack_val = match jvm_code.max_stack(&main_cp) {
                 Ok(max_stack) => max_stack.saturating_mul(2).max(stack_floor),
                 Err(error) => {
@@ -1310,7 +1354,12 @@ pub fn oomir_to_jvm_bytecode(
 
             // Create MethodParameters attribute to preserve parameter names
             let mut parameters_for_attribute = Vec::new();
-            for (name, _) in &function.signature.params {
+            let emitted_signature = if use_relative_pointer_abi {
+                function.signature.relative_pointer_abi_signature()
+            } else {
+                function.signature.clone()
+            };
+            for (name, _) in &emitted_signature.params {
                 let name_index = main_cp.add_utf8(name)?;
                 parameters_for_attribute.push(jvm::attributes::MethodParameter {
                     name_index,
@@ -1322,7 +1371,6 @@ pub fn oomir_to_jvm_bytecode(
                 name_index: method_parameters_attribute_name_index,
                 parameters: parameters_for_attribute,
             };
-
             let mut method = jvm::Method::default();
             // Assume static for now, adjust if instance methods are needed
             method.access_flags = if function.name.starts_with(large_methods::METHOD_PREFIX) {
@@ -1336,8 +1384,25 @@ pub fn oomir_to_jvm_bytecode(
                 // Constructors cannot be static
                 method.access_flags = MethodAccessFlags::PUBLIC;
             }
-            method.name_index = name_index;
-            method.descriptor_index = descriptor_index;
+            method.name_index = if use_relative_pointer_abi {
+                main_cp.add_utf8(format!(
+                    "{}{}",
+                    function.name,
+                    oomir::RELATIVE_POINTER_METHOD_SUFFIX
+                ))?
+            } else {
+                name_index
+            };
+            method.descriptor_index = if use_relative_pointer_abi {
+                main_cp.add_utf8(
+                    function
+                        .signature
+                        .relative_pointer_abi_signature()
+                        .to_string(),
+                )?
+            } else {
+                descriptor_index
+            };
             method.attributes.push(code_attribute);
             // Add MethodParameters attribute (skip for constructors as they often have synthetic params)
             if function.name != "<init>" && !function.name.starts_with(large_methods::METHOD_PREFIX)
@@ -1346,6 +1411,22 @@ pub fn oomir_to_jvm_bytecode(
             }
 
             methods.push(method);
+            if use_relative_pointer_abi {
+                let bridge_flags = if function.name.starts_with(large_methods::METHOD_PREFIX) {
+                    MethodAccessFlags::PRIVATE
+                        | MethodAccessFlags::STATIC
+                        | MethodAccessFlags::SYNTHETIC
+                } else {
+                    MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC
+                };
+                methods.push(create_relative_pointer_bridge(
+                    &mut main_cp,
+                    &class_name_jvm,
+                    &function.name,
+                    &function,
+                    bridge_flags,
+                )?);
+            }
         }
 
         // Add a default constructor if none was provided in OOMIR
@@ -1461,6 +1542,7 @@ pub fn oomir_to_jvm_bytecode(
                     subclasses,
                     nest_host,
                     debug_info,
+                    &relative_static_methods,
                 )?;
                 emit_generated_class(
                     &mut generated_classes,

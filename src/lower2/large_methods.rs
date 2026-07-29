@@ -733,7 +733,7 @@ fn instruction_operands(instruction: &oomir::Instruction) -> Vec<&Operand> {
         I::ConstructObject { args, .. } => args.iter().map(|(operand, _)| operand).collect(),
         I::SetField { value, .. } => vec![value],
         I::GetField { object, .. } | I::Cast { op: object, .. } => vec![object],
-        I::InvokeStatic { args, .. } => args.iter().collect(),
+        I::InvokeStatic { args, .. } | I::InvokeRustStatic { args, .. } => args.iter().collect(),
         _ => Vec::new(),
     }
 }
@@ -774,6 +774,11 @@ fn instruction_definition_type(instruction: &oomir::Instruction) -> Option<(Stri
             ..
         }
         | I::InvokeStatic {
+            dest,
+            method_ty: signature,
+            ..
+        }
+        | I::InvokeRustStatic {
             dest,
             method_ty: signature,
             ..

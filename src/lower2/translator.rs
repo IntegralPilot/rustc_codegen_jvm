@@ -32,6 +32,7 @@ pub(crate) struct DebugInfoOptions {
 /// Represents the state during the translation of a single function's body.
 pub struct FunctionTranslator<'a, 'cp> {
     module: &'a oomir::Module,
+    relative_static_methods: &'a HashSet<oomir::FunctionKey>,
     oomir_func: &'a oomir::Function,
     constant_pool: &'cp mut InternedConstantPool,
     bootstrap_methods: &'cp mut Vec<BootstrapMethod>,
@@ -44,6 +45,7 @@ pub struct FunctionTranslator<'a, 'cp> {
     direct_field_projections: HashMap<String, DirectFieldProjection>,
     direct_cell_projections: HashMap<String, DirectCellProjection>,
     direct_cell_slots: HashMap<String, u16>,
+    known_function_pointer_adapters: HashMap<String, String>,
     next_local_index: u16,
     jvm_instructions: Vec<jvm::attributes::Instruction>,
     label_to_instr_index: HashMap<String, u16>, // OOMIR label -> JVM instruction index
@@ -123,17 +125,29 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         constant_pool: &'cp mut InternedConstantPool,
         bootstrap_methods: &'cp mut Vec<BootstrapMethod>,
         module: &'a oomir::Module,
+        relative_static_methods: &'a HashSet<oomir::FunctionKey>,
         is_static: bool,
         owner_class_name: Option<&str>,
         debug_info: DebugInfoOptions,
+        relative_pointer_abi: bool,
     ) -> Self {
-        let deferred_pointer_variables = deferred_pointer_variables(oomir_func);
+        let mut deferred_pointer_variables = deferred_pointer_variables(oomir_func);
+        if relative_pointer_abi {
+            let first_explicit_param = if is_static { 0 } else { 1 };
+            for (index, (_, ty)) in oomir_func.signature.params.iter().enumerate() {
+                if index >= first_explicit_param && matches!(ty, Type::Pointer(_)) {
+                    deferred_pointer_variables.insert(format!("_{}", index + 1));
+                }
+            }
+        }
         let direct_field_projections =
             direct_field_projections(oomir_func, module, &deferred_pointer_variables);
         let direct_cell_projections = direct_cell_projections(oomir_func);
+        let known_function_pointer_adapters = known_function_pointer_adapters(oomir_func);
         let mut translator = FunctionTranslator {
             oomir_func,
             module,
+            relative_static_methods,
             constant_pool,
             bootstrap_methods,
             local_var_map: HashMap::default(),
@@ -144,6 +158,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             direct_field_projections,
             direct_cell_projections,
             direct_cell_slots: HashMap::default(),
+            known_function_pointer_adapters,
             next_local_index: if is_static { 0 } else { 1 },
             jvm_instructions: Vec::new(),
             label_to_instr_index: HashMap::default(),
@@ -152,7 +167,13 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             current_oomir_block_label: String::new(),
             current_fallthrough_block_label: None,
             initial_locals: stackmaps::initial_locals_for_oomir_function(
-                oomir_func,
+                &if relative_pointer_abi {
+                    let mut function = oomir_func.clone();
+                    function.signature = function.signature.relative_pointer_abi_signature();
+                    function
+                } else {
+                    oomir_func.clone()
+                },
                 is_static,
                 owner_class_name,
             ),
@@ -230,6 +251,16 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
 
             // Use assign_local to allocate the slot
             let assigned_index = translator.assign_local(param_translator_name.as_str(), param_ty);
+            if relative_pointer_abi && matches!(param_ty, Type::Pointer(_)) {
+                let element_offset = translator.next_local_index;
+                let byte_offset = element_offset + 2;
+                translator.next_local_index += 4;
+                translator.max_locals_used =
+                    translator.max_locals_used.max(translator.next_local_index);
+                translator
+                    .pointer_offset_slots
+                    .insert(assigned_index, (element_offset, byte_offset));
+            }
 
             if is_synthetic_jvm_main_arg {
                 continue;
@@ -268,7 +299,8 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 .typed_local_var_map
                 .insert((param_oomir_name.clone(), param_ty.clone()), assigned_index);
 
-            if matches!(param_ty, Type::Pointer(_))
+            if !relative_pointer_abi
+                && matches!(param_ty, Type::Pointer(_))
                 && translator
                     .deferred_pointer_variables
                     .contains(&param_oomir_name)
@@ -696,6 +728,17 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
 
     fn load_pointer_components(&mut self, operand: &oomir::Operand) -> Result<(), jvm::Error> {
         if self.load_deferred_pointer_components(operand)? {
+            return Ok(());
+        }
+        if matches!(
+            operand,
+            oomir::Operand::Variable { name, ty: Type::Pointer(_) }
+                if self.direct_this_aliases.contains(name)
+        ) {
+            let pointer_ty = get_operand_type(operand);
+            self.load_jvm_receiver_as_pointer(operand, &pointer_ty)?;
+            self.jvm_instructions.push(Instruction::Lconst_0);
+            self.jvm_instructions.push(Instruction::Lconst_0);
             return Ok(());
         }
         self.load_operand(operand)?;
@@ -4044,19 +4087,49 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 args,
                 signature,
             } => {
+                let relative_adapter = match function_ptr.as_ref() {
+                    oomir::Operand::Constant(oomir::Constant::FunctionPointer {
+                        adapter_class,
+                        ..
+                    }) => Some(adapter_class.as_str()),
+                    oomir::Operand::Variable { name, .. } => self
+                        .known_function_pointer_adapters
+                        .get(name)
+                        .map(String::as_str),
+                    _ => None,
+                }
+                .filter(|_| signature.supports_relative_pointer_abi())
+                .map(str::to_string);
                 let interface_name = match function_ptr.get_type() {
                     Some(oomir::Type::Interface(name)) => name,
                     _ => signature.fn_ptr_interface_name(),
                 };
-                let class_index = self.constant_pool.add_class(&interface_name)?;
-                let descriptor = signature.to_jvm_descriptor_with_explicit_params();
-                let method_ref = self.constant_pool.add_interface_method_ref(
-                    class_index,
-                    "call",
-                    &descriptor,
-                )?;
+                let descriptor = relative_adapter.as_ref().map_or_else(
+                    || signature.to_jvm_descriptor_with_explicit_params(),
+                    |_| {
+                        signature
+                            .relative_pointer_abi_signature()
+                            .to_jvm_descriptor_with_explicit_params()
+                    },
+                );
+                let method_ref = if let Some(adapter_class) = &relative_adapter {
+                    let class_index = self.constant_pool.add_class(adapter_class)?;
+                    self.constant_pool.add_method_ref(
+                        class_index,
+                        &format!("call{}", oomir::RELATIVE_POINTER_METHOD_SUFFIX),
+                        &descriptor,
+                    )?
+                } else {
+                    let class_index = self.constant_pool.add_class(&interface_name)?;
+                    self.constant_pool
+                        .add_interface_method_ref(class_index, "call", &descriptor)?
+                };
 
                 self.load_operand(function_ptr)?;
+                if let Some(adapter_class) = &relative_adapter {
+                    let class_index = self.constant_pool.add_class(adapter_class)?;
+                    self.jvm_instructions.push(JI::Checkcast(class_index));
+                }
                 if args.len() != signature.params.len() {
                     return Err(jvm::Error::VerificationError {
                         context: format!("Function {}", self.oomir_func.name),
@@ -4068,12 +4141,20 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     });
                 }
                 for (arg, (_, expected_ty)) in args.iter().zip(signature.params.iter()) {
-                    self.load_call_argument_as(arg, expected_ty)?;
+                    if relative_adapter.is_some() && matches!(expected_ty, Type::Pointer(_)) {
+                        self.load_pointer_components(arg)?;
+                    } else {
+                        self.load_call_argument_as(arg, expected_ty)?;
+                    }
                 }
 
-                let count = self.invokeinterface_count(args)?;
-                self.jvm_instructions
-                    .push(JI::Invokeinterface(method_ref, count));
+                if relative_adapter.is_some() {
+                    self.jvm_instructions.push(JI::Invokevirtual(method_ref));
+                } else {
+                    let count = self.invokeinterface_count(args)?;
+                    self.jvm_instructions
+                        .push(JI::Invokeinterface(method_ref, count));
+                }
 
                 if let Some(dest_var) = dest {
                     if signature.ret.has_jvm_value() {
@@ -5615,6 +5696,21 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 self.load_jvm_receiver_as_pointer(&args[0], &method_ty.ret)?;
                 self.store_result(dest, &method_ty.ret)?;
             }
+            OI::InvokeRustStatic {
+                dest,
+                class_name,
+                method_name,
+                method_ty,
+                args,
+            } => {
+                self.translate_rust_static_call(
+                    dest.as_deref(),
+                    class_name,
+                    method_name,
+                    method_ty,
+                    args,
+                )?;
+            }
             OI::InvokeStatic {
                 dest,
                 class_name,
@@ -5622,6 +5718,19 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 method_ty,
                 args,
             } => {
+                let method_key = oomir::FunctionKey::new(class_name, method_name, method_ty);
+                let use_relative_pointer_abi = self.relative_static_methods.contains(&method_key)
+                    && method_ty.supports_relative_pointer_abi();
+                let invoked_name = if use_relative_pointer_abi {
+                    format!("{method_name}{}", oomir::RELATIVE_POINTER_METHOD_SUFFIX)
+                } else {
+                    method_name.clone()
+                };
+                let invoked_signature = if use_relative_pointer_abi {
+                    method_ty.relative_pointer_abi_signature()
+                } else {
+                    method_ty.clone()
+                };
                 // 1. Add Method reference to constant pool
                 let class_index = self.constant_pool.add_class(class_name)?;
                 let method_ref_index = if matches!(
@@ -5631,14 +5740,14 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 {
                     self.constant_pool.add_interface_method_ref(
                         class_index,
-                        method_name,
-                        &method_ty.to_string(),
+                        &invoked_name,
+                        &invoked_signature.to_string(),
                     )?
                 } else {
                     self.constant_pool.add_method_ref(
                         class_index,
-                        method_name,
-                        &method_ty.to_string(),
+                        &invoked_name,
+                        &invoked_signature.to_string(),
                     )?
                 };
 
@@ -5655,7 +5764,11 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     });
                 }
                 for (arg, (_, expected_ty)) in args.iter().zip(method_ty.params.iter()) {
-                    self.load_call_argument_as(arg, expected_ty)?;
+                    if use_relative_pointer_abi && matches!(expected_ty, Type::Pointer(_)) {
+                        self.load_pointer_components(arg)?;
+                    } else {
+                        self.load_call_argument_as(arg, expected_ty)?;
+                    }
                 }
 
                 // 3. Emit 'invokestatic' instruction
@@ -5675,6 +5788,81 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                         _ => {}
                     }
                 }
+            }
+        }
+        Ok(())
+    }
+
+    fn translate_rust_static_call(
+        &mut self,
+        dest: Option<&str>,
+        class_name: &str,
+        method_name: &str,
+        method_ty: &oomir::Signature,
+        args: &[oomir::Operand],
+    ) -> Result<(), jvm::Error> {
+        let method_key = oomir::FunctionKey::new(class_name, method_name, method_ty);
+        let use_relative_pointer_abi = method_ty.supports_relative_pointer_abi()
+            && (!crate::lower1::naming::is_global_link_symbol_class(class_name)
+                || self.relative_static_methods.contains(&method_key));
+        let invoked_name = if use_relative_pointer_abi {
+            format!("{method_name}{}", oomir::RELATIVE_POINTER_METHOD_SUFFIX)
+        } else {
+            method_name.to_string()
+        };
+        let invoked_signature = if use_relative_pointer_abi {
+            method_ty.relative_pointer_abi_signature()
+        } else {
+            method_ty.clone()
+        };
+        let class_index = self.constant_pool.add_class(class_name)?;
+        let method_ref = if matches!(
+            self.module.data_types.get(class_name),
+            Some(oomir::DataType::Interface { .. })
+        ) || self.module.external_interfaces.contains(class_name)
+        {
+            self.constant_pool.add_interface_method_ref(
+                class_index,
+                &invoked_name,
+                &invoked_signature.to_string(),
+            )?
+        } else {
+            self.constant_pool.add_method_ref(
+                class_index,
+                &invoked_name,
+                &invoked_signature.to_string(),
+            )?
+        };
+        if args.len() != method_ty.params.len() {
+            return Err(jvm::Error::VerificationError {
+                context: format!("Function {}", self.oomir_func.name),
+                message: format!(
+                    "Argument count mismatch for Rust static method '{}.{}': expected {}, found {}",
+                    class_name,
+                    method_name,
+                    method_ty.params.len(),
+                    args.len()
+                ),
+            });
+        }
+        for (arg, (_, expected_ty)) in args.iter().zip(method_ty.params.iter()) {
+            if use_relative_pointer_abi && matches!(expected_ty, Type::Pointer(_)) {
+                self.load_pointer_components(arg)?;
+            } else {
+                self.load_call_argument_as(arg, expected_ty)?;
+            }
+        }
+        self.jvm_instructions
+            .push(Instruction::Invokestatic(method_ref));
+        if let Some(dest) = dest {
+            if method_ty.ret.has_jvm_value() {
+                self.store_result(dest, &method_ty.ret)?;
+            }
+        } else if method_ty.ret.has_jvm_value() {
+            match get_type_size(&method_ty.ret) {
+                1 => self.jvm_instructions.push(Instruction::Pop),
+                2 => self.jvm_instructions.push(Instruction::Pop2),
+                _ => {}
             }
         }
         Ok(())
@@ -6593,6 +6781,70 @@ fn instruction_destination(instruction: &oomir::Instruction) -> Option<&str> {
     }
 }
 
+fn known_function_pointer_adapters(function: &oomir::Function) -> HashMap<String, String> {
+    let mut adapters = HashMap::<String, HashSet<String>>::default();
+    let mut moves = Vec::<(String, String)>::new();
+    let mut invalid = HashSet::<String>::default();
+
+    for block in function.body.basic_blocks.values() {
+        for instruction in &block.instructions {
+            let Some(dest) = instruction_destination(instruction) else {
+                continue;
+            };
+            match instruction {
+                oomir::Instruction::Move {
+                    src:
+                        oomir::Operand::Constant(oomir::Constant::FunctionPointer {
+                            adapter_class, ..
+                        }),
+                    ..
+                } => {
+                    adapters
+                        .entry(dest.to_string())
+                        .or_default()
+                        .insert(adapter_class.clone());
+                }
+                oomir::Instruction::Move {
+                    src: oomir::Operand::Variable { name, .. },
+                    ..
+                } => moves.push((dest.to_string(), name.clone())),
+                _ => {
+                    invalid.insert(dest.to_string());
+                }
+            }
+        }
+    }
+
+    loop {
+        let mut changed = false;
+        for (dest, source) in &moves {
+            let Some(source_adapters) = adapters.get(source).cloned() else {
+                continue;
+            };
+            let dest_adapters = adapters.entry(dest.clone()).or_default();
+            let old_len = dest_adapters.len();
+            dest_adapters.extend(source_adapters);
+            changed |= dest_adapters.len() != old_len;
+        }
+        if !changed {
+            break;
+        }
+    }
+    for (dest, source) in moves {
+        if adapters.get(&source).is_none_or(|values| values.len() != 1) {
+            invalid.insert(dest);
+        }
+    }
+
+    adapters
+        .into_iter()
+        .filter_map(|(name, adapters)| {
+            (!invalid.contains(&name) && adapters.len() == 1)
+                .then(|| (name, adapters.into_iter().next().unwrap()))
+        })
+        .collect()
+}
+
 fn operand_uses_name(operand: &oomir::Operand, name: &str) -> bool {
     operand.get_name() == Some(name)
 }
@@ -6635,7 +6887,9 @@ fn instruction_uses_name(instruction: &oomir::Instruction, name: &str) -> bool {
         I::InvokeInterface { operand, args, .. } | I::InvokeVirtual { operand, args, .. } => {
             operand_uses_name(operand, name) || operands_use_name(args, name)
         }
-        I::InvokeStatic { args, .. } => operands_use_name(args, name),
+        I::InvokeStatic { args, .. } | I::InvokeRustStatic { args, .. } => {
+            operands_use_name(args, name)
+        }
         I::Switch { discr, .. } => operand_uses_name(discr, name),
         I::NewArray { size, .. } => operand_uses_name(size, name),
         I::ArrayStore {

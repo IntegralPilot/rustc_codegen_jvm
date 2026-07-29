@@ -124,7 +124,8 @@ pub fn oomir_function_stack_floor(function: &oomir::Function) -> u16 {
                         2,
                     ));
                 }
-                oomir::Instruction::InvokeStatic { args, .. } => {
+                oomir::Instruction::InvokeStatic { args, .. }
+                | oomir::Instruction::InvokeRustStatic { args, .. } => {
                     floor = floor.max(operand_sequence_stack_floor(args, 0));
                 }
                 oomir::Instruction::CallIndirect {
@@ -169,6 +170,39 @@ pub fn oomir_function_stack_floor(function: &oomir::Function) -> u16 {
         }
     }
     floor
+}
+
+/// Deferred thin pointers add two `long` components at internal call sites.
+/// Ristretto's generic max-stack estimator does not know about this lower2 ABI
+/// expansion, so reserve the extra JVM slots described by the OOMIR calls.
+pub fn relative_pointer_call_stack_extra(function: &oomir::Function) -> u16 {
+    let mut max_pointers = function
+        .signature
+        .explicit_jvm_params()
+        .iter()
+        .filter(|(_, ty)| matches!(ty, Type::Pointer(_)))
+        .count();
+    for block in function.body.basic_blocks.values() {
+        for instruction in &block.instructions {
+            let args = match instruction {
+                oomir::Instruction::InvokeStatic { args, .. }
+                | oomir::Instruction::InvokeRustStatic { args, .. }
+                | oomir::Instruction::CallIndirect { args, .. } => Some(args.as_slice()),
+                _ => None,
+            };
+            if let Some(args) = args {
+                max_pointers = max_pointers.max(
+                    args.iter()
+                        .filter(|arg| matches!(arg.get_type(), Some(Type::Pointer(_))))
+                        .count(),
+                );
+            }
+        }
+    }
+    max_pointers
+        .saturating_mul(4)
+        .try_into()
+        .unwrap_or(u16::MAX)
 }
 
 /// Gets the appropriate type-specific load instruction.

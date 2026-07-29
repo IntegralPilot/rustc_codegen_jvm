@@ -6,6 +6,7 @@ use super::{
     consts::{get_int_const_instr, load_constant},
     helpers::{
         get_cast_instructions, get_load_instruction, get_type_size, oomir_function_stack_floor,
+        relative_pointer_call_stack_extra,
     },
     optimise2, stackmaps,
 };
@@ -1111,6 +1112,59 @@ fn return_instruction_for_type(ty: &Type) -> Instruction {
     }
 }
 
+pub(super) fn create_relative_pointer_bridge(
+    cp: &mut InternedConstantPool,
+    class_name: &str,
+    method_name: &str,
+    function: &oomir::Function,
+    access_flags: MethodAccessFlags,
+) -> jvm::Result<jvm::Method> {
+    debug_assert!(function.signature.is_static);
+    let relative_signature = function.signature.relative_pointer_abi_signature();
+    let relative_name = format!("{method_name}{}", oomir::RELATIVE_POINTER_METHOD_SUFFIX);
+    let class_index = cp.add_class(class_name)?;
+    let target = cp.add_method_ref(class_index, &relative_name, &relative_signature.to_string())?;
+
+    let mut instructions = Vec::new();
+    let mut local = 0u16;
+    let mut stack = 0u16;
+    let mut max_stack = 0u16;
+    for (_, ty) in &function.signature.params {
+        if !ty.has_jvm_value() {
+            continue;
+        }
+        instructions.push(get_load_instruction(ty, local)?);
+        let size = get_type_size(ty);
+        local += size;
+        stack += size;
+        if matches!(ty, Type::Pointer(_)) {
+            instructions.push(Instruction::Lconst_0);
+            instructions.push(Instruction::Lconst_0);
+            stack += 4;
+        }
+        max_stack = max_stack.max(stack);
+    }
+    instructions.push(Instruction::Invokestatic(target));
+    instructions.push(return_instruction_for_type(&function.signature.ret));
+
+    let descriptor = function.signature.to_string();
+    Ok(jvm::Method {
+        access_flags,
+        name_index: cp.add_utf8(method_name)?,
+        descriptor_index: cp.add_utf8(&descriptor)?,
+        attributes: vec![code_attribute_for_descriptor(
+            cp,
+            max_stack.max(get_type_size(&function.signature.ret)),
+            local,
+            instructions,
+            &descriptor,
+            true,
+            Some(class_name),
+            method_name,
+        )?],
+    })
+}
+
 fn create_static_instance_bridge(
     cp: &mut InternedConstantPool,
     class_name_jvm: &str,
@@ -1390,6 +1444,7 @@ pub(super) fn create_data_type_classfile_for_class(
     subclasses: Vec<String>,
     nest_host: Option<String>,
     debug_info: DebugInfoOptions,
+    relative_static_methods: &HashSet<oomir::FunctionKey>,
 ) -> jvm::Result<Vec<u8>> {
     let source_files = methods
         .values()
@@ -1514,6 +1569,16 @@ pub(super) fn create_data_type_classfile_for_class(
             }
             DataTypeMethod::Function(function) => {
                 let mut function = function.clone();
+                let relative_adapter_method = method_name
+                    .ends_with(oomir::RELATIVE_POINTER_METHOD_SUFFIX)
+                    && function.signature.supports_relative_pointer_abi();
+                let relative_static_method = function.signature.is_static
+                    && relative_static_methods.contains(&oomir::FunctionKey::new(
+                        class_name_jvm,
+                        method_name,
+                        &function.signature,
+                    ));
+                let use_relative_pointer_abi = relative_adapter_method || relative_static_method;
                 super::prepare_function_constants(
                     &mut function,
                     &mut cp,
@@ -1542,9 +1607,11 @@ pub(super) fn create_data_type_classfile_for_class(
                     &mut cp,
                     &mut bootstrap_methods,
                     module,
+                    relative_static_methods,
                     function.signature.is_static,
                     owner_class,
                     debug_info,
+                    use_relative_pointer_abi,
                 );
                 let (jvm_code, max_locals_val, code_attributes, exception_table) = translator
                     .translate()
@@ -1553,7 +1620,8 @@ pub(super) fn create_data_type_classfile_for_class(
                         message: format!("Failed to translate function: {error:?}"),
                     })?;
 
-                let stack_floor = oomir_function_stack_floor(&function);
+                let stack_floor = oomir_function_stack_floor(&function)
+                    .saturating_add(relative_pointer_call_stack_extra(&function));
                 let max_stack_val = match jvm_code.max_stack(&cp) {
                     Ok(max_stack) => max_stack.saturating_mul(2).max(stack_floor),
                     Err(error) => {
@@ -1581,7 +1649,12 @@ pub(super) fn create_data_type_classfile_for_class(
                 // Create MethodParameters attribute to preserve parameter names
                 // For instance methods where the first param is self, skip it as it's implicit in JVM
                 let mut parameters_for_attribute = Vec::new();
-                for (name, param_ty) in function.signature.explicit_jvm_params() {
+                let emitted_signature = if use_relative_pointer_abi {
+                    function.signature.relative_pointer_abi_signature()
+                } else {
+                    function.signature.clone()
+                };
+                for (name, param_ty) in emitted_signature.explicit_jvm_params() {
                     if !param_ty.has_jvm_value() {
                         continue;
                     }
@@ -1597,8 +1670,13 @@ pub(super) fn create_data_type_classfile_for_class(
                     parameters: parameters_for_attribute,
                 };
 
-                let name_index = cp.add_utf8(method_name)?;
-                let descriptor_index = cp.add_utf8(&function.signature.to_string())?;
+                let emitted_method_name = if relative_static_method {
+                    format!("{method_name}{}", oomir::RELATIVE_POINTER_METHOD_SUFFIX)
+                } else {
+                    method_name.clone()
+                };
+                let name_index = cp.add_utf8(&emitted_method_name)?;
+                let descriptor_index = cp.add_utf8(&emitted_signature.to_string())?;
 
                 let mut attributes_vec = vec![code_attribute];
                 // Skip MethodParameters for constructors and getVariantIdx
@@ -1618,7 +1696,19 @@ pub(super) fn create_data_type_classfile_for_class(
                 };
 
                 jvm_methods.push(jvm_method);
-                if !function.signature.is_static && !function.signature.params.is_empty() {
+                if relative_static_method {
+                    jvm_methods.push(create_relative_pointer_bridge(
+                        &mut cp,
+                        class_name_jvm,
+                        method_name,
+                        &function,
+                        MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
+                    )?);
+                }
+                if !function.signature.is_static
+                    && !function.signature.params.is_empty()
+                    && !relative_adapter_method
+                {
                     jvm_methods.push(create_static_instance_bridge(
                         &mut cp,
                         class_name_jvm,

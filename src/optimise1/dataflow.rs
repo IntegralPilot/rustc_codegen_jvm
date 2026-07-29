@@ -1197,6 +1197,13 @@ pub fn process_block_instructions(
                 method_name,
                 method_ty,
                 args,
+            }
+            | Instruction::InvokeRustStatic {
+                dest,
+                class_name,
+                method_name,
+                method_ty,
+                args,
             } => {
                 // Propagate constants in arguments
                 let new_args: Vec<Operand> = args
@@ -1251,13 +1258,24 @@ pub fn process_block_instructions(
                         keep
                     });
                 }
-                optimised_instruction = Instruction::InvokeStatic {
-                    dest: dest.clone(),
-                    class_name: class_name.clone(),
-                    method_name: method_name.clone(),
-                    method_ty: method_ty.clone(),
-                    args: new_args,
-                };
+                optimised_instruction =
+                    if matches!(instruction, Instruction::InvokeRustStatic { .. }) {
+                        Instruction::InvokeRustStatic {
+                            dest: dest.clone(),
+                            class_name: class_name.clone(),
+                            method_name: method_name.clone(),
+                            method_ty: method_ty.clone(),
+                            args: new_args,
+                        }
+                    } else {
+                        Instruction::InvokeStatic {
+                            dest: dest.clone(),
+                            class_name: class_name.clone(),
+                            method_name: method_name.clone(),
+                            method_ty: method_ty.clone(),
+                            args: new_args,
+                        }
+                    };
                 keep_original_instruction = true;
             }
 
@@ -1413,7 +1431,8 @@ fn instruction_destination(instruction: &Instruction) -> Option<&str> {
         Instruction::CallIndirect { dest, .. }
         | Instruction::InvokeInterface { dest, .. }
         | Instruction::InvokeVirtual { dest, .. }
-        | Instruction::InvokeStatic { dest, .. } => dest.as_deref(),
+        | Instruction::InvokeStatic { dest, .. }
+        | Instruction::InvokeRustStatic { dest, .. } => dest.as_deref(),
         Instruction::SourceLocation(_)
         | Instruction::LocalVariableScope(_)
         | Instruction::UnwindStart { .. }
