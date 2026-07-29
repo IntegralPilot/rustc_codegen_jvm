@@ -482,6 +482,7 @@ public final class Pointer {
     private static final int ATOMIC_SEQ_CST = 4;
     private static final Object[] ATOMIC_STRIPES = createAtomicStripes();
     private static final Object ATOMIC_SEQUENCE_LOCK = new Object();
+    private static final Object[] EMPTY_UNION_OBJECT_STORAGE = new Object[0];
     private static final AtomicLong ATOMIC_FENCE_EPOCH = new AtomicLong();
     @SuppressWarnings("unchecked")
     private static <V> Map<Object, V>[] createWeakMapStripes() {
@@ -10230,10 +10231,20 @@ public final class Pointer {
             int targetOffset,
             int size) {
         System.arraycopy(sourceBytes, sourceOffset, targetBytes, targetOffset, size);
-        System.arraycopy(sourceObjects, sourceOffset, targetObjects, targetOffset, size);
+        if (targetObjects.length != 0) {
+            if (sourceObjects.length == 0) {
+                Arrays.fill(targetObjects, targetOffset, targetOffset + size, null);
+            } else {
+                System.arraycopy(sourceObjects, sourceOffset, targetObjects, targetOffset, size);
+            }
+        }
         transferEncodedPointers(
                 sourceBytes, sourceOffset, targetBytes, targetOffset, size, false);
         transferEncodedReferences(sourceBytes, targetBytes);
+    }
+
+    public static Object[] emptyUnionObjectStorage() {
+        return EMPTY_UNION_OBJECT_STORAGE;
     }
 
     private static byte[] encodeAggregate(String codecClassName, Object value) {

@@ -228,6 +228,29 @@ fn object_array_type() -> oomir::Type {
     oomir::Type::Array(Box::new(oomir::Type::Class("java/lang/Object".to_string())))
 }
 
+fn allocate_union_object_storage(dest: impl Into<String>, size: usize) -> oomir::Instruction {
+    let dest = dest.into();
+    if size == 0 {
+        oomir::Instruction::InvokeStatic {
+            dest: Some(dest),
+            class_name: oomir::POINTER_CLASS.to_string(),
+            method_name: "emptyUnionObjectStorage".to_string(),
+            method_ty: oomir::Signature {
+                params: Vec::new(),
+                ret: Box::new(object_array_type()),
+                is_static: true,
+            },
+            args: Vec::new(),
+        }
+    } else {
+        oomir::Instruction::NewArray {
+            dest,
+            element_type: oomir::Type::Class("java/lang/Object".to_string()),
+            size: oomir::Operand::Constant(oomir::Constant::I32(size as i32)),
+        }
+    }
+}
+
 fn next_union_temp(prefix: &str, counter: &mut usize) -> String {
     let temp = format!("{}_{}", prefix, *counter);
     *counter += 1;
@@ -364,6 +387,90 @@ fn resolve_union_ty<'tcx>(
         .instantiate(tcx, instance_context.args)
         .skip_norm_wip();
     Ok(normalize_union_ty(tcx, instantiated).unwrap_or(instantiated))
+}
+
+fn needs_union_object_storage_inner<'tcx>(
+    ty: Ty<'tcx>,
+    tcx: TyCtxt<'tcx>,
+    instance_context: rustc_middle::ty::Instance<'tcx>,
+    visiting: &mut HashSet<Ty<'tcx>>,
+) -> Result<bool, String> {
+    let ty = resolve_union_ty(tcx, ty, instance_context)?;
+    if layout_size_bytes(tcx, ty)? == 0 {
+        return Ok(false);
+    }
+    if !visiting.insert(ty) {
+        return Ok(true);
+    }
+    let needs_objects = match ty.kind() {
+        TyKind::Bool | TyKind::Char | TyKind::Int(_) | TyKind::Uint(_) | TyKind::Float(_) => false,
+        TyKind::Pat(inner, _) | TyKind::Array(inner, _) => {
+            needs_union_object_storage_inner(*inner, tcx, instance_context, visiting)?
+        }
+        TyKind::Tuple(elements) => {
+            let mut needs_objects = false;
+            for element in elements.iter() {
+                needs_objects |=
+                    needs_union_object_storage_inner(element, tcx, instance_context, visiting)?;
+                if needs_objects {
+                    break;
+                }
+            }
+            needs_objects
+        }
+        TyKind::Closure(_, args) => {
+            let mut needs_objects = false;
+            for capture in args.as_closure().upvar_tys() {
+                needs_objects |=
+                    needs_union_object_storage_inner(capture, tcx, instance_context, visiting)?;
+                if needs_objects {
+                    break;
+                }
+            }
+            needs_objects
+        }
+        TyKind::Adt(adt_def, args)
+            if adt_def.is_struct() || adt_def.is_enum() || adt_def.is_union() =>
+        {
+            let mut needs_objects = false;
+            for field in adt_def
+                .variants()
+                .iter()
+                .flat_map(|variant| variant.fields.iter())
+            {
+                let field_ty = field.ty(tcx, args).skip_norm_wip();
+                needs_objects |=
+                    needs_union_object_storage_inner(field_ty, tcx, instance_context, visiting)?;
+                if needs_objects {
+                    break;
+                }
+            }
+            needs_objects
+        }
+        // These carriers retain JVM objects in addition to their encoded address.
+        TyKind::RawPtr(_, _)
+        | TyKind::Ref(_, _, _)
+        | TyKind::FnPtr(..)
+        | TyKind::Dynamic(..)
+        | TyKind::Coroutine(..) => true,
+        _ => true,
+    };
+    visiting.remove(&ty);
+    Ok(needs_objects)
+}
+
+fn union_object_storage_size<'tcx>(
+    ty: Ty<'tcx>,
+    rust_size: usize,
+    tcx: TyCtxt<'tcx>,
+    instance_context: rustc_middle::ty::Instance<'tcx>,
+) -> usize {
+    let mut visiting = HashSet::default();
+    if needs_union_object_storage_inner(ty, tcx, instance_context, &mut visiting).unwrap_or(true) {
+        rust_size.max(1)
+    } else {
+        0
+    }
 }
 
 pub(super) fn simple_enum_union_size<'tcx>(
@@ -3921,6 +4028,8 @@ fn emit_ty_from_union_bytes<'tcx>(
         }
         TyKind::Adt(adt_def, _) if adt_def.is_union() => {
             let union_size = layout_size_bytes(tcx, ty)?;
+            let object_storage_size =
+                union_object_storage_size(ty, union_size, tcx, instance_context);
             let union_oomir_ty = ty_to_oomir_type(ty, tcx, data_types, instance_context);
             let oomir::Type::Class(union_class) = &union_oomir_ty else {
                 return Err(format!("union {ty:?} did not map to a JVM class"));
@@ -3932,11 +4041,10 @@ fn emit_ty_from_union_bytes<'tcx>(
                 element_type: oomir::Type::I8,
                 size: oomir::Operand::Constant(oomir::Constant::I32(union_size as i32)),
             });
-            instructions.push(oomir::Instruction::NewArray {
-                dest: objects_dest.clone(),
-                element_type: oomir::Type::Class("java/lang/Object".to_string()),
-                size: oomir::Operand::Constant(oomir::Constant::I32(union_size.max(1) as i32)),
-            });
+            instructions.push(allocate_union_object_storage(
+                objects_dest.clone(),
+                object_storage_size,
+            ));
             let nested_storage =
                 JvmUnionStorage::at_start(bytes_dest.clone(), objects_dest.clone());
             emit_union_storage_copy(
@@ -5227,6 +5335,7 @@ pub(super) fn ensure_pointer_memory_codec<'tcx>(
     }
 
     let bytes_ty = byte_array_type();
+    let object_storage_size = union_object_storage_size(ty, size, tcx, instance_context);
 
     let mut encode_instructions = vec![
         oomir::Instruction::NewArray {
@@ -5234,11 +5343,7 @@ pub(super) fn ensure_pointer_memory_codec<'tcx>(
             element_type: oomir::Type::I8,
             size: oomir::Operand::Constant(oomir::Constant::I32(size as i32)),
         },
-        oomir::Instruction::NewArray {
-            dest: "_objects".to_string(),
-            element_type: oomir::Type::Class("java/lang/Object".to_string()),
-            size: oomir::Operand::Constant(oomir::Constant::I32(size.max(1) as i32)),
-        },
+        allocate_union_object_storage("_objects", object_storage_size),
     ];
     let encode_storage = JvmUnionStorage::at_start("_bytes", "_objects");
     let mut encode_counter = 0;
@@ -5278,11 +5383,10 @@ pub(super) fn ensure_pointer_memory_codec<'tcx>(
         body: simple_body(encode_instructions),
     };
 
-    let mut decode_instructions = vec![oomir::Instruction::NewArray {
-        dest: "_objects".to_string(),
-        element_type: oomir::Type::Class("java/lang/Object".to_string()),
-        size: oomir::Operand::Constant(oomir::Constant::I32(size.max(1) as i32)),
-    }];
+    let mut decode_instructions = vec![allocate_union_object_storage(
+        "_objects",
+        object_storage_size,
+    )];
     let decode_storage = JvmUnionStorage::at_start("_1", "_objects");
     let mut decode_counter = 0;
     let decoded = match emit_ty_from_union_bytes(
@@ -5658,6 +5762,7 @@ fn simple_body(instructions: Vec<oomir::Instruction>) -> oomir::CodeBlock {
 fn union_from_function<'tcx>(
     union_class: &str,
     union_size: usize,
+    object_storage_size: usize,
     field_name: &str,
     field_ty: Ty<'tcx>,
     field_oomir_ty: oomir::Type,
@@ -5672,11 +5777,7 @@ fn union_from_function<'tcx>(
             element_type: oomir::Type::I8,
             size: oomir::Operand::Constant(oomir::Constant::I32(union_size as i32)),
         },
-        oomir::Instruction::NewArray {
-            dest: "_objects".to_string(),
-            element_type: oomir::Type::Class("java/lang/Object".to_string()),
-            size: oomir::Operand::Constant(oomir::Constant::I32(union_size.max(1) as i32)),
-        },
+        allocate_union_object_storage("_objects", object_storage_size),
     ];
     let mut temp_counter = 0;
     let storage = JvmUnionStorage::at_start("_bytes", "_objects");
@@ -5943,6 +6044,8 @@ pub fn ensure_union_data_type<'tcx>(
     // Unresolved generic unions use one byte plus the object slot at offset zero.
     // Concrete monomorphizations replace this with their exact rustc layout.
     let union_size = layout_size_bytes(tcx, union_ty).unwrap_or(1);
+    let object_storage_size =
+        union_object_storage_size(union_ty, union_size, tcx, instance_context);
 
     let variant = adt_def.variant(0usize.into());
     let mut methods = HashMap::default();
@@ -5958,6 +6061,7 @@ pub fn ensure_union_data_type<'tcx>(
             DataTypeMethod::Function(union_from_function(
                 &union_class,
                 union_size,
+                object_storage_size,
                 &field_name,
                 field_ty,
                 field_oomir_ty.clone(),
