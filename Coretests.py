@@ -45,6 +45,7 @@ CONFIG = SuiteConfig(
     build_schema="coretests-build-v2",
     default_ignored_tests=DEFAULT_IGNORED_TESTS,
     java_options=("-XX:+UseParallelGC",),
+    default_jobs=4,
 )
 
 

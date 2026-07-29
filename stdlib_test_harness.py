@@ -612,6 +612,12 @@ def write_report(config: SuiteConfig, report: dict[str, Any], path: Path) -> Non
 
 
 def run_suite(config: SuiteConfig, argv: Sequence[str] | None = None) -> int:
+    available_jobs = (
+        os.process_cpu_count()
+        if hasattr(os, "process_cpu_count")
+        else os.cpu_count()
+    ) or 1
+    default_jobs = min(available_jobs, config.default_jobs or 4)
     parser = argparse.ArgumentParser(description=config.description)
     parser.add_argument("--release", action="store_true", help="Build in release mode")
     parser.add_argument("--filter", help="Only run test names containing this text")
@@ -622,7 +628,7 @@ def run_suite(config: SuiteConfig, argv: Sequence[str] | None = None) -> int:
         "-j",
         "--jobs",
         type=int,
-        default=config.default_jobs or min(os.cpu_count() or 1, 4),
+        default=default_jobs,
     )
     parser.add_argument(
         "--timeout",

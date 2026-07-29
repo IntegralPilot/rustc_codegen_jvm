@@ -21,6 +21,7 @@ CONFIG = SuiteConfig(
     default_ignored_tests=DEFAULT_IGNORED_TESTS,
     java_options=("-XX:+UseParallelGC",),
     include_upstream_ignored_with_defaults=True,
+    default_jobs=6,
 )
 
 
