@@ -1450,8 +1450,16 @@ public final class Pointer {
         private final CodecDecoder decode;
         private final CodecBinder bind;
         private final MethodHandle unionBytes;
+        private final MethodHandle unionObjects;
+        private final int arrayElementSize;
+        private final String arrayElementCodec;
 
-        private CodecPlan(Method encode, Method decode, Method bind)
+        private CodecPlan(
+                Method encode,
+                Method decode,
+                Method bind,
+                Method arrayElementSize,
+                Method arrayElementCodec)
                 throws IllegalAccessException {
             encodeParameterType = encode.getParameterTypes()[0];
             MethodHandles.Lookup lookup = MethodHandles.lookup();
@@ -1489,6 +1497,7 @@ public final class Pointer {
                                                 Pointer.class,
                                                 bind.getParameterTypes()[1]));
                 MethodHandle directUnionBytes = null;
+                MethodHandle directUnionObjects = null;
                 try {
                     Field bytes = encodeParameterType.getField("_bytes");
                     Field objects = encodeParameterType.getField("_objects");
@@ -1496,11 +1505,23 @@ public final class Pointer {
                             && objects.getType() == Object[].class) {
                         directUnionBytes = lookup.unreflectGetter(bytes).asType(
                                 MethodType.methodType(byte[].class, Object.class));
+                        directUnionObjects = lookup.unreflectGetter(objects).asType(
+                                MethodType.methodType(Object[].class, Object.class));
                     }
                 } catch (NoSuchFieldException ignored) {
                     // Ordinary generated aggregates use their encode/decode methods.
                 }
                 unionBytes = directUnionBytes;
+                unionObjects = directUnionObjects;
+                if (arrayElementSize == null || arrayElementCodec == null) {
+                    this.arrayElementSize = -1;
+                    this.arrayElementCodec = null;
+                } else {
+                    this.arrayElementSize =
+                            (int) lookup.unreflect(arrayElementSize).invokeExact();
+                    this.arrayElementCodec =
+                            (String) lookup.unreflect(arrayElementCodec).invokeExact();
+                }
             } catch (Throwable error) {
                 throw new IllegalAccessException(
                         "could not create pointer codec call adapter: " + error);
@@ -1520,6 +1541,27 @@ public final class Pointer {
                 throw new IllegalStateException(
                         "could not access generated Rust union storage", error);
             }
+        }
+
+        private Object[] directUnionObjects(Object value) {
+            if (unionObjects == null || value == null
+                    || !encodeParameterType.isInstance(value)) {
+                return null;
+            }
+            try {
+                return (Object[]) unionObjects.invokeExact(value);
+            } catch (RuntimeException | Error error) {
+                throw error;
+            } catch (Throwable error) {
+                throw new IllegalStateException(
+                        "could not access generated Rust union references", error);
+            }
+        }
+
+        private boolean isArrayCodecFor(Object value) {
+            return arrayElementSize > 0
+                    && value != null
+                    && value.getClass().isArray();
         }
     }
 
@@ -7186,6 +7228,357 @@ public final class Pointer {
         arraySet(array, elementIndex, carrierFromBits(current, updated, elementSize));
     }
 
+    private static long loadArrayCodecBits(
+            Object array, int byteOffset, int byteCount, CodecPlan arrayPlan) {
+        if (!arrayPlan.isArrayCodecFor(array)) {
+            throw new IllegalArgumentException("pointer codec is not a fixed-array codec");
+        }
+        int elementSize = arrayPlan.arrayElementSize;
+        int length = Array.getLength(array);
+        long totalSize = Math.multiplyExact((long) length, elementSize);
+        if (byteOffset < 0 || byteCount < 0
+                || Math.addExact((long) byteOffset, byteCount) > totalSize) {
+            throw new IndexOutOfBoundsException("scalar access exceeds fixed-array storage");
+        }
+
+        long result = 0;
+        int consumed = 0;
+        while (consumed < byteCount) {
+            int absolute = byteOffset + consumed;
+            int elementIndex = absolute / elementSize;
+            int withinElement = absolute % elementSize;
+            int chunk = Math.min(byteCount - consumed, elementSize - withinElement);
+            Object element = arrayGet(array, elementIndex);
+
+            if (isPrimitiveScalarCarrier(element) && elementSize <= 8) {
+                long bits = valueBits(element, elementSize);
+                long selected = (bits >>> (withinElement * 8)) & atomicMask(chunk);
+                result |= selected << (consumed * 8);
+                consumed += chunk;
+                continue;
+            }
+
+            byte[] image;
+            boolean temporary = false;
+            if (isGeneratedAggregateCodec(arrayPlan.arrayElementCodec)) {
+                CodecPlan elementPlan = codecPlan(arrayPlan.arrayElementCodec);
+                if (elementPlan.isArrayCodecFor(element)) {
+                    long selected =
+                            loadArrayCodecBits(element, withinElement, chunk, elementPlan);
+                    result |= selected << (consumed * 8);
+                    consumed += chunk;
+                    continue;
+                }
+                image = elementPlan.directUnionBytes(element);
+                if (image == null) {
+                    image = elementPlan.encode.encode(element);
+                    temporary = true;
+                }
+            } else {
+                image = encodeMemoryValue(
+                        element, elementSize, arrayPlan.arrayElementCodec);
+                temporary = true;
+            }
+            if (withinElement + chunk > image.length) {
+                if (temporary) {
+                    discardEncodedReferences(image);
+                }
+                throw new IndexOutOfBoundsException(
+                        "array element codec returned a short memory image");
+            }
+            for (int index = 0; index < chunk; index++) {
+                result |= ((long) image[withinElement + index] & 0xffL)
+                        << ((consumed + index) * 8);
+            }
+            if (temporary) {
+                discardEncodedReferences(image);
+            }
+            consumed += chunk;
+        }
+        return result;
+    }
+
+    private static void loadArrayCodecRange(
+            Object array,
+            int byteOffset,
+            byte[] target,
+            int targetOffset,
+            int byteCount,
+            CodecPlan arrayPlan) {
+        if (!arrayPlan.isArrayCodecFor(array)) {
+            throw new IllegalArgumentException("pointer codec is not a fixed-array codec");
+        }
+        int elementSize = arrayPlan.arrayElementSize;
+        int length = Array.getLength(array);
+        long totalSize = Math.multiplyExact((long) length, elementSize);
+        if (byteOffset < 0 || byteCount < 0
+                || Math.addExact((long) byteOffset, byteCount) > totalSize
+                || targetOffset < 0
+                || targetOffset + byteCount > target.length) {
+            throw new IndexOutOfBoundsException("range access exceeds fixed-array storage");
+        }
+
+        int consumed = 0;
+        while (consumed < byteCount) {
+            int absolute = byteOffset + consumed;
+            int elementIndex = absolute / elementSize;
+            int withinElement = absolute % elementSize;
+            int chunk = Math.min(byteCount - consumed, elementSize - withinElement);
+            Object element = arrayGet(array, elementIndex);
+
+            if (isPrimitiveScalarCarrier(element) && elementSize <= 8) {
+                long bits = valueBits(element, elementSize);
+                for (int index = 0; index < chunk; index++) {
+                    target[targetOffset + consumed + index] =
+                            (byte) (bits >>> ((withinElement + index) * 8));
+                }
+                consumed += chunk;
+                continue;
+            }
+
+            byte[] image;
+            boolean temporary = false;
+            if (isGeneratedAggregateCodec(arrayPlan.arrayElementCodec)) {
+                CodecPlan elementPlan = codecPlan(arrayPlan.arrayElementCodec);
+                if (elementPlan.isArrayCodecFor(element)) {
+                    loadArrayCodecRange(
+                            element,
+                            withinElement,
+                            target,
+                            targetOffset + consumed,
+                            chunk,
+                            elementPlan);
+                    consumed += chunk;
+                    continue;
+                }
+                image = elementPlan.directUnionBytes(element);
+                if (image == null) {
+                    image = elementPlan.encode.encode(element);
+                    temporary = true;
+                }
+            } else {
+                image = encodeMemoryValue(
+                        element, elementSize, arrayPlan.arrayElementCodec);
+                temporary = true;
+            }
+            if (withinElement + chunk > image.length) {
+                if (temporary) {
+                    discardEncodedReferences(image);
+                }
+                throw new IndexOutOfBoundsException(
+                        "array element codec returned a short memory image");
+            }
+            System.arraycopy(
+                    image,
+                    withinElement,
+                    target,
+                    targetOffset + consumed,
+                    chunk);
+            transferEncodedPointers(
+                    image,
+                    withinElement,
+                    target,
+                    targetOffset + consumed,
+                    chunk,
+                    false);
+            transferEncodedReferences(image, target);
+            if (temporary) {
+                discardEncodedReferences(image);
+            }
+            consumed += chunk;
+        }
+    }
+
+    private static void storeArrayCodecBits(
+            Object array, int byteOffset, long incoming, int byteCount, CodecPlan arrayPlan) {
+        if (!arrayPlan.isArrayCodecFor(array)) {
+            throw new IllegalArgumentException("pointer codec is not a fixed-array codec");
+        }
+        int elementSize = arrayPlan.arrayElementSize;
+        int length = Array.getLength(array);
+        long totalSize = Math.multiplyExact((long) length, elementSize);
+        if (byteOffset < 0 || byteCount < 0
+                || Math.addExact((long) byteOffset, byteCount) > totalSize) {
+            throw new IndexOutOfBoundsException("scalar access exceeds fixed-array storage");
+        }
+
+        int consumed = 0;
+        while (consumed < byteCount) {
+            int absolute = byteOffset + consumed;
+            int elementIndex = absolute / elementSize;
+            int withinElement = absolute % elementSize;
+            int chunk = Math.min(byteCount - consumed, elementSize - withinElement);
+            Object element = independentRepeatedArrayElement(array, elementIndex);
+            long selected = (incoming >>> (consumed * 8)) & atomicMask(chunk);
+
+            if (isPrimitiveScalarCarrier(element) && elementSize <= 8) {
+                int shift = withinElement * 8;
+                long mask = atomicMask(chunk) << shift;
+                long current = valueBits(element, elementSize);
+                arraySet(
+                        array,
+                        elementIndex,
+                        carrierFromBits(
+                                element,
+                                (current & ~mask) | (selected << shift),
+                                elementSize));
+                consumed += chunk;
+                continue;
+            }
+
+            if (isGeneratedAggregateCodec(arrayPlan.arrayElementCodec)) {
+                CodecPlan elementPlan = codecPlan(arrayPlan.arrayElementCodec);
+                if (elementPlan.isArrayCodecFor(element)) {
+                    storeArrayCodecBits(
+                            element, withinElement, selected, chunk, elementPlan);
+                    consumed += chunk;
+                    continue;
+                }
+                byte[] direct = elementPlan.directUnionBytes(element);
+                Object[] objects = elementPlan.directUnionObjects(element);
+                if (direct != null
+                        && elementSize == 1
+                        && withinElement == 0
+                        && chunk == 1
+                        && direct.length == 1
+                        && (objects == null || objects.length == 0 || objects[0] == null)) {
+                    discardEncodedPointers(direct, 0, 1);
+                    direct[0] = (byte) selected;
+                    consumed++;
+                    continue;
+                }
+            }
+
+            byte[] image = encodeMemoryValue(
+                    element, elementSize, arrayPlan.arrayElementCodec);
+            if (withinElement + chunk > image.length) {
+                discardEncodedReferences(image);
+                throw new IndexOutOfBoundsException(
+                        "array element codec returned a short memory image");
+            }
+            for (int index = 0; index < chunk; index++) {
+                image[withinElement + index] =
+                        (byte) (selected >>> (index * 8));
+            }
+            Object updated = decodeMemoryValue(
+                    image,
+                    0,
+                    elementSize,
+                    arrayPlan.arrayElementCodec,
+                    array.getClass().getComponentType());
+            discardEncodedReferences(image);
+            arraySet(array, elementIndex, updated);
+            consumed += chunk;
+        }
+    }
+
+    private static void storeArrayCodecRange(
+            Object array,
+            int byteOffset,
+            byte[] source,
+            int sourceOffset,
+            int byteCount,
+            CodecPlan arrayPlan) {
+        if (!arrayPlan.isArrayCodecFor(array)) {
+            throw new IllegalArgumentException("pointer codec is not a fixed-array codec");
+        }
+        int elementSize = arrayPlan.arrayElementSize;
+        int length = Array.getLength(array);
+        long totalSize = Math.multiplyExact((long) length, elementSize);
+        if (byteOffset < 0 || byteCount < 0
+                || Math.addExact((long) byteOffset, byteCount) > totalSize
+                || sourceOffset < 0
+                || sourceOffset + byteCount > source.length) {
+            throw new IndexOutOfBoundsException("range access exceeds fixed-array storage");
+        }
+
+        int consumed = 0;
+        while (consumed < byteCount) {
+            int absolute = byteOffset + consumed;
+            int elementIndex = absolute / elementSize;
+            int withinElement = absolute % elementSize;
+            int chunk = Math.min(byteCount - consumed, elementSize - withinElement);
+            Object element = independentRepeatedArrayElement(array, elementIndex);
+
+            if (isPrimitiveScalarCarrier(element) && elementSize <= 8) {
+                long current = valueBits(element, elementSize);
+                for (int index = 0; index < chunk; index++) {
+                    int shift = (withinElement + index) * 8;
+                    current = (current & ~(0xffL << shift))
+                            | (((long) source[sourceOffset + consumed + index] & 0xffL)
+                                    << shift);
+                }
+                arraySet(
+                        array,
+                        elementIndex,
+                        carrierFromBits(element, current, elementSize));
+                consumed += chunk;
+                continue;
+            }
+
+            if (isGeneratedAggregateCodec(arrayPlan.arrayElementCodec)) {
+                CodecPlan elementPlan = codecPlan(arrayPlan.arrayElementCodec);
+                if (elementPlan.isArrayCodecFor(element)) {
+                    storeArrayCodecRange(
+                            element,
+                            withinElement,
+                            source,
+                            sourceOffset + consumed,
+                            chunk,
+                            elementPlan);
+                    consumed += chunk;
+                    continue;
+                }
+                byte[] direct = elementPlan.directUnionBytes(element);
+                Object[] objects = elementPlan.directUnionObjects(element);
+                if (direct != null
+                        && elementSize == 1
+                        && withinElement == 0
+                        && chunk == 1
+                        && direct.length == 1
+                        && (objects == null || objects.length == 0 || objects[0] == null)
+                        && !mayBeInIdentityFilter(
+                                ENCODED_POINTER_FILTER, source)) {
+                    discardEncodedPointers(direct, 0, 1);
+                    direct[0] = source[sourceOffset + consumed];
+                    consumed++;
+                    continue;
+                }
+            }
+
+            byte[] image = encodeMemoryValue(
+                    element, elementSize, arrayPlan.arrayElementCodec);
+            if (withinElement + chunk > image.length) {
+                discardEncodedReferences(image);
+                throw new IndexOutOfBoundsException(
+                        "array element codec returned a short memory image");
+            }
+            transferEncodedPointers(
+                    source,
+                    sourceOffset + consumed,
+                    image,
+                    withinElement,
+                    chunk,
+                    false);
+            transferEncodedReferences(source, image);
+            System.arraycopy(
+                    source,
+                    sourceOffset + consumed,
+                    image,
+                    withinElement,
+                    chunk);
+            Object updated = decodeMemoryValue(
+                    image,
+                    0,
+                    elementSize,
+                    arrayPlan.arrayElementCodec,
+                    array.getClass().getComponentType());
+            discardEncodedReferences(image);
+            arraySet(array, elementIndex, updated);
+            consumed += chunk;
+        }
+    }
+
     private Long loadEmbeddedArrayBits(long absoluteByteOffset, int byteCount) {
         Object array = embeddedPrimitiveArray();
         if (array == null) {
@@ -7309,6 +7702,10 @@ public final class Pointer {
                             value, allocationElementSize, allocationCodecClassName);
                 } else if (isGeneratedAggregateCodec(allocationCodecClassName)) {
                     CodecPlan plan = codecPlan(allocationCodecClassName);
+                    if (plan.isArrayCodecFor(value)) {
+                        return loadArrayCodecBits(
+                                value, withinElement, byteCount, plan);
+                    }
                     directUnionBytes = plan.directUnionBytes(value);
                     encoded = directUnionBytes == null
                             ? plan.encode.encode(value)
@@ -7396,6 +7793,9 @@ public final class Pointer {
         }
         if (isGeneratedAggregateCodec(allocationCodecClassName)) {
             CodecPlan plan = codecPlan(allocationCodecClassName);
+            if (plan.isArrayCodecFor(value)) {
+                return (int) loadArrayCodecBits(value, withinElement, 1, plan);
+            }
             byte[] direct = plan.directUnionBytes(value);
             byte[] bytes = direct == null ? plan.encode.encode(value) : direct;
             if (withinElement >= bytes.length) {
@@ -7482,6 +7882,17 @@ public final class Pointer {
             } else if (!directPrimitiveArray
                     && isGeneratedAggregateCodec(allocationCodecClassName)) {
                 CodecPlan plan = codecPlan(allocationCodecClassName);
+                if (plan.isArrayCodecFor(value)) {
+                    loadArrayCodecRange(
+                            value,
+                            withinElement,
+                            result,
+                            consumed,
+                            chunk,
+                            plan);
+                    consumed += chunk;
+                    continue;
+                }
                 byte[] direct = plan.directUnionBytes(value);
                 if (direct != null) {
                     if (withinElement + chunk > direct.length) {
@@ -7523,24 +7934,29 @@ public final class Pointer {
     }
 
     private void storeBytes(long bits, int byteCount) {
+        storeBytesAt(byteOffset, bits, byteCount);
+    }
+
+    private void storeBytesAt(long absoluteByteOffset, long bits, int byteCount) {
         if (byteCount < 0 || byteCount > 8) {
             throw new IllegalArgumentException("scalar stores support at most eight bytes");
         }
         if (byteCount == 0) {
             return;
         }
-        if (storeEmbeddedArrayBits(byteOffset, bits, byteCount)) {
+        if (storeEmbeddedArrayBits(absoluteByteOffset, bits, byteCount)) {
             return;
         }
         if (allocation != null && allocationElementSize > 0) {
-            int withinElement = (int) Math.floorMod(byteOffset, allocationElementSize);
-            if (withinElement + byteCount <= allocationElementSize
-                    && withinElement + byteCount <= 8) {
+            int withinElement =
+                    (int) Math.floorMod(absoluteByteOffset, allocationElementSize);
+            if (withinElement + byteCount <= allocationElementSize) {
                 int elementIndex = Math.toIntExact(
-                        Math.floorDiv(byteOffset, allocationElementSize));
-                prepareMemoryWrite(byteOffset, byteCount);
+                        Math.floorDiv(absoluteByteOffset, allocationElementSize));
+                prepareMemoryWrite(absoluteByteOffset, byteCount);
                 Object current = readElement(elementIndex);
-                if (isPrimitiveScalarCarrier(current)) {
+                if (isPrimitiveScalarCarrier(current)
+                        && withinElement + byteCount <= 8) {
                     int shift = withinElement * 8;
                     long valueMask = atomicMask(byteCount);
                     long mask = valueMask << shift;
@@ -7558,11 +7974,18 @@ public final class Pointer {
                             current, allocationElementSize, allocationCodecClassName);
                 } else if (isGeneratedAggregateCodec(allocationCodecClassName)) {
                     CodecPlan plan = codecPlan(allocationCodecClassName);
+                    if (plan.isArrayCodecFor(current)) {
+                        discardEncodedPointers(
+                                allocation, absoluteByteOffset, byteCount);
+                        storeArrayCodecBits(
+                                current, withinElement, bits, byteCount, plan);
+                        return;
+                    }
                     byte[] direct = plan.directUnionBytes(current);
                     if (direct != null && direct.length == 1
                             && withinElement == 0 && byteCount == 1) {
                         discardEncodedPointers(direct, 0, 1);
-                        discardEncodedPointers(allocation, byteOffset, 1);
+                        discardEncodedPointers(allocation, absoluteByteOffset, 1);
                         direct[0] = (byte) bits;
                         return;
                     }
@@ -7591,7 +8014,9 @@ public final class Pointer {
             }
         }
         for (int index = 0; index < byteCount; index++) {
-            storeByte(byteOffset + index, (int) ((bits >>> (index * 8)) & 0xffL));
+            storeByte(
+                    absoluteByteOffset + index,
+                    (int) ((bits >>> (index * 8)) & 0xffL));
         }
     }
 
@@ -7680,6 +8105,12 @@ public final class Pointer {
         }
         if (isGeneratedAggregateCodec(allocationCodecClassName)) {
             CodecPlan plan = codecPlan(allocationCodecClassName);
+            if (plan.isArrayCodecFor(current)) {
+                prepareMemoryWrite(absoluteByteOffset, 1);
+                discardEncodedPointers(allocation, absoluteByteOffset, 1);
+                storeArrayCodecBits(current, withinElement, value & 0xffL, 1, plan);
+                return;
+            }
             byte[] direct = plan.directUnionBytes(current);
             if (direct != null && direct.length == 1 && withinElement == 0) {
                 prepareMemoryWrite(absoluteByteOffset, 1);
@@ -9249,6 +9680,21 @@ public final class Pointer {
                         Math.toIntExact(Math.floorDiv(absoluteOffset, allocationElementSize));
                 int withinElement = (int) Math.floorMod(absoluteOffset, allocationElementSize);
                 Object current = readElement(elementIndex);
+                CodecPlan plan = codecPlan(allocationCodecClassName);
+                int chunk = Math.min(
+                        source.length - consumed,
+                        allocationElementSize - withinElement);
+                if (plan.isArrayCodecFor(current)) {
+                    storeArrayCodecRange(
+                            current,
+                            withinElement,
+                            source,
+                            consumed,
+                            chunk,
+                            plan);
+                    consumed += chunk;
+                    continue;
+                }
                 byte[] image = encodeAggregate(allocationCodecClassName, current);
                 transferEncodedPointers(
                         allocation,
@@ -9266,7 +9712,7 @@ public final class Pointer {
                         false);
                 transferEncodedReferences(allocation, image);
                 transferEncodedReferences(source, image);
-                int chunk = Math.min(source.length - consumed, image.length - withinElement);
+                chunk = Math.min(source.length - consumed, image.length - withinElement);
                 System.arraycopy(source, consumed, image, withinElement, chunk);
                 Object decoded = decodeAggregate(allocationCodecClassName, image);
                 discardEncodedReferences(image);
@@ -9349,6 +9795,8 @@ public final class Pointer {
             Method encode = null;
             Method decode = null;
             Method bind = null;
+            Method arrayElementSize = null;
+            Method arrayElementCodec = null;
             for (Method method : codec.getMethods()) {
                 if (method.getName().equals("encode") && method.getParameterTypes().length == 1) {
                     encode = method;
@@ -9358,6 +9806,12 @@ public final class Pointer {
                 } else if (method.getName().equals("bind")
                         && method.getParameterTypes().length == 2) {
                     bind = method;
+                } else if (method.getName().equals("_rustArrayElementSize")
+                        && method.getParameterTypes().length == 0) {
+                    arrayElementSize = method;
+                } else if (method.getName().equals("_rustArrayElementCodec")
+                        && method.getParameterTypes().length == 0) {
+                    arrayElementCodec = method;
                 }
             }
             if (encode == null || decode == null) {
@@ -9369,7 +9823,14 @@ public final class Pointer {
             if (bind != null) {
                 bind.setAccessible(true);
             }
-            CodecPlan plan = new CodecPlan(encode, decode, bind);
+            if (arrayElementSize != null) {
+                arrayElementSize.setAccessible(true);
+            }
+            if (arrayElementCodec != null) {
+                arrayElementCodec.setAccessible(true);
+            }
+            CodecPlan plan = new CodecPlan(
+                    encode, decode, bind, arrayElementSize, arrayElementCodec);
             CodecPlan previous = CODEC_METHODS.putIfAbsent(codecClassName, plan);
             CodecPlan result = previous == null ? plan : previous;
             recent.remember(codecClassName, result);

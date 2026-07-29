@@ -5348,11 +5348,51 @@ pub(super) fn ensure_pointer_memory_codec<'tcx>(
         body: simple_body(bind_instructions),
     };
 
-    let methods = HashMap::from_iter([
+    let mut methods = HashMap::from_iter([
         ("encode".to_string(), DataTypeMethod::Function(encode)),
         ("decode".to_string(), DataTypeMethod::Function(decode)),
         ("bind".to_string(), DataTypeMethod::Function(bind)),
     ]);
+    if let TyKind::Array(element_ty, _) = ty.kind() {
+        let element_size = layout_size_bytes(tcx, *element_ty)?;
+        let element_codec =
+            pointer_view_codec_operand(*element_ty, tcx, data_types, instance_context);
+        methods.insert(
+            "_rustArrayElementSize".to_string(),
+            DataTypeMethod::Function(oomir::Function {
+                name: "_rustArrayElementSize".to_string(),
+                owner_class: None,
+                debug_variables: Vec::new(),
+                signature: oomir::Signature {
+                    params: Vec::new(),
+                    ret: Box::new(oomir::Type::I32),
+                    is_static: true,
+                },
+                body: simple_body(vec![oomir::Instruction::Return {
+                    operand: Some(oomir::Operand::Constant(oomir::Constant::I32(
+                        i32::try_from(element_size)
+                            .map_err(|_| "array element layout exceeds JVM address space")?,
+                    ))),
+                }]),
+            }),
+        );
+        methods.insert(
+            "_rustArrayElementCodec".to_string(),
+            DataTypeMethod::Function(oomir::Function {
+                name: "_rustArrayElementCodec".to_string(),
+                owner_class: None,
+                debug_variables: Vec::new(),
+                signature: oomir::Signature {
+                    params: Vec::new(),
+                    ret: Box::new(oomir::Type::java_string()),
+                    is_static: true,
+                },
+                body: simple_body(vec![oomir::Instruction::Return {
+                    operand: Some(element_codec),
+                }]),
+            }),
+        );
+    }
     match data_types.get_mut(&class_name) {
         Some(oomir::DataType::Class {
             methods: existing, ..
