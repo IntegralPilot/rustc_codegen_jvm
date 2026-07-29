@@ -339,6 +339,25 @@ pub fn optimise_module(module: Module) -> Module {
         let new_func = optimise_function(func, &module.data_types);
         new_funcs.insert(name, new_func);
     }
+
+    // Rust emits tiny generic helpers such as `needs_drop::<T>` as ordinary
+    // functions even when their result is a compile-time constant. Fold calls
+    // to side-effect-free constant-returning functions before the caller's
+    // final optimisation pass. This lets constant branches and the pointer
+    // temporaries contained exclusively in their dead arms disappear before
+    // JVM lowering.
+    let constant_returns = new_funcs
+        .iter()
+        .filter_map(|(key, function)| {
+            simple_constant_return(function).map(|constant| (key.clone(), constant))
+        })
+        .collect::<HashMap<_, _>>();
+    for function in new_funcs.values_mut() {
+        if fold_constant_static_calls(function, &constant_returns) {
+            *function = optimise_function(function.clone(), &module.data_types);
+        }
+    }
+
     breadcrumbs::log!(
         breadcrumbs::LogLevel::Info,
         "optimisation",
@@ -351,5 +370,130 @@ pub fn optimise_module(module: Module) -> Module {
         data_types: module.data_types, // Assume data_types are read-only for opts
         external_interfaces: module.external_interfaces,
         statics: module.statics,
+    }
+}
+
+fn simple_constant_return(function: &Function) -> Option<Constant> {
+    let mut returned = None;
+    for block in function.body.basic_blocks.values() {
+        for instruction in &block.instructions {
+            match instruction {
+                Instruction::SourceLocation(_)
+                | Instruction::LocalVariableScope(_)
+                | Instruction::Label { .. }
+                | Instruction::Jump { .. } => {}
+                Instruction::Return {
+                    operand: Some(Operand::Constant(constant)),
+                } if constant.is_propagatable() => {
+                    if returned
+                        .as_ref()
+                        .is_some_and(|previous| previous != constant)
+                    {
+                        return None;
+                    }
+                    returned = Some(constant.clone());
+                }
+                _ => return None,
+            }
+        }
+    }
+    returned
+}
+
+fn fold_constant_static_calls(
+    function: &mut Function,
+    constant_returns: &HashMap<FunctionKey, Constant>,
+) -> bool {
+    let mut changed = false;
+    for block in function.body.basic_blocks.values_mut() {
+        block.instructions.retain_mut(|instruction| {
+            let Instruction::InvokeStatic {
+                dest,
+                class_name,
+                method_name,
+                method_ty,
+                ..
+            } = instruction
+            else {
+                return true;
+            };
+            let key = FunctionKey::new(class_name, method_name, method_ty);
+            let Some(constant) = constant_returns.get(&key) else {
+                return true;
+            };
+
+            changed = true;
+            if let Some(dest) = dest.take() {
+                *instruction = Instruction::Move {
+                    dest,
+                    src: Operand::Constant(constant.clone()),
+                };
+                true
+            } else {
+                false
+            }
+        });
+    }
+    changed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn function(name: &str, instructions: Vec<Instruction>) -> Function {
+        Function {
+            name: name.to_string(),
+            owner_class: Some("example/Test".to_string()),
+            signature: Signature {
+                params: Vec::new(),
+                ret: Box::new(Type::Boolean),
+                is_static: true,
+            },
+            debug_variables: Vec::new(),
+            body: CodeBlock {
+                entry: "entry".to_string(),
+                basic_blocks: HashMap::from_iter([(
+                    "entry".to_string(),
+                    BasicBlock {
+                        label: "entry".to_string(),
+                        instructions,
+                    },
+                )]),
+            },
+        }
+    }
+
+    #[test]
+    fn folds_same_module_constant_return_calls() {
+        let callee = function(
+            "constant",
+            vec![Instruction::Return {
+                operand: Some(Operand::Constant(Constant::Boolean(false))),
+            }],
+        );
+        let mut caller = function(
+            "caller",
+            vec![Instruction::InvokeStatic {
+                dest: Some("result".to_string()),
+                class_name: "example/Test".to_string(),
+                method_name: "constant".to_string(),
+                method_ty: callee.signature.clone(),
+                args: Vec::new(),
+            }],
+        );
+        let constants = HashMap::from_iter([(
+            FunctionKey::new("example/Test", "constant", &callee.signature),
+            simple_constant_return(&callee).unwrap(),
+        )]);
+
+        assert!(fold_constant_static_calls(&mut caller, &constants));
+        assert_eq!(
+            caller.body.basic_blocks["entry"].instructions,
+            vec![Instruction::Move {
+                dest: "result".to_string(),
+                src: Operand::Constant(Constant::Boolean(false)),
+            }]
+        );
     }
 }

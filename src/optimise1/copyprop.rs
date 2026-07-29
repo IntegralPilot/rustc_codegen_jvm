@@ -243,7 +243,7 @@ fn eliminate_dead_moves(
             for (index, instruction) in block.instructions.iter().enumerate().rev() {
                 let def = instruction_def(instruction).and_then(|name| locals.id(name));
 
-                if let Instruction::Move { dest, .. } = instruction
+                if let Some(dest) = removable_dead_definition(instruction)
                     && let Some(dest) = locals.id(dest)
                     && !bit_set_contains(&live, dest)
                     && !debug_locals.contains(&dest)
@@ -274,6 +274,23 @@ fn eliminate_dead_moves(
         if !removed_any {
             break;
         }
+    }
+}
+
+fn removable_dead_definition(instruction: &Instruction) -> Option<&str> {
+    match instruction {
+        Instruction::Move { dest, .. } => Some(dest),
+        Instruction::InvokeStatic {
+            dest: Some(dest),
+            class_name,
+            method_name,
+            ..
+        } if class_name == POINTER_CLASS
+            && matches!(method_name.as_str(), "cell" | "cellAligned") =>
+        {
+            Some(dest)
+        }
+        _ => None,
     }
 }
 
@@ -531,6 +548,51 @@ mod tests {
         kill_aliases_touching(2, &mut aliases);
 
         assert!(aliases.is_empty());
+    }
+
+    #[test]
+    fn removes_unused_pointer_cells() {
+        let signature = Signature {
+            params: vec![("value".to_string(), Type::I32)],
+            ret: Box::new(Type::Pointer(Box::new(Type::I32))),
+            is_static: true,
+        };
+        let mut function = Function {
+            name: "unused_cell".to_string(),
+            owner_class: None,
+            signature: Signature {
+                params: Vec::new(),
+                ret: Box::new(Type::Void),
+                is_static: true,
+            },
+            debug_variables: Vec::new(),
+            body: CodeBlock {
+                entry: "entry".to_string(),
+                basic_blocks: HashMap::from_iter([(
+                    "entry".to_string(),
+                    BasicBlock {
+                        label: "entry".to_string(),
+                        instructions: vec![
+                            Instruction::InvokeStatic {
+                                dest: Some("pointer".to_string()),
+                                class_name: POINTER_CLASS.to_string(),
+                                method_name: "cell".to_string(),
+                                method_ty: signature,
+                                args: vec![Operand::Constant(Constant::I32(1))],
+                            },
+                            Instruction::Return { operand: None },
+                        ],
+                    },
+                )]),
+            },
+        };
+
+        propagate_copies_and_eliminate_dead_moves(&mut function);
+
+        assert_eq!(
+            function.body.basic_blocks["entry"].instructions,
+            vec![Instruction::Return { operand: None }]
+        );
     }
 }
 

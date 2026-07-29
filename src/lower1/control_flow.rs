@@ -4580,7 +4580,25 @@ pub(super) fn convert_basic_block<'tcx>(
                         let is_ptr_metadata = (is_compiler_intrinsic
                             && intrinsic_name.as_str() == "ptr_metadata")
                             || is_core_ptr_metadata_api(tcx, called_def_id);
-                        if is_compiler_intrinsic && intrinsic_name == "abort" {
+                        if is_diagnostic_item(sym::needs_drop)
+                            || (is_compiler_intrinsic && intrinsic_name == "needs_drop")
+                        {
+                            let queried_ty = func_instance
+                                .args
+                                .types()
+                                .next()
+                                .expect("needs_drop has a type argument");
+                            let needs_drop =
+                                queried_ty.needs_drop(tcx, TypingEnv::fully_monomorphized());
+                            if let Some(dest) = effective_dest.clone() {
+                                instructions.push(oomir::Instruction::Move {
+                                    dest,
+                                    src: oomir::Operand::Constant(oomir::Constant::Boolean(
+                                        needs_drop,
+                                    )),
+                                });
+                            }
+                        } else if is_compiler_intrinsic && intrinsic_name == "abort" {
                             instructions.push(oomir::Instruction::InvokeStatic {
                                 dest: None,
                                 class_name: "org/rustlang/runtime/PanicSupport".to_string(),

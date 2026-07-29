@@ -77,6 +77,11 @@ fn opaque_f128(value: f128) -> f128 {
     value
 }
 
+#[inline(never)]
+fn runtime_needs_drop<T>() -> bool {
+    core::mem::needs_drop::<T>()
+}
+
 #[derive(Clone, Copy)]
 struct LookupPair(u8, u8);
 
@@ -1077,6 +1082,11 @@ fn test_try_branch_zst_residual() {
 }
 
 fn main() {
+    assert!(!runtime_needs_drop::<u64>());
+    assert!(!runtime_needs_drop::<*mut String>());
+    assert!(runtime_needs_drop::<String>());
+    assert!(runtime_needs_drop::<Option<String>>());
+
     large_constant_value_semantics();
     test_try_branch_zst_residual();
     fixed_array_pattern_checks_every_element();
