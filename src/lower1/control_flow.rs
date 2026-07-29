@@ -1579,6 +1579,8 @@ fn emit_comparison_value<'tcx>(
     mut operand: oomir::Operand,
     mut mir_ty: Ty<'tcx>,
     dest_prefix: &str,
+    tcx: TyCtxt<'tcx>,
+    data_types: &HashMap<String, oomir::DataType>,
     instructions: &mut Vec<oomir::Instruction>,
 ) -> oomir::Operand {
     let mut depth = 0;
@@ -1594,6 +1596,32 @@ fn emit_comparison_value<'tcx>(
         );
         mir_ty = *pointee;
         depth += 1;
+    }
+    if matches!(
+        mir_ty.kind(),
+        TyKind::Adt(adt, _) if tcx.is_diagnostic_item(sym::NonNull, adt.did())
+    ) && let Some(oomir::Type::Class(class_name)) = operand.get_type()
+        && let Some(oomir::DataType::Class { fields, .. }) = data_types.get(&class_name)
+        && let Some((field_name, field_ty)) = fields.iter().find(|(field_name, field_ty)| {
+            field_name == "pointer"
+                && matches!(
+                    field_ty,
+                    oomir::Type::Pointer(_) | oomir::Type::Slice(_) | oomir::Type::Str
+                )
+        })
+    {
+        let dest = format!("{dest_prefix}_nonnull_pointer");
+        instructions.push(oomir::Instruction::GetField {
+            dest: dest.clone(),
+            object: operand,
+            field_name: field_name.clone(),
+            field_ty: field_ty.clone(),
+            owner_class: class_name,
+        });
+        operand = oomir::Operand::Variable {
+            name: dest,
+            ty: field_ty.clone(),
+        };
     }
     if matches!(
         mir_ty.kind(),
@@ -1653,6 +1681,37 @@ fn supports_direct_ordering(ty: &oomir::Type) -> bool {
                     || class_name == crate::lower2::U128_CLASS
                     || class_name == crate::lower2::F128_CLASS
         )
+}
+
+fn is_non_null_comparison_type(tcx: TyCtxt<'_>, mut ty: Ty<'_>) -> bool {
+    while let TyKind::Ref(_, pointee, _) = ty.kind() {
+        ty = *pointee;
+    }
+    matches!(
+        ty.kind(),
+        TyKind::Adt(adt, _) if tcx.is_diagnostic_item(sym::NonNull, adt.did())
+    )
+}
+
+fn non_null_comparison_carrier<'a>(
+    tcx: TyCtxt<'_>,
+    mir_ty: Ty<'_>,
+    oomir_ty: &'a oomir::Type,
+    data_types: &'a HashMap<String, oomir::DataType>,
+) -> Option<&'a oomir::Type> {
+    if !is_non_null_comparison_type(tcx, mir_ty) {
+        return None;
+    }
+    let oomir::Type::Class(class_name) = oomir_ty else {
+        return None;
+    };
+    let oomir::DataType::Class { fields, .. } = data_types.get(class_name)? else {
+        return None;
+    };
+    fields
+        .iter()
+        .find(|(field_name, _)| field_name == "pointer")
+        .map(|(_, field_ty)| field_ty)
 }
 
 /// Convert a single MIR basic block into an OOMIR basic block.
@@ -2796,16 +2855,31 @@ pub(super) fn convert_basic_block<'tcx>(
                                     .and_then(oomir::Operand::get_type)
                                     .zip(fn_inputs.get(1).copied())
                                     .map(|(ty, mir_ty)| comparison_value_type(ty, mir_ty));
+                                let non_null_carrier = non_null_comparison_carrier(
+                                    tcx,
+                                    resolved_receiver_mir_ty,
+                                    &comparison_value_ty,
+                                    data_types,
+                                );
+                                let direct_non_null_fat_equality =
+                                    non_null_carrier.is_some_and(|ty| {
+                                        matches!(ty, oomir::Type::Slice(_) | oomir::Type::Str)
+                                    });
                                 let direct_equality =
                                     matches!(declared_method_name.as_str(), "eq" | "ne")
-                                        && supports_direct_equality(&comparison_value_ty)
+                                        && (supports_direct_equality(&comparison_value_ty)
+                                            || non_null_carrier.is_some_and(|ty| {
+                                                supports_direct_equality(ty)
+                                                    || direct_non_null_fat_equality
+                                            }))
                                         && comparison_rhs_ty.as_ref() == Some(&comparison_value_ty)
                                         && oomir_operands.len() == 2;
                                 let direct_ordering =
                                     matches!(
                                         declared_method_name.as_str(),
                                         "lt" | "le" | "gt" | "ge"
-                                    ) && supports_direct_ordering(&comparison_value_ty)
+                                    ) && (supports_direct_ordering(&comparison_value_ty)
+                                        || non_null_carrier.is_some_and(supports_direct_ordering))
                                         && comparison_rhs_ty.as_ref() == Some(&comparison_value_ty)
                                         && oomir_operands.len() == 2;
                                 let direct_unit_comparison = comparison_value_ty
@@ -2951,16 +3025,57 @@ pub(super) fn convert_basic_block<'tcx>(
                                             oomir_operands[0].clone(),
                                             fn_inputs[0],
                                             &format!("{label}_comparison_left"),
+                                            tcx,
+                                            data_types,
                                             &mut instructions,
                                         );
                                         let right = emit_comparison_value(
                                             oomir_operands[1].clone(),
                                             fn_inputs[1],
                                             &format!("{label}_comparison_right"),
+                                            tcx,
+                                            data_types,
                                             &mut instructions,
                                         );
-                                        if matches!(left.get_type(), Some(oomir::Type::Pointer(_)))
+                                        if matches!(
+                                            left.get_type(),
+                                            Some(oomir::Type::Slice(_) | oomir::Type::Str)
+                                        ) && direct_non_null_fat_equality
                                         {
+                                            let equality_result = if declared_method_name == "ne" {
+                                                format!("{dest}_fat_pointer_eq")
+                                            } else {
+                                                dest.clone()
+                                            };
+                                            let object_ty =
+                                                oomir::Type::Class("java/lang/Object".to_string());
+                                            instructions.push(oomir::Instruction::InvokeStatic {
+                                                dest: Some(equality_result.clone()),
+                                                class_name: oomir::POINTER_CLASS.to_string(),
+                                                method_name: "fatPointerEquals".to_string(),
+                                                method_ty: oomir::Signature {
+                                                    params: vec![
+                                                        ("left".to_string(), object_ty.clone()),
+                                                        ("right".to_string(), object_ty),
+                                                    ],
+                                                    ret: Box::new(oomir::Type::Boolean),
+                                                    is_static: true,
+                                                },
+                                                args: vec![left, right],
+                                            });
+                                            if declared_method_name == "ne" {
+                                                instructions.push(oomir::Instruction::Not {
+                                                    dest,
+                                                    src: oomir::Operand::Variable {
+                                                        name: equality_result,
+                                                        ty: oomir::Type::Boolean,
+                                                    },
+                                                });
+                                            }
+                                        } else if matches!(
+                                            left.get_type(),
+                                            Some(oomir::Type::Pointer(_))
+                                        ) {
                                             let pointer_result = if declared_method_name == "ne" {
                                                 format!("{dest}_pointer_eq")
                                             } else {

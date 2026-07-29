@@ -1602,6 +1602,11 @@ fn pointer_wrapper_unsized_coercions() {
     let non_null_array = unsafe { NonNull::new_unchecked(&mut data as *mut [u8; 4]) };
     let non_null_slice: NonNull<[u8]> = non_null_array;
     assert!(core::ptr::metadata(non_null_slice.as_ptr()) == 4);
+    assert!(unsafe { non_null_slice.as_ref() } == &[10, 20, 30, 40]);
+    assert!(non_null_slice == NonNull::from(&mut data[..]));
+
+    let mut other = [10_u8, 20, 30, 40];
+    assert!(non_null_slice != NonNull::from(&mut other[..]));
 
     let mut empty = [];
     let unique_array = unsafe { Unique::new_unchecked(&mut empty as *mut [u8; 0]) };
