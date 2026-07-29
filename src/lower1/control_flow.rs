@@ -3239,7 +3239,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                         tcx,
                                         function_item,
                                     );
-                                    instructions.push(oomir::Instruction::InvokeStatic {
+                                    instructions.push(oomir::Instruction::InvokeRustStatic {
                                         class_name: target
                                             .class_to_call_on
                                             .expect("function item has a JVM owner"),
@@ -4069,23 +4069,26 @@ pub(super) fn convert_basic_block<'tcx>(
                                                 closure_call_args
                                                     .insert(0, explicit_method_args[0].clone());
                                             }
-                                            instructions.push(oomir::Instruction::InvokeStatic {
-                                                class_name: super::naming::mono_owner_class(
-                                                    tcx,
-                                                    closure_instance,
-                                                ),
-                                                method_name: super::generate_closure_function_name(
-                                                    tcx,
-                                                    closure_instance,
-                                                ),
-                                                method_ty: oomir::Signature {
-                                                    params: closure_params,
-                                                    ret: Box::new(oomir::Type::U64),
-                                                    is_static: true,
+                                            instructions.push(
+                                                oomir::Instruction::InvokeRustStatic {
+                                                    class_name: super::naming::mono_owner_class(
+                                                        tcx,
+                                                        closure_instance,
+                                                    ),
+                                                    method_name:
+                                                        super::generate_closure_function_name(
+                                                            tcx,
+                                                            closure_instance,
+                                                        ),
+                                                    method_ty: oomir::Signature {
+                                                        params: closure_params,
+                                                        ret: Box::new(oomir::Type::U64),
+                                                        is_static: true,
+                                                    },
+                                                    args: closure_call_args,
+                                                    dest: Some(mapped_address_dest.clone()),
                                                 },
-                                                args: closure_call_args,
-                                                dest: Some(mapped_address_dest.clone()),
-                                            });
+                                            );
                                         }
                                         TyKind::FnDef(def_id, generic_args) => {
                                             let mapper_instance = Instance::resolve_for_fn_ptr(
@@ -4099,22 +4102,24 @@ pub(super) fn convert_basic_block<'tcx>(
                                                 tcx,
                                                 mapper_instance,
                                             );
-                                            instructions.push(oomir::Instruction::InvokeStatic {
-                                                class_name: target.class_to_call_on.expect(
-                                                    "map_addr function item has a JVM owner",
-                                                ),
-                                                method_name: target.method_name,
-                                                method_ty: oomir::Signature {
-                                                    params: vec![(
-                                                        "address".to_string(),
-                                                        oomir::Type::U64,
-                                                    )],
-                                                    ret: Box::new(oomir::Type::U64),
-                                                    is_static: true,
+                                            instructions.push(
+                                                oomir::Instruction::InvokeRustStatic {
+                                                    class_name: target.class_to_call_on.expect(
+                                                        "map_addr function item has a JVM owner",
+                                                    ),
+                                                    method_name: target.method_name,
+                                                    method_ty: oomir::Signature {
+                                                        params: vec![(
+                                                            "address".to_string(),
+                                                            oomir::Type::U64,
+                                                        )],
+                                                        ret: Box::new(oomir::Type::U64),
+                                                        is_static: true,
+                                                    },
+                                                    args: vec![address_operand],
+                                                    dest: Some(mapped_address_dest.clone()),
                                                 },
-                                                args: vec![address_operand],
-                                                dest: Some(mapped_address_dest.clone()),
-                                            });
+                                            );
                                         }
                                         TyKind::FnPtr(_, _) => {
                                             let signature = super::types::fn_ptr_signature_from_ty(
@@ -4397,25 +4402,36 @@ pub(super) fn convert_basic_block<'tcx>(
                                         }
                                         _ => None,
                                     };
-                                    let static_target = runtime_static_target.or_else(|| {
-                                        (uses_concrete_trait_default
-                                            || receiver_self_requires_static_dispatch
-                                            || requires_compiled_static_dispatch(&class_type))
-                                        .then(|| {
-                                            let target = super::naming::mono_fn_name_from_instance(
-                                                tcx,
-                                                func_instance,
-                                            );
-                                            (
-                                                target.class_to_call_on.expect(
-                                                    "monomorphized functions have JVM owners",
-                                                ),
-                                                target.method_name,
-                                            )
+                                    let static_target = runtime_static_target
+                                        .map(|(class_name, method_name)| {
+                                            (class_name, method_name, false)
                                         })
-                                    });
+                                        .or_else(|| {
+                                            (uses_concrete_trait_default
+                                                || receiver_self_requires_static_dispatch
+                                                || requires_compiled_static_dispatch(&class_type))
+                                            .then(|| {
+                                                let target =
+                                                    super::naming::mono_fn_name_from_instance(
+                                                        tcx,
+                                                        func_instance,
+                                                    );
+                                                (
+                                                    target.class_to_call_on.expect(
+                                                        "monomorphized functions have JVM owners",
+                                                    ),
+                                                    target.method_name,
+                                                    true,
+                                                )
+                                            })
+                                        });
 
-                                    if let Some((class_name, static_method_name)) = static_target {
+                                    if let Some((
+                                        class_name,
+                                        static_method_name,
+                                        generated_rust_target,
+                                    )) = static_target
+                                    {
                                         let mut static_signature = method_signature;
                                         static_signature.is_static = true;
                                         let mut static_args = oomir_operands.clone();
@@ -4532,12 +4548,22 @@ pub(super) fn convert_basic_block<'tcx>(
                                             static_signature.params.pop();
                                             static_args.pop();
                                         }
-                                        instructions.push(oomir::Instruction::InvokeStatic {
-                                            class_name,
-                                            method_name: static_method_name,
-                                            method_ty: static_signature,
-                                            args: static_args,
-                                            dest: effective_dest,
+                                        instructions.push(if generated_rust_target {
+                                            oomir::Instruction::InvokeRustStatic {
+                                                class_name,
+                                                method_name: static_method_name,
+                                                method_ty: static_signature,
+                                                args: static_args,
+                                                dest: effective_dest,
+                                            }
+                                        } else {
+                                            oomir::Instruction::InvokeStatic {
+                                                class_name,
+                                                method_name: static_method_name,
+                                                method_ty: static_signature,
+                                                args: static_args,
+                                                dest: effective_dest,
+                                            }
                                         });
                                     } else {
                                         let class_name = class_type
@@ -4621,7 +4647,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                             if methods.contains_key(&method_name)
                                     )
                                 {
-                                    instructions.push(oomir::Instruction::InvokeStatic {
+                                    instructions.push(oomir::Instruction::InvokeRustStatic {
                                         class_name: class_name.to_string(),
                                         method_name: method_name.clone(),
                                         method_ty: method_signature.clone(),
@@ -4635,7 +4661,7 @@ pub(super) fn convert_basic_block<'tcx>(
                             if !generated {
                                 let fn_name_data =
                                     super::naming::mono_fn_name_from_instance(tcx, func_instance);
-                                instructions.push(oomir::Instruction::InvokeStatic {
+                                instructions.push(oomir::Instruction::InvokeRustStatic {
                                     class_name: fn_name_data
                                         .class_to_call_on
                                         .expect("monomorphized functions have JVM owners"),
@@ -7161,7 +7187,7 @@ pub(super) fn convert_basic_block<'tcx>(
                             ) {
                                 external_interfaces.insert(class_name.clone());
                             }
-                            instructions.push(oomir::Instruction::InvokeStatic {
+                            instructions.push(oomir::Instruction::InvokeRustStatic {
                                 class_name,
                                 method_name: function,
                                 method_ty: method_signature,

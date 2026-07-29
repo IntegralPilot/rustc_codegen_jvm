@@ -2336,6 +2336,7 @@ fn adapt_value_for_field<'tcx>(
 #[derive(Debug, Clone)]
 pub(crate) enum FnPointerTarget {
     Static(super::super::naming::FnNameData),
+    ImportedStatic(super::super::naming::FnNameData),
     Virtual {
         class_name: String,
         method_name: String,
@@ -2353,10 +2354,12 @@ pub(crate) enum FnPointerTarget {
 impl FnPointerTarget {
     fn display_name(&self) -> String {
         match self {
-            Self::Static(target) => target.class_to_call_on.as_deref().map_or_else(
-                || target.method_name.clone(),
-                |class| format!("{class}::{}", target.method_name),
-            ),
+            Self::Static(target) | Self::ImportedStatic(target) => {
+                target.class_to_call_on.as_deref().map_or_else(
+                    || target.method_name.clone(),
+                    |class| format!("{class}::{}", target.method_name),
+                )
+            }
             Self::Virtual {
                 class_name,
                 method_name,
@@ -2392,10 +2395,12 @@ pub(crate) fn fn_pointer_target<'tcx>(
                 "JVM import descriptor `{explicit_descriptor}` does not match the lowered Rust signature `{rust_descriptor}`"
             ));
         }
-        return Some(FnPointerTarget::Static(super::super::naming::FnNameData {
-            class_to_call_on: Some(import.class_name),
-            method_name: import.method_name,
-        }));
+        return Some(FnPointerTarget::ImportedStatic(
+            super::super::naming::FnNameData {
+                class_to_call_on: Some(import.class_name),
+                method_name: import.method_name,
+            },
+        ));
     }
     let static_name = super::super::naming::mono_fn_name_from_instance(tcx, target_instance);
     let associated_item = tcx.opt_associated_item(target_instance.def_id());
@@ -2508,7 +2513,17 @@ pub(crate) fn ensure_fn_pointer_adapter_class<'tcx>(
 
         let mut prefix = Vec::new();
         let call = match target_function {
-            FnPointerTarget::Static(target) => oomir::Instruction::InvokeStatic {
+            FnPointerTarget::Static(target) => oomir::Instruction::InvokeRustStatic {
+                dest: call_dest.clone(),
+                class_name: target
+                    .class_to_call_on
+                    .clone()
+                    .expect("function pointer targets have JVM owners"),
+                method_name: target.method_name.clone(),
+                method_ty: signature.clone(),
+                args: call_args,
+            },
+            FnPointerTarget::ImportedStatic(target) => oomir::Instruction::InvokeStatic {
                 dest: call_dest.clone(),
                 class_name: target
                     .class_to_call_on
@@ -2632,6 +2647,14 @@ pub(crate) fn ensure_fn_pointer_adapter_class<'tcx>(
             )]),
         },
     });
+    let relative_method_name = format!("call{}", oomir::RELATIVE_POINTER_METHOD_SUFFIX);
+    let relative_call_method = signature.supports_relative_pointer_abi().then(|| {
+        let oomir::DataTypeMethod::Function(mut function) = call_method.clone() else {
+            unreachable!("function-pointer adapters are OOMIR functions");
+        };
+        function.name = relative_method_name.clone();
+        oomir::DataTypeMethod::Function(function)
+    });
 
     match data_types.get_mut(&class_name) {
         Some(oomir::DataType::Class {
@@ -2640,6 +2663,11 @@ pub(crate) fn ensure_fn_pointer_adapter_class<'tcx>(
             ..
         }) => {
             methods.entry("call".to_string()).or_insert(call_method);
+            if let Some(relative_call_method) = relative_call_method {
+                methods
+                    .entry(relative_method_name)
+                    .or_insert(relative_call_method);
+            }
             if !interfaces
                 .iter()
                 .any(|interface| interface == interface_name)
@@ -2658,12 +2686,16 @@ pub(crate) fn ensure_fn_pointer_adapter_class<'tcx>(
             );
         }
         None => {
+            let mut methods = HashMap::from_iter([("call".to_string(), call_method)]);
+            if let Some(relative_call_method) = relative_call_method {
+                methods.insert(relative_method_name, relative_call_method);
+            }
             data_types.insert(
                 class_name.clone(),
                 oomir::DataType::Class {
                     fields: vec![],
                     is_abstract: false,
-                    methods: HashMap::from_iter([("call".to_string(), call_method)]),
+                    methods,
                     super_class: Some("java/lang/Object".to_string()),
                     interfaces: vec![interface_name.to_string()],
                 },
@@ -2761,7 +2793,7 @@ pub(crate) fn ensure_closure_fn_pointer_adapter_class<'tcx>(
         .into_iter()
         .collect();
     let call_dest = signature.ret.has_jvm_value().then(|| "_ret".to_string());
-    instructions.push(oomir::Instruction::InvokeStatic {
+    instructions.push(oomir::Instruction::InvokeRustStatic {
         dest: call_dest.clone(),
         class_name: target_owner,
         method_name: target_method,
@@ -2799,6 +2831,14 @@ pub(crate) fn ensure_closure_fn_pointer_adapter_class<'tcx>(
             )]),
         },
     });
+    let relative_method_name = format!("call{}", oomir::RELATIVE_POINTER_METHOD_SUFFIX);
+    let relative_call_method = signature.supports_relative_pointer_abi().then(|| {
+        let oomir::DataTypeMethod::Function(mut function) = call_method.clone() else {
+            unreachable!("closure function-pointer adapters are OOMIR functions");
+        };
+        function.name = relative_method_name.clone();
+        oomir::DataTypeMethod::Function(function)
+    });
 
     match data_types.get_mut(&class_name) {
         Some(oomir::DataType::Class {
@@ -2807,6 +2847,11 @@ pub(crate) fn ensure_closure_fn_pointer_adapter_class<'tcx>(
             ..
         }) => {
             methods.entry("call".to_string()).or_insert(call_method);
+            if let Some(relative_call_method) = relative_call_method {
+                methods
+                    .entry(relative_method_name)
+                    .or_insert(relative_call_method);
+            }
             if !interfaces.iter().any(|name| name == interface_name) {
                 interfaces.push(interface_name.to_string());
             }
@@ -2815,12 +2860,16 @@ pub(crate) fn ensure_closure_fn_pointer_adapter_class<'tcx>(
             panic!("closure function-pointer adapter name collided with an interface")
         }
         None => {
+            let mut methods = HashMap::from_iter([("call".to_string(), call_method)]);
+            if let Some(relative_call_method) = relative_call_method {
+                methods.insert(relative_method_name, relative_call_method);
+            }
             data_types.insert(
                 class_name.clone(),
                 oomir::DataType::Class {
                     fields: Vec::new(),
                     is_abstract: false,
-                    methods: HashMap::from_iter([("call".to_string(), call_method)]),
+                    methods,
                     super_class: Some("java/lang/Object".to_string()),
                     interfaces: vec![interface_name.to_string()],
                 },
