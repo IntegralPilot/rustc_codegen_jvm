@@ -2953,6 +2953,173 @@ fn emit_union_storage_copy(
     });
 }
 
+fn emit_direct_pointer_to_union_bytes<'tcx>(
+    ty: Ty<'tcx>,
+    pointee: Ty<'tcx>,
+    source: oomir::Operand,
+    storage: &JvmUnionStorage,
+    base_offset: usize,
+    tcx: TyCtxt<'tcx>,
+    data_types: &mut HashMap<String, oomir::DataType>,
+    instance_context: rustc_middle::ty::Instance<'tcx>,
+    instructions: &mut Vec<oomir::Instruction>,
+    temp_counter: &mut usize,
+) -> Result<(), String> {
+    let pointer_ty = ty_to_oomir_type(ty, tcx, data_types, instance_context);
+    let pointer_codec = pointer_builtin_codec_operand(ty, tcx, data_types, instance_context);
+    let uses_typed_address =
+        !matches!(pointee.kind(), TyKind::Dynamic(..)) && pointer_codec.is_some();
+    let encoded_size = layout_size_bytes(tcx, ty)?;
+    let storage_offset =
+        uses_typed_address.then(|| storage.byte_index(base_offset, instructions, temp_counter));
+    let address_dest = next_union_temp("union_pointer_address", temp_counter);
+    instructions.push(oomir::Instruction::InvokeStatic {
+        dest: Some(address_dest.clone()),
+        class_name: oomir::POINTER_CLASS.to_string(),
+        method_name: if matches!(pointee.kind(), TyKind::Dynamic(..)) {
+            "erasedAddress".to_string()
+        } else {
+            "encodedAddress".to_string()
+        },
+        method_ty: oomir::Signature {
+            params: if matches!(pointee.kind(), TyKind::Dynamic(..)) {
+                vec![("pointer".to_string(), pointer_ty)]
+            } else if uses_typed_address {
+                vec![
+                    ("pointer".to_string(), pointer_ty),
+                    (
+                        "owner".to_string(),
+                        oomir::Type::Class("java/lang/Object".to_string()),
+                    ),
+                    ("owner_offset".to_string(), oomir::Type::I32),
+                    ("encoded_size".to_string(), oomir::Type::I32),
+                    ("pointer_codec".to_string(), oomir::Type::java_string()),
+                ]
+            } else {
+                vec![
+                    ("pointer".to_string(), pointer_ty),
+                    (
+                        "owner".to_string(),
+                        oomir::Type::Class("java/lang/Object".to_string()),
+                    ),
+                ]
+            },
+            ret: Box::new(oomir::Type::U64),
+            is_static: true,
+        },
+        args: if matches!(pointee.kind(), TyKind::Dynamic(..)) {
+            vec![source]
+        } else if uses_typed_address {
+            vec![
+                source,
+                operand_var(storage.bytes_var.clone(), byte_array_type()),
+                storage_offset.expect("typed pointer storage offset disappeared"),
+                oomir::Operand::Constant(oomir::Constant::I32(
+                    i32::try_from(encoded_size)
+                        .map_err(|_| "pointer layout exceeds JVM address space")?,
+                )),
+                pointer_codec.expect("typed pointer codec disappeared"),
+            ]
+        } else {
+            vec![
+                source,
+                operand_var(storage.bytes_var.clone(), byte_array_type()),
+            ]
+        },
+    });
+    emit_bits_to_union_bytes(
+        operand_var(address_dest, oomir::Type::U64),
+        oomir::Type::U64,
+        encoded_size,
+        storage,
+        base_offset,
+        instructions,
+        temp_counter,
+    )
+}
+
+fn emit_direct_pointer_from_union_bytes<'tcx>(
+    ty: Ty<'tcx>,
+    pointee: Ty<'tcx>,
+    storage: &JvmUnionStorage,
+    base_offset: usize,
+    tcx: TyCtxt<'tcx>,
+    data_types: &mut HashMap<String, oomir::DataType>,
+    instance_context: rustc_middle::ty::Instance<'tcx>,
+    instructions: &mut Vec<oomir::Instruction>,
+    temp_counter: &mut usize,
+) -> Result<oomir::Operand, String> {
+    let pointer_ty = ty_to_oomir_type(ty, tcx, data_types, instance_context);
+    let is_erased_trait_object = matches!(pointee.kind(), TyKind::Dynamic(..));
+    let pointer_codec = (!is_erased_trait_object)
+        .then(|| pointer_builtin_codec_operand(ty, tcx, data_types, instance_context))
+        .flatten();
+    let uses_typed_address = pointer_codec.is_some();
+    let bits = emit_bits_from_union_bytes(
+        oomir::Type::I64,
+        layout_size_bytes(tcx, ty)?,
+        storage,
+        base_offset,
+        instructions,
+        temp_counter,
+    );
+    let pointer_dest = next_union_temp("union_pointer_value", temp_counter);
+    instructions.push(oomir::Instruction::InvokeStatic {
+        dest: Some(pointer_dest.clone()),
+        class_name: oomir::POINTER_CLASS.to_string(),
+        method_name: if is_erased_trait_object {
+            "fromErasedAddress".to_string()
+        } else if uses_typed_address {
+            "fromEncodedAddress".to_string()
+        } else {
+            "fromAddress".to_string()
+        },
+        method_ty: oomir::Signature {
+            params: if is_erased_trait_object {
+                vec![("address".to_string(), oomir::Type::U64)]
+            } else if uses_typed_address {
+                vec![
+                    ("address".to_string(), oomir::Type::U64),
+                    ("view_size".to_string(), oomir::Type::U64),
+                    ("view_codec".to_string(), oomir::Type::java_string()),
+                    ("pointer_codec".to_string(), oomir::Type::java_string()),
+                ]
+            } else {
+                vec![
+                    ("address".to_string(), oomir::Type::U64),
+                    ("view_size".to_string(), oomir::Type::U64),
+                    ("view_codec".to_string(), oomir::Type::java_string()),
+                ]
+            },
+            ret: Box::new(pointer_ty.clone()),
+            is_static: true,
+        },
+        args: if is_erased_trait_object {
+            vec![bits]
+        } else if uses_typed_address {
+            vec![
+                bits,
+                oomir::Operand::Constant(oomir::Constant::U64(
+                    u64::try_from(layout_size_bytes(tcx, pointee)?)
+                        .map_err(|_| "Rust pointer pointee layout exceeds u64")?,
+                )),
+                pointer_view_codec_operand(pointee, tcx, data_types, instance_context),
+                pointer_codec.expect("non-erased pointer codec disappeared"),
+            ]
+        } else {
+            vec![
+                bits,
+                oomir::Operand::Constant(oomir::Constant::U64(
+                    u64::try_from(layout_size_bytes(tcx, pointee)?)
+                        .map_err(|_| "Rust pointer pointee layout exceeds u64")?,
+                )),
+                pointer_view_codec_operand(pointee, tcx, data_types, instance_context),
+            ]
+        },
+    });
+    Ok(operand_var(pointer_dest, pointer_ty))
+}
+
 fn emit_ty_to_union_bytes<'tcx>(
     ty: Ty<'tcx>,
     source: oomir::Operand,
@@ -3013,6 +3180,30 @@ fn emit_ty_to_union_bytes<'tcx>(
             ],
         });
         return Ok(());
+    }
+    if let TyKind::Adt(adt_def, args) = ty.kind()
+        && tcx.is_diagnostic_item(sym::NonNull, adt_def.did())
+        && matches!(
+            ty_to_oomir_type(ty, tcx, data_types, instance_context),
+            oomir::Type::Pointer(_)
+        )
+    {
+        let pointee = args
+            .iter()
+            .find_map(|arg| arg.as_type())
+            .ok_or_else(|| format!("NonNull pointer has no pointee type: {ty:?}"))?;
+        return emit_direct_pointer_to_union_bytes(
+            ty,
+            pointee,
+            source,
+            storage,
+            base_offset,
+            tcx,
+            data_types,
+            instance_context,
+            instructions,
+            temp_counter,
+        );
     }
     if matches!(ty.kind(), TyKind::Coroutine(_, _)) {
         let codec = ensure_pointer_memory_codec(ty, tcx, data_types, instance_context)?
@@ -3718,6 +3909,29 @@ fn emit_ty_from_union_bytes<'tcx>(
         });
         return Ok(operand_var(typed_dest, jvm_ty));
     }
+    if let TyKind::Adt(adt_def, args) = ty.kind()
+        && tcx.is_diagnostic_item(sym::NonNull, adt_def.did())
+        && matches!(
+            ty_to_oomir_type(ty, tcx, data_types, instance_context),
+            oomir::Type::Pointer(_)
+        )
+    {
+        let pointee = args
+            .iter()
+            .find_map(|arg| arg.as_type())
+            .ok_or_else(|| format!("NonNull pointer has no pointee type: {ty:?}"))?;
+        return emit_direct_pointer_from_union_bytes(
+            ty,
+            pointee,
+            storage,
+            base_offset,
+            tcx,
+            data_types,
+            instance_context,
+            instructions,
+            temp_counter,
+        );
+    }
     if matches!(ty.kind(), TyKind::Coroutine(_, _)) {
         let codec = ensure_pointer_memory_codec(ty, tcx, data_types, instance_context)?
             .ok_or_else(|| format!("coroutine {ty:?} has no exact memory codec"))?;
@@ -4267,18 +4481,22 @@ fn emit_unprovenanced_pointer_from_union_bytes<'tcx>(
             let Some(pointee) = args.iter().find_map(|arg| arg.as_type()) else {
                 return Ok(None);
             };
-            let oomir::Type::Class(class_name) = &target_oomir_ty else {
-                return Ok(None);
-            };
-            let Some(oomir::DataType::Class { fields, .. }) = data_types.get(class_name) else {
-                return Ok(None);
-            };
-            fields
-                .iter()
-                .find(|(field_name, field_ty)| {
-                    field_name == "pointer" && matches!(field_ty, oomir::Type::Pointer(_))
-                })
-                .map(|(_, field_ty)| (field_ty.clone(), pointee, Some(class_name.clone())))
+            if matches!(target_oomir_ty, oomir::Type::Pointer(_)) {
+                Some((target_oomir_ty.clone(), pointee, None))
+            } else {
+                let oomir::Type::Class(class_name) = &target_oomir_ty else {
+                    return Ok(None);
+                };
+                let Some(oomir::DataType::Class { fields, .. }) = data_types.get(class_name) else {
+                    return Ok(None);
+                };
+                fields
+                    .iter()
+                    .find(|(field_name, field_ty)| {
+                        field_name == "pointer" && matches!(field_ty, oomir::Type::Pointer(_))
+                    })
+                    .map(|(_, field_ty)| (field_ty.clone(), pointee, Some(class_name.clone())))
+            }
         }
         _ => None,
     };
@@ -4450,12 +4668,18 @@ pub(super) fn ensure_exact_transmute_helper<'tcx>(
         return Ok(helper);
     }
 
-    let pointer_pointee = |ty: Ty<'tcx>| match ty.kind() {
+    let pointer_pointee = |ty: Ty<'tcx>, oomir_ty: &oomir::Type| match ty.kind() {
         TyKind::RawPtr(pointee, _) | TyKind::Ref(_, pointee, _) => Some(*pointee),
+        TyKind::Adt(adt_def, args)
+            if tcx.is_diagnostic_item(sym::NonNull, adt_def.did())
+                && matches!(oomir_ty, oomir::Type::Pointer(_)) =>
+        {
+            args.iter().find_map(|arg| arg.as_type())
+        }
         _ => None,
     };
-    let source_pointee = pointer_pointee(source_ty);
-    let target_pointee = pointer_pointee(target_ty);
+    let source_pointee = pointer_pointee(source_ty, &source_oomir_ty);
+    let target_pointee = pointer_pointee(target_ty, &target_oomir_ty);
     let source_is_u8_slice = source_pointee.is_some_and(
         |pointee| matches!(pointee.kind(), TyKind::Slice(element) if *element == tcx.types.u8),
     );
@@ -4499,6 +4723,14 @@ pub(super) fn ensure_exact_transmute_helper<'tcx>(
             if target_oomir_ty.has_jvm_value() =>
         {
             Some((target_oomir_ty.clone(), *pointee, None))
+        }
+        TyKind::Adt(adt_def, args)
+            if tcx.is_diagnostic_item(sym::NonNull, adt_def.did())
+                && matches!(target_oomir_ty, oomir::Type::Pointer(_)) =>
+        {
+            args.iter()
+                .find_map(|arg| arg.as_type())
+                .map(|pointee| (target_oomir_ty.clone(), pointee, None))
         }
         _ => target_non_null.as_ref().and_then(|(class_name, pointee)| {
             let oomir::DataType::Class { fields, .. } = data_types.get(class_name)? else {
@@ -5687,6 +5919,27 @@ fn pointer_builtin_codec_operand<'tcx>(
     instance_context: rustc_middle::ty::Instance<'tcx>,
 ) -> Option<oomir::Operand> {
     let ty = resolve_union_ty(tcx, ty, instance_context).ok()?;
+    let mut sized_pointer_codec = |pointee: Ty<'tcx>| {
+        let pointee_size = layout_size_bytes(tcx, pointee).ok()?;
+        let pointee_class = match pointee.kind() {
+            TyKind::Tuple(_) | TyKind::Adt(_, _) | TyKind::Closure(_, _) => {
+                ty_to_oomir_type(pointee, tcx, data_types, instance_context)
+                    .get_class_name()
+                    .unwrap_or_default()
+                    .to_string()
+            }
+            _ => String::new(),
+        };
+        let pointee_codec = pointer_view_codec_operand(pointee, tcx, data_types, instance_context);
+        let pointee_codec = match pointee_codec {
+            oomir::Operand::Constant(oomir::Constant::String(codec)) => codec,
+            oomir::Operand::Constant(oomir::Constant::Null(_)) => String::new(),
+            other => panic!("raw-pointer pointee codec must be constant, found {other:?}"),
+        };
+        Some(format!(
+            "{RAW_POINTER_VIEW_CODEC}\n{pointee_size}\n{pointee_class}\n{pointee_codec}"
+        ))
+    };
     let codec = match ty.kind() {
         TyKind::Ref(_, pointee, _) if let TyKind::Array(element, length) = pointee.kind() => {
             let length = length.try_to_target_usize(tcx)?;
@@ -5701,26 +5954,16 @@ fn pointer_builtin_codec_operand<'tcx>(
             format!("{ARRAY_REFERENCE_VIEW_CODEC_PREFIX}{length}\n{element_size}\n{element_codec}")
         }
         TyKind::RawPtr(pointee, _) | TyKind::Ref(_, pointee, _)
-            if pointee.is_sized(tcx, TypingEnv::fully_monomorphized()) =>
+            if is_codegen_sized(*pointee, tcx) =>
         {
-            let pointee_size = layout_size_bytes(tcx, *pointee).ok()?;
-            let pointee_class = match pointee.kind() {
-                TyKind::Tuple(_) | TyKind::Adt(_, _) | TyKind::Closure(_, _) => {
-                    ty_to_oomir_type(*pointee, tcx, data_types, instance_context)
-                        .get_class_name()
-                        .unwrap_or_default()
-                        .to_string()
-                }
-                _ => String::new(),
-            };
-            let pointee_codec =
-                pointer_view_codec_operand(*pointee, tcx, data_types, instance_context);
-            let pointee_codec = match pointee_codec {
-                oomir::Operand::Constant(oomir::Constant::String(codec)) => codec,
-                oomir::Operand::Constant(oomir::Constant::Null(_)) => String::new(),
-                other => panic!("raw-pointer pointee codec must be constant, found {other:?}"),
-            };
-            format!("{RAW_POINTER_VIEW_CODEC}\n{pointee_size}\n{pointee_class}\n{pointee_codec}")
+            sized_pointer_codec(*pointee)?
+        }
+        TyKind::Adt(adt_def, args) if tcx.is_diagnostic_item(sym::NonNull, adt_def.did()) => {
+            let pointee = args.iter().find_map(|arg| arg.as_type())?;
+            if !is_codegen_sized(pointee, tcx) {
+                return None;
+            }
+            sized_pointer_codec(pointee)?
         }
         TyKind::Int(IntTy::I128) => "@signed-big-integer".to_string(),
         TyKind::Uint(UintTy::U128) => "@unsigned-big-integer".to_string(),
@@ -6363,6 +6606,12 @@ pub fn force_define_named_adt<'tcx>(
     let TyKind::Adt(adt_def, substs) = ty.kind() else {
         return ty_to_oomir_type(ty, tcx, data_types, instance_context);
     };
+    if tcx.is_diagnostic_item(sym::NonNull, adt_def.did()) {
+        let lowered = ty_to_oomir_type(ty, tcx, data_types, instance_context);
+        if matches!(lowered, oomir::Type::Pointer(_)) {
+            return lowered;
+        }
+    }
     let jvm_name = generate_adt_jvm_class_name(adt_def, substs, tcx, data_types, instance_context);
     ensure_adt_data_type(
         adt_def,
@@ -6402,6 +6651,11 @@ pub fn ty_to_oomir_type<'tcx>(
     lowered
 }
 
+pub(crate) fn is_codegen_sized<'tcx>(ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) -> bool {
+    ty.has_trivial_sizedness(tcx, rustc_middle::ty::SizedTraitKind::Sized)
+        || (!ty.has_escaping_bound_vars() && ty.is_sized(tcx, TypingEnv::fully_monomorphized()))
+}
+
 fn ty_to_oomir_type_resolved<'tcx>(
     resolved_ty: Ty<'tcx>,
     tcx: TyCtxt<'tcx>,
@@ -6437,6 +6691,17 @@ fn ty_to_oomir_type_resolved<'tcx>(
             FloatTy::F128 => oomir::Type::Class(crate::lower2::F128_CLASS.to_string()),
         },
         rustc_middle::ty::TyKind::Adt(adt_def, substs) => {
+            if tcx.is_diagnostic_item(sym::NonNull, adt_def.did())
+                && let Some(pointee) = substs.iter().find_map(|arg| arg.as_type())
+                && is_codegen_sized(pointee, tcx)
+            {
+                return oomir::Type::Pointer(Box::new(ty_to_oomir_type(
+                    pointee,
+                    tcx,
+                    data_types,
+                    instance_context,
+                )));
+            }
             let jvm_name_full =
                 generate_adt_jvm_class_name(&adt_def, substs, tcx, data_types, instance_context);
 

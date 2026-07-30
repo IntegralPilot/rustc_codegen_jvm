@@ -8,7 +8,7 @@ use rustc_middle::ty::{
     AdtDef, EarlyBinder, FloatTy, GenericArgsRef, Instance, InstanceKind, IntTy,
     PseudoCanonicalInput, ScalarInt, ShimKind, Ty, TyCtxt, TyKind, TypingEnv, UintTy, Unnormalized,
 };
-use rustc_span::def_id::LOCAL_CRATE;
+use rustc_span::{def_id::LOCAL_CRATE, sym};
 use std::sync::{LazyLock, Mutex};
 
 use super::super::{
@@ -2196,7 +2196,35 @@ pub fn read_constant_value_from_memory<'tcx>(
         TyKind::Slice(_) => Err("Unsupported type: Direct read of slice from memory".to_string()),
 
         TyKind::Adt(adt_def, substs) => {
-            if adt_def.is_struct() {
+            if tcx.is_diagnostic_item(sym::NonNull, adt_def.did())
+                && matches!(
+                    ty_to_oomir_type(ty, tcx, oomir_data_types, instance),
+                    oomir::Type::Pointer(_)
+                )
+            {
+                let field = adt_def
+                    .variant(VariantIdx::from_usize(0))
+                    .fields
+                    .iter()
+                    .next()
+                    .ok_or_else(|| "NonNull constant has no pointer field".to_string())?;
+                let field_ty = tcx
+                    .try_normalize_erasing_regions(
+                        TypingEnv::fully_monomorphized(),
+                        field.ty(tcx, substs),
+                    )
+                    .map_err(|error| {
+                        format!("Could not normalize NonNull constant field: {error:?}")
+                    })?;
+                read_constant_value_from_memory(
+                    tcx,
+                    allocation,
+                    offset,
+                    field_ty,
+                    oomir_data_types,
+                    instance,
+                )
+            } else if adt_def.is_struct() {
                 handle_constant_struct(
                     tcx,
                     allocation,

@@ -15,6 +15,16 @@ pub const JAVA_STRING_CLASS: &str = "java/lang/String";
 pub const CALLER_LOCATION_PARAM_NAME: &str = "__caller_location";
 pub const INSTANCE_RECEIVER_POINTER_LOCAL: &str = "__instance_receiver_pointer";
 pub const RELATIVE_POINTER_METHOD_SUFFIX: &str = "$relative";
+pub const RELATIVE_POINTER_ELEMENT_OFFSET_SUFFIX: &str = "$rcj$elementOffset";
+pub const RELATIVE_POINTER_BYTE_OFFSET_SUFFIX: &str = "$rcj$byteOffset";
+
+pub fn relative_pointer_element_offset_field(field_name: &str) -> String {
+    format!("{field_name}{RELATIVE_POINTER_ELEMENT_OFFSET_SUFFIX}")
+}
+
+pub fn relative_pointer_byte_offset_field(field_name: &str) -> String {
+    format!("{field_name}{RELATIVE_POINTER_BYTE_OFFSET_SUFFIX}")
+}
 
 /// A Rust source position attached to generated code.
 ///

@@ -684,6 +684,12 @@ pub(super) fn emit_rust_drop_value<'tcx>(
                     let mut pointer_ty = oomir_ty.clone();
                     let mut pointer_rust_ty = rust_ty;
                     for depth in 0..3 {
+                        if matches!(
+                            pointer_ty,
+                            oomir::Type::Pointer(_) | oomir::Type::Slice(_) | oomir::Type::Str
+                        ) {
+                            break;
+                        }
                         let class_name = pointer_ty
                             .get_class_name()
                             .expect("Box pointer carrier must be a JVM class")
@@ -1165,6 +1171,16 @@ pub(super) fn collect_pointer_origins<'tcx>(
                     continue;
                 };
                 if !destination.projection.is_empty() {
+                    continue;
+                }
+                let destination_rust_ty =
+                    EarlyBinder::bind(tcx, destination.ty(&mir.local_decls, tcx).ty)
+                        .instantiate(tcx, instance.args)
+                        .skip_norm_wip();
+                if !matches!(
+                    destination_rust_ty.kind(),
+                    TyKind::Ref(..) | TyKind::RawPtr(..)
+                ) {
                     continue;
                 }
                 let destination_ty =
@@ -3525,6 +3541,33 @@ pub(super) fn convert_basic_block<'tcx>(
                                     if let Some(dest) = effective_dest {
                                         if let oomir::Type::Pointer(non_null_ty) =
                                             &dispatch_receiver_ty
+                                            && matches!(
+                                                non_null_ty.as_ref(),
+                                                oomir::Type::Pointer(_)
+                                            )
+                                        {
+                                            let pointer = super::place::emit_pointer_read(
+                                                receiver_operand,
+                                                non_null_ty,
+                                                &format!("{label}_non_null_pointer"),
+                                                &mut instructions,
+                                            );
+                                            let reference =
+                                                super::value_repr::adapt_operand_to_rust_type(
+                                                    pointer,
+                                                    fn_output,
+                                                    &format!("{label}_non_null_reference"),
+                                                    tcx,
+                                                    instance,
+                                                    data_types,
+                                                    &mut instructions,
+                                                );
+                                            instructions.push(oomir::Instruction::Move {
+                                                dest,
+                                                src: reference,
+                                            });
+                                        } else if let oomir::Type::Pointer(non_null_ty) =
+                                            &dispatch_receiver_ty
                                             && let oomir::Type::Class(owner_class) =
                                                 non_null_ty.as_ref()
                                         {
@@ -4359,10 +4402,9 @@ pub(super) fn convert_basic_block<'tcx>(
                                                 };
                                             let target_pointee_is_sized = match fn_output.kind() {
                                                 TyKind::RawPtr(pointee, _)
-                                                | TyKind::Ref(_, pointee, _) => pointee.is_sized(
-                                                    tcx,
-                                                    TypingEnv::fully_monomorphized(),
-                                                ),
+                                                | TyKind::Ref(_, pointee, _) => {
+                                                    super::types::is_codegen_sized(*pointee, tcx)
+                                                }
                                                 _ => false,
                                             };
                                             Some((

@@ -13,6 +13,7 @@ use rustc_middle::{
     mir::{Body, Local, Operand as MirOperand, Place, ProjectionElem, Rvalue, StatementKind},
     ty::{AdtDef, EarlyBinder, GenericArgsRef, Instance, Ty, TyCtxt, TyKind, TypingEnv},
 };
+use rustc_span::sym;
 use std::cell::RefCell;
 
 pub(crate) fn has_slice_or_str_struct_tail<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {
@@ -166,6 +167,11 @@ pub(crate) fn emit_pointer_write(
     let pointer_ty = pointer
         .get_type()
         .expect("a pointer write requires a typed operand");
+    let value_ty = if pointee_ty.is_jvm_primitive() {
+        pointee_ty.clone()
+    } else {
+        oomir::Type::Class("java/lang/Object".to_string())
+    };
     instructions.push(Instruction::InvokeVirtual {
         dest: None,
         class_name: oomir::POINTER_CLASS.to_string(),
@@ -173,10 +179,7 @@ pub(crate) fn emit_pointer_write(
         method_ty: oomir::Signature {
             params: vec![
                 ("self".to_string(), pointer_ty),
-                (
-                    "value".to_string(),
-                    oomir::Type::Class("java/lang/Object".to_string()),
-                ),
+                ("value".to_string(), value_ty),
             ],
             ret: Box::new(oomir::Type::Void),
             is_static: false,
@@ -806,6 +809,20 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
                     EarlyBinder::bind(tcx, base_place_for_field.ty(&mir.local_decls, tcx).ty)
                         .instantiate(tcx, instance.args)
                         .skip_norm_wip();
+
+                if field_index.index() == 0
+                    && matches!(
+                        base_rust_ty.kind(),
+                        TyKind::Adt(adt_def, _)
+                            if tcx.is_diagnostic_item(sym::NonNull, adt_def.did())
+                    )
+                    && matches!(current_type, oomir::Type::Pointer(_))
+                {
+                    // Sized NonNull<T> is represented by its pointer carrier, so
+                    // projecting its sole transparent field is an identity.
+                    current_type = ty_to_oomir_type(field_ty, tcx, data_types, instance);
+                    continue;
+                }
 
                 let has_slice_tail = matches!(current_type, oomir::Type::Pointer(_))
                     && has_slice_or_str_struct_tail(tcx, base_rust_ty);
@@ -1601,6 +1618,29 @@ pub fn emit_instructions_to_set_value<'tcx>(
             local: dest_place.local,
             projection: tcx.mk_place_elems(base_projection_elems),
         };
+        if matches!(last_projection, ProjectionElem::Field(field, _) if field.index() == 0) {
+            let base_rust_ty = EarlyBinder::bind(tcx, base_place.ty(&mir.local_decls, tcx).ty)
+                .instantiate(tcx, instance.args)
+                .skip_norm_wip();
+            if matches!(
+                base_rust_ty.kind(),
+                TyKind::Adt(adt_def, _)
+                    if tcx.is_diagnostic_item(sym::NonNull, adt_def.did())
+            ) && matches!(
+                ty_to_oomir_type(base_rust_ty, tcx, data_types, instance),
+                oomir::Type::Pointer(_)
+            ) {
+                instructions.extend(emit_instructions_to_set_value(
+                    &base_place,
+                    source_operand,
+                    tcx,
+                    instance,
+                    mir,
+                    data_types,
+                ));
+                return instructions;
+            }
+        }
 
         // 2. Generate instructions to get the value of the *base* place.
         //    This base value is the object we'll call SetField on, or the array

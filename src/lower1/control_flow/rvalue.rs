@@ -10,6 +10,7 @@ use rustc_middle::{
         adjustment::PointerCoercion,
     },
 };
+use rustc_span::sym;
 
 use super::{
     super::{
@@ -1207,6 +1208,47 @@ fn emit_unsize_value<'tcx>(
         Some(oomir::Operand::Variable {
             name: dest.to_string(),
             ty: target_oomir_ty,
+        })
+    } else if let (TyKind::Adt(source_def, source_args), TyKind::Adt(target_def, target_args)) =
+        (source_ty.kind(), target_ty.kind())
+        && source_def.did() == target_def.did()
+        && tcx.is_diagnostic_item(sym::NonNull, source_def.did())
+        && matches!(source_oomir_ty, oomir::Type::Pointer(_))
+        && let oomir::Type::Class(target_class) = &target_oomir_ty
+    {
+        let field = source_def
+            .variant(0usize.into())
+            .fields
+            .iter()
+            .next()
+            .expect("NonNull has a pointer field");
+        let source_field_ty =
+            normalize_unsize_ty(field.ty(tcx, source_args).skip_norm_wip(), tcx, instance);
+        let target_field_ty =
+            normalize_unsize_ty(field.ty(tcx, target_args).skip_norm_wip(), tcx, instance);
+        emit_unsize_value(
+            source_field_ty,
+            target_field_ty,
+            source,
+            &format!("{dest}_pointer"),
+            tcx,
+            instance,
+            data_types,
+            instructions,
+        )
+        .map(|pointer| {
+            let pointer_ty = pointer
+                .get_type()
+                .expect("unsized NonNull pointer has a JVM value");
+            instructions.push(oomir::Instruction::ConstructObject {
+                dest: dest.to_string(),
+                class_name: target_class.clone(),
+                args: vec![(pointer, pointer_ty)],
+            });
+            oomir::Operand::Variable {
+                name: dest.to_string(),
+                ty: target_oomir_ty.clone(),
+            }
         })
     } else if let (TyKind::Adt(source_def, source_args), TyKind::Adt(target_def, target_args)) =
         (source_ty.kind(), target_ty.kind())
@@ -3296,11 +3338,8 @@ fn ensure_erased_receiver_fn_pointer_bridge<'tcx>(
     let Some((_, target_receiver_ty)) = target_signature.params.first() else {
         return Err("function has no receiver carrier parameter".to_string());
     };
-    let oomir::Type::Class(carrier_class) = target_receiver_ty else {
-        return Err("target receiver is not a NonNull carrier".to_string());
-    };
-    if !oomir::is_non_null_class_name(carrier_class) {
-        return Err("target receiver is not a NonNull carrier".to_string());
+    if source_receiver_ty == target_receiver_ty {
+        return Err("function receiver representation is unchanged".to_string());
     }
     if !source_receiver_ty.has_jvm_value() {
         return Err("zero-sized erased receivers need no bridge".to_string());
@@ -3317,16 +3356,28 @@ fn ensure_erased_receiver_fn_pointer_bridge<'tcx>(
         }
     }
 
-    let Some(oomir::DataType::Class { fields, .. }) = data_types.get(carrier_class) else {
-        return Err(format!(
-            "receiver carrier class {carrier_class} is undefined"
-        ));
-    };
-    let Some((carrier_field_name, carrier_field_ty)) = fields.first().cloned() else {
-        return Err(format!(
-            "receiver carrier class {carrier_class} has no payload"
-        ));
-    };
+    let direct_pointer_carrier = matches!(target_receiver_ty, oomir::Type::Pointer(_));
+    let (carrier_class, carrier_field_name, carrier_field_ty) =
+        if let oomir::Type::Class(carrier_class) = target_receiver_ty {
+            if !oomir::is_non_null_class_name(carrier_class) {
+                return Err("target receiver is not a NonNull carrier".to_string());
+            }
+            let Some(oomir::DataType::Class { fields, .. }) = data_types.get(carrier_class) else {
+                return Err(format!(
+                    "receiver carrier class {carrier_class} is undefined"
+                ));
+            };
+            let Some((field_name, field_ty)) = fields.first().cloned() else {
+                return Err(format!(
+                    "receiver carrier class {carrier_class} has no payload"
+                ));
+            };
+            (Some(carrier_class.clone()), Some(field_name), field_ty)
+        } else if direct_pointer_carrier {
+            (None, None, target_receiver_ty.clone())
+        } else {
+            return Err("target receiver is not a NonNull carrier".to_string());
+        };
     let erased_pointer_to_slice = matches!(carrier_field_ty, oomir::Type::Pointer(_))
         && matches!(source_receiver_ty, oomir::Type::Slice(_) | oomir::Type::Str);
     if carrier_field_ty.to_jvm_descriptor() != "Ljava/lang/Object;"
@@ -3342,7 +3393,9 @@ fn ensure_erased_receiver_fn_pointer_bridge<'tcx>(
 
     let source_descriptor = source_signature.to_jvm_descriptor_with_explicit_params();
     let target_descriptor = target_signature.to_jvm_descriptor_with_explicit_params();
-    let identity = format!("{source_descriptor}->{target_descriptor}");
+    let identity = format!(
+        "{source_signature:?}:{source_descriptor}->{target_signature:?}:{target_descriptor}"
+    );
     let local_name = crate::stable_hash::readable_or_hashed_name(
         "FnPtrErasedReceiverBridge",
         &format!(
@@ -3370,25 +3423,29 @@ fn ensure_erased_receiver_fn_pointer_bridge<'tcx>(
     let erased_payload_name = "_erased_receiver_payload".to_string();
     let typed_receiver_name = "_typed_receiver".to_string();
 
-    let mut instructions = vec![
-        oomir::Instruction::GetField {
-            dest: source_pointer_name.clone(),
-            object: self_operand,
-            field_name: "function".to_string(),
-            field_ty: oomir::Type::Interface(source_interface.to_string()),
-            owner_class: class_name.clone(),
-        },
-        oomir::Instruction::GetField {
+    let mut instructions = vec![oomir::Instruction::GetField {
+        dest: source_pointer_name.clone(),
+        object: self_operand,
+        field_name: "function".to_string(),
+        field_ty: oomir::Type::Interface(source_interface.to_string()),
+        owner_class: class_name.clone(),
+    }];
+    let erased_payload = if let (Some(carrier_class), Some(carrier_field_name)) =
+        (carrier_class, carrier_field_name)
+    {
+        instructions.push(oomir::Instruction::GetField {
             dest: erased_payload_name.clone(),
             object: erased_receiver,
             field_name: carrier_field_name,
             field_ty: erased_payload_ty.clone(),
-            owner_class: carrier_class.clone(),
-        },
-    ];
-    let erased_payload = oomir::Operand::Variable {
-        name: erased_payload_name,
-        ty: erased_payload_ty.clone(),
+            owner_class: carrier_class,
+        });
+        oomir::Operand::Variable {
+            name: erased_payload_name,
+            ty: erased_payload_ty.clone(),
+        }
+    } else {
+        erased_receiver
     };
     if erased_pointer_to_slice {
         let restored_object_name = "_restored_slice_object".to_string();
@@ -4027,14 +4084,7 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                     let oomir_operand =
                         convert_operand(operand, tcx, instance, mir, data_types, &mut instructions);
 
-                    if source_signature.to_jvm_descriptor_with_explicit_params()
-                        == target_signature.to_jvm_descriptor_with_explicit_params()
-                    {
-                        instructions.push(oomir::Instruction::Move {
-                            dest: temp_cast_var.clone(),
-                            src: oomir_operand,
-                        });
-                    } else if let Ok(bridge_class) = ensure_erased_receiver_fn_pointer_bridge(
+                    if let Ok(bridge_class) = ensure_erased_receiver_fn_pointer_bridge(
                         data_types,
                         &source_signature,
                         &source_interface,
@@ -4047,6 +4097,13 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                             dest: temp_cast_var.clone(),
                             class_name: bridge_class,
                             args: vec![(oomir_operand, oomir::Type::Interface(source_interface))],
+                        });
+                    } else if source_signature.to_jvm_descriptor_with_explicit_params()
+                        == target_signature.to_jvm_descriptor_with_explicit_params()
+                    {
+                        instructions.push(oomir::Instruction::Move {
+                            dest: temp_cast_var.clone(),
+                            src: oomir_operand,
                         });
                     } else {
                         breadcrumbs::log!(
@@ -4095,8 +4152,10 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                             pointer_pointee_ty(resolved_target_mir_ty).kind(),
                             TyKind::Dynamic(..)
                         )
-                        && pointer_pointee_ty(resolved_target_mir_ty)
-                            .is_sized(tcx, TypingEnv::fully_monomorphized())
+                        && super::super::types::is_codegen_sized(
+                            pointer_pointee_ty(resolved_target_mir_ty),
+                            tcx,
+                        )
                         && matches!(oomir_target_type, oomir::Type::Pointer(_))
                     {
                         instructions.push(oomir::Instruction::InvokeStatic {
@@ -5814,7 +5873,26 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                             instance,
                         );
                     }
-                    if adt_def.is_struct() {
+                    if tcx.is_diagnostic_item(sym::NonNull, adt_def.did())
+                        && matches!(aggregate_oomir_type, oomir::Type::Pointer(_))
+                    {
+                        let operand = operands
+                            .iter()
+                            .next()
+                            .expect("NonNull aggregate has a pointer field");
+                        let value = convert_operand(
+                            operand,
+                            tcx,
+                            instance,
+                            mir,
+                            data_types,
+                            &mut instructions,
+                        );
+                        instructions.push(oomir::Instruction::Move {
+                            dest: temp_aggregate_var.clone(),
+                            src: value,
+                        });
+                    } else if adt_def.is_struct() {
                         let variant = adt_def.variant(*variant_idx);
                         let jvm_class_name = generate_adt_jvm_class_name(
                             &adt_def, substs, tcx, data_types, instance,
