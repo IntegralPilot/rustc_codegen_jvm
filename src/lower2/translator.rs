@@ -142,6 +142,27 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         }
         let direct_field_projections =
             direct_field_projections(oomir_func, module, &deferred_pointer_variables);
+        for block in oomir_func.body.basic_blocks.values() {
+            for instruction in &block.instructions {
+                if let oomir::Instruction::InvokeVirtual {
+                    dest: Some(dest),
+                    method_name,
+                    args,
+                    operand: oomir::Operand::Variable { name, .. },
+                    ..
+                } = instruction
+                    && direct_field_projections
+                        .get(name)
+                        .is_some_and(|projection| {
+                            matches!(projection.field_ty, Type::Pointer(_))
+                                && is_direct_field_getter(method_name, args, projection)
+                        })
+                {
+                    deferred_pointer_variables.insert(dest.clone());
+                }
+            }
+        }
+        propagate_deferred_pointer_moves(oomir_func, &mut deferred_pointer_variables);
         let direct_cell_projections = direct_cell_projections(oomir_func);
         let known_function_pointer_adapters = known_function_pointer_adapters(oomir_func);
         let mut translator = FunctionTranslator {
@@ -1054,6 +1075,33 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             &projection.field_name,
             &projection.field_ty.to_jvm_descriptor(),
         )?;
+        if matches!(projection.field_ty, Type::Pointer(_)) && projection.wrappers.is_empty() {
+            self.jvm_instructions.push(Instruction::Dup);
+            self.jvm_instructions.push(Instruction::Dup);
+            self.jvm_instructions.push(Instruction::Getfield(field));
+            self.store_result(dest, result_ty)?;
+            let pointer_slot = self.get_or_assign_local(dest, result_ty);
+            let offset_slots = self.pointer_offset_slots(pointer_slot);
+            for (offset_name, offset_slot) in [
+                (
+                    oomir::relative_pointer_element_offset_field(&projection.field_name),
+                    offset_slots.0,
+                ),
+                (
+                    oomir::relative_pointer_byte_offset_field(&projection.field_name),
+                    offset_slots.1,
+                ),
+            ] {
+                let offset_field =
+                    self.constant_pool
+                        .add_field_ref(owner_class, offset_name, "J")?;
+                self.jvm_instructions
+                    .push(Instruction::Getfield(offset_field));
+                self.jvm_instructions
+                    .push(get_store_instruction(&Type::I64, offset_slot)?);
+            }
+            return Ok(());
+        }
         self.jvm_instructions.push(Instruction::Getfield(field));
         for wrapper in &projection.wrappers {
             let wrapper_class = self.constant_pool.add_class(&wrapper.class_name)?;
@@ -1077,23 +1125,61 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         value: &oomir::Operand,
     ) -> Result<(), jvm::Error> {
         let is_direct_this = self.load_direct_field_owner(projection)?;
-        self.load_operand_as(value, &projection.view_ty)?;
-        for wrapper in projection.wrappers.iter().rev() {
-            let wrapper_class = self.constant_pool.add_class(&wrapper.class_name)?;
-            let field = self.constant_pool.add_field_ref(
-                wrapper_class,
-                &wrapper.field_name,
-                &wrapper.inner_ty.to_jvm_descriptor(),
-            )?;
-            self.jvm_instructions.push(Instruction::Getfield(field));
-        }
         let owner_class = self.constant_pool.add_class(&projection.owner_class)?;
         let field = self.constant_pool.add_field_ref(
             owner_class,
             &projection.field_name,
             &projection.field_ty.to_jvm_descriptor(),
         )?;
-        self.jvm_instructions.push(Instruction::Putfield(field));
+        if matches!(projection.field_ty, Type::Pointer(_)) && projection.wrappers.is_empty() {
+            self.jvm_instructions.push(Instruction::Dup);
+            self.jvm_instructions.push(Instruction::Dup);
+            let deferred_slots = match value {
+                oomir::Operand::Variable {
+                    name,
+                    ty: Type::Pointer(_),
+                } if self.deferred_pointer_variables.contains(name) => {
+                    let pointer_slot = self.get_local_index(name)?;
+                    self.jvm_instructions
+                        .push(get_load_instruction(&projection.field_ty, pointer_slot)?);
+                    self.pointer_offset_slots.get(&pointer_slot).copied()
+                }
+                _ => {
+                    self.load_operand_as(value, &projection.view_ty)?;
+                    None
+                }
+            };
+            self.jvm_instructions.push(Instruction::Putfield(field));
+            for (offset_name, byte_component) in [
+                (
+                    oomir::relative_pointer_element_offset_field(&projection.field_name),
+                    false,
+                ),
+                (
+                    oomir::relative_pointer_byte_offset_field(&projection.field_name),
+                    true,
+                ),
+            ] {
+                let offset_field =
+                    self.constant_pool
+                        .add_field_ref(owner_class, offset_name, "J")?;
+                self.load_pointer_offset_component(deferred_slots, byte_component)?;
+                self.jvm_instructions
+                    .push(Instruction::Putfield(offset_field));
+            }
+        } else {
+            self.load_operand_as(value, &projection.view_ty)?;
+            for wrapper in projection.wrappers.iter().rev() {
+                let wrapper_class = self.constant_pool.add_class(&wrapper.class_name)?;
+                let field = self.constant_pool.add_field_ref(
+                    wrapper_class,
+                    &wrapper.field_name,
+                    &wrapper.inner_ty.to_jvm_descriptor(),
+                )?;
+                self.jvm_instructions.push(Instruction::Getfield(field));
+            }
+            self.jvm_instructions.push(Instruction::Putfield(field));
+        }
         if projection.source_kind == DirectFieldSource::PointerView && !is_direct_this {
             self.load_operand(&projection.source)?;
             let pointer_class = self.constant_pool.add_class(oomir::POINTER_CLASS)?;
@@ -1113,10 +1199,13 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             self.jvm_instructions
                 .push(Instruction::Invokestatic(commit));
         } else if projection.source_kind == DirectFieldSource::DeferredPointerView {
-            return Err(jvm::Error::VerificationError {
-                context: format!("Function {}", self.oomir_func.name),
-                message: "a deferred direct field write escaped analysis".to_string(),
-            });
+            self.load_operand(&projection.source)?;
+            let pointer_class = self.constant_pool.add_class(oomir::POINTER_CLASS)?;
+            let commit =
+                self.constant_pool
+                    .add_method_ref(pointer_class, "commitMemoryView", "()V")?;
+            self.jvm_instructions
+                .push(Instruction::Invokevirtual(commit));
         }
         Ok(())
     }
@@ -4104,14 +4193,14 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     Some(oomir::Type::Interface(name)) => name,
                     _ => signature.fn_ptr_interface_name(),
                 };
-                let descriptor = relative_adapter.as_ref().map_or_else(
-                    || signature.to_jvm_descriptor_with_explicit_params(),
-                    |_| {
-                        signature
-                            .relative_pointer_abi_signature()
-                            .to_jvm_descriptor_with_explicit_params()
-                    },
-                );
+                let use_relative_pointer_abi = signature.supports_relative_pointer_abi();
+                let descriptor = if use_relative_pointer_abi {
+                    signature
+                        .relative_pointer_abi_signature()
+                        .to_jvm_descriptor_with_explicit_params()
+                } else {
+                    signature.to_jvm_descriptor_with_explicit_params()
+                };
                 let method_ref = if let Some(adapter_class) = &relative_adapter {
                     let class_index = self.constant_pool.add_class(adapter_class)?;
                     self.constant_pool.add_method_ref(
@@ -4121,8 +4210,16 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     )?
                 } else {
                     let class_index = self.constant_pool.add_class(&interface_name)?;
-                    self.constant_pool
-                        .add_interface_method_ref(class_index, "call", &descriptor)?
+                    let method_name = if use_relative_pointer_abi {
+                        format!("call{}", oomir::RELATIVE_POINTER_METHOD_SUFFIX)
+                    } else {
+                        "call".to_string()
+                    };
+                    self.constant_pool.add_interface_method_ref(
+                        class_index,
+                        &method_name,
+                        &descriptor,
+                    )?
                 };
 
                 self.load_operand(function_ptr)?;
@@ -4141,7 +4238,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     });
                 }
                 for (arg, (_, expected_ty)) in args.iter().zip(signature.params.iter()) {
-                    if relative_adapter.is_some() && matches!(expected_ty, Type::Pointer(_)) {
+                    if use_relative_pointer_abi && matches!(expected_ty, Type::Pointer(_)) {
                         self.load_pointer_components(arg)?;
                     } else {
                         self.load_call_argument_as(arg, expected_ty)?;
@@ -4151,7 +4248,20 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 if relative_adapter.is_some() {
                     self.jvm_instructions.push(JI::Invokevirtual(method_ref));
                 } else {
-                    let count = self.invokeinterface_count(args)?;
+                    let mut count = u16::from(self.invokeinterface_count(args)?);
+                    if use_relative_pointer_abi {
+                        count += signature
+                            .params
+                            .iter()
+                            .filter(|(_, ty)| matches!(ty, Type::Pointer(_)))
+                            .count() as u16
+                            * 4;
+                    }
+                    let count = u8::try_from(count).map_err(|_| jvm::Error::VerificationError {
+                        context: format!("Function {}", self.oomir_func.name),
+                        message: "relative invokeinterface argument slots exceed u8 range"
+                            .to_string(),
+                    })?;
                     self.jvm_instructions
                         .push(JI::Invokeinterface(method_ref, count));
                 }
@@ -4838,12 +4948,21 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 let constructor_arg_types = declared_field_types
                     .as_ref()
                     .filter(|field_types| field_types.len() == visible_args.len());
+                let relative_pointer_fields = constructor_arg_types.is_some_and(|field_types| {
+                    field_types.iter().any(|ty| matches!(ty, Type::Pointer(_)))
+                });
                 let constructor_descriptor = format!(
                     "({})V",
                     match constructor_arg_types {
                         Some(field_types) => field_types
                             .iter()
-                            .map(|ty| ty.to_jvm_descriptor())
+                            .map(|ty| {
+                                if relative_pointer_fields && matches!(ty, Type::Pointer(_)) {
+                                    format!("{}JJ", ty.to_jvm_descriptor())
+                                } else {
+                                    ty.to_jvm_descriptor()
+                                }
+                            })
                             .collect::<String>(),
                         None => visible_args
                             .iter()
@@ -4866,7 +4985,15 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 for (index, (arg, arg_ty)) in visible_args.into_iter().enumerate() {
                     let expected_ty =
                         constructor_arg_types.map_or(arg_ty, |field_types| field_types[index]);
-                    self.load_operand_as(arg, expected_ty)?;
+                    if relative_pointer_fields && matches!(expected_ty, Type::Pointer(_)) {
+                        if !self.load_deferred_pointer_components(arg)? {
+                            self.load_operand_as(arg, expected_ty)?;
+                            self.jvm_instructions.push(JI::Lconst_0);
+                            self.jvm_instructions.push(JI::Lconst_0);
+                        }
+                    } else {
+                        self.load_operand_as(arg, expected_ty)?;
+                    }
                 }
 
                 // 5. Emit 'invokespecial' to call the constructor
@@ -4910,7 +5037,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     });
                 }
 
-                // 2. Add Field reference to constant pool
                 let owner_class_index = self.constant_pool.add_class(owner_class)?;
                 let field_descriptor = field_ty.to_jvm_descriptor();
                 let field_ref_index = self.constant_pool.add_field_ref(
@@ -4918,18 +5044,48 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     field_name,
                     &field_descriptor,
                 )?;
-
-                // 3. Load the object reference onto the stack
-                // Use object_actual_type (which must be a reference type) to get aload
                 let load_object_instr =
                     get_load_instruction(&object_actual_type, object_var_index)?;
-                self.jvm_instructions.push(load_object_instr.clone()); // Stack: [object_ref]
+                if matches!(field_ty, Type::Pointer(_)) {
+                    self.jvm_instructions.push(load_object_instr.clone());
+                    let deferred_slots = match value {
+                        OO::Variable {
+                            name,
+                            ty: Type::Pointer(_),
+                        } if self.deferred_pointer_variables.contains(name) => {
+                            let slot = self.get_local_index(name)?;
+                            self.jvm_instructions
+                                .push(get_load_instruction(field_ty, slot)?);
+                            self.pointer_offset_slots.get(&slot).copied()
+                        }
+                        _ => {
+                            self.load_operand_as(value, field_ty)?;
+                            None
+                        }
+                    };
+                    self.jvm_instructions.push(JI::Putfield(field_ref_index));
 
-                // 4. Load the value to be stored onto the stack
-                self.load_operand_as(value, field_ty)?; // Stack: [object_ref, value] (value size 1 or 2)
-
-                // 5. Emit 'putfield' instruction
-                self.jvm_instructions.push(JI::Putfield(field_ref_index)); // Stack: []
+                    for (offset_name, byte_component) in [
+                        (
+                            oomir::relative_pointer_element_offset_field(field_name),
+                            false,
+                        ),
+                        (oomir::relative_pointer_byte_offset_field(field_name), true),
+                    ] {
+                        let offset_ref = self.constant_pool.add_field_ref(
+                            owner_class_index,
+                            offset_name,
+                            "J",
+                        )?;
+                        self.jvm_instructions.push(load_object_instr.clone());
+                        self.load_pointer_offset_component(deferred_slots, byte_component)?;
+                        self.jvm_instructions.push(JI::Putfield(offset_ref));
+                    }
+                } else {
+                    self.jvm_instructions.push(load_object_instr);
+                    self.load_operand_as(value, field_ty)?;
+                    self.jvm_instructions.push(JI::Putfield(field_ref_index));
+                }
             }
 
             OI::GetField { dest, field_ty, .. } if !field_ty.has_jvm_value() => {
@@ -4957,7 +5113,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     });
                 }
 
-                // 2. Add Field reference to constant pool (same as SetField)
                 let owner_class_index = self.constant_pool.add_class(owner_class)?;
                 let field_descriptor = field_ty.to_jvm_descriptor();
                 let field_ref_index = self.constant_pool.add_field_ref(
@@ -4965,20 +5120,63 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     field_name,
                     &field_descriptor,
                 )?;
-
-                // 3. Load the object reference onto the stack
-                self.load_operand(object)?; // Stack: [object_ref]
-
-                // 4. Emit 'getfield' instruction
-                self.jvm_instructions.push(JI::Getfield(field_ref_index)); // Stack: [field_value] (size 1 or 2)
-
-                // 5. Store the retrieved field value into the destination variable
-                //    The type for storage is the field's type (field_ty)
+                self.load_operand(object)?;
+                self.jvm_instructions.push(JI::Getfield(field_ref_index));
                 if object.get_name() == Some(dest.as_str()) {
                     self.store_result_in_distinct_slot(dest, field_ty)?;
                 } else {
                     self.store_result(dest, field_ty)?;
                 }
+                if matches!(field_ty, Type::Pointer(_)) {
+                    let pointer_slot = self.get_or_assign_local(dest, field_ty);
+                    let offset_slots = self.pointer_offset_slots(pointer_slot);
+                    for (offset_name, offset_slot) in [
+                        (
+                            oomir::relative_pointer_element_offset_field(field_name),
+                            offset_slots.0,
+                        ),
+                        (
+                            oomir::relative_pointer_byte_offset_field(field_name),
+                            offset_slots.1,
+                        ),
+                    ] {
+                        let offset_ref = self.constant_pool.add_field_ref(
+                            owner_class_index,
+                            offset_name,
+                            "J",
+                        )?;
+                        self.load_operand(object)?;
+                        self.jvm_instructions.push(JI::Getfield(offset_ref));
+                        self.jvm_instructions
+                            .push(get_store_instruction(&Type::I64, offset_slot)?);
+                    }
+                }
+            }
+            OI::Cast {
+                op: op @ OO::Variable { name, .. },
+                ty: target_ty @ Type::Pointer(_),
+                dest,
+            } if self.deferred_pointer_variables.contains(name) => {
+                let source_ty = get_operand_type(op);
+                let source_slot = self.get_local_index(name)?;
+                let source_offsets = self.pointer_offset_slots.get(&source_slot).copied();
+                self.jvm_instructions
+                    .push(get_load_instruction(&source_ty, source_slot)?);
+                self.jvm_instructions.extend(get_cast_instructions(
+                    &self.oomir_func.name,
+                    &source_ty,
+                    target_ty,
+                    self.constant_pool,
+                )?);
+                self.store_result(dest, target_ty)?;
+                let dest_slot = self.get_or_assign_local(dest, target_ty);
+                let dest_offsets = self.pointer_offset_slots(dest_slot);
+                self.load_pointer_offset_component(source_offsets, false)?;
+                self.jvm_instructions
+                    .push(get_store_instruction(&Type::I64, dest_offsets.0)?);
+                self.load_pointer_offset_component(source_offsets, true)?;
+                self.jvm_instructions
+                    .push(get_store_instruction(&Type::I64, dest_offsets.1)?);
             }
             OI::Cast { op, ty, dest } => {
                 let restored_dest = dest
@@ -5280,6 +5478,34 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 self.store_result(dest, &method_ty.ret)?;
             }
             OI::InvokeVirtual {
+                dest: Some(dest),
+                class_name,
+                method_name,
+                method_ty,
+                args,
+                operand,
+            } if class_name == oomir::POINTER_CLASS
+                && method_name == "samePointer"
+                && args.len() == 1
+                && matches!(operand.get_type(), Some(Type::Pointer(_)))
+                && matches!(args[0].get_type(), Some(Type::Pointer(_))) =>
+            {
+                self.load_pointer_components(operand)?;
+                self.load_pointer_components(&args[0])?;
+                let pointer_class = self.constant_pool.add_class(oomir::POINTER_CLASS)?;
+                let compare = self.constant_pool.add_method_ref(
+                    pointer_class,
+                    "samePointerRelative",
+                    &format!(
+                        "(L{};JJL{};JJ)Z",
+                        oomir::POINTER_CLASS,
+                        oomir::POINTER_CLASS
+                    ),
+                )?;
+                self.jvm_instructions.push(JI::Invokestatic(compare));
+                self.store_result(dest, &method_ty.ret)?;
+            }
+            OI::InvokeVirtual {
                 dest,
                 method_name,
                 operand,
@@ -5485,8 +5711,9 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     self.load_operand(operand)?; // Stack: [object_ref]
                 }
 
-                // 3. Load arguments onto the stack. Pointer.set has an erased
-                // Object boundary so primitive Rust carriers must be boxed.
+                // 3. Load arguments onto the stack. Aggregate Pointer.set calls
+                // retain an erased Object boundary, while primitive overloads
+                // keep their JVM carriers unboxed.
                 let explicit_params = Self::explicit_instance_params(method_ty);
                 if args.len() != explicit_params.len() {
                     return Err(jvm::Error::VerificationError {
@@ -5501,7 +5728,10 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     });
                 }
                 for (arg, (_, expected_ty)) in args.iter().zip(explicit_params.iter()) {
-                    if class_name == oomir::POINTER_CLASS && method_name == "set" {
+                    if class_name == oomir::POINTER_CLASS
+                        && method_name == "set"
+                        && expected_ty == &oomir::Type::Class("java/lang/Object".to_string())
+                    {
                         self.load_operand_as(
                             arg,
                             &oomir::Type::Class("java/lang/Object".to_string()),
@@ -6941,7 +7171,6 @@ fn is_allowed_direct_field_use(
             && ((is_direct_field_getter(method_name, args, projection))
                 || (method_name == "set"
                     && args.len() == 1
-                    && projection.source_kind != DirectFieldSource::DeferredPointerView
                     && get_operand_type(&args[0]) == projection.view_ty))
     ) || pointer_retype_pointees(instruction).is_some_and(|(source, _, dest, _)| {
         source == name && projections.contains_key(source) && projections.contains_key(dest)
@@ -6980,7 +7209,6 @@ fn is_direct_field_getter(
 
 fn deferred_pointer_variables(function: &oomir::Function) -> HashSet<String> {
     let mut variables = HashSet::default();
-    let mut pointer_moves = Vec::new();
 
     for block in function.body.basic_blocks.values() {
         for instruction in &block.instructions {
@@ -7018,32 +7246,59 @@ fn deferred_pointer_variables(function: &oomir::Function) -> HashSet<String> {
                         variables.insert(dest.clone());
                     }
                 }
-                oomir::Instruction::Move {
+                oomir::Instruction::GetField {
                     dest,
-                    src:
-                        oomir::Operand::Variable {
-                            name: source,
-                            ty: Type::Pointer(_),
-                        },
-                } => pointer_moves.push((source.clone(), dest.clone())),
+                    field_ty: Type::Pointer(_),
+                    ..
+                } => {
+                    variables.insert(dest.clone());
+                }
                 _ => {}
             }
         }
     }
 
+    propagate_deferred_pointer_moves(function, &mut variables);
+    variables
+}
+
+fn propagate_deferred_pointer_moves(function: &oomir::Function, variables: &mut HashSet<String>) {
+    let pointer_aliases = function
+        .body
+        .basic_blocks
+        .values()
+        .flat_map(|block| block.instructions.iter())
+        .filter_map(|instruction| match instruction {
+            oomir::Instruction::Move {
+                dest,
+                src:
+                    oomir::Operand::Variable {
+                        name: source,
+                        ty: Type::Pointer(_),
+                    },
+            } => Some((source, dest, true)),
+            oomir::Instruction::Cast {
+                op: oomir::Operand::Variable { name: source, .. },
+                ty: Type::Pointer(_),
+                dest,
+            } => Some((source, dest, false)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
     loop {
         let mut changed = false;
-        for (source, dest) in &pointer_moves {
-            if variables.contains(source) || variables.contains(dest) {
-                changed |= variables.insert(source.clone());
+        for &(source, dest, bidirectional) in &pointer_aliases {
+            if variables.contains(source) {
                 changed |= variables.insert(dest.clone());
+            }
+            if bidirectional && variables.contains(dest) {
+                changed |= variables.insert(source.clone());
             }
         }
         if !changed {
             break;
         }
     }
-    variables
 }
 
 fn is_deferred_pointer_arithmetic(method_name: &str) -> bool {
