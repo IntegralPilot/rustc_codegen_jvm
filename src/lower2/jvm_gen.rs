@@ -1025,6 +1025,84 @@ fn create_field_constructor(
     })
 }
 
+fn create_relative_pointer_field_constructor(
+    cp: &mut InternedConstantPool,
+    this_class_index: u16,
+    super_class_index: u16,
+    fields: &[(String, Type)],
+) -> jvm::Result<jvm::Method> {
+    let descriptor = format!(
+        "({})V",
+        fields
+            .iter()
+            .map(|(_, ty)| {
+                if matches!(ty, Type::Pointer(_)) {
+                    format!("{}JJ", ty.to_jvm_descriptor())
+                } else {
+                    ty.to_jvm_descriptor()
+                }
+            })
+            .collect::<String>()
+    );
+    let super_init = cp.add_method_ref(super_class_index, "<init>", "()V")?;
+    let mut instructions = vec![Instruction::Aload_0, Instruction::Invokespecial(super_init)];
+    let mut next_local = 1u16;
+    let mut parameters = Vec::new();
+
+    for (field_name, field_ty) in fields {
+        let field =
+            cp.add_field_ref(this_class_index, field_name, &field_ty.to_jvm_descriptor())?;
+        instructions.push(Instruction::Aload_0);
+        instructions.push(get_load_instruction(field_ty, next_local)?);
+        instructions.push(Instruction::Putfield(field));
+        parameters.push(jvm::attributes::MethodParameter {
+            name_index: cp.add_utf8(field_name)?,
+            access_flags: MethodAccessFlags::empty(),
+        });
+        next_local += get_type_size(field_ty);
+
+        if matches!(field_ty, Type::Pointer(_)) {
+            for offset_name in [
+                oomir::relative_pointer_element_offset_field(field_name),
+                oomir::relative_pointer_byte_offset_field(field_name),
+            ] {
+                let offset = cp.add_field_ref(this_class_index, &offset_name, "J")?;
+                instructions.push(Instruction::Aload_0);
+                instructions.push(get_load_instruction(&Type::I64, next_local)?);
+                instructions.push(Instruction::Putfield(offset));
+                parameters.push(jvm::attributes::MethodParameter {
+                    name_index: cp.add_utf8(offset_name)?,
+                    access_flags: MethodAccessFlags::SYNTHETIC,
+                });
+                next_local += 2;
+            }
+        }
+    }
+    instructions.push(Instruction::Return);
+
+    Ok(jvm::Method {
+        access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::SYNTHETIC,
+        name_index: cp.add_utf8("<init>")?,
+        descriptor_index: cp.add_utf8(&descriptor)?,
+        attributes: vec![
+            code_attribute_for_descriptor(
+                cp,
+                3,
+                next_local,
+                instructions,
+                &descriptor,
+                false,
+                None,
+                "<init>",
+            )?,
+            Attribute::MethodParameters {
+                name_index: cp.add_utf8("MethodParameters")?,
+                parameters,
+            },
+        ],
+    })
+}
+
 fn create_managed_copy_method(
     cp: &mut InternedConstantPool,
     this_class_index: u16,
@@ -1049,13 +1127,30 @@ fn create_managed_copy_method(
     let object_type = Type::Class("java/lang/Object".to_string());
     let mut instructions = vec![Instruction::New(this_class_index), Instruction::Dup];
     let mut argument_slots = 0u16;
+    let mut max_stack = 2u16;
 
     for (field_name, field_ty) in fields {
         let field =
             cp.add_field_ref(this_class_index, field_name, &field_ty.to_jvm_descriptor())?;
         instructions.push(Instruction::Aload_0);
         instructions.push(Instruction::Getfield(field));
-        if field_ty.is_jvm_reference_type() {
+        if matches!(field_ty, Type::Pointer(_)) {
+            for offset_name in [
+                oomir::relative_pointer_element_offset_field(field_name),
+                oomir::relative_pointer_byte_offset_field(field_name),
+            ] {
+                let offset = cp.add_field_ref(this_class_index, offset_name, "J")?;
+                instructions.push(Instruction::Aload_0);
+                instructions.push(Instruction::Getfield(offset));
+            }
+            let materialize = cp.add_method_ref(
+                pointer_class,
+                "materializeRelative",
+                &format!("(L{};JJ)L{};", oomir::POINTER_CLASS, oomir::POINTER_CLASS),
+            )?;
+            instructions.push(Instruction::Invokestatic(materialize));
+            max_stack = max_stack.max(7u16.saturating_add(argument_slots));
+        } else if field_ty.is_jvm_reference_type() {
             instructions.push(Instruction::Invokestatic(copy_managed_value));
             instructions.extend(get_cast_instructions(
                 "rustCopy",
@@ -1065,6 +1160,7 @@ fn create_managed_copy_method(
             )?);
         }
         argument_slots = argument_slots.saturating_add(get_type_size(field_ty));
+        max_stack = max_stack.max(2u16.saturating_add(argument_slots));
     }
     instructions.push(Instruction::Invokespecial(constructor));
     instructions.push(Instruction::Areturn);
@@ -1075,7 +1171,7 @@ fn create_managed_copy_method(
         descriptor_index: cp.add_utf8(descriptor)?,
         attributes: vec![code_attribute_for_descriptor(
             cp,
-            2u16.saturating_add(argument_slots),
+            max_stack,
             1,
             instructions,
             descriptor,
@@ -1504,6 +1600,20 @@ pub(super) fn create_data_type_classfile_for_class(
             attributes: Vec::new(),
         };
         jvm_fields.push(field);
+        if matches!(field_ty, Type::Pointer(_)) {
+            for offset_name in [
+                oomir::relative_pointer_element_offset_field(field_name),
+                oomir::relative_pointer_byte_offset_field(field_name),
+            ] {
+                jvm_fields.push(jvm::Field {
+                    access_flags: FieldAccessFlags::PUBLIC | FieldAccessFlags::SYNTHETIC,
+                    name_index: cp.add_utf8(offset_name)?,
+                    descriptor_index: cp.add_utf8("J")?,
+                    field_type: oomir_type_to_ristretto_field_type(&Type::I64),
+                    attributes: Vec::new(),
+                });
+            }
+        }
         breadcrumbs::log!(
             breadcrumbs::LogLevel::Info,
             "bytecode-gen",
@@ -1519,6 +1629,17 @@ pub(super) fn create_data_type_classfile_for_class(
         create_field_constructor(&mut cp, this_class_index, super_class_index, &fields)?
     };
     let mut jvm_methods = vec![constructor];
+    if fields
+        .iter()
+        .any(|(_, field_ty)| matches!(field_ty, Type::Pointer(_)))
+    {
+        jvm_methods.push(create_relative_pointer_field_constructor(
+            &mut cp,
+            this_class_index,
+            super_class_index,
+            &fields,
+        )?);
+    }
     if !is_abstract {
         jvm_methods.push(create_managed_copy_method(
             &mut cp,
@@ -2075,6 +2196,80 @@ pub(super) fn create_data_type_classfile_for_interface(
             attributes: Vec::new(), // Abstract methods have no Code attribute
         };
         jvm_methods.push(jvm_method);
+        if method_name == "call" && interface_name_jvm.starts_with("org/rustlang/runtime/FnPtr_") {
+            let mut explicit_signature = signature.clone();
+            explicit_signature.is_static = true;
+            if explicit_signature.supports_relative_pointer_abi() {
+                let relative_signature = explicit_signature.relative_pointer_abi_signature();
+                let relative_descriptor =
+                    relative_signature.to_jvm_descriptor_with_explicit_params();
+                let call_descriptor = explicit_signature.to_jvm_descriptor_with_explicit_params();
+                let pointer_class = cp.add_class(oomir::POINTER_CLASS)?;
+                let materialize = cp.add_method_ref(
+                    pointer_class,
+                    "materializeRelative",
+                    &format!("(L{};JJ)L{};", oomir::POINTER_CLASS, oomir::POINTER_CLASS),
+                )?;
+                let call_ref =
+                    cp.add_interface_method_ref(this_class_index, "call", &call_descriptor)?;
+
+                let mut instructions = vec![Instruction::Aload_0];
+                let mut local = 1u16;
+                let mut stack = 1u16;
+                let mut max_stack = stack;
+                let mut call_slots = 1u16;
+                for (_, ty) in &explicit_signature.params {
+                    if !ty.has_jvm_value() {
+                        continue;
+                    }
+                    if matches!(ty, Type::Pointer(_)) {
+                        instructions.push(get_load_instruction(ty, local)?);
+                        instructions.push(get_load_instruction(&Type::I64, local + 1)?);
+                        instructions.push(get_load_instruction(&Type::I64, local + 3)?);
+                        max_stack = max_stack.max(stack.saturating_add(5));
+                        instructions.push(Instruction::Invokestatic(materialize));
+                        local += 5;
+                        stack += 1;
+                        call_slots += 1;
+                    } else {
+                        let size = get_type_size(ty);
+                        instructions.push(get_load_instruction(ty, local)?);
+                        local += size;
+                        stack += size;
+                        call_slots += size;
+                        max_stack = max_stack.max(stack);
+                    }
+                }
+                instructions.push(Instruction::Invokeinterface(
+                    call_ref,
+                    call_slots
+                        .try_into()
+                        .map_err(|_| jvm::Error::VerificationError {
+                            context: format!(
+                                "Relative function-pointer bridge {interface_name_jvm}"
+                            ),
+                            message: "interface call exceeds 255 JVM parameter slots".to_string(),
+                        })?,
+                ));
+                instructions.push(return_instruction_for_type(&explicit_signature.ret));
+                jvm_methods.push(jvm::Method {
+                    access_flags: MethodAccessFlags::PUBLIC,
+                    name_index: cp
+                        .add_utf8(&format!("call{}", oomir::RELATIVE_POINTER_METHOD_SUFFIX))?,
+                    descriptor_index: cp.add_utf8(&relative_descriptor)?,
+                    attributes: vec![code_attribute_for_descriptor(
+                        &mut cp,
+                        max_stack.max(get_type_size(&explicit_signature.ret)),
+                        local,
+                        instructions,
+                        &relative_descriptor,
+                        false,
+                        Some(interface_name_jvm),
+                        "call$relative",
+                    )?],
+                });
+            }
+        }
         // Consider using tracing or logging
         breadcrumbs::log!(
             breadcrumbs::LogLevel::Info,

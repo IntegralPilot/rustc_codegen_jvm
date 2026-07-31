@@ -172,7 +172,8 @@ pub fn oomir_function_stack_floor(function: &oomir::Function) -> u16 {
     floor
 }
 
-/// Deferred thin pointers add two `long` components at internal call sites.
+/// Deferred thin pointers add two `long` components at internal call sites
+/// and generated-class constructors.
 /// Ristretto's generic max-stack estimator does not know about this lower2 ABI
 /// expansion, so reserve the extra JVM slots described by the OOMIR calls.
 pub fn relative_pointer_call_stack_extra(function: &oomir::Function) -> u16 {
@@ -184,19 +185,33 @@ pub fn relative_pointer_call_stack_extra(function: &oomir::Function) -> u16 {
         .count();
     for block in function.body.basic_blocks.values() {
         for instruction in &block.instructions {
-            let args = match instruction {
+            let pointer_count = match instruction {
                 oomir::Instruction::InvokeStatic { args, .. }
                 | oomir::Instruction::InvokeRustStatic { args, .. }
-                | oomir::Instruction::CallIndirect { args, .. } => Some(args.as_slice()),
-                _ => None,
+                | oomir::Instruction::CallIndirect { args, .. } => args
+                    .iter()
+                    .filter(|arg| matches!(arg.get_type(), Some(Type::Pointer(_))))
+                    .count(),
+                oomir::Instruction::ConstructObject { args, .. } => args
+                    .iter()
+                    .filter(|(_, ty)| matches!(ty, Type::Pointer(_)))
+                    .count(),
+                oomir::Instruction::InvokeVirtual {
+                    class_name,
+                    method_name,
+                    operand,
+                    args,
+                    ..
+                } if class_name == oomir::POINTER_CLASS && method_name == "samePointer" => {
+                    usize::from(matches!(operand.get_type(), Some(Type::Pointer(_))))
+                        + args
+                            .iter()
+                            .filter(|arg| matches!(arg.get_type(), Some(Type::Pointer(_))))
+                            .count()
+                }
+                _ => 0,
             };
-            if let Some(args) = args {
-                max_pointers = max_pointers.max(
-                    args.iter()
-                        .filter(|arg| matches!(arg.get_type(), Some(Type::Pointer(_))))
-                        .count(),
-                );
-            }
+            max_pointers = max_pointers.max(pointer_count);
         }
     }
     max_pointers
