@@ -30,6 +30,11 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicLongArray;
 
 public final class Pointer {
+    private static final String RELATIVE_POINTER_ELEMENT_OFFSET_SUFFIX =
+            "$rcj$elementOffset";
+    private static final String RELATIVE_POINTER_BYTE_OFFSET_SUFFIX =
+            "$rcj$byteOffset";
+
     private static Object arrayGet(Object array, int index) {
         if (array instanceof byte[]) {
             return Byte.valueOf(((byte[]) array)[index]);
@@ -143,8 +148,9 @@ public final class Pointer {
         }
         if (isSliceViewCarrierType(pointer.getClass())) {
             try {
-                Object backing = instanceField(pointer.getClass(), "array").get(pointer);
-                int offset = instanceField(pointer.getClass(), "offset").getInt(pointer);
+                SliceAccess access = SLICE_ACCESSES.get(pointer.getClass());
+                Object backing = access.array(pointer);
+                int offset = access.offset(pointer);
                 if (backing instanceof Pointer) {
                     Object payload = ((Pointer) backing).add(offset).directCellValueOrSelf();
                     if (payload != backing) {
@@ -238,8 +244,10 @@ public final class Pointer {
     private static final Map<Object, AllocationInfo> ALLOCATIONS = new WeakIdentityMap<>();
     private static final Map<Object, Boolean> ALLOCATOR_OWNED_ALLOCATIONS =
             new IdentityHashMap<>();
-    private static final Map<String, byte[]> CONSTANT_ALLOCATIONS = new HashMap<>();
-    private static final Map<String, Pointer> CONSTANT_CELLS = new HashMap<>();
+    private static final ConcurrentHashMap<String, byte[]> CONSTANT_ALLOCATIONS =
+            new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<String, Pointer> CONSTANT_CELLS =
+            new ConcurrentHashMap<>();
     private static final Map<Long, ExposedTarget> EXPOSED_ADDRESSES = new HashMap<>();
     private static final ConcurrentHashMap<Long, TypedExposedEntry>
             TYPED_EXPOSED_ADDRESSES = new ConcurrentHashMap<>();
@@ -262,6 +270,13 @@ public final class Pointer {
                     return new CodecPlanCache();
                 }
             };
+    private static final ThreadLocal<ResolvedClassCache> RECENT_RESOLVED_CLASSES =
+            new ThreadLocal<ResolvedClassCache>() {
+                @Override
+                protected ResolvedClassCache initialValue() {
+                    return new ResolvedClassCache();
+                }
+            };
     private static final ConcurrentHashMap<String, Object> SHARED_CONSTANTS =
             new ConcurrentHashMap<>();
     private static final Map<Object, Boolean> SHARED_CONSTANT_ARRAYS =
@@ -273,6 +288,8 @@ public final class Pointer {
     private static final ConcurrentHashMap<String, String[]> CODEC_DESCRIPTORS =
             new ConcurrentHashMap<>();
     private static final ConcurrentHashMap<String, String> BINARY_CLASS_NAMES =
+            new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<Class<?>, Boolean> STRUCTURAL_METADATA_TYPES =
             new ConcurrentHashMap<>();
     private static final ConcurrentHashMap<Class<?>, Method[]> SCALAR_ENUM_METHODS =
             new ConcurrentHashMap<>();
@@ -296,6 +313,13 @@ public final class Pointer {
                     return new ConcurrentHashMap<>();
                 }
             };
+    private static final ClassValue<SliceAccess> SLICE_ACCESSES =
+            new ClassValue<SliceAccess>() {
+                @Override
+                protected SliceAccess computeValue(Class<?> type) {
+                    return new SliceAccess(type);
+                }
+            };
     private static final ClassValue<Field[]> PUBLIC_INSTANCE_FIELDS =
             new ClassValue<Field[]>() {
                 @Override
@@ -303,14 +327,16 @@ public final class Pointer {
                     Field[] all = type.getFields();
                     int count = 0;
                     for (Field field : all) {
-                        if (!Modifier.isStatic(field.getModifiers())) {
+                        if (!Modifier.isStatic(field.getModifiers())
+                                && !field.isSynthetic()) {
                             count++;
                         }
                     }
                     Field[] fields = new Field[count];
                     int index = 0;
                     for (Field field : all) {
-                        if (!Modifier.isStatic(field.getModifiers())) {
+                        if (!Modifier.isStatic(field.getModifiers())
+                                && !field.isSynthetic()) {
                             field.setAccessible(true);
                             fields[index++] = field;
                         }
@@ -403,14 +429,15 @@ public final class Pointer {
                     return new ManagedCopyPlan(fieldPlans, constructor, defaults);
                 }
             };
-    private static final Map<Object, Long> MANAGED_OBJECT_ADDRESSES = new IdentityHashMap<>();
-    private static final Map<Long, WeakReference<Object>> MANAGED_OBJECTS = new HashMap<>();
+    private static final Map<Object, Long> MANAGED_OBJECT_ADDRESSES = new WeakIdentityMap<>();
+    private static final Map<Long, ManagedObjectReference> MANAGED_OBJECTS = new HashMap<>();
+    private static final ReferenceQueue<Object> MANAGED_OBJECT_QUEUE = new ReferenceQueue<>();
     private static final ConcurrentHashMap<String, JavaStringViews> JAVA_STRING_VIEWS =
             new ConcurrentHashMap<>();
     private static final Map<String, Pointer> TRAIT_METADATA_MARKERS = new HashMap<>();
     private static final ConcurrentHashMap<Long, TraitMetadataInfo> TRAIT_METADATA_INFO =
             new ConcurrentHashMap<>();
-    private static final int STATE_STRIPE_COUNT = 64;
+    private static final int STATE_STRIPE_COUNT = 256;
     private static final int LAZY_ARRAY_REPEAT_THRESHOLD = 2;
     private static final int REPEATED_ARRAY_FILTER_WORDS = 1 << 16;
     private static final long IDENTITY_FILTER_REBUILD_MARKS = 1L << 18;
@@ -421,6 +448,7 @@ public final class Pointer {
         private volatile AtomicLongArray primary;
         private volatile AtomicLongArray secondary;
         private final AtomicLong marks = new AtomicLong();
+        private final AtomicInteger rebuilding = new AtomicInteger();
 
         private RebuildableIdentityFilter() {
             this(REPEATED_ARRAY_FILTER_WORDS, IDENTITY_FILTER_REBUILD_MARKS);
@@ -474,7 +502,7 @@ public final class Pointer {
             ThreadLocal.withInitial(MemoryViewAbsenceCache::new);
     private static final Map<Object, Map<String, WeakReference<FieldCell>>>[] FIELD_CELLS =
             createWeakMapStripes();
-    private static final int ATOMIC_STRIPE_COUNT = 64;
+    private static final int ATOMIC_STRIPE_COUNT = 1024;
     private static final int ATOMIC_RELAXED = 0;
     private static final int ATOMIC_RELEASE = 1;
     private static final int ATOMIC_ACQUIRE = 2;
@@ -509,6 +537,26 @@ public final class Pointer {
 
     private static void advanceMemoryViewEpoch(Object allocation) {
         MEMORY_VIEW_EPOCHS.incrementAndGet(stateStripeIndex(allocation));
+    }
+
+    private static boolean directCellHasNoMemoryViews(Object allocation) {
+        if (allocation instanceof Cell) {
+            return !((Cell) allocation).hasMemoryView;
+        }
+        if (allocation instanceof ReceiverCell) {
+            return !((ReceiverCell) allocation).hasMemoryView;
+        }
+        return allocation instanceof FieldCell && !((FieldCell) allocation).hasMemoryView;
+    }
+
+    private static void setDirectCellHasMemoryView(Object allocation, boolean present) {
+        if (allocation instanceof Cell) {
+            ((Cell) allocation).hasMemoryView = present;
+        } else if (allocation instanceof ReceiverCell) {
+            ((ReceiverCell) allocation).hasMemoryView = present;
+        } else if (allocation instanceof FieldCell) {
+            ((FieldCell) allocation).hasMemoryView = present;
+        }
     }
 
     private static Object encodedReferenceOwner(Object owner) {
@@ -605,6 +653,15 @@ public final class Pointer {
 
         private EncodedReferenceSet(Object first) {
             allocations.put(first, Boolean.TRUE);
+        }
+    }
+
+    private static final class ManagedObjectReference extends WeakReference<Object> {
+        private final long address;
+
+        private ManagedObjectReference(Object value, long address) {
+            super(value, MANAGED_OBJECT_QUEUE);
+            this.address = address;
         }
     }
 
@@ -803,21 +860,37 @@ public final class Pointer {
         private final int size;
         private final String codec;
         private final ExposedTarget target;
+        private final boolean targetUsesOwnerAllocation;
 
-        private EncodedPointerState(int size, String codec, ExposedTarget target) {
+        private EncodedPointerState(
+                Object owner, int size, String codec, ExposedTarget target) {
             this.size = size;
             this.codec = codec;
-            this.target = target;
+            targetUsesOwnerAllocation = target.allocation == owner;
+            this.target = targetUsesOwnerAllocation
+                    ? target.withAllocation(null)
+                    : target;
+        }
+
+        private ExposedTarget target(Object owner) {
+            return targetUsesOwnerAllocation
+                    ? target.withAllocation(owner)
+                    : target;
         }
     }
 
     private static final class EncodedPointerCopy {
         private final long offset;
-        private final EncodedPointerState state;
+        private final int size;
+        private final String codec;
+        private final ExposedTarget target;
 
-        private EncodedPointerCopy(long offset, EncodedPointerState state) {
+        private EncodedPointerCopy(
+                long offset, int size, String codec, ExposedTarget target) {
             this.offset = offset;
-            this.state = state;
+            this.size = size;
+            this.codec = codec;
+            this.target = target;
         }
     }
 
@@ -854,7 +927,9 @@ public final class Pointer {
                 stripe.put(owner, pointers);
             }
             removeOverlappingEncodedPointers(pointers, offset, size);
-            pointers.put(offset, new EncodedPointerState(size, codec, target));
+            pointers.put(
+                    offset,
+                    new EncodedPointerState(owner, size, codec, target));
         }
         maybeRebuildEncodedPointerFilter();
     }
@@ -874,7 +949,7 @@ public final class Pointer {
             if (state != null
                     && state.size == size
                     && codec.equals(state.codec)) {
-                Pointer pointer = pointerFromExposedTarget(state.target);
+                Pointer pointer = pointerFromExposedTarget(state.target(owner));
                 if (pointer.numericAddress() == address) {
                     return pointer;
                 }
@@ -914,7 +989,11 @@ public final class Pointer {
                     if (copied == null) {
                         copied = new java.util.ArrayList<>();
                     }
-                    copied.add(new EncodedPointerCopy(entryOffset, state));
+                    copied.add(new EncodedPointerCopy(
+                            entryOffset,
+                            state.size,
+                            state.codec,
+                            state.target(sourceOwner)));
                 }
             }
             if (move) {
@@ -943,7 +1022,11 @@ public final class Pointer {
                         Math.addExact(
                                 targetOffset,
                                 Math.subtractExact(entry.offset, sourceOffset)),
-                        entry.state);
+                        new EncodedPointerState(
+                                targetOwner,
+                                entry.size,
+                                entry.codec,
+                                entry.target));
             }
         }
     }
@@ -1389,6 +1472,7 @@ public final class Pointer {
         private final int size;
         private final String codecClassName;
         private final Object value;
+        private volatile boolean active = true;
         private byte[] originalImage;
 
         private MemoryViewState(
@@ -1675,6 +1759,46 @@ public final class Pointer {
             secondPlan = firstPlan;
             firstName = name;
             firstPlan = plan;
+        }
+    }
+
+    /** Two-entry per-thread cache for the generated types used by tight loops. */
+    private static final class ResolvedClassCache {
+        private String firstName;
+        private ClassLoader firstLoader;
+        private Class<?> firstClass;
+        private String secondName;
+        private ClassLoader secondLoader;
+        private Class<?> secondClass;
+
+        private Class<?> get(String name, ClassLoader loader) {
+            if (loader == firstLoader
+                    && (name == firstName || (firstName != null && firstName.equals(name)))) {
+                return firstClass;
+            }
+            if (loader == secondLoader
+                    && (name == secondName || (secondName != null && secondName.equals(name)))) {
+                String previousName = firstName;
+                ClassLoader previousLoader = firstLoader;
+                Class<?> previousClass = firstClass;
+                firstName = secondName;
+                firstLoader = secondLoader;
+                firstClass = secondClass;
+                secondName = previousName;
+                secondLoader = previousLoader;
+                secondClass = previousClass;
+                return firstClass;
+            }
+            return null;
+        }
+
+        private void remember(String name, ClassLoader loader, Class<?> resolved) {
+            secondName = firstName;
+            secondLoader = firstLoader;
+            secondClass = firstClass;
+            firstName = name;
+            firstLoader = loader;
+            firstClass = resolved;
         }
     }
 
@@ -2415,6 +2539,7 @@ public final class Pointer {
         long bits;
         if (MANAGED_OBJECT_VIEW_CODEC.equals(codec)) {
             bits = managedObjectAddress(value);
+            retainEncodedReference(encoded, value);
         } else if (isRawPointerCodec(codec)) {
             Pointer pointer = rawPointerCarrier(value, codec);
             bits = encodedAddress(pointer, encoded, 0, size, codec);
@@ -2652,17 +2777,17 @@ public final class Pointer {
             }
             Pointer marker = pointerObjectFromAddress(pointerMetadata);
             TraitMetadataInfo info = TRAIT_METADATA_INFO.get(marker.numericAddress());
-            data.traitMetadataMarker = marker;
+            data.traitMetadataMarker(marker);
             if (info != null) {
-                data.traitPointeeSize = info.size;
-                data.traitPointeeAlignment = info.alignment;
-                data.traitAdapterClassName = info.adapterClassName;
-                data.traitPointeeCodecClassName = info.pointeeCodecClassName;
+                data.traitPointeeSize(info.size);
+                data.traitPointeeAlignment(info.alignment);
+                data.traitAdapterClassName(info.adapterClassName);
+                data.traitPointeeCodecClassName(info.pointeeCodecClassName);
             } else {
-                data.traitPointeeSize = marker.traitPointeeSize;
-                data.traitPointeeAlignment = marker.traitPointeeAlignment;
-                data.traitAdapterClassName = marker.traitAdapterClassName;
-                data.traitPointeeCodecClassName = marker.traitPointeeCodecClassName;
+                data.traitPointeeSize(marker.traitPointeeSize());
+                data.traitPointeeAlignment(marker.traitPointeeAlignment());
+                data.traitAdapterClassName(marker.traitAdapterClassName());
+                data.traitPointeeCodecClassName(marker.traitPointeeCodecClassName());
             }
             return data;
         }
@@ -2681,31 +2806,31 @@ public final class Pointer {
             } else {
                 Pointer marker = pointerObjectFromAddress(pointerMetadata);
                 TraitMetadataInfo info = TRAIT_METADATA_INFO.get(marker.numericAddress());
-                data.traitMetadataMarker = marker;
+                data.traitMetadataMarker(marker);
                 if (info != null) {
-                    data.traitPointeeSize = info.size;
-                    data.traitPointeeAlignment = info.alignment;
-                    data.traitAdapterClassName = info.adapterClassName;
-                    data.traitPointeeCodecClassName = info.pointeeCodecClassName;
-                    if (data.traitMetadataCarrier == null && info.adapterClassName != null) {
+                    data.traitPointeeSize(info.size);
+                    data.traitPointeeAlignment(info.alignment);
+                    data.traitAdapterClassName(info.adapterClassName);
+                    data.traitPointeeCodecClassName(info.pointeeCodecClassName);
+                    if (data.traitMetadataCarrier() == null
+                            && info.adapterClassName != null) {
                         try {
                             Pointer tailData = data.byteOffsetRetype(
                                     structTailPointerPrefixSize(descriptor),
                                     info.size,
                                     info.pointeeCodecClassName);
                             Class<?> adapter = resolvedRuntimeClass(info.adapterClassName);
-                            data.traitMetadataCarrier =
-                                    constructorWithArity(adapter, 1).newInstance(tailData);
+                            data.traitMetadataCarrier(constructorWithArity(adapter, 1).newInstance(tailData));
                         } catch (ReflectiveOperationException error) {
                             throw new IllegalStateException(
                                     "could not reconstruct Rust trait-object tail", error);
                         }
                     }
                 } else {
-                    data.traitPointeeSize = marker.traitPointeeSize;
-                    data.traitPointeeAlignment = marker.traitPointeeAlignment;
-                    data.traitAdapterClassName = marker.traitAdapterClassName;
-                    data.traitPointeeCodecClassName = marker.traitPointeeCodecClassName;
+                    data.traitPointeeSize(marker.traitPointeeSize());
+                    data.traitPointeeAlignment(marker.traitPointeeAlignment());
+                    data.traitAdapterClassName(marker.traitAdapterClassName());
+                    data.traitPointeeCodecClassName(marker.traitPointeeCodecClassName());
                 }
             }
             return data.retype(
@@ -2804,10 +2929,15 @@ public final class Pointer {
 
     private static Class<?> resolvedClass(String className, ClassLoader loader)
             throws ClassNotFoundException {
-        String binaryName = binaryClassName(className);
         if (loader == null) {
             loader = RUNTIME_CLASS_LOADER;
         }
+        ResolvedClassCache recent = RECENT_RESOLVED_CLASSES.get();
+        Class<?> recentClass = recent.get(className, loader);
+        if (recentClass != null) {
+            return recentClass;
+        }
+        String binaryName = binaryClassName(className);
         ConcurrentHashMap<String, Class<?>> classes;
         if (loader == RUNTIME_CLASS_LOADER) {
             classes = RUNTIME_RESOLVED_CLASSES;
@@ -2822,11 +2952,14 @@ public final class Pointer {
         }
         Class<?> cached = classes.get(binaryName);
         if (cached != null) {
+            recent.remember(className, loader, cached);
             return cached;
         }
         Class<?> resolved = Class.forName(binaryName, true, loader);
         Class<?> previous = classes.putIfAbsent(binaryName, resolved);
-        return previous == null ? resolved : previous;
+        Class<?> result = previous == null ? resolved : previous;
+        recent.remember(className, loader, result);
+        return result;
     }
 
     private static String binaryClassName(String className) {
@@ -2840,6 +2973,20 @@ public final class Pointer {
         String converted = className.replace('/', '.');
         String previous = BINARY_CLASS_NAMES.putIfAbsent(className, converted);
         return previous == null ? converted : previous;
+    }
+
+    private static boolean matchesBinaryClassName(String className, String binaryName) {
+        if (className.length() != binaryName.length()) {
+            return false;
+        }
+        for (int index = 0; index < className.length(); index++) {
+            char actual = className.charAt(index);
+            char expected = binaryName.charAt(index);
+            if (actual != expected && !(actual == '/' && expected == '.')) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private static Class<?> resolvedRuntimeClass(String className)
@@ -2863,6 +3010,14 @@ public final class Pointer {
         return previous == null ? field : previous;
     }
 
+    private static Field optionalInstanceField(Class<?> owner, String name) {
+        try {
+            return instanceField(owner, name);
+        } catch (NoSuchFieldException ignored) {
+            return null;
+        }
+    }
+
     private static FieldAccess fieldAccess(Class<?> owner, String name)
             throws NoSuchFieldException {
         ConcurrentHashMap<String, FieldAccess> accesses = FIELD_ACCESSORS.get(owner);
@@ -2877,17 +3032,17 @@ public final class Pointer {
 
     private static long sliceLogicalLength(Object slice)
             throws ReflectiveOperationException {
-        return instanceField(slice.getClass(), "rustLength").getLong(slice);
+        return SLICE_ACCESSES.get(slice.getClass()).rustLength(slice);
     }
 
     private static Object sliceBackingForArray(Object slice, Class<?> targetArrayType)
             throws ReflectiveOperationException {
-        Class<?> sliceClass = slice.getClass();
-        Object backing = instanceField(sliceClass, "array").get(slice);
-        int offset = instanceField(sliceClass, "offset").getInt(slice);
-        int length = instanceField(sliceClass, "length").getInt(slice);
+        SliceAccess access = SLICE_ACCESSES.get(slice.getClass());
+        Object backing = access.array(slice);
+        int offset = access.offset(slice);
+        int length = access.length(slice);
         if (backing instanceof Pointer) {
-            backing = ((Pointer) backing).backingArray();
+            backing = ((Pointer) backing).backingArray(targetArrayType);
         }
         if (backing == null || !backing.getClass().isArray()) {
             throw new IllegalArgumentException("slice-tail view is not backed by an array");
@@ -2964,7 +3119,7 @@ public final class Pointer {
             if (!(backing instanceof Pointer)) {
                 return sliceBackingForArray(value, targetArrayType);
             }
-            Object directBacking = ((Pointer) backing).backingArray();
+            Object directBacking = ((Pointer) backing).backingArray(targetArrayType);
             if (directBacking != null
                     && directBacking.getClass().isArray()
                     && (targetArrayType.getComponentType().isAssignableFrom(
@@ -3249,15 +3404,13 @@ public final class Pointer {
     }
 
     private static void maybeRebuildMemoryViewFilter() {
-        if (MEMORY_VIEW_FILTER.marks.get() < IDENTITY_FILTER_REBUILD_MARKS) {
+        if (MEMORY_VIEW_FILTER.marks.get() < MEMORY_VIEW_FILTER.rebuildMarks
+                || !MEMORY_VIEW_FILTER.rebuilding.compareAndSet(0, 1)) {
             return;
         }
-        synchronized (MEMORY_VIEW_FILTER) {
-            if (MEMORY_VIEW_FILTER.marks.get() < IDENTITY_FILTER_REBUILD_MARKS) {
-                return;
-            }
+        try {
             AtomicLongArray rebuilt =
-                    new AtomicLongArray(REPEATED_ARRAY_FILTER_WORDS);
+                    new AtomicLongArray(MEMORY_VIEW_FILTER.wordCount);
             MEMORY_VIEW_FILTER.secondary = rebuilt;
             for (Map<Object, LongRangeMap<MemoryViewState>> stripe : MEMORY_VIEWS) {
                 synchronized (stripe) {
@@ -3268,21 +3421,20 @@ public final class Pointer {
             MEMORY_VIEW_FILTER.primary = rebuilt;
             MEMORY_VIEW_FILTER.secondary = null;
             MEMORY_VIEW_FILTER.marks.set(0);
+        } finally {
+            MEMORY_VIEW_FILTER.rebuilding.set(0);
         }
     }
 
     private static void maybeRebuildMemoryViewOriginFilter() {
         if (MEMORY_VIEW_ORIGIN_FILTER.marks.get()
-                < MEMORY_VIEW_ORIGIN_FILTER_REBUILD_MARKS) {
+                        < MEMORY_VIEW_ORIGIN_FILTER_REBUILD_MARKS
+                || !MEMORY_VIEW_ORIGIN_FILTER.rebuilding.compareAndSet(0, 1)) {
             return;
         }
-        synchronized (MEMORY_VIEW_ORIGIN_FILTER) {
-            if (MEMORY_VIEW_ORIGIN_FILTER.marks.get()
-                    < MEMORY_VIEW_ORIGIN_FILTER_REBUILD_MARKS) {
-                return;
-            }
+        try {
             AtomicLongArray rebuilt =
-                    new AtomicLongArray(REPEATED_ARRAY_FILTER_WORDS);
+                    new AtomicLongArray(MEMORY_VIEW_ORIGIN_FILTER.wordCount);
             MEMORY_VIEW_ORIGIN_FILTER.secondary = rebuilt;
             for (Map<Object, MemoryViewOrigin> stripe : MEMORY_VIEW_ORIGINS) {
                 synchronized (stripe) {
@@ -3293,20 +3445,19 @@ public final class Pointer {
             MEMORY_VIEW_ORIGIN_FILTER.primary = rebuilt;
             MEMORY_VIEW_ORIGIN_FILTER.secondary = null;
             MEMORY_VIEW_ORIGIN_FILTER.marks.set(0);
+        } finally {
+            MEMORY_VIEW_ORIGIN_FILTER.rebuilding.set(0);
         }
     }
 
     private static void maybeRebuildStructuralViewFilter() {
-        if (STRUCTURAL_VIEW_FILTER.marks.get() < IDENTITY_FILTER_REBUILD_MARKS) {
+        if (STRUCTURAL_VIEW_FILTER.marks.get() < STRUCTURAL_VIEW_FILTER.rebuildMarks
+                || !STRUCTURAL_VIEW_FILTER.rebuilding.compareAndSet(0, 1)) {
             return;
         }
-        synchronized (STRUCTURAL_VIEW_FILTER) {
-            if (STRUCTURAL_VIEW_FILTER.marks.get()
-                    < IDENTITY_FILTER_REBUILD_MARKS) {
-                return;
-            }
+        try {
             AtomicLongArray rebuilt =
-                    new AtomicLongArray(REPEATED_ARRAY_FILTER_WORDS);
+                    new AtomicLongArray(STRUCTURAL_VIEW_FILTER.wordCount);
             STRUCTURAL_VIEW_FILTER.secondary = rebuilt;
             for (Map<Object, Map<Long, StructuralViewState>> stripe : STRUCTURAL_VIEWS) {
                 synchronized (stripe) {
@@ -3317,20 +3468,19 @@ public final class Pointer {
             STRUCTURAL_VIEW_FILTER.primary = rebuilt;
             STRUCTURAL_VIEW_FILTER.secondary = null;
             STRUCTURAL_VIEW_FILTER.marks.set(0);
+        } finally {
+            STRUCTURAL_VIEW_FILTER.rebuilding.set(0);
         }
     }
 
     private static void maybeRebuildEncodedReferenceFilter() {
-        if (ENCODED_REFERENCE_FILTER.marks.get() < IDENTITY_FILTER_REBUILD_MARKS) {
+        if (ENCODED_REFERENCE_FILTER.marks.get() < ENCODED_REFERENCE_FILTER.rebuildMarks
+                || !ENCODED_REFERENCE_FILTER.rebuilding.compareAndSet(0, 1)) {
             return;
         }
-        synchronized (ENCODED_REFERENCE_FILTER) {
-            if (ENCODED_REFERENCE_FILTER.marks.get()
-                    < IDENTITY_FILTER_REBUILD_MARKS) {
-                return;
-            }
+        try {
             AtomicLongArray rebuilt =
-                    new AtomicLongArray(REPEATED_ARRAY_FILTER_WORDS);
+                    new AtomicLongArray(ENCODED_REFERENCE_FILTER.wordCount);
             ENCODED_REFERENCE_FILTER.secondary = rebuilt;
             for (Map<Object, Object> stripe : ENCODED_REFERENCES) {
                 synchronized (stripe) {
@@ -3340,19 +3490,18 @@ public final class Pointer {
             ENCODED_REFERENCE_FILTER.primary = rebuilt;
             ENCODED_REFERENCE_FILTER.secondary = null;
             ENCODED_REFERENCE_FILTER.marks.set(0);
+        } finally {
+            ENCODED_REFERENCE_FILTER.rebuilding.set(0);
         }
     }
 
     private static void maybeRebuildEncodedPointerFilter() {
         if (ENCODED_POINTER_FILTER.marks.get()
-                < ENCODED_POINTER_FILTER.rebuildMarks) {
+                        < ENCODED_POINTER_FILTER.rebuildMarks
+                || !ENCODED_POINTER_FILTER.rebuilding.compareAndSet(0, 1)) {
             return;
         }
-        synchronized (ENCODED_POINTER_FILTER) {
-            if (ENCODED_POINTER_FILTER.marks.get()
-                    < ENCODED_POINTER_FILTER.rebuildMarks) {
-                return;
-            }
+        try {
             AtomicLongArray rebuilt =
                     new AtomicLongArray(ENCODED_POINTER_FILTER.wordCount);
             ENCODED_POINTER_FILTER.secondary = rebuilt;
