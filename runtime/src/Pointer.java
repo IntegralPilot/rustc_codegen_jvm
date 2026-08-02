@@ -3514,6 +3514,8 @@ public final class Pointer {
             ENCODED_POINTER_FILTER.primary = rebuilt;
             ENCODED_POINTER_FILTER.secondary = null;
             ENCODED_POINTER_FILTER.marks.set(0);
+        } finally {
+            ENCODED_POINTER_FILTER.rebuilding.set(0);
         }
     }
 
@@ -3569,7 +3571,8 @@ public final class Pointer {
     }
 
     private void flushMemoryViewsOverlapping(long offset, int size) {
-        if (!mayBeInIdentityFilter(MEMORY_VIEW_FILTER, allocation)) {
+        if (directCellHasNoMemoryViews(allocation)
+                || !mayBeInIdentityFilter(MEMORY_VIEW_FILTER, allocation)) {
             return;
         }
         long observedEpoch = memoryViewEpoch(allocation);
@@ -3583,6 +3586,7 @@ public final class Pointer {
         synchronized (stripe) {
             LongRangeMap<MemoryViewState> views = stripe.get(allocation);
             if (views == null) {
+                setDirectCellHasMemoryView(allocation, false);
                 if (memoryViewEpoch(allocation) == observedEpoch) {
                     absence.remember(allocation, observedEpoch);
                 }
@@ -3591,6 +3595,7 @@ public final class Pointer {
             pending = removeOverlappingMemoryViews(views, offset, size);
             if (views.isEmpty()) {
                 stripe.remove(allocation);
+                setDirectCellHasMemoryView(allocation, false);
                 absence.remember(allocation, memoryViewEpoch(allocation));
             }
         }
@@ -3604,7 +3609,8 @@ public final class Pointer {
     }
 
     private void flushAllMemoryViews() {
-        if (!mayBeInIdentityFilter(MEMORY_VIEW_FILTER, allocation)) {
+        if (directCellHasNoMemoryViews(allocation)
+                || !mayBeInIdentityFilter(MEMORY_VIEW_FILTER, allocation)) {
             return;
         }
         LongRangeMap<MemoryViewState> pending;
@@ -3613,8 +3619,13 @@ public final class Pointer {
         synchronized (stripe) {
             pending = stripe.remove(allocation);
             if (pending == null) {
+                setDirectCellHasMemoryView(allocation, false);
                 return;
             }
+            for (int index = 0; index < pending.size(); index++) {
+                pending.valueAt(index).active = false;
+            }
+            setDirectCellHasMemoryView(allocation, false);
         }
         for (int index = 0; index < pending.size(); index++) {
             writeBackMemoryView(pending.keyAt(index), pending.valueAt(index));
@@ -3622,7 +3633,8 @@ public final class Pointer {
     }
 
     private void discardMemoryViewsOverlapping(long offset, int size) {
-        if (!mayBeInIdentityFilter(MEMORY_VIEW_FILTER, allocation)) {
+        if (directCellHasNoMemoryViews(allocation)
+                || !mayBeInIdentityFilter(MEMORY_VIEW_FILTER, allocation)) {
             return;
         }
         long observedEpoch = memoryViewEpoch(allocation);
@@ -3635,6 +3647,7 @@ public final class Pointer {
         synchronized (stripe) {
             LongRangeMap<MemoryViewState> views = stripe.get(allocation);
             if (views == null) {
+                setDirectCellHasMemoryView(allocation, false);
                 if (memoryViewEpoch(allocation) == observedEpoch) {
                     absence.remember(allocation, observedEpoch);
                 }
@@ -3643,6 +3656,7 @@ public final class Pointer {
             removeOverlappingMemoryViews(views, offset, size);
             if (views.isEmpty()) {
                 stripe.remove(allocation);
+                setDirectCellHasMemoryView(allocation, false);
                 absence.remember(allocation, memoryViewEpoch(allocation));
             }
         }
@@ -3669,6 +3683,7 @@ public final class Pointer {
                 if (removed == null) {
                     removed = new java.util.ArrayList<>();
                 }
+                state.active = false;
                 removed.add(new MemoryViewWriteback(entryOffset, state));
                 views.removeAt(index);
             } else {
@@ -3676,6 +3691,15 @@ public final class Pointer {
             }
         }
         return removed;
+    }
+
+    private static void deactivateMemoryViews(LongRangeMap<MemoryViewState> views) {
+        if (views == null) {
+            return;
+        }
+        for (int index = 0; index < views.size(); index++) {
+            views.valueAt(index).active = false;
+        }
     }
 
     /**
@@ -3698,8 +3722,26 @@ public final class Pointer {
         }
     }
 
+    private Object activeBoundMemoryViewValue(int materializedSize) {
+        MemoryViewState bound = boundMemoryViewState();
+        if (bound != null
+                && bound.active
+                && bound.size == materializedSize
+                && bound.codecClassName.equals(viewCodecClassName)) {
+            Object transparent = transparentManagedView(bound.value.getClass());
+            return transparent == null ? bound.value : transparent;
+        }
+        return null;
+    }
+
     private Object decodedMemoryViewLocked() {
         int materializedSize = materializedViewSize();
+        Object boundValue = activeBoundMemoryViewValue(materializedSize);
+        if (boundValue != null) {
+            Object value = boundValue;
+            registerMemoryViewOrigin(value);
+            return value;
+        }
         Map<Object, LongRangeMap<MemoryViewState>> stripe =
                 stateStripe(MEMORY_VIEWS, allocation);
         if (mayBeInIdentityFilter(MEMORY_VIEW_FILTER, allocation)) {
@@ -3709,6 +3751,7 @@ public final class Pointer {
                 if (cached != null
                         && cached.size == viewSize
                         && cached.codecClassName.equals(viewCodecClassName)) {
+                    setDirectCellHasMemoryView(allocation, true);
                     setBoundMemoryViewState(cached);
                     Object transparent = transparentManagedView(cached.value.getClass());
                     if (transparent != null) {
@@ -3732,6 +3775,7 @@ public final class Pointer {
         MemoryViewState state =
                 new MemoryViewState(materializedSize, viewCodecClassName, decoded, image);
         advanceMemoryViewEpoch(allocation);
+        setDirectCellHasMemoryView(allocation, true);
         markIdentityFilter(MEMORY_VIEW_FILTER, allocation);
         synchronized (stripe) {
             LongRangeMap<MemoryViewState> views = stripe.get(allocation);
@@ -3753,7 +3797,8 @@ public final class Pointer {
     }
 
     private void attachDecodedTraitTail(Object decoded) {
-        if (decoded == null || traitMetadataCarrier == null) {
+        Object carrier = traitMetadataCarrier();
+        if (decoded == null || carrier == null) {
             return;
         }
         Field[] fields = PUBLIC_INSTANCE_FIELDS.get(decoded.getClass());
@@ -3761,11 +3806,11 @@ public final class Pointer {
             return;
         }
         Field tail = fields[fields.length - 1];
-        if (!tail.getType().isInstance(traitMetadataCarrier)) {
+        if (!tail.getType().isInstance(carrier)) {
             return;
         }
         try {
-            tail.set(decoded, traitMetadataCarrier);
+            tail.set(decoded, carrier);
         } catch (IllegalAccessException error) {
             throw new IllegalStateException("could not attach Rust trait-object tail", error);
         }
@@ -4001,6 +4046,8 @@ public final class Pointer {
             if (!views.containsKey(byteOffset)) {
                 views.put(byteOffset, state);
             }
+            state.active = true;
+            setDirectCellHasMemoryView(allocation, true);
         }
         advanceMemoryViewEpoch(allocation);
         registerMemoryViewOrigin(state.value);
@@ -4056,7 +4103,8 @@ public final class Pointer {
             Map<Object, LongRangeMap<MemoryViewState>> stripe =
                     stateStripe(MEMORY_VIEWS, cell);
             synchronized (stripe) {
-                stripe.remove(cell);
+                deactivateMemoryViews(stripe.remove(cell));
+                setDirectCellHasMemoryView(cell, false);
             }
         }
         for (FieldCell cell : projected) {
@@ -4166,7 +4214,7 @@ public final class Pointer {
                     String prefixCodec = descriptor[4].isEmpty() ? null : descriptor[4];
                     prefix = retype(prefixSize, prefixCodec).getObject();
                 }
-                return constructStructuralView(prefix, targetClass, traitMetadataCarrier);
+                return constructStructuralView(prefix, targetClass, traitMetadataCarrier());
             } catch (ClassNotFoundException error) {
                 throw new IllegalStateException(
                         "could not load Rust trait-tailed view " + descriptor[0], error);
@@ -4217,7 +4265,8 @@ public final class Pointer {
         try {
             ClassLoader loader = source.getClass().getClassLoader();
             Class<?> targetClass = resolvedClass(targetClassName, loader);
-            return structuralViewState(source, true).activate(targetClass, traitMetadataCarrier);
+            return structuralViewState(source, true)
+                    .activate(targetClass, traitMetadataCarrier());
         } catch (ClassNotFoundException error) {
             throw new IllegalStateException(
                     "could not load structural Rust view " + targetClassName, error);
@@ -4233,7 +4282,7 @@ public final class Pointer {
                 return sliceLogicalLength(value);
             }
             for (Field field : PUBLIC_INSTANCE_FIELDS.get(value.getClass())) {
-                if (field.getType().isPrimitive()) {
+                if (!mayContainStructuralMetadata(field.getType())) {
                     continue;
                 }
                 long metadata = inferredStructuralMetadata(field.get(value));
@@ -4247,9 +4296,60 @@ public final class Pointer {
         }
     }
 
+    private static boolean mayContainStructuralMetadata(Class<?> type) {
+        Boolean cached = STRUCTURAL_METADATA_TYPES.get(type);
+        if (cached != null) {
+            return cached.booleanValue();
+        }
+        return mayContainStructuralMetadata(
+                type,
+                java.util.Collections.newSetFromMap(new IdentityHashMap<>()),
+                new boolean[1]);
+    }
+
+    private static boolean mayContainStructuralMetadata(
+            Class<?> type, Set<Class<?>> visiting, boolean[] encounteredCycle) {
+        Boolean cached = STRUCTURAL_METADATA_TYPES.get(type);
+        if (cached != null) {
+            return cached.booleanValue();
+        }
+        if (isSliceViewCarrierType(type)) {
+            STRUCTURAL_METADATA_TYPES.putIfAbsent(type, Boolean.TRUE);
+            return true;
+        }
+        if (type.isPrimitive()
+                || type.isArray()
+                || type == Object.class
+                || type == String.class
+                || type == Pointer.class
+                || Number.class.isAssignableFrom(type)
+                || type == Boolean.class
+                || type == Character.class) {
+            return false;
+        }
+        if (!visiting.add(type)) {
+            encounteredCycle[0] = true;
+            return false;
+        }
+        boolean result = false;
+        for (Field field : PUBLIC_INSTANCE_FIELDS.get(type)) {
+            if (mayContainStructuralMetadata(
+                    field.getType(), visiting, encounteredCycle)) {
+                result = true;
+                break;
+            }
+        }
+        visiting.remove(type);
+        if (result || !encounteredCycle[0]) {
+            STRUCTURAL_METADATA_TYPES.putIfAbsent(type, Boolean.valueOf(result));
+        }
+        return result;
+    }
+
     private static final class Cell {
         private Object value;
         private volatile boolean hasStructuralView;
+        private volatile boolean hasMemoryView;
 
         private Cell(Object value) {
             this.value = value;
@@ -4265,6 +4365,7 @@ public final class Pointer {
     private static final class ReceiverCell {
         private final Object value;
         private volatile boolean hasStructuralView;
+        private volatile boolean hasMemoryView;
 
         private ReceiverCell(Object value) {
             if (value == null) {
@@ -4279,6 +4380,7 @@ public final class Pointer {
         private final FieldAccess access;
         private final int fieldNameHash;
         private volatile boolean hasStructuralView;
+        private volatile boolean hasMemoryView;
 
         private FieldCell(Object owner, FieldAccess access) {
             this.owner = owner;
@@ -4325,8 +4427,100 @@ public final class Pointer {
                         MethodType.methodType(Object.class, Object.class));
                 setter = lookup.unreflectSetter(field).asType(
                         MethodType.methodType(void.class, Object.class, Object.class));
+                if (field.getType() == Pointer.class) {
+                    Field elementOffset = optionalInstanceField(
+                            field.getDeclaringClass(),
+                            field.getName() + RELATIVE_POINTER_ELEMENT_OFFSET_SUFFIX);
+                    Field byteOffset = optionalInstanceField(
+                            field.getDeclaringClass(),
+                            field.getName() + RELATIVE_POINTER_BYTE_OFFSET_SUFFIX);
+                    if (elementOffset != null && byteOffset != null) {
+                        elementOffsetGetter = lookup.unreflectGetter(elementOffset).asType(
+                                MethodType.methodType(long.class, Object.class));
+                        byteOffsetGetter = lookup.unreflectGetter(byteOffset).asType(
+                                MethodType.methodType(long.class, Object.class));
+                        elementOffsetSetter = lookup.unreflectSetter(elementOffset).asType(
+                                MethodType.methodType(void.class, Object.class, long.class));
+                        byteOffsetSetter = lookup.unreflectSetter(byteOffset).asType(
+                                MethodType.methodType(void.class, Object.class, long.class));
+                    } else {
+                        elementOffsetGetter = null;
+                        byteOffsetGetter = null;
+                        elementOffsetSetter = null;
+                        byteOffsetSetter = null;
+                    }
+                } else {
+                    elementOffsetGetter = null;
+                    byteOffsetGetter = null;
+                    elementOffsetSetter = null;
+                    byteOffsetSetter = null;
+                }
             } catch (IllegalAccessException error) {
                 throw new IllegalStateException("could not access Rust field pointer", error);
+            }
+        }
+    }
+
+    private static final class SliceAccess {
+        private final MethodHandle array;
+        private final MethodHandle offset;
+        private final MethodHandle length;
+        private final MethodHandle rustLength;
+
+        private SliceAccess(Class<?> type) {
+            try {
+                MethodHandles.Lookup lookup = MethodHandles.lookup();
+                array = lookup.unreflectGetter(instanceField(type, "array")).asType(
+                        MethodType.methodType(Object.class, Object.class));
+                offset = lookup.unreflectGetter(instanceField(type, "offset")).asType(
+                        MethodType.methodType(int.class, Object.class));
+                length = lookup.unreflectGetter(instanceField(type, "length")).asType(
+                        MethodType.methodType(int.class, Object.class));
+                rustLength = lookup.unreflectGetter(instanceField(type, "rustLength")).asType(
+                        MethodType.methodType(long.class, Object.class));
+            } catch (ReflectiveOperationException error) {
+                throw new IllegalArgumentException(
+                        "invalid Rust slice view " + type.getName(), error);
+            }
+        }
+
+        private Object array(Object slice) throws ReflectiveOperationException {
+            try {
+                return (Object) array.invokeExact(slice);
+            } catch (RuntimeException | Error error) {
+                throw error;
+            } catch (Throwable error) {
+                throw new IllegalStateException("could not read Rust slice backing", error);
+            }
+        }
+
+        private int offset(Object slice) throws ReflectiveOperationException {
+            try {
+                return (int) offset.invokeExact(slice);
+            } catch (RuntimeException | Error error) {
+                throw error;
+            } catch (Throwable error) {
+                throw new IllegalStateException("could not read Rust slice offset", error);
+            }
+        }
+
+        private int length(Object slice) throws ReflectiveOperationException {
+            try {
+                return (int) length.invokeExact(slice);
+            } catch (RuntimeException | Error error) {
+                throw error;
+            } catch (Throwable error) {
+                throw new IllegalStateException("could not read Rust slice storage length", error);
+            }
+        }
+
+        private long rustLength(Object slice) throws ReflectiveOperationException {
+            try {
+                return (long) rustLength.invokeExact(slice);
+            } catch (RuntimeException | Error error) {
+                throw error;
+            } catch (Throwable error) {
+                throw new IllegalStateException("could not read Rust slice length", error);
             }
         }
     }
@@ -4453,6 +4647,29 @@ public final class Pointer {
             this.addressOriginOffset = addressOriginOffset;
         }
 
+        private ExposedTarget withAllocation(Object replacement) {
+            return new ExposedTarget(
+                    replacement,
+                    allocationElementSize,
+                    byteOffset,
+                    exposedAddress,
+                    codecClassName,
+                    viewSize,
+                    viewCodecClassName,
+                    metadata,
+                    zeroSizedSourceViewSize,
+                    zeroSizedSourceViewCodecClassName,
+                    traitObjectCarrier,
+                    traitMetadataCarrier,
+                    traitMetadataMarker,
+                    traitPointeeSize,
+                    traitPointeeAlignment,
+                    traitAdapterClassName,
+                    traitPointeeCodecClassName,
+                    addressOrigin,
+                    addressOriginOffset);
+        }
+
         private boolean matches(Pointer pointer) {
             return allocation == pointer.allocation
                     && allocationElementSize == pointer.allocationElementSize
@@ -4466,15 +4683,15 @@ public final class Pointer {
                     && java.util.Objects.equals(
                             zeroSizedSourceViewCodecClassName,
                             pointer.zeroSizedSourceViewCodecClassName())
-                    && traitObjectCarrier == pointer.traitObjectCarrier
-                    && traitMetadataCarrier == pointer.traitMetadataCarrier
-                    && traitMetadataMarker == pointer.traitMetadataMarker
-                    && traitPointeeSize == pointer.traitPointeeSize
-                    && traitPointeeAlignment == pointer.traitPointeeAlignment
+                    && traitObjectCarrier == pointer.traitObjectCarrier()
+                    && traitMetadataCarrier == pointer.traitMetadataCarrier()
+                    && traitMetadataMarker == pointer.traitMetadataMarker()
+                    && traitPointeeSize == pointer.traitPointeeSize()
+                    && traitPointeeAlignment == pointer.traitPointeeAlignment()
                     && java.util.Objects.equals(
-                            traitAdapterClassName, pointer.traitAdapterClassName)
+                            traitAdapterClassName, pointer.traitAdapterClassName())
                     && java.util.Objects.equals(
-                            traitPointeeCodecClassName, pointer.traitPointeeCodecClassName)
+                            traitPointeeCodecClassName, pointer.traitPointeeCodecClassName())
                     && addressOrigin == pointer.addressOrigin()
                     && addressOriginOffset == pointer.addressOriginOffset();
         }
@@ -4582,13 +4799,6 @@ public final class Pointer {
     private volatile AddressOriginState addressState;
     private volatile RarePointerState rareState;
     private long metadata = -1;
-    private Object traitObjectCarrier;
-    private Object traitMetadataCarrier;
-    private Pointer traitMetadataMarker;
-    private long traitPointeeSize = -1;
-    private long traitPointeeAlignment = -1;
-    private String traitAdapterClassName;
-    private String traitPointeeCodecClassName;
 
     private static final class AddressOriginState {
         private Pointer addressOrigin;
@@ -4602,6 +4812,13 @@ public final class Pointer {
         private long erasedAddressToken = -1;
         private long zeroSizedSourceViewSize = -1;
         private String zeroSizedSourceViewCodecClassName;
+        private Object traitObjectCarrier;
+        private Object traitMetadataCarrier;
+        private Pointer traitMetadataMarker;
+        private long traitPointeeSize = -1;
+        private long traitPointeeAlignment = -1;
+        private String traitAdapterClassName;
+        private String traitPointeeCodecClassName;
     }
 
     private AddressOriginState mutableAddressState() {
@@ -4628,6 +4845,97 @@ public final class Pointer {
             }
             return rareState;
         }
+    }
+
+    private Object traitObjectCarrier() {
+        RarePointerState current = rareState;
+        return current == null ? null : current.traitObjectCarrier;
+    }
+
+    private void traitObjectCarrier(Object value) {
+        RarePointerState current = rareState;
+        if (current == null && value == null) {
+            return;
+        }
+        mutableRareState().traitObjectCarrier = value;
+    }
+
+    private Object traitMetadataCarrier() {
+        RarePointerState current = rareState;
+        return current == null ? null : current.traitMetadataCarrier;
+    }
+
+    private void traitMetadataCarrier(Object value) {
+        RarePointerState current = rareState;
+        if (current == null && value == null) {
+            return;
+        }
+        mutableRareState().traitMetadataCarrier = value;
+    }
+
+    private Pointer traitMetadataMarker() {
+        RarePointerState current = rareState;
+        return current == null ? null : current.traitMetadataMarker;
+    }
+
+    private void traitMetadataMarker(Pointer value) {
+        RarePointerState current = rareState;
+        if (current == null && value == null) {
+            return;
+        }
+        mutableRareState().traitMetadataMarker = value;
+    }
+
+    private long traitPointeeSize() {
+        RarePointerState current = rareState;
+        return current == null ? -1 : current.traitPointeeSize;
+    }
+
+    private void traitPointeeSize(long value) {
+        RarePointerState current = rareState;
+        if (current == null && value == -1) {
+            return;
+        }
+        mutableRareState().traitPointeeSize = value;
+    }
+
+    private long traitPointeeAlignment() {
+        RarePointerState current = rareState;
+        return current == null ? -1 : current.traitPointeeAlignment;
+    }
+
+    private void traitPointeeAlignment(long value) {
+        RarePointerState current = rareState;
+        if (current == null && value == -1) {
+            return;
+        }
+        mutableRareState().traitPointeeAlignment = value;
+    }
+
+    private String traitAdapterClassName() {
+        RarePointerState current = rareState;
+        return current == null ? null : current.traitAdapterClassName;
+    }
+
+    private void traitAdapterClassName(String value) {
+        RarePointerState current = rareState;
+        if (current == null && value == null) {
+            return;
+        }
+        mutableRareState().traitAdapterClassName = value;
+    }
+
+    private String traitPointeeCodecClassName() {
+        RarePointerState current = rareState;
+        return current == null ? null : current.traitPointeeCodecClassName;
+    }
+
+    private void traitPointeeCodecClassName(String value) {
+        RarePointerState current = rareState;
+        if (current == null && value == null) {
+            return;
+        }
+        mutableRareState().traitPointeeCodecClassName = value;
     }
 
     private Pointer addressOrigin() {
@@ -4850,7 +5158,8 @@ public final class Pointer {
                 && !(value instanceof Character)
                 && !(value instanceof String)
                 && !(value instanceof Pointer)
-                && !value.getClass().isArray();
+                && !value.getClass().isArray()
+                && mayContainStructuralMetadata(value.getClass());
     }
 
     public static Pointer cell(Object value, int size) {
@@ -4938,17 +5247,15 @@ public final class Pointer {
             String fieldName,
             long fieldOffset,
             long fieldSize,
-        String fieldCodecClassName) {
+            String fieldCodecClassName) {
         boolean managedField = fieldSize == 0;
         Class<?> fieldType = null;
-        if (!managedField || traitMetadataCarrier != null) {
+        if (!managedField || traitMetadataCarrier() != null) {
             try {
                 Class<?> ownerClass = resolvedRuntimeClass(ownerClassName);
                 fieldType = instanceField(ownerClass, fieldName).getType();
                 if (!managedField) {
-                    managedField = !fieldType.isPrimitive()
-                            && fieldType != Pointer.class
-                            && !isSliceViewType(fieldType);
+                    managedField = !fieldType.isPrimitive();
                 }
             } catch (ClassNotFoundException error) {
                 throw new IllegalArgumentException(
@@ -4967,11 +5274,11 @@ public final class Pointer {
             }
         }
         Pointer projected = byteOffsetRetype(fieldOffset, fieldSize, fieldCodecClassName);
-        if (traitMetadataCarrier != null
+        if (traitMetadataCarrier() != null
                 && fieldType != null
-                && fieldType.isInstance(traitMetadataCarrier)) {
-            projected.traitObjectCarrier = traitMetadataCarrier;
-            projected.traitMetadataCarrier = null;
+                && fieldType.isInstance(traitMetadataCarrier())) {
+            projected.traitObjectCarrier(traitMetadataCarrier());
+            projected.traitMetadataCarrier(null);
         }
         return projected;
     }
@@ -5139,13 +5446,13 @@ public final class Pointer {
         if (checkedOffset > checkedLength) {
             throw new IndexOutOfBoundsException("constant pointer offset exceeds its allocation");
         }
-        byte[] allocation;
-        synchronized (CONSTANT_ALLOCATIONS) {
-            allocation = CONSTANT_ALLOCATIONS.get(identity);
-            if (allocation == null) {
-                allocation = new byte[checkedLength];
-                Arrays.fill(allocation, (byte) initialByte);
-                CONSTANT_ALLOCATIONS.put(identity, allocation);
+        byte[] allocation = CONSTANT_ALLOCATIONS.get(identity);
+        if (allocation == null) {
+            byte[] candidate = new byte[checkedLength];
+            Arrays.fill(candidate, (byte) initialByte);
+            byte[] existing = CONSTANT_ALLOCATIONS.putIfAbsent(identity, candidate);
+            allocation = existing == null ? candidate : existing;
+            if (existing == null) {
                 recordAlignment(allocation, checkedAlignment);
             }
         }
