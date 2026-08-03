@@ -8501,13 +8501,12 @@ public final class Pointer {
         }
         prepareMemoryWrite(absoluteByteOffset, byteCount);
         int elementIndex = Math.toIntExact(Math.floorDiv(absoluteByteOffset, elementSize));
-        Object current = arrayGet(array, elementIndex);
         int shift = withinElement * 8;
         long valueMask = atomicMask(byteCount);
         long mask = valueMask << shift;
-        long currentBits = valueBits(current, elementSize);
+        long currentBits = primitiveArrayBits(array, elementIndex);
         long updated = (currentBits & ~mask) | ((incoming & valueMask) << shift);
-        arraySet(array, elementIndex, carrierFromBits(current, updated, elementSize));
+        storePrimitiveArrayBits(array, elementIndex, updated);
         return true;
     }
 
@@ -8550,6 +8549,20 @@ public final class Pointer {
         }
         if (byteCount == 0) {
             return 0;
+        }
+        if (allocation instanceof byte[]) {
+            byte[] bytes = (byte[]) allocation;
+            int offset = Math.toIntExact(absoluteByteOffset);
+            if (offset < 0 || offset > bytes.length - byteCount) {
+                throw new IndexOutOfBoundsException(
+                        "scalar load exceeds byte-addressable Rust storage");
+            }
+            flushMemoryViewsOverlapping(absoluteByteOffset, byteCount);
+            long result = 0;
+            for (int index = 0; index < byteCount; index++) {
+                result |= ((long) bytes[offset + index] & 0xffL) << (index * 8);
+            }
+            return result;
         }
         Long embedded = loadEmbeddedArrayBits(absoluteByteOffset, byteCount);
         if (embedded != null) {
@@ -8632,6 +8645,10 @@ public final class Pointer {
     }
 
     private int loadByte(long absoluteByteOffset) {
+        return loadByte(absoluteByteOffset, true);
+    }
+
+    private int loadByte(long absoluteByteOffset, boolean flushMemoryViews) {
         if (allocation == null) {
             throw new NullPointerException("attempted to dereference a null Rust pointer");
         }
@@ -8646,11 +8663,14 @@ public final class Pointer {
                             + ", recorded_source_size=" + zeroSizedSourceViewSize()
                             + ", recorded_source_codec=" + zeroSizedSourceViewCodecClassName());
         }
-        Long embedded = loadEmbeddedArrayBits(absoluteByteOffset, 1);
+        Long embedded =
+                loadEmbeddedArrayBits(absoluteByteOffset, 1, flushMemoryViews);
         if (embedded != null) {
             return embedded.intValue();
         }
-        flushMemoryViewsOverlapping(absoluteByteOffset, 1);
+        if (flushMemoryViews) {
+            flushMemoryViewsOverlapping(absoluteByteOffset, 1);
+        }
         int elementIndex = Math.toIntExact(Math.floorDiv(absoluteByteOffset, allocationElementSize));
         int withinElement = (int) Math.floorMod(absoluteByteOffset, allocationElementSize);
         Object value;
@@ -8734,6 +8754,20 @@ public final class Pointer {
         }
         if (allocationElementSize == 0) {
             throw new IndexOutOfBoundsException("zero-sized storage has no addressable bytes");
+        }
+        if (allocation instanceof byte[]) {
+            byte[] bytes = (byte[]) allocation;
+            int offset = Math.toIntExact(byteOffset);
+            if (offset < 0 || offset > bytes.length - byteCount) {
+                throw new IndexOutOfBoundsException(
+                        "range load exceeds byte-addressable Rust storage");
+            }
+            flushMemoryViewsOverlapping(byteOffset, byteCount);
+            System.arraycopy(bytes, offset, result, 0, byteCount);
+            transferEncodedPointers(
+                    allocation, byteOffset, result, 0, byteCount, false);
+            transferEncodedReferences(allocation, result);
+            return result;
         }
 
         flushMemoryViewsOverlapping(byteOffset, byteCount);
@@ -8822,7 +8856,8 @@ public final class Pointer {
             } else if (directAggregateElementSize == 0
                     && !directNestedPrimitiveElement) {
                 for (int index = 0; index < chunk; index++) {
-                    result[consumed + index] = (byte) loadByte(absoluteOffset + index);
+                    result[consumed + index] =
+                            (byte) loadByte(absoluteOffset + index, false);
                 }
             }
             consumed += chunk;
@@ -8842,6 +8877,20 @@ public final class Pointer {
             throw new IllegalArgumentException("scalar stores support at most eight bytes");
         }
         if (byteCount == 0) {
+            return;
+        }
+        if (allocation instanceof byte[]) {
+            byte[] bytes = (byte[]) allocation;
+            int offset = Math.toIntExact(absoluteByteOffset);
+            if (offset < 0 || offset > bytes.length - byteCount) {
+                throw new IndexOutOfBoundsException(
+                        "scalar store exceeds byte-addressable Rust storage");
+            }
+            prepareMemoryWrite(absoluteByteOffset, byteCount);
+            discardEncodedPointers(allocation, absoluteByteOffset, byteCount);
+            for (int index = 0; index < byteCount; index++) {
+                bytes[offset + index] = (byte) (bits >>> (index * 8));
+            }
             return;
         }
         if (storeEmbeddedArrayBits(absoluteByteOffset, bits, byteCount)) {
@@ -9424,25 +9473,59 @@ public final class Pointer {
         boolean sameCodec = base.allocationCodecClassName == null
                 ? base.viewCodecClassName == null
                 : base.allocationCodecClassName.equals(base.viewCodecClassName);
+        if (elementOffset == 0
+                && byteOffset == 0
+                && base.allocation instanceof Cell
+                && base.byteOffset == 0
+                && base.viewSize == base.allocationElementSize
+                && base.rareState == null
+                && !((Cell) base.allocation).hasStructuralView
+                && !isStructuralViewCodec(base.viewCodecClassName)
+                && sameCodec) {
+            return ((Cell) base.allocation).value;
+        }
         if (base.allocation != null
                 && base.allocationElementSize > 0
                 && absoluteByteOffset % base.allocationElementSize == 0
                 && base.viewSize == base.allocationElementSize
                 && sameCodec
                 && !mayHaveStructuralView(base.allocation)) {
-            base.flushMemoryViewsOverlapping(
-                    absoluteByteOffset, base.allocationElementSize);
             int elementIndex = Math.toIntExact(
                     Math.floorDiv(absoluteByteOffset, base.allocationElementSize));
             Object value = base.readElement(elementIndex);
-            if (targetClassName == null || targetClassName.isEmpty() || value == null) {
+            boolean trustedDirectCarrier = base.allocation instanceof Cell
+                    || base.allocation instanceof ReceiverCell
+                    || base.allocation instanceof FieldCell;
+            if (targetClassName == null
+                    || targetClassName.isEmpty()
+                    || value == null
+                    || trustedDirectCarrier) {
+                base.flushMemoryViewsOverlapping(
+                        absoluteByteOffset, base.allocationElementSize);
+                value = base.readElement(elementIndex);
                 return value;
             }
             try {
+                Class<?> valueClass = value.getClass();
+                if (matchesBinaryClassName(targetClassName, valueClass.getName())) {
+                    base.flushMemoryViewsOverlapping(
+                            absoluteByteOffset, base.allocationElementSize);
+                    value = base.readElement(elementIndex);
+                    if (value != null
+                            && matchesBinaryClassName(
+                                    targetClassName, value.getClass().getName())) {
+                        return value;
+                    }
+                }
                 Class<?> targetClass =
-                        resolvedClass(targetClassName, value.getClass().getClassLoader());
+                        resolvedClass(targetClassName, valueClass.getClassLoader());
                 if (targetClass.isInstance(value)) {
-                    return value;
+                    base.flushMemoryViewsOverlapping(
+                            absoluteByteOffset, base.allocationElementSize);
+                    value = base.readElement(elementIndex);
+                    if (targetClass.isInstance(value)) {
+                        return value;
+                    }
                 }
             } catch (ClassNotFoundException error) {
                 throw new IllegalStateException(
@@ -9491,9 +9574,87 @@ public final class Pointer {
         return Double.longBitsToDouble(loadUnsigned(8));
     }
 
+    private boolean hasPrimitiveArrayStorage() {
+        return allocation != null
+                && allocation.getClass().isArray()
+                && allocation.getClass().getComponentType().isPrimitive();
+    }
+
+    public void set(boolean value) {
+        requireScalarViewSize(1, "bool");
+        if (hasPrimitiveArrayStorage()) {
+            storeBytes(value ? 1 : 0, 1);
+        } else {
+            set((Object) Boolean.valueOf(value));
+        }
+    }
+
+    public void set(byte value) {
+        requireScalarViewSize(1, "i8/u8");
+        if (hasPrimitiveArrayStorage()) {
+            storeBytes(value, 1);
+        } else {
+            set((Object) Byte.valueOf(value));
+        }
+    }
+
+    public void set(short value) {
+        requireScalarViewSize(2, "i16/f16");
+        if (hasPrimitiveArrayStorage()) {
+            storeBytes(value, 2);
+        } else {
+            set((Object) Short.valueOf(value));
+        }
+    }
+
+    public void set(char value) {
+        requireScalarViewSize(2, "u16");
+        if (hasPrimitiveArrayStorage()) {
+            storeBytes(value, 2);
+        } else {
+            set((Object) Character.valueOf(value));
+        }
+    }
+
+    public void set(int value) {
+        requireScalarViewSize(4, "i32/u32");
+        if (hasPrimitiveArrayStorage()) {
+            storeBytes(value, 4);
+        } else {
+            set((Object) Integer.valueOf(value));
+        }
+    }
+
+    public void set(long value) {
+        requireScalarViewSize(8, "i64/u64");
+        if (hasPrimitiveArrayStorage()) {
+            storeBytes(value, 8);
+        } else {
+            set((Object) Long.valueOf(value));
+        }
+    }
+
+    public void set(float value) {
+        requireScalarViewSize(4, "f32");
+        if (hasPrimitiveArrayStorage()) {
+            storeBytes(Float.floatToRawIntBits(value), 4);
+        } else {
+            set((Object) Float.valueOf(value));
+        }
+    }
+
+    public void set(double value) {
+        requireScalarViewSize(8, "f64");
+        if (hasPrimitiveArrayStorage()) {
+            storeBytes(Double.doubleToRawLongBits(value), 8);
+        } else {
+            set((Object) Double.valueOf(value));
+        }
+    }
+
     public Object getObject() {
-        if (traitObjectCarrier != null) {
-            return traitObjectCarrier;
+        if (traitObjectCarrier() != null) {
+            return traitObjectCarrier();
         }
         Object direct = directCellValueOrSelf();
         if (direct != this && direct instanceof TraitObjectCarrier) {
@@ -9512,13 +9673,13 @@ public final class Pointer {
                             zeroSizedSourceViewCodecClassName(),
                             exposedAddress).withMetadata(metadata)
                     .copyAddressOrigin(this, 0);
-            pointer.traitObjectCarrier = traitObjectCarrier;
-            pointer.traitMetadataCarrier = traitMetadataCarrier;
-            pointer.traitMetadataMarker = traitMetadataMarker;
-            pointer.traitPointeeSize = traitPointeeSize;
-            pointer.traitPointeeAlignment = traitPointeeAlignment;
-            pointer.traitAdapterClassName = traitAdapterClassName;
-            pointer.traitPointeeCodecClassName = traitPointeeCodecClassName;
+            pointer.traitObjectCarrier(traitObjectCarrier());
+            pointer.traitMetadataCarrier(traitMetadataCarrier());
+            pointer.traitMetadataMarker(traitMetadataMarker());
+            pointer.traitPointeeSize(traitPointeeSize());
+            pointer.traitPointeeAlignment(traitPointeeAlignment());
+            pointer.traitAdapterClassName(traitAdapterClassName());
+            pointer.traitPointeeCodecClassName(traitPointeeCodecClassName());
             return pointer.getObject();
         }
         if (direct != this
@@ -9635,9 +9796,30 @@ public final class Pointer {
         if (targetClassName == null || targetClassName.isEmpty()) {
             return getObject();
         }
+        Object boundValue = activeBoundMemoryViewValue(materializedViewSize());
+        if (boundValue != null
+                && matchesBinaryClassName(
+                        targetClassName, boundValue.getClass().getName())) {
+            // A bound decoded carrier is already registered when it is
+            // created. Reusing it needs neither a map lookup nor another
+            // traversal through the general structural-view path.
+            return boundValue;
+        }
+        if (allocation instanceof Cell
+                && byteOffset == 0
+                && viewSize == allocationElementSize
+                && traitObjectCarrier() == null
+                && rareState == null
+                && !((Cell) allocation).hasStructuralView
+                && !isStructuralViewCodec(viewCodecClassName)
+                && (allocationCodecClassName == null
+                        ? viewCodecClassName == null
+                        : allocationCodecClassName.equals(viewCodecClassName))) {
+            return ((Cell) allocation).value;
+        }
         Object direct = directCellValueOrSelf();
         if (direct != this
-                && traitObjectCarrier == null
+                && traitObjectCarrier() == null
                 && zeroSizedSourceViewSize() < 0
                 && !isStructuralViewCodec(viewCodecClassName)
                 && isDirectAllocationView()
@@ -9650,11 +9832,12 @@ public final class Pointer {
                 && !viewCodecClassName.equals(zeroSizedSourceViewCodecClassName())) {
             Object requestedView = decodedMemoryView();
             if (requestedView != null
-                    && requestedView.getClass().getName().equals(binaryClassName(targetClassName))) {
+                    && matchesBinaryClassName(
+                            targetClassName, requestedView.getClass().getName())) {
                 return requestedView;
             }
         }
-        if (SLICE_VIEW_CLASS_NAME.equals(binaryClassName(targetClassName))
+        if (matchesBinaryClassName(targetClassName, SLICE_VIEW_CLASS_NAME)
                 && isArrayReferenceCodec(viewCodecClassName)
                 && !isDirectAllocationView()) {
             try {
@@ -9696,7 +9879,7 @@ public final class Pointer {
         }
         try {
             Class<?> targetClass = resolvedClass(targetClassName, value.getClass().getClassLoader());
-            return state.activate(targetClass, traitMetadataCarrier);
+            return state.activate(targetClass, traitMetadataCarrier());
         } catch (ClassNotFoundException error) {
             throw new IllegalStateException(
                     "could not load requested Rust structural view " + targetClassName, error);
@@ -9724,11 +9907,23 @@ public final class Pointer {
     }
 
     public Object backingArray() {
+        return backingArray(null);
+    }
+
+    private Object backingArray(Class<?> requestedArrayType) {
         if (allocation == null) {
             return null;
         }
         flushAllMemoryViews();
         if (allocation.getClass().isArray()) {
+            if (requestedArrayType != null
+                    && (!requestedArrayType.isArray()
+                            || (!requestedArrayType.getComponentType().isAssignableFrom(
+                                            allocation.getClass().getComponentType())
+                                    && requestedArrayType.getComponentType()
+                                            != allocation.getClass().getComponentType()))) {
+                return null;
+            }
             if (allocationElementSize == 0 || byteOffset == 0) {
                 return allocation;
             }
@@ -9795,7 +9990,8 @@ public final class Pointer {
     // A decoded view assigned back to its source already aliases that storage.
     // Flush it with its own codec instead of reinterpreting its JVM carrier.
     private boolean flushSameOriginMemoryView(Object value, int size) {
-        if (cannotCarryMemoryViewOrigin(value)) {
+        if (directCellHasNoMemoryViews(allocation)
+                || cannotCarryMemoryViewOrigin(value)) {
             return false;
         }
         if (!mayBeInIdentityFilter(MEMORY_VIEW_ORIGIN_FILTER, value)) {
@@ -9901,6 +10097,7 @@ public final class Pointer {
             if (MANAGED_OBJECT_VIEW_CODEC.equals(viewCodecClassName)) {
                 long address = managedObjectAddress(value);
                 byte[] image = new byte[materializedSize];
+                retainEncodedReference(image, value);
                 for (int index = 0; index < Math.min(materializedSize, 8); index++) {
                     image[index] = (byte) (address >>> (index * 8));
                 }
@@ -9942,6 +10139,14 @@ public final class Pointer {
 
     public static void copy(Pointer source, Pointer destination, int byteCount) {
         if (tryCopyScalarRange(
+                source,
+                source.byteOffset,
+                destination,
+                destination.byteOffset,
+                byteCount)) {
+            return;
+        }
+        if (tryCopyDirectUnionRange(
                 source,
                 source.byteOffset,
                 destination,
@@ -9992,6 +10197,90 @@ public final class Pointer {
                 byteCount,
                 false);
         transferEncodedReferences(source.allocation, destination.allocation);
+        return true;
+    }
+
+    private static Object directCellCarrier(Object allocation) {
+        if (allocation instanceof Cell) {
+            return ((Cell) allocation).value;
+        }
+        if (allocation instanceof ReceiverCell) {
+            return ((ReceiverCell) allocation).value;
+        }
+        if (allocation instanceof FieldCell) {
+            return ((FieldCell) allocation).get();
+        }
+        return null;
+    }
+
+    /**
+     * Copies a range between generated union carriers without serialising the
+     * complete containing aggregate. Sorting scratch buffers such as
+     * {@code [MaybeUninit<String>; N]} use these byte/object planes directly.
+     */
+    private static boolean tryCopyDirectUnionRange(
+            Pointer source,
+            long sourceByteOffset,
+            Pointer destination,
+            long destinationByteOffset,
+            int byteCount) {
+        if (byteCount < 0
+                || source.allocationCodecClassName == null
+                || destination.allocationCodecClassName == null
+                || !isGeneratedAggregateCodec(source.allocationCodecClassName)
+                || !isGeneratedAggregateCodec(destination.allocationCodecClassName)) {
+            return false;
+        }
+        Object sourceCarrier = directCellCarrier(source.allocation);
+        Object destinationCarrier = directCellCarrier(destination.allocation);
+        if (sourceCarrier == null || destinationCarrier == null) {
+            return false;
+        }
+        CodecPlan sourcePlan = codecPlan(source.allocationCodecClassName);
+        CodecPlan destinationPlan = codecPlan(destination.allocationCodecClassName);
+        byte[] sourceBytes = sourcePlan.directUnionBytes(sourceCarrier);
+        byte[] destinationBytes = destinationPlan.directUnionBytes(destinationCarrier);
+        if (sourceBytes == null || destinationBytes == null) {
+            return false;
+        }
+        Object[] sourceObjects = sourcePlan.directUnionObjects(sourceCarrier);
+        Object[] destinationObjects = destinationPlan.directUnionObjects(destinationCarrier);
+        if (sourceObjects == null || destinationObjects == null) {
+            return false;
+        }
+        int sourceOffset;
+        int destinationOffset;
+        try {
+            sourceOffset = Math.toIntExact(sourceByteOffset);
+            destinationOffset = Math.toIntExact(destinationByteOffset);
+        } catch (ArithmeticException error) {
+            return false;
+        }
+        if (sourceOffset < 0
+                || destinationOffset < 0
+                || byteCount > sourceBytes.length - sourceOffset
+                || byteCount > destinationBytes.length - destinationOffset
+                || (sourceObjects.length != 0
+                        && byteCount > sourceObjects.length - sourceOffset)
+                || (destinationObjects.length != 0
+                        && byteCount > destinationObjects.length - destinationOffset)) {
+            return false;
+        }
+        if (byteCount == 0
+                || (sourceBytes == destinationBytes
+                        && sourceOffset == destinationOffset)) {
+            return true;
+        }
+        source.flushMemoryViewsOverlapping(sourceByteOffset, byteCount);
+        destination.prepareMemoryWrite(destinationByteOffset, byteCount);
+        copyUnionStorage(
+                sourceBytes,
+                sourceObjects,
+                sourceOffset,
+                destinationBytes,
+                destinationObjects,
+                destinationOffset,
+                byteCount);
         return true;
     }
 
@@ -10063,7 +10352,7 @@ public final class Pointer {
                 throw new IllegalArgumentException("copy_nonoverlapping regions overlap");
             }
         }
-        if (tryCopyPrimitiveArrayRange(
+        if (tryCopyScalarRange(
                 source,
                 absoluteSourceByteOffset,
                 destination,
@@ -10071,7 +10360,15 @@ public final class Pointer {
                 byteCount)) {
             return;
         }
-        if (tryCopyScalarRange(
+        if (tryCopyDirectUnionRange(
+                source,
+                absoluteSourceByteOffset,
+                destination,
+                absoluteDestinationByteOffset,
+                byteCount)) {
+            return;
+        }
+        if (tryCopyPrimitiveArrayRange(
                 source,
                 absoluteSourceByteOffset,
                 destination,
@@ -10431,6 +10728,11 @@ public final class Pointer {
                             -1)
                     .withMetadata(storage.metadata)
                     .copyAddressOrigin(storage, 0);
+        }
+        if (storage.viewSize == checkedElementSize
+                && java.util.Objects.equals(
+                        storage.viewCodecClassName, elementCodecClassName)) {
+            return storage;
         }
         return storage.retype(checkedElementSize, elementCodecClassName);
     }
@@ -11248,6 +11550,12 @@ public final class Pointer {
     }
 
     private static Object carrierFromBits(Object current, long bits, int size) {
+        if (current == null) {
+            if (size <= 4) {
+                return Integer.valueOf((int) bits);
+            }
+            return Long.valueOf(bits);
+        }
         if (current instanceof Boolean) {
             return Boolean.valueOf(bits != 0);
         }
@@ -11283,12 +11591,6 @@ public final class Pointer {
             } catch (ReflectiveOperationException error) {
                 throw new IllegalStateException("could not reconstruct Rust enum", error);
             }
-        }
-        if (current == null) {
-            if (size <= 4) {
-                return Integer.valueOf((int) bits);
-            }
-            return Long.valueOf(bits);
         }
         throw new UnsupportedOperationException(
                 "aggregate JVM carrier requires a generated Rust memory codec: "
