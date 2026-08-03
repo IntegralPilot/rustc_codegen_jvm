@@ -628,7 +628,23 @@ public final class FileSystemSupport {
             boolean hasPosixMode,
             int permissionMode) {
         try {
-            setPermissions(path(pathBytes, pathLength), readonly, hasPosixMode, permissionMode);
+            setPermissions(
+                    path(pathBytes, pathLength), readonly, hasPosixMode, permissionMode, true);
+            return 0;
+        } catch (Exception error) {
+            return failInt(error);
+        }
+    }
+
+    public static int setPermissionsNoFollow(
+            Pointer pathBytes,
+            long pathLength,
+            boolean readonly,
+            boolean hasPosixMode,
+            int permissionMode) {
+        try {
+            setPermissions(
+                    path(pathBytes, pathLength), readonly, hasPosixMode, permissionMode, false);
             return 0;
         } catch (Exception error) {
             return failInt(error);
@@ -638,7 +654,7 @@ public final class FileSystemSupport {
     public static int setFilePermissions(
             long handle, boolean readonly, boolean hasPosixMode, int permissionMode) {
         try {
-            setPermissions(file(handle).path, readonly, hasPosixMode, permissionMode);
+            setPermissions(file(handle).path, readonly, hasPosixMode, permissionMode, true);
             return 0;
         } catch (Exception error) {
             return failInt(error);
@@ -958,21 +974,33 @@ public final class FileSystemSupport {
     }
 
     private static void setPermissions(
-            Path path, boolean readonly, boolean hasPosixMode, int permissionMode)
+            Path path,
+            boolean readonly,
+            boolean hasPosixMode,
+            int permissionMode,
+            boolean followLinks)
             throws IOException {
+        LinkOption[] options = followLinks
+                ? new LinkOption[0]
+                : new LinkOption[] {LinkOption.NOFOLLOW_LINKS};
         PosixFileAttributeView posixView =
-                Files.getFileAttributeView(path, PosixFileAttributeView.class);
+                Files.getFileAttributeView(path, PosixFileAttributeView.class, options);
         if (hasPosixMode && posixView != null) {
             posixView.setPermissions(posixPermissions(permissionMode));
             return;
         }
 
-        DosFileAttributeView dosView = Files.getFileAttributeView(path, DosFileAttributeView.class);
+        DosFileAttributeView dosView =
+                Files.getFileAttributeView(path, DosFileAttributeView.class, options);
         if (dosView != null) {
             dosView.setReadOnly(readonly);
             return;
         }
 
+        if (!followLinks) {
+            throw new UnsupportedOperationException(
+                    "changing permissions without following links is unavailable");
+        }
         File file = path.toFile();
         if (!file.setWritable(!readonly, false)) {
             throw new AccessDeniedException(path.toString());

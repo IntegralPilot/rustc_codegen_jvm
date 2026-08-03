@@ -116,6 +116,14 @@ unsafe extern "C" {
         has_posix_mode: bool,
         permission_mode: i32,
     ) -> i32;
+    #[link_name = "jvm:static:org/rustlang/runtime/FileSystemSupport:setPermissionsNoFollow"]
+    fn jvm_set_permissions_nofollow(
+        path: *const u8,
+        path_length: usize,
+        readonly: bool,
+        has_posix_mode: bool,
+        permission_mode: i32,
+    ) -> i32;
     #[link_name = "jvm:static:org/rustlang/runtime/FileSystemSupport:setFilePermissions"]
     fn jvm_set_file_permissions(
         handle: u64,
@@ -770,6 +778,19 @@ pub fn set_perm(path: &Path, permissions: FilePermissions) -> io::Result<()> {
     let bytes = path.as_os_str().as_encoded_bytes();
     result_code(unsafe {
         jvm_set_permissions(
+            bytes.as_ptr(),
+            bytes.len(),
+            permissions.readonly,
+            permissions.has_posix_mode,
+            permissions.mode.into(),
+        )
+    })
+}
+
+pub fn set_perm_nofollow(path: &Path, permissions: FilePermissions) -> io::Result<()> {
+    let bytes = path.as_os_str().as_encoded_bytes();
+    result_code(unsafe {
+        jvm_set_permissions_nofollow(
             bytes.as_ptr(),
             bytes.len(),
             permissions.readonly,
