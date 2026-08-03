@@ -4040,13 +4040,22 @@ pub(super) fn convert_basic_block<'tcx>(
                                         name: address_dest,
                                         ty: oomir::Type::U64,
                                     };
-                                    match mapper_ty.kind() {
+                                    let mapped_address_ty = match mapper_ty.kind() {
                                         TyKind::Closure(closure_def_id, closure_args) => {
                                             let closure_instance =
                                                 Instance::new_raw(*closure_def_id, *closure_args);
                                             let closure_signature = closure_args.as_closure().sig();
                                             let closure_inputs =
                                                 closure_signature.inputs().skip_binder().to_vec();
+                                            let closure_output =
+                                                closure_signature.output().skip_binder();
+                                            let closure_output_oomir_ty =
+                                                super::types::ty_to_oomir_type(
+                                                    closure_output,
+                                                    tcx,
+                                                    data_types,
+                                                    instance,
+                                                );
                                             let closure_arg_ty = *closure_inputs.first().expect(
                                                 "FnOnce closure signature has an argument tuple",
                                             );
@@ -4125,13 +4134,16 @@ pub(super) fn convert_basic_block<'tcx>(
                                                         ),
                                                     method_ty: oomir::Signature {
                                                         params: closure_params,
-                                                        ret: Box::new(oomir::Type::U64),
+                                                        ret: Box::new(
+                                                            closure_output_oomir_ty.clone(),
+                                                        ),
                                                         is_static: true,
                                                     },
                                                     args: closure_call_args,
                                                     dest: Some(mapped_address_dest.clone()),
                                                 },
                                             );
+                                            closure_output_oomir_ty
                                         }
                                         TyKind::FnDef(def_id, generic_args) => {
                                             let mapper_instance = Instance::resolve_for_fn_ptr(
@@ -4145,6 +4157,22 @@ pub(super) fn convert_basic_block<'tcx>(
                                                 tcx,
                                                 mapper_instance,
                                             );
+                                            let mapper_signature =
+                                                mapper_ty.fn_sig(tcx).skip_binder();
+                                            let mapper_input_oomir_ty =
+                                                super::types::ty_to_oomir_type(
+                                                    mapper_signature.inputs()[0],
+                                                    tcx,
+                                                    data_types,
+                                                    instance,
+                                                );
+                                            let mapper_output_oomir_ty =
+                                                super::types::ty_to_oomir_type(
+                                                    mapper_signature.output(),
+                                                    tcx,
+                                                    data_types,
+                                                    instance,
+                                                );
                                             instructions.push(
                                                 oomir::Instruction::InvokeRustStatic {
                                                     class_name: target.class_to_call_on.expect(
@@ -4154,15 +4182,18 @@ pub(super) fn convert_basic_block<'tcx>(
                                                     method_ty: oomir::Signature {
                                                         params: vec![(
                                                             "address".to_string(),
-                                                            oomir::Type::U64,
+                                                            mapper_input_oomir_ty,
                                                         )],
-                                                        ret: Box::new(oomir::Type::U64),
+                                                        ret: Box::new(
+                                                            mapper_output_oomir_ty.clone(),
+                                                        ),
                                                         is_static: true,
                                                     },
                                                     args: vec![address_operand],
                                                     dest: Some(mapped_address_dest.clone()),
                                                 },
                                             );
+                                            mapper_output_oomir_ty
                                         }
                                         TyKind::FnPtr(_, _) => {
                                             let signature = super::types::fn_ptr_signature_from_ty(
@@ -4171,6 +4202,8 @@ pub(super) fn convert_basic_block<'tcx>(
                                             super::types::ensure_fn_ptr_interface(
                                                 &signature, data_types, tcx, instance,
                                             );
+                                            let mapper_output_oomir_ty =
+                                                signature.ret.as_ref().clone();
                                             instructions.push(oomir::Instruction::CallIndirect {
                                                 dest: Some(mapped_address_dest.clone()),
                                                 function_ptr: Box::new(
@@ -4179,11 +4212,12 @@ pub(super) fn convert_basic_block<'tcx>(
                                                 args: vec![address_operand],
                                                 signature,
                                             });
+                                            mapper_output_oomir_ty
                                         }
                                         other => panic!(
                                             "raw pointer map_addr requires a monomorphized callable, got {other:?}"
                                         ),
-                                    }
+                                    };
                                     instructions.push(oomir::Instruction::InvokeStatic {
                                         class_name: oomir::POINTER_CLASS.to_string(),
                                         method_name: "with_addr".to_string(),
@@ -4202,7 +4236,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                             receiver_operand,
                                             oomir::Operand::Variable {
                                                 name: mapped_address_dest,
-                                                ty: oomir::Type::U64,
+                                                ty: mapped_address_ty,
                                             },
                                         ],
                                         dest: effective_dest,

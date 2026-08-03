@@ -956,18 +956,28 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         if !self.load_deferred_pointer_components(source)? {
             return Ok(false);
         }
-        let (runtime_method, descriptor) = match method_name {
+        let (runtime_method, descriptor, runtime_result_ty) = match method_name {
             "address" | "expose_provenance" => (
                 "addressRelative",
                 format!("(L{};JJ)J", oomir::POINTER_CLASS),
+                Type::U64,
             ),
-            "addr" => ("addrRelative", format!("(L{};JJ)J", oomir::POINTER_CLASS)),
-            "is_null" => ("isNullRelative", format!("(L{};JJ)Z", oomir::POINTER_CLASS)),
+            "addr" => (
+                "addrRelative",
+                format!("(L{};JJ)J", oomir::POINTER_CLASS),
+                Type::U64,
+            ),
+            "is_null" => (
+                "isNullRelative",
+                format!("(L{};JJ)Z", oomir::POINTER_CLASS),
+                Type::Boolean,
+            ),
             "is_aligned_to" if args.len() == 1 => {
                 self.load_pointer_arithmetic_amount(&args[0])?;
                 (
                     "isAlignedRelative",
                     format!("(L{};JJJ)Z", oomir::POINTER_CLASS),
+                    Type::Boolean,
                 )
             }
             _ => return Ok(false),
@@ -977,7 +987,20 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             self.constant_pool
                 .add_method_ref(pointer_class, runtime_method, &descriptor)?;
         self.jvm_instructions.push(Instruction::Invokestatic(query));
-        self.store_result(dest, result_ty)?;
+        if result_ty == &runtime_result_ty
+            || result_ty.to_jvm_descriptor() == runtime_result_ty.to_jvm_descriptor()
+        {
+            self.store_result(dest, result_ty)?;
+        } else if self.adapt_loaded_single_value_representation(&runtime_result_ty, result_ty)? {
+            self.store_result(dest, result_ty)?;
+        } else {
+            return Err(jvm::Error::VerificationError {
+                context: format!("Function {}", self.oomir_func.name),
+                message: format!(
+                    "pointer query {method_name} returns {runtime_result_ty:?}, which cannot be represented as {result_ty:?}"
+                ),
+            });
+        }
         Ok(true)
     }
 
@@ -2153,6 +2176,45 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             self.load_operand(operand)?;
             return self.convert_loaded_slice_to_pointer();
         }
+        if actual_ty != *expected_ty
+            && matches!(
+                expected_ty,
+                oomir::Type::Pointer(_) | oomir::Type::Slice(_) | oomir::Type::Str
+            )
+            && let oomir::Type::Class(class_name) = &actual_ty
+            && oomir::is_non_null_class_name(class_name)
+            && let Some((field_name, field_ty)) =
+                self.module
+                    .data_types
+                    .get(class_name)
+                    .and_then(|data_type| match data_type {
+                        oomir::DataType::Class { fields, .. } => {
+                            fields.iter().find(|(name, _)| name == "pointer").cloned()
+                        }
+                        _ => None,
+                    })
+        {
+            self.load_operand(operand)?;
+            let owner = self.constant_pool.add_class(class_name)?;
+            let field = self.constant_pool.add_field_ref(
+                owner,
+                &field_name,
+                &field_ty.to_jvm_descriptor(),
+            )?;
+            self.jvm_instructions.push(Instruction::Getfield(field));
+            if field_ty != *expected_ty
+                && field_ty.to_jvm_descriptor() != expected_ty.to_jvm_descriptor()
+                && !self.adapt_loaded_view(&field_ty, expected_ty)?
+            {
+                self.jvm_instructions.extend(get_cast_instructions(
+                    &self.oomir_func.name,
+                    &field_ty,
+                    expected_ty,
+                    self.constant_pool,
+                )?);
+            }
+            return Ok(());
+        }
         if let oomir::Type::Pointer(pointee_ty) = &actual_ty
             && !matches!(expected_ty, oomir::Type::Pointer(_))
             && expected_ty != &oomir::Type::Class("java/lang/Object".to_string())
@@ -2233,6 +2295,9 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             && actual_ty.to_jvm_descriptor() != expected_ty.to_jvm_descriptor()
         {
             if self.adapt_loaded_view(&actual_ty, expected_ty)? {
+                return Ok(());
+            }
+            if self.adapt_loaded_single_value_representation(&actual_ty, expected_ty)? {
                 return Ok(());
             }
             let cast_instructions = get_cast_instructions(
@@ -2501,6 +2566,97 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         self.jvm_instructions
             .push(Instruction::Invokespecial(constructor_ref_index));
         Ok(())
+    }
+
+    fn single_value_wrapper_path(
+        &self,
+        target_ty: &oomir::Type,
+        source_ty: &oomir::Type,
+    ) -> Option<Vec<(String, String, oomir::Type)>> {
+        if target_ty == source_ty || target_ty.to_jvm_descriptor() == source_ty.to_jvm_descriptor()
+        {
+            return Some(Vec::new());
+        }
+        let oomir::Type::Class(class_name) = target_ty else {
+            return None;
+        };
+        let oomir::DataType::Class { fields, .. } = self.module.data_types.get(class_name)? else {
+            return None;
+        };
+        let mut value_fields = fields
+            .iter()
+            .filter(|(_, field_ty)| field_ty.has_jvm_value());
+        let (field_name, field_ty) = value_fields.next()?;
+        if value_fields.next().is_some() {
+            return None;
+        }
+
+        let mut path = self.single_value_wrapper_path(field_ty, source_ty)?;
+        path.insert(
+            0,
+            (class_name.clone(), field_name.clone(), field_ty.clone()),
+        );
+        Some(path)
+    }
+
+    fn construct_single_value_wrappers_from_local(
+        &mut self,
+        source_slot: u16,
+        source_ty: &oomir::Type,
+        wrappers: &[(String, String, oomir::Type)],
+    ) -> Result<(), jvm::Error> {
+        let Some(((class_name, _, field_ty), remaining)) = wrappers.split_first() else {
+            self.jvm_instructions
+                .push(get_load_instruction(source_ty, source_slot)?);
+            return Ok(());
+        };
+
+        let class = self.constant_pool.add_class(class_name)?;
+        self.jvm_instructions.push(Instruction::New(class));
+        self.jvm_instructions.push(Instruction::Dup);
+        self.construct_single_value_wrappers_from_local(source_slot, source_ty, remaining)?;
+        let constructor = self.constant_pool.add_method_ref(
+            class,
+            "<init>",
+            &format!("({})V", field_ty.to_jvm_descriptor()),
+        )?;
+        self.jvm_instructions
+            .push(Instruction::Invokespecial(constructor));
+        Ok(())
+    }
+
+    fn adapt_loaded_single_value_representation(
+        &mut self,
+        actual_ty: &oomir::Type,
+        expected_ty: &oomir::Type,
+    ) -> Result<bool, jvm::Error> {
+        if let Some(wrappers) = self.single_value_wrapper_path(expected_ty, actual_ty)
+            && !wrappers.is_empty()
+        {
+            let temporary = format!("$rcj$representation_{}", self.next_local_index);
+            let source_slot = self.assign_local(&temporary, actual_ty);
+            self.jvm_instructions
+                .push(get_store_instruction(actual_ty, source_slot)?);
+            self.construct_single_value_wrappers_from_local(source_slot, actual_ty, &wrappers)?;
+            return Ok(true);
+        }
+
+        if let Some(wrappers) = self.single_value_wrapper_path(actual_ty, expected_ty)
+            && !wrappers.is_empty()
+        {
+            for (class_name, field_name, field_ty) in wrappers {
+                let class = self.constant_pool.add_class(&class_name)?;
+                let field = self.constant_pool.add_field_ref(
+                    class,
+                    &field_name,
+                    &field_ty.to_jvm_descriptor(),
+                )?;
+                self.jvm_instructions.push(Instruction::Getfield(field));
+            }
+            return Ok(true);
+        }
+
+        Ok(false)
     }
 
     /// Appends JVM instructions for storing the value currently on top of the stack
@@ -6249,6 +6405,9 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             && actual_ty.to_jvm_descriptor() != expected_ty.to_jvm_descriptor()
         {
             if self.adapt_loaded_view(&actual_ty, expected_ty)? {
+                return Ok(());
+            }
+            if self.adapt_loaded_single_value_representation(&actual_ty, expected_ty)? {
                 return Ok(());
             }
             self.jvm_instructions.extend(get_cast_instructions(

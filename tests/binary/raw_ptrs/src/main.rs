@@ -974,6 +974,50 @@ fn stable_pointer_api_surface() {
     assert!(dangling.addr() == dangling_mut.addr());
 }
 
+fn non_null_tagged_addresses() {
+    use core::num::NonZero;
+    use core::ptr::NonNull;
+
+    #[repr(transparent)]
+    struct Tagged<T>(NonNull<T>);
+
+    impl<T> Tagged<T> {
+        const ALIGNMENT: usize = core::mem::align_of::<T>();
+        const NUM_BITS: u32 = Self::ALIGNMENT.trailing_zeros();
+        const ADDRESS_MASK: usize = usize::MAX << Self::NUM_BITS;
+        const DATA_MASK: usize = !Self::ADDRESS_MASK;
+
+        fn tag(&self) -> usize {
+            self.0.addr().get() & Self::DATA_MASK
+        }
+
+        fn set_tag(&mut self, tag: usize) {
+            assert_eq!(tag & Self::ADDRESS_MASK, 0);
+            self.0 = self.0.map_addr(|address| unsafe {
+                NonZero::new_unchecked(
+                    (address.get() & Self::ADDRESS_MASK) | (tag & Self::DATA_MASK),
+                )
+            });
+        }
+
+        fn pointer(&self) -> NonNull<T> {
+            self.0.map_addr(|address| unsafe {
+                NonZero::new_unchecked(address.get() & Self::ADDRESS_MASK)
+            })
+        }
+    }
+
+    let mut value = 42_i32;
+    let mut tagged = Tagged(NonNull::from(&mut value));
+    assert_eq!(tagged.tag(), 0);
+    tagged.set_tag(1);
+    assert_eq!(tagged.tag(), 1);
+    assert_eq!(unsafe { *tagged.pointer().as_ptr() }, 42);
+    tagged.set_tag(3);
+    assert_eq!(tagged.tag(), 3);
+    assert_eq!(unsafe { *tagged.pointer().as_ptr() }, 42);
+}
+
 fn raw_slice_metadata() {
     let values = [3_i32, 6, 9, 12];
     let raw = core::ptr::slice_from_raw_parts(values.as_ptr(), values.len());
@@ -2308,6 +2352,7 @@ fn main() {
     projected_field_addresses_share_allocations();
     byte_methods_alignment_provenance_and_zsts();
     stable_pointer_api_surface();
+    non_null_tagged_addresses();
     raw_slice_metadata();
     narrow_integer_slice_writes();
     generic_sized_raw_pointer_metadata();
