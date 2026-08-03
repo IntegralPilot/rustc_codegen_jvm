@@ -4394,7 +4394,16 @@ public final class Pointer {
 
         private Object get() {
             try {
-                return (Object) access.getter.invokeExact(owner());
+                Object value = (Object) access.getter.invokeExact(owner());
+                if (value instanceof Pointer && access.elementOffsetGetter != null) {
+                    long elementOffset =
+                            (long) access.elementOffsetGetter.invokeExact(owner());
+                    long byteOffset =
+                            (long) access.byteOffsetGetter.invokeExact(owner());
+                    return materializeRelative(
+                            (Pointer) value, elementOffset, byteOffset);
+                }
+                return value;
             } catch (RuntimeException | Error error) {
                 throw error;
             } catch (Throwable error) {
@@ -4405,6 +4414,10 @@ public final class Pointer {
         private void set(Object value) {
             try {
                 access.setter.invokeExact(owner(), value);
+                if (access.elementOffsetSetter != null) {
+                    access.elementOffsetSetter.invokeExact(owner(), 0L);
+                    access.byteOffsetSetter.invokeExact(owner(), 0L);
+                }
             } catch (RuntimeException | Error error) {
                 throw error;
             } catch (Throwable error) {
@@ -4412,11 +4425,16 @@ public final class Pointer {
             }
             commitOriginMemoryView(owner());
         }
+
     }
 
     private static final class FieldAccess {
         private final MethodHandle getter;
         private final MethodHandle setter;
+        private final MethodHandle elementOffsetGetter;
+        private final MethodHandle byteOffsetGetter;
+        private final MethodHandle elementOffsetSetter;
+        private final MethodHandle byteOffsetSetter;
         private final int fieldNameHash;
 
         private FieldAccess(Field field) {
@@ -5479,14 +5497,10 @@ public final class Pointer {
         if (checkedOffset > bytes.length) {
             throw new IndexOutOfBoundsException("constant pointer offset exceeds its allocation");
         }
-        byte[] allocation;
-        synchronized (CONSTANT_ALLOCATIONS) {
-            allocation = CONSTANT_ALLOCATIONS.get(identity);
-            if (allocation == null) {
-                allocation = bytes;
-                CONSTANT_ALLOCATIONS.put(identity, allocation);
-                recordAlignment(allocation, checkedAlignment);
-            }
+        byte[] allocation = CONSTANT_ALLOCATIONS.putIfAbsent(identity, bytes);
+        if (allocation == null) {
+            allocation = bytes;
+            recordAlignment(allocation, checkedAlignment);
         }
         return new Pointer(
                 allocation,
@@ -5507,61 +5521,55 @@ public final class Pointer {
             long alignment) {
         int checkedSize = checkedArrayLength(viewSize);
         int checkedAlignment = checkedAlignment(alignment);
-        synchronized (CONSTANT_CELLS) {
-            Pointer pointer = CONSTANT_CELLS.get(identity);
-            if (pointer == null) {
-                if (value != null && value.getClass().isArray()) {
-                    // A Rust fixed array is one value, but its elements must
-                    // remain individually addressable after pointer casts.
-                    // Keeping the JVM array as the allocation preserves that
-                    // storage instead of turning it into one scalar Cell.
-                    if (value instanceof byte[]) {
-                        synchronized (CONSTANT_ALLOCATIONS) {
-                            byte[] existing = CONSTANT_ALLOCATIONS.get(identity);
-                            if (existing == null) {
-                                existing = (byte[]) value;
-                                CONSTANT_ALLOCATIONS.put(identity, existing);
+        Pointer pointer = CONSTANT_CELLS.computeIfAbsent(
+                identity,
+                ignored -> {
+                    Object storedValue = value;
+                    if (storedValue != null && storedValue.getClass().isArray()) {
+                        // A Rust fixed array is one value, but its elements must
+                        // remain individually addressable after pointer casts.
+                        // Keep the JVM array instead of creating a scalar Cell.
+                        if (storedValue instanceof byte[]) {
+                            byte[] existing = CONSTANT_ALLOCATIONS.putIfAbsent(
+                                    identity, (byte[]) storedValue);
+                            if (existing != null) {
+                                storedValue = existing;
                             }
-                            value = existing;
                         }
+                        recordAlignment(storedValue, checkedAlignment);
+                        return new Pointer(
+                                storedValue,
+                                inferredArrayElementSize(storedValue),
+                                0,
+                                checkedSize,
+                                null,
+                                viewCodecClassName,
+                                -1);
                     }
-                    recordAlignment(value, checkedAlignment);
-                    pointer = new Pointer(
-                            value,
-                            inferredArrayElementSize(value),
-                            0,
-                            checkedSize,
-                            null,
-                            viewCodecClassName,
-                            -1);
-                } else {
-                    pointer = cellAligned(
-                            value,
+                    return cellAligned(
+                            storedValue,
                             checkedSize,
                             viewCodecClassName,
                             checkedAlignment);
-                }
-                CONSTANT_CELLS.put(identity, pointer);
-            }
-            if (value != null
-                    && !value.getClass().isArray()
-                    && pointer.allocation != null
-                    && pointer.allocation.getClass().isArray()
-                    && !pointer.allocation.getClass().getComponentType().isPrimitive()
-                    && pointer.allocation.getClass().getComponentType().isInstance(value)) {
-                // CTFE can name the same promoted allocation once as a fixed
-                // array and once as its sole element. Release optimization may
-                // materialize either view first, so recover the Rust element
-                // layout instead of inheriting the JVM reference-slot width.
-                return pointer.sliceStorageView(checkedSize, viewCodecClassName);
-            }
-            if (pointer.viewSize == checkedSize
-                    && java.util.Objects.equals(
-                            pointer.viewCodecClassName, viewCodecClassName)) {
-                return pointer;
-            }
-            return pointer.retype(checkedSize, viewCodecClassName);
+                });
+        if (value != null
+                && !value.getClass().isArray()
+                && pointer.allocation != null
+                && pointer.allocation.getClass().isArray()
+                && !pointer.allocation.getClass().getComponentType().isPrimitive()
+                && pointer.allocation.getClass().getComponentType().isInstance(value)) {
+            // CTFE can name the same promoted allocation once as a fixed
+            // array and once as its sole element. Release optimization may
+            // materialize either view first, so recover the Rust element
+            // layout instead of inheriting the JVM reference-slot width.
+            return pointer.sliceStorageView(checkedSize, viewCodecClassName);
         }
+        if (pointer.viewSize == checkedSize
+                && java.util.Objects.equals(
+                        pointer.viewCodecClassName, viewCodecClassName)) {
+            return pointer;
+        }
+        return pointer.retype(checkedSize, viewCodecClassName);
     }
 
     /**
@@ -5601,36 +5609,37 @@ public final class Pointer {
                 + checkedViewSize
                 + ":"
                 + String.valueOf(viewCodecClassName);
-        synchronized (CONSTANT_CELLS) {
-            Pointer pointer = CONSTANT_CELLS.get(viewIdentity);
-            if (pointer == null) {
-                byte[] allocation;
-                synchronized (CONSTANT_ALLOCATIONS) {
-                    allocation = CONSTANT_ALLOCATIONS.get(identity);
+        Pointer pointer = CONSTANT_CELLS.computeIfAbsent(
+                viewIdentity,
+                ignored -> {
+                    byte[] allocation = CONSTANT_ALLOCATIONS.get(identity);
                     if (allocation == null) {
-                        allocation = new byte[checkedAllocationSize];
-                        CONSTANT_ALLOCATIONS.put(identity, allocation);
-                        recordAlignment(allocation, checkedAlignment);
-                    } else if (allocation.length != checkedAllocationSize) {
+                        byte[] candidate = new byte[checkedAllocationSize];
+                        byte[] existing =
+                                CONSTANT_ALLOCATIONS.putIfAbsent(identity, candidate);
+                        allocation = existing == null ? candidate : existing;
+                        if (existing == null) {
+                            recordAlignment(allocation, checkedAlignment);
+                        }
+                    }
+                    if (allocation.length != checkedAllocationSize) {
                         throw new IllegalStateException(
                                 "constant allocation was materialized with a different size");
                     }
-                }
-                pointer = new Pointer(
-                        allocation,
-                        1,
-                        checkedOffset,
-                        checkedViewSize,
-                        null,
-                        viewCodecClassName,
-                        -1);
-                if (value != null && checkedViewSize != 0) {
-                    pointer.set(value);
-                }
-                CONSTANT_CELLS.put(viewIdentity, pointer);
-            }
-            return pointer.retype(checkedViewSize, viewCodecClassName);
-        }
+                    Pointer candidate = new Pointer(
+                            allocation,
+                            1,
+                            checkedOffset,
+                            checkedViewSize,
+                            null,
+                            viewCodecClassName,
+                            -1);
+                    if (value != null && checkedViewSize != 0) {
+                        candidate.set(value);
+                    }
+                    return candidate;
+                });
+        return pointer.retype(checkedViewSize, viewCodecClassName);
     }
 
     /** Materializes one stable array-backed CTFE allocation. */
@@ -5645,15 +5654,13 @@ public final class Pointer {
         if (value == null || !value.getClass().isArray()) {
             throw new IllegalArgumentException("constant Rust array requires JVM array storage");
         }
-        synchronized (CONSTANT_CELLS) {
-            Pointer pointer = CONSTANT_CELLS.get(identity);
-            if (pointer == null) {
-                recordAlignment(value, checkedAlignment);
-                pointer = array(value, 0, checkedSize, elementCodecClassName);
-                CONSTANT_CELLS.put(identity, pointer);
-            }
-            return pointer.retype(checkedSize, elementCodecClassName);
-        }
+        Pointer pointer = CONSTANT_CELLS.computeIfAbsent(
+                identity,
+                ignored -> {
+                    recordAlignment(value, checkedAlignment);
+                    return array(value, 0, checkedSize, elementCodecClassName);
+                });
+        return pointer.retype(checkedSize, elementCodecClassName);
     }
 
     public static Pointer reallocateBytes(
@@ -5716,7 +5723,8 @@ public final class Pointer {
         Map<Object, LongRangeMap<MemoryViewState>> memoryStripe =
                 stateStripe(MEMORY_VIEWS, allocation);
         synchronized (memoryStripe) {
-            memoryStripe.remove(allocation);
+            deactivateMemoryViews(memoryStripe.remove(allocation));
+            setDirectCellHasMemoryView(allocation, false);
         }
         Map<Object, Map<Long, StructuralViewState>> structuralStripe =
                 stateStripe(STRUCTURAL_VIEWS, allocation);
@@ -5750,11 +5758,10 @@ public final class Pointer {
             return ((Pointer) sliceView).retype(elementSize, codecClassName);
         }
         try {
-            Field arrayField = instanceField(sliceView.getClass(), "array");
-            Field offsetField = instanceField(sliceView.getClass(), "offset");
-            Object backing = arrayField.get(sliceView);
-            int offset = offsetField.getInt(sliceView);
-            long length = sliceLogicalLength(sliceView);
+            SliceAccess access = SLICE_ACCESSES.get(sliceView.getClass());
+            Object backing = access.array(sliceView);
+            int offset = access.offset(sliceView);
+            long length = access.rustLength(sliceView);
             if (backing instanceof Pointer) {
                 return ((Pointer) backing)
                         .sliceStorageView(elementSize, codecClassName)
@@ -5820,12 +5827,11 @@ public final class Pointer {
             return ((Pointer) sliceView).retype(elementSize, codecClassName);
         }
         try {
-            Field arrayField = instanceField(sliceView.getClass(), "array");
-            Object backing = arrayField.get(sliceView);
+            SliceAccess access = SLICE_ACCESSES.get(sliceView.getClass());
+            Object backing = access.array(sliceView);
             if (backing instanceof Pointer) {
-                Field offsetField = instanceField(sliceView.getClass(), "offset");
-                int offset = offsetField.getInt(sliceView);
-                long length = sliceLogicalLength(sliceView);
+                int offset = access.offset(sliceView);
+                long length = access.rustLength(sliceView);
                 return ((Pointer) backing)
                         .sliceStorageView(elementSize, codecClassName)
                         .add(offset)
@@ -5846,8 +5852,7 @@ public final class Pointer {
             return nullPointer();
         }
         try {
-            Field arrayField = instanceField(sliceView.getClass(), "array");
-            Object array = arrayField.get(sliceView);
+            Object array = SLICE_ACCESSES.get(sliceView.getClass()).array(sliceView);
             if (array instanceof Pointer) {
                 Pointer pointer = (Pointer) array;
                 return fromSlice(
@@ -5872,21 +5877,21 @@ public final class Pointer {
     }
 
     public static Pointer traitMetadataMarker(Pointer pointer, String metadataClassName) {
-        if (pointer != null && pointer.traitMetadataMarker != null) {
-            return pointer.traitMetadataMarker;
+        if (pointer != null && pointer.traitMetadataMarker() != null) {
+            return pointer.traitMetadataMarker();
         }
         Object value = null;
         String concreteClassName = "<null>";
         if (pointer != null) {
-            if (pointer.traitMetadataCarrier != null) {
-                value = pointer.traitMetadataCarrier;
+            if (pointer.traitMetadataCarrier() != null) {
+                value = pointer.traitMetadataCarrier();
                 concreteClassName = value.getClass().getName();
-            } else if (pointer.traitPointeeSize == 0
-                    && pointer.traitAdapterClassName != null) {
+            } else if (pointer.traitPointeeSize() == 0
+                    && pointer.traitAdapterClassName() != null) {
                 // A ZST data pointer is a non-null dangling address and has no
                 // Java value to dereference. Its generated adapter still gives
                 // the vtable a stable, concrete identity.
-                concreteClassName = pointer.traitAdapterClassName;
+                concreteClassName = pointer.traitAdapterClassName();
             } else {
                 value = pointer.getObject();
                 concreteClassName = value == null ? "<null>" : value.getClass().getName();
@@ -5898,34 +5903,33 @@ public final class Pointer {
             if (marker == null) {
                 marker = cell(null, 0, null);
                 if (pointer != null) {
-                    marker.traitPointeeSize = pointer.traitPointeeSize;
-                    marker.traitPointeeAlignment = pointer.traitPointeeAlignment;
-                    marker.traitAdapterClassName = pointer.traitAdapterClassName;
+                    marker.traitPointeeSize(pointer.traitPointeeSize());
+                    marker.traitPointeeAlignment(pointer.traitPointeeAlignment());
+                    marker.traitAdapterClassName(pointer.traitAdapterClassName());
                 }
                 if (value instanceof TraitObjectCarrier) {
                     TraitObjectCarrier carrier = (TraitObjectCarrier) value;
-                    marker.traitPointeeSize = carrier.rustTraitObjectSize();
-                    marker.traitPointeeAlignment = carrier.rustTraitObjectAlignment();
-                    marker.traitAdapterClassName = value.getClass().getName();
+                    marker.traitPointeeSize(carrier.rustTraitObjectSize());
+                    marker.traitPointeeAlignment(carrier.rustTraitObjectAlignment());
+                    marker.traitAdapterClassName(value.getClass().getName());
                     Object payload = carrier.rustTraitObjectPayload();
                     if (payload instanceof Pointer) {
-                        marker.traitPointeeCodecClassName =
-                                ((Pointer) payload).viewCodecClassName;
+                        marker.traitPointeeCodecClassName(((Pointer) payload).viewCodecClassName);
                     }
                 }
                 TRAIT_METADATA_MARKERS.put(key, marker);
             }
-            if (marker.traitPointeeSize >= 0 && marker.traitPointeeAlignment > 0) {
+            if (marker.traitPointeeSize() >= 0 && marker.traitPointeeAlignment() > 0) {
                 TRAIT_METADATA_INFO.put(
                         marker.numericAddress(),
                         new TraitMetadataInfo(
-                                marker.traitPointeeSize,
-                                marker.traitPointeeAlignment,
-                                marker.traitAdapterClassName,
-                                marker.traitPointeeCodecClassName));
+                                marker.traitPointeeSize(),
+                                marker.traitPointeeAlignment(),
+                                marker.traitAdapterClassName(),
+                                marker.traitPointeeCodecClassName()));
             }
             if (pointer != null) {
-                pointer.traitMetadataMarker = marker;
+                pointer.traitMetadataMarker(marker);
             }
             return marker;
         }
@@ -5952,10 +5956,10 @@ public final class Pointer {
                 marker = cell(null, 0, null);
                 TRAIT_METADATA_MARKERS.put(key, marker);
             }
-            marker.traitPointeeSize = pointeeSize;
-            marker.traitPointeeAlignment = pointeeAlignment;
-            marker.traitAdapterClassName = adapterClassName;
-            marker.traitPointeeCodecClassName = pointeeCodecClassName;
+            marker.traitPointeeSize(pointeeSize);
+            marker.traitPointeeAlignment(pointeeAlignment);
+            marker.traitAdapterClassName(adapterClassName);
+            marker.traitPointeeCodecClassName(pointeeCodecClassName);
             TRAIT_METADATA_INFO.put(
                     marker.numericAddress(),
                     new TraitMetadataInfo(
@@ -5971,8 +5975,8 @@ public final class Pointer {
         if (marker == null) {
             throw new IllegalStateException("Rust vtable does not carry a pointee size");
         }
-        if (marker.traitPointeeSize >= 0) {
-            return marker.traitPointeeSize;
+        if (marker.traitPointeeSize() >= 0) {
+            return marker.traitPointeeSize();
         }
         TraitMetadataInfo info = TRAIT_METADATA_INFO.get(marker.numericAddress());
         if (info == null) {
@@ -5985,8 +5989,8 @@ public final class Pointer {
         if (marker == null) {
             throw new IllegalStateException("Rust vtable does not carry a pointee alignment");
         }
-        if (marker.traitPointeeAlignment > 0) {
-            return marker.traitPointeeAlignment;
+        if (marker.traitPointeeAlignment() > 0) {
+            return marker.traitPointeeAlignment();
         }
         TraitMetadataInfo info = TRAIT_METADATA_INFO.get(marker.numericAddress());
         if (info == null) {
@@ -6030,13 +6034,13 @@ public final class Pointer {
                             target.zeroSizedSourceViewSize,
                             target.zeroSizedSourceViewCodecClassName);
                 }
-                pointer.traitObjectCarrier = target.traitObjectCarrier;
-                pointer.traitMetadataCarrier = target.traitMetadataCarrier;
-                pointer.traitMetadataMarker = target.traitMetadataMarker;
-                pointer.traitPointeeSize = target.traitPointeeSize;
-                pointer.traitPointeeAlignment = target.traitPointeeAlignment;
-                pointer.traitAdapterClassName = target.traitAdapterClassName;
-                pointer.traitPointeeCodecClassName = target.traitPointeeCodecClassName;
+                pointer.traitObjectCarrier(target.traitObjectCarrier);
+                pointer.traitMetadataCarrier(target.traitMetadataCarrier);
+                pointer.traitMetadataMarker(target.traitMetadataMarker);
+                pointer.traitPointeeSize(target.traitPointeeSize);
+                pointer.traitPointeeAlignment(target.traitPointeeAlignment);
+                pointer.traitAdapterClassName(target.traitAdapterClassName);
+                pointer.traitPointeeCodecClassName(target.traitPointeeCodecClassName);
                 pointer.setAddressOrigin(target.addressOrigin, target.addressOriginOffset);
                 return pointer;
             }
@@ -6081,14 +6085,22 @@ public final class Pointer {
             return 0;
         }
         synchronized (MANAGED_OBJECT_ADDRESSES) {
+            discardCollectedManagedObjects();
             Long existing = MANAGED_OBJECT_ADDRESSES.get(value);
             if (existing != null) {
                 return existing.longValue();
             }
             long address = allocateAddress(16, 16);
             MANAGED_OBJECT_ADDRESSES.put(value, address);
-            MANAGED_OBJECTS.put(address, new WeakReference<>(value));
+            MANAGED_OBJECTS.put(address, new ManagedObjectReference(value, address));
             return address;
+        }
+    }
+
+    private static void discardCollectedManagedObjects() {
+        ManagedObjectReference collected;
+        while ((collected = (ManagedObjectReference) MANAGED_OBJECT_QUEUE.poll()) != null) {
+            MANAGED_OBJECTS.remove(Long.valueOf(collected.address), collected);
         }
     }
 
@@ -6097,7 +6109,8 @@ public final class Pointer {
             return null;
         }
         synchronized (MANAGED_OBJECT_ADDRESSES) {
-            WeakReference<Object> reference = MANAGED_OBJECTS.get(address);
+            discardCollectedManagedObjects();
+            ManagedObjectReference reference = MANAGED_OBJECTS.get(address);
             Object value = reference == null ? null : reference.get();
             if (value == null) {
                 MANAGED_OBJECTS.remove(address);
@@ -6127,7 +6140,7 @@ public final class Pointer {
             throw new NullPointerException("Rust str source is null");
         }
         JavaStringViews views = javaStringViews(value);
-        boolean utf8 = UTF8_VIEW_CLASS_NAME.equals(binaryClassName(viewClassName));
+        boolean utf8 = matchesBinaryClassName(viewClassName, UTF8_VIEW_CLASS_NAME);
         Object cached = utf8 ? views.utf8 : views.slice;
         if (cached != null) {
             return cached;
@@ -6198,13 +6211,13 @@ public final class Pointer {
                     target.zeroSizedSourceViewSize,
                     target.zeroSizedSourceViewCodecClassName);
         }
-        pointer.traitObjectCarrier = target.traitObjectCarrier;
-        pointer.traitMetadataCarrier = target.traitMetadataCarrier;
-        pointer.traitMetadataMarker = target.traitMetadataMarker;
-        pointer.traitPointeeSize = target.traitPointeeSize;
-        pointer.traitPointeeAlignment = target.traitPointeeAlignment;
-        pointer.traitAdapterClassName = target.traitAdapterClassName;
-        pointer.traitPointeeCodecClassName = target.traitPointeeCodecClassName;
+        pointer.traitObjectCarrier(target.traitObjectCarrier);
+        pointer.traitMetadataCarrier(target.traitMetadataCarrier);
+        pointer.traitMetadataMarker(target.traitMetadataMarker);
+        pointer.traitPointeeSize(target.traitPointeeSize);
+        pointer.traitPointeeAlignment(target.traitPointeeAlignment);
+        pointer.traitAdapterClassName(target.traitAdapterClassName);
+        pointer.traitPointeeCodecClassName(target.traitPointeeCodecClassName);
         if (target.addressOrigin != null) {
             pointer.setAddressOrigin(target.addressOrigin, target.addressOriginOffset);
         }
@@ -6345,13 +6358,13 @@ public final class Pointer {
             Pointer pointer, long newViewSize, String newViewCodecClassName) {
         Pointer result = pointer.retype(newViewSize, newViewCodecClassName);
         result.metadata = 0;
-        result.traitObjectCarrier = null;
-        result.traitMetadataCarrier = null;
-        result.traitMetadataMarker = null;
-        result.traitPointeeSize = -1;
-        result.traitPointeeAlignment = -1;
-        result.traitAdapterClassName = null;
-        result.traitPointeeCodecClassName = null;
+        result.traitObjectCarrier(null);
+        result.traitMetadataCarrier(null);
+        result.traitMetadataMarker(null);
+        result.traitPointeeSize(-1);
+        result.traitPointeeAlignment(-1);
+        result.traitAdapterClassName(null);
+        result.traitPointeeCodecClassName(null);
         return result;
     }
 
@@ -6376,10 +6389,10 @@ public final class Pointer {
                         && (pointeeAlignment & (pointeeAlignment - 1)) != 0)) {
             throw new IllegalArgumentException("invalid trait-object pointee layout");
         }
-        pointer.traitObjectCarrier = carrier;
-        pointer.traitPointeeSize = pointeeSize;
-        pointer.traitPointeeAlignment = pointeeAlignment;
-        pointer.traitAdapterClassName = carrier.getClass().getName();
+        pointer.traitObjectCarrier(carrier);
+        pointer.traitPointeeSize(pointeeSize);
+        pointer.traitPointeeAlignment(pointeeAlignment);
+        pointer.traitAdapterClassName(carrier.getClass().getName());
         return pointer;
     }
 
@@ -6404,15 +6417,15 @@ public final class Pointer {
         if (pointer == null || tailPointer == null) {
             throw new NullPointerException("struct-tail trait metadata requires a trait pointer");
         }
-        Object carrier = tailPointer.traitObjectCarrier != null
-                ? tailPointer.traitObjectCarrier
-                : tailPointer.traitMetadataCarrier;
+        Object carrier = tailPointer.traitObjectCarrier() != null
+                ? tailPointer.traitObjectCarrier()
+                : tailPointer.traitMetadataCarrier();
         Object direct = tailPointer.directCellValueOrSelf();
         while (carrier == null && direct instanceof Pointer && direct != tailPointer) {
             Pointer nested = (Pointer) direct;
-            carrier = nested.traitObjectCarrier != null
-                    ? nested.traitObjectCarrier
-                    : nested.traitMetadataCarrier;
+            carrier = nested.traitObjectCarrier() != null
+                    ? nested.traitObjectCarrier()
+                    : nested.traitMetadataCarrier();
             Object next = nested.directCellValueOrSelf();
             if (next == direct) {
                 break;
@@ -6427,22 +6440,22 @@ public final class Pointer {
                     "struct-tail trait pointer does not carry dynamic metadata");
         }
         TraitObjectCarrier traitCarrier = (TraitObjectCarrier) carrier;
-        pointer.traitMetadataCarrier = carrier;
-        pointer.traitMetadataMarker = tailPointer.traitMetadataMarker;
-        pointer.traitPointeeSize = tailPointer.traitPointeeSize >= 0
-                ? tailPointer.traitPointeeSize
-                : traitCarrier.rustTraitObjectSize();
-        pointer.traitPointeeAlignment = tailPointer.traitPointeeAlignment > 0
-                ? tailPointer.traitPointeeAlignment
-                : traitCarrier.rustTraitObjectAlignment();
-        pointer.traitAdapterClassName = tailPointer.traitAdapterClassName != null
-                ? tailPointer.traitAdapterClassName
-                : carrier.getClass().getName();
-        pointer.traitPointeeCodecClassName = tailPointer.traitPointeeCodecClassName;
-        if (pointer.traitPointeeCodecClassName == null) {
+        pointer.traitMetadataCarrier(carrier);
+        pointer.traitMetadataMarker(tailPointer.traitMetadataMarker());
+        pointer.traitPointeeSize(tailPointer.traitPointeeSize() >= 0
+                ? tailPointer.traitPointeeSize()
+                : traitCarrier.rustTraitObjectSize());
+        pointer.traitPointeeAlignment(tailPointer.traitPointeeAlignment() > 0
+                ? tailPointer.traitPointeeAlignment()
+                : traitCarrier.rustTraitObjectAlignment());
+        pointer.traitAdapterClassName(tailPointer.traitAdapterClassName() != null
+                ? tailPointer.traitAdapterClassName()
+                : carrier.getClass().getName());
+        pointer.traitPointeeCodecClassName(tailPointer.traitPointeeCodecClassName());
+        if (pointer.traitPointeeCodecClassName() == null) {
             Object payload = traitCarrier.rustTraitObjectPayload();
             if (payload instanceof Pointer) {
-                pointer.traitPointeeCodecClassName = ((Pointer) payload).viewCodecClassName;
+                pointer.traitPointeeCodecClassName(((Pointer) payload).viewCodecClassName);
             }
         }
         return pointer;
@@ -6477,13 +6490,13 @@ public final class Pointer {
             String newViewCodecClassName) {
         Pointer result = pointer.retype(newViewSize, newViewCodecClassName);
         result.metadata = metadataSource.metadata;
-        result.traitObjectCarrier = metadataSource.traitObjectCarrier;
-        result.traitMetadataCarrier = metadataSource.traitMetadataCarrier;
-        result.traitMetadataMarker = metadataSource.traitMetadataMarker;
-        result.traitPointeeSize = metadataSource.traitPointeeSize;
-        result.traitPointeeAlignment = metadataSource.traitPointeeAlignment;
-        result.traitAdapterClassName = metadataSource.traitAdapterClassName;
-        result.traitPointeeCodecClassName = metadataSource.traitPointeeCodecClassName;
+        result.traitObjectCarrier(metadataSource.traitObjectCarrier());
+        result.traitMetadataCarrier(metadataSource.traitMetadataCarrier());
+        result.traitMetadataMarker(metadataSource.traitMetadataMarker());
+        result.traitPointeeSize(metadataSource.traitPointeeSize());
+        result.traitPointeeAlignment(metadataSource.traitPointeeAlignment());
+        result.traitAdapterClassName(metadataSource.traitAdapterClassName());
+        result.traitPointeeCodecClassName(metadataSource.traitPointeeCodecClassName());
         return result;
     }
 
@@ -6495,16 +6508,16 @@ public final class Pointer {
             String newViewCodecClassName) {
         Pointer result = attachStructTailTraitMetadata(
                 pointer.retype(newViewSize, newViewCodecClassName), metadataSource);
-        if (result.traitAdapterClassName == null) {
+        if (result.traitAdapterClassName() == null) {
             return result;
         }
         try {
             Pointer tailData = result.byteOffsetRetype(
                     newViewSize,
-                    result.traitPointeeSize,
-                    result.traitPointeeCodecClassName);
-            Class<?> adapter = resolvedRuntimeClass(result.traitAdapterClassName);
-            result.traitMetadataCarrier = constructorWithArity(adapter, 1).newInstance(tailData);
+                    result.traitPointeeSize(),
+                    result.traitPointeeCodecClassName());
+            Class<?> adapter = resolvedRuntimeClass(result.traitAdapterClassName());
+            result.traitMetadataCarrier(constructorWithArity(adapter, 1).newInstance(tailData));
             return result;
         } catch (ReflectiveOperationException error) {
             throw new IllegalStateException("could not retarget Rust trait-object tail", error);
@@ -6517,8 +6530,8 @@ public final class Pointer {
             long newViewSize,
             String newViewCodecClassName) {
         Pointer result = pointer.retype(newViewSize, newViewCodecClassName);
-        result.traitObjectCarrier = null;
-        result.traitMetadataCarrier = null;
+        result.traitObjectCarrier(null);
+        result.traitMetadataCarrier(null);
         return attachStructTailTraitMetadata(result, pointer);
     }
 
@@ -6629,13 +6642,13 @@ public final class Pointer {
                 pointer.allocationCodecClassName,
                 pointer.exposedAddress).withMetadata(pointer.metadata)
                 .copyAddressOrigin(pointer, 0);
-        result.traitObjectCarrier = pointer.traitObjectCarrier;
-        result.traitMetadataCarrier = pointer.traitMetadataCarrier;
-        result.traitMetadataMarker = pointer.traitMetadataMarker;
-        result.traitPointeeSize = pointer.traitPointeeSize;
-        result.traitPointeeAlignment = pointer.traitPointeeAlignment;
-        result.traitAdapterClassName = pointer.traitAdapterClassName;
-        result.traitPointeeCodecClassName = pointer.traitPointeeCodecClassName;
+        result.traitObjectCarrier(pointer.traitObjectCarrier());
+        result.traitMetadataCarrier(pointer.traitMetadataCarrier());
+        result.traitMetadataMarker(pointer.traitMetadataMarker());
+        result.traitPointeeSize(pointer.traitPointeeSize());
+        result.traitPointeeAlignment(pointer.traitPointeeAlignment());
+        result.traitAdapterClassName(pointer.traitAdapterClassName());
+        result.traitPointeeCodecClassName(pointer.traitPointeeCodecClassName());
         return result;
     }
 
@@ -6690,10 +6703,10 @@ public final class Pointer {
                 throw new IllegalArgumentException("Rust trait metadata has no vtable pointer");
             }
             TraitMetadataInfo info = TRAIT_METADATA_INFO.get(marker.numericAddress());
-            long pointeeSize = marker.traitPointeeSize;
-            long pointeeAlignment = marker.traitPointeeAlignment;
-            String adapterClassName = marker.traitAdapterClassName;
-            String pointeeCodecClassName = marker.traitPointeeCodecClassName;
+            long pointeeSize = marker.traitPointeeSize();
+            long pointeeAlignment = marker.traitPointeeAlignment();
+            String adapterClassName = marker.traitAdapterClassName();
+            String pointeeCodecClassName = marker.traitPointeeCodecClassName();
             if (info != null) {
                 pointeeSize = info.size;
                 pointeeAlignment = info.alignment;
@@ -6704,14 +6717,14 @@ public final class Pointer {
                     ? data.retype(pointeeSize, pointeeCodecClassName)
                     : restoreErasedView(data);
             Pointer result = source.retype(0);
-            result.traitMetadataMarker = marker;
-            result.traitPointeeSize = pointeeSize;
-            result.traitPointeeAlignment = pointeeAlignment;
-            result.traitAdapterClassName = adapterClassName;
+            result.traitMetadataMarker(marker);
+            result.traitPointeeSize(pointeeSize);
+            result.traitPointeeAlignment(pointeeAlignment);
+            result.traitAdapterClassName(adapterClassName);
             if (adapterClassName != null) {
                 Class<?> adapter = resolvedRuntimeClass(adapterClassName);
                 Object carrier = constructorWithArity(adapter, 1).newInstance(source);
-                result.traitObjectCarrier = carrier;
+                result.traitObjectCarrier(carrier);
             }
             return result;
         } catch (ReflectiveOperationException error) {
@@ -6725,13 +6738,25 @@ public final class Pointer {
     }
 
     private Pointer copyDynamicMetadata(Pointer source) {
-        traitObjectCarrier = source.traitObjectCarrier;
-        traitMetadataCarrier = source.traitMetadataCarrier;
-        traitMetadataMarker = source.traitMetadataMarker;
-        traitPointeeSize = source.traitPointeeSize;
-        traitPointeeAlignment = source.traitPointeeAlignment;
-        traitAdapterClassName = source.traitAdapterClassName;
-        traitPointeeCodecClassName = source.traitPointeeCodecClassName;
+        RarePointerState sourceState = source.rareState;
+        if (sourceState == null
+                || (sourceState.traitObjectCarrier == null
+                        && sourceState.traitMetadataCarrier == null
+                        && sourceState.traitMetadataMarker == null
+                        && sourceState.traitPointeeSize == -1
+                        && sourceState.traitPointeeAlignment == -1
+                        && sourceState.traitAdapterClassName == null
+                        && sourceState.traitPointeeCodecClassName == null)) {
+            return this;
+        }
+        RarePointerState targetState = mutableRareState();
+        targetState.traitObjectCarrier = sourceState.traitObjectCarrier;
+        targetState.traitMetadataCarrier = sourceState.traitMetadataCarrier;
+        targetState.traitMetadataMarker = sourceState.traitMetadataMarker;
+        targetState.traitPointeeSize = sourceState.traitPointeeSize;
+        targetState.traitPointeeAlignment = sourceState.traitPointeeAlignment;
+        targetState.traitAdapterClassName = sourceState.traitAdapterClassName;
+        targetState.traitPointeeCodecClassName = sourceState.traitPointeeCodecClassName;
         return this;
     }
 
@@ -6815,12 +6840,12 @@ public final class Pointer {
     private static long traitPointeeSize(Object value) {
         if (value instanceof Pointer) {
             Pointer pointer = (Pointer) value;
-            if (pointer.traitPointeeSize >= 0) {
-                return pointer.traitPointeeSize;
+            if (pointer.traitPointeeSize() >= 0) {
+                return pointer.traitPointeeSize();
             }
-            value = pointer.traitObjectCarrier != null
-                    ? pointer.traitObjectCarrier
-                    : pointer.traitMetadataCarrier;
+            value = pointer.traitObjectCarrier() != null
+                    ? pointer.traitObjectCarrier()
+                    : pointer.traitMetadataCarrier();
             if (value == null) {
                 Object direct = pointer.directCellValueOrSelf();
                 value = direct == pointer ? null : direct;
@@ -6835,12 +6860,12 @@ public final class Pointer {
     private static long traitPointeeAlignment(Object value) {
         if (value instanceof Pointer) {
             Pointer pointer = (Pointer) value;
-            if (pointer.traitPointeeAlignment > 0) {
-                return pointer.traitPointeeAlignment;
+            if (pointer.traitPointeeAlignment() > 0) {
+                return pointer.traitPointeeAlignment();
             }
-            value = pointer.traitObjectCarrier != null
-                    ? pointer.traitObjectCarrier
-                    : pointer.traitMetadataCarrier;
+            value = pointer.traitObjectCarrier() != null
+                    ? pointer.traitObjectCarrier()
+                    : pointer.traitMetadataCarrier();
             if (value == null) {
                 Object direct = pointer.directCellValueOrSelf();
                 value = direct == pointer ? null : direct;
@@ -7243,12 +7268,12 @@ public final class Pointer {
         if (other == null) {
             return false;
         }
-        if (traitObjectCarrier != null
-                || traitAdapterClassName != null
-                || traitMetadataMarker != null
-                || other.traitObjectCarrier != null
-                || other.traitAdapterClassName != null
-                || other.traitMetadataMarker != null) {
+        if (traitObjectCarrier() != null
+                || traitAdapterClassName() != null
+                || traitMetadataMarker() != null
+                || other.traitObjectCarrier() != null
+                || other.traitAdapterClassName() != null
+                || other.traitMetadataMarker() != null) {
             Pointer leftData = RuntimeSupport.traitObjectDataPointer(this, 0, null);
             Pointer rightData = RuntimeSupport.traitObjectDataPointer(other, 0, null);
             return leftData.samePointerWords(rightData);
@@ -7260,6 +7285,10 @@ public final class Pointer {
         if (!sameAddress(other)) {
             return false;
         }
+        return samePointerMetadataWords(other);
+    }
+
+    private boolean samePointerMetadataWords(Pointer other) {
         boolean leftHasDstMetadata = viewCodecClassName != null
                 && viewCodecClassName.startsWith(STRUCT_TAIL_VIEW_CODEC_PREFIX);
         boolean rightHasDstMetadata = other.viewCodecClassName != null
@@ -7267,22 +7296,61 @@ public final class Pointer {
         if ((leftHasDstMetadata || rightHasDstMetadata) && metadata != other.metadata) {
             return false;
         }
-        if (traitMetadataMarker != null && other.traitMetadataMarker != null) {
-            return traitMetadataMarker.sameAddress(other.traitMetadataMarker);
+        if (traitMetadataMarker() != null && other.traitMetadataMarker() != null) {
+            return traitMetadataMarker().sameAddress(other.traitMetadataMarker());
         }
-        if (traitMetadataMarker == null && other.traitMetadataMarker == null) {
+        if (traitMetadataMarker() == null && other.traitMetadataMarker() == null) {
             return java.util.Objects.equals(
-                    traitAdapterClassName, other.traitAdapterClassName);
+                    traitAdapterClassName(), other.traitAdapterClassName());
         }
-        Pointer marker = traitMetadataMarker != null
-                ? traitMetadataMarker
-                : other.traitMetadataMarker;
-        String unmaterializedAdapter = traitMetadataMarker == null
-                ? traitAdapterClassName
-                : other.traitAdapterClassName;
+        Pointer marker = traitMetadataMarker() != null
+                ? traitMetadataMarker()
+                : other.traitMetadataMarker();
+        String unmaterializedAdapter = traitMetadataMarker() == null
+                ? traitAdapterClassName()
+                : other.traitAdapterClassName();
         TraitMetadataInfo info = TRAIT_METADATA_INFO.get(marker.numericAddress());
-        String markerAdapter = info == null ? marker.traitAdapterClassName : info.adapterClassName;
+        String markerAdapter = info == null ? marker.traitAdapterClassName() : info.adapterClassName;
         return markerAdapter != null && markerAdapter.equals(unmaterializedAdapter);
+    }
+
+    /** Compares deferred pointer data and metadata words without materialization. */
+    public static boolean samePointerRelative(
+            Pointer left,
+            long leftElementOffset,
+            long leftByteOffset,
+            Pointer right,
+            long rightElementOffset,
+            long rightByteOffset) {
+        if (left == null || right == null) {
+            return false;
+        }
+        if (left.traitObjectCarrier() != null
+                || left.traitAdapterClassName() != null
+                || left.traitMetadataMarker() != null
+                || right.traitObjectCarrier() != null
+                || right.traitAdapterClassName() != null
+                || right.traitMetadataMarker() != null) {
+            return materializeRelative(left, leftElementOffset, leftByteOffset)
+                    .samePointer(materializeRelative(
+                            right, rightElementOffset, rightByteOffset));
+        }
+        long leftDisplacement = Math.addExact(
+                Math.multiplyExact(leftElementOffset, left.viewSize), leftByteOffset);
+        long rightDisplacement = Math.addExact(
+                Math.multiplyExact(rightElementOffset, right.viewSize), rightByteOffset);
+        boolean sameAddress;
+        if (left.allocation != null && left.allocation == right.allocation) {
+            sameAddress = Math.addExact(left.byteOffset, leftDisplacement)
+                    == Math.addExact(right.byteOffset, rightDisplacement);
+        } else if (left.allocation == null && right.allocation == null) {
+            sameAddress = Math.addExact(left.exposedAddress, leftDisplacement)
+                    == Math.addExact(right.exposedAddress, rightDisplacement);
+        } else {
+            sameAddress = Math.addExact(left.numericAddress(), leftDisplacement)
+                    == Math.addExact(right.numericAddress(), rightDisplacement);
+        }
+        return sameAddress && left.samePointerMetadataWords(right);
     }
 
     /** Compares both words of a Rust slice/str fat pointer. */
@@ -7344,6 +7412,15 @@ public final class Pointer {
     }
 
     public int compareAddress(Pointer other) {
+        if (other != null
+                && allocation != null
+                && allocation == other.allocation
+                && addressOrigin() == null
+                && other.addressOrigin() == null
+                && byteOffset >= 0
+                && other.byteOffset >= 0) {
+            return Long.compareUnsigned(byteOffset, other.byteOffset);
+        }
         return Long.compareUnsigned(numericAddress(), other.numericAddress());
     }
 
@@ -7525,15 +7602,11 @@ public final class Pointer {
         Long cachedBase =
                 cachedAllocationBase(ALLOCATION_BASE_CACHE, allocation);
         if (cachedBase != null) {
-            long address = Math.addExact(cachedBase.longValue(), byteOffset);
-            setPublishedAddress(address);
-            return address;
+            return Math.addExact(cachedBase.longValue(), byteOffset);
         }
         synchronized (ALLOCATIONS) {
             AllocationInfo info = allocationInfo(allocation);
-            long address = allocationBase(info) + byteOffset;
-            setPublishedAddress(address);
-            return address;
+            return Math.addExact(allocationBase(info), byteOffset);
         }
     }
 
@@ -7690,13 +7763,13 @@ public final class Pointer {
                 metadata,
                 zeroSizedSourceViewSize(),
                 zeroSizedSourceViewCodecClassName(),
-                traitObjectCarrier,
-                traitMetadataCarrier,
-                traitMetadataMarker,
-                traitPointeeSize,
-                traitPointeeAlignment,
-                traitAdapterClassName,
-                traitPointeeCodecClassName,
+                traitObjectCarrier(),
+                traitMetadataCarrier(),
+                traitMetadataMarker(),
+                traitPointeeSize(),
+                traitPointeeAlignment(),
+                traitAdapterClassName(),
+                traitPointeeCodecClassName(),
                 addressOrigin(),
                 addressOriginOffset());
     }
@@ -7715,13 +7788,13 @@ public final class Pointer {
                 metadata,
                 zeroSizedSourceViewSize(),
                 zeroSizedSourceViewCodecClassName(),
-                traitObjectCarrier,
-                traitMetadataCarrier,
-                traitMetadataMarker,
-                traitPointeeSize,
-                traitPointeeAlignment,
-                traitAdapterClassName,
-                traitPointeeCodecClassName,
+                traitObjectCarrier(),
+                traitMetadataCarrier(),
+                traitMetadataMarker(),
+                traitPointeeSize(),
+                traitPointeeAlignment(),
+                traitAdapterClassName(),
+                traitPointeeCodecClassName(),
                 addressOrigin(),
                 Math.addExact(addressOriginOffset(), displacement));
     }
@@ -7857,12 +7930,10 @@ public final class Pointer {
                         ? ((Cell) allocation).value
                         : ((ReceiverCell) allocation).value;
                 String constantIdentity = null;
-                synchronized (CONSTANT_CELLS) {
-                    for (Map.Entry<String, Pointer> entry : CONSTANT_CELLS.entrySet()) {
-                        if (entry.getValue().allocation == allocation) {
-                            constantIdentity = entry.getKey();
-                            break;
-                        }
+                for (Map.Entry<String, Pointer> entry : CONSTANT_CELLS.entrySet()) {
+                    if (entry.getValue().allocation == allocation) {
+                        constantIdentity = entry.getKey();
+                        break;
                     }
                 }
                 throw new IndexOutOfBoundsException(
@@ -7915,11 +7986,10 @@ public final class Pointer {
         } else {
             return null;
         }
-        if (value == null || !value.getClass().isArray()
-                || !value.getClass().getComponentType().isPrimitive()) {
+        int length = primitiveArrayLength(value);
+        if (length < 0) {
             return null;
         }
-        int length = Array.getLength(value);
         if (length == 0 || allocationElementSize % length != 0) {
             return null;
         }
@@ -7928,7 +7998,87 @@ public final class Pointer {
     }
 
     private int embeddedArrayElementSize(Object array) {
-        return allocationElementSize / Array.getLength(array);
+        return allocationElementSize / primitiveArrayLength(array);
+    }
+
+    /** Returns -1 for reference arrays and non-arrays. */
+    private static int primitiveArrayLength(Object array) {
+        if (array instanceof byte[]) {
+            return ((byte[]) array).length;
+        }
+        if (array instanceof boolean[]) {
+            return ((boolean[]) array).length;
+        }
+        if (array instanceof short[]) {
+            return ((short[]) array).length;
+        }
+        if (array instanceof char[]) {
+            return ((char[]) array).length;
+        }
+        if (array instanceof int[]) {
+            return ((int[]) array).length;
+        }
+        if (array instanceof long[]) {
+            return ((long[]) array).length;
+        }
+        if (array instanceof float[]) {
+            return ((float[]) array).length;
+        }
+        if (array instanceof double[]) {
+            return ((double[]) array).length;
+        }
+        return -1;
+    }
+
+    private static long primitiveArrayBits(Object array, int index) {
+        if (array instanceof byte[]) {
+            return ((byte[]) array)[index] & 0xffL;
+        }
+        if (array instanceof boolean[]) {
+            return ((boolean[]) array)[index] ? 1L : 0L;
+        }
+        if (array instanceof short[]) {
+            return ((short[]) array)[index] & 0xffffL;
+        }
+        if (array instanceof char[]) {
+            return ((char[]) array)[index];
+        }
+        if (array instanceof int[]) {
+            return Integer.toUnsignedLong(((int[]) array)[index]);
+        }
+        if (array instanceof long[]) {
+            return ((long[]) array)[index];
+        }
+        if (array instanceof float[]) {
+            return Integer.toUnsignedLong(
+                    Float.floatToRawIntBits(((float[]) array)[index]));
+        }
+        if (array instanceof double[]) {
+            return Double.doubleToRawLongBits(((double[]) array)[index]);
+        }
+        throw new IllegalArgumentException("not a primitive JVM array");
+    }
+
+    private static void storePrimitiveArrayBits(Object array, int index, long bits) {
+        if (array instanceof byte[]) {
+            ((byte[]) array)[index] = (byte) bits;
+        } else if (array instanceof boolean[]) {
+            ((boolean[]) array)[index] = bits != 0;
+        } else if (array instanceof short[]) {
+            ((short[]) array)[index] = (short) bits;
+        } else if (array instanceof char[]) {
+            ((char[]) array)[index] = (char) bits;
+        } else if (array instanceof int[]) {
+            ((int[]) array)[index] = (int) bits;
+        } else if (array instanceof long[]) {
+            ((long[]) array)[index] = bits;
+        } else if (array instanceof float[]) {
+            ((float[]) array)[index] = Float.intBitsToFloat((int) bits);
+        } else if (array instanceof double[]) {
+            ((double[]) array)[index] = Double.longBitsToDouble(bits);
+        } else {
+            throw new IllegalArgumentException("not a primitive JVM array");
+        }
     }
 
     /** Returns the byte width of a primitive fixed-array carrier, if compatible. */
@@ -8316,6 +8466,11 @@ public final class Pointer {
     }
 
     private Long loadEmbeddedArrayBits(long absoluteByteOffset, int byteCount) {
+        return loadEmbeddedArrayBits(absoluteByteOffset, byteCount, true);
+    }
+
+    private Long loadEmbeddedArrayBits(
+            long absoluteByteOffset, int byteCount, boolean flushMemoryViews) {
         Object array = embeddedPrimitiveArray();
         if (array == null) {
             return null;
@@ -8325,10 +8480,11 @@ public final class Pointer {
         if (withinElement + byteCount > elementSize || byteCount > 8) {
             return null;
         }
-        flushMemoryViewsOverlapping(absoluteByteOffset, byteCount);
+        if (flushMemoryViews) {
+            flushMemoryViewsOverlapping(absoluteByteOffset, byteCount);
+        }
         int elementIndex = Math.toIntExact(Math.floorDiv(absoluteByteOffset, elementSize));
-        Object current = arrayGet(array, elementIndex);
-        long bits = valueBits(current, elementSize);
+        long bits = primitiveArrayBits(array, elementIndex);
         return Long.valueOf((bits >>> (withinElement * 8)) & atomicMask(byteCount));
     }
 
