@@ -92,6 +92,14 @@ struct TransparentFieldWrapper {
     inner_ty: Type,
 }
 
+#[derive(Clone)]
+struct SingleValueWrapper {
+    class_name: String,
+    field_name: String,
+    field_ty: Type,
+    constructor_fields: Vec<(String, Type)>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DirectFieldSource {
     PointerView,
@@ -1722,14 +1730,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                             .to_string(),
                     }
                 })?;
-                let line_number =
-                    u16::try_from(location.line).map_err(|_| jvm::Error::VerificationError {
-                        context: format!("Function {}", self.oomir_func.name),
-                        message: format!(
-                            "Rust source line {} exceeds the JVM LineNumberTable limit",
-                            location.line
-                        ),
-                    })?;
+                let line_number = u16::try_from(location.line).unwrap_or(0);
                 line_numbers.push(jvm::attributes::LineNumber {
                     start_pc,
                     line_number,
@@ -2572,7 +2573,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         &self,
         target_ty: &oomir::Type,
         source_ty: &oomir::Type,
-    ) -> Option<Vec<(String, String, oomir::Type)>> {
+    ) -> Option<Vec<SingleValueWrapper>> {
         if target_ty == source_ty || target_ty.to_jvm_descriptor() == source_ty.to_jvm_descriptor()
         {
             return Some(Vec::new());
@@ -2585,7 +2586,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         };
         let mut value_fields = fields
             .iter()
-            .filter(|(_, field_ty)| field_ty.has_jvm_value());
+            .filter(|(_, field_ty)| !self.is_zero_sized_storage_type(field_ty));
         let (field_name, field_ty) = value_fields.next()?;
         if value_fields.next().is_some() {
             return None;
@@ -2594,31 +2595,110 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         let mut path = self.single_value_wrapper_path(field_ty, source_ty)?;
         path.insert(
             0,
-            (class_name.clone(), field_name.clone(), field_ty.clone()),
+            SingleValueWrapper {
+                class_name: class_name.clone(),
+                field_name: field_name.clone(),
+                field_ty: field_ty.clone(),
+                constructor_fields: fields
+                    .iter()
+                    .filter(|(_, field_ty)| field_ty.has_jvm_value())
+                    .cloned()
+                    .collect(),
+            },
         );
         Some(path)
+    }
+
+    fn is_zero_sized_storage_type(&self, ty: &oomir::Type) -> bool {
+        if !ty.has_jvm_value() {
+            return true;
+        }
+        let oomir::Type::Class(class_name) = ty else {
+            return false;
+        };
+        matches!(
+            self.module.data_types.get(class_name),
+            Some(oomir::DataType::Class { fields, .. })
+                if fields
+                    .iter()
+                    .all(|(_, field_ty)| self.is_zero_sized_storage_type(field_ty))
+        )
+    }
+
+    fn construct_zero_sized_storage_value(&mut self, ty: &oomir::Type) -> Result<(), jvm::Error> {
+        let oomir::Type::Class(class_name) = ty else {
+            return Err(jvm::Error::VerificationError {
+                context: format!("Function {}", self.oomir_func.name),
+                message: format!("zero-sized wrapper field has non-class type {ty:?}"),
+            });
+        };
+        let fields = match self.module.data_types.get(class_name) {
+            Some(oomir::DataType::Class { fields, .. }) => fields
+                .iter()
+                .filter(|(_, field_ty)| field_ty.has_jvm_value())
+                .map(|(_, field_ty)| field_ty.clone())
+                .collect::<Vec<_>>(),
+            _ => {
+                return Err(jvm::Error::VerificationError {
+                    context: format!("Function {}", self.oomir_func.name),
+                    message: format!("zero-sized wrapper class {class_name} was not generated"),
+                });
+            }
+        };
+        let class = self.constant_pool.add_class(class_name)?;
+        self.jvm_instructions.push(Instruction::New(class));
+        self.jvm_instructions.push(Instruction::Dup);
+        for field_ty in &fields {
+            self.construct_zero_sized_storage_value(field_ty)?;
+        }
+        let descriptor = format!(
+            "({})V",
+            fields
+                .iter()
+                .map(oomir::Type::to_jvm_descriptor)
+                .collect::<String>()
+        );
+        let constructor = self
+            .constant_pool
+            .add_method_ref(class, "<init>", &descriptor)?;
+        self.jvm_instructions
+            .push(Instruction::Invokespecial(constructor));
+        Ok(())
     }
 
     fn construct_single_value_wrappers_from_local(
         &mut self,
         source_slot: u16,
         source_ty: &oomir::Type,
-        wrappers: &[(String, String, oomir::Type)],
+        wrappers: &[SingleValueWrapper],
     ) -> Result<(), jvm::Error> {
-        let Some(((class_name, _, field_ty), remaining)) = wrappers.split_first() else {
+        let Some((wrapper, remaining)) = wrappers.split_first() else {
             self.jvm_instructions
                 .push(get_load_instruction(source_ty, source_slot)?);
             return Ok(());
         };
 
-        let class = self.constant_pool.add_class(class_name)?;
+        let class = self.constant_pool.add_class(&wrapper.class_name)?;
         self.jvm_instructions.push(Instruction::New(class));
         self.jvm_instructions.push(Instruction::Dup);
-        self.construct_single_value_wrappers_from_local(source_slot, source_ty, remaining)?;
+        for (field_name, field_ty) in &wrapper.constructor_fields {
+            if field_name == &wrapper.field_name {
+                self.construct_single_value_wrappers_from_local(source_slot, source_ty, remaining)?;
+            } else {
+                self.construct_zero_sized_storage_value(field_ty)?;
+            }
+        }
         let constructor = self.constant_pool.add_method_ref(
             class,
             "<init>",
-            &format!("({})V", field_ty.to_jvm_descriptor()),
+            &format!(
+                "({})V",
+                wrapper
+                    .constructor_fields
+                    .iter()
+                    .map(|(_, field_ty)| field_ty.to_jvm_descriptor())
+                    .collect::<String>()
+            ),
         )?;
         self.jvm_instructions
             .push(Instruction::Invokespecial(constructor));
@@ -2644,12 +2724,12 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         if let Some(wrappers) = self.single_value_wrapper_path(actual_ty, expected_ty)
             && !wrappers.is_empty()
         {
-            for (class_name, field_name, field_ty) in wrappers {
-                let class = self.constant_pool.add_class(&class_name)?;
+            for wrapper in wrappers {
+                let class = self.constant_pool.add_class(&wrapper.class_name)?;
                 let field = self.constant_pool.add_field_ref(
                     class,
-                    &field_name,
-                    &field_ty.to_jvm_descriptor(),
+                    &wrapper.field_name,
+                    &wrapper.field_ty.to_jvm_descriptor(),
                 )?;
                 self.jvm_instructions.push(Instruction::Getfield(field));
             }
