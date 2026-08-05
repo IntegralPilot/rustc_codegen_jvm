@@ -231,6 +231,38 @@ fn ascii_char_formatting() {
     assert!(extended == "abcABC");
 }
 
+fn bytewise_slice_contains() {
+    use core::num::NonZero;
+    use std::ascii::Char;
+
+    let mut bools = [false; 64];
+    assert!(bools.contains(&false), "bool slice lost false");
+    assert!(!bools.contains(&true), "bool slice found absent true");
+    bools[31] = true;
+    assert!(bools.contains(&true), "bool slice lost inserted true");
+
+    let one = NonZero::new(1_u8).unwrap();
+    let two = NonZero::new(2_u8).unwrap();
+    let three = NonZero::new(3_u8).unwrap();
+    let mut nonzeros = [one; 64];
+    nonzeros[31] = two;
+    assert!(nonzeros.contains(&one), "NonZero slice lost one");
+    assert!(nonzeros.contains(&two), "NonZero slice lost inserted two");
+    assert!(!nonzeros.contains(&three), "NonZero slice found absent three");
+
+    let mut optional_nonzeros = [Some(one); 64];
+    optional_nonzeros[31] = None;
+    assert!(optional_nonzeros.contains(&Some(one)), "niche slice lost Some");
+    assert!(optional_nonzeros.contains(&None), "niche slice lost None");
+    assert!(!optional_nonzeros.contains(&Some(two)), "niche slice found absent Some");
+
+    let mut ascii = [Char::CapitalA; 64];
+    ascii[31] = Char::CapitalZ;
+    assert!(ascii.contains(&Char::CapitalA), "ASCII slice lost A");
+    assert!(ascii.contains(&Char::CapitalZ), "ASCII slice lost inserted Z");
+    assert!(!ascii.contains(&Char::CapitalQ), "ASCII slice found absent Q");
+}
+
 fn borrowed_iteration() {
     let values = [2, 4, 6, 8];
     let mut sum = 0;
@@ -907,6 +939,7 @@ fn main() {
     array_iteration();
     ascii_escape_iterator();
     ascii_char_formatting();
+    bytewise_slice_contains();
     borrowed_iteration();
     fixed_u32_slice_iteration();
     loop_control();

@@ -10751,10 +10751,17 @@ public final class Pointer {
         if (backing instanceof byte[]) {
             return ((byte[]) backing)[index];
         }
+        if (backing instanceof boolean[]) {
+            return (byte) (((boolean[]) backing)[index] ? 1 : 0);
+        }
         Pointer pointer = slicePointer(backing, index);
-        return pointer != null
-                ? pointer.getI8()
-                : ((Number) arrayGet(backing, index)).byteValue();
+        if (pointer != null) {
+            return pointer.getI8();
+        }
+        Object value = arrayGet(backing, index);
+        return value instanceof Boolean
+                ? (byte) (((Boolean) value).booleanValue() ? 1 : 0)
+                : ((Number) value).byteValue();
     }
 
     /** Materializes byte-oriented slice storage regardless of its JVM backing. */
@@ -10842,6 +10849,10 @@ public final class Pointer {
     public static void sliceSetI8(Object backing, int index, byte value) {
         if (backing instanceof byte[]) {
             ((byte[]) backing)[index] = value;
+            return;
+        }
+        if (backing instanceof boolean[]) {
+            ((boolean[]) backing)[index] = value != 0;
             return;
         }
         sliceSetObject(backing, index, Byte.valueOf(value));

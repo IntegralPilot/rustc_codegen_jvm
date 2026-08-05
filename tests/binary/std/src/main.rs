@@ -15,6 +15,7 @@ fn main() {
     test_environment();
     test_stdin();
     test_provided_trait_method_on_trait_object();
+    test_read_exact_eof();
     test_pointer_formatting();
     test_ipv6_formatting();
     test_filesystem();
@@ -68,6 +69,13 @@ fn test_provided_trait_method_on_trait_object() {
 
     let mut input = &b"xyz"[..];
     assert_eq!(input.bytes().next().unwrap().unwrap(), b'x');
+}
+
+fn test_read_exact_eof() {
+    let mut input = io::empty();
+    let mut byte = [0_u8];
+    let error = input.read_exact(&mut byte).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof, "{error:?}");
 }
 
 fn test_pointer_formatting() {

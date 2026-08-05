@@ -1,0 +1,16 @@
+diff --git a/core/src/io/error.rs b/core/src/io/error.rs
+--- a/core/src/io/error.rs
++++ b/core/src/io/error.rs
+@@ -8,10 +8,10 @@
+ // targets, and the unpacked representation must be used instead.
+ #[cfg_attr(
+-    all(target_pointer_width = "64", not(target_os = "uefi")),
++    all(target_pointer_width = "64", not(any(target_os = "uefi", target_os = "jvm"))),
+     path = "error/repr_bitpacked.rs"
+ )]
+ #[cfg_attr(
+-    not(all(target_pointer_width = "64", not(target_os = "uefi"))),
++    not(all(target_pointer_width = "64", not(any(target_os = "uefi", target_os = "jvm")))),
+     path = "error/repr_unpacked.rs"
+ )]
+ mod repr;
