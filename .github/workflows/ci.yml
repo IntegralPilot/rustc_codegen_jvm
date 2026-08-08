@@ -5,6 +5,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 jobs:
   self-tests:
@@ -30,22 +31,35 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
 
-    - name: Set up Rust (nightly)
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.x'
+
+    - name: Read pinned Rust toolchain
+      id: rust-toolchain
+      shell: bash
+      run: |
+        python - <<'PY'
+        import os, tomllib
+        with open("rust-toolchain.toml", "rb") as file:
+            toolchain = tomllib.load(file)["toolchain"]
+        with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+            output.write(f"channel={toolchain['channel']}\n")
+            output.write(f"components={','.join(toolchain.get('components', []))}\n")
+        PY
+
+    - name: Set up pinned Rust
       uses: dtolnay/rust-toolchain@stable
       with:
-        toolchain: nightly
-        components: rustc-dev rust-src llvm-tools cargo
+        toolchain: ${{ steps.rust-toolchain.outputs.channel }}
+        components: ${{ steps.rust-toolchain.outputs.components }}
 
     - name: Set up Java
       uses: actions/setup-java@v4
       with:
         distribution: 'temurin'
         java-version: '25'
-
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.x'
 
     - name: Cache Cargo dependencies
       uses: Swatinem/rust-cache@v2
@@ -89,22 +103,35 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
 
-    - name: Set up Rust (nightly)
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.x'
+
+    - name: Read pinned Rust toolchain
+      id: rust-toolchain
+      shell: bash
+      run: |
+        python - <<'PY'
+        import os, tomllib
+        with open("rust-toolchain.toml", "rb") as file:
+            toolchain = tomllib.load(file)["toolchain"]
+        with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+            output.write(f"channel={toolchain['channel']}\n")
+            output.write(f"components={','.join(toolchain.get('components', []))}\n")
+        PY
+
+    - name: Set up pinned Rust
       uses: dtolnay/rust-toolchain@stable
       with:
-        toolchain: nightly
-        components: rustc-dev rust-src llvm-tools cargo
+        toolchain: ${{ steps.rust-toolchain.outputs.channel }}
+        components: ${{ steps.rust-toolchain.outputs.components }}
 
     - name: Set up Java
       uses: actions/setup-java@v4
       with:
         distribution: temurin
         java-version: '25'
-
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.x'
 
     - name: Cache Cargo dependencies
       uses: Swatinem/rust-cache@v2
@@ -152,22 +179,35 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
 
-    - name: Set up Rust (nightly)
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.x'
+
+    - name: Read pinned Rust toolchain
+      id: rust-toolchain
+      shell: bash
+      run: |
+        python - <<'PY'
+        import os, tomllib
+        with open("rust-toolchain.toml", "rb") as file:
+            toolchain = tomllib.load(file)["toolchain"]
+        with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+            output.write(f"channel={toolchain['channel']}\n")
+            output.write(f"components={','.join(toolchain.get('components', []))}\n")
+        PY
+
+    - name: Set up pinned Rust
       uses: dtolnay/rust-toolchain@stable
       with:
-        toolchain: nightly
-        components: rustc-dev rust-src llvm-tools cargo
+        toolchain: ${{ steps.rust-toolchain.outputs.channel }}
+        components: ${{ steps.rust-toolchain.outputs.components }}
 
     - name: Set up Java
       uses: actions/setup-java@v4
       with:
         distribution: temurin
         java-version: '25'
-
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.x'
 
     - name: Cache Cargo dependencies
       uses: Swatinem/rust-cache@v2

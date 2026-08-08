@@ -166,7 +166,10 @@ def clean():
 def install_rust_components():
     """Installs required Rust nightly components."""
     print(f"{Colors.CYAN}🔧 Installing Rust components...{Colors.RESET}")
-    run_command(["rustup", "component", "add", "rustc-dev", "llvm-tools"])
+    run_command(
+        ["rustup", "component", "add", "rustc-dev", "rust-src", "llvm-tools-preview"],
+        cwd=Config.ROOT_DIR,
+    )
 
 def build_runtime():
     """Builds the Java runtime support JAR."""

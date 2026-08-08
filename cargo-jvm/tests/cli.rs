@@ -6,8 +6,15 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::TempDir;
 
-fn cargo_jvm() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_cargo-jvm"))
+fn cargo_jvm(temp: &TempDir) -> Command {
+    let rustup = temp.path().join("rustup");
+    executable(
+        &rustup,
+        "#!/bin/sh\nif [ \"$1\" = component ] && [ \"$2\" = list ]; then\n  printf '%s\\n' rustc-dev-test-host rust-src llvm-tools-test-host\n  exit 0\nfi\nif [ \"$1\" = run ]; then\n  shift 2\n  exec \"$@\"\nfi\nexit 0\n",
+    );
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-jvm"));
+    command.env("RUSTUP", rustup);
+    command
 }
 
 fn executable(path: &Path, contents: &str) {
@@ -24,6 +31,11 @@ fn fake_backend(temp: &TempDir) -> PathBuf {
     fs::write(root.join("jvm-unknown-unknown.json"), "{}").unwrap();
     fs::write(root.join("config.toml"), "").unwrap();
     fs::write(root.join("Cargo.toml"), "[package]\nname = \"backend\"\n").unwrap();
+    fs::write(
+        root.join("rust-toolchain.toml"),
+        "[toolchain]\nchannel = \"nightly-2099-01-01\"\nprofile = \"minimal\"\ncomponents = [\"rustc-dev\", \"rust-src\", \"llvm-tools-preview\"]\n",
+    )
+    .unwrap();
     fs::write(root.join("stdlib_overlay.py"), "").unwrap();
     fs::write(root.join("build.py"), "").unwrap();
     fs::write(root.join("runtime/build/libs/runtime-0.1.0.jar"), "").unwrap();
@@ -81,7 +93,7 @@ fn setup_persists_the_backend_path() {
     let backend = fake_backend(&temp);
     let config = temp.path().join("config/config.toml");
     let (python, capture) = fake_python(&temp);
-    let output = cargo_jvm()
+    let output = cargo_jvm(&temp)
         .env("CARGO_JVM_CONFIG", &config)
         .env("PYTHON", python)
         .env("PYTHON_CAPTURE", capture)
@@ -100,6 +112,41 @@ fn setup_persists_the_backend_path() {
 }
 
 #[test]
+fn setup_installs_the_backend_pinned_toolchain_when_missing() {
+    let temp = TempDir::new().unwrap();
+    let backend = fake_backend(&temp);
+    let config = temp.path().join("config/config.toml");
+    let (python, capture) = fake_python(&temp);
+    let rustup_capture = temp.path().join("rustup-arguments");
+    let rustup = temp.path().join("rustup-install");
+    executable(
+        &rustup,
+        "#!/bin/sh\nif [ \"$1\" = component ] && [ \"$2\" = list ]; then exit 1; fi\nprintf '%s\\n' \"$@\" > \"$RUSTUP_CAPTURE\"\n",
+    );
+
+    let output = cargo_jvm(&temp)
+        .env("CARGO_JVM_CONFIG", &config)
+        .env("PYTHON", python)
+        .env("PYTHON_CAPTURE", capture)
+        .env("RUSTUP", rustup)
+        .env("RUSTUP_CAPTURE", &rustup_capture)
+        .arg("setup")
+        .arg(&backend)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let arguments = fs::read_to_string(rustup_capture).unwrap();
+    assert!(arguments.starts_with("toolchain\ninstall\nnightly-2099-01-01\n"));
+    assert!(arguments.contains("--profile\nminimal\n"));
+    assert!(arguments.contains("--component\nrustc-dev,rust-src,llvm-tools-preview\n"));
+}
+
+#[test]
 fn doctor_reports_tool_and_backend_versions() {
     let temp = TempDir::new().unwrap();
     let backend = fake_backend(&temp);
@@ -113,8 +160,8 @@ fn doctor_reports_tool_and_backend_versions() {
     executable(&rustc, "#!/bin/sh\nprintf 'rustc test-version\\n'\n");
     executable(&java, "#!/bin/sh\nprintf 'java test-version\\n' >&2\n");
 
-    let output = cargo_jvm()
-        .env("CARGO", cargo)
+    let output = cargo_jvm(&temp)
+        .env("CARGO_JVM_CARGO", cargo)
         .env("RUSTC", rustc)
         .env("JAVA", java)
         .arg("--backend-path")
@@ -131,6 +178,7 @@ fn doctor_reports_tool_and_backend_versions() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains(&format!("cargo-jvm: {}", env!("CARGO_PKG_VERSION"))));
     assert!(stdout.contains(&format!("rustc_codegen_jvm HEAD: {commit}\t{subject}")));
+    assert!(stdout.contains("pinned Rust toolchain: nightly-2099-01-01"));
     assert!(stdout.contains("cargo: cargo test-version"));
     assert!(stdout.contains("rustc: rustc test-version"));
     assert!(stdout.contains("java: java test-version"));
@@ -143,15 +191,17 @@ fn build_forwards_cargo_arguments_and_adds_the_jvm_toolchain() {
     let overlay = temp.path().join("overlay");
     fs::create_dir(&overlay).unwrap();
     let capture = temp.path().join("cargo-arguments");
+    let toolchain_capture = temp.path().join("cargo-toolchain");
     let cargo = temp.path().join("cargo");
     executable(
         &cargo,
-        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$CARGO_CAPTURE\"\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$CARGO_CAPTURE\"\nprintf '%s\\n' \"$RUSTUP_TOOLCHAIN\" > \"$TOOLCHAIN_CAPTURE\"\n",
     );
 
-    let status = cargo_jvm()
-        .env("CARGO", cargo)
+    let status = cargo_jvm(&temp)
+        .env("CARGO_JVM_CARGO", cargo)
         .env("CARGO_CAPTURE", &capture)
+        .env("TOOLCHAIN_CAPTURE", &toolchain_capture)
         .env("__CARGO_TESTS_ONLY_SRC_ROOT", overlay)
         .arg("--backend-path")
         .arg(&backend)
@@ -164,6 +214,10 @@ fn build_forwards_cargo_arguments_and_adds_the_jvm_toolchain() {
     assert!(arguments.starts_with("build\n--target\n"));
     assert!(arguments.contains("-Zbuild-std=std,panic_unwind\n"));
     assert!(arguments.ends_with("--release\n--features\ndemo\n"));
+    assert_eq!(
+        fs::read_to_string(toolchain_capture).unwrap(),
+        "nightly-2099-01-01\n"
+    );
 }
 
 #[test]
@@ -196,8 +250,8 @@ fn run_launches_the_reported_binary_jar_with_java_options() {
         "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$JAVA_CAPTURE\"\n",
     );
 
-    let status = cargo_jvm()
-        .env("CARGO", cargo)
+    let status = cargo_jvm(&temp)
+        .env("CARGO_JVM_CARGO", cargo)
         .env("JAVA", java)
         .env("JAVA_CAPTURE", &java_capture)
         .env("__CARGO_TESTS_ONLY_SRC_ROOT", overlay)
@@ -258,8 +312,8 @@ fn package_links_library_rlibs_and_the_runtime_into_the_output_jar() {
     );
     let output = temp.path().join("dist/demo.jar");
 
-    let status = cargo_jvm()
-        .env("CARGO", cargo)
+    let status = cargo_jvm(&temp)
+        .env("CARGO_JVM_CARGO", cargo)
         .env("LINKER_CAPTURE", &linker_capture)
         .env("__CARGO_TESTS_ONLY_SRC_ROOT", overlay)
         .arg("--backend-path")
@@ -307,8 +361,8 @@ fn test_launches_each_cargo_test_artifact() {
         "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$JAVA_CAPTURE\"\n",
     );
 
-    let status = cargo_jvm()
-        .env("CARGO", cargo)
+    let status = cargo_jvm(&temp)
+        .env("CARGO_JVM_CARGO", cargo)
         .env("JAVA", java)
         .env("JAVA_CAPTURE", &java_capture)
         .env("__CARGO_TESTS_ONLY_SRC_ROOT", overlay)
@@ -333,7 +387,7 @@ fn update_pulls_and_rebuilds_the_configured_checkout() {
     let config = temp.path().join("config/config.toml");
     let (python, python_capture) = fake_python(&temp);
     assert!(
-        cargo_jvm()
+        cargo_jvm(&temp)
             .env("CARGO_JVM_CONFIG", &config)
             .env("PYTHON", &python)
             .env("PYTHON_CAPTURE", &python_capture)
@@ -350,7 +404,7 @@ fn update_pulls_and_rebuilds_the_configured_checkout() {
         &git,
         "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$GIT_CAPTURE\"\n",
     );
-    let status = cargo_jvm()
+    let status = cargo_jvm(&temp)
         .env("CARGO_JVM_CONFIG", &config)
         .env("GIT", git)
         .env("GIT_CAPTURE", &git_capture)
@@ -385,7 +439,7 @@ fn setup_without_arguments_clones_builds_and_configures_a_backend() {
     );
     let (python, python_capture) = fake_python(&temp);
 
-    let status = cargo_jvm()
+    let status = cargo_jvm(&temp)
         .env("CARGO_JVM_CONFIG", &config)
         .env("GIT", git)
         .env("GIT_CAPTURE", &git_capture)

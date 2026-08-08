@@ -2,7 +2,7 @@
 
 [![License: MIT/Apache-2.0](https://img.shields.io/badge/license-MIT%20%7C%20Apache--2.0-blue.svg)](https://opensource.org/licenses/MIT)
 [![CI](https://github.com/IntegralPilot/rustc_codegen_jvm/actions/workflows/ci.yml/badge.svg)](https://github.com/IntegralPilot/rustc_codegen_jvm/actions)
-[![Rust: Nightly](https://img.shields.io/badge/Rust-Nightly-orange.svg)](https://rustup.rs/)
+[![Rust: Pinned Nightly](https://img.shields.io/badge/Rust-Pinned%20Nightly-orange.svg)](https://rustup.rs/)
 ![Java: 8+](https://img.shields.io/badge/Java-8%2B-red.svg)
 
 A custom Rust compiler backend that compiles Rust directly to Java Virtual Machine (JVM) bytecode, enabling you to compile crates into a runnable `.jar` compatible with Java 8+. 
@@ -34,7 +34,10 @@ cargo jvm setup "$PWD"
 ```
 
 ### Make a new hello_world project
-Please make sure you are on the latest Rust nightly. If it isn't your default toolchain, you might have to use `cargo +nightly`.
+
+`cargo-jvm` installs and selects the backend's pinned Rust nightly automatically;
+your default toolchain can remain stable.
+
 ```bash
 cargo new hello_world --bin
 cd hello_world
@@ -308,7 +311,8 @@ Rust constructs map directly to JVM structures without requiring JNI wrapper cod
 
 ## Prerequisites
 
-- **Rust Nightly** (configured automatically via `rust-toolchain.toml`)
+- **Rust installed with rustup** (the exact nightly and required components are
+  installed automatically from `rust-toolchain.toml`)
 - **JDK 8+** (`java`, `javac`, and `jar` must be available on `PATH`)
 - **Python 3.8+**
 - **Git**
@@ -318,7 +322,10 @@ Rust constructs map directly to JVM structures without requiring JNI wrapper cod
 
 [`cargo-jvm`](cargo-jvm/README.md) is used to make building and running Rust projects on the JVM as seamless as possible. It wraps the standard Cargo workflow, forwarding all ordinary Cargo selection and feature arguments. For instructions on installing `cargo-jvm`, see [its README](cargo-jvm/README.md).
 
-The following commands assume you are within a Rust project directory that you wish to compile/run using the JVM, and which is configured to use the latest nightly toolchain.
+The following commands assume you are within a Rust project directory that you
+wish to compile/run using the JVM. `cargo-jvm` forces the backend's pinned
+nightly for its Cargo and rustc subprocesses, regardless of that project's
+default toolchain.
 
 ### Building
 
@@ -384,7 +391,15 @@ This compiles Cargo's test targets with `--no-run`, then launches every reported
 available), the configured backend's current Git commit, Java, Cargo, rustc,
 target and runtime paths. Please run this if you are reporting a bug.
 
-`cargo jvm update` pulls and rebuilds the backend. 
+`cargo jvm update` pulls and rebuilds the backend. If the backend changes its
+nightly pin, `cargo-jvm` installs that dated nightly and its required components
+before rebuilding.
+
+The pin in `rust-toolchain.toml` is the single source of truth for local builds,
+`cargo-jvm`, and CI. A scheduled GitHub Actions workflow checks Rust's latest
+published nightly once per day. It skips an already-tested date, advances the
+pin only after the backend, compiler unit tests, and debug/release self-tests
+pass, and opens or updates an issue when compatibility fails.
 
 Run `cargo jvm --help` for all options.
 

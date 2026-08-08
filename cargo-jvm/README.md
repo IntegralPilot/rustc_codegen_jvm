@@ -9,7 +9,8 @@ Java, and creates distributable JARs.
 
 ## Requirements
 
-- Rust nightly
+- Rust installed with [rustup](https://rustup.rs/); the required dated nightly
+  and components are installed automatically
 - JDK 8 or newer (`java`, `javac`, and `jar`)
 - Python 3.8 or newer
 - Git
@@ -24,7 +25,9 @@ cargo jvm setup
 ```
 
 `cargo jvm setup` clones `rustc_codegen_jvm` into the platform's user data
-directory, builds it, and remembers that location. 
+directory, reads its `rust-toolchain.toml`, installs the exact pinned nightly and
+components when needed, builds it with that toolchain, and remembers the
+location. Your default Rust toolchain can remain stable.
 
 A custom destination, repository, or branch can be selected:
 
@@ -51,6 +54,9 @@ You can update the `rustc_codegen_jvm` backend to a newer commit if available wi
 ```bash
 cargo jvm update
 ```
+
+If an update advances the nightly pin, the new toolchain is installed
+automatically before the backend is rebuilt.
 
 `cargo-jvm` itself can be updated with `cargo install cargo-jvm --force`.
 
@@ -104,8 +110,11 @@ The backend checkout can be overridden without changing saved configuration
 using `--backend-path PATH` or `CARGO_JVM_BACKEND_PATH`. `CARGO_JVM_HOME`
 changes the default no-argument setup destination.
 
-The `CARGO`, `RUSTC`, `JAVA`, `GIT`, `PYTHON`, and `CARGO_JVM_STACK` environment
-variables override their corresponding executables or defaults.
+The `CARGO_JVM_CARGO`, `RUSTC`, `RUSTUP`, `JAVA`, `GIT`, `PYTHON`, and
+`CARGO_JVM_STACK` environment variables override their corresponding
+executables or defaults. `CARGO_JVM_CARGO` is intentionally separate from
+Cargo's automatically injected `CARGO` variable so that invoking `cargo jvm`
+from stable cannot leak stable Cargo into the pinned nightly workflow.
 
 Run `cargo jvm help` for the complete command reference.
 

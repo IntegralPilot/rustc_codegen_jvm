@@ -17,6 +17,20 @@ const DEFAULT_STACK: &str = "16m";
 const DEFAULT_REPOSITORY: &str = "https://github.com/IntegralPilot/rustc_codegen_jvm.git";
 const UPDATE_CHECK_INTERVAL_SECONDS: u64 = 24 * 60 * 60;
 
+#[derive(Clone, Debug, Deserialize)]
+struct RustToolchainFile {
+    toolchain: RustToolchain,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct RustToolchain {
+    channel: String,
+    #[serde(default)]
+    components: Vec<String>,
+    #[serde(default)]
+    profile: Option<String>,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct UserConfig {
     backend_path: PathBuf,
@@ -27,6 +41,7 @@ struct UserConfig {
 #[derive(Clone, Debug)]
 pub struct Backend {
     root: PathBuf,
+    toolchain: RustToolchain,
     target_spec: PathBuf,
     cargo_config: PathBuf,
     overlay_script: PathBuf,
@@ -40,6 +55,7 @@ impl Backend {
         let root = canonicalize_existing(root.as_ref(), "rustc_codegen_jvm directory")?;
         let executable_suffix = if cfg!(windows) { ".exe" } else { "" };
         let backend = Self {
+            toolchain: load_toolchain(&root)?,
             target_spec: root.join("jvm-unknown-unknown.json"),
             cargo_config: root.join("config.toml"),
             overlay_script: root.join("stdlib_overlay.py"),
@@ -273,8 +289,8 @@ GLOBAL:
     --backend-path PATH Use a checkout without changing the saved setup
 
 All unrecognized command arguments are forwarded to Cargo. Set
-CARGO_JVM_STACK, CARGO_JVM_HOME, CARGO_JVM_BACKEND_PATH, CARGO, RUSTC, JAVA,
-GIT, or PYTHON to override the corresponding defaults."
+CARGO_JVM_STACK, CARGO_JVM_HOME, CARGO_JVM_BACKEND_PATH, CARGO_JVM_CARGO,
+RUSTC, RUSTUP, JAVA, GIT, or PYTHON to override the corresponding defaults."
     );
 }
 
@@ -436,11 +452,16 @@ fn configured_root(explicit: Option<PathBuf>) -> DynResult<(PathBuf, Option<User
 
 fn configured_backend(explicit: Option<PathBuf>) -> DynResult<(Backend, Option<UserConfig>)> {
     let (root, config) = configured_root(explicit)?;
-    Ok((Backend::discover(root)?, config))
+    let backend = Backend::discover(root)?;
+    ensure_toolchain(&backend.toolchain)?;
+    Ok((backend, config))
 }
 
 fn validate_checkout(root: &Path) -> DynResult<()> {
-    if root.join("build.py").is_file() && root.join("Cargo.toml").is_file() {
+    if root.join("build.py").is_file()
+        && root.join("Cargo.toml").is_file()
+        && root.join("rust-toolchain.toml").is_file()
+    {
         Ok(())
     } else {
         Err(user_error(format!(
@@ -450,12 +471,116 @@ fn validate_checkout(root: &Path) -> DynResult<()> {
     }
 }
 
+fn load_toolchain(root: &Path) -> DynResult<RustToolchain> {
+    let path = root.join("rust-toolchain.toml");
+    let contents = fs::read_to_string(&path).map_err(|error| {
+        user_error(format!(
+            "could not read the backend toolchain pin at {}: {error}",
+            path.display()
+        ))
+    })?;
+    let file: RustToolchainFile = toml::from_str(&contents)
+        .map_err(|error| user_error(format!("invalid {}: {error}", path.display())))?;
+    if !is_pinned_nightly(&file.toolchain.channel) {
+        return Err(user_error(format!(
+            "{} must pin a dated nightly such as `nightly-2026-08-08`; found `{}`",
+            path.display(),
+            file.toolchain.channel
+        )));
+    }
+    Ok(file.toolchain)
+}
+
+fn is_pinned_nightly(channel: &str) -> bool {
+    let Some(date) = channel.strip_prefix("nightly-") else {
+        return false;
+    };
+    date.len() == 10
+        && date.bytes().enumerate().all(|(index, byte)| match index {
+            4 | 7 => byte == b'-',
+            _ => byte.is_ascii_digit(),
+        })
+}
+
+fn ensure_toolchain(toolchain: &RustToolchain) -> DynResult<()> {
+    let rustup = rustup_executable();
+    let installed = Command::new(&rustup)
+        .args(["component", "list", "--toolchain"])
+        .arg(&toolchain.channel)
+        .args(["--installed", "--quiet"])
+        .output()
+        .map_err(|error| {
+            user_error(format!(
+                "rustup is required to install {}: {error}",
+                toolchain.channel
+            ))
+        })?;
+
+    if !installed.status.success() {
+        println!(
+            "Installing required Rust toolchain {}...",
+            toolchain.channel
+        );
+        let mut command = Command::new(&rustup);
+        command
+            .args(["toolchain", "install"])
+            .arg(&toolchain.channel)
+            .arg("--profile")
+            .arg(toolchain.profile.as_deref().unwrap_or("minimal"));
+        if !toolchain.components.is_empty() {
+            command
+                .arg("--component")
+                .arg(toolchain.components.join(","));
+        }
+        return require_success(command.status()?, "Rust toolchain installation");
+    }
+
+    let installed = String::from_utf8(installed.stdout)?;
+    let missing = toolchain
+        .components
+        .iter()
+        .filter(|component| !component_is_installed(component, &installed))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    println!(
+        "Installing missing {} component(s): {}...",
+        toolchain.channel,
+        missing
+            .iter()
+            .map(|component| component.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let mut command = Command::new(&rustup);
+    command
+        .args(["component", "add", "--toolchain"])
+        .arg(&toolchain.channel)
+        .args(missing);
+    require_success(command.status()?, "Rust component installation")
+}
+
+fn component_is_installed(component: &str, installed: &str) -> bool {
+    let component = component.strip_suffix("-preview").unwrap_or(component);
+    installed.lines().any(|installed| {
+        installed == component
+            || installed
+                .strip_prefix(component)
+                .is_some_and(|suffix| suffix.starts_with('-'))
+    })
+}
+
 fn build_backend(root: &Path) -> DynResult<()> {
     validate_checkout(root)?;
+    let toolchain = load_toolchain(root)?;
+    ensure_toolchain(&toolchain)?;
     println!("Building rustc_codegen_jvm in {}...", root.display());
     let status = python_command(root)?
         .arg(root.join("build.py"))
         .arg("all")
+        .env("RUSTUP_TOOLCHAIN", &toolchain.channel)
         .current_dir(root)
         .status()?;
     require_success(status, "rustc_codegen_jvm build")?;
@@ -545,13 +670,14 @@ fn run_build(backend: &Backend, cargo_args: Vec<OsString>) -> DynResult<i32> {
 }
 
 fn run_clean(backend: &Backend, cargo_args: Vec<OsString>) -> DynResult<i32> {
-    let mut command = Command::new(cargo_executable());
+    let mut command = pinned_cargo_command(&backend.toolchain);
     command
         .arg("clean")
         .arg("--target")
         .arg(&backend.target_spec)
         .arg("--config")
         .arg(&backend.cargo_config)
+        .env("RUSTUP_TOOLCHAIN", &backend.toolchain.channel)
         .args(cargo_args);
     Ok(command.status()?.code().unwrap_or(1))
 }
@@ -607,7 +733,7 @@ fn run_tests(backend: &Backend, mut options: JavaOptions) -> DynResult<i32> {
 }
 
 fn run_package(backend: &Backend, options: PackageOptions) -> DynResult<i32> {
-    let metadata = cargo_metadata(&options.cargo_args)?;
+    let metadata = cargo_metadata(backend, &options.cargo_args)?;
     let build = capture_cargo(backend, "build", &options.cargo_args)?;
     let mut selected = build
         .artifacts
@@ -724,7 +850,7 @@ fn cargo_command(
     capture: bool,
 ) -> DynResult<Command> {
     let overlay = prepare_overlay(backend)?;
-    let mut command = Command::new(cargo_executable());
+    let mut command = pinned_cargo_command(&backend.toolchain);
     command
         .arg(subcommand)
         .arg("--target")
@@ -734,6 +860,7 @@ fn cargo_command(
         .arg("-Zbuild-std-features=")
         .arg("--config")
         .arg(&backend.cargo_config)
+        .env("RUSTUP_TOOLCHAIN", &backend.toolchain.channel)
         .env("__CARGO_TESTS_ONLY_SRC_ROOT", overlay);
     if capture {
         command.arg("--message-format=json-render-diagnostics");
@@ -836,9 +963,11 @@ fn parse_artifact(message: &Value) -> Option<Artifact> {
     })
 }
 
-fn cargo_metadata(cargo_args: &[OsString]) -> DynResult<Metadata> {
-    let mut command = Command::new(cargo_executable());
-    command.args(["metadata", "--format-version", "1", "--no-deps"]);
+fn cargo_metadata(backend: &Backend, cargo_args: &[OsString]) -> DynResult<Metadata> {
+    let mut command = pinned_cargo_command(&backend.toolchain);
+    command
+        .args(["metadata", "--format-version", "1", "--no-deps"])
+        .env("RUSTUP_TOOLCHAIN", &backend.toolchain.channel);
     if let Some(manifest) = selected_value_os(cargo_args, "--manifest-path") {
         command.arg("--manifest-path").arg(manifest);
     }
@@ -1013,6 +1142,7 @@ fn prepare_overlay(backend: &Backend) -> DynResult<PathBuf> {
     }
     let output = python_command(&backend.root)?
         .arg(&backend.overlay_script)
+        .env("RUSTUP_TOOLCHAIN", &backend.toolchain.channel)
         .current_dir(&backend.root)
         .output()?;
     if !output.status.success() {
@@ -1051,8 +1181,17 @@ fn python_command(_backend_root: &Path) -> DynResult<Command> {
     ))
 }
 
-fn cargo_executable() -> OsString {
-    env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"))
+fn pinned_cargo_command(toolchain: &RustToolchain) -> Command {
+    let mut command = Command::new(rustup_executable());
+    command
+        .arg("run")
+        .arg(&toolchain.channel)
+        .arg(env::var_os("CARGO_JVM_CARGO").unwrap_or_else(|| OsString::from("cargo")));
+    command
+}
+
+fn rustup_executable() -> OsString {
+    env::var_os("RUSTUP").unwrap_or_else(|| OsString::from("rustup"))
 }
 
 fn git_executable() -> OsString {
@@ -1083,24 +1222,41 @@ fn print_doctor(backend: &Backend) -> DynResult<()> {
     }
     println!();
     println!("rustc_codegen_jvm: {}", backend.root.display());
+    println!("pinned Rust toolchain: {}", backend.toolchain.channel);
     match git_output(&backend.root, &["log", "-1", "--format=%H%x09%s"]) {
         Ok(commit) => println!("rustc_codegen_jvm HEAD: {}", commit.trim()),
         Err(_) => println!("rustc_codegen_jvm HEAD: unavailable (not a Git checkout)"),
     }
-    for (name, executable, version_argument) in [
-        ("cargo", cargo_executable(), "--version"),
+    let cargo_version = pinned_cargo_command(&backend.toolchain)
+        .arg("--version")
+        .output()?;
+    if !cargo_version.status.success() {
+        return Err(user_error("cargo is not working"));
+    }
+    println!(
+        "cargo: {}",
+        String::from_utf8_lossy(&cargo_version.stdout).trim()
+    );
+    for (name, executable, version_argument, pinned) in [
         (
             "rustc",
             env::var_os("RUSTC").unwrap_or_else(|| OsString::from("rustc")),
             "--version",
+            true,
         ),
         (
             "java",
             env::var_os("JAVA").unwrap_or_else(|| OsString::from("java")),
             "-version",
+            false,
         ),
     ] {
-        let output = Command::new(&executable).arg(version_argument).output()?;
+        let mut command = Command::new(&executable);
+        command.arg(version_argument);
+        if pinned {
+            command.env("RUSTUP_TOOLCHAIN", &backend.toolchain.channel);
+        }
+        let output = command.output()?;
         if !output.status.success() {
             return Err(user_error(format!("{name} is not working")));
         }
@@ -1337,6 +1493,29 @@ mod tests {
         for invalid in ["", "m", "-1m", "eight"] {
             assert!(validate_stack(invalid).is_err(), "{invalid}");
         }
+    }
+
+    #[test]
+    fn requires_a_dated_nightly_pin() {
+        assert!(is_pinned_nightly("nightly-2026-08-08"));
+        for unpinned in [
+            "nightly",
+            "stable",
+            "nightly-2026-8-8",
+            "nightly-2026-08-08-x86_64-unknown-linux-gnu",
+        ] {
+            assert!(!is_pinned_nightly(unpinned), "{unpinned}");
+        }
+    }
+
+    #[test]
+    fn recognizes_rustup_component_names_with_host_suffixes() {
+        let installed =
+            "rustc-dev-x86_64-unknown-linux-gnu\nrust-src\nllvm-tools-x86_64-unknown-linux-gnu\n";
+        assert!(component_is_installed("rustc-dev", installed));
+        assert!(component_is_installed("rust-src", installed));
+        assert!(component_is_installed("llvm-tools-preview", installed));
+        assert!(!component_is_installed("rustfmt", installed));
     }
 
     #[test]
