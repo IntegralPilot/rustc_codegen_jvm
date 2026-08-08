@@ -76,7 +76,7 @@ use rustc_middle::{
     },
 };
 use rustc_session::{
-    Session,
+    IncrCompSession, Session,
     config::{CrateType, OutputFilenames},
 };
 use rustc_span::def_id::{DefId, LOCAL_CRATE};
@@ -1411,6 +1411,7 @@ impl CodegenBackend for MyBackend {
         &self,
         ongoing_codegen: Box<dyn Any>,
         _sess: &Session,
+        _incr_comp_session: Option<&IncrCompSession>,
         outputs: &OutputFilenames,
         _crate_info: &CrateInfo,
     ) -> (CompiledModules, UnordMap<WorkProductId, WorkProduct>) {

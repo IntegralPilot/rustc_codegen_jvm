@@ -1,0 +1,12 @@
+diff --git a/std/src/sys/sync/futex/mod.rs b/std/src/sys/sync/futex/mod.rs
+--- a/std/src/sys/sync/futex/mod.rs
++++ b/std/src/sys/sync/futex/mod.rs
+@@ -35,5 +35,8 @@ cfg_select! {
+     target_os = "motor" => {
+         pub use moto_rt::futex::*;
+     }
++    target_os = "jvm" => {
++        pub use crate::sys::pal::futex::*;
++    }
+     _ => {}
+ }
