@@ -115,6 +115,18 @@ jobs:
       if: steps.latest.outputs.changed == 'true'
       run: python Tester.py --release
 
+    - name: Run coretests (debug)
+      if: steps.latest.outputs.changed == 'true'
+      run: python Coretests.py --timeout 20 --build-timeout 1200
+
+    - name: Run coretests (release)
+      if: steps.latest.outputs.changed == 'true'
+      run: python Coretests.py --release --timeout 20 --build-timeout 1200
+
+    - name: Run alloctests (debug)
+      if: steps.latest.outputs.changed == 'true'
+      run: python Alloctests.py --timeout 120 --build-timeout 1200
+
     - name: Commit updated nightly pin
       if: steps.latest.outputs.changed == 'true' && success()
       env:
