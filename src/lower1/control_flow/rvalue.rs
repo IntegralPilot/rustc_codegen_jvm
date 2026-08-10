@@ -6049,7 +6049,10 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                                     },
                                 );
 
-                                if tcx.is_lang_item(adt_def.did(), rustc_hir::LangItem::Option) {
+                                if tcx.is_lang_item(
+                                    adt_def.did(),
+                                    rustc_hir::attrs::lang_items::LangItem::Option,
+                                ) {
                                     methods.insert(
                                         "is_none".to_string(),
                                         DataTypeMethod::AdtHelperMethod {
@@ -6093,8 +6096,10 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                                             },
                                         );
                                     }
-                                    if tcx.is_lang_item(adt_def.did(), rustc_hir::LangItem::Option)
-                                    {
+                                    if tcx.is_lang_item(
+                                        adt_def.did(),
+                                        rustc_hir::attrs::lang_items::LangItem::Option,
+                                    ) {
                                         if !methods.contains_key("is_none") {
                                             methods.insert(
                                                 "is_none".to_string(),

@@ -1356,7 +1356,10 @@ fn ensure_enum_data_types<'tcx>(
         add_enum_helper_methods(
             methods,
             variants_info.clone(),
-            tcx.is_lang_item(adt_def.did(), rustc_hir::LangItem::Option),
+            tcx.is_lang_item(
+                adt_def.did(),
+                rustc_hir::attrs::lang_items::LangItem::Option,
+            ),
         );
         methods
             .entry(ENUM_DROP_FIELDS_METHOD.to_string())

@@ -2,7 +2,7 @@
 
 use super::jvm_names;
 use rustc_hash::FxHashMap as HashMap;
-use rustc_hir::{LangItem, def::DefKind};
+use rustc_hir::{attrs::lang_items::LangItem, def::DefKind};
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 use rustc_middle::ty::{GenericArg, Instance, InstanceKind, TyCtxt, TypeVisitableExt};
 use rustc_span::sym;
