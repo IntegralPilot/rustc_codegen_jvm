@@ -20,5 +20,5 @@
     "tier": 3
   },
   "panic-strategy": "unwind",
-  "llvm-target": "jvm-unknown-unknown"
+  "llvm-target": "jvm-unknown-jvm"
 }

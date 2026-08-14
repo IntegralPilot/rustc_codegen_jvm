@@ -62,7 +62,7 @@ def investigate(name: str, release: bool) -> int:
     javap_dir.mkdir()
 
     invalidated = prepare_shared_cache()
-    print(f"🔬 Investigating {test.name} [{test.kind}, {mode}, jvm-unknown-unknown]")
+    print(f"🔬 Investigating {test.name} [{test.kind}, {mode}, jvm-unknown-jvm]")
     if invalidated:
         print("|- Compiler inputs changed; reset the shared test cache")
     print("|- Building shared core/compiler_builtins cache...")

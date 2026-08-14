@@ -26,7 +26,7 @@ from stdlib_overlay import (
 
 
 ROOT = Path(__file__).resolve().parent
-TARGET_SPEC = ROOT / "jvm-unknown-unknown.json"
+TARGET_SPEC = ROOT / "jvm-unknown-jvm.json"
 TEST_CONFIG = ROOT / "config.toml"
 MAX_CAPTURE_CHARS = 64 * 1024
 MAX_BUILD_CACHE_ENTRIES = 2
@@ -333,7 +333,7 @@ def find_suite_jar(
 ) -> Path | None:
     profile = "release" if release else "debug"
     candidates = list(
-        (target_dir / "jvm-unknown-unknown" / profile / "deps").glob(
+        (target_dir / "jvm-unknown-jvm" / profile / "deps").glob(
             f"{config.cargo_test_target}-*.jar"
         )
     )

@@ -10,7 +10,7 @@ fn is_runtime_crate_name(crate_name: rustc_span::Symbol) -> bool {
 }
 
 pub fn uses_compiled_core(tcx: TyCtxt<'_>) -> bool {
-    tcx.sess.target.llvm_target.as_ref() == "jvm-unknown-unknown"
+    tcx.sess.target.llvm_target.as_ref() == "jvm-unknown-jvm"
 }
 
 pub fn compiles_external_core_instances(tcx: TyCtxt<'_>) -> bool {

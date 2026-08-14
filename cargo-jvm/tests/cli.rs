@@ -28,7 +28,7 @@ fn fake_backend(temp: &TempDir) -> PathBuf {
     let root = temp.path().join("backend");
     fs::create_dir_all(root.join("java-linker/target/release")).unwrap();
     fs::create_dir_all(root.join("runtime/build/libs")).unwrap();
-    fs::write(root.join("jvm-unknown-unknown.json"), "{}").unwrap();
+    fs::write(root.join("jvm-unknown-jvm.json"), "{}").unwrap();
     fs::write(root.join("config.toml"), "").unwrap();
     fs::write(root.join("Cargo.toml"), "[package]\nname = \"backend\"\n").unwrap();
     fs::write(

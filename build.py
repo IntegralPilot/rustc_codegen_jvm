@@ -51,7 +51,7 @@ class Config:
     RUNTIME_JAR = RUNTIME_DIR / f"build/libs/runtime-{RUNTIME_VERSION}.jar"
     RUNTIME_CLASSES_DIR = RUNTIME_DIR / "build/classes"
     CONFIG_TOML = ROOT_DIR / "config.toml"
-    JVM_TARGET_JSON = ROOT_DIR / "jvm-unknown-unknown.json"
+    JVM_TARGET_JSON = ROOT_DIR / "jvm-unknown-jvm.json"
 
     # Platform-specific details
     if platform.system() == "Windows":
@@ -263,7 +263,7 @@ def build_cargo_jvm():
     print(f"{Colors.GREEN}   cargo-jvm built successfully.{Colors.RESET}")
     
 def generate_config_files():
-    """Generates config.toml and jvm-unknown-unknown.json from templates."""
+    """Generates config.toml and jvm-unknown-jvm.json from templates."""
     print(f"{Colors.CYAN}🛠️  Generating configuration files from templates...{Colors.RESET}")
 
     # Logic from GenerateFiles.py is now integrated here

@@ -17,7 +17,7 @@ from stdlib_overlay import (
 )
 
 ROOT = Path(__file__).resolve().parent
-TARGET_SPEC = ROOT / "jvm-unknown-unknown.json"
+TARGET_SPEC = ROOT / "jvm-unknown-jvm.json"
 TEST_TARGET_DIR = ROOT / "target" / "test-suite"
 TEST_CONFIG = ROOT / "config.toml"
 CORE_BUILD_MANIFEST = ROOT / "tests" / "support" / "core_build" / "Cargo.toml"
@@ -291,7 +291,7 @@ def build_test(
 
 def jar_path(test: TestCase, release: bool) -> Path:
     profile = "release" if release else "debug"
-    profile_dir = TEST_TARGET_DIR / "jvm-unknown-unknown" / profile
+    profile_dir = TEST_TARGET_DIR / "jvm-unknown-jvm" / profile
     direct = profile_dir / f"{test.artifact_name}.jar"
     if direct.exists():
         return direct

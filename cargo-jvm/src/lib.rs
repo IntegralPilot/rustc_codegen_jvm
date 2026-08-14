@@ -56,7 +56,7 @@ impl Backend {
         let executable_suffix = if cfg!(windows) { ".exe" } else { "" };
         let backend = Self {
             toolchain: load_toolchain(&root)?,
-            target_spec: root.join("jvm-unknown-unknown.json"),
+            target_spec: root.join("jvm-unknown-jvm.json"),
             cargo_config: root.join("config.toml"),
             overlay_script: root.join("stdlib_overlay.py"),
             build_script: root.join("build.py"),
@@ -257,7 +257,7 @@ USAGE:
 COMMANDS:
     setup [PATH]        Clone or configure and build rustc_codegen_jvm
     update              Pull and rebuild the configured backend
-    build [CARGO ARGS]  Build binaries or libraries for jvm-unknown-unknown
+    build [CARGO ARGS]  Build binaries or libraries for jvm-unknown-jvm
     run [CARGO ARGS] [-- PROGRAM ARGS]
                         Build and run one binary with Java
     test [CARGO ARGS] [-- TEST ARGS]

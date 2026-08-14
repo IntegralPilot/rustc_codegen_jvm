@@ -432,7 +432,7 @@ def main() -> int:
     mode = "release" if args.release else "debug"
     per_build_jobs = cargo_jobs(workers)
     print("🧪 rustc_codegen_jvm test suite")
-    print(f"|- Target: {mode} jvm-unknown-unknown with real std")
+    print(f"|- Target: {mode} jvm-unknown-jvm with real std")
     print(f"|- Parallelism: {workers} test worker(s), {per_build_jobs} Cargo job(s) each")
     print(f"|- Java process timeout: {args.java_timeout:g}s")
     if cache_invalidated:

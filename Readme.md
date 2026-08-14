@@ -335,7 +335,7 @@ cargo jvm build --release --features serde
 cargo jvm build --workspace -j 8
 ```
 
-Build artifacts are placed under `target/jvm-unknown-unknown/debug` or `release`, just as with an explicit Cargo target. 
+Build artifacts are placed under `target/jvm-unknown-jvm/debug` or `release`, just as with an explicit Cargo target.
 
 Binary and `cdylib` artifacts are JARs, but ordinary Rust libraries remain `.rlib` inputs.
 
