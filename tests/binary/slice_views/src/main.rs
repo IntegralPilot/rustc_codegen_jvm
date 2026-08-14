@@ -68,6 +68,27 @@ fn check_other_element_types() {
     assert!(middle[1] == "two");
 }
 
+#[inline(never)]
+fn first_u16_is_one(values: &[u16]) -> bool {
+    values[0] == 1
+}
+
+fn check_u16_indexing() {
+    assert!(!first_u16_is_one(&[0_u16; 1]));
+    assert!(first_u16_is_one(&[1_u16; 1]));
+
+    let mut values = [0_u16, 0x7fff, 0x8000, u16::MAX];
+    let tail: &[u16] = &values[1..];
+    assert!(tail[0] == 0x7fff);
+    assert!(tail[1] == 0x8000);
+    assert!(tail[2] == u16::MAX);
+
+    let middle: &mut [u16] = &mut values[1..3];
+    middle[0] = u16::MAX;
+    middle[1] = 1;
+    assert!(values == [0, u16::MAX, 1, u16::MAX]);
+}
+
 fn check_mutation() {
     let mut values = [1, 2, 3, 4, 5];
     {
@@ -261,6 +282,7 @@ fn main() {
     check_middle_and_nested(whole);
     check_empty_views();
     check_other_element_types();
+    check_u16_indexing();
     check_mutation();
     check_mutable_reborrows();
     check_shim_boundary_match();

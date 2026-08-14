@@ -4801,10 +4801,8 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                         oomir::Type::Boolean => ("Boolean", "Z"),
                         oomir::Type::I8 | oomir::Type::U8 => ("I8", "B"),
                         oomir::Type::I16 | oomir::Type::F16 => ("I16", "S"),
-                        oomir::Type::I32
-                        | oomir::Type::U16
-                        | oomir::Type::U32
-                        | oomir::Type::Char => ("I32", "I"),
+                        oomir::Type::U16 => ("U16", "C"),
+                        oomir::Type::I32 | oomir::Type::U32 | oomir::Type::Char => ("I32", "I"),
                         oomir::Type::I64 | oomir::Type::U64 => ("I64", "J"),
                         oomir::Type::F32 => ("F32", "F"),
                         oomir::Type::F64 => ("F64", "D"),
@@ -4956,10 +4954,10 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                         oomir::Type::Boolean => ("Boolean", "Z", false),
                         oomir::Type::I8 | oomir::Type::U8 => ("I8", "B", false),
                         oomir::Type::I16 | oomir::Type::F16 => ("I16", "S", false),
-                        oomir::Type::I32
-                        | oomir::Type::U16
-                        | oomir::Type::U32
-                        | oomir::Type::Char => ("I32", "I", false),
+                        oomir::Type::U16 => ("U16", "C", false),
+                        oomir::Type::I32 | oomir::Type::U32 | oomir::Type::Char => {
+                            ("I32", "I", false)
+                        }
                         oomir::Type::I64 | oomir::Type::U64 => ("I64", "J", false),
                         oomir::Type::F32 => ("F32", "F", false),
                         oomir::Type::F64 => ("F64", "D", false),

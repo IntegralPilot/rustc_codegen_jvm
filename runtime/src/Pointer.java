@@ -10783,6 +10783,23 @@ public final class Pointer {
                 : ((Number) arrayGet(backing, index)).shortValue();
     }
 
+    public static char sliceGetU16(Object backing, int index) {
+        if (backing instanceof char[]) {
+            return ((char[]) backing)[index];
+        }
+        if (backing instanceof short[]) {
+            return (char) (((short[]) backing)[index] & 0xffff);
+        }
+        Pointer pointer = slicePointer(backing, index);
+        if (pointer != null) {
+            return (char) (pointer.getI16() & 0xffff);
+        }
+        Object value = arrayGet(backing, index);
+        return value instanceof Character
+                ? ((Character) value).charValue()
+                : (char) (((Number) value).intValue() & 0xffff);
+    }
+
     public static int sliceGetI32(Object backing, int index) {
         if (backing instanceof int[]) {
             return ((int[]) backing)[index];
@@ -10864,6 +10881,18 @@ public final class Pointer {
             return;
         }
         sliceSetObject(backing, index, Short.valueOf(value));
+    }
+
+    public static void sliceSetU16(Object backing, int index, char value) {
+        if (backing instanceof char[]) {
+            ((char[]) backing)[index] = value;
+            return;
+        }
+        if (backing instanceof short[]) {
+            ((short[]) backing)[index] = (short) value;
+            return;
+        }
+        sliceSetObject(backing, index, Character.valueOf(value));
     }
 
     public static void sliceSetI32(Object backing, int index, int value) {
