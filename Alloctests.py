@@ -4,9 +4,17 @@
 from stdlib_test_harness import ROOT, SuiteConfig, run_suite
 
 
+# Remaining tests over 20 seconds; none uses the reduced sort length table.
+SLOW_TEST_SECONDS = {
+    "sort::tests::stable::stability_legacy": 29.173,
+    "str::utf8_char_counts": 48.417,
+    "vec_deque::test_append_permutations": 25.902,
+}
+
+
 DEFAULT_IGNORED_TESTS = {
-    "str::strslice_issue_16589": "prohibitively slow exhaustive substring stress test",
-    "str::test_strslice_contains": "prohibitively slow substring permutation stress test",
+    name: f"took {seconds:.1f} seconds in the six-thread full-suite profile"
+    for name, seconds in SLOW_TEST_SECONDS.items()
 }
 
 

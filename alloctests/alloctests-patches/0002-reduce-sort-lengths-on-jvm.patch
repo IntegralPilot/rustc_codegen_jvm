@@ -1,0 +1,21 @@
+diff --git a/tests/sort/tests.rs b/tests/sort/tests.rs
+--- a/tests/sort/tests.rs
++++ b/tests/sort/tests.rs
+@@ -12,13 +12,14 @@ const TEST_LENGTHS: &[usize] = &[2, 3, 4, 7, 10, 15, 20, 24, 33, 50, 100, 171, 3
+ 
+-// node.js gives out of memory error to use with length 1_100_000
++// node.js gives out of memory error to use with length 1_100_000.
++// The JVM backend also uses this bounded set to keep test time practical.
+-#[cfg(all(not(miri), target_os = "emscripten"))]
++#[cfg(all(not(miri), any(target_os = "emscripten", target_os = "jvm")))]
+ const TEST_LENGTHS: &[usize] = &[
+     2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 16, 17, 20, 24, 30, 32, 33, 35, 50, 100, 200, 500, 1_000,
+     2_048, 5_000, 10_000, 100_000,
+ ];
+ 
+-#[cfg(all(not(miri), not(target_os = "emscripten")))]
++#[cfg(all(not(miri), not(any(target_os = "emscripten", target_os = "jvm"))))]
+ const TEST_LENGTHS: &[usize] = &[
+     2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 16, 17, 20, 24, 30, 32, 33, 35, 50, 100, 200, 500, 1_000,
+     2_048, 5_000, 10_000, 100_000, 1_100_000,
+ ];

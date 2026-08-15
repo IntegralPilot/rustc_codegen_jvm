@@ -15,7 +15,7 @@ It also enables modern Rust code to run on older platforms outside the reach of 
 
 By leveraging a ["virtual MMU" translation layer](runtime/src/Pointer.java), it supports [raw pointers with complex pointer arithmetic](tests/binary/raw_ptrs/src/main.rs), [transmute](tests/binary/transmute/src/main.rs), and [unions](tests/binary/raw_ptrs/src/main.rs). It also supports key parts of the Rust standard library, including [networking](tests/binary/network/src/main.rs), [async/await](tests/binary/async_await/src/main.rs), [threading](tests/binary/threads/src/main.rs), [unwinding](tests/binary/panic/src/main.rs), [allocation](tests/binary/alloc/src/main.rs), as well as [file system operations, STDIO, and more](tests/binary/std/src/main.rs).
 
-All official Rust [`coretests`](https://github.com/rust-lang/rust/tree/main/library/coretests) pass, with 99.6% verified [by CI](.github/workflows/ci.yml) on every commit (11 slow cases are skipped). Similarly, 99.9% of [`alloctests`](https://github.com/rust-lang/rust/tree/main/library/alloctests) pass on the [same CI](.github/workflows/ci.yml), with only 2 cases skipped due to slowness.
+Every selected official Rust [`coretests`](https://github.com/rust-lang/rust/tree/main/library/coretests) and [`alloctests`](https://github.com/rust-lang/rust/tree/main/library/alloctests) test passes [in CI](.github/workflows/ci.yml) in both debug and release mode. CI currently verifies 2,812 of 2,817 `coretests` and 1,474 of 1,477 `alloctests`, which is roughly **99.8%** of the upstream test suites.
 
 > [!NOTE]
 > This project is in an active mid-stage of development. While it supports the vast majority of the Rust language, edge-case bugs are continually being ironed out. The ultimate goal is potential upstreaming into main `rustc`.
@@ -237,10 +237,10 @@ The vast majority of the Rust language is supported, including generics, traits,
 
 The following pass rates are a quality gate enforced [by CI](.github/workflows/ci.yml), in both debug and release mode.
 
-| Suite | Tests passed | Tests skipped (too slow) | Total tests | Pass % |
-|---|---|---|---|---|
-| [`coretests`](https://github.com/rust-lang/rust/tree/main/library/coretests) tests & benches | 2799 | 11 | 2810 | **99.61%** |
-| [`alloctests`](https://github.com/rust-lang/rust/tree/main/library/alloctests) tests & benches | 1347 | 2 | 1349 | **99.85%** |
+| Suite | Passed | Project skips (too slow) | Upstream ignored | Total | Verified |
+|---|---:|---:|---:|---:|---:|
+| [`coretests`](https://github.com/rust-lang/rust/tree/main/library/coretests) | 2,812 | 3 | 2 | 2,817 | **99.82%** |
+| [`alloctests`](https://github.com/rust-lang/rust/tree/main/library/alloctests) | 1,474 | 3 | 0 | 1,477 | **99.80%** |
 
 ### Standard Library Support Matrix
 
