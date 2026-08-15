@@ -33,6 +33,38 @@ pub struct JvmStaticImport {
     pub descriptor: Option<String>,
 }
 
+fn validate_jvm_internal_class_name(class_name: &str) -> Result<(), String> {
+    if class_name.is_empty()
+        || class_name.starts_with('/')
+        || class_name.ends_with('/')
+        || class_name.split('/').any(str::is_empty)
+        || class_name.contains(['.', ';', '['])
+    {
+        return Err(format!(
+            "invalid JVM internal class name `{class_name}`; use `/` between non-empty package components"
+        ));
+    }
+    Ok(())
+}
+
+/// Parses the `#[link_name]` carried by an `extern type` as a JVM class.
+///
+/// The plain JVM internal name is canonical. `jvm:class:` is also accepted so
+/// callers can use an explicitly JVM-namespaced spelling if desired.
+pub fn parse_jvm_class_link_name(link_name: &str) -> Result<String, String> {
+    let class_name = if let Some(class_name) = link_name.strip_prefix("jvm:class:") {
+        class_name
+    } else if link_name.starts_with("jvm:") {
+        return Err(format!(
+            "unsupported JVM extern-type link name `{link_name}`; expected `jvm:class:<internal-class>`"
+        ));
+    } else {
+        link_name
+    };
+    validate_jvm_internal_class_name(class_name)?;
+    Ok(class_name.to_string())
+}
+
 fn is_external_runtime_generic<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> bool {
     let def_id = instance.def_id();
     !def_id.is_local()
@@ -121,11 +153,7 @@ pub fn parse_jvm_link_name(link_name: &str) -> Result<Option<JvmStaticImport>, S
     if descriptor == Some("") {
         return Err("malformed JVM import; an explicit descriptor cannot be empty".to_string());
     }
-    if class_name.contains('.') || class_name.starts_with('/') || class_name.ends_with('/') {
-        return Err(format!(
-            "invalid JVM internal class name `{class_name}`; use `/` between package components"
-        ));
-    }
+    validate_jvm_internal_class_name(class_name)?;
     if method_name.contains('/') || method_name.contains('.') {
         return Err(format!("invalid JVM method name `{method_name}`"));
     }
@@ -427,7 +455,7 @@ pub fn mono_fn_name_from_instance<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'t
 
 #[cfg(test)]
 mod tests {
-    use super::{JvmStaticImport, jvm_names, parse_jvm_link_name};
+    use super::{JvmStaticImport, jvm_names, parse_jvm_class_link_name, parse_jvm_link_name};
 
     #[test]
     fn generated_jvm_identifiers_preserve_rust_underscores() {
@@ -488,5 +516,30 @@ mod tests {
     fn rejects_empty_explicit_descriptor() {
         let error = parse_jvm_link_name("jvm:static:java/lang/System:exit:").unwrap_err();
         assert!(error.contains("descriptor cannot be empty"));
+    }
+
+    #[test]
+    fn parses_extern_type_class_link_names() {
+        assert_eq!(
+            parse_jvm_class_link_name("java/lang/String"),
+            Ok("java/lang/String".to_string())
+        );
+        assert_eq!(
+            parse_jvm_class_link_name("jvm:class:java/util/ArrayList"),
+            Ok("java/util/ArrayList".to_string())
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_extern_type_class_link_names() {
+        for invalid in [
+            "",
+            "/java/lang/String",
+            "java//lang/String",
+            "java.lang.String",
+            "jvm:static:java/lang/String",
+        ] {
+            assert!(parse_jvm_class_link_name(invalid).is_err(), "{invalid}");
+        }
     }
 }

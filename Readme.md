@@ -77,6 +77,7 @@ Rust enums, generics, function pointers, unions, and traits map directly onto JV
 import org.rustlang.runtime.Utf8View;
 import my_crate.NamedCounter;
 import my_crate.Accumulator;
+import java.time.LocalDate;
 import static my_crate.my_crate.*;
 
 public class Main {
@@ -89,10 +90,6 @@ public class Main {
             this.sum += amount;
             return this.sum;
         }
-    }
-
-    public static void helloWorld() {
-        System.out.println("Hello from Rust!");
     }
 
     public static void main(String[] args) {
@@ -110,18 +107,23 @@ public class Main {
         int finalSum = run_accumulation(acc);
         System.out.println("Accumulator sum: " + finalSum);
 
-        // 4. Trigger a foreign function call from Rust back into Java
-        trigger_hello();
+        // 4. Construct a standard Java API object in Rust
+        LocalDate leapDay = make_java_date(2024, 2, 29);
+        System.out.println("Leap day: " + leapDay);
     }
 }
 ```
 
 **Rust**
 ```rust
+#![feature(extern_types)]
+
 unsafe extern "C" {
-    // Link directly to the static method on the Java Main class
-    #[link_name = "jvm:static:Main:helloWorld"]
-    fn hello_world();
+    #[link_name = "java/time/LocalDate"]
+    pub type JavaLocalDate;
+
+    #[link_name = "jvm:static:java/time/LocalDate:of"]
+    fn java_local_date_of(year: i32, month: i32, day: i32) -> *const JavaLocalDate;
 }
 
 pub struct NamedCounter {
@@ -150,8 +152,8 @@ pub fn run_accumulation(acc: &mut dyn Accumulator) -> i32 {
     acc.add(10) + acc.add(5)
 }
 
-pub fn trigger_hello() {
-    unsafe { hello_world(); }
+pub fn make_java_date(year: i32, month: i32, day: i32) -> *const JavaLocalDate {
+    unsafe { java_local_date_of(year, month, day) }
 }
 ```
 

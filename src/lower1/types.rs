@@ -6723,15 +6723,35 @@ fn ty_to_oomir_type_resolved<'tcx>(
             oomir::Type::Class(jvm_name_full)
         }
         rustc_middle::ty::TyKind::Str => oomir::Type::Str,
-        // Opaque metadata markers such as the compiler's trait-object VTable
-        // carry no standalone JVM value. The data pointer already retains the
-        // JVM interface dispatch information.
-        rustc_middle::ty::TyKind::Foreign(_) => oomir::Type::Unit,
+        // A linked foreign type names the JVM class carried by pointers and
+        // references to that opaque Rust type. Unlinked compiler-internal
+        // foreign types (i.e. core's VTable marker) remain valueless.
+        // Rust still enforces the extern type's DST restrictions; the backend
+        // only supplies its JVM ABI.
+        rustc_middle::ty::TyKind::Foreign(def_id) => {
+            let Some((link_name, span)) = rustc_hir::find_attr!(
+                tcx,
+                *def_id,
+                LinkName { name, span } => (*name, *span)
+            ) else {
+                return oomir::Type::Unit;
+            };
+            let class_name = super::naming::parse_jvm_class_link_name(link_name.as_str())
+                .unwrap_or_else(|message| tcx.dcx().span_fatal(span, message));
+            oomir::Type::Class(class_name)
+        }
         rustc_middle::ty::TyKind::Pat(inner_ty, _) => {
             ty_to_oomir_type(*inner_ty, tcx, data_types, instance_context)
         }
         rustc_middle::ty::TyKind::Ref(_, inner_ty, _mutability) => {
             let pointee_oomir_type = ty_to_oomir_type(*inner_ty, tcx, data_types, instance_context);
+            if matches!(inner_ty.kind(), rustc_middle::ty::TyKind::Foreign(_))
+                && matches!(pointee_oomir_type, oomir::Type::Class(_))
+            {
+                // A Java object reference is already the thin pointer for an
+                // opaque foreign Java type; do not wrap it in runtime Pointer.
+                return pointee_oomir_type;
+            }
             // For trait objects (&dyn Trait, &mut dyn Trait), represent as direct Interface
             // rather than using the array wrapper, since we call virtual methods on the object
             if matches!(
@@ -6769,6 +6789,17 @@ fn ty_to_oomir_type_resolved<'tcx>(
                 let oomir_component_type =
                     ty_to_oomir_type(component_ty, tcx, data_types, instance_context);
                 oomir::Type::Slice(Box::new(oomir_component_type))
+            } else if matches!(ty.kind(), rustc_middle::ty::TyKind::Foreign(_)) {
+                // See the reference case above: the JVM object reference is
+                // the linked extern type's native thin-pointer
+                // representation. Preserve runtime Pointer for unlinked
+                // compiler-internal foreign markers.
+                let pointee_oomir_type = ty_to_oomir_type(*ty, tcx, data_types, instance_context);
+                if matches!(pointee_oomir_type, oomir::Type::Class(_)) {
+                    pointee_oomir_type
+                } else {
+                    oomir::Type::Pointer(Box::new(pointee_oomir_type))
+                }
             } else {
                 // Sized raw pointers and sized references intentionally share
                 // one address representation. This preserves identity across
