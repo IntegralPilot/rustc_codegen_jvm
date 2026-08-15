@@ -7,18 +7,17 @@ diff --git a/panic_unwind/src/lib.rs b/panic_unwind/src/lib.rs
 +        #[path = "jvm.rs"]
 +        mod imp;
 +    }
-     target_os = "hermit" => {
-         #[path = "hermit.rs"]
-         mod imp;
-     }
+     any(
+         all(target_family = "windows", target_env = "gnu"),
+         target_os = "psp",
 diff --git a/std/src/sys/personality/mod.rs b/std/src/sys/personality/mod.rs
 --- a/std/src/sys/personality/mod.rs
 +++ b/std/src/sys/personality/mod.rs
 @@ -15,6 +15,6 @@ mod dwarf;
  #[cfg(not(any(test, doctest)))]
  cfg_select! {
--    any(target_env = "msvc", target_family = "wasm", target_os = "motor") => {
-+    any(target_os = "jvm", target_env = "msvc", target_family = "wasm", target_os = "motor") => {
+-    any(target_env = "msvc", target_family = "wasm") => {
++    any(target_os = "jvm", target_env = "msvc", target_family = "wasm") => {
          // This is required by the compiler to exist (e.g., it's a lang item),
          // but it's never actually called by the compiler because
          // __CxxFrameHandler3 (msvc) / __gxx_wasm_personality_v0 (wasm) is the
