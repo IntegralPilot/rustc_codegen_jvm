@@ -2426,23 +2426,48 @@ pub(crate) fn fn_pointer_target<'tcx>(
     target_instance: Instance<'tcx>,
     signature: &oomir::Signature,
 ) -> Option<FnPointerTarget> {
-    let jvm_import = super::super::naming::jvm_static_import_from_instance(tcx, target_instance)
+    let jvm_import = super::super::naming::jvm_import_from_instance(tcx, target_instance)
         .unwrap_or_else(|message| tcx.dcx().fatal(message));
     if let Some(import) = jvm_import {
-        let rust_descriptor = signature.to_jvm_descriptor_with_explicit_params();
-        if let Some(explicit_descriptor) = import.descriptor
-            && rust_descriptor != explicit_descriptor
-        {
-            tcx.dcx().fatal(format!(
-                "JVM import descriptor `{explicit_descriptor}` does not match the lowered Rust signature `{rust_descriptor}`"
-            ));
+        match import {
+            super::super::naming::JvmImport::Static(import) => {
+                let rust_descriptor = signature.to_jvm_descriptor_with_explicit_params();
+                if let Some(explicit_descriptor) = import.descriptor
+                    && rust_descriptor != explicit_descriptor
+                {
+                    tcx.dcx().fatal(format!(
+                        "JVM import descriptor `{explicit_descriptor}` does not match the lowered Rust signature `{rust_descriptor}`"
+                    ));
+                }
+                return Some(FnPointerTarget::ImportedStatic(
+                    super::super::naming::FnNameData {
+                        class_to_call_on: Some(import.class_name),
+                        method_name: import.method_name,
+                    },
+                ));
+            }
+            super::super::naming::JvmImport::Virtual(import) => {
+                let class_name = super::super::naming::jvm_virtual_receiver_class_from_instance(
+                    tcx,
+                    target_instance,
+                )
+                .unwrap_or_else(|message| tcx.dcx().fatal(message));
+                let mut method_signature = signature.clone();
+                method_signature.is_static = false;
+                let rust_descriptor = method_signature.to_string();
+                if let Some(explicit_descriptor) = import.descriptor
+                    && rust_descriptor != explicit_descriptor
+                {
+                    tcx.dcx().fatal(format!(
+                        "JVM import descriptor `{explicit_descriptor}` does not match the lowered Rust signature `{rust_descriptor}`"
+                    ));
+                }
+                return Some(FnPointerTarget::Virtual {
+                    class_name,
+                    method_name: import.method_name,
+                });
+            }
         }
-        return Some(FnPointerTarget::ImportedStatic(
-            super::super::naming::FnNameData {
-                class_to_call_on: Some(import.class_name),
-                method_name: import.method_name,
-            },
-        ));
     }
     let static_name = super::super::naming::mono_fn_name_from_instance(tcx, target_instance);
     let associated_item = tcx.opt_associated_item(target_instance.def_id());

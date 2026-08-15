@@ -4,7 +4,7 @@ use super::jvm_names;
 use rustc_hash::FxHashMap as HashMap;
 use rustc_hir::{attrs::lang_items::LangItem, def::DefKind};
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
-use rustc_middle::ty::{GenericArg, Instance, InstanceKind, TyCtxt, TypeVisitableExt};
+use rustc_middle::ty::{GenericArg, Instance, InstanceKind, TyCtxt, TyKind, TypeVisitableExt};
 use rustc_span::sym;
 
 const MAX_MONO_FN_NAME_LEN: usize = 128;
@@ -31,6 +31,19 @@ pub struct JvmStaticImport {
     pub method_name: String,
     /// Optional legacy descriptor used only to verify the inferred Rust ABI.
     pub descriptor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JvmVirtualImport {
+    pub method_name: String,
+    /// Optional descriptor used only to verify the inferred Rust ABI.
+    pub descriptor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JvmImport {
+    Static(JvmStaticImport),
+    Virtual(JvmVirtualImport),
 }
 
 fn validate_jvm_internal_class_name(class_name: &str) -> Result<(), String> {
@@ -128,47 +141,122 @@ pub fn instance_is_trait_interface_owned<'tcx>(
     false
 }
 
-pub fn parse_jvm_link_name(link_name: &str) -> Result<Option<JvmStaticImport>, String> {
+fn validate_jvm_method_name(method_name: &str) -> Result<(), String> {
+    if method_name.is_empty() || method_name.contains(['/', '.', ':']) {
+        return Err(format!("invalid JVM method name `{method_name}`"));
+    }
+    Ok(())
+}
+
+pub fn parse_jvm_link_name(link_name: &str) -> Result<Option<JvmImport>, String> {
     let Some(import) = link_name.strip_prefix("jvm:") else {
         return Ok(None);
     };
 
-    let mut parts = import.splitn(4, ':');
-    let invocation = parts.next().unwrap_or_default();
-    let class_name = parts.next().unwrap_or_default();
-    let method_name = parts.next().unwrap_or_default();
-    let descriptor = parts.next();
+    let (invocation, import) = import.split_once(':').ok_or_else(|| {
+        "malformed JVM import; expected `jvm:static:<internal-class>:<method>` or `jvm:virtual:<method>`"
+            .to_string()
+    })?;
 
-    if invocation != "static" {
-        return Err(format!(
-            "unsupported JVM import invocation `{invocation}`; only `jvm:static` is supported"
-        ));
-    }
-    if class_name.is_empty() || method_name.is_empty() {
-        return Err(
-            "malformed JVM import; expected `jvm:static:<internal-class>:<method>[:<descriptor>]`"
-                .to_string(),
-        );
-    }
-    if descriptor == Some("") {
-        return Err("malformed JVM import; an explicit descriptor cannot be empty".to_string());
-    }
-    validate_jvm_internal_class_name(class_name)?;
-    if method_name.contains('/') || method_name.contains('.') {
-        return Err(format!("invalid JVM method name `{method_name}`"));
-    }
+    match invocation {
+        "static" => {
+            let mut parts = import.splitn(3, ':');
+            let class_name = parts.next().unwrap_or_default();
+            let method_name = parts.next().unwrap_or_default();
+            let descriptor = parts.next();
+            if class_name.is_empty() || method_name.is_empty() {
+                return Err(
+                    "malformed JVM import; expected `jvm:static:<internal-class>:<method>[:<descriptor>]`"
+                        .to_string(),
+                );
+            }
+            if descriptor == Some("") {
+                return Err(
+                    "malformed JVM import; an explicit descriptor cannot be empty".to_string(),
+                );
+            }
+            validate_jvm_internal_class_name(class_name)?;
+            validate_jvm_method_name(method_name)?;
 
-    Ok(Some(JvmStaticImport {
-        class_name: class_name.to_string(),
-        method_name: method_name.to_string(),
-        descriptor: descriptor.map(str::to_string),
-    }))
+            Ok(Some(JvmImport::Static(JvmStaticImport {
+                class_name: class_name.to_string(),
+                method_name: method_name.to_string(),
+                descriptor: descriptor.map(str::to_string),
+            })))
+        }
+        "virtual" => {
+            let mut parts = import.splitn(2, ':');
+            let method_name = parts.next().unwrap_or_default();
+            let descriptor = parts.next();
+            if method_name.is_empty() {
+                return Err(
+                    "malformed JVM import; expected `jvm:virtual:<method>[:<descriptor>]`"
+                        .to_string(),
+                );
+            }
+            if descriptor == Some("") {
+                return Err(
+                    "malformed JVM import; an explicit descriptor cannot be empty".to_string(),
+                );
+            }
+            validate_jvm_method_name(method_name)?;
+
+            Ok(Some(JvmImport::Virtual(JvmVirtualImport {
+                method_name: method_name.to_string(),
+                descriptor: descriptor.map(str::to_string),
+            })))
+        }
+        _ => Err(format!(
+            "unsupported JVM import invocation `{invocation}`; expected `jvm:static` or `jvm:virtual`"
+        )),
+    }
 }
 
-pub fn jvm_static_import_from_instance<'tcx>(
+pub fn jvm_virtual_receiver_class_from_instance<'tcx>(
     tcx: TyCtxt<'tcx>,
     instance: Instance<'tcx>,
-) -> Result<Option<JvmStaticImport>, String> {
+) -> Result<String, String> {
+    let signature = tcx
+        .fn_sig(instance.def_id())
+        .instantiate(tcx, instance.args)
+        .skip_binder();
+    let Some(receiver_ty) = signature.inputs().first().copied() else {
+        return Err(
+            "a `jvm:virtual` import requires a receiver as its first parameter".to_string(),
+        );
+    };
+    let pointee_ty = match receiver_ty.kind() {
+        TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _) => *pointee,
+        _ => {
+            return Err(
+                "the first parameter of a `jvm:virtual` import must be a pointer or reference to a linked `extern type`"
+                    .to_string(),
+            );
+        }
+    };
+    let TyKind::Foreign(def_id) = pointee_ty.kind() else {
+        return Err(
+            "the first parameter of a `jvm:virtual` import must be a pointer or reference to a linked `extern type`"
+                .to_string(),
+        );
+    };
+    let Some(link_name) = rustc_hir::find_attr!(
+        tcx,
+        *def_id,
+        LinkName { name, .. } => *name
+    ) else {
+        return Err(
+            "the receiver extern type of a `jvm:virtual` import must have a `#[link_name]`"
+                .to_string(),
+        );
+    };
+    parse_jvm_class_link_name(link_name.as_str())
+}
+
+pub fn jvm_import_from_instance<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
+) -> Result<Option<JvmImport>, String> {
     let Some(symbol_name) = tcx.codegen_fn_attrs(instance.def_id()).symbol_name else {
         return Ok(None);
     };
@@ -177,6 +265,9 @@ pub fn jvm_static_import_from_instance<'tcx>(
         return Err(
             "a `jvm:` link name is only supported on a function in an `extern` block".to_string(),
         );
+    }
+    if matches!(import, Some(JvmImport::Virtual(_))) {
+        jvm_virtual_receiver_class_from_instance(tcx, instance)?;
     }
     Ok(import)
 }
@@ -455,7 +546,10 @@ pub fn mono_fn_name_from_instance<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'t
 
 #[cfg(test)]
 mod tests {
-    use super::{JvmStaticImport, jvm_names, parse_jvm_class_link_name, parse_jvm_link_name};
+    use super::{
+        JvmImport, JvmStaticImport, JvmVirtualImport, jvm_names, parse_jvm_class_link_name,
+        parse_jvm_link_name,
+    };
 
     #[test]
     fn generated_jvm_identifiers_preserve_rust_underscores() {
@@ -471,11 +565,11 @@ mod tests {
     fn parses_static_jvm_import_with_inferred_descriptor() {
         assert_eq!(
             parse_jvm_link_name("jvm:static:org/rustlang/runtime/PanicSupport:raise"),
-            Ok(Some(JvmStaticImport {
+            Ok(Some(JvmImport::Static(JvmStaticImport {
                 class_name: "org/rustlang/runtime/PanicSupport".to_string(),
                 method_name: "raise".to_string(),
                 descriptor: None,
-            }))
+            })))
         );
     }
 
@@ -485,11 +579,33 @@ mod tests {
             parse_jvm_link_name(
                 "jvm:static:org/rustlang/runtime/PanicSupport:raise:(Lorg/rustlang/runtime/Pointer;)V"
             ),
-            Ok(Some(JvmStaticImport {
+            Ok(Some(JvmImport::Static(JvmStaticImport {
                 class_name: "org/rustlang/runtime/PanicSupport".to_string(),
                 method_name: "raise".to_string(),
                 descriptor: Some("(Lorg/rustlang/runtime/Pointer;)V".to_string()),
-            }))
+            })))
+        );
+    }
+
+    #[test]
+    fn parses_virtual_jvm_import_with_inferred_owner_and_descriptor() {
+        assert_eq!(
+            parse_jvm_link_name("jvm:virtual:getYear"),
+            Ok(Some(JvmImport::Virtual(JvmVirtualImport {
+                method_name: "getYear".to_string(),
+                descriptor: None,
+            })))
+        );
+    }
+
+    #[test]
+    fn parses_virtual_jvm_import_with_explicit_descriptor() {
+        assert_eq!(
+            parse_jvm_link_name("jvm:virtual:plusDays:(J)Ljava/time/LocalDate;"),
+            Ok(Some(JvmImport::Virtual(JvmVirtualImport {
+                method_name: "plusDays".to_string(),
+                descriptor: Some("(J)Ljava/time/LocalDate;".to_string()),
+            })))
         );
     }
 
@@ -500,10 +616,14 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_invocation_kind() {
-        let error =
-            parse_jvm_link_name("jvm:virtual:java/lang/Object:toString:()Ljava/lang/String;")
-                .unwrap_err();
-        assert!(error.contains("only `jvm:static` is supported"));
+        let error = parse_jvm_link_name("jvm:special:java/lang/Object:toString").unwrap_err();
+        assert!(error.contains("expected `jvm:static` or `jvm:virtual`"));
+    }
+
+    #[test]
+    fn rejects_virtual_jvm_import_with_duplicated_owner() {
+        let error = parse_jvm_link_name("jvm:virtual:java/lang/Object:toString").unwrap_err();
+        assert!(error.contains("invalid JVM method name"));
     }
 
     #[test]
@@ -515,6 +635,9 @@ mod tests {
     #[test]
     fn rejects_empty_explicit_descriptor() {
         let error = parse_jvm_link_name("jvm:static:java/lang/System:exit:").unwrap_err();
+        assert!(error.contains("descriptor cannot be empty"));
+
+        let error = parse_jvm_link_name("jvm:virtual:toString:").unwrap_err();
         assert!(error.contains("descriptor cannot be empty"));
     }
 

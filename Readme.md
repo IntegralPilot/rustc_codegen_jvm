@@ -107,9 +107,10 @@ public class Main {
         int finalSum = run_accumulation(acc);
         System.out.println("Accumulator sum: " + finalSum);
 
-        // 4. Construct a standard Java API object in Rust
+        // 4. Construct and call a standard Java API object in Rust
         LocalDate leapDay = make_java_date(2024, 2, 29);
         System.out.println("Leap day: " + leapDay);
+        System.out.println("Leap year: " + java_date_year(leapDay));
     }
 }
 ```
@@ -124,6 +125,15 @@ unsafe extern "C" {
 
     #[link_name = "jvm:static:java/time/LocalDate:of"]
     fn java_local_date_of(year: i32, month: i32, day: i32) -> *const JavaLocalDate;
+
+    #[link_name = "jvm:virtual:getYear"]
+    fn java_local_date_get_year(date: &JavaLocalDate) -> i32;
+}
+
+impl JavaLocalDate {
+    pub fn year(&self) -> i32 {
+        unsafe { java_local_date_get_year(self) }
+    }
 }
 
 pub struct NamedCounter {
@@ -154,6 +164,10 @@ pub fn run_accumulation(acc: &mut dyn Accumulator) -> i32 {
 
 pub fn make_java_date(year: i32, month: i32, day: i32) -> *const JavaLocalDate {
     unsafe { java_local_date_of(year, month, day) }
+}
+
+pub fn java_date_year(date: &JavaLocalDate) -> i32 {
+    date.year()
 }
 ```
 

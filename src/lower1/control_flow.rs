@@ -2379,35 +2379,73 @@ pub(super) fn convert_basic_block<'tcx>(
                         oomir_operands.push(location);
                     }
 
-                    let jvm_import =
-                        super::naming::jvm_static_import_from_instance(tcx, func_instance)
-                            .unwrap_or_else(|message| {
-                                tcx.dcx().span_fatal(terminator.source_info.span, message)
-                            });
+                    let jvm_import = super::naming::jvm_import_from_instance(tcx, func_instance)
+                        .unwrap_or_else(|message| {
+                            tcx.dcx().span_fatal(terminator.source_info.span, message)
+                        });
                     let assoc_item = tcx.opt_associated_item(func_instance.def_id());
 
                     if let Some(jvm_import) = jvm_import {
-                        method_signature.is_static = true;
-                        let rust_descriptor =
-                            method_signature.to_jvm_descriptor_with_explicit_params();
-                        if let Some(explicit_descriptor) = &jvm_import.descriptor
-                            && rust_descriptor != *explicit_descriptor
-                        {
-                            tcx.dcx().span_fatal(
-                                terminator.source_info.span,
-                                format!(
-                                    "JVM import descriptor `{}` does not match the lowered Rust signature `{rust_descriptor}`",
-                                    explicit_descriptor
-                                ),
-                            );
+                        match jvm_import {
+                            super::naming::JvmImport::Static(jvm_import) => {
+                                method_signature.is_static = true;
+                                let rust_descriptor =
+                                    method_signature.to_jvm_descriptor_with_explicit_params();
+                                if let Some(explicit_descriptor) = &jvm_import.descriptor
+                                    && rust_descriptor != *explicit_descriptor
+                                {
+                                    tcx.dcx().span_fatal(
+                                        terminator.source_info.span,
+                                        format!(
+                                            "JVM import descriptor `{}` does not match the lowered Rust signature `{rust_descriptor}`",
+                                            explicit_descriptor
+                                        ),
+                                    );
+                                }
+                                instructions.push(oomir::Instruction::InvokeStatic {
+                                    class_name: jvm_import.class_name,
+                                    method_name: jvm_import.method_name,
+                                    method_ty: method_signature,
+                                    args: oomir_operands,
+                                    dest: effective_dest,
+                                });
+                            }
+                            super::naming::JvmImport::Virtual(jvm_import) => {
+                                let class_name =
+                                    super::naming::jvm_virtual_receiver_class_from_instance(
+                                        tcx,
+                                        func_instance,
+                                    )
+                                    .unwrap_or_else(
+                                        |message| {
+                                            tcx.dcx()
+                                                .span_fatal(terminator.source_info.span, message)
+                                        },
+                                    );
+                                let receiver = oomir_operands.remove(0);
+                                method_signature.is_static = false;
+                                let rust_descriptor = method_signature.to_string();
+                                if let Some(explicit_descriptor) = &jvm_import.descriptor
+                                    && rust_descriptor != *explicit_descriptor
+                                {
+                                    tcx.dcx().span_fatal(
+                                        terminator.source_info.span,
+                                        format!(
+                                            "JVM import descriptor `{}` does not match the lowered Rust signature `{rust_descriptor}`",
+                                            explicit_descriptor
+                                        ),
+                                    );
+                                }
+                                instructions.push(oomir::Instruction::InvokeVirtual {
+                                    class_name,
+                                    method_name: jvm_import.method_name,
+                                    method_ty: method_signature,
+                                    args: oomir_operands,
+                                    operand: receiver,
+                                    dest: effective_dest,
+                                });
+                            }
                         }
-                        instructions.push(oomir::Instruction::InvokeStatic {
-                            class_name: jvm_import.class_name,
-                            method_name: jvm_import.method_name,
-                            method_ty: method_signature,
-                            args: oomir_operands,
-                            dest: effective_dest,
-                        });
                     } else if let InstanceKind::Shim(ShimKind::DropGlue(_, drop_ty)) =
                         func_instance.def
                     {
