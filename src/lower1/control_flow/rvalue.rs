@@ -1689,6 +1689,22 @@ fn emit_pointer_to_place<'tcx>(
                 let (base_name, base_instructions, base_ty) =
                     emit_instructions_to_get_on_own(&base_place, tcx, instance, mir, data_types);
                 instructions.extend(base_instructions);
+                if matches!(
+                    normalize_unsize_ty(place.ty(&mir.local_decls, tcx).ty, tcx, instance).kind(),
+                    TyKind::Dynamic(..)
+                ) && matches!(base_ty, oomir::Type::Interface(_))
+                    && matches!(pointer_ty, oomir::Type::Pointer(_))
+                {
+                    return super::super::value_repr::emit_trait_object_reference_pointer(
+                        oomir::Operand::Variable {
+                            name: base_name,
+                            ty: base_ty,
+                        },
+                        pointer_ty,
+                        &format!("{temp_prefix}_reborrow"),
+                        instructions,
+                    );
+                }
                 if matches!(base_ty, oomir::Type::Pointer(_)) {
                     let dest = format!("{temp_prefix}_reborrow");
                     let source = oomir::Operand::Variable {
@@ -4228,6 +4244,23 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                         data_types,
                         &mut instructions,
                     );
+                    if matches!(source_mir_ty.kind(), TyKind::Ref(_, pointee, _)
+                            if matches!(pointee.kind(), TyKind::Dynamic(..)))
+                        && matches!(resolved_target_mir_ty.kind(), TyKind::RawPtr(pointee, _)
+                            if matches!(pointee.kind(), TyKind::Dynamic(..)))
+                        && matches!(oomir_target_type, oomir::Type::Pointer(_))
+                    {
+                        let pointer = super::super::value_repr::adapt_operand_to_rust_type(
+                            oomir_operand,
+                            resolved_target_mir_ty,
+                            &format!("{}_trait_object_pointer", base_temp_name),
+                            tcx,
+                            instance,
+                            data_types,
+                            &mut instructions,
+                        );
+                        return (instructions, pointer);
+                    }
                     if matches!(source_mir_ty.kind(), TyKind::RawPtr(..) | TyKind::Ref(..))
                         && matches!(target_mir_ty.kind(), TyKind::RawPtr(..) | TyKind::Ref(..))
                         && let Some(result) = emit_trait_object_to_struct_tail_cast(

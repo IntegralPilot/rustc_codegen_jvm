@@ -6386,10 +6386,16 @@ pub(super) fn convert_basic_block<'tcx>(
                             )
                         {
                             if let Some(dest) = effective_dest.clone() {
-                                instructions.push(oomir::Instruction::Move {
-                                    dest,
-                                    src: oomir_operands[0].clone(),
-                                });
+                                let pointer = super::value_repr::adapt_operand_to_rust_type(
+                                    oomir_operands[0].clone(),
+                                    fn_output,
+                                    &format!("{label}_pointer_from_reference"),
+                                    tcx,
+                                    instance,
+                                    data_types,
+                                    &mut instructions,
+                                );
+                                instructions.push(oomir::Instruction::Move { dest, src: pointer });
                             }
                         } else if (has_diagnostic_item("ptr_eq")
                             || intrinsic_name.as_str() == "addr_eq")

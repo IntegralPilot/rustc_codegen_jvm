@@ -6374,6 +6374,42 @@ public final class Pointer {
                 pointer, newViewSize, newViewCodecClassName);
     }
 
+    /** Converts the direct JVM carrier used by {@code &dyn Trait} into a raw fat pointer. */
+    public static Pointer fromTraitObjectReference(Object reference) {
+        if (!(reference instanceof TraitObjectCarrier)) {
+            // A Rust function pointer already implements the callable JVM
+            // interface used for dyn Fn, so it does not need a generated
+            // TraitObjectCarrier adapter. Recover its concrete pointer-sized
+            // layout here while retaining the function object as metadata.
+            if (reference != null && isRustFunctionPointer(reference.getClass())) {
+                Pointer dataPointer = cell(reference, Long.BYTES, null).retype(0);
+                return attachTraitObjectCarrier(
+                        dataPointer, reference, Long.BYTES, Long.BYTES);
+            }
+            throw new IllegalArgumentException(
+                    "Rust trait-object reference has no dynamic metadata carrier");
+        }
+
+        TraitObjectCarrier carrier = (TraitObjectCarrier) reference;
+        Object data = carrier.rustTraitObjectPayload();
+        while (data instanceof TraitObjectCarrier) {
+            Object next = ((TraitObjectCarrier) data).rustTraitObjectPayload();
+            if (next == data) {
+                throw new IllegalArgumentException("cyclic Rust trait-object carrier");
+            }
+            data = next;
+        }
+
+        Pointer dataPointer = data instanceof Pointer
+                ? ((Pointer) data).retype(0)
+                : cell(data, carrier.rustTraitObjectSize(), null);
+        return attachTraitObjectCarrier(
+                dataPointer,
+                reference,
+                carrier.rustTraitObjectSize(),
+                carrier.rustTraitObjectAlignment());
+    }
+
     public static Pointer attachTraitObjectCarrier(Pointer pointer, Object carrier) {
         return attachTraitObjectCarrier(pointer, carrier, -1, -1);
     }

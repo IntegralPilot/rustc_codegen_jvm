@@ -1401,6 +1401,7 @@ fn verify_noalias_handling() {
 
 trait Inspector {
     fn inspect(&self) -> i32;
+    fn replace(&mut self, value: i32);
 }
 
 struct Item {
@@ -1411,6 +1412,76 @@ impl Inspector for Item {
     fn inspect(&self) -> i32 {
         self.value
     }
+
+    fn replace(&mut self, value: i32) {
+        self.value = value;
+    }
+}
+
+impl Inspector for () {
+    fn inspect(&self) -> i32 {
+        99
+    }
+
+    fn replace(&mut self, _value: i32) {}
+}
+
+fn trait_object_references_to_raw_pointers() {
+    let item = Item { value: 42 };
+    let shared: &dyn Inspector = &item;
+
+    // The backend recognizes `ptr::from_ref` as an identity operation, even
+    // though references and raw pointers to trait objects use different JVM
+    // carriers. The conversion must preserve both the data address and the
+    // dynamically populated trait metadata.
+    let from_ref: *const dyn Inspector = core::ptr::from_ref(shared);
+    let coerced: *const dyn Inspector = shared;
+    let cast: *const dyn Inspector = shared as *const dyn Inspector;
+    let concrete: *const dyn Inspector = &item;
+    for pointer in [from_ref, coerced, cast] {
+        assert!(!pointer.is_null());
+        assert!(core::ptr::addr_eq(pointer, concrete));
+        unsafe {
+            assert_eq!((*pointer).inspect(), 42);
+        }
+    }
+    assert_eq!(core::ptr::metadata(from_ref), core::ptr::metadata(coerced));
+    assert_eq!(core::ptr::metadata(from_ref), core::ptr::metadata(cast));
+
+    let sendable: &(dyn Inspector + Send) = &item;
+    let sendable_raw: *const (dyn Inspector + Send) = core::ptr::from_ref(sendable);
+    unsafe {
+        assert_eq!((*sendable_raw).inspect(), 42);
+    }
+
+    let add_one = |value: i32| value + 1;
+    let callable: &dyn Fn(i32) -> i32 = &add_one;
+    let callable_raw: *const dyn Fn(i32) -> i32 = core::ptr::from_ref(callable);
+    assert!(!callable_raw.is_null());
+    unsafe {
+        assert_eq!((*callable_raw)(41), 42);
+    }
+
+    let unit = ();
+    let zero_sized: &dyn Inspector = &unit;
+    let zero_sized_raw: *const dyn Inspector = core::ptr::from_ref(zero_sized);
+    assert!(!zero_sized_raw.is_null());
+    assert!(core::ptr::addr_eq(zero_sized_raw, core::ptr::from_ref(&unit)));
+    unsafe {
+        assert_eq!((*zero_sized_raw).inspect(), 99);
+    }
+
+    let mut mutable_item = Item { value: 17 };
+    let mutable_data = core::ptr::from_mut(&mut mutable_item);
+    let mutable: &mut dyn Inspector = &mut mutable_item;
+    let from_mut: *mut dyn Inspector = core::ptr::from_mut(mutable);
+    assert!(!from_mut.is_null());
+    assert!(core::ptr::addr_eq(from_mut, mutable_data));
+    unsafe {
+        assert_eq!((*from_mut).inspect(), 17);
+        (*from_mut).replace(23);
+    }
+    assert_eq!(mutable_item.value, 23);
 }
 
 fn trait_object_raw_pointer_options() {
@@ -2370,6 +2441,7 @@ fn main() {
     pointer_niche_layouts();
     custom_dst_projections();
     verify_noalias_handling();
+    trait_object_references_to_raw_pointers();
     trait_object_raw_pointer_options();
     unsized_raw_pointer_as_ref();
     fat_pointer_abi_boundaries();

@@ -74,6 +74,30 @@ fn operand_var(name: String, ty: oomir::Type) -> oomir::Operand {
     oomir::Operand::Variable { name, ty }
 }
 
+pub(super) fn emit_trait_object_reference_pointer(
+    source: oomir::Operand,
+    target_jvm_ty: &oomir::Type,
+    temp_prefix: &str,
+    instructions: &mut Vec<oomir::Instruction>,
+) -> oomir::Operand {
+    let dest = format!("{temp_prefix}_trait_object_pointer");
+    instructions.push(oomir::Instruction::InvokeStatic {
+        dest: Some(dest.clone()),
+        class_name: oomir::POINTER_CLASS.to_string(),
+        method_name: "fromTraitObjectReference".to_string(),
+        method_ty: oomir::Signature {
+            params: vec![(
+                "reference".to_string(),
+                oomir::Type::Class("java/lang/Object".to_string()),
+            )],
+            ret: Box::new(target_jvm_ty.clone()),
+            is_static: true,
+        },
+        args: vec![source],
+    });
+    operand_var(dest, target_jvm_ty.clone())
+}
+
 fn integer_constant_bits(constant: &oomir::Constant) -> Option<u128> {
     match constant {
         oomir::Constant::I8(value) => Some(*value as u8 as u128),
@@ -775,6 +799,22 @@ fn adapt_mutable_reference_carrier<'tcx>(
         TyKind::Pat(inner, _) => resolved_ty(*inner, tcx, instance),
         _ => target_rust_ty,
     };
+    if let oomir::Type::Pointer(_) = target_jvm_ty
+        && let TyKind::Ref(_, pointee_ty, _) | TyKind::RawPtr(pointee_ty, _) =
+            target_pointer_ty.kind()
+        && matches!(
+            resolved_ty(*pointee_ty, tcx, instance).kind(),
+            TyKind::Dynamic(..)
+        )
+        && !matches!(source.get_type(), Some(oomir::Type::Pointer(_)))
+    {
+        return emit_trait_object_reference_pointer(
+            source,
+            target_jvm_ty,
+            temp_prefix,
+            instructions,
+        );
+    }
     if let (Some(oomir::Type::Pointer(source_inner)), oomir::Type::Pointer(_)) =
         (source.get_type(), target_jvm_ty)
         && let TyKind::Ref(_, pointee_ty, _) | TyKind::RawPtr(pointee_ty, _) =
