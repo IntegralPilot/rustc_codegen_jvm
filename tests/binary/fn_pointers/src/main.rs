@@ -210,6 +210,103 @@ fn increment_i32(value: i32) -> i32 {
     value + 1
 }
 
+unsafe fn unsafe_increment_i32(value: i32) -> i32 {
+    value + 1
+}
+
+extern "C" fn c_increment_i32(value: i32) -> i32 {
+    value + 1
+}
+
+fn function_pointer_address_roundtrips() {
+    type Unary = fn(i32) -> i32;
+
+    let function: Unary = increment_i32;
+    let copied = function;
+    let address = function as usize;
+    assert!(address != 0);
+    assert!(copied as usize == address);
+    assert!(function as u64 == address as u64);
+    assert!(function as isize as usize == address);
+    assert!(function as i64 as usize == address);
+
+    let from_usize: Unary = unsafe { core::mem::transmute(address) };
+    let from_u64: Unary = unsafe { core::mem::transmute(address as u64) };
+    let from_isize: Unary = unsafe { core::mem::transmute(address as isize) };
+    let from_i64: Unary = unsafe { core::mem::transmute(address as i64) };
+    for restored in [from_usize, from_u64, from_isize, from_i64] {
+        assert!(restored(41) == 42);
+        assert!(restored as usize == address);
+    }
+
+    let transmuted_address: usize = unsafe { core::mem::transmute(function) };
+    assert!(transmuted_address == address);
+    let transmuted_back: Unary = unsafe { core::mem::transmute(transmuted_address) };
+    assert!(transmuted_back(41) == 42);
+
+    let raw = function as *const ();
+    assert!(!raw.is_null());
+    assert!(raw.addr() == address);
+    assert!(raw.expose_provenance() == address);
+    let from_raw: Unary = unsafe { core::mem::transmute(raw) };
+    assert!(from_raw(41) == 42);
+
+    let raw_from_cast = address as *const ();
+    let raw_from_exposed = core::ptr::with_exposed_provenance::<()>(address);
+    for restored_raw in [raw_from_cast, raw_from_exposed] {
+        assert!(restored_raw == raw);
+        let restored: Unary = unsafe { core::mem::transmute(restored_raw) };
+        assert!(restored(41) == 42);
+    }
+
+    union FunctionAddress {
+        function: Unary,
+        address: usize,
+    }
+
+    let union_address = unsafe { FunctionAddress { function }.address };
+    assert!(union_address == address);
+    let union_function = unsafe {
+        FunctionAddress {
+            address: union_address,
+        }
+        .function
+    };
+    assert!(union_function(41) == 42);
+
+    let closure: Unary = |value| value * 2;
+    let closure_address = closure as usize;
+    assert!(closure_address != 0);
+    assert!(closure_address != address);
+    let closure_again: Unary = unsafe { core::mem::transmute(closure_address) };
+    assert!(closure_again(21) == 42);
+
+    let unsafe_function: unsafe fn(i32) -> i32 = unsafe_increment_i32;
+    let unsafe_address = unsafe_function as usize;
+    assert!(unsafe_address != 0);
+    let unsafe_again: unsafe fn(i32) -> i32 = unsafe { core::mem::transmute(unsafe_address) };
+    assert!(unsafe { unsafe_again(41) } == 42);
+
+    let c_function: extern "C" fn(i32) -> i32 = c_increment_i32;
+    let c_address = c_function as usize;
+    assert!(c_address != 0);
+    let c_again: extern "C" fn(i32) -> i32 = unsafe { core::mem::transmute(c_address) };
+    assert!(c_again(41) == 42);
+
+    let no_args: fn() -> i32 = || 42;
+    let no_args_address = no_args as usize;
+    assert!(no_args_address != 0);
+    let no_args_again: fn() -> i32 = unsafe { core::mem::transmute(no_args_address) };
+    assert!(no_args_again() == 42);
+
+    let static_function = unsafe { STATIC_FUNCTION_UNION.function };
+    let static_address = unsafe { STATIC_FUNCTION_UNION.bits };
+    assert!(static_address != 0);
+    assert!(static_function as usize == static_address);
+    let static_again: Unary = unsafe { core::mem::transmute(static_address) };
+    assert!(static_again(41) == 42);
+}
+
 #[derive(Copy, Clone)]
 struct Constructed(u32);
 
@@ -243,6 +340,7 @@ fn higher_ranked_maybe_uninit_slice() {
 
 fn main() {
     higher_ranked_maybe_uninit_slice();
+    function_pointer_address_roundtrips();
 
     let res_const = derivative(constant, 10.0, 0.125);
     assert!(res_const == 0.0);

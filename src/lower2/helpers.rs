@@ -542,47 +542,12 @@ pub fn get_cast_instructions(
         }
     }
 
-    // Keep code generation moving after a representation mismatch. The replacement is
-    // verifier-correct but deliberately has no semantic meaning: discard the source and
-    // synthesize the JVM default value for the requested destination type.
-    breadcrumbs::log!(
-        breadcrumbs::LogLevel::Warn,
-        "bytecode-gen",
-        format!(
-            "Unsupported cast: {:?} → {:?}; replacing it with the destination's default value. In function: {}",
-            src, dest, fn_name
-        )
-    );
-
-    let mut instructions = match get_type_size(src) {
-        0 => Vec::new(),
-        2 => vec![JI::Pop2],
-        _ => vec![JI::Pop],
-    };
-    instructions.extend(match dest {
-        Type::Unit | Type::Void => Vec::new(),
-        Type::I8
-        | Type::U8
-        | Type::I16
-        | Type::U16
-        | Type::F16
-        | Type::I32
-        | Type::U32
-        | Type::Boolean
-        | Type::Char => vec![JI::Iconst_0],
-        Type::I64 | Type::U64 => vec![JI::Lconst_0],
-        Type::F32 => vec![JI::Fconst_0],
-        Type::F64 => vec![JI::Dconst_0],
-        Type::MutableReference(_)
-        | Type::Pointer(_)
-        | Type::Reference(_)
-        | Type::Array(_)
-        | Type::Slice(_)
-        | Type::Str
-        | Type::Class(_)
-        | Type::Interface(_) => vec![JI::Aconst_null],
-    });
-    Ok(instructions)
+    Err(jvm::Error::VerificationError {
+        context: format!("Function {fn_name}"),
+        message: format!(
+            "unsupported representation cast {src:?} → {dest:?}; refusing to synthesize a default value"
+        ),
+    })
 }
 
 /// Semantic Rust primitive casts.  The JVM descriptor alone is insufficient here:

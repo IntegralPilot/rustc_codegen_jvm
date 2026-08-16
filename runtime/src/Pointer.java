@@ -432,6 +432,12 @@ public final class Pointer {
     private static final Map<Object, Long> MANAGED_OBJECT_ADDRESSES = new WeakIdentityMap<>();
     private static final Map<Long, ManagedObjectReference> MANAGED_OBJECTS = new HashMap<>();
     private static final ReferenceQueue<Object> MANAGED_OBJECT_QUEUE = new ReferenceQueue<>();
+    // Function pointers denote static code and remain valid after the carrier
+    // local that exposed them goes out of scope. Keep one canonical pointer
+    // cell per callable identity so integer, raw-pointer, and union views all
+    // observe the same nonzero address and can reconstruct the callable.
+    private static final Map<Object, Pointer> FUNCTION_POINTER_CELLS = new IdentityHashMap<>();
+    private static final Map<Long, Object> FUNCTION_POINTERS_BY_ADDRESS = new HashMap<>();
     private static final ConcurrentHashMap<String, JavaStringViews> JAVA_STRING_VIEWS =
             new ConcurrentHashMap<>();
     private static final Map<String, Pointer> TRAIT_METADATA_MARKERS = new HashMap<>();
@@ -6084,6 +6090,9 @@ public final class Pointer {
         if (value == null) {
             return 0;
         }
+        if (isRustFunctionPointer(value.getClass())) {
+            return functionPointerAddress(value);
+        }
         synchronized (MANAGED_OBJECT_ADDRESSES) {
             discardCollectedManagedObjects();
             Long existing = MANAGED_OBJECT_ADDRESSES.get(value);
@@ -6108,6 +6117,12 @@ public final class Pointer {
         if (address == 0) {
             return null;
         }
+        synchronized (FUNCTION_POINTER_CELLS) {
+            Object functionPointer = FUNCTION_POINTERS_BY_ADDRESS.get(address);
+            if (functionPointer != null) {
+                return functionPointer;
+            }
+        }
         synchronized (MANAGED_OBJECT_ADDRESSES) {
             discardCollectedManagedObjects();
             ManagedObjectReference reference = MANAGED_OBJECTS.get(address);
@@ -6116,6 +6131,52 @@ public final class Pointer {
                 MANAGED_OBJECTS.remove(address);
                 throw new IllegalStateException(
                         "managed Rust reference address is no longer live: "
+                                + Long.toUnsignedString(address));
+            }
+            return value;
+        }
+    }
+
+    private static Pointer canonicalFunctionPointer(Object value) {
+        if (value == null || !isRustFunctionPointer(value.getClass())) {
+            throw new IllegalArgumentException(
+                    "value is not a non-null Rust function pointer");
+        }
+        synchronized (FUNCTION_POINTER_CELLS) {
+            Pointer existing = FUNCTION_POINTER_CELLS.get(value);
+            if (existing != null) {
+                return existing;
+            }
+            Pointer pointer = cellAligned(value, Long.BYTES, null, Long.BYTES);
+            long address = pointer.address();
+            FUNCTION_POINTER_CELLS.put(value, pointer);
+            FUNCTION_POINTERS_BY_ADDRESS.put(address, value);
+            return pointer;
+        }
+    }
+
+    /** Returns the stable nonzero Rust address of a JVM function-pointer carrier. */
+    public static long functionPointerAddress(Object value) {
+        return canonicalFunctionPointer(value).address();
+    }
+
+    /** Converts a function pointer to a raw pointer without changing its address word. */
+    public static Pointer fromFunctionPointer(
+            Object value, long viewSize, String viewCodecClassName) {
+        return canonicalFunctionPointer(value).retype(viewSize, viewCodecClassName);
+    }
+
+    /** Reconstructs a function-pointer carrier from a previously exposed address. */
+    public static Object functionPointerFromAddress(long address) {
+        if (address == 0) {
+            throw new IllegalArgumentException(
+                    "null address cannot be converted to a Rust function pointer");
+        }
+        synchronized (FUNCTION_POINTER_CELLS) {
+            Object value = FUNCTION_POINTERS_BY_ADDRESS.get(address);
+            if (value == null) {
+                throw new IllegalArgumentException(
+                        "address does not identify an exposed Rust function pointer: "
                                 + Long.toUnsignedString(address));
             }
             return value;

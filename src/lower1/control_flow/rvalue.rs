@@ -4309,19 +4309,64 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                     }
 
                     if matches!(source_mir_ty.kind(), TyKind::FnPtr(..))
+                        && matches!(target_mir_ty.kind(), TyKind::Int(..) | TyKind::Uint(..))
+                        && matches!(
+                            cast_kind,
+                            CastKind::Transmute | CastKind::PointerExposeProvenance
+                        )
+                    {
+                        let address_dest = if oomir_target_type == oomir::Type::U64 {
+                            temp_cast_var.clone()
+                        } else {
+                            format!("{temp_cast_var}_function_address")
+                        };
+                        instructions.push(oomir::Instruction::InvokeStatic {
+                            dest: Some(address_dest.clone()),
+                            class_name: oomir::POINTER_CLASS.to_string(),
+                            method_name: "functionPointerAddress".to_string(),
+                            method_ty: oomir::Signature {
+                                params: vec![(
+                                    "function".to_string(),
+                                    oomir::Type::Class("java/lang/Object".to_string()),
+                                )],
+                                ret: Box::new(oomir::Type::U64),
+                                is_static: true,
+                            },
+                            args: vec![oomir_operand],
+                        });
+                        if oomir_target_type != oomir::Type::U64 {
+                            instructions.push(oomir::Instruction::Cast {
+                                op: oomir::Operand::Variable {
+                                    name: address_dest,
+                                    ty: oomir::Type::U64,
+                                },
+                                ty: oomir_target_type.clone(),
+                                dest: temp_cast_var.clone(),
+                            });
+                        }
+                        return (
+                            instructions,
+                            oomir::Operand::Variable {
+                                name: temp_cast_var,
+                                ty: oomir_target_type,
+                            },
+                        );
+                    }
+
+                    if matches!(source_mir_ty.kind(), TyKind::FnPtr(..))
                         && matches!(target_mir_ty.kind(), TyKind::RawPtr(..))
                     {
                         instructions.push(oomir::Instruction::InvokeStatic {
                             dest: Some(temp_cast_var.clone()),
                             class_name: oomir::POINTER_CLASS.to_string(),
-                            method_name: "cell".to_string(),
+                            method_name: "fromFunctionPointer".to_string(),
                             method_ty: oomir::Signature {
                                 params: vec![
                                     (
                                         "value".to_string(),
                                         oomir::Type::Class("java/lang/Object".to_string()),
                                     ),
-                                    ("size".to_string(), oomir::Type::I32),
+                                    ("view_size".to_string(), oomir::Type::U64),
                                     ("codec".to_string(), oomir::Type::java_string()),
                                 ],
                                 ret: Box::new(oomir_target_type.clone()),
@@ -4347,6 +4392,53 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                         );
                     }
 
+                    if matches!(source_mir_ty.kind(), TyKind::Int(..) | TyKind::Uint(..))
+                        && matches!(target_mir_ty.kind(), TyKind::FnPtr(..))
+                        && matches!(cast_kind, CastKind::Transmute)
+                    {
+                        let address = if oomir_source_type == oomir::Type::U64 {
+                            oomir_operand
+                        } else {
+                            let address_dest = format!("{temp_cast_var}_function_address");
+                            instructions.push(oomir::Instruction::Cast {
+                                op: oomir_operand,
+                                ty: oomir::Type::U64,
+                                dest: address_dest.clone(),
+                            });
+                            oomir::Operand::Variable {
+                                name: address_dest,
+                                ty: oomir::Type::U64,
+                            }
+                        };
+                        let object_dest = format!("{temp_cast_var}_function_object");
+                        instructions.push(oomir::Instruction::InvokeStatic {
+                            dest: Some(object_dest.clone()),
+                            class_name: oomir::POINTER_CLASS.to_string(),
+                            method_name: "functionPointerFromAddress".to_string(),
+                            method_ty: oomir::Signature {
+                                params: vec![("address".to_string(), oomir::Type::U64)],
+                                ret: Box::new(oomir::Type::Class("java/lang/Object".to_string())),
+                                is_static: true,
+                            },
+                            args: vec![address],
+                        });
+                        instructions.push(oomir::Instruction::Cast {
+                            op: oomir::Operand::Variable {
+                                name: object_dest,
+                                ty: oomir::Type::Class("java/lang/Object".to_string()),
+                            },
+                            ty: oomir_target_type.clone(),
+                            dest: temp_cast_var.clone(),
+                        });
+                        return (
+                            instructions,
+                            oomir::Operand::Variable {
+                                name: temp_cast_var,
+                                ty: oomir_target_type,
+                            },
+                        );
+                    }
+
                     if matches!(source_mir_ty.kind(), TyKind::RawPtr(..))
                         && matches!(target_mir_ty.kind(), TyKind::FnPtr(..))
                         && matches!(cast_kind, CastKind::Transmute)
@@ -4361,14 +4453,19 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                     }
 
                     if matches!(oomir_source_type, oomir::Type::Pointer(_))
-                        && oomir_target_type == oomir::Type::U64
+                        && matches!(target_mir_ty.kind(), TyKind::Int(..) | TyKind::Uint(..))
                         && matches!(
                             cast_kind,
                             CastKind::Transmute | CastKind::PointerExposeProvenance
                         )
                     {
+                        let address_dest = if oomir_target_type == oomir::Type::U64 {
+                            temp_cast_var.clone()
+                        } else {
+                            format!("{temp_cast_var}_pointer_address")
+                        };
                         instructions.push(oomir::Instruction::InvokeStatic {
-                            dest: Some(temp_cast_var.clone()),
+                            dest: Some(address_dest.clone()),
                             class_name: oomir::POINTER_CLASS.to_string(),
                             method_name: "address".to_string(),
                             method_ty: oomir::Signature {
@@ -4378,22 +4475,46 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                             },
                             args: vec![oomir_operand],
                         });
+                        if oomir_target_type != oomir::Type::U64 {
+                            instructions.push(oomir::Instruction::Cast {
+                                op: oomir::Operand::Variable {
+                                    name: address_dest,
+                                    ty: oomir::Type::U64,
+                                },
+                                ty: oomir_target_type.clone(),
+                                dest: temp_cast_var.clone(),
+                            });
+                        }
                         return (
                             instructions,
                             oomir::Operand::Variable {
                                 name: temp_cast_var,
-                                ty: oomir::Type::U64,
+                                ty: oomir_target_type,
                             },
                         );
                     }
 
-                    if oomir_source_type == oomir::Type::U64
+                    if matches!(source_mir_ty.kind(), TyKind::Int(..) | TyKind::Uint(..))
                         && matches!(oomir_target_type, oomir::Type::Pointer(_))
                         && matches!(
                             cast_kind,
                             CastKind::PointerWithExposedProvenance | CastKind::IntToInt
                         )
                     {
+                        let address = if oomir_source_type == oomir::Type::U64 {
+                            oomir_operand
+                        } else {
+                            let address_dest = format!("{temp_cast_var}_pointer_address");
+                            instructions.push(oomir::Instruction::Cast {
+                                op: oomir_operand,
+                                ty: oomir::Type::U64,
+                                dest: address_dest.clone(),
+                            });
+                            oomir::Operand::Variable {
+                                name: address_dest,
+                                ty: oomir::Type::U64,
+                            }
+                        };
                         instructions.push(oomir::Instruction::InvokeStatic {
                             dest: Some(temp_cast_var.clone()),
                             class_name: oomir::POINTER_CLASS.to_string(),
@@ -4408,7 +4529,7 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                                 is_static: true,
                             },
                             args: vec![
-                                oomir_operand,
+                                address,
                                 pointer_view_size_operand(*target_mir_ty, tcx, instance),
                                 super::super::types::pointer_view_codec_operand(
                                     pointer_pointee_ty(*target_mir_ty),
