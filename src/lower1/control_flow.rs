@@ -2445,6 +2445,115 @@ pub(super) fn convert_basic_block<'tcx>(
                                     dest: effective_dest,
                                 });
                             }
+                            super::naming::JvmImport::Field(jvm_import) => {
+                                let class_name =
+                                    super::naming::jvm_field_receiver_class_from_instance(
+                                        tcx,
+                                        func_instance,
+                                    )
+                                    .unwrap_or_else(
+                                        |message| {
+                                            tcx.dcx()
+                                                .span_fatal(terminator.source_info.span, message)
+                                        },
+                                    );
+                                let access = super::naming::classify_jvm_field_access(
+                                    &method_signature,
+                                    false,
+                                )
+                                .unwrap_or_else(|message| {
+                                    tcx.dcx().span_fatal(terminator.source_info.span, message)
+                                });
+                                let receiver = oomir_operands.remove(0);
+                                match access {
+                                    super::naming::JvmFieldAccess::Getter { field_ty } => {
+                                        let dest = effective_dest.unwrap_or_else(|| {
+                                            tcx.dcx().span_fatal(
+                                                terminator.source_info.span,
+                                                "a JVM field getter must return a JVM value",
+                                            )
+                                        });
+                                        instructions.push(oomir::Instruction::GetJvmField {
+                                            dest,
+                                            object: receiver,
+                                            field_name: jvm_import.field_name,
+                                            field_ty,
+                                            class_name,
+                                        });
+                                    }
+                                    super::naming::JvmFieldAccess::Setter { field_ty } => {
+                                        let value = oomir_operands.pop().unwrap_or_else(|| {
+                                            tcx.dcx().span_fatal(
+                                                terminator.source_info.span,
+                                                "a JVM field setter requires a value parameter",
+                                            )
+                                        });
+                                        instructions.push(oomir::Instruction::SetJvmField {
+                                            object: receiver,
+                                            field_name: jvm_import.field_name,
+                                            value,
+                                            field_ty,
+                                            class_name,
+                                        });
+                                    }
+                                }
+                            }
+                            super::naming::JvmImport::StaticField(jvm_import) => {
+                                let access = super::naming::classify_jvm_field_access(
+                                    &method_signature,
+                                    true,
+                                )
+                                .unwrap_or_else(|message| {
+                                    tcx.dcx().span_fatal(terminator.source_info.span, message)
+                                });
+                                match access {
+                                    super::naming::JvmFieldAccess::Getter { field_ty } => {
+                                        let dest = effective_dest.unwrap_or_else(|| {
+                                            tcx.dcx().span_fatal(
+                                                terminator.source_info.span,
+                                                "a JVM static field getter must return a JVM value",
+                                            )
+                                        });
+                                        instructions.push(oomir::Instruction::GetStaticField {
+                                            dest,
+                                            class_name: jvm_import.class_name,
+                                            field_name: jvm_import.field_name,
+                                            field_ty,
+                                        });
+                                    }
+                                    super::naming::JvmFieldAccess::Setter { field_ty } => {
+                                        let value = oomir_operands.pop().unwrap_or_else(|| {
+                                            tcx.dcx().span_fatal(
+                                                terminator.source_info.span,
+                                                "a JVM static field setter requires a value parameter",
+                                            )
+                                        });
+                                        instructions.push(oomir::Instruction::SetStaticField {
+                                            class_name: jvm_import.class_name,
+                                            field_name: jvm_import.field_name,
+                                            value,
+                                            field_ty,
+                                        });
+                                    }
+                                }
+                            }
+                            super::naming::JvmImport::Constructor(jvm_import) => {
+                                let dest = effective_dest.unwrap_or_else(|| {
+                                    tcx.dcx().span_fatal(
+                                        terminator.source_info.span,
+                                        "a JVM constructor import must return its linked extern type",
+                                    )
+                                });
+                                let args = oomir_operands
+                                    .into_iter()
+                                    .zip(method_signature.params.into_iter().map(|(_, ty)| ty))
+                                    .collect();
+                                instructions.push(oomir::Instruction::ConstructObject {
+                                    dest,
+                                    class_name: jvm_import.class_name,
+                                    args,
+                                });
+                            }
                         }
                     } else if let InstanceKind::Shim(ShimKind::DropGlue(_, drop_ty)) =
                         func_instance.def

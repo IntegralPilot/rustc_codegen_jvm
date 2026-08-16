@@ -987,6 +987,71 @@ pub fn process_block_instructions(
                     current_state.remove(dest); // Object not constant
                 }
             }
+            Instruction::GetStaticField { dest, .. } => {
+                // A static load may run the declaring class initializer and its
+                // value can be changed by code outside this function.
+                current_state.remove(dest);
+                keep_original_instruction = true;
+            }
+            Instruction::GetJvmField {
+                dest,
+                object,
+                class_name,
+                field_name,
+                field_ty,
+            } => {
+                optimised_instruction = Instruction::GetJvmField {
+                    dest: dest.clone(),
+                    object: object.clone(),
+                    class_name: class_name.clone(),
+                    field_name: field_name.clone(),
+                    field_ty: field_ty.clone(),
+                };
+                current_state.remove(dest);
+                keep_original_instruction = true;
+            }
+            Instruction::SetJvmField {
+                object,
+                class_name,
+                field_name,
+                value,
+                field_ty,
+            } => {
+                if let Operand::Variable { name, .. } = object
+                    && let Some(constant) = current_state.remove(name)
+                {
+                    pre_extra_instructions.push(Instruction::Move {
+                        dest: name.clone(),
+                        src: Operand::Constant(constant),
+                    });
+                }
+                let value =
+                    lookup_const(value, &current_state).map_or(value.clone(), Operand::Constant);
+                optimised_instruction = Instruction::SetJvmField {
+                    object: object.clone(),
+                    class_name: class_name.clone(),
+                    field_name: field_name.clone(),
+                    value,
+                    field_ty: field_ty.clone(),
+                };
+                keep_original_instruction = true;
+            }
+            Instruction::SetStaticField {
+                class_name,
+                field_name,
+                value,
+                field_ty,
+            } => {
+                let new_value =
+                    lookup_const(value, &current_state).map_or(value.clone(), Operand::Constant);
+                optimised_instruction = Instruction::SetStaticField {
+                    class_name: class_name.clone(),
+                    field_name: field_name.clone(),
+                    value: new_value,
+                    field_ty: field_ty.clone(),
+                };
+                keep_original_instruction = true;
+            }
 
             Instruction::ArrayGet { dest, array, index } => {
                 let const_array = lookup_const(array, &current_state);
@@ -1427,6 +1492,8 @@ fn instruction_destination(instruction: &Instruction) -> Option<&str> {
         | Instruction::ConstructObject { dest, .. }
         | Instruction::CreateFunctionPointer { dest, .. }
         | Instruction::GetField { dest, .. }
+        | Instruction::GetStaticField { dest, .. }
+        | Instruction::GetJvmField { dest, .. }
         | Instruction::Cast { dest, .. } => Some(dest),
         Instruction::CallIndirect { dest, .. }
         | Instruction::InvokeInterface { dest, .. }
@@ -1446,6 +1513,8 @@ fn instruction_destination(instruction: &Instruction) -> Option<&str> {
         | Instruction::ArrayStore { .. }
         | Instruction::ArrayFill { .. }
         | Instruction::SetField { .. }
+        | Instruction::SetStaticField { .. }
+        | Instruction::SetJvmField { .. }
         | Instruction::Label { .. } => None,
     }
 }

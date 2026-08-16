@@ -560,6 +560,36 @@ pub enum Instruction {
         field_ty: Type,      // Type of the field (needed for JVM descriptor)
         owner_class: String, // JVM class name where the field is defined
     },
+    /// An exact JVM instance-field load. Unlike Rust-generated object fields,
+    /// pointer values are self-contained and have no companion offset fields.
+    GetJvmField {
+        dest: String,
+        object: Operand,
+        class_name: String,
+        field_name: String,
+        field_ty: Type,
+    },
+    /// An exact JVM instance-field store; pointer offsets are materialized
+    /// into the public `Pointer` carrier before the value crosses the ABI.
+    SetJvmField {
+        object: Operand,
+        class_name: String,
+        field_name: String,
+        value: Operand,
+        field_ty: Type,
+    },
+    GetStaticField {
+        dest: String,
+        class_name: String,
+        field_name: String,
+        field_ty: Type,
+    },
+    SetStaticField {
+        class_name: String,
+        field_name: String,
+        value: Operand,
+        field_ty: Type,
+    },
     Label {
         name: String,
     },

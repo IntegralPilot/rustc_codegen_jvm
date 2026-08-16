@@ -159,11 +159,18 @@ pub fn oomir_function_stack_floor(function: &oomir::Function) -> u16 {
                 }
                 oomir::Instruction::Length { array, .. }
                 | oomir::Instruction::GetField { object: array, .. }
+                | oomir::Instruction::GetJvmField { object: array, .. }
                 | oomir::Instruction::Cast { op: array, .. } => {
                     floor = floor.max(operand_load_stack_floor(array));
                 }
                 oomir::Instruction::SetField { value, .. } => {
                     floor = floor.max(1 + operand_load_stack_floor(value));
+                }
+                oomir::Instruction::SetStaticField { value, .. } => {
+                    floor = floor.max(operand_load_stack_floor(value));
+                }
+                oomir::Instruction::SetJvmField { object, value, .. } => {
+                    floor = floor.max(operand_sequence_stack_floor([object, value], 0));
                 }
                 _ => {}
             }

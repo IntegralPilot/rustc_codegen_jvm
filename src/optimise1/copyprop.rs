@@ -463,15 +463,24 @@ fn rewrite_instruction_uses(
             rewrite_variable_name(object, aliases, locals);
             rewrite_operand(value, aliases, locals);
         }
+        Instruction::SetStaticField { value, .. } => {
+            rewrite_operand(value, aliases, locals);
+        }
+        Instruction::SetJvmField { object, value, .. } => {
+            rewrite_operand(object, aliases, locals);
+            rewrite_operand(value, aliases, locals);
+        }
         Instruction::GetField { object, .. } | Instruction::Cast { op: object, .. } => {
             rewrite_operand(object, aliases, locals);
         }
+        Instruction::GetJvmField { object, .. } => rewrite_operand(object, aliases, locals),
         Instruction::SourceLocation(_)
         | Instruction::LocalVariableScope(_)
         | Instruction::UnwindStart { .. }
         | Instruction::UnwindEnd
         | Instruction::Rethrow
         | Instruction::CreateFunctionPointer { .. }
+        | Instruction::GetStaticField { .. }
         | Instruction::Jump { .. }
         | Instruction::ThrowNewWithMessage { .. }
         | Instruction::Label { .. } => {}
@@ -674,15 +683,22 @@ pub(crate) fn visit_instruction_uses<'a>(
             visitor(object);
             visit_operand_use(value, visitor);
         }
+        Instruction::SetStaticField { value, .. } => visit_operand_use(value, visitor),
+        Instruction::SetJvmField { object, value, .. } => {
+            visit_operand_use(object, visitor);
+            visit_operand_use(value, visitor);
+        }
         Instruction::GetField { object, .. } | Instruction::Cast { op: object, .. } => {
             visit_operand_use(object, visitor);
         }
+        Instruction::GetJvmField { object, .. } => visit_operand_use(object, visitor),
         Instruction::SourceLocation(_)
         | Instruction::LocalVariableScope(_)
         | Instruction::UnwindStart { .. }
         | Instruction::UnwindEnd
         | Instruction::Rethrow
         | Instruction::CreateFunctionPointer { .. }
+        | Instruction::GetStaticField { .. }
         | Instruction::Jump { .. }
         | Instruction::ThrowNewWithMessage { .. }
         | Instruction::Label { .. } => {}
@@ -728,6 +744,8 @@ pub(crate) fn instruction_def(instruction: &Instruction) -> Option<&str> {
         | Instruction::ConstructObject { dest, .. }
         | Instruction::CreateFunctionPointer { dest, .. }
         | Instruction::GetField { dest, .. }
+        | Instruction::GetStaticField { dest, .. }
+        | Instruction::GetJvmField { dest, .. }
         | Instruction::Cast { dest, .. } => Some(dest),
         Instruction::CallIndirect { dest, .. }
         | Instruction::InvokeInterface { dest, .. }
@@ -747,6 +765,8 @@ pub(crate) fn instruction_def(instruction: &Instruction) -> Option<&str> {
         | Instruction::ArrayStore { .. }
         | Instruction::ArrayFill { .. }
         | Instruction::SetField { .. }
+        | Instruction::SetStaticField { .. }
+        | Instruction::SetJvmField { .. }
         | Instruction::Label { .. } => None,
     }
 }

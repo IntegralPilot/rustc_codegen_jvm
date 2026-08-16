@@ -793,7 +793,13 @@ fn prepare_function_constants(
                     }
                 }
                 I::SetField { value, .. } => prepare(value, false)?,
+                I::SetStaticField { value, .. } => prepare(value, false)?,
+                I::SetJvmField { object, value, .. } => {
+                    prepare(object, false)?;
+                    prepare(value, false)?;
+                }
                 I::GetField { object, .. } => prepare(object, false)?,
+                I::GetJvmField { object, .. } => prepare(object, false)?,
                 I::Cast { op, .. } => prepare(op, false)?,
                 I::Switch { discr, .. } => prepare(discr, false)?,
                 I::SourceLocation(_)
@@ -803,6 +809,7 @@ fn prepare_function_constants(
                 | I::Rethrow
                 | I::Jump { .. }
                 | I::CreateFunctionPointer { .. }
+                | I::GetStaticField { .. }
                 | I::ThrowNewWithMessage { .. }
                 | I::Label { .. } => {}
             }

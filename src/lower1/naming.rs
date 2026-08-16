@@ -41,9 +41,73 @@ pub struct JvmVirtualImport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JvmFieldImport {
+    pub field_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JvmStaticFieldImport {
+    pub class_name: String,
+    pub field_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JvmConstructorImport {
+    pub class_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JvmImport {
     Static(JvmStaticImport),
     Virtual(JvmVirtualImport),
+    Field(JvmFieldImport),
+    StaticField(JvmStaticFieldImport),
+    Constructor(JvmConstructorImport),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JvmFieldAccess {
+    Getter { field_ty: crate::oomir::Type },
+    Setter { field_ty: crate::oomir::Type },
+}
+
+/// Infers a JVM field get or put from the Rust declaration. Field imports are
+/// deliberately shape-checked here so an invalid declaration fails during
+/// lowering instead of producing verifier-invalid bytecode.
+pub fn classify_jvm_field_access(
+    signature: &crate::oomir::Signature,
+    is_static: bool,
+) -> Result<JvmFieldAccess, String> {
+    let value_params = signature
+        .params
+        .iter()
+        .map(|(_, ty)| ty)
+        .collect::<Vec<_>>();
+    let receiver_params = usize::from(!is_static);
+    let value_param_count = value_params.len().saturating_sub(receiver_params);
+    let returns_unit = matches!(signature.ret.as_ref(), crate::oomir::Type::Unit);
+
+    if value_params.len() < receiver_params {
+        return Err("an instance JVM field import requires a receiver parameter".to_string());
+    }
+    match (value_param_count, returns_unit) {
+        (0, false) if signature.ret.has_jvm_value() => Ok(JvmFieldAccess::Getter {
+            field_ty: signature.ret.as_ref().clone(),
+        }),
+        (1, true) if value_params[receiver_params].has_jvm_value() => Ok(JvmFieldAccess::Setter {
+            field_ty: value_params[receiver_params].clone(),
+        }),
+        _ => {
+            let expected = if is_static {
+                "a getter `fn() -> T` or setter `fn(T) -> ()`"
+            } else {
+                "a getter `fn(&ExternType) -> T` or setter `fn(&mut ExternType, T) -> ()`"
+            };
+            Err(format!(
+                "a JVM field import must be declared as {expected}, where `T` has a JVM value"
+            ))
+        }
+    }
 }
 
 fn validate_jvm_internal_class_name(class_name: &str) -> Result<(), String> {
@@ -148,14 +212,20 @@ fn validate_jvm_method_name(method_name: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_jvm_field_name(field_name: &str) -> Result<(), String> {
+    if field_name.is_empty() || field_name.contains(['/', '.', ':', ';', '[', '<', '>']) {
+        return Err(format!("invalid JVM field name `{field_name}`"));
+    }
+    Ok(())
+}
+
 pub fn parse_jvm_link_name(link_name: &str) -> Result<Option<JvmImport>, String> {
     let Some(import) = link_name.strip_prefix("jvm:") else {
         return Ok(None);
     };
 
     let (invocation, import) = import.split_once(':').ok_or_else(|| {
-        "malformed JVM import; expected `jvm:static:<internal-class>:<method>` or `jvm:virtual:<method>`"
-            .to_string()
+        "malformed JVM import; expected a JVM method, field, or constructor import".to_string()
     })?;
 
     match invocation {
@@ -206,13 +276,124 @@ pub fn parse_jvm_link_name(link_name: &str) -> Result<Option<JvmImport>, String>
                 descriptor: descriptor.map(str::to_string),
             })))
         }
+        "field" => {
+            validate_jvm_field_name(import)?;
+            Ok(Some(JvmImport::Field(JvmFieldImport {
+                field_name: import.to_string(),
+            })))
+        }
+        "static-field" => {
+            let (class_name, field_name) = import.split_once(':').ok_or_else(|| {
+                "malformed JVM import; expected `jvm:static-field:<internal-class>:<field>`"
+                    .to_string()
+            })?;
+            if field_name.contains(':') {
+                return Err(
+                    "malformed JVM import; expected `jvm:static-field:<internal-class>:<field>`"
+                        .to_string(),
+                );
+            }
+            validate_jvm_internal_class_name(class_name)?;
+            validate_jvm_field_name(field_name)?;
+            Ok(Some(JvmImport::StaticField(JvmStaticFieldImport {
+                class_name: class_name.to_string(),
+                field_name: field_name.to_string(),
+            })))
+        }
+        "new" => {
+            validate_jvm_internal_class_name(import)?;
+            Ok(Some(JvmImport::Constructor(JvmConstructorImport {
+                class_name: import.to_string(),
+            })))
+        }
         _ => Err(format!(
-            "unsupported JVM import invocation `{invocation}`; expected `jvm:static` or `jvm:virtual`"
+            "unsupported JVM import invocation `{invocation}`; expected `jvm:static`, `jvm:virtual`, `jvm:field`, `jvm:static-field`, or `jvm:new`"
         )),
     }
 }
 
+fn jvm_receiver_class_from_instance<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
+    import_kind: &str,
+) -> Result<String, String> {
+    let signature = tcx
+        .fn_sig(instance.def_id())
+        .instantiate(tcx, instance.args)
+        .skip_binder();
+    let Some(receiver_ty) = signature.inputs().first().copied() else {
+        return Err(format!(
+            "a `{import_kind}` import requires a receiver as its first parameter"
+        ));
+    };
+    let pointee_ty = match receiver_ty.kind() {
+        TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _) => *pointee,
+        _ => {
+            return Err(format!(
+                "the first parameter of a `{import_kind}` import must be a pointer or reference to a linked `extern type`"
+            ));
+        }
+    };
+    let TyKind::Foreign(def_id) = pointee_ty.kind() else {
+        return Err(format!(
+            "the first parameter of a `{import_kind}` import must be a pointer or reference to a linked `extern type`"
+        ));
+    };
+    let Some(link_name) = rustc_hir::find_attr!(
+        tcx,
+        *def_id,
+        LinkName { name, .. } => *name
+    ) else {
+        return Err(format!(
+            "the receiver extern type of a `{import_kind}` import must have a `#[link_name]`"
+        ));
+    };
+    parse_jvm_class_link_name(link_name.as_str())
+}
+
 pub fn jvm_virtual_receiver_class_from_instance<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
+) -> Result<String, String> {
+    jvm_receiver_class_from_instance(tcx, instance, "jvm:virtual")
+}
+
+pub fn jvm_field_receiver_class_from_instance<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
+) -> Result<String, String> {
+    jvm_receiver_class_from_instance(tcx, instance, "jvm:field")
+}
+
+fn validate_jvm_field_setter_receiver<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
+) -> Result<(), String> {
+    let signature = tcx
+        .fn_sig(instance.def_id())
+        .instantiate(tcx, instance.args)
+        .skip_binder();
+    let is_setter_shape = signature.inputs().len() == 2
+        && matches!(signature.output().kind(), TyKind::Tuple(fields) if fields.is_empty());
+    if !is_setter_shape {
+        return Ok(());
+    }
+    let receiver_ty = signature.inputs()[0];
+    if matches!(
+        receiver_ty.kind(),
+        TyKind::Ref(_, _, rustc_hir::Mutability::Mut)
+            | TyKind::RawPtr(_, rustc_hir::Mutability::Mut)
+    ) {
+        Ok(())
+    } else {
+        Err(
+            "a `jvm:field` setter requires a mutable reference or mutable raw pointer receiver"
+                .to_string(),
+        )
+    }
+}
+
+fn jvm_constructor_return_class_from_instance<'tcx>(
     tcx: TyCtxt<'tcx>,
     instance: Instance<'tcx>,
 ) -> Result<String, String> {
@@ -220,23 +401,19 @@ pub fn jvm_virtual_receiver_class_from_instance<'tcx>(
         .fn_sig(instance.def_id())
         .instantiate(tcx, instance.args)
         .skip_binder();
-    let Some(receiver_ty) = signature.inputs().first().copied() else {
-        return Err(
-            "a `jvm:virtual` import requires a receiver as its first parameter".to_string(),
-        );
-    };
-    let pointee_ty = match receiver_ty.kind() {
+    let return_ty = signature.output();
+    let pointee_ty = match return_ty.kind() {
         TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _) => *pointee,
         _ => {
             return Err(
-                "the first parameter of a `jvm:virtual` import must be a pointer or reference to a linked `extern type`"
+                "a `jvm:new` import must return a pointer or reference to a linked `extern type`"
                     .to_string(),
             );
         }
     };
     let TyKind::Foreign(def_id) = pointee_ty.kind() else {
         return Err(
-            "the first parameter of a `jvm:virtual` import must be a pointer or reference to a linked `extern type`"
+            "a `jvm:new` import must return a pointer or reference to a linked `extern type`"
                 .to_string(),
         );
     };
@@ -246,8 +423,7 @@ pub fn jvm_virtual_receiver_class_from_instance<'tcx>(
         LinkName { name, .. } => *name
     ) else {
         return Err(
-            "the receiver extern type of a `jvm:virtual` import must have a `#[link_name]`"
-                .to_string(),
+            "the returned extern type of a `jvm:new` import must have a `#[link_name]`".to_string(),
         );
     };
     parse_jvm_class_link_name(link_name.as_str())
@@ -266,8 +442,24 @@ pub fn jvm_import_from_instance<'tcx>(
             "a `jvm:` link name is only supported on a function in an `extern` block".to_string(),
         );
     }
-    if matches!(import, Some(JvmImport::Virtual(_))) {
-        jvm_virtual_receiver_class_from_instance(tcx, instance)?;
+    match &import {
+        Some(JvmImport::Virtual(_)) => {
+            jvm_virtual_receiver_class_from_instance(tcx, instance)?;
+        }
+        Some(JvmImport::Field(_)) => {
+            jvm_field_receiver_class_from_instance(tcx, instance)?;
+            validate_jvm_field_setter_receiver(tcx, instance)?;
+        }
+        Some(JvmImport::Constructor(constructor)) => {
+            let return_class = jvm_constructor_return_class_from_instance(tcx, instance)?;
+            if return_class != constructor.class_name {
+                return Err(format!(
+                    "the `jvm:new` class `{}` does not match the linked return type `{return_class}`",
+                    constructor.class_name
+                ));
+            }
+        }
+        _ => {}
     }
     Ok(import)
 }
@@ -547,9 +739,11 @@ pub fn mono_fn_name_from_instance<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'t
 #[cfg(test)]
 mod tests {
     use super::{
-        JvmImport, JvmStaticImport, JvmVirtualImport, jvm_names, parse_jvm_class_link_name,
-        parse_jvm_link_name,
+        JvmConstructorImport, JvmFieldAccess, JvmFieldImport, JvmImport, JvmStaticFieldImport,
+        JvmStaticImport, JvmVirtualImport, classify_jvm_field_access, jvm_names,
+        parse_jvm_class_link_name, parse_jvm_link_name,
     };
+    use crate::oomir::{Signature, Type};
 
     #[test]
     fn generated_jvm_identifiers_preserve_rust_underscores() {
@@ -610,6 +804,100 @@ mod tests {
     }
 
     #[test]
+    fn parses_instance_and_static_field_imports() {
+        assert_eq!(
+            parse_jvm_link_name("jvm:field:value"),
+            Ok(Some(JvmImport::Field(JvmFieldImport {
+                field_name: "value".to_string(),
+            })))
+        );
+        assert_eq!(
+            parse_jvm_link_name("jvm:static-field:example/Globals:counter"),
+            Ok(Some(JvmImport::StaticField(JvmStaticFieldImport {
+                class_name: "example/Globals".to_string(),
+                field_name: "counter".to_string(),
+            })))
+        );
+    }
+
+    #[test]
+    fn parses_constructor_import() {
+        assert_eq!(
+            parse_jvm_link_name("jvm:new:example/Widget"),
+            Ok(Some(JvmImport::Constructor(JvmConstructorImport {
+                class_name: "example/Widget".to_string(),
+            })))
+        );
+    }
+
+    #[test]
+    fn infers_field_access_from_rust_signature() {
+        let receiver = (
+            "receiver".to_string(),
+            Type::Class("example/Widget".to_string()),
+        );
+        let getter = Signature {
+            params: vec![receiver.clone()],
+            ret: Box::new(Type::I32),
+            is_static: false,
+        };
+        assert_eq!(
+            classify_jvm_field_access(&getter, false),
+            Ok(JvmFieldAccess::Getter {
+                field_ty: Type::I32
+            })
+        );
+
+        let setter = Signature {
+            params: vec![receiver, ("value".to_string(), Type::I64)],
+            ret: Box::new(Type::Unit),
+            is_static: false,
+        };
+        assert_eq!(
+            classify_jvm_field_access(&setter, false),
+            Ok(JvmFieldAccess::Setter {
+                field_ty: Type::I64
+            })
+        );
+
+        let static_getter = Signature {
+            params: Vec::new(),
+            ret: Box::new(Type::Boolean),
+            is_static: false,
+        };
+        assert_eq!(
+            classify_jvm_field_access(&static_getter, true),
+            Ok(JvmFieldAccess::Getter {
+                field_ty: Type::Boolean
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_ambiguous_or_valueless_field_signatures() {
+        let no_value = Signature {
+            params: Vec::new(),
+            ret: Box::new(Type::Unit),
+            is_static: false,
+        };
+        assert!(classify_jvm_field_access(&no_value, true).is_err());
+
+        let getter_with_argument = Signature {
+            params: vec![("value".to_string(), Type::I32)],
+            ret: Box::new(Type::I32),
+            is_static: false,
+        };
+        assert!(classify_jvm_field_access(&getter_with_argument, true).is_err());
+
+        let never_returning_setter = Signature {
+            params: vec![("value".to_string(), Type::I32)],
+            ret: Box::new(Type::Void),
+            is_static: false,
+        };
+        assert!(classify_jvm_field_access(&never_returning_setter, true).is_err());
+    }
+
+    #[test]
     fn ignores_normal_link_names() {
         assert_eq!(parse_jvm_link_name("ordinary_native_symbol"), Ok(None));
     }
@@ -617,7 +905,7 @@ mod tests {
     #[test]
     fn rejects_unsupported_invocation_kind() {
         let error = parse_jvm_link_name("jvm:special:java/lang/Object:toString").unwrap_err();
-        assert!(error.contains("expected `jvm:static` or `jvm:virtual`"));
+        assert!(error.contains("expected `jvm:static`"));
     }
 
     #[test]
@@ -639,6 +927,20 @@ mod tests {
 
         let error = parse_jvm_link_name("jvm:virtual:toString:").unwrap_err();
         assert!(error.contains("descriptor cannot be empty"));
+    }
+
+    #[test]
+    fn rejects_malformed_field_and_constructor_imports() {
+        for invalid in [
+            "jvm:field:",
+            "jvm:field:owner/value",
+            "jvm:static-field:example/Globals",
+            "jvm:static-field:example/Globals:value:extra",
+            "jvm:new:",
+            "jvm:new:example.Widget",
+        ] {
+            assert!(parse_jvm_link_name(invalid).is_err(), "{invalid}");
+        }
     }
 
     #[test]

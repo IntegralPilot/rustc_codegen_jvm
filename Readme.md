@@ -92,6 +92,17 @@ public class Main {
         }
     }
 
+    // Ordinary Java fields and constructors can be imported by Rust.
+    public static int sharedCount = 10;
+
+    public static final class JavaCounter {
+        public int value;
+
+        public JavaCounter(int value) {
+            this.value = value;
+        }
+    }
+
     public static void main(String[] args) {
         // 1. Interact with Rust types and methods
         NamedCounter counter = NamedCounter.new(Utf8View.fromJavaString("JVM-Counter"));
@@ -111,6 +122,9 @@ public class Main {
         LocalDate leapDay = make_java_date(2024, 2, 29);
         System.out.println("Leap day: " + leapDay);
         System.out.println("Leap year: " + java_date_year(leapDay));
+
+        // 5. Construct a Java object and access its fields from Rust
+        System.out.println("Java field result: " + update_java_counter());
     }
 }
 ```
@@ -128,6 +142,26 @@ unsafe extern "C" {
 
     #[link_name = "jvm:virtual:getYear"]
     fn java_local_date_get_year(date: &JavaLocalDate) -> i32;
+
+    #[link_name = "Main$JavaCounter"]
+    pub type JavaCounter;
+
+    #[link_name = "jvm:new:Main$JavaCounter"]
+    fn java_counter_new(value: i32) -> *mut JavaCounter;
+
+    // A return value makes this an instance-field getter.
+    #[link_name = "jvm:field:value"]
+    fn java_counter_value(counter: &JavaCounter) -> i32;
+
+    // A value parameter and () return make this an instance-field setter.
+    #[link_name = "jvm:field:value"]
+    fn java_counter_set_value(counter: &mut JavaCounter, value: i32);
+
+    #[link_name = "jvm:static-field:Main:sharedCount"]
+    fn shared_count() -> i32;
+
+    #[link_name = "jvm:static-field:Main:sharedCount"]
+    fn set_shared_count(value: i32);
 }
 
 impl JavaLocalDate {
@@ -168,6 +202,15 @@ pub fn make_java_date(year: i32, month: i32, day: i32) -> *const JavaLocalDate {
 
 pub fn java_date_year(date: &JavaLocalDate) -> i32 {
     date.year()
+}
+
+pub fn update_java_counter() -> i32 {
+    unsafe {
+        let counter = java_counter_new(5);
+        java_counter_set_value(&mut *counter, java_counter_value(&*counter) + 1);
+        set_shared_count(shared_count() + 1);
+        java_counter_value(&*counter) + shared_count()
+    }
 }
 ```
 

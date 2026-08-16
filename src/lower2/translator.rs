@@ -5226,7 +5226,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                             self.jvm_instructions.push(JI::Lconst_0);
                         }
                     } else {
-                        self.load_operand_as(arg, expected_ty)?;
+                        self.load_call_argument_as(arg, expected_ty)?;
                     }
                 }
 
@@ -5385,6 +5385,70 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                             .push(get_store_instruction(&Type::I64, offset_slot)?);
                     }
                 }
+            }
+            OI::GetJvmField {
+                dest,
+                object,
+                class_name,
+                field_name,
+                field_ty,
+            } => {
+                let class_index = self.constant_pool.add_class(class_name)?;
+                let field_ref_index = self.constant_pool.add_field_ref(
+                    class_index,
+                    field_name,
+                    &field_ty.to_jvm_descriptor(),
+                )?;
+                self.load_operand(object)?;
+                self.jvm_instructions.push(JI::Getfield(field_ref_index));
+                self.store_result(dest, field_ty)?;
+            }
+            OI::SetJvmField {
+                object,
+                class_name,
+                field_name,
+                value,
+                field_ty,
+            } => {
+                let class_index = self.constant_pool.add_class(class_name)?;
+                let field_ref_index = self.constant_pool.add_field_ref(
+                    class_index,
+                    field_name,
+                    &field_ty.to_jvm_descriptor(),
+                )?;
+                self.load_operand(object)?;
+                self.load_call_argument_as(value, field_ty)?;
+                self.jvm_instructions.push(JI::Putfield(field_ref_index));
+            }
+            OI::GetStaticField {
+                dest,
+                class_name,
+                field_name,
+                field_ty,
+            } => {
+                let class_index = self.constant_pool.add_class(class_name)?;
+                let field_ref_index = self.constant_pool.add_field_ref(
+                    class_index,
+                    field_name,
+                    &field_ty.to_jvm_descriptor(),
+                )?;
+                self.jvm_instructions.push(JI::Getstatic(field_ref_index));
+                self.store_result(dest, field_ty)?;
+            }
+            OI::SetStaticField {
+                class_name,
+                field_name,
+                value,
+                field_ty,
+            } => {
+                let class_index = self.constant_pool.add_class(class_name)?;
+                let field_ref_index = self.constant_pool.add_field_ref(
+                    class_index,
+                    field_name,
+                    &field_ty.to_jvm_descriptor(),
+                )?;
+                self.load_call_argument_as(value, field_ty)?;
+                self.jvm_instructions.push(JI::Putstatic(field_ref_index));
             }
             OI::Cast {
                 op: op @ OO::Variable { name, .. },
@@ -7239,6 +7303,8 @@ fn instruction_destination(instruction: &oomir::Instruction) -> Option<&str> {
         | I::Length { dest, .. }
         | I::ConstructObject { dest, .. }
         | I::GetField { dest, .. }
+        | I::GetJvmField { dest, .. }
+        | I::GetStaticField { dest, .. }
         | I::Cast { dest, .. } => Some(dest),
         I::CallIndirect { dest, .. }
         | I::InvokeInterface { dest, .. }
@@ -7374,7 +7440,12 @@ fn instruction_uses_name(instruction: &oomir::Instruction, name: &str) -> bool {
             .iter()
             .any(|(operand, _)| operand_uses_name(operand, name)),
         I::SetField { object, value, .. } => object == name || operand_uses_name(value, name),
+        I::SetStaticField { value, .. } => operand_uses_name(value, name),
+        I::SetJvmField { object, value, .. } => {
+            operand_uses_name(object, name) || operand_uses_name(value, name)
+        }
         I::GetField { object, .. } | I::Cast { op: object, .. } => operand_uses_name(object, name),
+        I::GetJvmField { object, .. } => operand_uses_name(object, name),
         I::SourceLocation(_)
         | I::LocalVariableScope(_)
         | I::UnwindStart { .. }
@@ -7382,6 +7453,7 @@ fn instruction_uses_name(instruction: &oomir::Instruction, name: &str) -> bool {
         | I::Rethrow
         | I::Jump { .. }
         | I::CreateFunctionPointer { .. }
+        | I::GetStaticField { .. }
         | I::ThrowNewWithMessage { .. }
         | I::Label { .. } => false,
     }

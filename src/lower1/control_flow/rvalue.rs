@@ -2407,6 +2407,19 @@ pub(crate) enum FnPointerTarget {
         class_name: String,
         method_name: String,
     },
+    ImportedField {
+        class_name: String,
+        field_name: String,
+        access: super::super::naming::JvmFieldAccess,
+    },
+    ImportedStaticField {
+        class_name: String,
+        field_name: String,
+        access: super::super::naming::JvmFieldAccess,
+    },
+    ImportedConstructor {
+        class_name: String,
+    },
 }
 
 impl FnPointerTarget {
@@ -2430,6 +2443,17 @@ impl FnPointerTarget {
                 class_name,
                 method_name,
             } => format!("{class_name}::{method_name}"),
+            Self::ImportedField {
+                class_name,
+                field_name,
+                ..
+            }
+            | Self::ImportedStaticField {
+                class_name,
+                field_name,
+                ..
+            } => format!("{class_name}::{field_name}"),
+            Self::ImportedConstructor { class_name } => format!("{class_name}::<init>"),
         }
     }
 }
@@ -2481,6 +2505,34 @@ pub(crate) fn fn_pointer_target<'tcx>(
                 return Some(FnPointerTarget::Virtual {
                     class_name,
                     method_name: import.method_name,
+                });
+            }
+            super::super::naming::JvmImport::Field(import) => {
+                let class_name = super::super::naming::jvm_field_receiver_class_from_instance(
+                    tcx,
+                    target_instance,
+                )
+                .unwrap_or_else(|message| tcx.dcx().fatal(message));
+                let access = super::super::naming::classify_jvm_field_access(signature, false)
+                    .unwrap_or_else(|message| tcx.dcx().fatal(message));
+                return Some(FnPointerTarget::ImportedField {
+                    class_name,
+                    field_name: import.field_name,
+                    access,
+                });
+            }
+            super::super::naming::JvmImport::StaticField(import) => {
+                let access = super::super::naming::classify_jvm_field_access(signature, true)
+                    .unwrap_or_else(|message| tcx.dcx().fatal(message));
+                return Some(FnPointerTarget::ImportedStaticField {
+                    class_name: import.class_name,
+                    field_name: import.field_name,
+                    access,
+                });
+            }
+            super::super::naming::JvmImport::Constructor(import) => {
+                return Some(FnPointerTarget::ImportedConstructor {
+                    class_name: import.class_name,
                 });
             }
         }
@@ -2616,6 +2668,71 @@ pub(crate) fn ensure_fn_pointer_adapter_class<'tcx>(
                 method_ty: signature.clone(),
                 args: call_args,
             },
+            FnPointerTarget::ImportedField {
+                class_name,
+                field_name,
+                access,
+            } => {
+                let receiver = call_args.remove(0);
+                match access {
+                    super::super::naming::JvmFieldAccess::Getter { field_ty } => {
+                        oomir::Instruction::GetJvmField {
+                            dest: call_dest
+                                .clone()
+                                .expect("a field getter function pointer returns a value"),
+                            object: receiver,
+                            field_name: field_name.clone(),
+                            field_ty: field_ty.clone(),
+                            class_name: class_name.clone(),
+                        }
+                    }
+                    super::super::naming::JvmFieldAccess::Setter { field_ty } => {
+                        oomir::Instruction::SetJvmField {
+                            object: receiver,
+                            field_name: field_name.clone(),
+                            value: call_args.remove(0),
+                            field_ty: field_ty.clone(),
+                            class_name: class_name.clone(),
+                        }
+                    }
+                }
+            }
+            FnPointerTarget::ImportedStaticField {
+                class_name,
+                field_name,
+                access,
+            } => match access {
+                super::super::naming::JvmFieldAccess::Getter { field_ty } => {
+                    oomir::Instruction::GetStaticField {
+                        dest: call_dest
+                            .clone()
+                            .expect("a static field getter function pointer returns a value"),
+                        class_name: class_name.clone(),
+                        field_name: field_name.clone(),
+                        field_ty: field_ty.clone(),
+                    }
+                }
+                super::super::naming::JvmFieldAccess::Setter { field_ty } => {
+                    oomir::Instruction::SetStaticField {
+                        class_name: class_name.clone(),
+                        field_name: field_name.clone(),
+                        value: call_args.remove(0),
+                        field_ty: field_ty.clone(),
+                    }
+                }
+            },
+            FnPointerTarget::ImportedConstructor { class_name } => {
+                oomir::Instruction::ConstructObject {
+                    dest: call_dest
+                        .clone()
+                        .expect("a constructor function pointer returns an object"),
+                    class_name: class_name.clone(),
+                    args: call_args
+                        .into_iter()
+                        .zip(signature.params.iter().map(|(_, ty)| ty.clone()))
+                        .collect(),
+                }
+            }
             FnPointerTarget::Virtual {
                 class_name,
                 method_name,
