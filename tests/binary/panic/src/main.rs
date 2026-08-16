@@ -1,7 +1,8 @@
 use std::any::Any;
+use std::cell::Cell;
 use std::mem::ManuallyDrop;
 use std::panic::{AssertUnwindSafe, catch_unwind, panic_any, resume_unwind};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 static PANICKING_DROP_RAN: AtomicBool = AtomicBool::new(false);
 static FIELD_AFTER_PANIC_DROPPED: AtomicBool = AtomicBool::new(false);
@@ -48,7 +49,94 @@ fn move_plain_panic_payload(payload: Box<dyn Any>) -> Box<dyn Any> {
     ManuallyDrop::into_inner(ManuallyDrop::new(payload))
 }
 
+fn panicking_vec_clone_cleanup(panic_on_clone: usize) -> (u32, u32) {
+    struct PanickingClone<'count> {
+        drop_count: &'count AtomicU32,
+        ordinary_drop_count: &'count Cell<u32>,
+        panic_on_clone: bool,
+    }
+
+    impl Clone for PanickingClone<'_> {
+        fn clone(&self) -> Self {
+            if self.panic_on_clone {
+                panic!("panic while cloning a vector element");
+            }
+            Self { ..*self }
+        }
+    }
+
+    impl Drop for PanickingClone<'_> {
+        fn drop(&mut self) {
+            self.drop_count.fetch_add(1, Ordering::SeqCst);
+            self.ordinary_drop_count
+                .set(self.ordinary_drop_count.get() + 1);
+        }
+    }
+
+    let drop_count = AtomicU32::new(0);
+    let ordinary_drop_count = Cell::new(0);
+    let mut values = (0..3)
+        .map(|index| PanickingClone {
+            drop_count: &drop_count,
+            ordinary_drop_count: &ordinary_drop_count,
+            panic_on_clone: index == panic_on_clone,
+        })
+        .collect::<Vec<_>>();
+
+    catch_unwind(AssertUnwindSafe(move || values.extend_from_within(..)))
+        .expect_err("the selected element clone must panic");
+    (
+        ordinary_drop_count.get(),
+        drop_count.load(Ordering::SeqCst),
+    )
+}
+
+fn concurrent_panicking_vec_clone_cleanup() {
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let results = std::thread::scope(|scope| {
+        let handles = (0..8)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut mismatch = None;
+                    for _ in 0..16 {
+                        for panic_on_clone in 0..3 {
+                            let counts = panicking_vec_clone_cleanup(panic_on_clone);
+                            let expected = 3 + panic_on_clone as u32;
+                            if counts != (expected, expected) {
+                                mismatch = Some((panic_on_clone, counts, expected));
+                                break;
+                            }
+                        }
+                        if mismatch.is_some() {
+                            break;
+                        }
+                    }
+                    mismatch
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| handle.join())
+            .collect::<Vec<_>>()
+    });
+    std::panic::set_hook(previous_hook);
+
+    for result in results {
+        let mismatch = result.expect("panic cleanup worker must complete");
+        if let Some((panic_on_clone, (ordinary, atomic), expected)) = mismatch {
+            panic!(
+                "Vec clone panicking at index {panic_on_clone} dropped {ordinary} ordinary and \
+                 {atomic} atomic values; expected {expected}"
+            );
+        }
+    }
+}
+
 fn main() {
+    concurrent_panicking_vec_clone_cleanup();
+
     let plain_payload = move_plain_panic_payload(Box::new(73_u32));
     assert_eq!(plain_payload.downcast_ref::<u32>(), Some(&73));
 

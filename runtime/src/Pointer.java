@@ -4429,7 +4429,7 @@ public final class Pointer {
             } catch (Throwable error) {
                 throw new IllegalStateException("could not write Rust field pointer", error);
             }
-            commitOriginMemoryView(owner());
+            commitFieldOwner(owner());
         }
 
     }
@@ -4442,9 +4442,11 @@ public final class Pointer {
         private final MethodHandle elementOffsetSetter;
         private final MethodHandle byteOffsetSetter;
         private final int fieldNameHash;
+        private final boolean primitive;
 
         private FieldAccess(Field field) {
             fieldNameHash = field.getName().hashCode();
+            primitive = field.getType().isPrimitive();
             try {
                 MethodHandles.Lookup lookup = MethodHandles.lookup();
                 getter = lookup.unreflectGetter(field).asType(
@@ -5245,6 +5247,25 @@ public final class Pointer {
         }
     }
 
+    private Object directStructView(String ownerClassName) {
+        try {
+            Class<?> ownerClass = resolvedRuntimeClass(ownerClassName);
+            Object direct = directCellValueOrSelf();
+            if (ownerClass.isInstance(direct)) {
+                return direct;
+            }
+            try {
+                Object candidate = getObject();
+                return ownerClass.isInstance(candidate) ? candidate : null;
+            } catch (IllegalStateException incompatibleView) {
+                return null;
+            }
+        } catch (ClassNotFoundException error) {
+            throw new IllegalArgumentException(
+                    "unknown Rust aggregate class " + ownerClassName, error);
+        }
+    }
+
     private boolean hasStableManagedCarrier() {
         return isDirectAllocationView()
                 || allocation instanceof Cell
@@ -5272,15 +5293,11 @@ public final class Pointer {
             long fieldOffset,
             long fieldSize,
             String fieldCodecClassName) {
-        boolean managedField = fieldSize == 0;
         Class<?> fieldType = null;
-        if (!managedField || traitMetadataCarrier() != null) {
+        if (fieldSize != 0 || traitMetadataCarrier() != null) {
             try {
                 Class<?> ownerClass = resolvedRuntimeClass(ownerClassName);
                 fieldType = instanceField(ownerClass, fieldName).getType();
-                if (!managedField) {
-                    managedField = !fieldType.isPrimitive();
-                }
             } catch (ClassNotFoundException error) {
                 throw new IllegalArgumentException(
                         "unknown Rust aggregate class " + ownerClassName, error);
@@ -5289,8 +5306,19 @@ public final class Pointer {
                         "unknown Rust field " + ownerClassName + "." + fieldName, error);
             }
         }
-        if (managedField && hasStableManagedCarrier()) {
-            Object owner = compatibleStructView(ownerClassName);
+        boolean managedField = fieldType == null || !fieldType.isPrimitive();
+        // Root scalar fields remain byte projections so replacing the whole
+        // aggregate is visible through an existing field pointer. Nested and
+        // decoded carriers already have stable identity; mutating their JVM
+        // field directly avoids replacing the live aggregate during write-back.
+        boolean directPrimitiveField =
+                allocation instanceof FieldCell
+                        || allocation instanceof ReceiverCell
+                        || boundMemoryViewState() != null;
+        if ((managedField || directPrimitiveField) && hasStableManagedCarrier()) {
+            Object owner = fieldType != null && fieldType.isPrimitive()
+                    ? directStructView(ownerClassName)
+                    : compatibleStructView(ownerClassName);
             if (owner != null) {
                 return field(owner, fieldName, fieldSize, fieldCodecClassName)
                         .withMetadata(metadata)
@@ -6981,8 +7009,29 @@ public final class Pointer {
         }
     }
 
+    /** Returns to canonical aggregate storage when field-pointer arithmetic leaves its field. */
+    private Pointer escapedFieldStorage(long byteDelta) {
+        Pointer origin = addressOrigin();
+        if (!(allocation instanceof FieldCell)
+                || !((FieldCell) allocation).access.primitive
+                || byteDelta == 0
+                || origin == null) {
+            return null;
+        }
+        return origin.byteOffsetRetype(
+                        Math.addExact(addressOriginOffset(), byteDelta),
+                        viewSize,
+                        viewCodecClassName)
+                .withMetadata(metadata)
+                .copyDynamicMetadata(this);
+    }
+
     public Pointer offset(long elementCount) {
         long delta = Math.multiplyExact(elementCount, (long) viewSize);
+        Pointer escaped = escapedFieldStorage(delta);
+        if (escaped != null) {
+            return escaped;
+        }
         if (allocation == null) {
             return new Pointer(
                     null,
@@ -7038,6 +7087,10 @@ public final class Pointer {
     public static Pointer offset(Pointer pointer, int elementCount) { return pointer.offset(elementCount); }
 
     public Pointer byte_offset(long byteCount) {
+        Pointer escaped = escapedFieldStorage(byteCount);
+        if (escaped != null) {
+            return escaped;
+        }
         if (allocation == null) {
             return new Pointer(
                     null,
