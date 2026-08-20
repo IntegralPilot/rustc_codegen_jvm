@@ -10,6 +10,7 @@
 use crate::oomir;
 use control_flow::convert_basic_block;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use rustc_hir::attrs::lang_items::LangItem;
 use rustc_middle::{
     mir::{
         BasicBlock, Body, Local, OUTERMOST_SOURCE_SCOPE, Place, ProjectionElem, SourceScope,
@@ -17,7 +18,7 @@ use rustc_middle::{
     },
     ty::{EarlyBinder, Instance, TyCtxt},
 };
-use rustc_span::{Span, hygiene};
+use rustc_span::{Span, def_id::DefId, hygiene};
 use std::collections::VecDeque;
 use types::ty_to_oomir_type;
 
@@ -32,6 +33,10 @@ pub mod types;
 mod value_repr;
 
 pub use closures::generate_closure_function_name;
+
+pub(crate) fn is_non_null_lang_item(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
+    tcx.is_lang_item(def_id, LangItem::NonNull)
+}
 
 pub(crate) fn source_location(
     tcx: TyCtxt<'_>,

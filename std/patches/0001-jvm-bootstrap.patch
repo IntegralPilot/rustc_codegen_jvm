@@ -40,10 +40,8 @@ diff --git a/std/src/sys/random/mod.rs b/std/src/sys/random/mod.rs
 diff --git a/std/src/sys/time/mod.rs b/std/src/sys/time/mod.rs
 --- a/std/src/sys/time/mod.rs
 +++ b/std/src/sys/time/mod.rs
-@@ -3,6 +3,10 @@ cfg_select! {
-         mod hermit;
-         use hermit as imp;
-     }
+@@ -1,4 +1,8 @@
+ cfg_select! {
 +    target_os = "jvm" => {
 +        mod jvm;
 +        use jvm as imp;

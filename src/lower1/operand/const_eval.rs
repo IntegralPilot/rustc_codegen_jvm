@@ -8,7 +8,7 @@ use rustc_middle::ty::{
     AdtDef, EarlyBinder, FloatTy, GenericArgsRef, Instance, InstanceKind, IntTy,
     PseudoCanonicalInput, ScalarInt, ShimKind, Ty, TyCtxt, TyKind, TypingEnv, UintTy, Unnormalized,
 };
-use rustc_span::{def_id::LOCAL_CRATE, sym};
+use rustc_span::def_id::LOCAL_CRATE;
 use std::sync::{LazyLock, Mutex};
 
 use super::super::{
@@ -2196,7 +2196,7 @@ pub fn read_constant_value_from_memory<'tcx>(
         TyKind::Slice(_) => Err("Unsupported type: Direct read of slice from memory".to_string()),
 
         TyKind::Adt(adt_def, substs) => {
-            if tcx.is_diagnostic_item(sym::NonNull, adt_def.did())
+            if crate::lower1::is_non_null_lang_item(tcx, adt_def.did())
                 && matches!(
                     ty_to_oomir_type(ty, tcx, oomir_data_types, instance),
                     oomir::Type::Pointer(_)

@@ -3185,7 +3185,7 @@ fn emit_ty_to_union_bytes<'tcx>(
         return Ok(());
     }
     if let TyKind::Adt(adt_def, args) = ty.kind()
-        && tcx.is_diagnostic_item(sym::NonNull, adt_def.did())
+        && crate::lower1::is_non_null_lang_item(tcx, adt_def.did())
         && matches!(
             ty_to_oomir_type(ty, tcx, data_types, instance_context),
             oomir::Type::Pointer(_)
@@ -3913,7 +3913,7 @@ fn emit_ty_from_union_bytes<'tcx>(
         return Ok(operand_var(typed_dest, jvm_ty));
     }
     if let TyKind::Adt(adt_def, args) = ty.kind()
-        && tcx.is_diagnostic_item(sym::NonNull, adt_def.did())
+        && crate::lower1::is_non_null_lang_item(tcx, adt_def.did())
         && matches!(
             ty_to_oomir_type(ty, tcx, data_types, instance_context),
             oomir::Type::Pointer(_)
@@ -4480,7 +4480,7 @@ fn emit_unprovenanced_pointer_from_union_bytes<'tcx>(
         {
             Some((target_oomir_ty.clone(), *pointee, None))
         }
-        TyKind::Adt(adt_def, args) if tcx.is_diagnostic_item(sym::NonNull, adt_def.did()) => {
+        TyKind::Adt(adt_def, args) if crate::lower1::is_non_null_lang_item(tcx, adt_def.did()) => {
             let Some(pointee) = args.iter().find_map(|arg| arg.as_type()) else {
                 return Ok(None);
             };
@@ -4674,7 +4674,7 @@ pub(super) fn ensure_exact_transmute_helper<'tcx>(
     let pointer_pointee = |ty: Ty<'tcx>, oomir_ty: &oomir::Type| match ty.kind() {
         TyKind::RawPtr(pointee, _) | TyKind::Ref(_, pointee, _) => Some(*pointee),
         TyKind::Adt(adt_def, args)
-            if tcx.is_diagnostic_item(sym::NonNull, adt_def.did())
+            if crate::lower1::is_non_null_lang_item(tcx, adt_def.did())
                 && matches!(oomir_ty, oomir::Type::Pointer(_)) =>
         {
             args.iter().find_map(|arg| arg.as_type())
@@ -4703,7 +4703,7 @@ pub(super) fn ensure_exact_transmute_helper<'tcx>(
     // than publishing an address through temporary byte arrays and recovering it.
     let source_non_null = match (source_ty.kind(), &source_oomir_ty) {
         (TyKind::Adt(adt_def, args), oomir::Type::Class(class_name))
-            if tcx.is_diagnostic_item(sym::NonNull, adt_def.did()) =>
+            if crate::lower1::is_non_null_lang_item(tcx, adt_def.did()) =>
         {
             args.iter()
                 .find_map(|arg| arg.as_type())
@@ -4713,7 +4713,7 @@ pub(super) fn ensure_exact_transmute_helper<'tcx>(
     };
     let target_non_null = match (target_ty.kind(), &target_oomir_ty) {
         (TyKind::Adt(adt_def, args), oomir::Type::Class(class_name))
-            if tcx.is_diagnostic_item(sym::NonNull, adt_def.did()) =>
+            if crate::lower1::is_non_null_lang_item(tcx, adt_def.did()) =>
         {
             args.iter()
                 .find_map(|arg| arg.as_type())
@@ -4728,7 +4728,7 @@ pub(super) fn ensure_exact_transmute_helper<'tcx>(
             Some((target_oomir_ty.clone(), *pointee, None))
         }
         TyKind::Adt(adt_def, args)
-            if tcx.is_diagnostic_item(sym::NonNull, adt_def.did())
+            if crate::lower1::is_non_null_lang_item(tcx, adt_def.did())
                 && matches!(target_oomir_ty, oomir::Type::Pointer(_)) =>
         {
             args.iter()
@@ -5961,7 +5961,7 @@ fn pointer_builtin_codec_operand<'tcx>(
         {
             sized_pointer_codec(*pointee)?
         }
-        TyKind::Adt(adt_def, args) if tcx.is_diagnostic_item(sym::NonNull, adt_def.did()) => {
+        TyKind::Adt(adt_def, args) if crate::lower1::is_non_null_lang_item(tcx, adt_def.did()) => {
             let pointee = args.iter().find_map(|arg| arg.as_type())?;
             if !is_codegen_sized(pointee, tcx) {
                 return None;
@@ -6609,7 +6609,7 @@ pub fn force_define_named_adt<'tcx>(
     let TyKind::Adt(adt_def, substs) = ty.kind() else {
         return ty_to_oomir_type(ty, tcx, data_types, instance_context);
     };
-    if tcx.is_diagnostic_item(sym::NonNull, adt_def.did()) {
+    if crate::lower1::is_non_null_lang_item(tcx, adt_def.did()) {
         let lowered = ty_to_oomir_type(ty, tcx, data_types, instance_context);
         if matches!(lowered, oomir::Type::Pointer(_)) {
             return lowered;
@@ -6694,7 +6694,7 @@ fn ty_to_oomir_type_resolved<'tcx>(
             FloatTy::F128 => oomir::Type::Class(crate::lower2::F128_CLASS.to_string()),
         },
         rustc_middle::ty::TyKind::Adt(adt_def, substs) => {
-            if tcx.is_diagnostic_item(sym::NonNull, adt_def.did())
+            if crate::lower1::is_non_null_lang_item(tcx, adt_def.did())
                 && let Some(pointee) = substs.iter().find_map(|arg| arg.as_type())
                 && is_codegen_sized(pointee, tcx)
             {

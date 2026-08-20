@@ -13,7 +13,6 @@ use rustc_middle::{
     mir::{Body, Local, Operand as MirOperand, Place, ProjectionElem, Rvalue, StatementKind},
     ty::{AdtDef, EarlyBinder, GenericArgsRef, Instance, Ty, TyCtxt, TyKind, TypingEnv},
 };
-use rustc_span::sym;
 use std::cell::RefCell;
 
 pub(crate) fn has_slice_or_str_struct_tail<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {
@@ -814,7 +813,7 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
                     && matches!(
                         base_rust_ty.kind(),
                         TyKind::Adt(adt_def, _)
-                            if tcx.is_diagnostic_item(sym::NonNull, adt_def.did())
+                            if crate::lower1::is_non_null_lang_item(tcx, adt_def.did())
                     )
                     && matches!(current_type, oomir::Type::Pointer(_))
                 {
@@ -1625,7 +1624,7 @@ pub fn emit_instructions_to_set_value<'tcx>(
             if matches!(
                 base_rust_ty.kind(),
                 TyKind::Adt(adt_def, _)
-                    if tcx.is_diagnostic_item(sym::NonNull, adt_def.did())
+                    if crate::lower1::is_non_null_lang_item(tcx, adt_def.did())
             ) && matches!(
                 ty_to_oomir_type(base_rust_ty, tcx, data_types, instance),
                 oomir::Type::Pointer(_)

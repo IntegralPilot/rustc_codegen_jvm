@@ -1615,7 +1615,7 @@ fn emit_comparison_value<'tcx>(
     }
     if matches!(
         mir_ty.kind(),
-        TyKind::Adt(adt, _) if tcx.is_diagnostic_item(sym::NonNull, adt.did())
+        TyKind::Adt(adt, _) if crate::lower1::is_non_null_lang_item(tcx, adt.did())
     ) && let Some(oomir::Type::Class(class_name)) = operand.get_type()
         && let Some(oomir::DataType::Class { fields, .. }) = data_types.get(&class_name)
         && let Some((field_name, field_ty)) = fields.iter().find(|(field_name, field_ty)| {
@@ -1705,7 +1705,7 @@ fn is_non_null_comparison_type(tcx: TyCtxt<'_>, mut ty: Ty<'_>) -> bool {
     }
     matches!(
         ty.kind(),
-        TyKind::Adt(adt, _) if tcx.is_diagnostic_item(sym::NonNull, adt.did())
+        TyKind::Adt(adt, _) if crate::lower1::is_non_null_lang_item(tcx, adt.did())
     )
 }
 
@@ -2953,7 +2953,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                         || matches!(
                                             receiver_value_ty.kind(),
                                             TyKind::Adt(adt_def, _)
-                                            if tcx.is_diagnostic_item(sym::NonNull, adt_def.did())
+                                            if crate::lower1::is_non_null_lang_item(tcx, adt_def.did())
                                         )
                                 };
                                 let zero_sized_raw_pointer_offset = matches!(
@@ -7306,7 +7306,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                     let TyKind::Adt(adt_def, _) = input_ty.kind() else {
                                         continue;
                                     };
-                                    if !tcx.is_diagnostic_item(sym::NonNull, adt_def.did()) {
+                                    if !crate::lower1::is_non_null_lang_item(tcx, adt_def.did()) {
                                         continue;
                                     }
                                     let Some(operand) = oomir_operands.get(index).cloned() else {

@@ -1,17 +1,3 @@
-use rustc_abi::FieldIdx;
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
-use rustc_middle::{
-    mir::{
-        BinOp, Body, BorrowKind as MirBorrowKind, CastKind, Operand as MirOperand, Place,
-        ProjectionElem, Rvalue, UnOp,
-    },
-    ty::{
-        EarlyBinder, Instance, InstanceKind, Ty, TyCtxt, TyKind, TypingEnv,
-        adjustment::PointerCoercion,
-    },
-};
-use rustc_span::sym;
-
 use super::{
     super::{
         jvm_names,
@@ -32,6 +18,18 @@ use super::{
     checked_ops::emit_checked_arithmetic_oomir_instructions,
     oomir::{self, DataTypeMethod},
     trait_objects::{carrier_needs_trait_object_adapter, ensure_trait_object_adapter_class},
+};
+use rustc_abi::FieldIdx;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use rustc_middle::{
+    mir::{
+        BinOp, Body, BorrowKind as MirBorrowKind, CastKind, Operand as MirOperand, Place,
+        ProjectionElem, Rvalue, UnOp,
+    },
+    ty::{
+        EarlyBinder, Instance, InstanceKind, Ty, TyCtxt, TyKind, TypingEnv,
+        adjustment::PointerCoercion,
+    },
 };
 
 use std::sync::atomic::{AtomicUsize, Ordering}; // For unique temp names
@@ -1212,7 +1210,7 @@ fn emit_unsize_value<'tcx>(
     } else if let (TyKind::Adt(source_def, source_args), TyKind::Adt(target_def, target_args)) =
         (source_ty.kind(), target_ty.kind())
         && source_def.did() == target_def.did()
-        && tcx.is_diagnostic_item(sym::NonNull, source_def.did())
+        && crate::lower1::is_non_null_lang_item(tcx, source_def.did())
         && matches!(source_oomir_ty, oomir::Type::Pointer(_))
         && let oomir::Type::Class(target_class) = &target_oomir_ty
     {
@@ -6169,7 +6167,7 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                             instance,
                         );
                     }
-                    if tcx.is_diagnostic_item(sym::NonNull, adt_def.did())
+                    if crate::lower1::is_non_null_lang_item(tcx, adt_def.did())
                         && matches!(aggregate_oomir_type, oomir::Type::Pointer(_))
                     {
                         let operand = operands
