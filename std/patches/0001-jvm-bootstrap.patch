@@ -15,26 +15,32 @@ diff --git a/std/src/sys/alloc/mod.rs b/std/src/sys/alloc/mod.rs
 diff --git a/std/src/sys/io/error/mod.rs b/std/src/sys/io/error/mod.rs
 --- a/std/src/sys/io/error/mod.rs
 +++ b/std/src/sys/io/error/mod.rs
-@@ -36,6 +36,7 @@ cfg_select! {
-         target_family = "wasm",
-         target_os = "zkvm",
-         target_os = "trusty",
+@@ -31,6 +31,12 @@ cfg_select! {
+         mod xous;
+         pub use xous::*;
+     }
+-    any(target_os = "vexos", target_family = "wasm", target_os = "zkvm", target_os = "trusty") => {
++    any(
++        target_os = "vexos",
++        target_family = "wasm",
++        target_os = "zkvm",
++        target_os = "trusty",
 +        target_os = "jvm",
-     ) => {
++    ) => {
          mod generic;
          pub use generic::*;
 diff --git a/std/src/sys/random/mod.rs b/std/src/sys/random/mod.rs
 --- a/std/src/sys/random/mod.rs
 +++ b/std/src/sys/random/mod.rs
-@@ -9,6 +9,10 @@ cfg_select! {
+@@ -12,6 +12,10 @@ cfg_select! {
          mod apple;
          pub use apple::fill_bytes;
-     // Others, in alphabetical ordering.
-+    }
+         // Others, in alphabetical ordering.
+     }
 +    target_os = "jvm" => {
 +        mod jvm;
 +        pub use jvm::fill_bytes;
-     }
++    }
      any(
          target_os = "dragonfly",
 diff --git a/std/src/sys/time/mod.rs b/std/src/sys/time/mod.rs
@@ -93,15 +99,17 @@ diff --git a/std/src/sys/sync/once/mod.rs b/std/src/sys/sync/once/mod.rs
 diff --git a/std/src/sys/thread_local/mod.rs b/std/src/sys/thread_local/mod.rs
 --- a/std/src/sys/thread_local/mod.rs
 +++ b/std/src/sys/thread_local/mod.rs
-@@ -107,6 +107,7 @@ pub(crate) mod guard {
-         any(
-             target_os = "hermit",
-             target_os = "xous",
-+            target_os = "jvm",
-         ) => {
+@@ -126,7 +126,7 @@ pub(crate) mod guard {
+                 use crate::rt::thread_cleanup;
+             }
+         }
+-        any(target_os = "hermit", target_os = "xous") => {
++        any(target_os = "hermit", target_os = "xous", target_os = "jvm") => {
              // `std` is the only runtime, so it just calls the destructor functions
              // itself when the time comes.
-@@ -172,5 +173,15 @@ pub(crate) mod key {
+             pub(crate) fn enable() {}
+@@ -191,6 +191,16 @@ pub(crate) mod key {
+             pub(super) use xous::{Key, get, set};
              use xous::{create, destroy};
          }
 +        target_os = "jvm" => {
@@ -126,14 +134,15 @@ diff --git a/std/src/sys/args/mod.rs b/std/src/sys/args/mod.rs
 +    target_os = "jvm",
  ))]
  mod common;
-@@ -17,3 +18,7 @@ cfg_select! {
+@@ -16,4 +17,8 @@ mod common;
+ cfg_select! {
 +    target_os = "jvm" => {
 +        mod jvm;
 +        pub use jvm::*;
 +    }
      any(
-         all(target_family = "unix", not(any(all(target_family = "wasm", target_os = "linux"), target_os = "espidf", target_os = "vita"))),
-         target_os = "hermit",
+         all(
+             target_family = "unix",
 diff --git a/std/src/sys/env/mod.rs b/std/src/sys/env/mod.rs
 --- a/std/src/sys/env/mod.rs
 +++ b/std/src/sys/env/mod.rs
@@ -215,14 +224,14 @@ diff --git a/std/src/sys/exit.rs b/std/src/sys/exit.rs
  cfg_select! {
      target_os = "linux" => {
          /// Mitigation for <https://github.com/rust-lang/rust/issues/126600>
-@@ -105,4 +111,7 @@ pub fn exit(code: i32) -> ! {
+@@ -94,4 +100,7 @@ cfg_select! {
+ pub fn exit(code: i32) -> ! {
      cfg_select! {
 +        target_os = "jvm" => {
 +            unsafe { jvm_exit(code) }
 +        }
-         target_os = "hermit" => {
-             unsafe { hermit_abi::exit(code) }
-         }
+         target_os = "hermit" => unsafe { hermit_abi::exit(code) },
+         target_os = "linux" => unsafe {
 diff --git a/std/build.rs b/std/build.rs
 --- a/std/build.rs
 +++ b/std/build.rs
