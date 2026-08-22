@@ -21,6 +21,7 @@ extern crate rustc_metadata;
 extern crate rustc_middle;
 extern crate rustc_session;
 extern crate rustc_span;
+extern crate rustc_structures;
 extern crate rustc_target;
 extern crate self as breadcrumbs;
 
@@ -77,9 +78,10 @@ use rustc_middle::{
 };
 use rustc_session::{
     IncrCompSession, Session,
-    config::{CrateType, OutputFilenames},
+    config::OutputFilenames,
 };
 use rustc_span::def_id::{DefId, LOCAL_CRATE};
+use rustc_structures::CrateType;
 use std::{
     any::Any,
     io::{BufReader, BufWriter, Read, Write},
