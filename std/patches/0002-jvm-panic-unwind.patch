@@ -42,7 +42,7 @@ diff --git a/std/src/panicking.rs b/std/src/panicking.rs
          // the panic handler `__rust_panic_cleanup`. As such we can only
          // assume it returns the correct thing for `Box::from_raw` to work
          // without undefined behavior.
-         let obj = unsafe { Box::from_raw(__rust_panic_cleanup(payload)) };
+         let obj = unsafe { __rust_panic_cleanup(payload) };
 -        panic_count::decrease();
 +        if counted_rust_panic {
 +            panic_count::decrease();

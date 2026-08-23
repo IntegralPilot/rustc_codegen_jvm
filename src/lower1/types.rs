@@ -4636,11 +4636,6 @@ pub(super) fn ensure_exact_transmute_helper<'tcx>(
         ret: Box::new(target_oomir_ty.clone()),
         is_static: true,
     };
-    let identity = format!(
-        "{source_ty:?}:{}->{target_ty:?}:{}",
-        source_oomir_ty.to_jvm_descriptor(),
-        target_oomir_ty.to_jvm_descriptor()
-    );
     let readable = format!(
         "{}_to_{}",
         sanitize_name_token(&readable_rust_type_name(
@@ -4656,8 +4651,22 @@ pub(super) fn ensure_exact_transmute_helper<'tcx>(
             instance_context,
         ))
     );
-    let local_name =
-        crate::stable_hash::readable_or_hashed_name("ExactTransmute", &readable, &identity, 180);
+    let identity = format!(
+        "{}:{}->{}:{}",
+        stable_type_identity(tcx, source_ty),
+        source_oomir_ty.to_jvm_descriptor(),
+        stable_type_identity(tcx, target_ty),
+        target_oomir_ty.to_jvm_descriptor()
+    );
+    // The same readable Rust types can use different JVM carriers across
+    // upstream and downstream monomorphizations. Include the descriptors in
+    // the class identity so their helper methods cannot collide at link time.
+    let local_name = crate::stable_hash::readable_disambiguated_name(
+        "ExactTransmute",
+        &readable,
+        &identity,
+        180,
+    );
     let class_name = jvm_names::synthetic_class_for_instance(tcx, instance_context, local_name);
     let helper = ExactTransmuteHelper {
         class_name: class_name.clone(),
@@ -5493,7 +5502,6 @@ pub(super) fn ensure_pointer_memory_codec<'tcx>(
     if !value_ty.has_jvm_value() {
         return Ok(None);
     }
-    let identity = format!("{ty:?}:{}:{size}", value_ty.to_jvm_descriptor());
     let readable = format!(
         "{}_{}bytes",
         sanitize_name_token(&readable_pointer_codec_type_name(
@@ -5504,8 +5512,24 @@ pub(super) fn ensure_pointer_memory_codec<'tcx>(
         )),
         size
     );
-    let local_name =
-        crate::stable_hash::readable_or_hashed_name("PointerCodec", &readable, &identity, 180);
+    // A pretty-printed `Ty` can use a different crate alias in an upstream
+    // crate and a downstream monomorphization (for example `alloc::borrow`
+    // versus `std::borrow`). Pointer views of the same Rust allocation must
+    // nevertheless select the same codec: codec equality is what lets a
+    // retyped view mutate the original JVM carrier instead of a decoded copy.
+    // Use rustc's crate-alias-independent type hash, while retaining the JVM
+    // descriptor so genuinely different carrier ABIs remain disjoint.
+    let identity = format!(
+        "{}:{}:{size}",
+        stable_type_identity(tcx, ty),
+        value_ty.to_jvm_descriptor()
+    );
+    let local_name = crate::stable_hash::readable_disambiguated_name(
+        "PointerCodec",
+        &readable,
+        &identity,
+        180,
+    );
     let class_name = pointer_codec_class_name(ty, tcx, &local_name, &value_ty);
     if matches!(
         data_types.get(&class_name),
@@ -7263,6 +7287,19 @@ pub fn stable_def_path(tcx: TyCtxt<'_>, def_id: DefId) -> String {
 pub fn stable_def_identity(tcx: TyCtxt<'_>, def_id: DefId) -> String {
     let raw_hash = tcx.def_path_hash(def_id).to_raw_def_path_hash();
     crate::stable_hash::short_hash_bytes(&raw_hash.0, 16)
+}
+
+/// Returns rustc's crate-alias-independent identity for a monomorphic type.
+/// Normalize and erase regions before hashing so equivalent upstream and
+/// downstream views have the same JVM ABI identity.
+pub fn stable_type_identity<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> String {
+    let ty = normalize_union_ty(tcx, ty).unwrap_or(ty);
+    let hash = tcx.with_stable_hashing_context(|mut hcx| {
+        let mut hasher = StableHasher::new();
+        ty.stable_hash(&mut hcx, &mut hasher);
+        hasher.finish::<Hash64>()
+    });
+    format!("{hash:016x}")
 }
 
 /// Returns a crate-alias-independent identity for a concrete instance.

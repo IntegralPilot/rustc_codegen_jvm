@@ -203,6 +203,7 @@ fn main() {
     test_weak_refs();
     test_cow();
     test_cow_mutability();
+    test_cow_string_addition();
     test_recursive_box_list();
     test_box_pin_dispatch();
     test_owned_and_pinned_unsizing();
@@ -1066,6 +1067,43 @@ fn test_cow_mutability() {
     val.to_mut().push(4);
     assert!(matches!(val, Cow::Owned(_)));
     assert!(val.as_ref() == [1, 2, 3, 4]);
+}
+
+fn test_cow_string_addition() {
+    let borrowed_prefix: Cow<'_, str> = Cow::Borrowed("Hello, ");
+    let borrowed_suffix: Cow<'_, str> = Cow::Borrowed("World!");
+    let owned_prefix: Cow<'_, str> = Cow::Owned(String::from("Hi, "));
+    let owned_suffix: Cow<'_, str> = Cow::Owned(String::from("Rustaceans!"));
+
+    // These operations enter alloc through a pointer created in this crate.
+    // Both crates must derive the same allocation-codec identity so mutation
+    // through Cow::to_mut writes back to the caller's original storage.
+    assert!(borrowed_prefix.clone() + borrowed_suffix.clone() == "Hello, World!");
+    assert!(borrowed_prefix.clone() + owned_suffix.clone() == "Hello, Rustaceans!");
+    assert!(owned_prefix.clone() + borrowed_suffix.clone() == "Hi, World!");
+    assert!(owned_prefix.clone() + owned_suffix.clone() == "Hi, Rustaceans!");
+    assert!(borrowed_prefix.clone() + "World!" == "Hello, World!");
+    assert!(owned_prefix.clone() + "World!" == "Hi, World!");
+
+    let mut borrowed_cow = borrowed_prefix.clone();
+    borrowed_cow += owned_suffix;
+    assert!(borrowed_cow == "Hello, Rustaceans!");
+
+    let mut owned_cow = owned_prefix.clone();
+    owned_cow += borrowed_suffix;
+    assert!(owned_cow == "Hi, World!");
+
+    let mut borrowed_str = borrowed_prefix;
+    borrowed_str += "World!";
+    assert!(borrowed_str == "Hello, World!");
+
+    let mut owned_str = owned_prefix;
+    owned_str += "World!";
+    assert!(owned_str == "Hi, World!");
+
+    let mut empty: Cow<'_, str> = Cow::Borrowed("");
+    empty += "still borrowed";
+    assert!(matches!(empty, Cow::Borrowed("still borrowed")));
 }
 
 fn test_recursive_box_list() {

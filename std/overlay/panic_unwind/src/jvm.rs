@@ -1,4 +1,5 @@
 use alloc::boxed::Box;
+use alloc::panicking::PanicPayload;
 use alloc::string::String;
 use core::any::Any;
 use core::slice;
@@ -31,8 +32,8 @@ pub(crate) unsafe fn cleanup(payload: *mut u8) -> Box<dyn Any + Send> {
     unsafe { *Box::from_raw(payload.cast::<Box<dyn Any + Send>>()) }
 }
 
-pub(crate) unsafe fn panic(payload: Box<dyn Any + Send>) -> u32 {
-    let payload = Box::into_raw(Box::new(payload)).cast::<u8>();
+pub(crate) fn panic(payload: &mut dyn PanicPayload) -> u32 {
+    let payload = Box::into_raw(Box::new(payload.take_box())).cast::<u8>();
     unsafe { raise_payload(payload) };
     unreachable!()
 }

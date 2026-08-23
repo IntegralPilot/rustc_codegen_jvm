@@ -74,9 +74,27 @@ pub(crate) fn readable_or_hashed_name(
     }
 }
 
+/// Keep a readable generated identifier while always including the complete
+/// identity in its name. Use this for support classes whose JVM descriptor is
+/// not necessarily recoverable from their readable Rust type name.
+pub(crate) fn readable_disambiguated_name(
+    prefix: &str,
+    readable_suffix: &str,
+    identity: &str,
+    max_len: usize,
+) -> String {
+    let identity_hash = short_hash(identity, 10);
+    let suffix = if readable_suffix.is_empty() {
+        identity_hash
+    } else {
+        format!("{readable_suffix}_{identity_hash}")
+    };
+    readable_or_hashed_name(prefix, &suffix, identity, max_len)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::readable_or_hashed_name;
+    use super::{readable_disambiguated_name, readable_or_hashed_name};
 
     #[test]
     fn hashed_fallback_preserves_readable_specialization_identity() {
@@ -84,5 +102,26 @@ mod tests {
         let second = readable_or_hashed_name("Closure", &"Second".repeat(40), "shared", 160);
 
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn disambiguated_names_include_short_descriptor_identity() {
+        let pointer = readable_disambiguated_name(
+            "ExactTransmute",
+            "NonNull_Unit_to_MutPtrUnit",
+            "(Lorg/rustlang/runtime/Pointer;)Lorg/rustlang/runtime/Pointer;",
+            180,
+        );
+        let wrapper = readable_disambiguated_name(
+            "ExactTransmute",
+            "NonNull_Unit_to_MutPtrUnit",
+            "(Lorg/rustlang/core/ptr/non_null/NonNull_Unit;)Lorg/rustlang/runtime/Pointer;",
+            180,
+        );
+
+        assert_ne!(pointer, wrapper);
+        assert!(pointer.starts_with("ExactTransmute_NonNull_Unit_to_MutPtrUnit_"));
+        assert!(pointer.len() <= 180);
+        assert!(wrapper.len() <= 180);
     }
 }
