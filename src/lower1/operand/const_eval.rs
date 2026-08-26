@@ -19,12 +19,12 @@ use super::super::{
     jvm_names, ty_to_oomir_type,
     types::{
         UNION_BYTES_FIELD, UNION_OBJECTS_FIELD, ensure_fn_ptr_interface, ensure_union_data_type,
-        fn_ptr_signature_from_ty, generate_adt_jvm_class_name, generate_tuple_jvm_class_name,
-        pointer_memory_codec_operand, pointer_view_codec_operand, should_define_named_data_type,
-        union_from_method_name,
+        fn_ptr_signature_from_ty, force_define_named_adt, generate_adt_jvm_class_name,
+        generate_tuple_jvm_class_name, jvm_subtype_payload_ty, pointer_memory_codec_operand,
+        pointer_view_codec_operand, union_from_method_name,
     },
 };
-use crate::oomir::{self, DataTypeMethod};
+use crate::oomir;
 
 type ConstAllocation = Allocation<CtfeProvenance>;
 
@@ -2821,69 +2821,18 @@ fn handle_constant_enum<'tcx>(
     // 4. Construct the OOMIR constant
     let base_enum_name =
         generate_adt_jvm_class_name(&adt_def, substs, tcx, oomir_data_types, instance);
+    force_define_named_adt(enum_ty, tcx, oomir_data_types, instance);
+    if jvm_subtype_payload_ty(&adt_def, variant_def, substs, tcx).is_some() {
+        return params
+            .into_iter()
+            .next()
+            .ok_or_else(|| "`#[jvm::subtype]` constant payload has no JVM value".to_string());
+    }
     let variant_class_name = format!(
         "{}${}", // Using '$' as inner class separator is common in JVM
         base_enum_name,
         jvm_names::member_name(&variant_def.ident(tcx).to_string())
     );
-
-    let should_define_data_type = should_define_named_data_type(tcx, adt_def.did());
-
-    // the enum in general
-    if should_define_data_type && !oomir_data_types.contains_key(&base_enum_name) {
-        let mut methods = HashMap::default();
-        methods.insert(
-            "getVariantIdx".to_string(),
-            DataTypeMethod::SimpleConstantReturn(oomir::Type::I32, None),
-        );
-        oomir_data_types.insert(
-            base_enum_name.clone(),
-            oomir::DataType::Class {
-                fields: vec![], // No fields in the abstract class
-                is_abstract: true,
-                methods,
-                super_class: None,
-                interfaces: vec![],
-            },
-        );
-    }
-
-    // this variant
-    if should_define_data_type && !oomir_data_types.contains_key(&variant_class_name) {
-        let mut fields = vec![];
-        for field in variant_def.fields.iter() {
-            let field_type = ty_to_oomir_type(
-                field.ty(tcx, substs).skip_norm_wip(),
-                tcx,
-                oomir_data_types,
-                instance,
-            );
-            if field_type.has_jvm_value() {
-                let field_name = format!("field{}", fields.len());
-                fields.push((field_name, field_type));
-            }
-        }
-
-        let mut methods = HashMap::default();
-        methods.insert(
-            "getVariantIdx".to_string(),
-            DataTypeMethod::SimpleConstantReturn(
-                oomir::Type::I32,
-                Some(oomir::Constant::I32(active_variant_idx.as_u32() as i32)),
-            ),
-        );
-
-        oomir_data_types.insert(
-            variant_class_name.clone(),
-            oomir::DataType::Class {
-                fields,
-                is_abstract: false,
-                methods,
-                super_class: Some(base_enum_name.clone()),
-                interfaces: vec![],
-            },
-        );
-    }
 
     Ok(oomir::Constant::Instance {
         class_name: variant_class_name,

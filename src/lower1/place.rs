@@ -2,12 +2,12 @@ use super::{
     jvm_names,
     operand::convert_operand,
     types::{
-        adapt_simple_enum_operand, generate_adt_jvm_class_name, get_field_name_from_index,
-        pointer_view_codec_operand, should_define_named_data_type, ty_to_oomir_type,
-        union_getter_method_name, union_setter_method_name,
+        adapt_simple_enum_operand, force_define_named_adt, generate_adt_jvm_class_name,
+        get_field_name_from_index, jvm_subtype_payload_ty, pointer_view_codec_operand,
+        ty_to_oomir_type, union_getter_method_name, union_setter_method_name,
     },
 };
-use crate::oomir::{self, DataTypeMethod, Instruction, Operand};
+use crate::oomir::{self, Instruction, Operand};
 use rustc_hash::FxHashMap as HashMap;
 use rustc_middle::{
     mir::{Body, Local, Operand as MirOperand, Place, ProjectionElem, Rvalue, StatementKind},
@@ -810,6 +810,21 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
                         .skip_norm_wip();
 
                 if field_index.index() == 0
+                    && proj_index > 0
+                    && let ProjectionElem::Downcast(_, variant_idx) =
+                        place.projection[proj_index - 1]
+                    && let TyKind::Adt(adt_def, substs) = base_rust_ty.kind()
+                    && jvm_subtype_payload_ty(adt_def, adt_def.variant(variant_idx), substs, tcx)
+                        .is_some()
+                {
+                    // A transparent subtype case has no wrapper field: after
+                    // the downcast, projecting its sole Rust payload is an
+                    // identity at the JVM level.
+                    current_type = ty_to_oomir_type(field_ty, tcx, data_types, instance);
+                    continue;
+                }
+
+                if field_index.index() == 0
                     && matches!(
                         base_rust_ty.kind(),
                         TyKind::Adt(adt_def, _)
@@ -1402,6 +1417,12 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
                 // manufacture invalid names such as `$Break$Break`.
                 let base_enum_oomir_name =
                     generate_adt_jvm_class_name(&adt_def, substs, tcx, data_types, instance);
+                force_define_named_adt(
+                    Ty::new_adt(tcx, adt_def, substs),
+                    tcx,
+                    data_types,
+                    instance,
+                );
 
                 // 2. Get the specific variant definition using the index.
                 let variant_def = adt_def.variant(variant_idx);
@@ -1412,56 +1433,13 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
                     base_enum_oomir_name, // Use OOMIR name already derived
                     jvm_names::member_name(&variant_def.name.to_string())
                 );
+                let transparent_payload =
+                    jvm_subtype_payload_ty(&adt_def, variant_def, substs, tcx);
+                let variant_runtime_type = transparent_payload
+                    .map(|payload_ty| ty_to_oomir_type(payload_ty, tcx, data_types, instance))
+                    .unwrap_or_else(|| oomir::Type::Class(variant_class_name.clone()));
 
-                // 4. Update current_type directly to the OOMIR Class representing the variant.
-                current_type = oomir::Type::Class(variant_class_name.clone());
-
-                // Verify this class exists in data_types
-                if should_define_named_data_type(tcx, adt_def.did())
-                    && !data_types.contains_key(&variant_class_name)
-                {
-                    breadcrumbs::log!(
-                        breadcrumbs::LogLevel::Info,
-                        "place-lowering",
-                        format!(
-                            "Info: Downcast resulted in variant class name '{}' which is not yet in data_types! Will insert it.",
-                            variant_class_name
-                        )
-                    );
-                    let mut fields = vec![];
-                    for field in variant_def.fields.iter() {
-                        let field_type = ty_to_oomir_type(
-                            field.ty(tcx, substs).skip_norm_wip(),
-                            tcx,
-                            data_types,
-                            instance,
-                        );
-                        if field_type.has_jvm_value() {
-                            let field_name = format!("field{}", fields.len());
-                            fields.push((field_name, field_type));
-                        }
-                    }
-
-                    let mut methods = HashMap::default();
-                    methods.insert(
-                        "getVariantIdx".to_string(),
-                        DataTypeMethod::SimpleConstantReturn(
-                            oomir::Type::I32,
-                            Some(oomir::Constant::I32(variant_idx.as_u32() as i32)),
-                        ),
-                    );
-
-                    data_types.insert(
-                        variant_class_name.clone(),
-                        oomir::DataType::Class {
-                            fields,
-                            is_abstract: false,
-                            methods,
-                            super_class: Some(base_enum_oomir_name.clone()),
-                            interfaces: vec![],
-                        },
-                    );
-                }
+                current_type = variant_runtime_type.clone();
 
                 // insert a Cast instruction to convert the base enum to the variant class
                 instructions.push(oomir::Instruction::Cast {
@@ -1470,7 +1448,7 @@ pub fn emit_instructions_to_get_recursive<'tcx>(
                         name: current_var.clone(),
                         ty: type_before_proj,
                     },
-                    ty: oomir::Type::Class(variant_class_name),
+                    ty: variant_runtime_type,
                 });
 
                 breadcrumbs::log!(
@@ -1535,6 +1513,9 @@ pub fn get_place_type<'tcx>(
             let base_class =
                 generate_adt_jvm_class_name(&adt_def, substs, tcx, data_types, instance);
             let variant = adt_def.variant(*variant_idx);
+            if let Some(payload_ty) = jvm_subtype_payload_ty(&adt_def, variant, substs, tcx) {
+                return ty_to_oomir_type(payload_ty, tcx, data_types, instance);
+            }
             return oomir::Type::Class(format!(
                 "{}${}",
                 base_class,

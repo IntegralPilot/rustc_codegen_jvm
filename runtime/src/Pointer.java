@@ -11310,20 +11310,37 @@ public final class Pointer {
         try {
             boolean hasPayload = PUBLIC_INSTANCE_FIELDS.get(type).length != 0;
             if (!hasPayload) {
-                Method discriminant = type.getMethod("_unionDiscriminant");
-                Method fromDiscriminant = type.getMethod("_fromUnionDiscriminant", long.class);
-                if (discriminant.getReturnType() == long.class
-                        && Modifier.isStatic(fromDiscriminant.getModifiers())) {
-                    discriminant.setAccessible(true);
-                    fromDiscriminant.setAccessible(true);
-                    methods = new Method[] {discriminant, fromDiscriminant};
-                }
+                methods = scalarEnumMethodsOnCarrier(type);
             }
-        } catch (NoSuchMethodException ignored) {
-            // This is an ordinary non-enum JVM carrier.
+        } catch (SecurityException ignored) {
+            // Reflection is unavailable for this carrier.
         }
         Method[] previous = SCALAR_ENUM_METHODS.putIfAbsent(type, methods);
         return previous == null ? methods : previous;
+    }
+
+    private static Method[] scalarEnumMethodsOnCarrier(Class<?> type) {
+        for (Class<?> enumInterface : type.getInterfaces()) {
+            try {
+                Method discriminant = enumInterface.getMethod(
+                        "_unionDiscriminant", enumInterface);
+                Method fromDiscriminant = enumInterface.getMethod(
+                        "_fromUnionDiscriminant", long.class);
+                if (discriminant.getReturnType() == long.class
+                        && Modifier.isStatic(discriminant.getModifiers())
+                        && Modifier.isStatic(fromDiscriminant.getModifiers())) {
+                    discriminant.setAccessible(true);
+                    fromDiscriminant.setAccessible(true);
+                    return new Method[] {discriminant, fromDiscriminant};
+                }
+            } catch (NoSuchMethodException ignored) {
+                Method[] inherited = scalarEnumMethodsOnCarrier(enumInterface);
+                if (inherited.length != 0) {
+                    return inherited;
+                }
+            }
+        }
+        return new Method[0];
     }
 
     public static void copyUnionStorage(
@@ -11397,7 +11414,8 @@ public final class Pointer {
         Method[] enumMethods = scalarEnumMethods(value.getClass());
         if (size <= 8 && enumMethods.length != 0) {
             try {
-                return ((Number) enumMethods[0].invoke(value)).longValue();
+                Object result = enumMethods[0].invoke(null, value);
+                return ((Number) result).longValue();
             } catch (ReflectiveOperationException error) {
                 throw new IllegalStateException("could not read Rust enum discriminant", error);
             }

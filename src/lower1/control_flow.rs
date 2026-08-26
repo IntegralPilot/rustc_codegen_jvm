@@ -5,7 +5,7 @@ use super::{
         emit_instructions_to_get_on_own, emit_instructions_to_set_value, emit_pointer_read,
         emit_pointer_slice_parts, emit_retyped_slice_data_pointer, place_to_string,
     },
-    types::mir_int_to_oomir_const,
+    types::{enum_scoped_method_name, mir_int_to_oomir_const},
 };
 use crate::oomir;
 
@@ -1090,11 +1090,11 @@ pub(super) fn emit_rust_drop_value<'tcx>(
         // Rust unions require ManuallyDrop fields. Enums use a virtual helper
         // generated on every variant so the active payload is destroyed without
         // trying to reinterpret the JVM subclass as an inactive variant.
-        TyKind::Adt(adt_def, _) if adt_def.is_enum() => {
-            let class_name = oomir_ty
-                .get_class_name()
-                .expect("a Rust enum has a JVM class")
-                .to_string();
+        TyKind::Adt(adt_def, substs) if adt_def.is_enum() => {
+            super::types::force_define_named_adt(rust_ty, tcx, data_types, instance);
+            let class_name = super::types::generate_adt_jvm_class_name(
+                adt_def, substs, tcx, data_types, instance,
+            );
             if adt_def.destructor(tcx).is_some() {
                 let drop_signature = oomir::Signature {
                     params: vec![("self".to_string(), oomir_ty.clone())],
@@ -1120,22 +1120,23 @@ pub(super) fn emit_rust_drop_value<'tcx>(
                     },
                     args: vec![
                         value,
-                        oomir::Operand::Constant(oomir::Constant::String(class_name)),
+                        oomir::Operand::Constant(oomir::Constant::String(class_name.clone())),
                         oomir::Operand::Constant(oomir::Constant::String("drop".to_string())),
                         oomir::Operand::Constant(oomir::Constant::String(
                             drop_signature.to_jvm_descriptor_with_explicit_params(),
                         )),
-                        oomir::Operand::Constant(oomir::Constant::String(
-                            "_rust_drop_fields".to_string(),
-                        )),
+                        oomir::Operand::Constant(oomir::Constant::String(enum_scoped_method_name(
+                            &class_name,
+                            "_rust_drop_fields",
+                        ))),
                     ],
                     dest: None,
                 });
                 return;
             }
             instructions.push(oomir::Instruction::InvokeVirtual {
-                class_name,
-                method_name: "_rust_drop_fields".to_string(),
+                class_name: class_name.clone(),
+                method_name: enum_scoped_method_name(&class_name, "_rust_drop_fields"),
                 method_ty: oomir::Signature {
                     params: vec![("self".to_string(), oomir_ty)],
                     ret: Box::new(oomir::Type::Void),
@@ -2838,7 +2839,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                             jvm_names::class_for_def_id(tcx, trait_def_id);
                                         matches!(
                                             data_types.get(&interface_name),
-                                            Some(oomir::DataType::Interface { methods })
+                                            Some(oomir::DataType::Interface { methods, .. })
                                                 if methods.contains_key(&declared_method_name)
                                         )
                                         .then_some(interface_name)

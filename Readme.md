@@ -77,6 +77,9 @@ Rust enums, generics, function pointers, unions, and traits map directly onto JV
 import org.rustlang.runtime.Utf8View;
 import my_crate.NamedCounter;
 import my_crate.Accumulator;
+import my_crate.Calculation;
+import my_crate.NetworkEvent;
+import my_crate.AppEvent;
 import java.time.LocalDate;
 import static my_crate.my_crate.*;
 
@@ -109,21 +112,36 @@ public class Main {
         counter.increment();
         System.out.println("Counter: " + counter.count);
 
-        // 2. Pass a standard Java lambda directly to a Rust Fn closure
+        // 2. Construct, inspect, compare, and call methods on Rust enums
+        Calculation calculation = new Calculation.Success(42);
+        Calculation sameCalculation = new Calculation.Success(42);
+        int payload = ((Calculation.Success) calculation).field0;
+        System.out.println("Enum payload: " + payload);
+        System.out.println("Enum method: " + calculation.value_or(-1));
+        System.out.println("Enum equality: " + Calculation.eq(calculation, sameCalculation));
+
+        // A transparent enum subtype needs no AppEvent.Network wrapper.
+        NetworkEvent network = new NetworkEvent.Connected(8080);
+        AppEvent event = network;
+        System.out.println("Outer variant: " + AppEvent.variantIndex(event));
+        System.out.println("Trait method: " + event.code());
+        System.out.println("Rust match: " + inspect_event(event));
+
+        // 3. Pass a standard Java lambda directly to a Rust Fn closure
         int result = apply_twice(val -> val * 3, 2);
         System.out.println("Lambda output: " + result);
 
-        // 3. Pass a Java trait implementation to Rust dynamic dispatch
+        // 4. Pass a Java trait implementation to Rust dynamic dispatch
         JavaAccumulator acc = new JavaAccumulator();
         int finalSum = run_accumulation(acc);
         System.out.println("Accumulator sum: " + finalSum);
 
-        // 4. Construct and call a standard Java API object in Rust
+        // 5. Construct and call a standard Java API object in Rust
         LocalDate leapDay = make_java_date(2024, 2, 29);
         System.out.println("Leap day: " + leapDay);
         System.out.println("Leap year: " + java_date_year(leapDay));
 
-        // 5. Construct a Java object and access its fields from Rust
+        // 6. Construct a Java object and access its fields from Rust
         System.out.println("Java field result: " + update_java_counter());
     }
 }
@@ -131,7 +149,8 @@ public class Main {
 
 **Rust**
 ```rust
-#![feature(extern_types)]
+#![feature(extern_types, register_tool)]
+#![register_tool(jvm)]
 
 unsafe extern "C" {
     #[link_name = "java/time/LocalDate"]
@@ -182,6 +201,50 @@ impl NamedCounter {
     pub fn increment(&mut self) {
         self.count += 1;
     }
+}
+
+pub enum Calculation {
+    Success(i32),
+    Failure(i32),
+}
+
+impl Calculation {
+    pub fn value_or(&self, fallback: i32) -> i32 {
+        match self {
+            Calculation::Success(value) => *value,
+            Calculation::Failure(_) => fallback,
+        }
+    }
+}
+
+pub enum NetworkEvent {
+    Connected(i32),
+    Disconnected,
+}
+
+pub enum AppEvent {
+    // NetworkEvent extends AppEvent on the JVM; AppEvent$Network is omitted.
+    #[jvm::subtype]
+    Network(NetworkEvent),
+    Calculation(Calculation),
+}
+
+pub trait EventCode {
+    fn code(&self) -> i32;
+}
+
+impl EventCode for AppEvent {
+    fn code(&self) -> i32 {
+        match self {
+            AppEvent::Network(NetworkEvent::Connected(port)) => *port,
+            AppEvent::Network(NetworkEvent::Disconnected) => -1,
+            AppEvent::Calculation(value) => value.value_or(-1),
+        }
+    }
+}
+
+pub fn inspect_event(event: AppEvent) -> i32 {
+    event.code()
 }
 
 pub fn apply_twice(callback: &dyn Fn(i32) -> i32, value: i32) -> i32 {
@@ -348,7 +411,7 @@ To enable `unsafe` Rust features without violating JVM bytecode verification or 
 Because the JVM uses garbage collection, `rustc_codegen_jvm` preserves Rust's deterministic RAII semantics by emitting explicit drop calls at compile time.
 
 * Drop elaboration (scopes, drop order, drop flags) is fully handled by `rustc`'s frontend. The backend emits direct bytecode calls at every MIR `Drop` terminator, executing cleanup synchronously at scope exit rather than relying on GC finalisation.
-* This emits static calls for structs, unrolled loops for arrays, dynamic helpers (`Pointer.dropSlice`) for slices, and per-variant virtual methods (`_rust_drop_fields`) for enums to prevent dropping inactive variant payloads.
+* This emits static calls for structs, unrolled loops for arrays, dynamic helpers (`Pointer.dropSlice`) for slices, and enum-scoped per-variant methods for enums to prevent dropping inactive variant payloads. Scoping the generated method names also makes transparent nested enum subtypes safe.
 * Types needing drop implement a simple runtime interface (`public interface RustDrop { void rustDrop(); }`). Dynamic cases like `dyn Trait` objects or pointers use runtime `instanceof` checks (`Pointer.dropRustValue`) to dispatch destructors safely.
 * JVM GC handles raw memory reclamation, but all Rust `Drop` side effects (closing handles, releasing locks) run eagerly as normal Java method calls at standard Rust scope boundaries.
 
@@ -360,13 +423,70 @@ Rust constructs map directly to JVM structures without requiring JNI wrapper cod
 | Rust Construct | JVM Representation |
 |---|---|
 | `struct` | Standard Java class with 1:1 mapped fields and methods |
-| `enum` | Abstract base class with concrete subclasses per variant |
+| `enum` | Java interface with a final concrete class per variant. More info below. |
 | `union` | Class backed by contiguous byte-array storage with reinterpretation helpers |
 | `trait` | Java interface |
 | `fn(A, B) -> R` | Single-method Java interface (Functional Interface) |
-| `impl` methods | Class instance methods |
+| `impl` methods | JVM instance/default methods, with owner-qualified static entry points for Rust dispatch |
 | `&dyn Trait` | Java interface reference |
 | `*const T` / `*mut T` | Shared pointer wrapper (`org.rustlang.runtime.Pointer`) |
+
+### Enums
+
+Rust enums become unsealed Java interfaces, with a final class and public
+payload fields for each variant.
+
+`#[jvm::subtype]` lets a one-field variant use its nested enum directly, without
+a wrapper class:
+
+```rust
+#![feature(register_tool)]
+#![register_tool(jvm)]
+
+pub enum Leaf {
+    A(i32),
+    B,
+}
+
+pub enum Root {
+    #[jvm::subtype]
+    Leaf(Leaf),
+    Other(i32),
+}
+```
+
+Conceptually, this generates:
+
+```java
+public interface Root {
+    static int variantIndex(Root value) { /* instanceof-based tag */ }
+    static boolean eq(Root left, Root right) { /* structural equality */ }
+
+    final class Other implements Root {
+        public int field0;
+        public Other(int field0) { this.field0 = field0; }
+    }
+}
+
+// Leaf is itself the Root.Leaf case: no Root$Leaf wrapper is emitted.
+public interface Leaf extends Root {
+    final class A implements Leaf {
+        public int field0;
+        public A(int field0) { this.field0 = field0; }
+    }
+
+    final class B implements Leaf {
+        public B() {}
+    }
+}
+
+// Ordinary Java code can use the generated hierarchy directly.
+Leaf leaf = new Leaf.A(42);
+Root root = leaf;
+int outerVariant = Root.variantIndex(root); // 0: Root.Leaf
+int payload = ((Leaf.A) root).field0;        // 42
+boolean equal = Root.eq(root, new Leaf.A(42));
+```
 
 ## Prerequisites
 

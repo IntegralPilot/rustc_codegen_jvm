@@ -3,7 +3,7 @@
 use super::{
     DebugInfoOptions, FunctionTranslator,
     constant_pool::{InternedConstantPool, verify_no_duplicate_constants},
-    consts::{get_int_const_instr, load_constant},
+    consts::{get_int_const_instr, get_long_const_instr, load_constant},
     helpers::{
         get_cast_instructions, get_load_instruction, get_type_size, oomir_function_stack_floor,
         relative_pointer_call_stack_extra,
@@ -1214,12 +1214,17 @@ pub(super) fn create_relative_pointer_bridge(
     method_name: &str,
     function: &oomir::Function,
     access_flags: MethodAccessFlags,
+    owner_is_interface: bool,
 ) -> jvm::Result<jvm::Method> {
     debug_assert!(function.signature.is_static);
     let relative_signature = function.signature.relative_pointer_abi_signature();
     let relative_name = format!("{method_name}{}", oomir::RELATIVE_POINTER_METHOD_SUFFIX);
     let class_index = cp.add_class(class_name)?;
-    let target = cp.add_method_ref(class_index, &relative_name, &relative_signature.to_string())?;
+    let target = if owner_is_interface {
+        cp.add_interface_method_ref(class_index, &relative_name, &relative_signature.to_string())?
+    } else {
+        cp.add_method_ref(class_index, &relative_name, &relative_signature.to_string())?
+    };
 
     let mut instructions = Vec::new();
     let mut local = 0u16;
@@ -1266,6 +1271,7 @@ fn create_static_instance_bridge(
     class_name_jvm: &str,
     method_name: &str,
     function: &oomir::Function,
+    owner_is_interface: bool,
 ) -> jvm::Result<jvm::Method> {
     debug_assert!(
         !function.signature.is_static && !function.signature.params.is_empty(),
@@ -1290,8 +1296,11 @@ fn create_static_instance_bridge(
     let descriptor_index = cp.add_utf8(&bridge_descriptor)?;
 
     let class_index = cp.add_class(class_name_jvm)?;
-    let instance_method_ref =
-        cp.add_method_ref(class_index, method_name, &function.signature.to_string())?;
+    let instance_method_ref = if owner_is_interface {
+        cp.add_interface_method_ref(class_index, method_name, &function.signature.to_string())?
+    } else {
+        cp.add_method_ref(class_index, method_name, &function.signature.to_string())?
+    };
 
     let mut instructions = Vec::new();
     let mut next_local = 0;
@@ -1305,7 +1314,19 @@ fn create_static_instance_bridge(
         max_stack += size;
         next_local += size;
     }
-    instructions.push(Instruction::Invokevirtual(instance_method_ref));
+    if owner_is_interface {
+        instructions.push(Instruction::Invokeinterface(
+            instance_method_ref,
+            next_local
+                .try_into()
+                .map_err(|_| jvm::Error::VerificationError {
+                    context: format!("Static receiver bridge {class_name_jvm}::{method_name}"),
+                    message: "interface call exceeds 255 JVM parameter slots".to_string(),
+                })?,
+        ));
+    } else {
+        instructions.push(Instruction::Invokevirtual(instance_method_ref));
+    }
     instructions.push(return_instruction_for_type(bridge_signature.ret.as_ref()));
 
     let mut parameters = Vec::new();
@@ -1412,7 +1433,7 @@ fn patch_branch_target(instructions: &mut [Instruction], branch_index: usize, ta
 fn has_generated_eq(module: &oomir::Module, class_name: &str) -> bool {
     match module.data_types.get(class_name) {
         Some(oomir::DataType::Class { methods, .. }) => methods.contains_key("eq"),
-        Some(oomir::DataType::Interface { methods }) => methods.contains_key("eq"),
+        Some(oomir::DataType::Interface { methods, .. }) => methods.contains_key("eq"),
         None => false,
     }
 }
@@ -1489,16 +1510,41 @@ fn append_field_equality_check(
         }
         Type::Class(class_name) if has_generated_eq(module, class_name) => {
             let class_idx = cp.add_class(class_name)?;
-            let eq_desc = format!("(L{};)Z", class_name);
-            let eq_ref = cp.add_method_ref(class_idx, "eq", &eq_desc)?;
-            instructions.push(Instruction::Invokevirtual(eq_ref));
+            if matches!(
+                module.data_types.get(class_name),
+                Some(oomir::DataType::Interface { is_enum: true, .. })
+            ) {
+                let eq_desc = format!("(L{class_name};L{class_name};)Z");
+                let eq_ref = cp.add_interface_method_ref(class_idx, "eq", &eq_desc)?;
+                instructions.push(Instruction::Invokestatic(eq_ref));
+            } else if matches!(
+                module.data_types.get(class_name),
+                Some(oomir::DataType::Interface { .. })
+            ) {
+                let eq_desc = format!("(L{class_name};)Z");
+                let eq_ref = cp.add_interface_method_ref(class_idx, "eq", &eq_desc)?;
+                instructions.push(Instruction::Invokeinterface(eq_ref, 2));
+            } else {
+                let eq_desc = format!("(L{class_name};)Z");
+                let eq_ref = cp.add_method_ref(class_idx, "eq", &eq_desc)?;
+                instructions.push(Instruction::Invokevirtual(eq_ref));
+            }
             append_boolean_false_check(instructions, false_fixups);
         }
         Type::Interface(interface_name) if has_generated_eq(module, interface_name) => {
             let interface_idx = cp.add_class(interface_name)?;
-            let eq_desc = format!("(L{};)Z", interface_name);
-            let eq_ref = cp.add_interface_method_ref(interface_idx, "eq", &eq_desc)?;
-            instructions.push(Instruction::Invokeinterface(eq_ref, 2));
+            if matches!(
+                module.data_types.get(interface_name),
+                Some(oomir::DataType::Interface { is_enum: true, .. })
+            ) {
+                let eq_desc = format!("(L{interface_name};L{interface_name};)Z");
+                let eq_ref = cp.add_interface_method_ref(interface_idx, "eq", &eq_desc)?;
+                instructions.push(Instruction::Invokestatic(eq_ref));
+            } else {
+                let eq_desc = format!("(L{interface_name};)Z");
+                let eq_ref = cp.add_interface_method_ref(interface_idx, "eq", &eq_desc)?;
+                instructions.push(Instruction::Invokeinterface(eq_ref, 2));
+            }
             append_boolean_false_check(instructions, false_fixups);
         }
         Type::Array(inner) if matches!(inner.as_ref(), Type::Pointer(_)) => {
@@ -1525,6 +1571,167 @@ fn append_field_equality_check(
     }
 
     Ok(())
+}
+
+fn create_enum_adt_helper_method(
+    cp: &mut InternedConstantPool,
+    module: &oomir::Module,
+    owner_name: &str,
+    method_name: &str,
+    kind: &AdtHelperKind,
+) -> jvm::Result<jvm::Method> {
+    let (descriptor, max_stack, max_locals, mut instructions) = match kind {
+        AdtHelperKind::EnumVariantIndex {
+            enum_class,
+            variants,
+        } => {
+            let mut instructions = Vec::new();
+            for (variant_idx, variant) in variants.iter().enumerate() {
+                instructions.push(Instruction::Aload_0);
+                let runtime_type = cp.add_class(&variant.runtime_type)?;
+                instructions.push(Instruction::Instanceof(runtime_type));
+                let next_variant_fixup = instructions.len();
+                instructions.push(Instruction::Ifeq(0));
+                instructions.push(get_int_const_instr(cp, variant_idx as i32));
+                instructions.push(Instruction::Ireturn);
+                let next_variant = instructions.len() as u16;
+                patch_branch_target(&mut instructions, next_variant_fixup, next_variant);
+            }
+            instructions.push(Instruction::Iconst_m1);
+            instructions.push(Instruction::Ireturn);
+            (format!("(L{enum_class};)I"), 1, 1, instructions)
+        }
+        AdtHelperKind::EnumDiscriminant {
+            enum_class,
+            variants,
+            values,
+        } => {
+            let mut instructions = Vec::new();
+            for (variant, value) in variants.iter().zip(values) {
+                instructions.push(Instruction::Aload_0);
+                let runtime_type = cp.add_class(&variant.runtime_type)?;
+                instructions.push(Instruction::Instanceof(runtime_type));
+                let next_variant_fixup = instructions.len();
+                instructions.push(Instruction::Ifeq(0));
+                instructions.push(get_long_const_instr(cp, *value));
+                instructions.push(Instruction::Lreturn);
+                let next_variant = instructions.len() as u16;
+                patch_branch_target(&mut instructions, next_variant_fixup, next_variant);
+            }
+            instructions.push(Instruction::Lconst_0);
+            instructions.push(Instruction::Lreturn);
+            (format!("(L{enum_class};)J"), 2, 1, instructions)
+        }
+        AdtHelperKind::EnumIsVariant {
+            enum_class,
+            runtime_type,
+        } => {
+            let runtime_type = cp.add_class(runtime_type)?;
+            (
+                format!("(L{enum_class};)Z"),
+                1,
+                1,
+                vec![
+                    Instruction::Aload_0,
+                    Instruction::Instanceof(runtime_type),
+                    Instruction::Ireturn,
+                ],
+            )
+        }
+        AdtHelperKind::StaticPartialEqEnum {
+            enum_class,
+            variants,
+        } => {
+            let mut instructions = vec![Instruction::Aload_0, Instruction::Aload_1];
+            let same_reference_fixup = instructions.len();
+            instructions.push(Instruction::If_acmpne(0));
+            instructions.push(Instruction::Iconst_1);
+            instructions.push(Instruction::Ireturn);
+            let first_variant = instructions.len() as u16;
+            patch_branch_target(&mut instructions, same_reference_fixup, first_variant);
+
+            let mut false_fixups = Vec::new();
+            for variant in variants {
+                let runtime_type_idx = cp.add_class(&variant.runtime_type)?;
+                instructions.push(Instruction::Aload_0);
+                instructions.push(Instruction::Instanceof(runtime_type_idx));
+                let next_variant_fixup = instructions.len();
+                instructions.push(Instruction::Ifeq(0));
+
+                instructions.push(Instruction::Aload_1);
+                instructions.push(Instruction::Instanceof(runtime_type_idx));
+                false_fixups.push(instructions.len());
+                instructions.push(Instruction::Ifeq(0));
+
+                if variant.transparent {
+                    instructions.push(Instruction::Aload_0);
+                    instructions.push(Instruction::Checkcast(runtime_type_idx));
+                    instructions.push(Instruction::Aload_1);
+                    instructions.push(Instruction::Checkcast(runtime_type_idx));
+                    let inner_eq_descriptor =
+                        format!("(L{};L{};)Z", variant.runtime_type, variant.runtime_type);
+                    let inner_eq =
+                        cp.add_interface_method_ref(runtime_type_idx, "eq", &inner_eq_descriptor)?;
+                    instructions.push(Instruction::Invokestatic(inner_eq));
+                    instructions.push(Instruction::Ireturn);
+                } else {
+                    for (field_idx, field_ty) in variant.fields.iter().enumerate() {
+                        if field_ty.has_jvm_value() {
+                            append_field_equality_check(
+                                module,
+                                cp,
+                                &mut instructions,
+                                &mut false_fixups,
+                                runtime_type_idx,
+                                &format!("field{field_idx}"),
+                                field_ty,
+                            )?;
+                        }
+                    }
+                    instructions.push(Instruction::Iconst_1);
+                    instructions.push(Instruction::Ireturn);
+                }
+
+                let next_variant = instructions.len() as u16;
+                patch_branch_target(&mut instructions, next_variant_fixup, next_variant);
+            }
+            let false_target = instructions.len() as u16;
+            instructions.push(Instruction::Iconst_0);
+            instructions.push(Instruction::Ireturn);
+            for fixup in false_fixups {
+                patch_branch_target(&mut instructions, fixup, false_target);
+            }
+            (
+                format!("(L{enum_class};L{enum_class};)Z"),
+                4,
+                2,
+                instructions,
+            )
+        }
+        AdtHelperKind::PartialEqClass { .. } => {
+            return Err(jvm::Error::VerificationError {
+                context: format!("Enum helper {owner_name}::{method_name}"),
+                message: "class equality helper requested from enum helper generator".to_string(),
+            });
+        }
+    };
+
+    let code = code_attribute_for_descriptor(
+        cp,
+        max_stack,
+        max_locals,
+        std::mem::take(&mut instructions),
+        &descriptor,
+        true,
+        Some(owner_name),
+        method_name,
+    )?;
+    Ok(jvm::Method {
+        access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
+        name_index: cp.add_utf8(method_name)?,
+        descriptor_index: cp.add_utf8(&descriptor)?,
+        attributes: vec![code],
+    })
 }
 
 /// Creates a ClassFile (as bytes) for a given OOMIR DataType that's a class
@@ -1655,6 +1862,20 @@ pub(super) fn create_data_type_classfile_for_class(
     // Check for jvm_methods
     for (method_name, method) in methods.iter() {
         match method {
+            DataTypeMethod::Abstract(signature) => {
+                let name_index = cp.add_utf8(method_name)?;
+                let descriptor_index = cp.add_utf8(signature.to_string())?;
+                let mut access_flags = MethodAccessFlags::PUBLIC | MethodAccessFlags::ABSTRACT;
+                if signature.is_static {
+                    access_flags |= MethodAccessFlags::STATIC;
+                }
+                jvm_methods.push(jvm::Method {
+                    access_flags,
+                    name_index,
+                    descriptor_index,
+                    attributes: Vec::new(),
+                });
+            }
             DataTypeMethod::SimpleConstantReturn(return_type, return_const) => {
                 let method_desc = format!("(){}", return_type.to_jvm_descriptor());
 
@@ -1800,8 +2021,8 @@ pub(super) fn create_data_type_classfile_for_class(
                 let descriptor_index = cp.add_utf8(&emitted_signature.to_string())?;
 
                 let mut attributes_vec = vec![code_attribute];
-                // Skip MethodParameters for constructors and getVariantIdx
-                if method_name != "<init>" && method_name != "getVariantIdx" {
+                // Constructors do not expose source-level parameter metadata.
+                if method_name != "<init>" {
                     attributes_vec.push(method_parameters_attribute);
                 }
 
@@ -1824,6 +2045,7 @@ pub(super) fn create_data_type_classfile_for_class(
                         method_name,
                         &function,
                         MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
+                        false,
                     )?);
                 }
                 if !function.signature.is_static
@@ -1835,170 +2057,22 @@ pub(super) fn create_data_type_classfile_for_class(
                         class_name_jvm,
                         method_name,
                         &function,
+                        false,
                     )?);
                 }
             }
             DataTypeMethod::AdtHelperMethod { kind } => {
                 let jvm_method = match kind {
-                    AdtHelperKind::IsVariant { variant_idx } => {
-                        // Signature: ()Z - returns boolean
-                        let method_desc = "()Z";
-                        let name_index = cp.add_utf8(method_name)?;
-                        let descriptor_index = cp.add_utf8(method_desc)?;
-
-                        // Get the getVariantIdx method reference on THIS class
-                        let this_class_idx = this_class_index;
-                        let get_variant_idx_ref =
-                            cp.add_method_ref(this_class_idx, "getVariantIdx", "()I")?;
-
-                        let idx = *variant_idx as u16;
-                        // Offsets are instruction indices, not byte offsets:
-                        // 0: aload_0
-                        // 1: invokevirtual - getVariantIdx()
-                        // 2: iconst_X     - push variant index to compare
-                        // 3: if_icmpne 6  - if not equal, jump to instruction 6 (iconst_0)
-                        // 4: iconst_1     - push true
-                        // 5: goto 7       - jump to instruction 7 (ireturn)
-                        // 6: iconst_0     - push false
-                        // 7: ireturn
-                        let push_iconst = match idx {
-                            0 => Instruction::Iconst_0,
-                            1 => Instruction::Iconst_1,
-                            2 => Instruction::Iconst_2,
-                            3 => Instruction::Iconst_3,
-                            4 => Instruction::Iconst_4,
-                            5 => Instruction::Iconst_5,
-                            _ => Instruction::Bipush(idx as i8),
-                        };
-
-                        let instructions = vec![
-                            Instruction::Aload_0,
-                            Instruction::Invokevirtual(get_variant_idx_ref),
-                            push_iconst,
-                            Instruction::If_icmpne(6), // Jump to instruction index 6
-                            Instruction::Iconst_1,
-                            Instruction::Goto(7), // Jump to instruction index 7
-                            Instruction::Iconst_0,
-                            Instruction::Ireturn,
-                        ];
-
-                        let max_stack = 2u16;
-                        let max_locals = 1u16;
-
-                        let code_attribute = code_attribute_for_descriptor(
-                            &mut cp,
-                            max_stack,
-                            max_locals,
-                            instructions,
-                            method_desc,
-                            false,
-                            Some(class_name_jvm),
-                            method_name,
-                        )?;
-
-                        jvm::Method {
-                            access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::FINAL,
-                            name_index,
-                            descriptor_index,
-                            attributes: vec![code_attribute],
-                        }
-                    }
-                    AdtHelperKind::PartialEqEnum { variants } => {
-                        // Signature: (LObject;)Z - takes another enum instance, returns boolean
-                        let method_desc = format!("(L{};)Z", class_name_jvm);
-                        let name_index = cp.add_utf8(method_name)?;
-                        let descriptor_index = cp.add_utf8(&method_desc)?;
-
-                        // Get the getVariantIdx method reference on THIS class
-                        let this_class_idx = this_class_index;
-                        let get_variant_idx_ref =
-                            cp.add_method_ref(this_class_idx, "getVariantIdx", "()I")?;
-
-                        let mut instructions = vec![
-                            Instruction::Aload_0,
-                            Instruction::Invokevirtual(get_variant_idx_ref),
-                            Instruction::Aload_1,
-                            Instruction::Invokevirtual(get_variant_idx_ref),
-                        ];
-                        let mut false_fixups = vec![instructions.len()];
-                        instructions.push(Instruction::If_icmpne(0));
-
-                        for (variant_idx, (variant_name, fields)) in variants.iter().enumerate() {
-                            if fields.is_empty() {
-                                continue;
-                            }
-
-                            let variant_class_name = format!("{class_name_jvm}${variant_name}");
-                            if !module.data_types.contains_key(&variant_class_name) {
-                                continue;
-                            }
-
-                            instructions.push(Instruction::Aload_0);
-                            instructions.push(Instruction::Invokevirtual(get_variant_idx_ref));
-                            instructions.push(get_int_const_instr(&mut cp, variant_idx as i32));
-                            let next_variant_fixup = instructions.len();
-                            instructions.push(Instruction::If_icmpne(0));
-
-                            let variant_class_idx = cp.add_class(&variant_class_name)?;
-
-                            for (field_idx, field_ty) in fields.iter().enumerate() {
-                                if !field_ty.has_jvm_value() {
-                                    continue;
-                                }
-                                append_field_equality_check(
-                                    module,
-                                    &mut cp,
-                                    &mut instructions,
-                                    &mut false_fixups,
-                                    variant_class_idx,
-                                    &format!("field{field_idx}"),
-                                    field_ty,
-                                )?;
-                            }
-
-                            instructions.push(Instruction::Iconst_1);
-                            instructions.push(Instruction::Ireturn);
-
-                            let next_variant_target = instructions.len() as u16;
-                            patch_branch_target(
-                                &mut instructions,
-                                next_variant_fixup,
-                                next_variant_target,
-                            );
-                        }
-
-                        instructions.push(Instruction::Iconst_1);
-                        instructions.push(Instruction::Ireturn);
-
-                        let false_target = instructions.len() as u16;
-                        instructions.push(Instruction::Iconst_0);
-                        instructions.push(Instruction::Ireturn);
-
-                        for fixup in false_fixups {
-                            patch_branch_target(&mut instructions, fixup, false_target);
-                        }
-
-                        let max_stack = 4u16;
-                        let max_locals = 2u16;
-
-                        let code_attribute = code_attribute_for_descriptor(
-                            &mut cp,
-                            max_stack,
-                            max_locals,
-                            instructions,
-                            &method_desc,
-                            false,
-                            Some(class_name_jvm),
-                            method_name,
-                        )?;
-
-                        jvm::Method {
-                            access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::FINAL,
-                            name_index,
-                            descriptor_index,
-                            attributes: vec![code_attribute],
-                        }
-                    }
+                    AdtHelperKind::EnumVariantIndex { .. }
+                    | AdtHelperKind::EnumDiscriminant { .. }
+                    | AdtHelperKind::EnumIsVariant { .. }
+                    | AdtHelperKind::StaticPartialEqEnum { .. } => create_enum_adt_helper_method(
+                        &mut cp,
+                        module,
+                        class_name_jvm,
+                        method_name,
+                        kind,
+                    )?,
                     AdtHelperKind::PartialEqClass { fields } => {
                         let method_desc = format!("(L{};)Z", class_name_jvm);
                         let name_index = cp.add_utf8(method_name)?;
@@ -2156,9 +2230,23 @@ pub(super) fn create_data_type_classfile_for_class(
 
 /// Creates a ClassFile (as bytes) for a given OOMIR DataType that's an interface
 pub(super) fn create_data_type_classfile_for_interface(
-    interface_name_jvm: &str, // Renamed for clarity
-    methods: &HashMap<String, Signature>,
+    interface_name_jvm: &str,
+    methods: &HashMap<String, DataTypeMethod>,
+    super_interfaces: &[String],
+    module: &oomir::Module,
+    subclasses: Vec<String>,
+    nest_host: Option<String>,
+    debug_info: DebugInfoOptions,
+    relative_static_methods: &HashSet<oomir::FunctionKey>,
 ) -> jvm::Result<Vec<u8>> {
+    let source_files = methods
+        .values()
+        .filter_map(|method| match method {
+            DataTypeMethod::Function(function) => function.source_file(),
+            _ => None,
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    let source_file_name = source_files.first().map(|file| (*file).to_string());
     let mut cp = InternedConstantPool::default();
 
     let this_class_index = cp.add_class(interface_name_jvm)?;
@@ -2167,115 +2255,336 @@ pub(super) fn create_data_type_classfile_for_interface(
     let super_class_index = cp.add_class("java/lang/Object")?;
 
     let mut jvm_methods: Vec<jvm::Method> = Vec::new();
-    for (method_name, signature) in methods {
-        // Construct the descriptor: (param1_desc param2_desc ...)return_desc
-        let mut descriptor = String::from("(");
-        for (_param_name, param_type) in &signature.params {
-            if param_type.has_jvm_value() {
-                descriptor.push_str(&param_type.to_jvm_descriptor());
-            }
-        }
-        descriptor.push(')');
-        descriptor.push_str(&signature.ret.to_jvm_return_descriptor());
+    let mut class_attributes = Vec::new();
+    let mut bootstrap_methods: Vec<BootstrapMethod> = Vec::new();
+    let mut next_factory = 0;
+    for (method_name, method) in methods {
+        match method {
+            DataTypeMethod::Abstract(signature) => {
+                if signature.is_static {
+                    return Err(jvm::Error::VerificationError {
+                        context: format!("Interface {interface_name_jvm}"),
+                        message: format!(
+                            "static interface method {method_name} cannot be abstract"
+                        ),
+                    });
+                }
+                // Abstract interface signatures contain only their explicit
+                // JVM parameters. There is no OOMIR function body here, so no
+                // synthetic receiver local needs to be stripped.
+                let descriptor = signature.to_jvm_descriptor_with_explicit_params();
+                jvm_methods.push(jvm::Method {
+                    access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::ABSTRACT,
+                    name_index: cp.add_utf8(method_name)?,
+                    descriptor_index: cp.add_utf8(&descriptor)?,
+                    attributes: Vec::new(),
+                });
 
-        let name_index = cp.add_utf8(method_name)?;
-        let descriptor_index = cp.add_utf8(&descriptor)?;
+                if method_name == "call"
+                    && interface_name_jvm.starts_with("org/rustlang/runtime/FnPtr_")
+                {
+                    let mut explicit_signature = signature.clone();
+                    explicit_signature.is_static = true;
+                    if explicit_signature.supports_relative_pointer_abi() {
+                        let relative_signature =
+                            explicit_signature.relative_pointer_abi_signature();
+                        let relative_descriptor =
+                            relative_signature.to_jvm_descriptor_with_explicit_params();
+                        let call_descriptor =
+                            explicit_signature.to_jvm_descriptor_with_explicit_params();
+                        let pointer_class = cp.add_class(oomir::POINTER_CLASS)?;
+                        let materialize = cp.add_method_ref(
+                            pointer_class,
+                            "materializeRelative",
+                            &format!("(L{};JJ)L{};", oomir::POINTER_CLASS, oomir::POINTER_CLASS),
+                        )?;
+                        let call_ref = cp.add_interface_method_ref(
+                            this_class_index,
+                            "call",
+                            &call_descriptor,
+                        )?;
 
-        let flags = if signature.is_static {
-            MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC | MethodAccessFlags::ABSTRACT
-        } else {
-            MethodAccessFlags::PUBLIC | MethodAccessFlags::ABSTRACT
-        };
-
-        // Interface methods are implicitly public and abstract (unless 'default' or 'static')
-        // We assume these are the standard abstract interface methods.
-        let jvm_method = jvm::Method {
-            access_flags: flags,
-            name_index,
-            descriptor_index,
-            attributes: Vec::new(), // Abstract methods have no Code attribute
-        };
-        jvm_methods.push(jvm_method);
-        if method_name == "call" && interface_name_jvm.starts_with("org/rustlang/runtime/FnPtr_") {
-            let mut explicit_signature = signature.clone();
-            explicit_signature.is_static = true;
-            if explicit_signature.supports_relative_pointer_abi() {
-                let relative_signature = explicit_signature.relative_pointer_abi_signature();
-                let relative_descriptor =
-                    relative_signature.to_jvm_descriptor_with_explicit_params();
-                let call_descriptor = explicit_signature.to_jvm_descriptor_with_explicit_params();
-                let pointer_class = cp.add_class(oomir::POINTER_CLASS)?;
-                let materialize = cp.add_method_ref(
-                    pointer_class,
-                    "materializeRelative",
-                    &format!("(L{};JJ)L{};", oomir::POINTER_CLASS, oomir::POINTER_CLASS),
-                )?;
-                let call_ref =
-                    cp.add_interface_method_ref(this_class_index, "call", &call_descriptor)?;
-
-                let mut instructions = vec![Instruction::Aload_0];
-                let mut local = 1u16;
-                let mut stack = 1u16;
-                let mut max_stack = stack;
-                let mut call_slots = 1u16;
-                for (_, ty) in &explicit_signature.params {
-                    if !ty.has_jvm_value() {
-                        continue;
-                    }
-                    if matches!(ty, Type::Pointer(_)) {
-                        instructions.push(get_load_instruction(ty, local)?);
-                        instructions.push(get_load_instruction(&Type::I64, local + 1)?);
-                        instructions.push(get_load_instruction(&Type::I64, local + 3)?);
-                        max_stack = max_stack.max(stack.saturating_add(5));
-                        instructions.push(Instruction::Invokestatic(materialize));
-                        local += 5;
-                        stack += 1;
-                        call_slots += 1;
-                    } else {
-                        let size = get_type_size(ty);
-                        instructions.push(get_load_instruction(ty, local)?);
-                        local += size;
-                        stack += size;
-                        call_slots += size;
-                        max_stack = max_stack.max(stack);
+                        let mut instructions = vec![Instruction::Aload_0];
+                        let mut local = 1u16;
+                        let mut stack = 1u16;
+                        let mut max_stack = stack;
+                        let mut call_slots = 1u16;
+                        for (_, ty) in &explicit_signature.params {
+                            if !ty.has_jvm_value() {
+                                continue;
+                            }
+                            if matches!(ty, Type::Pointer(_)) {
+                                instructions.push(get_load_instruction(ty, local)?);
+                                instructions.push(get_load_instruction(&Type::I64, local + 1)?);
+                                instructions.push(get_load_instruction(&Type::I64, local + 3)?);
+                                max_stack = max_stack.max(stack.saturating_add(5));
+                                instructions.push(Instruction::Invokestatic(materialize));
+                                local += 5;
+                                stack += 1;
+                                call_slots += 1;
+                            } else {
+                                let size = get_type_size(ty);
+                                instructions.push(get_load_instruction(ty, local)?);
+                                local += size;
+                                stack += size;
+                                call_slots += size;
+                                max_stack = max_stack.max(stack);
+                            }
+                        }
+                        instructions.push(Instruction::Invokeinterface(
+                            call_ref,
+                            call_slots
+                                .try_into()
+                                .map_err(|_| jvm::Error::VerificationError {
+                                    context: format!(
+                                        "Relative function-pointer bridge {interface_name_jvm}"
+                                    ),
+                                    message: "interface call exceeds 255 JVM parameter slots"
+                                        .to_string(),
+                                })?,
+                        ));
+                        instructions.push(return_instruction_for_type(&explicit_signature.ret));
+                        jvm_methods.push(jvm::Method {
+                            access_flags: MethodAccessFlags::PUBLIC,
+                            name_index: cp.add_utf8(&format!(
+                                "call{}",
+                                oomir::RELATIVE_POINTER_METHOD_SUFFIX
+                            ))?,
+                            descriptor_index: cp.add_utf8(&relative_descriptor)?,
+                            attributes: vec![code_attribute_for_descriptor(
+                                &mut cp,
+                                max_stack.max(get_type_size(&explicit_signature.ret)),
+                                local,
+                                instructions,
+                                &relative_descriptor,
+                                false,
+                                Some(interface_name_jvm),
+                                "call$relative",
+                            )?],
+                        });
                     }
                 }
-                instructions.push(Instruction::Invokeinterface(
-                    call_ref,
-                    call_slots
-                        .try_into()
-                        .map_err(|_| jvm::Error::VerificationError {
-                            context: format!(
-                                "Relative function-pointer bridge {interface_name_jvm}"
-                            ),
-                            message: "interface call exceeds 255 JVM parameter slots".to_string(),
-                        })?,
-                ));
-                instructions.push(return_instruction_for_type(&explicit_signature.ret));
+            }
+            DataTypeMethod::SimpleConstantReturn(return_type, return_const) => {
+                let descriptor = format!("(){}", return_type.to_jvm_descriptor());
+                let (access_flags, attributes) = if let Some(return_const) = return_const {
+                    (
+                        MethodAccessFlags::PUBLIC,
+                        vec![create_code_from_method_name_and_constant_return(
+                            return_const,
+                            &mut cp,
+                        )?],
+                    )
+                } else {
+                    (
+                        MethodAccessFlags::PUBLIC | MethodAccessFlags::ABSTRACT,
+                        Vec::new(),
+                    )
+                };
                 jvm_methods.push(jvm::Method {
-                    access_flags: MethodAccessFlags::PUBLIC,
-                    name_index: cp
-                        .add_utf8(&format!("call{}", oomir::RELATIVE_POINTER_METHOD_SUFFIX))?,
-                    descriptor_index: cp.add_utf8(&relative_descriptor)?,
-                    attributes: vec![code_attribute_for_descriptor(
-                        &mut cp,
-                        max_stack.max(get_type_size(&explicit_signature.ret)),
-                        local,
-                        instructions,
-                        &relative_descriptor,
-                        false,
-                        Some(interface_name_jvm),
-                        "call$relative",
-                    )?],
+                    access_flags,
+                    name_index: cp.add_utf8(method_name)?,
+                    descriptor_index: cp.add_utf8(&descriptor)?,
+                    attributes,
                 });
             }
+            DataTypeMethod::Function(function) => {
+                let mut function = function.clone();
+                let relative_adapter_method = method_name
+                    .ends_with(oomir::RELATIVE_POINTER_METHOD_SUFFIX)
+                    && function.signature.supports_relative_pointer_abi();
+                let relative_static_method = function.signature.is_static
+                    && relative_static_methods.contains(&oomir::FunctionKey::new(
+                        interface_name_jvm,
+                        method_name,
+                        &function.signature,
+                    ));
+                let use_relative_pointer_abi = relative_adapter_method || relative_static_method;
+                super::prepare_function_constants(
+                    &mut function,
+                    &mut cp,
+                    interface_name_jvm,
+                    &mut jvm_methods,
+                    &mut next_factory,
+                )
+                .map_err(|error| jvm::Error::VerificationError {
+                    context: format!("Constants for {interface_name_jvm}::{method_name}"),
+                    message: format!(
+                        "Failed after creating {next_factory} constant factories: {error:?}"
+                    ),
+                })?;
+
+                let owner = (!function.signature.is_static).then_some(interface_name_jvm);
+                let translator = FunctionTranslator::new(
+                    &function,
+                    &mut cp,
+                    &mut bootstrap_methods,
+                    module,
+                    relative_static_methods,
+                    function.signature.is_static,
+                    owner,
+                    debug_info,
+                    use_relative_pointer_abi,
+                );
+                let (jvm_code, max_locals, code_attributes, exception_table) = translator
+                    .translate()
+                    .map_err(|error| jvm::Error::VerificationError {
+                        context: format!("Function {interface_name_jvm}::{method_name}"),
+                        message: format!("Failed to translate function: {error:?}"),
+                    })?;
+                let stack_floor = oomir_function_stack_floor(&function)
+                    .saturating_add(relative_pointer_call_stack_extra(&function));
+                let max_stack = match jvm_code.max_stack(&cp) {
+                    Ok(max_stack) => max_stack.saturating_mul(2).max(stack_floor),
+                    Err(_) => stack_floor.max(1024),
+                };
+                let emitted_signature = if use_relative_pointer_abi {
+                    function.signature.relative_pointer_abi_signature()
+                } else {
+                    function.signature.clone()
+                };
+                let emitted_method_name = if relative_static_method {
+                    format!("{method_name}{}", oomir::RELATIVE_POINTER_METHOD_SUFFIX)
+                } else {
+                    method_name.clone()
+                };
+
+                let mut parameters = Vec::new();
+                for (name, param_ty) in emitted_signature.explicit_jvm_params() {
+                    if param_ty.has_jvm_value() {
+                        parameters.push(jvm::attributes::MethodParameter {
+                            name_index: cp.add_utf8(name)?,
+                            access_flags: MethodAccessFlags::empty(),
+                        });
+                    }
+                }
+                let mut attributes = vec![Attribute::Code {
+                    name_index: cp.add_utf8("Code")?,
+                    max_stack,
+                    max_locals,
+                    code: jvm_code,
+                    exception_table,
+                    attributes: code_attributes,
+                }];
+                attributes.push(Attribute::MethodParameters {
+                    name_index: cp.add_utf8("MethodParameters")?,
+                    parameters,
+                });
+                // OOMIR instance bodies retain `self` in local 0. The same
+                // bytecode is therefore valid as an owner-qualified static
+                // entry point when `self` is made explicit in the descriptor.
+                // Duplicating the body (rather than virtually delegating) is
+                // essential for enum-interface subtyping: an inner enum may
+                // have a same-named method, but Rust's statically resolved
+                // Outer::method call must still execute Outer's body.
+                let static_body = (!function.signature.is_static
+                    && !function.signature.params.is_empty()
+                    && !relative_adapter_method)
+                    .then(|| attributes[0].clone());
+                let mut access_flags = MethodAccessFlags::PUBLIC;
+                if function.signature.is_static {
+                    access_flags |= MethodAccessFlags::STATIC;
+                }
+                jvm_methods.push(jvm::Method {
+                    access_flags,
+                    name_index: cp.add_utf8(&emitted_method_name)?,
+                    descriptor_index: cp.add_utf8(&emitted_signature.to_string())?,
+                    attributes,
+                });
+                if relative_static_method {
+                    jvm_methods.push(create_relative_pointer_bridge(
+                        &mut cp,
+                        interface_name_jvm,
+                        method_name,
+                        &function,
+                        MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
+                        true,
+                    )?);
+                }
+                if let Some(code_attribute) = static_body {
+                    let mut static_signature = function.signature.clone();
+                    static_signature.is_static = true;
+                    if let Some((_, receiver_ty)) = static_signature.params.first_mut() {
+                        *receiver_ty = Type::Class(interface_name_jvm.to_string());
+                    }
+                    jvm_methods.push(jvm::Method {
+                        access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
+                        name_index: cp.add_utf8(method_name)?,
+                        descriptor_index: cp.add_utf8(&static_signature.to_string())?,
+                        attributes: vec![code_attribute],
+                    });
+                }
+            }
+            DataTypeMethod::AdtHelperMethod { kind } => {
+                let method = match kind {
+                    AdtHelperKind::EnumVariantIndex { .. }
+                    | AdtHelperKind::EnumDiscriminant { .. }
+                    | AdtHelperKind::EnumIsVariant { .. }
+                    | AdtHelperKind::StaticPartialEqEnum { .. } => create_enum_adt_helper_method(
+                        &mut cp,
+                        module,
+                        interface_name_jvm,
+                        method_name,
+                        kind,
+                    )?,
+                    AdtHelperKind::PartialEqClass { .. } => {
+                        return Err(jvm::Error::VerificationError {
+                            context: format!("Interface {interface_name_jvm}"),
+                            message: "class equality helper cannot be emitted on an interface"
+                                .to_string(),
+                        });
+                    }
+                };
+                jvm_methods.push(method);
+            }
         }
-        // Consider using tracing or logging
-        breadcrumbs::log!(
-            breadcrumbs::LogLevel::Info,
-            "bytecode-gen",
-            format!("  - Added interface method: {} {}", method_name, descriptor)
-        );
+    }
+
+    let interface_indices = super_interfaces
+        .iter()
+        .map(|interface| cp.add_class(interface))
+        .collect::<jvm::Result<Vec<_>>>()?;
+
+    if !subclasses.is_empty() || nest_host.is_some() {
+        let mut classes = Vec::new();
+        for subclass_name in subclasses {
+            classes.push(InnerClass {
+                class_info_index: cp.add_class(&subclass_name)?,
+                outer_class_info_index: this_class_index,
+                name_index: cp
+                    .add_utf8(subclass_name.rsplit('$').next().unwrap_or(&subclass_name))?,
+                access_flags: NestedClassAccessFlags::PUBLIC | NestedClassAccessFlags::STATIC,
+            });
+        }
+        if let Some(nest_host_name) = nest_host {
+            classes.push(InnerClass {
+                class_info_index: this_class_index,
+                outer_class_info_index: cp.add_class(&nest_host_name)?,
+                name_index: cp.add_utf8(
+                    interface_name_jvm
+                        .rsplit('$')
+                        .next()
+                        .unwrap_or(interface_name_jvm),
+                )?,
+                access_flags: NestedClassAccessFlags::PUBLIC | NestedClassAccessFlags::STATIC,
+            });
+        }
+        class_attributes.push(Attribute::InnerClasses {
+            name_index: cp.add_utf8("InnerClasses")?,
+            classes,
+        });
+    }
+    if let Some(source_file_name) = source_file_name {
+        class_attributes.push(Attribute::SourceFile {
+            name_index: cp.add_utf8("SourceFile")?,
+            source_file_index: cp.add_utf8(source_file_name)?,
+        });
+    }
+    if !bootstrap_methods.is_empty() {
+        class_attributes.push(Attribute::BootstrapMethods {
+            name_index: cp.add_utf8("BootstrapMethods")?,
+            methods: bootstrap_methods,
+        });
     }
 
     let class_file = ClassFile {
@@ -2287,10 +2596,10 @@ pub(super) fn create_data_type_classfile_for_interface(
             | ClassAccessFlags::ABSTRACT,
         this_class: this_class_index,
         super_class: super_class_index,
-        interfaces: Vec::new(),
+        interfaces: interface_indices,
         fields: Vec::new(),
         methods: jvm_methods,
-        attributes: Vec::new(),
+        attributes: class_attributes,
     };
     verify_no_duplicate_constants(&class_file)?;
 

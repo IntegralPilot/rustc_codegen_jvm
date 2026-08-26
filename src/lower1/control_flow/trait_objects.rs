@@ -735,7 +735,11 @@ pub(crate) fn ensure_trait_object_adapter_class_for_pointees<'tcx>(
     }
 
     match data_types.get_mut(interface_name) {
-        Some(oomir::DataType::Interface { methods }) => methods.extend(interface_methods),
+        Some(oomir::DataType::Interface { methods, .. }) => methods.extend(
+            interface_methods
+                .into_iter()
+                .map(|(name, signature)| (name, oomir::DataTypeMethod::Abstract(signature))),
+        ),
         Some(oomir::DataType::Class { .. }) => {
             return Err(format!(
                 "trait interface name is already a class: {interface_name}"
@@ -745,7 +749,12 @@ pub(crate) fn ensure_trait_object_adapter_class_for_pointees<'tcx>(
             data_types.insert(
                 interface_name.to_string(),
                 oomir::DataType::Interface {
-                    methods: interface_methods,
+                    methods: interface_methods
+                        .into_iter()
+                        .map(|(name, signature)| (name, oomir::DataTypeMethod::Abstract(signature)))
+                        .collect(),
+                    interfaces: vec![],
+                    is_enum: false,
                 },
             );
         }

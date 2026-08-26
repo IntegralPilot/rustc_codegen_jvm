@@ -136,16 +136,45 @@ impl Static {
 
 #[derive(Debug, Clone)]
 pub enum DataTypeMethod {
+    Abstract(Signature),
     SimpleConstantReturn(Type, Option<Constant>),
     Function(Function),
     AdtHelperMethod { kind: AdtHelperKind },
 }
 
 #[derive(Debug, Clone)]
+pub struct EnumVariantShape {
+    /// The concrete class used by an ordinary case, or the nested enum
+    /// interface used by a transparent subtype case.
+    pub runtime_type: String,
+    /// JVM fields on an ordinary case. A transparent case has one logical
+    /// payload but no wrapper field.
+    pub fields: Vec<Type>,
+    pub transparent: bool,
+}
+
+#[derive(Debug, Clone)]
 pub enum AdtHelperKind {
-    IsVariant { variant_idx: u32 },
-    PartialEqEnum { variants: Vec<(String, Vec<Type>)> },
-    PartialEqClass { fields: Vec<(String, Type)> },
+    EnumVariantIndex {
+        enum_class: String,
+        variants: Vec<EnumVariantShape>,
+    },
+    EnumDiscriminant {
+        enum_class: String,
+        variants: Vec<EnumVariantShape>,
+        values: Vec<i64>,
+    },
+    EnumIsVariant {
+        enum_class: String,
+        runtime_type: String,
+    },
+    StaticPartialEqEnum {
+        enum_class: String,
+        variants: Vec<EnumVariantShape>,
+    },
+    PartialEqClass {
+        fields: Vec<(String, Type)>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -158,7 +187,9 @@ pub enum DataType {
         interfaces: Vec<String>,
     },
     Interface {
-        methods: HashMap<String, Signature>,
+        methods: HashMap<String, DataTypeMethod>,
+        interfaces: Vec<String>,
+        is_enum: bool,
     },
 }
 
@@ -184,7 +215,7 @@ impl DataType {
                 }
                 *methods = unique_methods;
             }
-            DataType::Interface { methods } => {
+            DataType::Interface { methods, .. } => {
                 // Remove duplicate methods
                 let mut unique_methods = HashMap::default();
                 for (name, method) in methods.iter() {
@@ -758,7 +789,7 @@ pub enum Constant {
         params: Vec<Constant>,
         /// The declared JVM type of each constructor parameter. This can differ
         /// from the concrete constant type when, for example, an enum variant
-        /// is passed through its abstract enum base class.
+        /// is passed through its enum interface.
         param_types: Vec<Type>,
     },
 }

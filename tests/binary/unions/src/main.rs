@@ -1,3 +1,6 @@
+#![feature(register_tool)]
+#![register_tool(jvm)]
+
 #[derive(Copy, Clone)]
 #[repr(C)]
 struct TwoGroupsOfOneByte {
@@ -168,6 +171,26 @@ struct CompositePayload {
 union CompositeStorage {
     value: CompositePayload,
     bytes: [u8; core::mem::size_of::<CompositePayload>()],
+}
+
+#[derive(Copy, Clone)]
+#[repr(C, u8)]
+enum FlatLeaf {
+    Number(u16) = 3,
+    Empty = 5,
+}
+
+#[derive(Copy, Clone)]
+#[repr(C, u8)]
+enum FlatOuter {
+    #[jvm::subtype]
+    Leaf(FlatLeaf) = 1,
+    Other(u16) = 2,
+}
+
+union FlatOuterStorage {
+    value: FlatOuter,
+    bytes: [u8; core::mem::size_of::<FlatOuter>()],
 }
 
 fn main() {
@@ -509,5 +532,25 @@ fn main() {
         }
         assert!(composite_value.suffix[0] == 0x77);
         assert!(composite_value.suffix[1] == 0x88);
+
+        // A transparent enum subtype still uses the outer Rust layout when it
+        // crosses union storage, despite having no outer wrapper on the JVM.
+        let flat = FlatOuterStorage {
+            value: FlatOuter::Leaf(FlatLeaf::Number(0x1234)),
+        };
+        let flat_bytes = flat.bytes;
+        let round_trip = FlatOuterStorage { bytes: flat_bytes };
+        match round_trip.value {
+            FlatOuter::Leaf(FlatLeaf::Number(value)) => assert!(value == 0x1234),
+            _ => panic!(),
+        }
+
+        let other = FlatOuterStorage {
+            value: FlatOuter::Other(0x5678),
+        };
+        match other.value {
+            FlatOuter::Other(value) => assert!(value == 0x5678),
+            _ => panic!(),
+        }
     }
 }

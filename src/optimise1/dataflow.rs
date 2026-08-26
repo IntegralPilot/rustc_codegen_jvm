@@ -974,8 +974,8 @@ pub fn process_block_instructions(
                             current_state.insert(dest.clone(), field_const);
                             keep_original_instruction = false;
                         } else {
-                            // An enum variant constant has its concrete subclass type,
-                            // while the field may be declared as the abstract enum base.
+                            // An enum variant constant has its concrete case type,
+                            // while the field may be declared as the enum interface.
                             // Keep the typed field load so later propagation cannot leave
                             // the destination uninitialised after rejecting that mismatch.
                             current_state.remove(dest);

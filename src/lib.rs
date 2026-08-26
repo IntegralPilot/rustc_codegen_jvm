@@ -76,10 +76,7 @@ use rustc_middle::{
         TypeVisitableExt, TypingEnv, Unnormalized, VtblEntry,
     },
 };
-use rustc_session::{
-    IncrCompSession, Session,
-    config::OutputFilenames,
-};
+use rustc_session::{IncrCompSession, Session, config::OutputFilenames};
 use rustc_span::def_id::{DefId, LOCAL_CRATE};
 use rustc_structures::CrateType;
 use std::{
@@ -321,11 +318,18 @@ fn place_or_insert_mono_function<'tcx>(
                     }
 
                     let mut has_instance_method = false;
-                    if let Some(oomir::DataType::Class {
-                        methods,
-                        interfaces,
-                        ..
-                    }) = oomir_module.data_types.get_mut(&class_name)
+                    if let Some(
+                        oomir::DataType::Class {
+                            methods,
+                            interfaces,
+                            ..
+                        }
+                        | oomir::DataType::Interface {
+                            methods,
+                            interfaces,
+                            ..
+                        },
+                    ) = oomir_module.data_types.get_mut(&class_name)
                     {
                         let trait_method_matches_existing = implemented_trait.is_some()
                             && methods.get(&oomir_function.name).is_some_and(|method| {
@@ -970,8 +974,13 @@ fn ensure_trait_interface<'tcx>(
     match data_types.get_mut(&interface_name) {
         Some(oomir::DataType::Interface {
             methods: existing_methods,
+            ..
         }) => {
-            existing_methods.extend(methods);
+            existing_methods.extend(
+                methods
+                    .into_iter()
+                    .map(|(name, signature)| (name, oomir::DataTypeMethod::Abstract(signature))),
+            );
         }
         Some(oomir::DataType::Class { .. }) => {
             breadcrumbs::log!(
@@ -984,7 +993,17 @@ fn ensure_trait_interface<'tcx>(
             );
         }
         None => {
-            data_types.insert(interface_name, oomir::DataType::Interface { methods });
+            data_types.insert(
+                interface_name,
+                oomir::DataType::Interface {
+                    methods: methods
+                        .into_iter()
+                        .map(|(name, signature)| (name, oomir::DataTypeMethod::Abstract(signature)))
+                        .collect(),
+                    interfaces: vec![],
+                    is_enum: false,
+                },
+            );
         }
     }
 }

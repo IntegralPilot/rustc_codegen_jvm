@@ -10,9 +10,9 @@ use super::{
         types::{
             ENUM_UNION_DISCRIMINANT_METHOD, adapt_simple_enum_operand,
             ensure_exact_transmute_helper, ensure_fn_ptr_interface, ensure_union_data_type,
-            enum_union_discriminant_supported, fn_ptr_signature_from_ty,
-            generate_adt_jvm_class_name, should_define_named_data_type, ty_to_oomir_type,
-            union_from_method_name,
+            enum_union_discriminant_supported, fn_ptr_signature_from_ty, force_define_named_adt,
+            generate_adt_jvm_class_name, jvm_subtype_payload_ty, should_define_named_data_type,
+            ty_to_oomir_type, union_from_method_name,
         },
     },
     checked_ops::emit_checked_arithmetic_oomir_instructions,
@@ -6288,11 +6288,19 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                         let base_enum_name = generate_adt_jvm_class_name(
                             &adt_def, substs, tcx, data_types, instance,
                         );
+                        force_define_named_adt(
+                            Ty::new_adt(tcx, adt_def, substs),
+                            tcx,
+                            data_types,
+                            instance,
+                        );
                         let variant_class_name = format!(
                             "{}${}",
                             base_enum_name,
                             jvm_names::member_name(&variant_def.name.to_string())
                         );
+                        let transparent_payload =
+                            jvm_subtype_payload_ty(&adt_def, variant_def, substs, tcx);
 
                         breadcrumbs::log!(
                             breadcrumbs::LogLevel::Info,
@@ -6302,160 +6310,6 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                                 variant_def.name, temp_aggregate_var, variant_class_name
                             )
                         );
-
-                        if should_define_data_type {
-                            let variants_info: Vec<_> = adt_def
-                                .variants()
-                                .iter()
-                                .map(|v| {
-                                    let v_name = jvm_names::member_name(&v.name.to_string());
-                                    let v_fields: Vec<oomir::Type> = v
-                                        .fields
-                                        .iter()
-                                        .filter_map(|f| {
-                                            let field_ty = ty_to_oomir_type(
-                                                f.ty(tcx, substs).skip_norm_wip(),
-                                                tcx,
-                                                data_types,
-                                                instance,
-                                            );
-                                            field_ty.has_jvm_value().then_some(field_ty)
-                                        })
-                                        .collect();
-                                    (v_name, v_fields)
-                                })
-                                .collect();
-
-                            if !data_types.contains_key(&base_enum_name) {
-                                let mut methods = HashMap::default();
-                                methods.insert(
-                                    "getVariantIdx".to_string(),
-                                    DataTypeMethod::SimpleConstantReturn(oomir::Type::I32, None),
-                                );
-
-                                // Add AdtHelperMethod for PartialEq
-                                methods.insert(
-                                    "eq".to_string(),
-                                    DataTypeMethod::AdtHelperMethod {
-                                        kind: oomir::AdtHelperKind::PartialEqEnum {
-                                            variants: variants_info.clone(),
-                                        },
-                                    },
-                                );
-
-                                if tcx.is_lang_item(
-                                    adt_def.did(),
-                                    rustc_hir::attrs::lang_items::LangItem::Option,
-                                ) {
-                                    methods.insert(
-                                        "is_none".to_string(),
-                                        DataTypeMethod::AdtHelperMethod {
-                                            kind: oomir::AdtHelperKind::IsVariant {
-                                                variant_idx: 0,
-                                            },
-                                        },
-                                    );
-                                    methods.insert(
-                                        "is_some".to_string(),
-                                        DataTypeMethod::AdtHelperMethod {
-                                            kind: oomir::AdtHelperKind::IsVariant {
-                                                variant_idx: 1,
-                                            },
-                                        },
-                                    );
-                                }
-
-                                data_types.insert(
-                                    base_enum_name.clone(),
-                                    oomir::DataType::Class {
-                                        fields: vec![],
-                                        is_abstract: true,
-                                        methods,
-                                        super_class: None,
-                                        interfaces: vec![],
-                                    },
-                                );
-                            } else {
-                                // Merge helper methods into existing enum class
-                                if let oomir::DataType::Class { methods, .. } =
-                                    data_types.get_mut(&base_enum_name).unwrap()
-                                {
-                                    if !methods.contains_key("eq") {
-                                        methods.insert(
-                                            "eq".to_string(),
-                                            DataTypeMethod::AdtHelperMethod {
-                                                kind: oomir::AdtHelperKind::PartialEqEnum {
-                                                    variants: variants_info.clone(),
-                                                },
-                                            },
-                                        );
-                                    }
-                                    if tcx.is_lang_item(
-                                        adt_def.did(),
-                                        rustc_hir::attrs::lang_items::LangItem::Option,
-                                    ) {
-                                        if !methods.contains_key("is_none") {
-                                            methods.insert(
-                                                "is_none".to_string(),
-                                                DataTypeMethod::AdtHelperMethod {
-                                                    kind: oomir::AdtHelperKind::IsVariant {
-                                                        variant_idx: 0,
-                                                    },
-                                                },
-                                            );
-                                        }
-                                        if !methods.contains_key("is_some") {
-                                            methods.insert(
-                                                "is_some".to_string(),
-                                                DataTypeMethod::AdtHelperMethod {
-                                                    kind: oomir::AdtHelperKind::IsVariant {
-                                                        variant_idx: 1,
-                                                    },
-                                                },
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        // this variant
-                        if should_define_data_type && !data_types.contains_key(&variant_class_name)
-                        {
-                            let mut fields = vec![];
-                            for field in variant_def.fields.iter() {
-                                let field_type = ty_to_oomir_type(
-                                    field.ty(tcx, substs).skip_norm_wip(),
-                                    tcx,
-                                    data_types,
-                                    instance,
-                                );
-                                if field_type.has_jvm_value() {
-                                    let field_name = format!("field{}", fields.len());
-                                    fields.push((field_name, field_type));
-                                }
-                            }
-
-                            let mut methods = HashMap::default();
-                            methods.insert(
-                                "getVariantIdx".to_string(),
-                                DataTypeMethod::SimpleConstantReturn(
-                                    oomir::Type::I32,
-                                    Some(oomir::Constant::I32(variant_idx.as_u32() as i32)),
-                                ),
-                            );
-
-                            data_types.insert(
-                                variant_class_name.clone(),
-                                oomir::DataType::Class {
-                                    fields,
-                                    is_abstract: false,
-                                    methods,
-                                    super_class: Some(base_enum_name.clone()),
-                                    interfaces: vec![],
-                                },
-                            );
-                        }
 
                         let mut constructor_args = Vec::new();
                         for (i, field) in variant_def.fields.iter().enumerate() {
@@ -6485,11 +6339,26 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                             );
                             constructor_args.push((value_operand, field_oomir_type));
                         }
-                        instructions.push(oomir::Instruction::ConstructObject {
-                            dest: temp_aggregate_var.clone(),
-                            class_name: variant_class_name.clone(),
-                            args: constructor_args,
-                        });
+                        if transparent_payload.is_some() {
+                            let (value, _) =
+                                constructor_args.into_iter().next().unwrap_or_else(|| {
+                                    tcx.dcx().span_fatal(
+                                        tcx.def_span(variant_def.def_id),
+                                        "`#[jvm::subtype]` payload has no JVM value",
+                                    )
+                                });
+                            instructions.push(oomir::Instruction::Cast {
+                                dest: temp_aggregate_var.clone(),
+                                op: value,
+                                ty: oomir::Type::Class(base_enum_name.clone()),
+                            });
+                        } else {
+                            instructions.push(oomir::Instruction::ConstructObject {
+                                dest: temp_aggregate_var.clone(),
+                                class_name: variant_class_name.clone(),
+                                args: constructor_args,
+                            });
+                        }
                     } else {
                         let union_class_name = if should_define_data_type {
                             ensure_union_data_type(&adt_def, substs, tcx, data_types, instance)
@@ -6962,16 +6831,20 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                 }
                 return (instructions, result_operand);
             }
-            let use_numeric_discriminant = match place_mir_ty.kind() {
-                TyKind::Adt(adt_def, _) if adt_def.is_enum() => {
-                    enum_union_discriminant_supported(adt_def, tcx)
+            let (enum_class_name, use_numeric_discriminant) = match place_mir_ty.kind() {
+                TyKind::Adt(adt_def, substs) if adt_def.is_enum() => {
+                    force_define_named_adt(place_mir_ty, tcx, data_types, instance);
+                    (
+                        generate_adt_jvm_class_name(adt_def, substs, tcx, data_types, instance),
+                        enum_union_discriminant_supported(adt_def, tcx),
+                    )
                 }
-                _ => false,
+                _ => (place_class_name.clone(), false),
             };
             let method_name = if use_numeric_discriminant {
                 ENUM_UNION_DISCRIMINANT_METHOD.to_string()
             } else {
-                "getVariantIdx".to_string()
+                "variantIndex".to_string()
             };
             let method_return_type = if use_numeric_discriminant {
                 oomir::Type::I64
@@ -6980,22 +6853,23 @@ pub(super) fn convert_rvalue_to_operand<'a>(
             };
 
             let method_ty = oomir::Signature {
-                params: vec![],
+                params: vec![(
+                    "value".to_string(),
+                    oomir::Type::Class(enum_class_name.clone()),
+                )],
                 ret: Box::new(method_return_type.clone()),
-                is_static: false,
+                is_static: true,
             };
 
-            // 3. Call InvokeVirtual on the CORRECT variable
-            instructions.push(oomir::Instruction::InvokeVirtual {
-                class_name: place_class_name.clone(),
+            instructions.push(oomir::Instruction::InvokeStatic {
+                class_name: enum_class_name,
                 method_name,
-                args: vec![],
-                dest: Some(temp_discriminant_var.clone()),
-                method_ty,
-                operand: oomir::Operand::Variable {
+                args: vec![oomir::Operand::Variable {
                     name: actual_value_var_name,
                     ty: actual_value_oomir_type,
-                },
+                }],
+                dest: Some(temp_discriminant_var.clone()),
+                method_ty,
             });
 
             // 4. Convert a numeric enum discriminant to the MIR destination's

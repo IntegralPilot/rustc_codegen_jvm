@@ -1432,6 +1432,7 @@ pub fn oomir_to_jvm_bytecode(
                     &function.name,
                     &function,
                     bridge_flags,
+                    false,
                 )?);
             }
         }
@@ -1558,10 +1559,24 @@ pub fn oomir_to_jvm_bytecode(
                     dt_bytecode,
                 )?;
             }
-            DataType::Interface { methods } => {
+            DataType::Interface {
+                methods,
+                interfaces,
+                ..
+            } => {
+                let subclasses = subclasses_by_host.remove(dt_name_oomir).unwrap_or_default();
+                let nest_host = nest_host_by_class.remove(dt_name_oomir);
                 // Create and serialize the class file for this data type
-                let dt_bytecode =
-                    create_data_type_classfile_for_interface(&dt_name_oomir, &methods)?;
+                let dt_bytecode = create_data_type_classfile_for_interface(
+                    &dt_name_oomir,
+                    &methods,
+                    &interfaces,
+                    &module,
+                    subclasses,
+                    nest_host,
+                    debug_info,
+                    &relative_static_methods,
+                )?;
                 emit_generated_class(
                     &mut generated_classes,
                     registry,
