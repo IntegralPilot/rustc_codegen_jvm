@@ -7539,8 +7539,8 @@ pub fn stable_def_path(tcx: TyCtxt<'_>, def_id: DefId) -> String {
 /// definition can be rendered through aliases such as `std` or
 /// `rustc_std_workspace_core` in different rustc invocations.
 pub fn stable_def_identity(tcx: TyCtxt<'_>, def_id: DefId) -> String {
-    let raw_hash = tcx.def_path_hash(def_id).to_raw_def_path_hash();
-    crate::stable_hash::short_hash_bytes(&raw_hash.0, 16)
+    let hash_bytes = tcx.def_path_hash(def_id).0.to_le_bytes();
+    crate::stable_hash::short_hash_bytes(&hash_bytes, 16)
 }
 
 /// Returns rustc's crate-alias-independent identity for a monomorphic type.

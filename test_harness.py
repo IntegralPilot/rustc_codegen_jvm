@@ -174,7 +174,7 @@ def cargo_build_command(manifest: Path, release: bool, jobs: int) -> list[str]:
         str(TARGET_SPEC),
         "-Zjson-target-spec",
         "-Zbuild-std=std,panic_unwind",
-        "-Zbuild-std-features=",
+        "-Zbuild-std-features=panic-unwind",
         "--target-dir",
         str(TEST_TARGET_DIR),
         "--config",

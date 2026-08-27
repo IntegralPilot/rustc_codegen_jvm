@@ -870,7 +870,7 @@ fn cargo_command(
         .arg(&backend.target_spec)
         .arg("-Zjson-target-spec")
         .arg("-Zbuild-std=std,panic_unwind")
-        .arg("-Zbuild-std-features=")
+        .arg("-Zbuild-std-features=panic-unwind")
         .arg("--config")
         .arg(&backend.cargo_config)
         .env("RUSTUP_TOOLCHAIN", &backend.toolchain.channel)

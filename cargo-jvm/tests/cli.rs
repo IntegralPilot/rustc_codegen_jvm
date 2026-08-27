@@ -213,6 +213,7 @@ fn build_forwards_cargo_arguments_and_adds_the_jvm_toolchain() {
     let arguments = fs::read_to_string(capture).unwrap();
     assert!(arguments.starts_with("build\n--target\n"));
     assert!(arguments.contains("-Zbuild-std=std,panic_unwind\n"));
+    assert!(arguments.contains("-Zbuild-std-features=panic-unwind\n"));
     assert!(arguments.ends_with("--release\n--features\ndemo\n"));
     assert_eq!(
         fs::read_to_string(toolchain_capture).unwrap(),

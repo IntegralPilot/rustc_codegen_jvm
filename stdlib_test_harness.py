@@ -282,7 +282,7 @@ def cargo_build_command(
         "--message-format=json-render-diagnostics",
         "-Zjson-target-spec",
         "-Zbuild-std=std,panic_unwind",
-        "-Zbuild-std-features=",
+        "-Zbuild-std-features=panic-unwind",
     ]
     if release:
         command.append("--release")
