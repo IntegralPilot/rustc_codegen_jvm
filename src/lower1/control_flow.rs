@@ -1168,9 +1168,10 @@ pub(super) fn collect_pointer_origins<'tcx>(
         let mut changed = false;
         for block in mir.basic_blocks.iter() {
             for statement in &block.statements {
-                let StatementKind::Assign(box (destination, rvalue)) = &statement.kind else {
+                let StatementKind::Assign(assignment) = &statement.kind else {
                     continue;
                 };
+                let (destination, rvalue) = assignment.as_ref();
                 if !destination.projection.is_empty() {
                     continue;
                 }
@@ -1762,7 +1763,8 @@ pub(super) fn convert_basic_block<'tcx>(
         debug_local_collector.visit_statement(stmt, statement_location);
         let instruction_start = instructions.len();
         match &stmt.kind {
-            StatementKind::Assign(box (place, rvalue)) => {
+            StatementKind::Assign(assignment) => {
+                let (place, rvalue) = assignment.as_ref();
                 breadcrumbs::log!(
                     breadcrumbs::LogLevel::Info,
                     "mir-lowering",
@@ -1950,76 +1952,92 @@ pub(super) fn convert_basic_block<'tcx>(
             StatementKind::Nop | StatementKind::ConstEvalCounter => {
                 // Literally a no-op
             }
-            StatementKind::Intrinsic(box NonDivergingIntrinsic::Assume(operand)) => {
-                // `assume(false)` is UB, so a valid program never needs a JVM-side
-                // branch here. Still lower the operand so any place projection is
-                // evaluated consistently with other MIR operands.
-                let _ = convert_operand(operand, tcx, instance, mir, data_types, &mut instructions);
-            }
-            StatementKind::Intrinsic(box NonDivergingIntrinsic::CopyNonOverlapping(copy)) => {
-                let source =
-                    convert_operand(&copy.src, tcx, instance, mir, data_types, &mut instructions);
-                let destination =
-                    convert_operand(&copy.dst, tcx, instance, mir, data_types, &mut instructions);
-                let count = convert_operand(
-                    &copy.count,
-                    tcx,
-                    instance,
-                    mir,
-                    data_types,
-                    &mut instructions,
-                );
-                let source_rust_ty = copy.src.ty(&mir.local_decls, tcx);
-                let pointee = match source_rust_ty.kind() {
-                    TyKind::RawPtr(pointee, _) | TyKind::Ref(_, pointee, _) => *pointee,
-                    other => {
-                        panic!("copy_nonoverlapping MIR statement has non-pointer source {other:?}")
-                    }
-                };
-                let (method_name, count) = if let Ok(element_size) =
-                    super::types::layout_size_bytes(tcx, pointee)
-                {
-                    let byte_count_name = format!("{label}_copy_nonoverlapping_bytes");
-                    instructions.push(oomir::Instruction::Mul {
-                        dest: byte_count_name.clone(),
-                        op1: count,
-                        op2: oomir::Operand::Constant(oomir::Constant::U64(element_size as u64)),
-                    });
-                    (
-                        "copyNonOverlapping".to_string(),
-                        oomir::Operand::Variable {
-                            name: byte_count_name,
-                            ty: oomir::Type::U64,
+            StatementKind::Intrinsic(intrinsic) => match intrinsic.as_ref() {
+                NonDivergingIntrinsic::Assume(operand) => {
+                    // `assume(false)` is UB, so a valid program never needs a JVM-side
+                    // branch here. Still lower the operand so any place projection is
+                    // evaluated consistently with other MIR operands.
+                    let _ =
+                        convert_operand(operand, tcx, instance, mir, data_types, &mut instructions);
+                }
+                NonDivergingIntrinsic::CopyNonOverlapping(copy) => {
+                    let source = convert_operand(
+                        &copy.src,
+                        tcx,
+                        instance,
+                        mir,
+                        data_types,
+                        &mut instructions,
+                    );
+                    let destination = convert_operand(
+                        &copy.dst,
+                        tcx,
+                        instance,
+                        mir,
+                        data_types,
+                        &mut instructions,
+                    );
+                    let count = convert_operand(
+                        &copy.count,
+                        tcx,
+                        instance,
+                        mir,
+                        data_types,
+                        &mut instructions,
+                    );
+                    let source_rust_ty = copy.src.ty(&mir.local_decls, tcx);
+                    let pointee = match source_rust_ty.kind() {
+                        TyKind::RawPtr(pointee, _) | TyKind::Ref(_, pointee, _) => *pointee,
+                        other => panic!(
+                            "copy_nonoverlapping MIR statement has non-pointer source {other:?}"
+                        ),
+                    };
+                    let (method_name, count) =
+                        if let Ok(element_size) = super::types::layout_size_bytes(tcx, pointee) {
+                            let byte_count_name = format!("{label}_copy_nonoverlapping_bytes");
+                            instructions.push(oomir::Instruction::Mul {
+                                dest: byte_count_name.clone(),
+                                op1: count,
+                                op2: oomir::Operand::Constant(oomir::Constant::U64(
+                                    element_size as u64,
+                                )),
+                            });
+                            (
+                                "copyNonOverlapping".to_string(),
+                                oomir::Operand::Variable {
+                                    name: byte_count_name,
+                                    ty: oomir::Type::U64,
+                                },
+                            )
+                        } else {
+                            // Generic `core` bodies can retain `T` here. Pointer values carry
+                            // their concrete view size, so defer the sizeof(T) multiplication
+                            // to the runtime in that case.
+                            ("copyNonOverlappingElements".to_string(), count)
+                        };
+                    let source_ty = source
+                        .get_type()
+                        .expect("copy_nonoverlapping source is typed");
+                    let destination_ty = destination
+                        .get_type()
+                        .expect("copy_nonoverlapping destination is typed");
+                    instructions.push(oomir::Instruction::InvokeStatic {
+                        class_name: oomir::POINTER_CLASS.to_string(),
+                        method_name,
+                        method_ty: oomir::Signature {
+                            params: vec![
+                                ("source".to_string(), source_ty),
+                                ("destination".to_string(), destination_ty),
+                                ("byte_count".to_string(), oomir::Type::U64),
+                            ],
+                            ret: Box::new(oomir::Type::Void),
+                            is_static: true,
                         },
-                    )
-                } else {
-                    // Generic `core` bodies can retain `T` here. Pointer values carry
-                    // their concrete view size, so defer the sizeof(T) multiplication
-                    // to the runtime in that case.
-                    ("copyNonOverlappingElements".to_string(), count)
-                };
-                let source_ty = source
-                    .get_type()
-                    .expect("copy_nonoverlapping source is typed");
-                let destination_ty = destination
-                    .get_type()
-                    .expect("copy_nonoverlapping destination is typed");
-                instructions.push(oomir::Instruction::InvokeStatic {
-                    class_name: oomir::POINTER_CLASS.to_string(),
-                    method_name,
-                    method_ty: oomir::Signature {
-                        params: vec![
-                            ("source".to_string(), source_ty),
-                            ("destination".to_string(), destination_ty),
-                            ("byte_count".to_string(), oomir::Type::U64),
-                        ],
-                        ret: Box::new(oomir::Type::Void),
-                        is_static: true,
-                    },
-                    args: vec![source, destination, count],
-                    dest: None,
-                });
-            }
+                        args: vec![source, destination, count],
+                        dest: None,
+                    });
+                }
+            },
             StatementKind::SetDiscriminant {
                 place,
                 variant_index,

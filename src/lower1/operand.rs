@@ -68,7 +68,8 @@ pub fn convert_operand<'tcx>(
     instructions: &mut Vec<oomir::Instruction>,
 ) -> oomir::Operand {
     match mir_op {
-        MirOperand::Constant(box constant) => {
+        MirOperand::Constant(constant) => {
+            let constant = constant.as_ref();
             match constant.const_ {
                 Const::Val(const_val, ty) => {
                     handle_const_value(Some(constant), const_val, &ty, tcx, data_types, instance)

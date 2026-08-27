@@ -5509,7 +5509,8 @@ pub(super) fn convert_rvalue_to_operand<'a>(
             }
         }
 
-        Rvalue::BinaryOp(bin_op, box (op1, op2)) => {
+        Rvalue::BinaryOp(bin_op, operands) => {
+            let (op1, op2) = operands.as_ref();
             let temp_binop_var = generate_temp_var_name(&base_temp_name);
             let oomir_op1 = convert_operand(op1, tcx, instance, mir, data_types, &mut instructions);
             let oomir_op2 = convert_operand(op2, tcx, instance, mir, data_types, &mut instructions);
@@ -5922,7 +5923,8 @@ pub(super) fn convert_rvalue_to_operand<'a>(
             }
         }
 
-        Rvalue::Aggregate(box kind, operands) => {
+        Rvalue::Aggregate(kind, operands) => {
+            let kind = kind.as_ref();
             // Create a temporary variable to hold the aggregate
             let temp_aggregate_var = generate_temp_var_name(&base_temp_name);
             // Get the type from the original destination place

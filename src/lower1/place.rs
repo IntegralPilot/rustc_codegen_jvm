@@ -415,9 +415,10 @@ pub(crate) fn enter_stable_cell_analysis(mir: &Body<'_>) -> StableCellAnalysisGu
     let mut stable = vec![false; mir.local_decls.len()];
     for block in mir.basic_blocks.iter() {
         for statement in &block.statements {
-            let StatementKind::Assign(box (_, rvalue)) = &statement.kind else {
+            let StatementKind::Assign(assignment) = &statement.kind else {
                 continue;
             };
+            let (_, rvalue) = assignment.as_ref();
             let pointed_place = match rvalue {
                 Rvalue::Ref(_, _, place) | Rvalue::RawPtr(_, place) => place,
                 _ => continue,
@@ -471,9 +472,10 @@ pub(crate) fn local_uses_stable_cell(local: Local, mir: &Body<'_>) -> bool {
     }
     mir.basic_blocks.iter().any(|block| {
         block.statements.iter().any(|statement| {
-            let StatementKind::Assign(box (_, rvalue)) = &statement.kind else {
+            let StatementKind::Assign(assignment) = &statement.kind else {
                 return false;
             };
+            let (_, rvalue) = assignment.as_ref();
             let pointed_place = match rvalue {
                 Rvalue::Ref(_, _, place) | Rvalue::RawPtr(_, place) => place,
                 _ => return false,

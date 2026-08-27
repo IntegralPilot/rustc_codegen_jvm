@@ -6440,8 +6440,8 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     };
                 let load_type = match &stored_ty {
                     // If the argument is declared as Ref<Primitive>, load the primitive directly
-                    oomir::Type::Reference(box inner_ty) if inner_ty.is_jvm_primitive() => {
-                        inner_ty // Use the inner type for loading
+                    oomir::Type::Reference(inner_ty) if inner_ty.is_jvm_primitive() => {
+                        inner_ty.as_ref() // Use the inner type for loading
                     }
                     // Otherwise, use the declared type
                     _ => &stored_ty,

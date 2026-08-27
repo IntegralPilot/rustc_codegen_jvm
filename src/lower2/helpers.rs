@@ -526,7 +526,8 @@ pub fn get_cast_instructions(
             return Ok(vec![JI::Invokevirtual(method)]);
         }
 
-        if let Type::MutableReference(box inner) = src {
+        if let Type::MutableReference(inner) = src {
+            let inner = inner.as_ref();
             let mut instrs = vec![JI::Iconst_0, JI::Aaload];
             if dest != inner {
                 if let Some(dest_name) = dest.to_jvm_descriptor_or_internal_name() {

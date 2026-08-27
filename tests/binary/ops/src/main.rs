@@ -531,6 +531,13 @@ fn runtime_float_ops() {
     assert!(h1.algebraic_add(h2) == h1 + h2, "f16 algebraic add");
     assert!(h1.algebraic_rem(h2) == h1 % h2, "f16 algebraic remainder");
     assert!(
+        opaque_f16(48.34375f16)
+            .mul_add(opaque_f16(0.000013887882f16), opaque_f16(0.12438965f16))
+            .to_bits()
+            == 0x3001,
+        "f16 fused multiply-add rounds directly instead of through f32"
+    );
+    assert!(
         (-opaque_f16(2.0f16)).to_bits() == (-2.0f16).to_bits(),
         "f16 negation bits"
     );

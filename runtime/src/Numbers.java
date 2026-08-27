@@ -296,19 +296,59 @@ public final class Numbers {
     }
 
     public static short f64ToF16(double value) {
-        // Correctly rounded binary64 -> binary16 conversion cannot generally use a binary32
-        // intermediate because that can double-round.  The two exceptional midpoint cases
-        // are avoided by nudging an exact binary32 midpoint toward the original value.
-        float narrowed = (float) value;
-        if (Double.isFinite(value) && Float.isFinite(narrowed) && (double) narrowed != value) {
-            short candidate = f32ToF16(narrowed);
-            float candidateValue = f16ToF32(candidate);
-            if (candidateValue == narrowed) {
-                narrowed = Math.nextAfter(narrowed, value > narrowed
-                    ? Double.POSITIVE_INFINITY : Double.NEGATIVE_INFINITY);
+        long bits = Double.doubleToRawLongBits(value);
+        int sign = (int) ((bits >>> 48) & 0x8000);
+        int doubleExponent = (int) ((bits >>> 52) & 0x7ff);
+        long fraction = bits & 0x000f_ffff_ffff_ffffL;
+
+        if (doubleExponent == 0x7ff) {
+            if (fraction == 0) {
+                return (short) (sign | 0x7c00);
             }
+            int payload = (int) (fraction >>> 42) & 0x03ff;
+            return (short) (sign | 0x7c00 | payload | 0x0200);
         }
-        return f32ToF16(narrowed);
+
+        // Every binary64 subnormal is far below the binary16 underflow midpoint.
+        if (doubleExponent == 0) {
+            return (short) sign;
+        }
+
+        int exponent = doubleExponent - 1023;
+        long significand = (1L << 52) | fraction;
+        if (exponent > 15) {
+            return (short) (sign | 0x7c00);
+        }
+
+        if (exponent >= -14) {
+            long rounded = roundRightTiesToEven(significand, 42);
+            if (rounded == 0x800) {
+                exponent++;
+                rounded = 0x400;
+                if (exponent > 15) {
+                    return (short) (sign | 0x7c00);
+                }
+            }
+            return (short) (sign | ((exponent + 15) << 10) | ((int) rounded & 0x03ff));
+        }
+
+        if (exponent < -25) {
+            return (short) sign;
+        }
+        // Subnormals are integer multiples of 2^-24. A rounded value of 0x400
+        // naturally becomes the smallest normal binary16 value.
+        long rounded = roundRightTiesToEven(significand, 28 - exponent);
+        return (short) (sign | (int) rounded);
+    }
+
+    private static long roundRightTiesToEven(long value, int shift) {
+        long truncated = value >>> shift;
+        long remainder = value & ((1L << shift) - 1);
+        long halfway = 1L << (shift - 1);
+        if (remainder > halfway || (remainder == halfway && (truncated & 1) != 0)) {
+            truncated++;
+        }
+        return truncated;
     }
 
     public static short f16Add(short a, short b) { return f32ToF16(f16ToF32(a) + f16ToF32(b)); }

@@ -834,13 +834,26 @@ fn package_library(backend: &Backend, rlibs: &BTreeSet<PathBuf>, output: &Path) 
     if rlibs.is_empty() {
         return Err(user_error("Cargo did not report any library archives"));
     }
+    let has_panic_unwind = rlibs.iter().any(|path| rlib_crate_name(path) == Some("panic_unwind"));
+    let selected_rlibs = rlibs.iter().filter(|path| {
+        // `-Zbuild-std=std,panic_unwind` may still report panic_abort as a
+        // compiler artifact. A native linker selects one panic runtime; a JAR
+        // merge must make that selection explicitly to avoid duplicate global
+        // symbols being won by panic_abort's archive ordering.
+        !(has_panic_unwind && rlib_crate_name(path) == Some("panic_abort"))
+    });
     let status = Command::new(&backend.linker)
-        .args(rlibs)
+        .args(selected_rlibs)
         .arg(&backend.runtime_jar)
         .arg("-o")
         .arg(output)
         .status()?;
     require_success(status, "library JAR packaging")
+}
+
+fn rlib_crate_name(path: &Path) -> Option<&str> {
+    let name = path.file_stem()?.to_str()?.strip_prefix("lib")?;
+    Some(name.split_once('-').map_or(name, |(crate_name, _)| crate_name))
 }
 
 fn cargo_command(
@@ -1580,6 +1593,16 @@ mod tests {
             artifact.linked_library,
             Some(PathBuf::from("/tmp/demo.jar"))
         );
+    }
+
+    #[test]
+    fn extracts_crate_names_from_rlib_artifacts() {
+        assert_eq!(
+            rlib_crate_name(Path::new("/tmp/libpanic_unwind-35f4b19ff65eda2b.rlib")),
+            Some("panic_unwind")
+        );
+        assert_eq!(rlib_crate_name(Path::new("/tmp/libdemo.rlib")), Some("demo"));
+        assert_eq!(rlib_crate_name(Path::new("/tmp/demo.jar")), None);
     }
 
     #[test]

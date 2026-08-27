@@ -1,5 +1,4 @@
 #![feature(alloc_error_hook)]
-#![feature(box_patterns)]
 #![feature(rustc_private)]
 #![warn(clippy::pedantic)]
 #![allow(clippy::cast_possible_truncation)]
@@ -438,7 +437,7 @@ fn allocator_shim_target_signature(
     }
 }
 
-fn allocator_shim_source_signature(tcx: TyCtxt<'_>, source_name: &str) -> oomir::Signature {
+fn allocator_shim_source_signature(tcx: TyCtxt<'_>, source_name: &str) -> Option<oomir::Signature> {
     let declaration = std::iter::once(LOCAL_CRATE)
         .chain(tcx.crates(()).iter().copied())
         .flat_map(|crate_num| tcx.foreign_modules(crate_num).values())
@@ -454,14 +453,18 @@ fn allocator_shim_source_signature(tcx: TyCtxt<'_>, source_name: &str) -> oomir:
                     .class_to_call_on
                     .as_deref()
                     .is_some_and(lower1::naming::is_global_link_symbol_class)
-        })
-        .unwrap_or_else(|| panic!("allocator ABI declaration `{source_name}` was not found"));
+        })?;
     let instance = Instance::mono(tcx, declaration);
     let instance_ty = tcx
         .type_of(declaration)
         .instantiate(tcx, instance.args)
         .skip_norm_wip();
-    lower1::types::fn_ptr_signature_from_ty(instance_ty, tcx, &mut HashMap::default(), instance)
+    Some(lower1::types::fn_ptr_signature_from_ty(
+        instance_ty,
+        tcx,
+        &mut HashMap::default(),
+        instance,
+    ))
 }
 
 fn allocator_shim_call(
@@ -527,17 +530,28 @@ fn allocator_shim_call(
 
 fn emit_allocator_shims(tcx: TyCtxt<'_>, oomir_module: &mut oomir::Module) {
     use rustc_ast::expand::allocator::{
-        AllocatorTy, NO_ALLOC_SHIM_IS_UNSTABLE, default_fn_name, global_fn_name,
+        ALLOCATOR_METHODS, AllocatorTy, NO_ALLOC_SHIM_IS_UNSTABLE, default_fn_name, global_fn_name,
     };
 
-    let Some(kind) = rustc_codegen_ssa::base::allocator_kind_for_codegen(tcx) else {
-        return;
+    let allocator_kind = rustc_codegen_ssa::base::allocator_kind_for_codegen(tcx);
+    let methods = if let Some(kind) = allocator_kind {
+        rustc_codegen_ssa::base::allocator_shim_contents(tcx, kind)
+    } else {
+        // Native rlibs defer their allocator choice until a later link. A
+        // packaged JVM JAR is already the runnable artifact, so a crate with
+        // the allocator ABI in scope needs default wrappers in its own output.
+        let global_alloc =
+            lower1::jvm_names::member_name(&global_fn_name(ALLOCATOR_METHODS[0].name));
+        if allocator_shim_source_signature(tcx, &global_alloc).is_none() {
+            return;
+        }
+        ALLOCATOR_METHODS.to_vec()
     };
-
-    for method in rustc_codegen_ssa::base::allocator_shim_contents(tcx, kind) {
+    for method in methods {
         let source_name = lower1::jvm_names::member_name(&global_fn_name(method.name));
         let target_name = lower1::jvm_names::member_name(&default_fn_name(method.name));
-        let mut signature = allocator_shim_source_signature(tcx, &source_name);
+        let mut signature = allocator_shim_source_signature(tcx, &source_name)
+            .unwrap_or_else(|| panic!("allocator ABI declaration `{source_name}` was not found"));
         let target_signature = allocator_shim_target_signature(&method);
         for ((_, source_ty), (_, target_ty)) in
             signature.params.iter_mut().zip(&target_signature.params)
@@ -938,9 +952,10 @@ fn direct_mir_callees<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> Vec<
             }
         }
         for statement in &block.statements {
-            let rustc_middle::mir::StatementKind::Assign(box (_, rvalue)) = &statement.kind else {
+            let rustc_middle::mir::StatementKind::Assign(assignment) = &statement.kind else {
                 continue;
             };
+            let (_, rvalue) = assignment.as_ref();
             let rustc_middle::mir::Rvalue::Cast(
                 rustc_middle::mir::CastKind::PointerCoercion(
                     rustc_middle::ty::adjustment::PointerCoercion::Unsize,

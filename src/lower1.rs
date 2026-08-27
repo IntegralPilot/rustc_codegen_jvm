@@ -201,9 +201,10 @@ fn available_pointer_locals_at_block_entries<'tcx>(
             .statements
             .iter()
             .filter_map(|statement| {
-                let StatementKind::Assign(box (place, _)) = &statement.kind else {
+                let StatementKind::Assign(assignment) = &statement.kind else {
                     return None;
                 };
+                let (place, _) = assignment.as_ref();
                 (place.projection.is_empty() && pointer_origins.contains_key(&place.local))
                     .then_some(place.local)
             })
@@ -290,7 +291,8 @@ fn transfer_class_carrier_state(mir: &Body<'_>, block: BasicBlock, state: &mut H
     let block_data = &mir.basic_blocks[block];
     for statement in &block_data.statements {
         match &statement.kind {
-            StatementKind::Assign(box (place, _)) => {
+            StatementKind::Assign(assignment) => {
+                let (place, _) = assignment.as_ref();
                 update_class_carrier_state(place, state, None);
             }
             StatementKind::StorageLive(local) | StatementKind::StorageDead(local) => {
@@ -378,7 +380,8 @@ fn class_locals_needing_initial_carriers(mir: &Body<'_>) -> HashSet<Local> {
         let block_data = &mir.basic_blocks[block];
         for statement in &block_data.statements {
             match &statement.kind {
-                StatementKind::Assign(box (place, _)) => {
+                StatementKind::Assign(assignment) => {
+                    let (place, _) = assignment.as_ref();
                     update_class_carrier_state(place, &mut state, Some(&mut needs_initial_carrier))
                 }
                 StatementKind::StorageLive(local) | StatementKind::StorageDead(local) => {
