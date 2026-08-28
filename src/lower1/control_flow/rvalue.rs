@@ -1938,7 +1938,7 @@ fn emit_pointer_to_place<'tcx>(
                     TyKind::Adt(adt_def, _) if adt_def.is_struct() || adt_def.is_enum()
                 ) || matches!(
                     managed_base_rust_ty.kind(),
-                    TyKind::Tuple(_) | TyKind::Coroutine(..)
+                    TyKind::Tuple(_) | TyKind::Closure(..) | TyKind::Coroutine(..)
                 )) && matches!(pointer_ty, oomir::Type::Pointer(_));
                 let managed_field = if use_managed_field {
                     // For an enum downcast the place carrier is the concrete

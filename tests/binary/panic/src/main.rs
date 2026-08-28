@@ -43,23 +43,30 @@ struct FormattingFields {
 unsafe extern "C" {
     #[link_name = "jvm:static:java/lang/Math:addExact"]
     fn java_add_exact(left: i32, right: i32) -> i32;
+
+    #[link_name = "jvm:static:java/lang/System:gc"]
+    fn java_gc();
 }
 
 fn move_plain_panic_payload(payload: Box<dyn Any>) -> Box<dyn Any> {
     ManuallyDrop::into_inner(ManuallyDrop::new(payload))
 }
 
-fn panicking_vec_clone_cleanup(panic_on_clone: usize) -> (u32, u32) {
+fn panicking_vec_clone_cleanup(panic_on_clone: usize, force_gc: bool) -> (u32, u32) {
     struct PanickingClone<'count> {
         drop_count: &'count AtomicU32,
         ordinary_drop_count: &'count Cell<u32>,
         panic_on_clone: bool,
+        force_gc: bool,
     }
 
     impl Clone for PanickingClone<'_> {
         fn clone(&self) -> Self {
             if self.panic_on_clone {
                 panic!("panic while cloning a vector element");
+            }
+            if self.force_gc {
+                unsafe { java_gc() };
             }
             Self { ..*self }
         }
@@ -80,6 +87,7 @@ fn panicking_vec_clone_cleanup(panic_on_clone: usize) -> (u32, u32) {
             drop_count: &drop_count,
             ordinary_drop_count: &ordinary_drop_count,
             panic_on_clone: index == panic_on_clone,
+            force_gc: force_gc && index == 0,
         })
         .collect::<Vec<_>>();
 
@@ -89,6 +97,12 @@ fn panicking_vec_clone_cleanup(panic_on_clone: usize) -> (u32, u32) {
         ordinary_drop_count.get(),
         drop_count.load(Ordering::SeqCst),
     )
+}
+
+fn gc_during_panicking_vec_clone_cleanup() {
+    // The vector's spare-capacity pointer must remain valid even if temporary
+    // field-projection cache entries are collected before the next clone panics.
+    assert_eq!(panicking_vec_clone_cleanup(1, true), (4, 4));
 }
 
 fn concurrent_panicking_vec_clone_cleanup() {
@@ -101,7 +115,7 @@ fn concurrent_panicking_vec_clone_cleanup() {
                     let mut mismatch = None;
                     for _ in 0..16 {
                         for panic_on_clone in 0..3 {
-                            let counts = panicking_vec_clone_cleanup(panic_on_clone);
+                            let counts = panicking_vec_clone_cleanup(panic_on_clone, false);
                             let expected = 3 + panic_on_clone as u32;
                             if counts != (expected, expected) {
                                 mismatch = Some((panic_on_clone, counts, expected));
@@ -135,6 +149,7 @@ fn concurrent_panicking_vec_clone_cleanup() {
 }
 
 fn main() {
+    gc_during_panicking_vec_clone_cleanup();
     concurrent_panicking_vec_clone_cleanup();
 
     let plain_payload = move_plain_panic_payload(Box::new(73_u32));
