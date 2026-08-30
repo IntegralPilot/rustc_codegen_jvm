@@ -785,6 +785,84 @@ fn runtime_casts() {
     );
 }
 
+fn runtime_float_to_int_unchecked() {
+    macro_rules! assert_casts {
+        ($value:expr, $($target:ty),+ $(,)?) => {{
+            let value = $value;
+            $(
+                let converted = unsafe {
+                    core::intrinsics::float_to_int_unchecked::<_, $target>(value)
+                };
+                assert!(converted == 123 as $target);
+            )+
+        }};
+    }
+
+    assert_casts!(
+        opaque_f16(123.75_f16),
+        u8,
+        u16,
+        u32,
+        u64,
+        u128,
+        usize,
+        i8,
+        i16,
+        i32,
+        i64,
+        i128,
+        isize,
+    );
+    assert_casts!(
+        opaque_f32(123.75_f32),
+        u8,
+        u16,
+        u32,
+        u64,
+        u128,
+        usize,
+        i8,
+        i16,
+        i32,
+        i64,
+        i128,
+        isize,
+    );
+    assert_casts!(
+        opaque_f64(123.75_f64),
+        u8,
+        u16,
+        u32,
+        u64,
+        u128,
+        usize,
+        i8,
+        i16,
+        i32,
+        i64,
+        i128,
+        isize,
+    );
+    assert_casts!(
+        opaque_f128(123.75_f128),
+        u8,
+        u16,
+        u32,
+        u64,
+        u128,
+        usize,
+        i8,
+        i16,
+        i32,
+        i64,
+        i128,
+        isize,
+    );
+
+    assert!(unsafe { f64::to_int_unchecked::<i8>(opaque_f64(-123.75)) } == -123);
+    assert!(unsafe { f128::to_int_unchecked::<i128>(opaque_f128(-123.75_f128)) } == -123);
+}
+
 fn runtime_i64_isqrt_extended() {
     let check = |n: i64, expected: i64| {
         let n = opaque_i64(n);
@@ -1103,6 +1181,7 @@ fn main() {
     runtime_float_ops();
     runtime_new_integer_intrinsics();
     runtime_casts();
+    runtime_float_to_int_unchecked();
     runtime_i64_isqrt_extended();
     runtime_pointer_width();
     forwarded_reference_ops();
