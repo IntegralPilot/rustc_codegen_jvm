@@ -85,6 +85,7 @@ use std::{
     sync::{Arc, Mutex, mpsc},
 };
 
+mod async_interop;
 mod instrumentation;
 mod lower1;
 mod lower2;
@@ -889,6 +890,11 @@ fn synthetic_drop_callees_for_ty<'tcx>(
                     (!pointee.has_escaping_bound_vars() && pointee.needs_drop(tcx, typing_env))
                         .then(|| Instance::resolve_drop_glue(tcx, pointee))
                 }
+                TyKind::Coroutine(..)
+                    if !ty.has_escaping_bound_vars() && ty.needs_drop(tcx, typing_env) =>
+                {
+                    Some(Instance::resolve_drop_glue(tcx, ty))
+                }
                 _ => None,
             }
         })
@@ -1180,14 +1186,37 @@ fn lower_public_library_exports<'tcx>(
         return;
     }
 
-    let function_defs = java_public_surface_def_ids(tcx, JavaPublicSurface::Exported);
-
-    let function_roots = function_defs
+    let function_defs = java_public_surface_def_ids(tcx, JavaPublicSurface::Exported)
         .into_iter()
         .filter(|def_id| is_lowerable_java_public_function(tcx, *def_id))
-        .map(|def_id| Instance::mono(tcx, def_id));
+        .collect::<Vec<_>>();
+    let mut function_roots = function_defs
+        .iter()
+        .copied()
+        .map(|def_id| Instance::mono(tcx, def_id))
+        .collect::<Vec<_>>();
+    for function_def in &function_defs {
+        let Some(local_def) = function_def.as_local() else {
+            continue;
+        };
+        for nested_def in tcx.nested_bodies_within(local_def) {
+            let coroutine_def = nested_def.to_def_id();
+            if !tcx.coroutine_is_async(coroutine_def) {
+                continue;
+            }
+            let coroutine_ty = tcx
+                .type_of(coroutine_def)
+                .instantiate_identity()
+                .skip_norm_wip();
+            let TyKind::Coroutine(_, args) = coroutine_ty.kind() else {
+                continue;
+            };
+            function_roots.push(Instance::new_raw(coroutine_def, args));
+        }
+    }
     // Rustc's collector owns ordinary Rust reachability. Java exports are
-    // additional roots, so only they need a supplemental MIR call walk.
+    // additional roots. Async state-machine bodies are also roots because a
+    // JVM caller polls them through RustFuture rather than an ordinary MIR call.
     lower_supplemental_instance_closure(
         tcx,
         function_roots,

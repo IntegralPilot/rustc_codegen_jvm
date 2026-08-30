@@ -8,10 +8,10 @@ use rustc_hashes::Hash64;
 use rustc_middle::ty::layout::TyAndLayout;
 use rustc_middle::ty::print::{with_no_trimmed_paths, with_resolve_crate_name};
 use rustc_middle::ty::{
-    AdtDef, EarlyBinder, ExistentialPredicate, FloatTy, GenericArgsRef, IntTy, Region, Ty, TyCtxt,
-    TyKind, TypeFoldable, TypeFolder, TypeVisitableExt, TypingEnv, UintTy,
+    AdtDef, EarlyBinder, ExistentialPredicate, FloatTy, GenericArgs, GenericArgsRef, IntTy, Region,
+    Ty, TyCtxt, TyKind, TypeFoldable, TypeFolder, TypeVisitableExt, TypingEnv, UintTy,
 };
-use rustc_span::{def_id::DefId, sym};
+use rustc_span::{Symbol, def_id::DefId, sym};
 use std::{
     cell::RefCell,
     sync::{LazyLock, Mutex},
@@ -33,6 +33,26 @@ thread_local! {
 pub(crate) fn reset_type_lowering_cache() {
     TYPE_LOWERING_CACHE.with(|cache| cache.borrow_mut().clear());
     ENUM_TYPES_IN_PROGRESS.with(|types| types.borrow_mut().clear());
+}
+
+fn raw_waker_vtable_ty<'tcx>(tcx: TyCtxt<'tcx>) -> Ty<'tcx> {
+    let waker_def_id = tcx
+        .get_diagnostic_item(Symbol::intern("Waker"))
+        .expect("core::task::Waker diagnostic item is unavailable");
+    let waker_args = GenericArgs::identity_for_item(tcx, waker_def_id);
+    let raw_waker_ty = tcx.adt_def(waker_def_id).non_enum_variant().fields[FieldIdx::from_usize(0)]
+        .ty(tcx, waker_args)
+        .skip_norm_wip();
+    let TyKind::Adt(raw_waker_def, raw_waker_args) = raw_waker_ty.kind() else {
+        panic!("core::task::Waker no longer contains a RawWaker");
+    };
+    let vtable_ref_ty = raw_waker_def.non_enum_variant().fields[FieldIdx::from_usize(1)]
+        .ty(tcx, raw_waker_args)
+        .skip_norm_wip();
+    let TyKind::Ref(_, vtable_ty, _) = vtable_ref_ty.kind() else {
+        panic!("core::task::RawWaker no longer contains a RawWakerVTable reference");
+    };
+    *vtable_ty
 }
 
 pub const UNION_BYTES_FIELD: &str = "_bytes";
@@ -7474,6 +7494,73 @@ fn ty_to_oomir_type_resolved<'tcx>(
             }) = data_types.get_mut(&safe_name)
             {
                 *existing_fields = fields;
+            }
+            let needs_managed_drop = resolved_ty.needs_drop(tcx, TypingEnv::fully_monomorphized())
+                && matches!(
+                    data_types.get(&safe_name),
+                    Some(oomir::DataType::Class { methods, .. })
+                        if !methods.contains_key(MANAGED_DROP_METHOD)
+                );
+            if needs_managed_drop {
+                if let Some(oomir::DataType::Class {
+                    methods,
+                    interfaces,
+                    ..
+                }) = data_types.get_mut(&safe_name)
+                {
+                    methods.insert(
+                        MANAGED_DROP_METHOD.to_string(),
+                        DataTypeMethod::SimpleConstantReturn(oomir::Type::Void, None),
+                    );
+                    interfaces.push(MANAGED_DROP_INTERFACE.to_string());
+                }
+                let drop_method = managed_drop_glue_function(
+                    resolved_ty,
+                    &safe_name,
+                    tcx,
+                    data_types,
+                    instance_context,
+                );
+                if let Some(oomir::DataType::Class { methods, .. }) = data_types.get_mut(&safe_name)
+                {
+                    methods.insert(
+                        MANAGED_DROP_METHOD.to_string(),
+                        DataTypeMethod::Function(drop_method),
+                    );
+                }
+            }
+            if tcx.coroutine_is_async(*def_id) {
+                let future_size = layout_size_bytes(tcx, resolved_ty)
+                    .unwrap_or_else(|error| panic!("could not size Rust async value: {error}"));
+                let future_alignment = layout_align_bytes(tcx, resolved_ty)
+                    .unwrap_or_else(|error| panic!("could not align Rust async value: {error}"));
+                let future_codec =
+                    pointer_memory_codec_operand(resolved_ty, tcx, data_types, instance_context);
+                let vtable_ty = raw_waker_vtable_ty(tcx);
+                let vtable_size = layout_size_bytes(tcx, vtable_ty)
+                    .unwrap_or_else(|error| panic!("could not size RawWakerVTable: {error}"));
+                let vtable_alignment = layout_align_bytes(tcx, vtable_ty)
+                    .unwrap_or_else(|error| panic!("could not align RawWakerVTable: {error}"));
+                let vtable_codec =
+                    pointer_memory_codec_operand(vtable_ty, tcx, data_types, instance_context);
+                crate::async_interop::add_rust_future_bridge(
+                    data_types,
+                    &safe_name,
+                    crate::async_interop::PointerLayout {
+                        size: i32::try_from(future_size)
+                            .expect("Rust async value exceeds the JVM address space"),
+                        alignment: i32::try_from(future_alignment)
+                            .expect("Rust async alignment exceeds the JVM address space"),
+                        codec: future_codec,
+                    },
+                    crate::async_interop::PointerLayout {
+                        size: i32::try_from(vtable_size)
+                            .expect("RawWakerVTable exceeds the JVM address space"),
+                        alignment: i32::try_from(vtable_alignment)
+                            .expect("RawWakerVTable alignment exceeds the JVM address space"),
+                        codec: vtable_codec,
+                    },
+                );
             }
             oomir::Type::Class(safe_name)
         }

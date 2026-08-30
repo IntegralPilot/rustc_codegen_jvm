@@ -5,12 +5,15 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from test_harness import (
+    ROOT,
+    TEST_TARGET_DIR,
     TestCase,
     build_test,
     cargo_jobs,
@@ -196,6 +199,82 @@ def run_java(
     except (json.JSONDecodeError, ValueError) as error:
         logs.append(f"|---- ❌ Invalid Java process test input: {error}")
         return False
+
+    if test.kind == "kotlin":
+        kotlin_files = sorted(test.directory.glob("*.kt"))
+        kotlin_files.extend(sorted((ROOT / "runtime" / "kotlin").glob("*.kt")))
+        if not kotlin_files:
+            logs.append("|---- ❌ No .kt files found for Kotlin interop test")
+            return False
+
+        executable_name = "kotlinc.bat" if os.name == "nt" else "kotlinc"
+        configured = os.environ.get("KOTLINC")
+        kotlinc = (
+            Path(configured)
+            if configured
+            else Path(shutil.which("kotlinc") or "")
+        )
+        if not kotlinc.is_file():
+            local = (
+                ROOT
+                / "target"
+                / "tools"
+                / "kotlin-2.4.10"
+                / "kotlinc"
+                / "bin"
+                / executable_name
+            )
+            kotlinc = local if local.is_file() else Path()
+        if not kotlinc.is_file():
+            logs.append(
+                "|---- ❌ kotlinc is required for tests/kotlin; install Kotlin or set KOTLINC"
+            )
+            return False
+
+        profile = "release" if release else "debug"
+        kotlin_jar = TEST_TARGET_DIR / "kotlin" / profile / f"{test.name}.jar"
+        kotlin_jar.parent.mkdir(parents=True, exist_ok=True)
+        command = [
+            str(kotlinc),
+            "-jvm-target",
+            "1.8",
+            "-classpath",
+            str(jar),
+            "-include-runtime",
+            "-d",
+            str(kotlin_jar),
+            *(str(path) for path in kotlin_files),
+        ]
+        if os.name == "nt" and kotlinc.suffix.lower() == ".bat":
+            command = [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", *command]
+
+        logs.append("|--- 🟣 Compiling Kotlin interop test source...")
+        proc = run_command(command)
+        if proc.returncode != 0:
+            write_failure(test.directory / "kotlinc-fail.generated", proc)
+            logs.append(f"|---- ❌ kotlinc exited with code {proc.returncode}")
+            ci_diagnostic(logs, f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}")
+            return False
+
+        logs.append("|--- 🤖 Running Kotlin suspend entry point...")
+        classpath = os.pathsep.join([str(kotlin_jar), str(jar)])
+        proc, diagnostics = run_java_command(
+            ["java", "-cp", classpath, "MainKt", *java_arguments],
+            timeout=java_timeout,
+            input_text=stdin,
+        )
+        if diagnostics is not None:
+            output = (
+                f"Kotlin process exceeded the {java_timeout:g}s timeout.\n\n"
+                f"{diagnostics}\n\nSTDOUT:\n{proc.stdout}\n\nSTDERR:\n{proc.stderr}"
+            )
+            (test.directory / "java-timeout.generated").write_text(
+                output, encoding="utf-8"
+            )
+            logs.append(f"|---- ❌ Kotlin process timed out after {java_timeout:g}s")
+            ci_diagnostic(logs, output)
+            return False
+        return check_results(proc, test, release, logs)
 
     if test.kind != "integration":
         logs.append("|--- 🤖 Running with Java...")

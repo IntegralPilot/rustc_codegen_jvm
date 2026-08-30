@@ -5236,6 +5236,25 @@ public final class Pointer {
         return field(owner, fieldName, checkedArrayLength(size), codecClassName);
     }
 
+    /** Returns a stable field pointer with the exact alignment of its Rust field type. */
+    public static Pointer fieldAligned(
+            Object owner,
+            String fieldName,
+            long size,
+            String codecClassName,
+            long alignment) {
+        int checkedAlignment = Math.toIntExact(alignment);
+        if (checkedAlignment <= 0
+                || (checkedAlignment & (checkedAlignment - 1)) != 0) {
+            throw new IllegalArgumentException("Rust field alignment must be a power of two");
+        }
+        Pointer pointer = field(owner, fieldName, size, codecClassName);
+        if (pointer.allocation != null) {
+            recordAlignment(pointer.allocation, checkedAlignment);
+        }
+        return pointer;
+    }
+
     private Object compatibleStructView(String ownerClassName) {
         try {
             Class<?> ownerClass = resolvedRuntimeClass(ownerClassName);

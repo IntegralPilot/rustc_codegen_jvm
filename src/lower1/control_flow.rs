@@ -1071,6 +1071,64 @@ pub(super) fn emit_rust_drop_value<'tcx>(
                 dest: None,
             });
         }
+        TyKind::Coroutine(..) => {
+            let pointer_ty = oomir::Type::Pointer(Box::new(oomir_ty.clone()));
+            let pointer_name = format!("{temp_prefix}_coroutine_pointer");
+            let size = super::types::layout_size_bytes(tcx, rust_ty)
+                .unwrap_or_else(|error| panic!("could not size coroutine drop value: {error}"));
+            let alignment = super::types::layout_align_bytes(tcx, rust_ty)
+                .unwrap_or_else(|error| panic!("could not align coroutine drop value: {error}"));
+            let codec =
+                super::types::pointer_memory_codec_operand(rust_ty, tcx, data_types, instance);
+            instructions.push(oomir::Instruction::InvokeStatic {
+                dest: Some(pointer_name.clone()),
+                class_name: oomir::POINTER_CLASS.to_string(),
+                method_name: "receiverCellAligned".to_string(),
+                method_ty: oomir::Signature {
+                    params: vec![
+                        (
+                            "value".to_string(),
+                            oomir::Type::Class("java/lang/Object".to_string()),
+                        ),
+                        ("size".to_string(), oomir::Type::I32),
+                        ("codec".to_string(), oomir::Type::java_string()),
+                        ("alignment".to_string(), oomir::Type::I32),
+                    ],
+                    ret: Box::new(pointer_ty.clone()),
+                    is_static: true,
+                },
+                args: vec![
+                    value,
+                    oomir::Operand::Constant(oomir::Constant::I32(
+                        i32::try_from(size)
+                            .expect("coroutine drop value exceeds the JVM address space"),
+                    )),
+                    codec,
+                    oomir::Operand::Constant(oomir::Constant::I32(
+                        i32::try_from(alignment)
+                            .expect("coroutine drop alignment exceeds the JVM address space"),
+                    )),
+                ],
+            });
+            let drop_instance = Instance::resolve_drop_glue(tcx, rust_ty);
+            let target = super::naming::mono_fn_name_from_instance(tcx, drop_instance);
+            instructions.push(oomir::Instruction::InvokeStatic {
+                class_name: target
+                    .class_to_call_on
+                    .expect("coroutine drop glue has a JVM owner"),
+                method_name: target.method_name,
+                method_ty: oomir::Signature {
+                    params: vec![("coroutine".to_string(), pointer_ty.clone())],
+                    ret: Box::new(oomir::Type::Void),
+                    is_static: true,
+                },
+                args: vec![oomir::Operand::Variable {
+                    name: pointer_name,
+                    ty: pointer_ty,
+                }],
+                dest: None,
+            });
+        }
         TyKind::Dynamic(..) => {
             instructions.push(oomir::Instruction::InvokeStatic {
                 class_name: oomir::POINTER_CLASS.to_string(),

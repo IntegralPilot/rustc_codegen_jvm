@@ -95,6 +95,10 @@ jobs:
         distribution: temurin
         java-version: '25'
 
+    - name: Set up Kotlin
+      if: steps.latest.outputs.changed == 'true'
+      run: python tests/kotlin/install_kotlin.py --github-path
+
     - name: Cache Cargo dependencies
       if: steps.latest.outputs.changed == 'true'
       uses: Swatinem/rust-cache@v2

@@ -334,6 +334,7 @@ The following example programs live in `tests/`, are compiled with the standard 
 |---|---|
 | **[Lambda Callbacks](tests/integration/lambda_callbacks/Main.java)** | Passing native Java lambdas directly into Rust functions expecting `Fn` closures. |
 | **[Trait Implementors](tests/integration/trait_implementors/Main.java)** | Implementing a Rust trait on a Java class and passing it to Rust dynamic dispatch (`&dyn Trait`). |
+| **[Kotlin Async](tests/kotlin/async_interop/Main.kt)** | Awaiting Rust `async` functions from Kotlin `suspend` code. |
 
 ## Features & Standard Library Support
 
@@ -355,7 +356,7 @@ Beyond `core` and `alloc`, a large amount of the `std` is supported too, though 
 | Subsystem | Status | Details |
 |---|---|---|
 | **Threads & Sync** | **Supported** | Thread spawning, scoped threads, Mutex, RwLock, Condvar, TLS |
-| **Async & Futures** | **Supported** | Async functions, blocks, closures and trait methods; boxed/recursive `dyn Future`; cancellation |
+| **Async & Futures** | **Supported** | Async functions, blocks, closures and trait methods; boxed/recursive `dyn Future`; Kotlin `suspend` interop; cancellation |
 | **Panic Unwinding** | **Supported** | Complete unwinding stack, `catch_unwind`, panic hooks, and abort-on-double-panic semantics |
 | **Stdio & Env** | **Supported** | `println!`, `eprintln!`, `stdin`, `env::args`, `env::vars` |
 | **Time & Random** | **Supported** | `SystemTime`, `Instant`, standard entropy seeds |
@@ -496,6 +497,8 @@ boolean equal = Root.eq(root, new Leaf.A(42));
 - **Python 3.8+**
 - **Git**
 - **cargo-jvm** - see install instructions in [its README](cargo-jvm/README.md)
+
+The Kotlin compiler is only needed for `tests/kotlin`; CI installs the pinned version with `tests/kotlin/install_kotlin.py`.
 
 ## Usage
 
