@@ -1470,7 +1470,10 @@ pub fn oomir_to_jvm_bytecode(
             } else {
                 function.signature.clone()
             };
-            for (name, _) in &emitted_signature.params {
+            for (name, param_ty) in emitted_signature.explicit_jvm_params() {
+                if !param_ty.has_jvm_value() {
+                    continue;
+                }
                 let name_index = main_cp.add_utf8(name)?;
                 parameters_for_attribute.push(jvm::attributes::MethodParameter {
                     name_index,

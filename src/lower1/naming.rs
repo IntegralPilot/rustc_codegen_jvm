@@ -4,7 +4,9 @@ use super::jvm_names;
 use rustc_hash::FxHashMap as HashMap;
 use rustc_hir::{attrs::lang_items::LangItem, def::DefKind};
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
-use rustc_middle::ty::{GenericArg, Instance, InstanceKind, TyCtxt, TyKind, TypeVisitableExt};
+use rustc_middle::ty::{
+    GenericArg, Instance, InstanceKind, ShimKind, TyCtxt, TyKind, TypeVisitableExt,
+};
 use rustc_span::sym;
 
 const MAX_MONO_FN_NAME_LEN: usize = 128;
@@ -618,6 +620,22 @@ pub fn mono_fn_name_from_instance<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'t
         return FnNameData {
             class_to_call_on: Some(global_link_symbol_class(&method_name)),
             method_name,
+        };
+    }
+
+    if let InstanceKind::Shim(ShimKind::DropGlue(_, Some(drop_ty))) = instance.def
+        && let TyKind::Coroutine(def_id, args) = drop_ty.kind()
+    {
+        let base = jvm_names::method_for_function(tcx, instance.def_id());
+        let coroutine = jvm_names::coroutine_class_for_args(tcx, *def_id, args, instance);
+        return FnNameData {
+            class_to_call_on: Some(mono_owner_class(tcx, instance)),
+            method_name: crate::stable_hash::readable_or_hashed_name(
+                &base,
+                &super::types::sanitize_name_token(&coroutine),
+                &super::types::stable_def_identity(tcx, instance.def_id()),
+                MAX_MONO_FN_NAME_LEN,
+            ),
         };
     }
 

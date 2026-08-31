@@ -22,6 +22,19 @@ pub enum NestedEquality {
     Boxed(NumberBox),
 }
 
+// These names intentionally land in different canonical datatype shards.
+// Equality for the outer enum must still discover that its payload is an enum
+// interface through the crate-wide shared schema.
+pub enum RemoteChoice {
+    Value(i32),
+    Empty,
+}
+
+pub enum WrapperChoice {
+    Remote(RemoteChoice),
+    Direct(i32),
+}
+
 pub enum LeafEvent {
     Number(i32),
     Empty,
@@ -107,6 +120,14 @@ pub fn wrap_maybe(value: MaybeNumber) -> NestedEquality {
 
 pub fn wrap_boxed(value: NumberBox) -> NestedEquality {
     NestedEquality::Boxed(value)
+}
+
+pub fn make_remote_choice(value: i32) -> RemoteChoice {
+    RemoteChoice::Value(value)
+}
+
+pub fn wrap_remote_choice(value: RemoteChoice) -> WrapperChoice {
+    WrapperChoice::Remote(value)
 }
 
 pub fn make_leaf_number(value: i32) -> LeafEvent {

@@ -66,6 +66,14 @@ public final class PanicSupport {
         return caughtThrowable(caughtException) instanceof RustPanic;
     }
 
+    /** Ends Rust's tracked unwind when a panic is deliberately exported as a JVM exception. */
+    public static Throwable detachForForeignBoundary(Throwable failure) {
+        if (failure instanceof RustPanic && ACTIVE_PANIC.get() == failure) {
+            ACTIVE_PANIC.remove();
+        }
+        return failure;
+    }
+
     public static Pointer foreignFailureMessage(Pointer caughtException) {
         byte[] message = describe(caughtThrowable(caughtException)).getBytes(StandardCharsets.UTF_8);
         return Pointer.array(message, 0, 1);

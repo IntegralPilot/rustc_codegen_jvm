@@ -21,7 +21,7 @@ TARGET_SPEC = ROOT / "jvm-unknown-jvm.json"
 TEST_TARGET_DIR = ROOT / "target" / "test-suite"
 TEST_CONFIG = ROOT / "config.toml"
 CORE_BUILD_MANIFEST = ROOT / "tests" / "support" / "core_build" / "Cargo.toml"
-TEST_TYPES = ("binary", "multicrate", "integration", "cargo_jvm")
+TEST_TYPES = ("binary", "multicrate", "integration", "kotlin", "cargo_jvm")
 CACHE_TAG = (
     "Signature: 8a477f597d28d172789f06886806bc55\n"
     "# This file is a cache directory tag created by rustc_codegen_jvm.\n"
@@ -259,7 +259,7 @@ def build_test(
             command.append("--release")
         return run_command(command, env=stdlib_build_environment(env))
 
-    if test.kind == "integration":
+    if test.kind in ("integration", "kotlin"):
         cargo_jvm = ROOT / "cargo-jvm" / "target" / "release" / (
             "cargo-jvm.exe" if os.name == "nt" else "cargo-jvm"
         )

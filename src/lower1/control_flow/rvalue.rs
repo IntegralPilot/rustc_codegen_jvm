@@ -58,6 +58,19 @@ fn rust_layout_size_operand<'tcx>(
     ))
 }
 
+fn rust_layout_alignment<'tcx>(
+    ty: rustc_middle::ty::Ty<'tcx>,
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
+) -> usize {
+    let ty = EarlyBinder::bind(tcx, ty)
+        .instantiate(tcx, instance.args)
+        .skip_norm_wip();
+    super::super::types::layout_align_bytes(tcx, ty).unwrap_or_else(|error| {
+        panic!("could not determine pointer layout alignment for {ty:?}: {error}")
+    })
+}
+
 fn pointer_view_size_operand<'tcx>(
     pointer_ty: rustc_middle::ty::Ty<'tcx>,
     tcx: TyCtxt<'tcx>,
@@ -2005,6 +2018,7 @@ fn emit_pointer_to_place<'tcx>(
                         instructions,
                     );
                     if matches!(managed_base_rust_ty.kind(), TyKind::Tuple(_))
+                        || matches!(managed_base_rust_ty.kind(), TyKind::Closure(..))
                         || matches!(managed_base_rust_ty.kind(), TyKind::Adt(adt_def, _) if adt_def.is_struct())
                     {
                         let base_layout = tcx
@@ -2066,34 +2080,49 @@ fn emit_pointer_to_place<'tcx>(
                         instructions,
                     );
                     let result_name = format!("{temp_prefix}_dst_field_pointer");
+                    let field_alignment = rust_layout_alignment(field_rust_ty, tcx, instance);
+                    let explicitly_aligned = field_alignment > 16;
+                    let mut field_params = vec![
+                        (
+                            "owner".to_string(),
+                            oomir::Type::Class("java/lang/Object".to_string()),
+                        ),
+                        ("field_name".to_string(), oomir::Type::java_string()),
+                        ("size".to_string(), oomir::Type::U64),
+                        ("codec".to_string(), oomir::Type::java_string()),
+                    ];
+                    let mut field_args = vec![
+                        base_value,
+                        oomir::Operand::Constant(oomir::Constant::String(field_name)),
+                        rust_layout_size_operand(field_rust_ty, tcx, instance),
+                        super::super::types::pointer_view_codec_operand(
+                            field_rust_ty,
+                            tcx,
+                            data_types,
+                            instance,
+                        ),
+                    ];
+                    if explicitly_aligned {
+                        field_params.push(("alignment".to_string(), oomir::Type::U64));
+                        field_args.push(oomir::Operand::Constant(oomir::Constant::U64(
+                            u64::try_from(field_alignment)
+                                .expect("Rust layout alignment exceeds u64"),
+                        )));
+                    }
                     instructions.push(oomir::Instruction::InvokeStatic {
                         dest: Some(result_name.clone()),
                         class_name: oomir::POINTER_CLASS.to_string(),
-                        method_name: "field".to_string(),
+                        method_name: if explicitly_aligned {
+                            "fieldAligned".to_string()
+                        } else {
+                            "field".to_string()
+                        },
                         method_ty: oomir::Signature {
-                            params: vec![
-                                (
-                                    "owner".to_string(),
-                                    oomir::Type::Class("java/lang/Object".to_string()),
-                                ),
-                                ("field_name".to_string(), oomir::Type::java_string()),
-                                ("size".to_string(), oomir::Type::U64),
-                                ("codec".to_string(), oomir::Type::java_string()),
-                            ],
+                            params: field_params,
                             ret: Box::new(pointer_ty.clone()),
                             is_static: true,
                         },
-                        args: vec![
-                            base_value,
-                            oomir::Operand::Constant(oomir::Constant::String(field_name)),
-                            rust_layout_size_operand(field_rust_ty, tcx, instance),
-                            super::super::types::pointer_view_codec_operand(
-                                field_rust_ty,
-                                tcx,
-                                data_types,
-                                instance,
-                            ),
-                        ],
+                        args: field_args,
                     });
                     return oomir::Operand::Variable {
                         name: result_name,

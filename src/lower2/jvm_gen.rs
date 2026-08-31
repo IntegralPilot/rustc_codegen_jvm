@@ -1514,14 +1514,14 @@ fn append_field_equality_check(
         Type::Class(class_name) if has_generated_eq(module, class_name) => {
             let class_idx = cp.add_class(class_name)?;
             if matches!(
-                module.data_types.get(class_name),
+                module.data_type(class_name),
                 Some(oomir::DataType::Interface { is_enum: true, .. })
             ) {
                 let eq_desc = format!("(L{class_name};L{class_name};)Z");
                 let eq_ref = cp.add_interface_method_ref(class_idx, "eq", &eq_desc)?;
                 instructions.push(Instruction::Invokestatic(eq_ref));
             } else if matches!(
-                module.data_types.get(class_name),
+                module.data_type(class_name),
                 Some(oomir::DataType::Interface { .. })
             ) {
                 let eq_desc = format!("(L{class_name};)Z");
@@ -1537,7 +1537,7 @@ fn append_field_equality_check(
         Type::Interface(interface_name) if has_generated_eq(module, interface_name) => {
             let interface_idx = cp.add_class(interface_name)?;
             if matches!(
-                module.data_types.get(interface_name),
+                module.data_type(interface_name),
                 Some(oomir::DataType::Interface { is_enum: true, .. })
             ) {
                 let eq_desc = format!("(L{interface_name};L{interface_name};)Z");

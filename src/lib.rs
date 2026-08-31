@@ -85,6 +85,7 @@ use std::{
     sync::{Arc, Mutex, mpsc},
 };
 
+mod async_interop;
 mod lower1;
 mod lower2;
 mod metrics;
@@ -330,18 +331,8 @@ impl CanonicalDataTypeRegistry {
             {
                 schema = variants
                     .iter()
-                    .find_map(|variant| match variant {
-                        oomir::DataType::Interface {
-                            methods,
-                            interfaces,
-                            is_enum,
-                        } => Some(oomir::DataType::Interface {
-                            methods: methods.clone(),
-                            interfaces: interfaces.clone(),
-                            is_enum: *is_enum,
-                        }),
-                        _ => None,
-                    })
+                    .find(|variant| matches!(variant, oomir::DataType::Interface { .. }))
+                    .map(Self::schema_for)
                     .expect("an interface variant was observed");
             }
             schemas.insert(name.clone(), schema);
@@ -390,6 +381,54 @@ impl CanonicalDataTypeRegistry {
                 is_enum: *is_enum,
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod canonical_data_type_registry_tests {
+    use super::*;
+
+    #[test]
+    fn mixed_interface_schema_keeps_only_method_stubs() {
+        let interface_method = oomir::DataTypeMethod::AdtHelperMethod {
+            kind: oomir::AdtHelperKind::StaticPartialEqEnum {
+                enum_class: "example/Mixed".to_string(),
+                variants: Vec::new(),
+            },
+        };
+        let variants = HashMap::from_iter([(
+            "example/Mixed".to_string(),
+            vec![
+                oomir::DataType::Class {
+                    is_abstract: false,
+                    super_class: None,
+                    fields: Vec::new(),
+                    methods: HashMap::default(),
+                    interfaces: Vec::new(),
+                },
+                oomir::DataType::Interface {
+                    methods: HashMap::from_iter([("eq".to_string(), interface_method)]),
+                    interfaces: Vec::new(),
+                    is_enum: true,
+                },
+            ],
+        )]);
+
+        let schemas = CanonicalDataTypeRegistry::shared_schemas(&variants);
+        let oomir::DataType::Interface {
+            methods, is_enum, ..
+        } = &schemas["example/Mixed"]
+        else {
+            panic!("the interface schema must take precedence");
+        };
+        assert!(*is_enum);
+        assert_eq!(
+            methods.get("eq"),
+            Some(&oomir::DataTypeMethod::SimpleConstantReturn(
+                oomir::Type::Void,
+                None,
+            ))
+        );
     }
 }
 
@@ -1177,6 +1216,11 @@ fn synthetic_drop_callees_for_ty<'tcx>(
                     (!pointee.has_escaping_bound_vars() && pointee.needs_drop(tcx, typing_env))
                         .then(|| Instance::resolve_drop_glue(tcx, pointee))
                 }
+                TyKind::Coroutine(..)
+                    if !ty.has_escaping_bound_vars() && ty.needs_drop(tcx, typing_env) =>
+                {
+                    Some(Instance::resolve_drop_glue(tcx, ty))
+                }
                 _ => None,
             }
         })
@@ -1468,14 +1512,37 @@ fn lower_public_library_exports<'tcx>(
         return;
     }
 
-    let function_defs = java_public_surface_def_ids(tcx, JavaPublicSurface::Exported);
-
-    let function_roots = function_defs
+    let function_defs = java_public_surface_def_ids(tcx, JavaPublicSurface::Exported)
         .into_iter()
         .filter(|def_id| is_lowerable_java_public_function(tcx, *def_id))
-        .map(|def_id| Instance::mono(tcx, def_id));
+        .collect::<Vec<_>>();
+    let mut function_roots = function_defs
+        .iter()
+        .copied()
+        .map(|def_id| Instance::mono(tcx, def_id))
+        .collect::<Vec<_>>();
+    for function_def in &function_defs {
+        let Some(local_def) = function_def.as_local() else {
+            continue;
+        };
+        for nested_def in tcx.nested_bodies_within(local_def) {
+            let coroutine_def = nested_def.to_def_id();
+            if !tcx.coroutine_is_async(coroutine_def) {
+                continue;
+            }
+            let coroutine_ty = tcx
+                .type_of(coroutine_def)
+                .instantiate_identity()
+                .skip_norm_wip();
+            let TyKind::Coroutine(_, args) = coroutine_ty.kind() else {
+                continue;
+            };
+            function_roots.push(Instance::new_raw(coroutine_def, args));
+        }
+    }
     // Rustc's collector owns ordinary Rust reachability. Java exports are
-    // additional roots, so only they need a supplemental MIR call walk.
+    // additional roots. Async state-machine bodies are also roots because a
+    // JVM caller polls them through RustFuture rather than an ordinary MIR call.
     lower_supplemental_instance_closure(
         tcx,
         function_roots,
