@@ -25,6 +25,10 @@ public class Main {
         inner_classes.MaybeNumber seven = inner_classes.inner_classes.make_some(7);
         inner_classes.MaybeNumber anotherSeven = inner_classes.inner_classes.make_some(7);
         inner_classes.MaybeNumber eight = inner_classes.inner_classes.make_some(8);
+        inner_classes.MaybeNumber.Some someSeven = (inner_classes.MaybeNumber.Some) seven;
+        if (someSeven.value != 7 || someSeven.component1() != 7) {
+             throw new AssertionError("Single enum payload should use value and component1()");
+        }
 
         if (!inner_classes.MaybeNumber.eq(seven, anotherSeven)) {
              throw new AssertionError("Enum equality should accept matching payload fields");
@@ -35,6 +39,24 @@ public class Main {
 
         inner_classes.MaybeNumber pairTrue = inner_classes.inner_classes.make_pair(7, true);
         inner_classes.MaybeNumber pairFalse = inner_classes.inner_classes.make_pair(7, false);
+        inner_classes.MaybeNumber.Pair pair = (inner_classes.MaybeNumber.Pair) pairTrue;
+        if (pair._0 != 7 || !pair._1 || pair.component1() != 7 || !pair.component2()) {
+             throw new AssertionError("Tuple enum payload should use _0/_1 and component methods");
+        }
+
+        inner_classes.MaybeNumber.WithUnit withUnit = (inner_classes.MaybeNumber.WithUnit)
+                inner_classes.inner_classes.make_with_unit(9);
+        if (withUnit._1 != 9 || withUnit.component1() != 9
+                || inner_classes.inner_classes.read_with_unit(withUnit) != 9) {
+             throw new AssertionError("Enum field names should retain Rust indexes across ZSTs");
+        }
+
+        inner_classes.MaybeNumber.Stats stats = (inner_classes.MaybeNumber.Stats)
+                inner_classes.inner_classes.make_stats(12, true);
+        if (stats.count != 12 || !stats.enabled
+                || stats.component1() != 12 || !stats.component2()) {
+             throw new AssertionError("Struct-like enum payload should retain source field names");
+        }
 
         if (inner_classes.MaybeNumber.eq(pairTrue, pairFalse)) {
              throw new AssertionError("Enum equality should compare every payload field");

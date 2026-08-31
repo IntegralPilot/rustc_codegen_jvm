@@ -19,9 +19,9 @@ use super::super::{
     jvm_names, ty_to_oomir_type,
     types::{
         UNION_BYTES_FIELD, UNION_OBJECTS_FIELD, ensure_fn_ptr_interface, ensure_union_data_type,
-        fn_ptr_signature_from_ty, force_define_named_adt, generate_adt_jvm_class_name,
-        generate_tuple_jvm_class_name, jvm_subtype_payload_ty, pointer_memory_codec_operand,
-        pointer_view_codec_operand, union_from_method_name,
+        enum_variant_field_name, fn_ptr_signature_from_ty, force_define_named_adt,
+        generate_adt_jvm_class_name, generate_tuple_jvm_class_name, jvm_subtype_payload_ty,
+        pointer_memory_codec_operand, pointer_view_codec_operand, union_from_method_name,
     },
 };
 use crate::oomir;
@@ -783,18 +783,16 @@ pub fn read_zero_sized_constant<'tcx>(
                 jvm_names::member_name(&variant.name.to_string())
             );
             let mut values = Vec::new();
-            let mut jvm_index = 0usize;
-            for field in &variant.fields {
+            for (field_index, field) in variant.fields.iter().enumerate() {
                 let field_ty = EarlyBinder::bind(tcx, field.ty(tcx, substs).skip_norm_wip())
                     .instantiate(tcx, instance.args)
                     .skip_norm_wip();
                 let field_jvm_ty = ty_to_oomir_type(field_ty, tcx, oomir_data_types, instance);
                 if field_jvm_ty.has_jvm_value() {
                     values.push((
-                        format!("field{jvm_index}"),
+                        enum_variant_field_name(variant, field_index, tcx),
                         read_zero_sized_constant(tcx, field_ty, oomir_data_types, instance)?,
                     ));
-                    jvm_index += 1;
                 }
             }
             Ok(instance_constant_with_declared_fields(
@@ -2789,7 +2787,7 @@ fn handle_constant_enum<'tcx>(
         // Calculate absolute offset relative to the start of the *whole allocation* `offset`.
         let absolute_field_offset = offset + field_offset_in_variant_shape;
 
-        let field_name = format!("field{}", fields_map.len());
+        let field_name = enum_variant_field_name(variant_def, i, tcx);
 
         breadcrumbs::log!(
             breadcrumbs::LogLevel::Info,

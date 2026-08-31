@@ -2,9 +2,10 @@ use super::{
     jvm_names,
     operand::convert_operand,
     types::{
-        adapt_simple_enum_operand, force_define_named_adt, generate_adt_jvm_class_name,
-        get_field_name_from_index, jvm_subtype_payload_ty, pointer_view_codec_operand,
-        ty_to_oomir_type, union_getter_method_name, union_setter_method_name,
+        adapt_simple_enum_operand, enum_variant_field_name, force_define_named_adt,
+        generate_adt_jvm_class_name, get_field_name_from_index, jvm_subtype_payload_ty,
+        pointer_view_codec_operand, ty_to_oomir_type, union_getter_method_name,
+        union_setter_method_name,
     },
 };
 use crate::oomir::{self, Instruction, Operand};
@@ -691,7 +692,7 @@ fn field_name_from_rust_ty<'tcx>(
             .fields
             .get(rustc_abi::FieldIdx::from_usize(field_index))
             .map(|field| field.ident(tcx).to_string()),
-        TyKind::Adt(adt_def, _) if adt_def.is_enum() => Some(format!("field{}", field_index)),
+        TyKind::Adt(adt_def, _) if adt_def.is_enum() => None,
         TyKind::Coroutine(_, _) => Some(format!("arg{}", field_index)),
         _ => None,
     }
@@ -725,6 +726,22 @@ pub(super) fn field_name_for_projection<'tcx>(
     tcx: TyCtxt<'tcx>,
     data_types: &HashMap<String, oomir::DataType>,
 ) -> Result<String, String> {
+    let direct_rust_ty = match base_rust_ty.kind() {
+        TyKind::Ref(_, inner_ty, _) => *inner_ty,
+        _ => base_rust_ty,
+    };
+    if let TyKind::Adt(adt_def, _) = direct_rust_ty.kind()
+        && adt_def.is_enum()
+        && let Some(variant) = adt_def.variants().iter().find(|variant| {
+            owner_class_name.ends_with(&format!(
+                "${}",
+                jvm_names::member_name(&variant.name.to_string())
+            ))
+        })
+    {
+        return Ok(enum_variant_field_name(variant, field_index, tcx));
+    }
+
     let named_source_field = match base_rust_ty.kind() {
         TyKind::Ref(_, inner_ty, _) => match inner_ty.kind() {
             TyKind::Tuple(_) => field_name_from_rust_ty(*inner_ty, field_index, tcx),

@@ -101,7 +101,7 @@ pub trait BatchObserver {
 }
 
 pub enum PipelineResult {
-    Success(u32),
+    Success { count: u32, elapsed_ms: u64 },
     Rejected(i32),
 }
 
@@ -112,7 +112,10 @@ pub fn process_batch(
 ) -> PipelineResult {
     let processed = transform(batch_size);
     if observer.accept(processed) {
-        PipelineResult::Success(processed)
+        PipelineResult::Success {
+            count: processed,
+            elapsed_ms: u64::from(batch_size),
+        }
     } else {
         PipelineResult::Rejected(-1)
     }
@@ -144,15 +147,21 @@ suspend fun main() {
         .await<PipelineResult>()
 
     when (outcome) {
-        is PipelineResult.Success -> println("completed: ${outcome.field0}")
-        is PipelineResult.Rejected -> println("rejected: ${outcome.field0}")
+        is PipelineResult.Success -> {
+            val (count, elapsedMs) = outcome
+            println("completed: $count in ${elapsedMs}ms")
+        }
+        is PipelineResult.Rejected -> {
+            val (code) = outcome
+            println("rejected: $code")
+        }
         else -> error("unknown PipelineResult implementation")
     }
 }
 ```
 
-Enum variant payloads are exposed as `field0`, `field1`, and so on; named Rust
-`struct` fields retain their source names.
+Single tuple payloads use `value`, multi-field tuples use `_0`, `_1`, and so on,
+and struct-like variants retain their field names. Kotlin can destructure any payload variant.
 
 <details>
 <summary>Expanded Java/Rust example covering methods, callbacks, enum subtypes, constructors, and fields</summary>
@@ -200,7 +209,7 @@ public class Main {
         // 2. Construct, inspect, compare, and call methods on Rust enums
         Calculation calculation = new Calculation.Success(42);
         Calculation sameCalculation = new Calculation.Success(42);
-        int payload = ((Calculation.Success) calculation).field0;
+        int payload = ((Calculation.Success) calculation).value;
         System.out.println("Enum payload: " + payload);
         System.out.println("Enum method: " + calculation.value_or(-1));
         System.out.println("Enum equality: " + Calculation.eq(calculation, sameCalculation));
@@ -555,16 +564,18 @@ public interface Root {
     static boolean eq(Root left, Root right) { /* structural equality */ }
 
     final class Other implements Root {
-        public int field0;
-        public Other(int field0) { this.field0 = field0; }
+        public int value;
+        public Other(int value) { this.value = value; }
+        public int component1() { return value; }
     }
 }
 
 // Leaf is itself the Root.Leaf case: no Root$Leaf wrapper is emitted.
 public interface Leaf extends Root {
     final class A implements Leaf {
-        public int field0;
-        public A(int field0) { this.field0 = field0; }
+        public int value;
+        public A(int value) { this.value = value; }
+        public int component1() { return value; }
     }
 
     final class B implements Leaf {
@@ -576,7 +587,7 @@ public interface Leaf extends Root {
 Leaf leaf = new Leaf.A(42);
 Root root = leaf;
 int outerVariant = Root.variantIndex(root); // 0: Root.Leaf
-int payload = ((Leaf.A) root).field0;        // 42
+int payload = ((Leaf.A) root).value;         // 42
 boolean equal = Root.eq(root, new Leaf.A(42));
 ```
 

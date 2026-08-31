@@ -179,7 +179,7 @@ pub struct EnumVariantShape {
     pub runtime_type: String,
     /// JVM fields on an ordinary case. A transparent case has one logical
     /// payload but no wrapper field.
-    pub fields: Vec<Type>,
+    pub fields: Vec<(String, Type)>,
     pub transparent: bool,
 }
 
@@ -204,6 +204,10 @@ pub enum AdtHelperKind {
     },
     PartialEqClass {
         fields: Vec<(String, Type)>,
+    },
+    Component {
+        field_name: String,
+        field_ty: Type,
     },
 }
 
@@ -848,7 +852,8 @@ pub enum Constant {
         /// The fully qualified JVM class name (e.g., "MyStruct", "MyEnum$VariantA").
         class_name: String,
         /// The constant values of the fields, keyed by field name.
-        /// For enum variants using numbered fields, use "field0", "field1", etc.
+        /// Enum fields use their public JVM ABI names (`value`, `_0`, or the
+        /// source name for a struct-like variant).
         fields: HashMap<String, Constant>,
         /// Any parameters to the constructor.
         params: Vec<Constant>,

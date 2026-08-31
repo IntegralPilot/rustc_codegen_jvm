@@ -119,7 +119,8 @@ private suspend fun exerciseAsyncInterop() {
     val outcome = async_interop.async_interop.extensive_workflow(12, false)
         .await<AsyncOutcome>()
     check(outcome is AsyncOutcome.Completed)
-    val report = outcome.field0
+    val (report) = outcome
+    check(outcome.value === report)
     check(report.seed == 12)
     check(report.stages == 4)
     check(report.checksum == 81)
@@ -128,7 +129,9 @@ private suspend fun exerciseAsyncInterop() {
     val rejected = async_interop.async_interop.extensive_workflow(-7, true)
         .await<AsyncOutcome>()
     check(rejected is AsyncOutcome.Rejected)
-    check(rejected.field0 == -7)
+    val (code) = rejected
+    check(code == -7)
+    check(rejected.value == code)
 
     // Completion and exceptional exit both drop captured Rust state once.
     async_interop.async_interop.reset_drop_count()

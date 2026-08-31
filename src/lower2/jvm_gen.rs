@@ -1678,7 +1678,7 @@ fn create_enum_adt_helper_method(
                     instructions.push(Instruction::Invokestatic(inner_eq));
                     instructions.push(Instruction::Ireturn);
                 } else {
-                    for (field_idx, field_ty) in variant.fields.iter().enumerate() {
+                    for (field_name, field_ty) in &variant.fields {
                         if field_ty.has_jvm_value() {
                             append_field_equality_check(
                                 module,
@@ -1686,7 +1686,7 @@ fn create_enum_adt_helper_method(
                                 &mut instructions,
                                 &mut false_fixups,
                                 runtime_type_idx,
-                                &format!("field{field_idx}"),
+                                field_name,
                                 field_ty,
                             )?;
                         }
@@ -1711,10 +1711,10 @@ fn create_enum_adt_helper_method(
                 instructions,
             )
         }
-        AdtHelperKind::PartialEqClass { .. } => {
+        AdtHelperKind::PartialEqClass { .. } | AdtHelperKind::Component { .. } => {
             return Err(jvm::Error::VerificationError {
                 context: format!("Enum helper {owner_name}::{method_name}"),
-                message: "class equality helper requested from enum helper generator".to_string(),
+                message: "class-only helper requested from enum helper generator".to_string(),
             });
         }
     };
@@ -2132,6 +2132,37 @@ pub(super) fn create_data_type_classfile_for_class(
                             attributes: vec![code_attribute],
                         }
                     }
+                    AdtHelperKind::Component {
+                        field_name,
+                        field_ty,
+                    } => {
+                        let method_desc = format!("(){}", field_ty.to_jvm_descriptor());
+                        let field_ref = cp.add_field_ref(
+                            this_class_index,
+                            field_name,
+                            &field_ty.to_jvm_descriptor(),
+                        )?;
+                        let code_attribute = code_attribute_for_descriptor(
+                            &mut cp,
+                            get_type_size(field_ty).max(1),
+                            1,
+                            vec![
+                                Instruction::Aload_0,
+                                Instruction::Getfield(field_ref),
+                                return_instruction_for_type(field_ty),
+                            ],
+                            &method_desc,
+                            false,
+                            Some(class_name_jvm),
+                            method_name,
+                        )?;
+                        jvm::Method {
+                            access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::FINAL,
+                            name_index: cp.add_utf8(method_name)?,
+                            descriptor_index: cp.add_utf8(&method_desc)?,
+                            attributes: vec![code_attribute],
+                        }
+                    }
                 };
                 jvm_methods.push(jvm_method);
             }
@@ -2531,10 +2562,10 @@ pub(super) fn create_data_type_classfile_for_interface(
                         method_name,
                         kind,
                     )?,
-                    AdtHelperKind::PartialEqClass { .. } => {
+                    AdtHelperKind::PartialEqClass { .. } | AdtHelperKind::Component { .. } => {
                         return Err(jvm::Error::VerificationError {
                             context: format!("Interface {interface_name_jvm}"),
-                            message: "class equality helper cannot be emitted on an interface"
+                            message: "class-only helper cannot be emitted on an interface"
                                 .to_string(),
                         });
                     }

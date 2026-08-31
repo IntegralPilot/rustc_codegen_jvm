@@ -3,7 +3,7 @@ pub trait BatchObserver {
 }
 
 pub enum PipelineResult {
-    Success(u32),
+    Success { count: u32, elapsed_ms: u64 },
     Rejected(i32),
 }
 
@@ -14,7 +14,10 @@ pub fn process_batch(
 ) -> PipelineResult {
     let processed = transform(batch_size);
     if observer.accept(processed) {
-        PipelineResult::Success(processed)
+        PipelineResult::Success {
+            count: processed,
+            elapsed_ms: u64::from(batch_size),
+        }
     } else {
         PipelineResult::Rejected(-1)
     }

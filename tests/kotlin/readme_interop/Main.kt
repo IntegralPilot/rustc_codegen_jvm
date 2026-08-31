@@ -16,8 +16,16 @@ suspend fun main() {
         .await<PipelineResult>()
 
     when (outcome) {
-        is PipelineResult.Success -> println("completed: ${outcome.field0}")
-        is PipelineResult.Rejected -> println("rejected: ${outcome.field0}")
+        is PipelineResult.Success -> {
+            val (count, elapsedMs) = outcome
+            check(outcome.count == count)
+            check(outcome.elapsed_ms == elapsedMs)
+            println("completed: $count in ${elapsedMs}ms")
+        }
+        is PipelineResult.Rejected -> {
+            val (code) = outcome
+            println("rejected: $code")
+        }
         else -> error("unknown PipelineResult implementation")
     }
 
@@ -25,5 +33,7 @@ suspend fun main() {
         my_crate.my_crate.process_batch(40, { value -> value + 2 }, LimitObserver(10)),
     ).await<PipelineResult>()
     check(rejected is PipelineResult.Rejected)
-    check(rejected.field0 == -1)
+    val (code) = rejected
+    check(code == -1)
+    check(rejected.value == code)
 }

@@ -197,7 +197,7 @@ public final class KotlinFutureInterop {
                     return PENDING;
                 }
                 try {
-                    Field output = result.getClass().getField("field0");
+                    Field output = result.getClass().getField("value");
                     return output.get(result);
                 } catch (NoSuchFieldException noOutput) {
                     return UNIT;

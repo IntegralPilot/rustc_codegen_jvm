@@ -11,6 +11,8 @@ pub enum MaybeNumber {
     None,
     Some(i32),
     Pair(i32, bool),
+    WithUnit((), i32),
+    Stats { count: i32, enabled: bool },
 }
 
 pub struct NumberBox {
@@ -108,6 +110,21 @@ pub fn make_some(value: i32) -> MaybeNumber {
 
 pub fn make_pair(value: i32, flag: bool) -> MaybeNumber {
     MaybeNumber::Pair(value, flag)
+}
+
+pub fn make_with_unit(value: i32) -> MaybeNumber {
+    MaybeNumber::WithUnit((), value)
+}
+
+pub fn read_with_unit(value: MaybeNumber) -> i32 {
+    match value {
+        MaybeNumber::WithUnit((), value) => value,
+        _ => -1,
+    }
+}
+
+pub fn make_stats(count: i32, enabled: bool) -> MaybeNumber {
+    MaybeNumber::Stats { count, enabled }
 }
 
 pub fn make_number_box(value: i32) -> NumberBox {

@@ -71,6 +71,36 @@ const ENUM_DROP_FIELDS_METHOD: &str = "_rust_drop_fields";
 const MANAGED_DROP_METHOD: &str = "rustDrop";
 const MANAGED_DROP_INTERFACE: &str = "org/rustlang/runtime/RustDrop";
 
+/// Returns the public JVM field name for a Rust enum variant payload.
+///
+/// Struct-like variants retain their source field names. Tuple-like variants
+/// use `value` when there is exactly one payload and `_0`, `_1`, ... otherwise.
+pub(super) fn enum_variant_field_name(
+    variant: &rustc_middle::ty::VariantDef,
+    field_index: usize,
+    tcx: TyCtxt<'_>,
+) -> String {
+    let field = variant
+        .fields
+        .get(FieldIdx::from_usize(field_index))
+        .unwrap_or_else(|| {
+            panic!(
+                "enum variant {} has no field at index {field_index}",
+                variant.name
+            )
+        });
+    let source_name = field.ident(tcx).to_string();
+    if source_name.parse::<usize>().is_ok() {
+        if variant.fields.len() == 1 {
+            "value".to_string()
+        } else {
+            format!("_{field_index}")
+        }
+    } else {
+        jvm_names::member_name(&source_name)
+    }
+}
+
 pub(super) fn enum_scoped_method_name(enum_class: &str, method: &str) -> String {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     for byte in enum_class.bytes() {
@@ -795,8 +825,6 @@ fn enum_variant_drop_glue_function<'tcx>(
     let self_ty = oomir::Type::Class(variant_class_name.to_string());
     let self_operand = operand_var("_1", self_ty.clone());
     let mut actions = Vec::new();
-    let mut jvm_field_index = 0usize;
-
     for (field_index, field) in variant.fields.iter().enumerate() {
         let raw_field_ty = field.ty(tcx, substs).skip_norm_wip();
         let field_ty =
@@ -804,8 +832,7 @@ fn enum_variant_drop_glue_function<'tcx>(
         let field_oomir_ty = ty_to_oomir_type(field_ty, tcx, data_types, instance_context);
         let mut action = Vec::new();
         let field_value = if field_oomir_ty.has_jvm_value() {
-            let field_name = format!("field{jvm_field_index}");
-            jvm_field_index += 1;
+            let field_name = enum_variant_field_name(variant, field_index, tcx);
             let dest = format!("_drop_field_{field_index}");
             action.push(oomir::Instruction::GetField {
                 dest: dest.clone(),
@@ -1479,14 +1506,17 @@ fn ensure_enum_data_types<'tcx>(
             let fields = variant
                 .fields
                 .iter()
-                .filter_map(|field| {
+                .enumerate()
+                .filter_map(|(field_index, field)| {
                     let field_ty = ty_to_oomir_type(
                         field.ty(tcx, substs).skip_norm_wip(),
                         tcx,
                         data_types,
                         instance_context,
                     );
-                    field_ty.has_jvm_value().then_some(field_ty)
+                    field_ty
+                        .has_jvm_value()
+                        .then(|| (enum_variant_field_name(variant, field_index, tcx), field_ty))
                 })
                 .collect();
             let transparent_payload = jvm_subtype_payload_ty(adt_def, variant, substs, tcx)
@@ -1607,20 +1637,21 @@ fn ensure_enum_data_types<'tcx>(
             }
         }
 
-        let fields = variant
+        let fields: Vec<_> = variant
             .fields
             .iter()
-            .filter_map(|field| {
+            .enumerate()
+            .filter_map(|(field_index, field)| {
                 let field_ty = ty_to_oomir_type(
                     field.ty(tcx, substs).skip_norm_wip(),
                     tcx,
                     data_types,
                     instance_context,
                 );
-                field_ty.has_jvm_value().then_some(field_ty)
+                field_ty
+                    .has_jvm_value()
+                    .then(|| (enum_variant_field_name(variant, field_index, tcx), field_ty))
             })
-            .enumerate()
-            .map(|(field_idx, field_ty)| (format!("field{}", field_idx), field_ty))
             .collect();
         let mut methods = HashMap::default();
         methods.insert(
@@ -1635,6 +1666,17 @@ fn ensure_enum_data_types<'tcx>(
                 instance_context,
             )),
         );
+        for (component_index, (field_name, field_ty)) in fields.iter().enumerate() {
+            methods.insert(
+                format!("component{}", component_index + 1),
+                DataTypeMethod::AdtHelperMethod {
+                    kind: oomir::AdtHelperKind::Component {
+                        field_name: field_name.clone(),
+                        field_ty: field_ty.clone(),
+                    },
+                },
+            );
+        }
 
         let Some(oomir::DataType::Class {
             fields: existing_fields,
@@ -2481,7 +2523,6 @@ fn union_enum_variant_layout<'tcx>(
         jvm_names::member_name(&variant.name.to_string())
     );
     let mut fields = Vec::new();
-    let mut jvm_field_index = 0;
     for (field_index, field) in variant.fields.iter().enumerate() {
         let rust_ty =
             resolve_union_ty(tcx, field.ty(tcx, substs).skip_norm_wip(), instance_context)?;
@@ -2499,10 +2540,9 @@ fn union_enum_variant_layout<'tcx>(
         fields.push(UnionAggregateField {
             rust_ty,
             jvm_ty,
-            jvm_name: format!("field{jvm_field_index}"),
+            jvm_name: enum_variant_field_name(variant, field_index, tcx),
             offset,
         });
-        jvm_field_index += 1;
     }
     Ok(UnionAggregateLayout {
         class_name: variant_class,
