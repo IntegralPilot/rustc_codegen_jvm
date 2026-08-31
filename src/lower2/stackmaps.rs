@@ -177,20 +177,22 @@ impl FrameState {
     }
 }
 
-pub(super) fn initial_locals_for_oomir_function(
-    function: &oomir::Function,
+pub(super) fn initial_locals_for_oomir_signature(
+    function_name: &str,
+    function_owner_class: Option<&str>,
+    signature: &oomir::Signature,
     is_static: bool,
     owner_class_name: Option<&str>,
 ) -> Vec<FrameValue> {
     let mut locals = Vec::new();
     if !is_static {
-        let this_value = if function.name == "<init>" {
+        let this_value = if function_name == "<init>" {
             FrameValue::UninitializedThis
         } else {
             FrameValue::Object(
                 normalize_class_name(
                     owner_class_name
-                        .or(function.owner_class.as_deref())
+                        .or(function_owner_class)
                         .unwrap_or("java/lang/Object"),
                 )
                 .into(),
@@ -200,7 +202,7 @@ pub(super) fn initial_locals_for_oomir_function(
     }
 
     let first_explicit_param = if is_static { 0 } else { 1 };
-    for (_, param_ty) in function.signature.params.iter().skip(first_explicit_param) {
+    for (_, param_ty) in signature.params.iter().skip(first_explicit_param) {
         if param_ty.has_jvm_value() {
             push_local_value(&mut locals, frame_value_from_oomir_type(param_ty));
         }

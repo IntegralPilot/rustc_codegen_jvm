@@ -7,7 +7,24 @@ struct AliasValue {
     ty: Arc<Type>,
 }
 
-type AliasMap = HashMap<usize, AliasValue>;
+// Alias states are normally very sparse even when a function has thousands of
+// locals. A sorted sparse vector keeps state clones contiguous and allocation-
+// light without multiplying them by the full local count.
+type AliasMap = Vec<(usize, AliasValue)>;
+
+fn alias_get(aliases: &AliasMap, local: usize) -> Option<&AliasValue> {
+    aliases
+        .binary_search_by_key(&local, |(dest, _)| *dest)
+        .ok()
+        .map(|index| &aliases[index].1)
+}
+
+fn alias_insert(aliases: &mut AliasMap, local: usize, alias: AliasValue) {
+    match aliases.binary_search_by_key(&local, |(dest, _)| *dest) {
+        Ok(index) => aliases[index].1 = alias,
+        Err(index) => aliases.insert(index, (local, alias)),
+    }
+}
 
 #[derive(Debug)]
 struct LocalInterner {
@@ -111,24 +128,18 @@ fn analyze_copy_aliases(
         }
     }
 
-    let mut entry_aliases = vec![AliasMap::default(); labels.len()];
-    let mut exit_aliases = entry_aliases.clone();
+    let mut exit_aliases = vec![AliasMap::default(); labels.len()];
     let mut queue = (0..labels.len()).collect::<VecDeque<_>>();
     let mut queued = vec![true; labels.len()];
     let mut next_exit = AliasMap::default();
     while let Some(index) = queue.pop_front() {
         queued[index] = false;
         if Some(index) == entry {
-            entry_aliases[index].clear();
+            next_exit.clear();
         } else {
-            meet_predecessor_aliases(
-                &predecessors[index],
-                &exit_aliases,
-                &mut entry_aliases[index],
-            );
+            meet_predecessor_aliases(&predecessors[index], &exit_aliases, &mut next_exit);
         }
 
-        next_exit.clone_from(&entry_aliases[index]);
         if let Some(block) = function.body.basic_blocks.get(&labels[index]) {
             transfer_aliases_through_block(block, &mut next_exit, locals, debug_locals);
         } else {
@@ -144,6 +155,20 @@ fn analyze_copy_aliases(
             }
         }
         next_exit.clear();
+    }
+
+    // Entry states are only needed for the final rewrite. Materialising them
+    // after the exit-state fixpoint avoids cloning every state twice on each
+    // worklist visit.
+    let mut entry_aliases = vec![AliasMap::default(); labels.len()];
+    for index in 0..labels.len() {
+        if Some(index) != entry {
+            meet_predecessor_aliases(
+                &predecessors[index],
+                &exit_aliases,
+                &mut entry_aliases[index],
+            );
+        }
     }
 
     (labels, entry_aliases)
@@ -168,7 +193,20 @@ fn meet_predecessor_aliases(
             continue;
         }
         let predecessor_aliases = &exit_aliases[*predecessor];
-        aliases.retain(|dest, alias| predecessor_aliases.get(dest) == Some(alias));
+        let mut predecessor_index = 0;
+        aliases.retain(|(dest, alias)| {
+            while predecessor_aliases
+                .get(predecessor_index)
+                .is_some_and(|(predecessor_dest, _)| predecessor_dest < dest)
+            {
+                predecessor_index += 1;
+            }
+            predecessor_aliases.get(predecessor_index).is_some_and(
+                |(predecessor_dest, predecessor_alias)| {
+                    predecessor_dest == dest && predecessor_alias == alias
+                },
+            )
+        });
     }
 }
 
@@ -204,7 +242,7 @@ fn transfer_aliases_through_instruction(
         && dest != alias.source
         && !debug_locals.contains(&dest)
     {
-        aliases.insert(dest, alias);
+        alias_insert(aliases, dest, alias);
     }
 }
 
@@ -521,13 +559,13 @@ fn resolve_alias<'a>(
     locals: &LocalInterner,
 ) -> Option<&'a AliasValue> {
     // `move_alias` stores only ultimate sources, so every lookup is one hop.
-    aliases.get(&locals.id(name)?)
+    alias_get(aliases, locals.id(name)?)
 }
 
 fn kill_aliases_touching(local: usize, aliases: &mut AliasMap) {
     // `move_alias` flattens every alias to its ultimate source. Redefinition
     // therefore needs one pass over direct destinations and root sources.
-    aliases.retain(|dest, alias| *dest != local && alias.source != local);
+    aliases.retain(|(dest, alias)| *dest != local && alias.source != local);
 }
 
 #[cfg(test)]

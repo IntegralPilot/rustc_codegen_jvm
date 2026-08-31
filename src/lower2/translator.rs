@@ -173,6 +173,15 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         propagate_deferred_pointer_moves(oomir_func, &mut deferred_pointer_variables);
         let direct_cell_projections = direct_cell_projections(oomir_func);
         let known_function_pointer_adapters = known_function_pointer_adapters(oomir_func);
+        let relative_signature =
+            relative_pointer_abi.then(|| oomir_func.signature.relative_pointer_abi_signature());
+        let initial_locals = stackmaps::initial_locals_for_oomir_signature(
+            &oomir_func.name,
+            oomir_func.owner_class.as_deref(),
+            relative_signature.as_ref().unwrap_or(&oomir_func.signature),
+            is_static,
+            owner_class_name,
+        );
         let mut translator = FunctionTranslator {
             oomir_func,
             module,
@@ -195,17 +204,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             switch_fixups: Vec::new(),
             current_oomir_block_label: String::new(),
             current_fallthrough_block_label: None,
-            initial_locals: stackmaps::initial_locals_for_oomir_function(
-                &if relative_pointer_abi {
-                    let mut function = oomir_func.clone();
-                    function.signature = function.signature.relative_pointer_abi_signature();
-                    function
-                } else {
-                    oomir_func.clone()
-                },
-                is_static,
-                owner_class_name,
-            ),
+            initial_locals,
             direct_this_aliases: HashSet::default(),
             jvm_metadata: Vec::new(),
             current_source_location: None,
@@ -1611,7 +1610,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         } else {
             BTreeSet::new()
         };
-        let optimised = optimise2::optimise(
+        let mut optimised = optimise2::optimise(
             std::mem::take(&mut self.jvm_instructions),
             std::mem::take(&mut self.jvm_metadata),
             self.max_locals_used,
@@ -1623,6 +1622,16 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             context: format!("Function {}", self.oomir_func.name),
             message: format!("Failed to run optimise2: {error:?}"),
         })?;
+        if let Some(metrics) = optimised.metrics.take() {
+            crate::metrics::record_optimise2_method(metrics, || {
+                format!(
+                    "{}::{}{}",
+                    self.module.owner_class_for_function(self.oomir_func),
+                    self.oomir_func.name,
+                    self.oomir_func.signature
+                )
+            });
+        }
         self.jvm_instructions = optimised.instructions;
         self.jvm_metadata = optimised.metadata;
         self.max_locals_used = optimised.max_locals;
@@ -1660,10 +1669,8 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             0..0,
             std::iter::repeat_n(optimise2::BytecodeMetadata::default(), initializer_count),
         );
-        let code_size = instruction_byte_offsets(&self.jvm_instructions)?
-            .last()
-            .copied()
-            .unwrap_or(0);
+        let byte_offsets = instruction_byte_offsets(&self.jvm_instructions)?;
+        let code_size = byte_offsets.last().copied().unwrap_or(0);
         if code_size > usize::from(u16::MAX) {
             let handler_count = self
                 .exception_table
@@ -1671,7 +1678,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 .map(|entry| entry.handler_pc)
                 .collect::<BTreeSet<_>>()
                 .len();
-            let offsets = instruction_byte_offsets(&self.jvm_instructions)?;
             let mut reachable = vec![false; self.jvm_instructions.len()];
             let mut work = vec![0usize];
             while let Some(index) = work.pop() {
@@ -1688,7 +1694,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 .iter()
                 .enumerate()
                 .filter(|(_, reachable)| **reachable)
-                .map(|(index, _)| offsets[index + 1] - offsets[index])
+                .map(|(index, _)| byte_offsets[index + 1] - byte_offsets[index])
                 .sum::<usize>();
             return Err(jvm::Error::VerificationError {
                 context: format!("Function {}", self.oomir_func.name),
@@ -1746,7 +1752,6 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         }
 
         if self.debug_info.local_variables {
-            let byte_offsets = instruction_byte_offsets(&self.jvm_instructions)?;
             let mut local_variables = Vec::new();
             for (variable_index, variable) in self.oomir_func.debug_variables.iter().enumerate() {
                 let Some((old_slot, actual_type)) = self.debug_variable_local(variable) else {
@@ -2000,7 +2005,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         let oomir::Type::Class(class_name) = ty else {
             return None;
         };
-        match self.module.data_types.get(class_name) {
+        match self.module.data_type(class_name) {
             Some(oomir::DataType::Class {
                 fields,
                 is_abstract: false,
@@ -2581,7 +2586,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         let oomir::Type::Class(class_name) = target_ty else {
             return None;
         };
-        let oomir::DataType::Class { fields, .. } = self.module.data_types.get(class_name)? else {
+        let oomir::DataType::Class { fields, .. } = self.module.data_type(class_name)? else {
             return None;
         };
         let mut value_fields = fields
@@ -2617,7 +2622,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             return false;
         };
         matches!(
-            self.module.data_types.get(class_name),
+            self.module.data_type(class_name),
             Some(oomir::DataType::Class { fields, .. })
                 if fields
                     .iter()
@@ -2632,7 +2637,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 message: format!("zero-sized wrapper field has non-class type {ty:?}"),
             });
         };
-        let fields = match self.module.data_types.get(class_name) {
+        let fields = match self.module.data_type(class_name) {
             Some(oomir::DataType::Class { fields, .. }) => fields
                 .iter()
                 .filter(|(_, field_ty)| field_ty.has_jvm_value())
@@ -5169,7 +5174,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     .iter()
                     .filter(|(_, ty)| ty.has_jvm_value())
                     .collect::<Vec<_>>();
-                let declared_field_types = match self.module.data_types.get(class_name) {
+                let declared_field_types = match self.module.data_type(class_name) {
                     Some(oomir::DataType::Class { fields, .. }) => Some(
                         fields
                             .iter()
@@ -5942,7 +5947,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 // The class-file opcode and constant-pool entry must follow
                 // the resolved JVM owner, not that provisional OOMIR spelling.
                 let is_interface_owner = matches!(
-                    self.module.data_types.get(class_name),
+                    self.module.data_type(class_name),
                     Some(oomir::DataType::Interface { .. })
                 ) || matches!(
                     operand.get_type(),
@@ -6262,7 +6267,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                 // 1. Add Method reference to constant pool
                 let class_index = self.constant_pool.add_class(class_name)?;
                 let method_ref_index = if matches!(
-                    self.module.data_types.get(class_name),
+                    self.module.data_type(class_name),
                     Some(oomir::DataType::Interface { .. })
                 ) || self.module.external_interfaces.contains(class_name)
                 {
@@ -6345,7 +6350,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         };
         let class_index = self.constant_pool.add_class(class_name)?;
         let method_ref = if matches!(
-            self.module.data_types.get(class_name),
+            self.module.data_type(class_name),
             Some(oomir::DataType::Interface { .. })
         ) || self.module.external_interfaces.contains(class_name)
         {
@@ -7219,7 +7224,7 @@ fn adapt_direct_field_view(
     let Type::Class(class_name) = target_view else {
         return false;
     };
-    let Some(oomir::DataType::Class { fields, .. }) = module.data_types.get(class_name) else {
+    let Some(oomir::DataType::Class { fields, .. }) = module.data_type(class_name) else {
         return false;
     };
     let mut visible_fields = fields.iter().filter(|(_, ty)| ty.has_jvm_value());
@@ -7711,15 +7716,20 @@ fn jvm_switch_key(
 fn instruction_byte_offsets(instructions: &[Instruction]) -> Result<Vec<usize>, jvm::Error> {
     let mut offsets = Vec::with_capacity(instructions.len() + 1);
     let mut byte_offset = 0usize;
+    let mut scratch = Cursor::new(Vec::with_capacity(16));
     for instruction in instructions {
         offsets.push(byte_offset);
-        byte_offset += instruction_size_at(instruction, byte_offset)?;
+        byte_offset += instruction_size_at(instruction, byte_offset, &mut scratch)?;
     }
     offsets.push(byte_offset);
     Ok(offsets)
 }
 
-fn instruction_size_at(instruction: &Instruction, byte_offset: usize) -> Result<usize, jvm::Error> {
+fn instruction_size_at(
+    instruction: &Instruction,
+    byte_offset: usize,
+    scratch: &mut Cursor<Vec<u8>>,
+) -> Result<usize, jvm::Error> {
     match instruction {
         Instruction::Ifeq(_)
         | Instruction::Ifne(_)
@@ -7751,9 +7761,10 @@ fn instruction_size_at(instruction: &Instruction, byte_offset: usize) -> Result<
             Ok(1 + padding + 8 + lookup_switch.pairs.len() * 8)
         }
         _ => {
-            let mut bytes = Cursor::new(Vec::new());
-            instruction.to_bytes(&mut bytes)?;
-            Ok(bytes.get_ref().len())
+            scratch.get_mut().clear();
+            scratch.set_position(0);
+            instruction.to_bytes(scratch)?;
+            Ok(scratch.get_ref().len())
         }
     }
 }

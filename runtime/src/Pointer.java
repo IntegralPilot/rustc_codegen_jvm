@@ -4382,30 +4382,44 @@ public final class Pointer {
     }
 
     private static final class FieldCell {
-        private final Object owner;
+        private final Object fixedOwner;
+        private final Cell rootOwner;
         private final FieldAccess access;
         private final int fieldNameHash;
         private volatile boolean hasStructuralView;
         private volatile boolean hasMemoryView;
 
         private FieldCell(Object owner, FieldAccess access) {
-            this.owner = owner;
+            fixedOwner = owner;
+            rootOwner = null;
+            this.access = access;
+            fieldNameHash = access.fieldNameHash;
+        }
+
+        private FieldCell(Cell owner, FieldAccess access) {
+            fixedOwner = null;
+            rootOwner = owner;
             this.access = access;
             fieldNameHash = access.fieldNameHash;
         }
 
         private Object owner() {
-            return owner;
+            return rootOwner == null ? fixedOwner : rootOwner.value;
+        }
+
+        private Object ownerIdentity() {
+            return rootOwner == null ? fixedOwner : rootOwner;
         }
 
         private Object get() {
             try {
-                Object value = (Object) access.getter.invokeExact(owner());
+                Object owner = owner();
+                Object value = (Object) access.getter.invokeExact(owner);
                 if (value instanceof Pointer && access.elementOffsetGetter != null) {
                     long elementOffset =
-                            (long) access.elementOffsetGetter.invokeExact(owner());
+                            (long) access.elementOffsetGetter.invokeExact(owner);
                     long byteOffset =
-                            (long) access.byteOffsetGetter.invokeExact(owner());
+                            (long) access.byteOffsetGetter.invokeExact(owner);
                     return materializeRelative(
                             (Pointer) value, elementOffset, byteOffset);
                 }
@@ -4418,18 +4432,23 @@ public final class Pointer {
         }
 
         private void set(Object value) {
+            Object owner = owner();
             try {
-                access.setter.invokeExact(owner(), value);
+                access.setter.invokeExact(owner, value);
                 if (access.elementOffsetSetter != null) {
-                    access.elementOffsetSetter.invokeExact(owner(), 0L);
-                    access.byteOffsetSetter.invokeExact(owner(), 0L);
+                    access.elementOffsetSetter.invokeExact(owner, 0L);
+                    access.byteOffsetSetter.invokeExact(owner, 0L);
                 }
             } catch (RuntimeException | Error error) {
                 throw error;
             } catch (Throwable error) {
                 throw new IllegalStateException("could not write Rust field pointer", error);
             }
-            commitFieldOwner(owner());
+            commitFieldOwner(owner);
+            Object identity = ownerIdentity();
+            if (identity != owner) {
+                commitFieldOwner(identity);
+            }
         }
 
     }
@@ -5255,6 +5274,48 @@ public final class Pointer {
         return pointer;
     }
 
+    /**
+     * Projects a field through a replaceable root cell. The field follows the
+     * cell's current aggregate, so field mutations are immediately visible
+     * during unwinding while a later whole-place replacement remains visible
+     * through previously derived field pointers.
+     */
+    private static Pointer rootField(
+            Cell owner,
+            Class<?> ownerClass,
+            String fieldName,
+            long size,
+            String codecClassName) {
+        String cacheKey = ownerClass.getName() + '\n' + fieldName;
+        FieldCell cell;
+        Map<Object, Map<String, WeakReference<FieldCell>>> stripe =
+                stateStripe(FIELD_CELLS, owner);
+        synchronized (stripe) {
+            Map<String, WeakReference<FieldCell>> fields = stripe.get(owner);
+            if (fields == null) {
+                fields = new HashMap<>();
+                stripe.put(owner, fields);
+            }
+            WeakReference<FieldCell> reference = fields.get(cacheKey);
+            cell = reference == null ? null : reference.get();
+            if (cell == null) {
+                try {
+                    cell = new FieldCell(owner, fieldAccess(ownerClass, fieldName));
+                } catch (NoSuchFieldException error) {
+                    if (size == 0) {
+                        return Pointer.cell(null, 0, codecClassName);
+                    }
+                    throw new IllegalArgumentException(
+                            "unknown Rust field " + ownerClass.getName() + "." + fieldName,
+                            error);
+                }
+                fields.put(cacheKey, new WeakReference<>(cell));
+            }
+            markIdentityFilter(FIELD_CELL_FILTER, owner);
+        }
+        return new Pointer(cell, checkedArrayLength(size), 0, size, codecClassName);
+    }
+
     private Object compatibleStructView(String ownerClassName) {
         try {
             Class<?> ownerClass = resolvedRuntimeClass(ownerClassName);
@@ -5312,10 +5373,11 @@ public final class Pointer {
             long fieldOffset,
             long fieldSize,
             String fieldCodecClassName) {
+        Class<?> ownerClass = null;
         Class<?> fieldType = null;
         if (fieldSize != 0 || traitMetadataCarrier() != null) {
             try {
-                Class<?> ownerClass = resolvedRuntimeClass(ownerClassName);
+                ownerClass = resolvedRuntimeClass(ownerClassName);
                 fieldType = instanceField(ownerClass, fieldName).getType();
             } catch (ClassNotFoundException error) {
                 throw new IllegalArgumentException(
@@ -5325,11 +5387,32 @@ public final class Pointer {
                         "unknown Rust field " + ownerClassName + "." + fieldName, error);
             }
         }
+        if (allocation instanceof Cell
+                && byteOffset == 0
+                && viewSize == allocationElementSize) {
+            try {
+                if (ownerClass == null) {
+                    ownerClass = resolvedRuntimeClass(ownerClassName);
+                }
+                if (ownerClass.isInstance(((Cell) allocation).value)) {
+                    return rootField(
+                                    (Cell) allocation,
+                                    ownerClass,
+                                    fieldName,
+                                    fieldSize,
+                                    fieldCodecClassName)
+                            .withMetadata(metadata)
+                            .inheritAddressOrigin(this, fieldOffset);
+                }
+            } catch (ClassNotFoundException error) {
+                throw new IllegalArgumentException(
+                        "unknown Rust aggregate class " + ownerClassName, error);
+            }
+        }
         boolean managedField = fieldType == null || !fieldType.isPrimitive();
-        // Root scalar fields remain byte projections so replacing the whole
-        // aggregate is visible through an existing field pointer. Nested and
-        // decoded carriers already have stable identity; mutating their JVM
-        // field directly avoids replacing the live aggregate during write-back.
+        // Replaceable root cells use rootField above. Nested, receiver-backed,
+        // and decoded carriers already have stable identity, so their primitive
+        // fields can also mutate the live JVM carrier directly.
         boolean directPrimitiveField =
                 allocation instanceof FieldCell
                         || allocation instanceof ReceiverCell

@@ -53,6 +53,12 @@ pub(crate) fn short_hash_value(value: &impl Hash, length: usize) -> String {
     format!("{:016x}", hasher.finish())[..length].to_string()
 }
 
+pub(crate) fn hash_value(value: &impl Hash) -> u64 {
+    let mut hasher = Fnv1aHasher::default();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
 /// Prefer a readable generated identifier and retain a hash only as the
 /// bounded fallback for identities that would exceed the JVM-friendly limit.
 pub(crate) fn readable_or_hashed_name(

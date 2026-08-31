@@ -4,7 +4,7 @@ use std::ops::Deref;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum ConstantKey {
-    Utf8(String),
+    Utf8(jvm::JavaString),
     Integer(i32),
     Float(u32),
     Long(i64),
@@ -47,7 +47,7 @@ enum ConstantKey {
 impl From<&Constant<'_>> for ConstantKey {
     fn from(constant: &Constant<'_>) -> Self {
         match constant {
-            Constant::Utf8(value) => ConstantKey::Utf8(value.to_string()),
+            Constant::Utf8(value) => ConstantKey::Utf8(value.as_ref().to_owned()),
             Constant::Integer(value) => ConstantKey::Integer(*value),
             Constant::Float(value) => ConstantKey::Float(value.to_bits()),
             Constant::Long(value) => ConstantKey::Long(*value),
@@ -149,9 +149,7 @@ impl InternedConstantPool {
     }
 
     pub(super) fn add_utf8<S: AsRef<str>>(&mut self, value: S) -> jvm::Result<u16> {
-        self.add(Constant::Utf8(
-            jvm::JavaString::from(value.as_ref().to_string()).into(),
-        ))
+        self.add(Constant::Utf8(jvm::JavaString::from(value.as_ref()).into()))
     }
 
     pub(super) fn add_integer(&mut self, value: i32) -> jvm::Result<u16> {
@@ -288,6 +286,18 @@ impl InternedConstantPool {
     }
 }
 
+// Every generated class obtains its constants through InternedConstantPool,
+// which enforces this invariant as entries are added. Keep the full scan in
+// development builds as an assertion over that implementation, but do not
+// rebuild and hash the entire pool immediately before every production
+// serialization.
+#[cfg(not(debug_assertions))]
+#[inline]
+pub(super) fn verify_no_duplicate_constants(_class_file: &ClassFile<'_>) -> jvm::Result<()> {
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
 pub(super) fn verify_no_duplicate_constants(class_file: &ClassFile<'_>) -> jvm::Result<()> {
     let mut seen = HashMap::<ConstantKey, u16>::default();
     for index in 1..=class_file.constant_pool.len() {

@@ -76,6 +76,136 @@ pub(crate) struct DebugScopeCache {
     variables_by_local: HashMap<usize, Vec<usize>>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LocalBitSet {
+    words: Vec<u64>,
+}
+
+impl LocalBitSet {
+    fn empty(local_count: usize) -> Self {
+        Self {
+            words: vec![0; local_count.div_ceil(u64::BITS as usize)],
+        }
+    }
+
+    fn all(local_count: usize) -> Self {
+        let mut result = Self {
+            words: vec![u64::MAX; local_count.div_ceil(u64::BITS as usize)],
+        };
+        if let Some(last) = result.words.last_mut()
+            && !local_count.is_multiple_of(u64::BITS as usize)
+        {
+            *last = (1 << (local_count % u64::BITS as usize)) - 1;
+        }
+        result
+    }
+
+    fn insert(&mut self, local: Local) {
+        let index = local.index();
+        self.words[index / u64::BITS as usize] |= 1 << (index % u64::BITS as usize);
+    }
+
+    fn remove(&mut self, local: Local) {
+        let index = local.index();
+        self.words[index / u64::BITS as usize] &= !(1 << (index % u64::BITS as usize));
+    }
+
+    fn contains(&self, local: Local) -> bool {
+        let index = local.index();
+        self.words[index / u64::BITS as usize] & (1 << (index % u64::BITS as usize)) != 0
+    }
+
+    fn assign_union(&mut self, left: &Self, right: &Self) {
+        for ((dest, left), right) in self.words.iter_mut().zip(&left.words).zip(&right.words) {
+            *dest = *left | *right;
+        }
+    }
+
+    fn intersect_with_union(&mut self, left: &Self, right: &Self) {
+        for ((dest, left), right) in self.words.iter_mut().zip(&left.words).zip(&right.words) {
+            *dest &= *left | *right;
+        }
+    }
+
+    fn assign_transfer(&mut self, input: &Self, killed: &Self, generated: &Self) {
+        for (((dest, input), killed), generated) in self
+            .words
+            .iter_mut()
+            .zip(&input.words)
+            .zip(&killed.words)
+            .zip(&generated.words)
+        {
+            *dest = (*input & !*killed) | *generated;
+        }
+    }
+
+    fn intersect_with_transfer(&mut self, input: &Self, killed: &Self, generated: &Self) {
+        for (((dest, input), killed), generated) in self
+            .words
+            .iter_mut()
+            .zip(&input.words)
+            .zip(&killed.words)
+            .zip(&generated.words)
+        {
+            *dest &= (*input & !*killed) | *generated;
+        }
+    }
+
+    fn into_locals(self) -> Vec<Local> {
+        let mut locals = Vec::new();
+        for (word_index, mut word) in self.words.into_iter().enumerate() {
+            while word != 0 {
+                let bit = word.trailing_zeros() as usize;
+                locals.push(Local::from_usize(word_index * u64::BITS as usize + bit));
+                word &= word - 1;
+            }
+        }
+        locals
+    }
+
+    fn to_hash_set(&self) -> HashSet<Local> {
+        let mut locals = HashSet::default();
+        for (word_index, word) in self.words.iter().copied().enumerate() {
+            let mut word = word;
+            while word != 0 {
+                let bit = word.trailing_zeros() as usize;
+                locals.insert(Local::from_usize(word_index * u64::BITS as usize + bit));
+                word &= word - 1;
+            }
+        }
+        locals
+    }
+}
+
+struct MirControlFlow {
+    predecessors: Vec<Vec<BasicBlock>>,
+    reachable: Vec<bool>,
+}
+
+impl MirControlFlow {
+    fn new(mir: &Body<'_>) -> Self {
+        let mut predecessors = vec![Vec::new(); mir.basic_blocks.len()];
+        for (block, data) in mir.basic_blocks.iter_enumerated() {
+            for successor in data.terminator().successors() {
+                predecessors[successor.index()].push(block);
+            }
+        }
+
+        let mut reachable = vec![false; mir.basic_blocks.len()];
+        let mut queue = VecDeque::from([BasicBlock::from_usize(0)]);
+        while let Some(block) = queue.pop_front() {
+            if std::mem::replace(&mut reachable[block.index()], true) {
+                continue;
+            }
+            queue.extend(mir.basic_blocks[block].terminator().successors());
+        }
+        Self {
+            predecessors,
+            reachable,
+        }
+    }
+}
+
 impl DebugScopeCache {
     fn new(
         mir: &Body<'_>,
@@ -189,37 +319,24 @@ pub(crate) fn local_variable_scope(
 fn available_pointer_locals_at_block_entries<'tcx>(
     mir: &Body<'tcx>,
     pointer_origins: &control_flow::MutableBorrowMap<'tcx>,
-) -> HashMap<BasicBlock, HashSet<Local>> {
-    let all_pointer_locals = pointer_origins.keys().copied().collect::<HashSet<_>>();
-    let mut generated = HashMap::<BasicBlock, HashSet<Local>>::default();
-    let mut predecessors = HashMap::<BasicBlock, Vec<BasicBlock>>::default();
-    let mut reachable = HashSet::default();
-    let mut queue = VecDeque::from([BasicBlock::from_usize(0)]);
-
-    for (block, data) in mir.basic_blocks.iter_enumerated() {
-        let generated_here = data
-            .statements
-            .iter()
-            .filter_map(|statement| {
-                let StatementKind::Assign(assignment) = &statement.kind else {
-                    return None;
-                };
-                let (place, _) = assignment.as_ref();
-                (place.projection.is_empty() && pointer_origins.contains_key(&place.local))
-                    .then_some(place.local)
-            })
-            .collect();
-        generated.insert(block, generated_here);
-        for successor in data.terminator().successors() {
-            predecessors.entry(successor).or_default().push(block);
-        }
+    control_flow: &MirControlFlow,
+) -> Vec<LocalBitSet> {
+    let local_count = mir.local_decls.len();
+    let mut all_pointer_locals = LocalBitSet::empty(local_count);
+    for local in pointer_origins.keys().copied() {
+        all_pointer_locals.insert(local);
     }
-
-    while let Some(block) = queue.pop_front() {
-        if !reachable.insert(block) {
-            continue;
+    let mut generated = vec![LocalBitSet::empty(local_count); mir.basic_blocks.len()];
+    for (block, data) in mir.basic_blocks.iter_enumerated() {
+        for statement in &data.statements {
+            let StatementKind::Assign(assignment) = &statement.kind else {
+                continue;
+            };
+            let (place, _) = assignment.as_ref();
+            if place.projection.is_empty() && pointer_origins.contains_key(&place.local) {
+                generated[block.index()].insert(place.local);
+            }
         }
-        queue.extend(mir.basic_blocks[block].terminator().successors());
     }
 
     let entry = BasicBlock::from_usize(0);
@@ -227,35 +344,38 @@ fn available_pointer_locals_at_block_entries<'tcx>(
         .basic_blocks
         .indices()
         .map(|block| {
-            let initial = if block == entry || !reachable.contains(&block) {
-                HashSet::default()
+            if block == entry || !control_flow.reachable[block.index()] {
+                LocalBitSet::empty(local_count)
             } else {
                 all_pointer_locals.clone()
-            };
-            (block, initial)
+            }
         })
-        .collect::<HashMap<_, _>>();
+        .collect::<Vec<_>>();
+    let mut incoming = LocalBitSet::empty(local_count);
 
     loop {
         let mut changed = false;
         for block in mir.basic_blocks.indices().filter(|block| *block != entry) {
-            if !reachable.contains(&block) {
+            if !control_flow.reachable[block.index()] {
                 continue;
             }
-            let incoming = predecessors
-                .get(&block)
-                .into_iter()
-                .flatten()
-                .filter(|predecessor| reachable.contains(predecessor))
-                .map(|predecessor| {
-                    let mut outgoing = available[predecessor].clone();
-                    outgoing.extend(generated[predecessor].iter().copied());
-                    outgoing
-                })
-                .reduce(|left, right| left.intersection(&right).copied().collect())
-                .unwrap_or_default();
-            if available.get(&block) != Some(&incoming) {
-                available.insert(block, incoming);
+            let mut predecessors = control_flow.predecessors[block.index()]
+                .iter()
+                .copied()
+                .filter(|predecessor| control_flow.reachable[predecessor.index()]);
+            if let Some(first) = predecessors.next() {
+                incoming.assign_union(&available[first.index()], &generated[first.index()]);
+                for predecessor in predecessors {
+                    incoming.intersect_with_union(
+                        &available[predecessor.index()],
+                        &generated[predecessor.index()],
+                    );
+                }
+            } else {
+                incoming = LocalBitSet::empty(local_count);
+            }
+            if available[block.index()] != incoming {
+                available[block.index()].clone_from(&incoming);
                 changed = true;
             }
         }
@@ -269,8 +389,8 @@ fn available_pointer_locals_at_block_entries<'tcx>(
 
 fn update_class_carrier_state(
     place: &Place<'_>,
-    initialized: &mut HashSet<Local>,
-    needs_initial_carrier: Option<&mut HashSet<Local>>,
+    initialized: &mut LocalBitSet,
+    needs_initial_carrier: Option<&mut LocalBitSet>,
 ) {
     if place.projection.is_empty() {
         initialized.insert(place.local);
@@ -279,7 +399,7 @@ fn update_class_carrier_state(
 
     if matches!(place.projection.first(), Some(ProjectionElem::Field(..))) {
         if let Some(needs_initial_carrier) = needs_initial_carrier
-            && !initialized.contains(&place.local)
+            && !initialized.contains(place.local)
         {
             needs_initial_carrier.insert(place.local);
         }
@@ -287,82 +407,96 @@ fn update_class_carrier_state(
     }
 }
 
-fn transfer_class_carrier_state(mir: &Body<'_>, block: BasicBlock, state: &mut HashSet<Local>) {
-    let block_data = &mir.basic_blocks[block];
-    for statement in &block_data.statements {
-        match &statement.kind {
-            StatementKind::Assign(assignment) => {
-                let (place, _) = assignment.as_ref();
-                update_class_carrier_state(place, state, None);
-            }
-            StatementKind::StorageLive(local) | StatementKind::StorageDead(local) => {
-                state.remove(local);
-            }
-            _ => {}
-        }
-    }
-    if let TerminatorKind::Call { destination, .. } = &block_data.terminator().kind {
-        update_class_carrier_state(destination, state, None);
+fn record_class_carrier_transfer(
+    place: &Place<'_>,
+    generated: &mut LocalBitSet,
+    killed: &mut LocalBitSet,
+) {
+    if place.projection.is_empty()
+        || matches!(place.projection.first(), Some(ProjectionElem::Field(..)))
+    {
+        generated.insert(place.local);
+        killed.remove(place.local);
     }
 }
 
-fn class_locals_needing_initial_carriers(mir: &Body<'_>) -> HashSet<Local> {
+fn class_locals_needing_initial_carriers(
+    mir: &Body<'_>,
+    control_flow: &MirControlFlow,
+) -> Vec<Local> {
     let entry = BasicBlock::from_usize(0);
-    let all_locals = mir.local_decls.indices().collect::<HashSet<_>>();
-    let argument_locals = (1..=mir.arg_count)
-        .map(Local::from_usize)
-        .collect::<HashSet<_>>();
-    let mut predecessors = HashMap::<BasicBlock, Vec<BasicBlock>>::default();
-    let mut reachable = HashSet::default();
-    let mut queue = VecDeque::from([entry]);
-
-    for (block, data) in mir.basic_blocks.iter_enumerated() {
-        for successor in data.terminator().successors() {
-            predecessors.entry(successor).or_default().push(block);
-        }
+    let local_count = mir.local_decls.len();
+    let all_locals = LocalBitSet::all(local_count);
+    let mut argument_locals = LocalBitSet::empty(local_count);
+    for index in 1..=mir.arg_count {
+        argument_locals.insert(Local::from_usize(index));
     }
-    while let Some(block) = queue.pop_front() {
-        if !reachable.insert(block) {
-            continue;
+    let mut generated = vec![LocalBitSet::empty(local_count); mir.basic_blocks.len()];
+    let mut killed = generated.clone();
+    for (block, data) in mir.basic_blocks.iter_enumerated() {
+        let block_generated = &mut generated[block.index()];
+        let block_killed = &mut killed[block.index()];
+        for statement in &data.statements {
+            match &statement.kind {
+                StatementKind::Assign(assignment) => {
+                    let (place, _) = assignment.as_ref();
+                    record_class_carrier_transfer(place, block_generated, block_killed);
+                }
+                StatementKind::StorageLive(local) | StatementKind::StorageDead(local) => {
+                    block_generated.remove(*local);
+                    block_killed.insert(*local);
+                }
+                _ => {}
+            }
         }
-        queue.extend(mir.basic_blocks[block].terminator().successors());
+        if let TerminatorKind::Call { destination, .. } = &data.terminator().kind {
+            record_class_carrier_transfer(destination, block_generated, block_killed);
+        }
     }
 
     let mut available = mir
         .basic_blocks
         .indices()
         .map(|block| {
-            let initial = if block == entry {
+            if block == entry {
                 argument_locals.clone()
-            } else if reachable.contains(&block) {
+            } else if control_flow.reachable[block.index()] {
                 all_locals.clone()
             } else {
-                HashSet::default()
-            };
-            (block, initial)
+                LocalBitSet::empty(local_count)
+            }
         })
-        .collect::<HashMap<_, _>>();
+        .collect::<Vec<_>>();
+    let mut incoming = LocalBitSet::empty(local_count);
 
     loop {
         let mut changed = false;
         for block in mir.basic_blocks.indices().filter(|block| *block != entry) {
-            if !reachable.contains(&block) {
+            if !control_flow.reachable[block.index()] {
                 continue;
             }
-            let incoming = predecessors
-                .get(&block)
-                .into_iter()
-                .flatten()
-                .filter(|predecessor| reachable.contains(predecessor))
-                .map(|predecessor| {
-                    let mut outgoing = available[predecessor].clone();
-                    transfer_class_carrier_state(mir, *predecessor, &mut outgoing);
-                    outgoing
-                })
-                .reduce(|left, right| left.intersection(&right).copied().collect())
-                .unwrap_or_default();
-            if available.get(&block) != Some(&incoming) {
-                available.insert(block, incoming);
+            let mut predecessors = control_flow.predecessors[block.index()]
+                .iter()
+                .copied()
+                .filter(|predecessor| control_flow.reachable[predecessor.index()]);
+            if let Some(first) = predecessors.next() {
+                incoming.assign_transfer(
+                    &available[first.index()],
+                    &killed[first.index()],
+                    &generated[first.index()],
+                );
+                for predecessor in predecessors {
+                    incoming.intersect_with_transfer(
+                        &available[predecessor.index()],
+                        &killed[predecessor.index()],
+                        &generated[predecessor.index()],
+                    );
+                }
+            } else {
+                incoming = LocalBitSet::empty(local_count);
+            }
+            if available[block.index()] != incoming {
+                available[block.index()].clone_from(&incoming);
                 changed = true;
             }
         }
@@ -371,12 +505,12 @@ fn class_locals_needing_initial_carriers(mir: &Body<'_>) -> HashSet<Local> {
         }
     }
 
-    let mut needs_initial_carrier = HashSet::default();
+    let mut needs_initial_carrier = LocalBitSet::empty(local_count);
     for block in mir.basic_blocks.indices() {
-        if !reachable.contains(&block) {
+        if !control_flow.reachable[block.index()] {
             continue;
         }
-        let mut state = available[&block].clone();
+        let mut state = available[block.index()].clone();
         let block_data = &mir.basic_blocks[block];
         for statement in &block_data.statements {
             match &statement.kind {
@@ -385,7 +519,7 @@ fn class_locals_needing_initial_carriers(mir: &Body<'_>) -> HashSet<Local> {
                     update_class_carrier_state(place, &mut state, Some(&mut needs_initial_carrier))
                 }
                 StatementKind::StorageLive(local) | StatementKind::StorageDead(local) => {
-                    state.remove(local);
+                    state.remove(*local);
                 }
                 _ => {}
             }
@@ -394,7 +528,7 @@ fn class_locals_needing_initial_carriers(mir: &Body<'_>) -> HashSet<Local> {
             update_class_carrier_state(destination, &mut state, Some(&mut needs_initial_carrier));
         }
     }
-    needs_initial_carrier
+    needs_initial_carrier.into_locals()
 }
 
 fn jvm_default_operand(ty: &oomir::Type) -> oomir::Operand {
@@ -445,13 +579,6 @@ pub fn mir_to_oomir<'tcx>(
     let fn_name_data =
         fn_name_override.unwrap_or_else(|| naming::mono_fn_name_from_instance(tcx, instance));
     let fn_name = fn_name_data.method_name.clone();
-    let _timer = crate::instrumentation::Timer::function_lazy("lower1", None, || {
-        fn_name_data
-            .class_to_call_on
-            .as_deref()
-            .map(|owner| format!("{owner}::{fn_name}"))
-            .unwrap_or_else(|| fn_name.clone())
-    });
     let _stable_cell_analysis = place::enter_stable_cell_analysis(mir);
 
     // Extract function signature
@@ -653,8 +780,10 @@ pub fn mir_to_oomir<'tcx>(
     // MIR guarantees that the start block is BasicBlock 0.
     let entry_label = "bb0".to_string();
 
+    let mir_control_flow = MirControlFlow::new(mir);
     let mut mutable_borrows = control_flow::collect_pointer_origins(mir, tcx, instance, data_types);
-    let available_pointer_locals = available_pointer_locals_at_block_entries(mir, &mutable_borrows);
+    let available_pointer_locals =
+        available_pointer_locals_at_block_entries(mir, &mutable_borrows, &mir_control_flow);
 
     for (bb, bb_data) in mir.basic_blocks.iter_enumerated() {
         let bb_ir = convert_basic_block(
@@ -671,10 +800,7 @@ pub fn mir_to_oomir<'tcx>(
             &debug_variables,
             &debug_variable_scopes,
             &debug_scope_cache,
-            available_pointer_locals
-                .get(&bb)
-                .cloned()
-                .unwrap_or_default(),
+            available_pointer_locals[bb.index()].to_hash_set(),
         ); // Pass return type here
         basic_blocks.insert(bb_ir.label.clone(), bb_ir);
     }
@@ -736,10 +862,7 @@ pub fn mir_to_oomir<'tcx>(
         }
     }
 
-    let mut carrier_locals = class_locals_needing_initial_carriers(mir)
-        .into_iter()
-        .collect::<Vec<_>>();
-    carrier_locals.sort_by_key(|local| local.index());
+    let carrier_locals = class_locals_needing_initial_carriers(mir, &mir_control_flow);
     for local in carrier_locals {
         if place::local_uses_stable_cell(local, mir) {
             continue;

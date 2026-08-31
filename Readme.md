@@ -608,6 +608,24 @@ python3 Alloctests.py             # Debug mode
 python3 Alloctests.py --release   # Release mode
 ```
 
+Inspect compiler work amplification without replacing a native CPU profiler:
+
+```bash
+python3 Metrics.py --debug --only-run fibonacci
+```
+
+```text
+OOMIR: 936 -> 891 instructions; 22 shard-local data-type definitions
+optimise2: 137 methods, 3,298 -> 2,800 bytecode instructions
+liveness: 47 analyses, 14,072 matrix words allocated, 5,621 worklist pops
+classfiles: 36 built, 33 emitted, 3 exact duplicates discarded
+```
+
+The full JSON report also contains per-pass input/removal counts, repeated data
+types, classfile amplification, type-cache effectiveness, and linker fragment
+merging. Set `RCGJ_METRICS_DIR` directly to collect the same records from any
+build.
+
 ## Project Structure
 
 ```
@@ -616,6 +634,7 @@ python3 Alloctests.py --release   # Release mode
 │   ├── lower1/               # MIR -> OOMIR lowering
 │   ├── optimise1/            # OOMIR optimisation passes
 │   ├── lower2/               # OOMIR -> Bytecode generator
+│   ├── metrics.rs            # Structural compiler performance metrics
 │   └── oomir.rs              # OOMIR definitions
 ├── java-linker/              # JAR packaging and manifest utility
 ├── cargo-jvm/                # `cargo jvm` build, run, test and package command
@@ -626,6 +645,7 @@ python3 Alloctests.py --release   # Release mode
 ├── build.py                  # Master build script
 ├── test_harness.py           # Shared test execution utilities
 ├── Tester.py                 # Main test suite runner
+├── Metrics.py                # Compiler work-amplification report runner
 ├── Coretests.py              # Upstream rustc coretests runner
 └── Alloctests.py             # Upstream rustc alloctests runner
 ```

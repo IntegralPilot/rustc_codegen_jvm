@@ -25,15 +25,14 @@ type ConstantMap = HashMap<String, Constant>;
 
 type DataflowResult = HashMap<String, ConstantMap>;
 
-fn build_cfg(code_block: &CodeBlock) -> HashMap<String, BasicBlockInfo> {
-    let mut cfg: HashMap<String, BasicBlockInfo> = code_block
-        .basic_blocks
-        .iter()
+fn build_cfg(code_block: &mut CodeBlock) -> HashMap<String, BasicBlockInfo> {
+    let mut cfg: HashMap<String, BasicBlockInfo> = std::mem::take(&mut code_block.basic_blocks)
+        .into_iter()
         .map(|(label, block)| {
             (
-                label.clone(),
+                label,
                 BasicBlockInfo {
-                    original_block: block.clone(),
+                    original_block: block,
                     predecessors: HashSet::default(),
                     successors: HashSet::default(),
                 },
@@ -164,9 +163,9 @@ fn transform_function(
     let mut final_basic_blocks = HashMap::default();
     for label in &reachable_labels {
         // Get the block from the intermediate results using the reachable label
-        if let Some(block) = optimized_blocks_intermediate.get(label) {
+        if let Some(block) = optimized_blocks_intermediate.remove(label) {
             // Add the reachable block (including potentially empty ones)
-            final_basic_blocks.insert(label.clone(), block.clone());
+            final_basic_blocks.insert(label.clone(), block);
         } else {
             // This suggests reachable_labels contains a label not in intermediate map,
             // which would be an internal error (shouldn't happen if all_original_labels was used correctly).
@@ -241,18 +240,7 @@ fn transform_function(
     function.body.basic_blocks = final_basic_blocks;
 }
 
-pub fn optimise_function(
-    mut function: Function,
-    data_types: &HashMap<String, DataType>,
-) -> Function {
-    let _timer = crate::instrumentation::Timer::function_lazy("optimise1", None, || {
-        function
-            .owner_class
-            .as_deref()
-            .map(|owner| format!("{owner}::{}", function.name))
-            .unwrap_or_else(|| function.name.clone())
-    });
-
+fn optimise_function_in_place(function: &mut Function, data_types: &HashMap<String, DataType>) {
     if function.body.basic_blocks.is_empty() {
         breadcrumbs::log!(
             breadcrumbs::LogLevel::Info,
@@ -262,7 +250,7 @@ pub fn optimise_function(
                 function.name
             )
         );
-        return function;
+        return;
     }
     breadcrumbs::log!(
         breadcrumbs::LogLevel::Info,
@@ -271,12 +259,12 @@ pub fn optimise_function(
     );
 
     // 0. Run needed reorganisation passes
-    convert_labels_to_basic_blocks_in_function(&mut function);
-    eliminate_duplicate_basic_blocks(&mut function);
+    convert_labels_to_basic_blocks_in_function(function);
+    eliminate_duplicate_basic_blocks(function);
 
     // 1. Build Initial CFG
-    let cfg = build_cfg(&function.body);
-    if cfg.is_empty() && !function.body.basic_blocks.is_empty() {
+    let cfg = build_cfg(&mut function.body);
+    if cfg.is_empty() {
         breadcrumbs::log!(
             breadcrumbs::LogLevel::Warn,
             "optimisation",
@@ -285,7 +273,7 @@ pub fn optimise_function(
                 function.name
             )
         );
-        return function; // Avoid panic if CFG fails
+        return;
     }
 
     // 2. Perform Dataflow Analysis (Constant Propagation)
@@ -300,24 +288,35 @@ pub fn optimise_function(
             )
         );
         // This might happen if the entry block itself has no instructions or references invalid blocks.
-        return function;
+        function.body.basic_blocks = cfg
+            .into_iter()
+            .map(|(label, info)| (label, info.original_block))
+            .collect();
+        return;
     }
     let analysis_result = analyze_constant_propagation(&function.body.entry, &cfg);
 
     // 3. Transform & Perform Dead Code Elimination
-    transform_function(&mut function, &cfg, &analysis_result, data_types);
+    transform_function(function, &cfg, &analysis_result, data_types);
 
     // 4. Clean up simple copies introduced by lowering and constant/algebraic rewrites.
-    propagate_copies_and_eliminate_dead_moves(&mut function);
+    propagate_copies_and_eliminate_dead_moves(function);
 
     // 5. Eliminate duplicate basic blocks (re-pass-through after transformation)
-    eliminate_duplicate_basic_blocks(&mut function);
+    eliminate_duplicate_basic_blocks(function);
 
     breadcrumbs::log!(
         breadcrumbs::LogLevel::Info,
         "optimisation",
         format!("Finished optimizing function: {}", function.name)
     );
+}
+
+pub fn optimise_function(
+    mut function: Function,
+    data_types: &HashMap<String, DataType>,
+) -> Function {
+    optimise_function_in_place(&mut function, data_types);
     function
 }
 
@@ -354,7 +353,7 @@ pub fn optimise_module(module: Module) -> Module {
         .collect::<HashMap<_, _>>();
     for function in new_funcs.values_mut() {
         if fold_constant_static_calls(function, &constant_returns) {
-            *function = optimise_function(function.clone(), &module.data_types);
+            optimise_function_in_place(function, &module.data_types);
         }
     }
 
@@ -368,6 +367,9 @@ pub fn optimise_module(module: Module) -> Module {
         source_file: module.source_file,
         functions: new_funcs,
         data_types: module.data_types, // Assume data_types are read-only for opts
+        suppressed_data_types: module.suppressed_data_types,
+        shared_data_types: module.shared_data_types,
+        relative_static_methods: module.relative_static_methods,
         external_interfaces: module.external_interfaces,
         statics: module.statics,
     }

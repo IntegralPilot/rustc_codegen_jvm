@@ -569,6 +569,89 @@ fn prepare_constant_operand(
     Ok(())
 }
 
+fn function_needs_constant_preparation(function: &oomir::Function) -> bool {
+    fn operand_needs_preparation(operand: &oomir::Operand) -> bool {
+        matches!(operand, oomir::Operand::Constant(constant)
+            if constant_instruction_cost(constant) > MAX_INLINE_CONSTANT_INSTRUCTIONS)
+    }
+
+    use oomir::Instruction as I;
+    function.body.basic_blocks.values().any(|block| {
+        block
+            .instructions
+            .iter()
+            .any(|instruction| match instruction {
+                I::Add { op1, op2, .. }
+                | I::Sub { op1, op2, .. }
+                | I::Mul { op1, op2, .. }
+                | I::Div { op1, op2, .. }
+                | I::Rem { op1, op2, .. }
+                | I::Eq { op1, op2, .. }
+                | I::Ne { op1, op2, .. }
+                | I::Lt { op1, op2, .. }
+                | I::Le { op1, op2, .. }
+                | I::Gt { op1, op2, .. }
+                | I::Ge { op1, op2, .. }
+                | I::BitAnd { op1, op2, .. }
+                | I::BitOr { op1, op2, .. }
+                | I::BitXor { op1, op2, .. }
+                | I::Shl { op1, op2, .. }
+                | I::Shr { op1, op2, .. } => {
+                    operand_needs_preparation(op1) || operand_needs_preparation(op2)
+                }
+                I::Not { src, .. }
+                | I::Neg { src, .. }
+                | I::Move { src, .. }
+                | I::Branch { condition: src, .. }
+                | I::NewArray { size: src, .. }
+                | I::ArrayFill { value: src, .. }
+                | I::Length { array: src, .. }
+                | I::GetField { object: src, .. }
+                | I::GetJvmField { object: src, .. }
+                | I::Cast { op: src, .. }
+                | I::Switch { discr: src, .. }
+                | I::SetField { value: src, .. }
+                | I::SetStaticField { value: src, .. } => operand_needs_preparation(src),
+                I::Return { operand } => operand.as_ref().is_some_and(operand_needs_preparation),
+                I::CallIndirect {
+                    function_ptr, args, ..
+                } => {
+                    operand_needs_preparation(function_ptr)
+                        || args.iter().any(operand_needs_preparation)
+                }
+                I::InvokeInterface { operand, args, .. }
+                | I::InvokeVirtual { operand, args, .. } => {
+                    operand_needs_preparation(operand) || args.iter().any(operand_needs_preparation)
+                }
+                I::InvokeStatic { args, .. } | I::InvokeRustStatic { args, .. } => {
+                    args.iter().any(operand_needs_preparation)
+                }
+                I::ArrayStore { index, value, .. } => {
+                    operand_needs_preparation(index) || operand_needs_preparation(value)
+                }
+                I::ArrayGet { array, index, .. } => {
+                    operand_needs_preparation(array) || operand_needs_preparation(index)
+                }
+                I::ConstructObject { args, .. } => args
+                    .iter()
+                    .any(|(argument, _)| operand_needs_preparation(argument)),
+                I::SetJvmField { object, value, .. } => {
+                    operand_needs_preparation(object) || operand_needs_preparation(value)
+                }
+                I::SourceLocation(_)
+                | I::LocalVariableScope(_)
+                | I::UnwindStart { .. }
+                | I::UnwindEnd
+                | I::Rethrow
+                | I::Jump { .. }
+                | I::CreateFunctionPointer { .. }
+                | I::GetStaticField { .. }
+                | I::ThrowNewWithMessage { .. }
+                | I::Label { .. } => false,
+            })
+    })
+}
+
 fn operand_variable_name(operand: &oomir::Operand) -> Option<&str> {
     let oomir::Operand::Variable { name, .. } = operand else {
         return None;
@@ -940,7 +1023,9 @@ fn emit_generated_class(
     registry: &EmittedClassRegistry,
     class_name: String,
     bytecode: Vec<u8>,
+    origin: crate::metrics::ClassOrigin,
 ) -> jvm::Result<()> {
+    crate::metrics::record_classfile_attempt(&class_name, origin, bytecode.len());
     let hash = bytecode_hash(&bytecode);
     let bytecode_len = bytecode.len();
     let mut checked = rustc_hash::FxHashSet::default();
@@ -965,6 +1050,7 @@ fn emit_generated_class(
                 .cloned()
                 .collect::<Vec<_>>();
             if candidates.is_empty() {
+                let name_collision = !variants.is_empty();
                 let reservation = Arc::new(EmittedClassVariant {
                     hash,
                     len: bytecode_len,
@@ -972,13 +1058,13 @@ fn emit_generated_class(
                     ready: Condvar::new(),
                 });
                 variants.push(Arc::clone(&reservation));
-                (candidates, Some(reservation))
+                (candidates, Some((reservation, name_collision)))
             } else {
                 (candidates, None)
             }
         };
 
-        if let Some(reservation) = reservation {
+        if let Some((reservation, name_collision)) = reservation {
             let bytecode: Arc<[u8]> = bytecode.into();
             let mut state =
                 reservation
@@ -990,6 +1076,12 @@ fn emit_generated_class(
                     })?;
             *state = EmittedClassState::Ready(Arc::clone(&bytecode));
             reservation.ready.notify_all();
+            crate::metrics::record_classfile_emitted(
+                &class_name,
+                origin,
+                bytecode.len(),
+                name_collision,
+            );
             generated_classes.push((class_name, bytecode));
             return Ok(());
         }
@@ -1018,6 +1110,11 @@ fn emit_generated_class(
             };
             drop(state);
             if previous.as_ref() == bytecode.as_slice() {
+                crate::metrics::record_classfile_exact_duplicate(
+                    &class_name,
+                    origin,
+                    bytecode.len(),
+                );
                 return Ok(());
             }
         }
@@ -1119,22 +1216,27 @@ pub fn oomir_to_jvm_bytecode(
     registry: &EmittedClassRegistry,
 ) -> jvm::Result<Vec<(String, PathBuf)>> {
     large_methods::outline_large_functions(&mut module)?;
-    let mut relative_static_methods = module
+    let function_relative_methods = module
         .functions
         .values()
-        .filter(|function| {
-            function.signature.is_static
+        .filter_map(|function| {
+            (function.signature.is_static
                 && function.name != "<init>"
-                && function.signature.supports_relative_pointer_abi()
+                && function.signature.supports_relative_pointer_abi())
+            .then(|| {
+                oomir::FunctionKey::new(
+                    module.owner_class_for_function(function),
+                    &function.name,
+                    &function.signature,
+                )
+            })
         })
-        .map(|function| {
-            oomir::FunctionKey::new(
-                module.owner_class_for_function(function),
-                &function.name,
-                &function.signature,
-            )
-        })
-        .collect::<HashSet<_>>();
+        .collect::<Vec<_>>();
+    for method in function_relative_methods {
+        if !module.relative_static_methods.contains(&method) {
+            Arc::make_mut(&mut module.relative_static_methods).insert(method);
+        }
+    }
     for (class_name, data_type) in &module.data_types {
         let oomir::DataType::Class { methods, .. } = data_type else {
             continue;
@@ -1147,11 +1249,10 @@ pub fn oomir_to_jvm_bytecode(
                 && method_name != "<init>"
                 && function.signature.supports_relative_pointer_abi()
             {
-                relative_static_methods.insert(oomir::FunctionKey::new(
-                    class_name,
-                    method_name,
-                    &function.signature,
-                ));
+                let method = oomir::FunctionKey::new(class_name, method_name, &function.signature);
+                if !module.relative_static_methods.contains(&method) {
+                    Arc::make_mut(&mut module.relative_static_methods).insert(method);
+                }
             }
         }
     }
@@ -1172,12 +1273,14 @@ pub fn oomir_to_jvm_bytecode(
             registry,
             oomir::SLICE_VIEW_CLASS.to_string(),
             create_slice_view_classfile()?,
+            crate::metrics::ClassOrigin::Runtime,
         )?;
         emit_generated_class(
             &mut generated_classes,
             registry,
             oomir::UTF8_VIEW_CLASS.to_string(),
             create_utf8_view_classfile()?,
+            crate::metrics::ClassOrigin::Runtime,
         )?;
     }
 
@@ -1282,10 +1385,6 @@ pub fn oomir_to_jvm_bytecode(
 
         for mut function in functions {
             current_index += 1;
-            let _timer = crate::instrumentation::Timer::function_lazy("lower2", None, || {
-                format!("{class_name_jvm}::{}", function.name)
-            });
-
             // Don't create a default constructor if the OOMIR provided one
             if function.name == "<init>" {
                 has_constructor = true;
@@ -1293,9 +1392,14 @@ pub fn oomir_to_jvm_bytecode(
 
             let name_index = main_cp.add_utf8(&function.name)?;
             let descriptor_index = main_cp.add_utf8(&function.signature.to_string())?;
-            let use_relative_pointer_abi = relative_static_methods.contains(
-                &oomir::FunctionKey::new(&class_name_jvm, &function.name, &function.signature),
-            );
+            let use_relative_pointer_abi =
+                module
+                    .relative_static_methods
+                    .contains(&oomir::FunctionKey::new(
+                        &class_name_jvm,
+                        &function.name,
+                        &function.signature,
+                    ));
             prepare_function_constants(
                 &mut function,
                 &mut main_cp,
@@ -1317,7 +1421,7 @@ pub fn oomir_to_jvm_bytecode(
                 &mut main_cp, // Use the main class's constant pool
                 &mut bootstrap_methods,
                 &module,
-                &relative_static_methods,
+                &module.relative_static_methods,
                 true,
                 None, // No owner class for free functions
                 debug_info,
@@ -1482,6 +1586,7 @@ pub fn oomir_to_jvm_bytecode(
             registry,
             class_name_jvm.clone(),
             byte_vector,
+            crate::metrics::ClassOrigin::Module,
         )?;
 
         breadcrumbs::log!(
@@ -1521,15 +1626,14 @@ pub fn oomir_to_jvm_bytecode(
     }
 
     for (dt_name_oomir, data_type) in &module.data_types {
+        if module.suppressed_data_types.contains(dt_name_oomir) {
+            continue;
+        }
         breadcrumbs::log!(
             breadcrumbs::LogLevel::Info,
             "bytecode-gen",
             format!("Generating data type class: {}", dt_name_oomir)
         );
-
-        let mut data_type = data_type.clone();
-
-        data_type.clean_duplicates();
 
         match data_type {
             DataType::Class {
@@ -1543,23 +1647,24 @@ pub fn oomir_to_jvm_bytecode(
                 let nest_host = nest_host_by_class.remove(dt_name_oomir);
                 // Create and serialize the class file for this data type
                 let dt_bytecode = create_data_type_classfile_for_class(
-                    &dt_name_oomir,
+                    dt_name_oomir,
                     fields,
-                    is_abstract,
+                    *is_abstract,
                     methods,
                     super_class.as_deref().unwrap_or("java/lang/Object"),
                     interfaces,
                     &module,
-                    subclasses,
-                    nest_host,
+                    &subclasses,
+                    nest_host.as_deref(),
                     debug_info,
-                    &relative_static_methods,
+                    &module.relative_static_methods,
                 )?;
                 emit_generated_class(
                     &mut generated_classes,
                     registry,
                     dt_name_oomir.clone(),
                     dt_bytecode,
+                    crate::metrics::ClassOrigin::DataTypeClass,
                 )?;
             }
             DataType::Interface {
@@ -1571,20 +1676,21 @@ pub fn oomir_to_jvm_bytecode(
                 let nest_host = nest_host_by_class.remove(dt_name_oomir);
                 // Create and serialize the class file for this data type
                 let dt_bytecode = create_data_type_classfile_for_interface(
-                    &dt_name_oomir,
-                    &methods,
-                    &interfaces,
+                    dt_name_oomir,
+                    methods,
+                    interfaces,
                     &module,
                     subclasses,
                     nest_host,
                     debug_info,
-                    &relative_static_methods,
+                    &module.relative_static_methods,
                 )?;
                 emit_generated_class(
                     &mut generated_classes,
                     registry,
                     dt_name_oomir.clone(),
                     dt_bytecode,
+                    crate::metrics::ClassOrigin::DataTypeInterface,
                 )?;
             }
         }

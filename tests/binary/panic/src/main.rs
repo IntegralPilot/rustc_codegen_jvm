@@ -105,6 +105,35 @@ fn gc_during_panicking_vec_clone_cleanup() {
     assert_eq!(panicking_vec_clone_cleanup(1, true), (4, 4));
 }
 
+fn mutable_borrow_updates_survive_unwind() {
+    struct Progress<'observed> {
+        observed: &'observed AtomicU32,
+        completed_steps: u32,
+    }
+
+    impl Progress<'_> {
+        fn advance_then_panic(&mut self) {
+            self.completed_steps += 1;
+            panic!("panic after mutating a borrowed aggregate");
+        }
+    }
+
+    impl Drop for Progress<'_> {
+        fn drop(&mut self) {
+            self.observed.store(self.completed_steps, Ordering::SeqCst);
+        }
+    }
+
+    let observed = AtomicU32::new(0);
+    let mut progress = Progress {
+        observed: &observed,
+        completed_steps: 0,
+    };
+    catch_unwind(AssertUnwindSafe(move || progress.advance_then_panic()))
+        .expect_err("the mutation test must unwind");
+    assert_eq!(observed.load(Ordering::SeqCst), 1);
+}
+
 fn concurrent_panicking_vec_clone_cleanup() {
     let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
@@ -150,6 +179,7 @@ fn concurrent_panicking_vec_clone_cleanup() {
 
 fn main() {
     gc_during_panicking_vec_clone_cleanup();
+    mutable_borrow_updates_survive_unwind();
     concurrent_panicking_vec_clone_cleanup();
 
     let plain_payload = move_plain_panic_payload(Box::new(73_u32));

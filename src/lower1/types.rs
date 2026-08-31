@@ -6939,8 +6939,10 @@ pub fn ty_to_oomir_type<'tcx>(
     );
     if let Some(cached) = TYPE_LOWERING_CACHE.with(|cache| cache.borrow().get(&cache_key).cloned())
     {
+        crate::metrics::record_type_cache_hit();
         return cached;
     }
+    crate::metrics::record_type_cache_miss();
     let lowered = ty_to_oomir_type_resolved(resolved_ty, tcx, data_types, instance_context);
     TYPE_LOWERING_CACHE.with(|cache| {
         cache.borrow_mut().insert(cache_key, lowered.clone());

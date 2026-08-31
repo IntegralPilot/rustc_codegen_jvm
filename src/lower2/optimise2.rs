@@ -31,6 +31,7 @@ pub(super) struct Optimise2Result {
     pub metadata: Vec<BytecodeMetadata>,
     pub max_locals: u16,
     pub local_slot_map: BTreeMap<u16, u16>,
+    pub metrics: Option<crate::metrics::Optimise2MethodMetrics>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -118,6 +119,15 @@ impl CompactSuccessors {
                 visitor(*second);
             }
             Self::Many(successors) => successors.iter().copied().for_each(visitor),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::None => 0,
+            Self::One(_) => 1,
+            Self::Two(_, _) => 2,
+            Self::Many(successors) => successors.len(),
         }
     }
 }
@@ -209,66 +219,236 @@ pub(super) fn optimise(
             message: "Instruction/source-location vectors have different lengths".to_string(),
         });
     }
+    let mut metrics = crate::metrics::Optimise2MethodMetrics::new(instructions.len(), max_locals);
+    let before = instructions.len();
     let (instructions, source_locations) = fold_boolean_branch_materialization(
         instructions,
         source_locations,
         pinned_local_slots,
         exception_table,
+        metrics.as_mut(),
     )?;
+    if let Some(metrics) = metrics.as_mut() {
+        metrics.observe_pass(
+            crate::metrics::Optimise2Pass::BooleanMaterialisation,
+            before,
+            instructions.len(),
+        );
+    }
+    let before = instructions.len();
     let (instructions, source_locations) =
         remove_redundant_instructions(instructions, source_locations, exception_table)?;
+    if let Some(metrics) = metrics.as_mut() {
+        metrics.observe_pass(
+            crate::metrics::Optimise2Pass::RedundantInstructionsBefore,
+            before,
+            instructions.len(),
+        );
+    }
+    let before = instructions.len();
     let instructions = thread_jump_targets(instructions)?;
+    if let Some(metrics) = metrics.as_mut() {
+        metrics.observe_pass(
+            crate::metrics::Optimise2Pass::ThreadJumpsBefore,
+            before,
+            instructions.len(),
+        );
+    }
+    let before = instructions.len();
     let (instructions, source_locations) =
         fold_branch_over_goto(instructions, source_locations, exception_table)?;
+    if let Some(metrics) = metrics.as_mut() {
+        metrics.observe_pass(
+            crate::metrics::Optimise2Pass::BranchOverGotoBefore,
+            before,
+            instructions.len(),
+        );
+    }
+    let before = instructions.len();
     let (instructions, source_locations) =
         remove_unreachable_instructions(instructions, source_locations, exception_table)?;
+    if let Some(metrics) = metrics.as_mut() {
+        metrics.observe_pass(
+            crate::metrics::Optimise2Pass::UnreachableBefore,
+            before,
+            instructions.len(),
+        );
+    }
+    let post_cleanup_baseline = instructions.len();
+    let before = instructions.len();
     let (instructions, source_locations) =
         rewrite_store_load_pairs(instructions, source_locations, exception_table);
+    if let Some(metrics) = metrics.as_mut() {
+        metrics.observe_pass(
+            crate::metrics::Optimise2Pass::StoreLoadPairs,
+            before,
+            instructions.len(),
+        );
+    }
+    let before = instructions.len();
     let (instructions, source_locations) =
         fold_iinc_patterns(instructions, source_locations, exception_table)?;
+    if let Some(metrics) = metrics.as_mut() {
+        metrics.observe_pass(
+            crate::metrics::Optimise2Pass::IincPatterns,
+            before,
+            instructions.len(),
+        );
+    }
+    let before = instructions.len();
     let (instructions, source_locations) =
         fold_null_branch_comparisons(instructions, source_locations, exception_table)?;
+    if let Some(metrics) = metrics.as_mut() {
+        metrics.observe_pass(
+            crate::metrics::Optimise2Pass::NullComparisons,
+            before,
+            instructions.len(),
+        );
+    }
+    let before = instructions.len();
+    let mut liveness_cache = None;
     let (instructions, source_locations) = fold_boolean_zero_comparisons(
         instructions,
         source_locations,
         pinned_local_slots,
         exception_table,
+        metrics.as_mut(),
+        &mut liveness_cache,
     )?;
+    if let Some(metrics) = metrics.as_mut() {
+        metrics.observe_pass(
+            crate::metrics::Optimise2Pass::BooleanZeroComparisons,
+            before,
+            instructions.len(),
+        );
+    }
+    if instructions.len() != before {
+        liveness_cache = None;
+    }
+    let before = instructions.len();
     let (instructions, source_locations) = fold_stack_boolean_zero_comparisons(
         instructions,
         source_locations,
         pinned_local_slots,
         exception_table,
+        metrics.as_mut(),
+        &mut liveness_cache,
     )?;
+    if let Some(metrics) = metrics.as_mut() {
+        metrics.observe_pass(
+            crate::metrics::Optimise2Pass::StackBooleanZeroComparisons,
+            before,
+            instructions.len(),
+        );
+    }
+    if instructions.len() != before {
+        liveness_cache = None;
+    }
+    let before = instructions.len();
     let (instructions, source_locations) = remove_dead_duplicate_stores(
         instructions,
         source_locations,
         pinned_local_slots,
         exception_table,
+        metrics.as_mut(),
+        &mut liveness_cache,
     )?;
-    let instructions = thread_jump_targets(instructions)?;
-    let (instructions, source_locations) =
-        fold_branch_over_goto(instructions, source_locations, exception_table)?;
-    let (instructions, source_locations) =
-        remove_unreachable_instructions(instructions, source_locations, exception_table)?;
-    let (instructions, source_locations) =
-        remove_redundant_instructions(instructions, source_locations, exception_table)?;
+    if let Some(metrics) = metrics.as_mut() {
+        metrics.observe_pass(
+            crate::metrics::Optimise2Pass::DeadDuplicateStores,
+            before,
+            instructions.len(),
+        );
+    }
+    if instructions.len() != before {
+        liveness_cache = None;
+    }
+    let post_cleanup_changed = instructions.len() != post_cleanup_baseline;
+    let before = instructions.len();
+    let instructions = if post_cleanup_changed {
+        thread_jump_targets(instructions)?
+    } else {
+        instructions
+    };
+    if let Some(metrics) = metrics.as_mut() {
+        metrics.observe_pass(
+            crate::metrics::Optimise2Pass::ThreadJumpsAfter,
+            before,
+            instructions.len(),
+        );
+    }
+    let before = instructions.len();
+    let (instructions, source_locations) = if post_cleanup_changed {
+        fold_branch_over_goto(instructions, source_locations, exception_table)?
+    } else {
+        (instructions, source_locations)
+    };
+    if let Some(metrics) = metrics.as_mut() {
+        metrics.observe_pass(
+            crate::metrics::Optimise2Pass::BranchOverGotoAfter,
+            before,
+            instructions.len(),
+        );
+    }
+    let before = instructions.len();
+    let (instructions, source_locations) = if post_cleanup_changed {
+        remove_unreachable_instructions(instructions, source_locations, exception_table)?
+    } else {
+        (instructions, source_locations)
+    };
+    if let Some(metrics) = metrics.as_mut() {
+        metrics.observe_pass(
+            crate::metrics::Optimise2Pass::UnreachableAfter,
+            before,
+            instructions.len(),
+        );
+    }
+    let before = instructions.len();
+    let (instructions, source_locations) = if post_cleanup_changed {
+        remove_redundant_instructions(instructions, source_locations, exception_table)?
+    } else {
+        (instructions, source_locations)
+    };
+    if let Some(metrics) = metrics.as_mut() {
+        metrics.observe_pass(
+            crate::metrics::Optimise2Pass::RedundantInstructionsAfter,
+            before,
+            instructions.len(),
+        );
+    }
+    if post_cleanup_changed {
+        liveness_cache = None;
+    }
     let local_slot_map = allocate_local_slots(
         &instructions,
         max_locals,
         fixed_prefix_slots,
         pinned_local_slots,
         exception_table,
+        metrics.as_mut(),
+        &mut liveness_cache,
     );
+    let before = instructions.len();
     let (instructions, _) = rewrite_locals(instructions, &local_slot_map);
+    if let Some(metrics) = metrics.as_mut() {
+        metrics.observe_pass(
+            crate::metrics::Optimise2Pass::RewriteLocals,
+            before,
+            instructions.len(),
+        );
+    }
     let max_locals = compute_max_locals(&instructions);
     let max_locals = max_locals.max(fixed_prefix_slots);
+    if let Some(metrics) = metrics.as_mut() {
+        metrics.finish(instructions.len(), max_locals);
+    }
 
     Ok(Optimise2Result {
         instructions,
         metadata: source_locations,
         max_locals,
         local_slot_map,
+        metrics,
     })
 }
 
@@ -322,12 +502,13 @@ fn fold_boolean_branch_materialization(
     source_locations: Vec<BytecodeMetadata>,
     pinned_local_slots: &BTreeSet<u16>,
     exception_table: &mut Vec<ExceptionTableEntry>,
+    metrics: Option<&mut crate::metrics::Optimise2MethodMetrics>,
 ) -> jvm::Result<LocatedInstructions> {
     if instructions.len() < 7 || !has_boolean_branch_materialization(&instructions) {
         return Ok((instructions, source_locations));
     }
 
-    let liveness = analyze_local_liveness(&instructions, exception_table);
+    let liveness = analyze_local_liveness(&instructions, exception_table, metrics);
     let incoming = incoming_branch_sources(&instructions);
     let protected = protected_instruction_indices(&instructions, exception_table);
     let mut keep = vec![true; instructions.len()];
@@ -462,12 +643,14 @@ fn fold_boolean_zero_comparisons(
     source_locations: Vec<BytecodeMetadata>,
     pinned_local_slots: &BTreeSet<u16>,
     exception_table: &mut Vec<ExceptionTableEntry>,
+    metrics: Option<&mut crate::metrics::Optimise2MethodMetrics>,
+    liveness_cache: &mut Option<LocalLiveness>,
 ) -> jvm::Result<LocatedInstructions> {
     if instructions.len() < 6 || !has_boolean_zero_comparison(&instructions) {
         return Ok((instructions, source_locations));
     }
 
-    let liveness = analyze_local_liveness(&instructions, exception_table);
+    let liveness = cached_local_liveness(liveness_cache, &instructions, exception_table, metrics);
     let incoming = incoming_branch_sources(&instructions);
     let protected = protected_instruction_indices(&instructions, exception_table);
     let mut keep = vec![true; instructions.len()];
@@ -596,12 +779,14 @@ fn fold_stack_boolean_zero_comparisons(
     source_locations: Vec<BytecodeMetadata>,
     pinned_local_slots: &BTreeSet<u16>,
     exception_table: &mut Vec<ExceptionTableEntry>,
+    metrics: Option<&mut crate::metrics::Optimise2MethodMetrics>,
+    liveness_cache: &mut Option<LocalLiveness>,
 ) -> jvm::Result<LocatedInstructions> {
     if instructions.len() < 4 || !has_stack_boolean_zero_comparison(&instructions) {
         return Ok((instructions, source_locations));
     }
 
-    let liveness = analyze_local_liveness(&instructions, exception_table);
+    let liveness = cached_local_liveness(liveness_cache, &instructions, exception_table, metrics);
     let incoming = incoming_branch_sources(&instructions);
     let protected = protected_instruction_indices(&instructions, exception_table);
     let mut keep = vec![true; instructions.len()];
@@ -691,12 +876,14 @@ fn remove_dead_duplicate_stores(
     source_locations: Vec<BytecodeMetadata>,
     pinned_local_slots: &BTreeSet<u16>,
     exception_table: &mut Vec<ExceptionTableEntry>,
+    metrics: Option<&mut crate::metrics::Optimise2MethodMetrics>,
+    liveness_cache: &mut Option<LocalLiveness>,
 ) -> jvm::Result<LocatedInstructions> {
     if instructions.len() < 2 || !has_duplicate_store(&instructions) {
         return Ok((instructions, source_locations));
     }
 
-    let liveness = analyze_local_liveness(&instructions, exception_table);
+    let liveness = cached_local_liveness(liveness_cache, &instructions, exception_table, metrics);
     let protected = protected_instruction_indices(&instructions, exception_table);
     let mut keep = vec![true; instructions.len()];
     let mut index = 0;
@@ -744,7 +931,7 @@ fn remove_redundant_instructions(
     source_locations: Vec<BytecodeMetadata>,
     exception_table: &mut Vec<ExceptionTableEntry>,
 ) -> jvm::Result<LocatedInstructions> {
-    if instructions.is_empty() {
+    if instructions.is_empty() || !has_redundant_instruction(&instructions) {
         return Ok((instructions, source_locations));
     }
 
@@ -791,12 +978,37 @@ fn remove_redundant_instructions(
     compact_instructions(instructions, source_locations, &keep, exception_table)
 }
 
+fn has_redundant_instruction(instructions: &[Instruction]) -> bool {
+    instructions.iter().enumerate().any(|(index, instruction)| {
+        matches!(instruction, Instruction::Nop)
+            || matches!(instruction, Instruction::Goto(target) if usize::from(*target) == index + 1)
+            || matches!(instruction, Instruction::Goto_w(target) if *target >= 0 && *target as usize == index + 1)
+    }) || instructions.windows(2).any(|window| {
+        let Some((load_kind, load)) = local_load(&window[0]) else {
+            return false;
+        };
+        let Some((store_kind, store)) = local_store(&window[1]) else {
+            return false;
+        };
+        load.index == store.index && load_kind == store_kind
+    })
+}
+
 fn remove_unreachable_instructions(
     instructions: Vec<Instruction>,
     source_locations: Vec<BytecodeMetadata>,
     exception_table: &mut Vec<ExceptionTableEntry>,
 ) -> jvm::Result<LocatedInstructions> {
     if instructions.is_empty() {
+        return Ok((instructions, source_locations));
+    }
+    // If every instruction before the last one can fall through, the entry's
+    // linear path already reaches the complete method. Conditional branches
+    // do not invalidate this proof because they retain their fallthrough edge.
+    if instructions[..instructions.len() - 1]
+        .iter()
+        .all(instruction_can_fall_through)
+    {
         return Ok((instructions, source_locations));
     }
 
@@ -827,7 +1039,27 @@ fn remove_unreachable_instructions(
     compact_instructions(instructions, source_locations, &reachable, exception_table)
 }
 
+fn instruction_can_fall_through(instruction: &Instruction) -> bool {
+    !matches!(
+        instruction,
+        Instruction::Goto(_)
+            | Instruction::Goto_w(_)
+            | Instruction::Tableswitch(_)
+            | Instruction::Lookupswitch(_)
+            | Instruction::Ireturn
+            | Instruction::Lreturn
+            | Instruction::Freturn
+            | Instruction::Dreturn
+            | Instruction::Areturn
+            | Instruction::Return
+            | Instruction::Athrow
+    )
+}
+
 fn thread_jump_targets(mut instructions: Vec<Instruction>) -> jvm::Result<Vec<Instruction>> {
+    if !has_jump_chain(&instructions) {
+        return Ok(instructions);
+    }
     for index in 0..instructions.len() {
         let replacement = match &instructions[index] {
             Instruction::Ifeq(target) => Some(Instruction::Ifeq(thread_u16_target(
@@ -930,12 +1162,26 @@ fn thread_jump_targets(mut instructions: Vec<Instruction>) -> jvm::Result<Vec<In
     Ok(instructions)
 }
 
+fn has_jump_chain(instructions: &[Instruction]) -> bool {
+    instructions.iter().enumerate().any(|(index, instruction)| {
+        let mut found = false;
+        visit_branch_targets(index, instruction, |target| {
+            found |= target >= 0
+                && instructions
+                    .get(target as usize)
+                    .and_then(goto_target)
+                    .is_some();
+        });
+        found
+    })
+}
+
 fn fold_branch_over_goto(
     mut instructions: Vec<Instruction>,
     source_locations: Vec<BytecodeMetadata>,
     exception_table: &mut Vec<ExceptionTableEntry>,
 ) -> jvm::Result<LocatedInstructions> {
-    if instructions.len() < 3 {
+    if instructions.len() < 3 || !has_branch_over_goto(&instructions) {
         return Ok((instructions, source_locations));
     }
 
@@ -991,12 +1237,25 @@ fn fold_branch_over_goto(
     compact_instructions(instructions, source_locations, &keep, exception_table)
 }
 
+fn has_branch_over_goto(instructions: &[Instruction]) -> bool {
+    instructions.windows(2).enumerate().any(|(index, window)| {
+        conditional_branch_target(&window[0]) == u16::try_from(index + 2).ok()
+            && goto_target(&window[1]).is_some_and(|target| target != index + 2)
+    })
+}
+
 fn rewrite_store_load_pairs(
     mut instructions: Vec<Instruction>,
     mut metadata: Vec<BytecodeMetadata>,
     exception_table: &[ExceptionTableEntry],
 ) -> LocatedInstructions {
-    if instructions.len() < 2 {
+    if instructions.len() < 2
+        || !instructions.windows(2).any(|window| {
+            matches!((local_store(&window[0]), local_load(&window[1])),
+            (Some((store_kind, stored)), Some((load_kind, loaded)))
+                if store_kind == load_kind && stored.index == loaded.index)
+        })
+    {
         return (instructions, metadata);
     }
 
@@ -1036,7 +1295,12 @@ fn fold_iinc_patterns(
     source_locations: Vec<BytecodeMetadata>,
     exception_table: &mut Vec<ExceptionTableEntry>,
 ) -> jvm::Result<LocatedInstructions> {
-    if instructions.len() < 4 {
+    if instructions.len() < 4
+        || !instructions
+            .windows(4)
+            .enumerate()
+            .any(|(index, _)| iinc_pattern(&instructions, index).is_some())
+    {
         return Ok((instructions, source_locations));
     }
 
@@ -1078,7 +1342,16 @@ fn fold_null_branch_comparisons(
     source_locations: Vec<BytecodeMetadata>,
     exception_table: &mut Vec<ExceptionTableEntry>,
 ) -> jvm::Result<LocatedInstructions> {
-    if instructions.len() < 3 {
+    if instructions.len() < 3
+        || !instructions.windows(3).any(|window| {
+            matches!(local_load(&window[0]), Some((LocalKind::Reference, _)))
+                && matches!(window[1], Instruction::Aconst_null)
+                && matches!(
+                    window[2],
+                    Instruction::If_acmpeq(_) | Instruction::If_acmpne(_)
+                )
+        })
+    {
         return Ok((instructions, source_locations));
     }
 
@@ -1338,8 +1611,10 @@ fn allocate_local_slots(
     fixed_prefix_slots: u16,
     pinned_local_slots: &BTreeSet<u16>,
     exception_table: &[ExceptionTableEntry],
+    metrics: Option<&mut crate::metrics::Optimise2MethodMetrics>,
+    liveness_cache: &mut Option<LocalLiveness>,
 ) -> BTreeMap<u16, u16> {
-    let live_ranges = compute_live_ranges(instructions, exception_table);
+    let live_ranges = compute_live_ranges(instructions, exception_table, metrics, liveness_cache);
     let mut slot_map = BTreeMap::new();
 
     for old_slot in 0..fixed_prefix_slots.min(max_locals) {
@@ -1431,12 +1706,14 @@ fn first_available_slot(occupied: &mut Vec<bool>, first_slot: u16, width: u16) -
 fn compute_live_ranges(
     instructions: &[Instruction],
     exception_table: &[ExceptionTableEntry],
+    metrics: Option<&mut crate::metrics::Optimise2MethodMetrics>,
+    liveness_cache: &mut Option<LocalLiveness>,
 ) -> Vec<Option<LiveRange>> {
     if !has_backward_control_flow(instructions, exception_table) {
         return compute_linear_live_ranges(instructions);
     }
 
-    let liveness = analyze_local_liveness(instructions, exception_table);
+    let liveness = cached_local_liveness(liveness_cache, instructions, exception_table, metrics);
     let mut ranges: Vec<Option<LiveRange>> = vec![None; liveness.widths.len()];
 
     for index in 0..instructions.len() {
@@ -1518,9 +1795,26 @@ fn compute_linear_live_ranges(instructions: &[Instruction]) -> Vec<Option<LiveRa
     ranges
 }
 
+fn cached_local_liveness<'a>(
+    cache: &'a mut Option<LocalLiveness>,
+    instructions: &[Instruction],
+    exception_table: &[ExceptionTableEntry],
+    metrics: Option<&mut crate::metrics::Optimise2MethodMetrics>,
+) -> &'a LocalLiveness {
+    if cache.is_none() {
+        *cache = Some(analyze_local_liveness(
+            instructions,
+            exception_table,
+            metrics,
+        ));
+    }
+    cache.as_ref().expect("liveness cache was initialized")
+}
+
 fn analyze_local_liveness(
     instructions: &[Instruction],
     exception_table: &[ExceptionTableEntry],
+    metrics: Option<&mut crate::metrics::Optimise2MethodMetrics>,
 ) -> LocalLiveness {
     let mut widths = Vec::new();
     let mut uses = vec![None; instructions.len()];
@@ -1573,8 +1867,10 @@ fn analyze_local_liveness(
         }
     }
     let mut predecessors = vec![Vec::new(); instructions.len()];
+    let mut successor_edges = 0usize;
     for (index, instruction_successors) in successors.iter_mut().enumerate() {
         instruction_successors.retain_below(instructions.len());
+        successor_edges += instruction_successors.len();
         instruction_successors.for_each(|successor| {
             predecessors[successor].push(index);
         });
@@ -1584,7 +1880,9 @@ fn analyze_local_liveness(
     let mut queued = vec![true; instructions.len()];
     let mut next_out = vec![0; live_in.words_per_row];
     let mut next_in = vec![0; live_in.words_per_row];
+    let mut worklist_pops = 0usize;
     while let Some(index) = queue.pop_front() {
+        worklist_pops += 1;
         queued[index] = false;
         next_out.fill(0);
         successors[index].for_each(|successor| {
@@ -1615,6 +1913,16 @@ fn analyze_local_liveness(
                 }
             }
         }
+    }
+
+    if let Some(metrics) = metrics {
+        metrics.record_liveness(
+            instructions.len(),
+            local_count,
+            live_in.words.len().saturating_add(live_out.words.len()),
+            successor_edges,
+            worklist_pops,
+        );
     }
 
     LocalLiveness {
@@ -2425,7 +2733,7 @@ mod tests {
             Instruction::Pop,
             Instruction::Return,
         ];
-        let map = allocate_local_slots(&sequential, 6, 0, &BTreeSet::new(), &[]);
+        let map = allocate_local_slots(&sequential, 6, 0, &BTreeSet::new(), &[], None, &mut None);
         assert_eq!(map.get(&4), Some(&0));
         assert_eq!(map.get(&5), Some(&0));
 
@@ -2438,7 +2746,7 @@ mod tests {
             Instruction::Pop,
             Instruction::Return,
         ];
-        let map = allocate_local_slots(&overlapping, 6, 0, &BTreeSet::new(), &[]);
+        let map = allocate_local_slots(&overlapping, 6, 0, &BTreeSet::new(), &[], None, &mut None);
         assert_eq!(map.get(&4), Some(&0));
         assert_eq!(map.get(&5), Some(&1));
     }
@@ -2458,7 +2766,7 @@ mod tests {
             Instruction::Return,
         ];
         let pinned = BTreeSet::from([12]);
-        let map = allocate_local_slots(&instructions, 15, 0, &pinned, &[]);
+        let map = allocate_local_slots(&instructions, 15, 0, &pinned, &[], None, &mut None);
 
         assert_eq!(map.get(&10), Some(&0));
         assert_eq!(map.get(&12), Some(&12));

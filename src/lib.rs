@@ -63,7 +63,7 @@ use rustc_codegen_ssa::{
 };
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use rustc_hir::def::DefKind;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 use rustc_data_structures::unord::UnordMap;
 use rustc_metadata::EncodedMetadata;
@@ -86,9 +86,9 @@ use std::{
 };
 
 mod async_interop;
-mod instrumentation;
 mod lower1;
 mod lower2;
+mod metrics;
 mod oomir;
 mod optimise1;
 mod stable_hash;
@@ -96,15 +96,303 @@ mod stable_hash;
 /// An instance of our Java bytecode codegen backend.
 struct MyBackend;
 
-/// Rustc's codegen-unit partitioning is tuned for native backends which lower
-/// functions into independently owned LLVM modules. Keep each OOMIR shard
-/// bounded as a second line of defence for unusually large codegen units.
-const MAX_MONO_ITEMS_PER_OOMIR_SHARD: usize = 256;
 // Four lower2 workers usefully saturate large crates without retaining an
 // unbounded number of prepared OOMIR modules on many-core hosts.
 const MAX_CODEGEN_WORKERS: usize = 4;
 const OOMIR_SHARD_QUEUE_DEPTH: usize = 1;
 const CLASS_BUNDLE_MAGIC: &[u8; 8] = b"RCJVMB1\0";
+
+/// Crate-wide class contributions collected while ordinary function shards
+/// continue through lower2. Method bodies move here instead of being cloned;
+/// compatible fragments are merged and emitted exactly once after discovery.
+#[derive(Default)]
+struct CanonicalDataTypeRegistry {
+    variants: HashMap<String, Vec<oomir::DataType>>,
+    external_interfaces: HashSet<String>,
+}
+
+impl CanonicalDataTypeRegistry {
+    fn collect(&mut self, module: &mut oomir::Module) {
+        self.external_interfaces
+            .extend(module.external_interfaces.iter().cloned());
+        let relative_static_methods = Arc::make_mut(&mut module.relative_static_methods);
+        for (name, data_type) in &mut module.data_types {
+            let contribution = match data_type {
+                oomir::DataType::Class {
+                    is_abstract,
+                    super_class,
+                    fields,
+                    methods,
+                    interfaces,
+                } => oomir::DataType::Class {
+                    is_abstract: *is_abstract,
+                    super_class: super_class.clone(),
+                    fields: fields.clone(),
+                    methods: std::mem::take(methods),
+                    interfaces: interfaces.clone(),
+                },
+                oomir::DataType::Interface {
+                    methods,
+                    interfaces,
+                    is_enum,
+                } => oomir::DataType::Interface {
+                    methods: std::mem::take(methods),
+                    interfaces: interfaces.clone(),
+                    is_enum: *is_enum,
+                },
+            };
+            Self::record_relative_static_methods(name, &contribution, relative_static_methods);
+            module.suppressed_data_types.insert(name.clone());
+
+            let variants = self.variants.entry(name.clone()).or_default();
+            let mut contribution = Some(contribution);
+            for existing in variants.iter_mut() {
+                if Self::try_merge(existing, contribution.as_ref().unwrap()) {
+                    contribution = None;
+                    break;
+                }
+            }
+            if let Some(contribution) = contribution {
+                variants.push(contribution);
+            }
+        }
+    }
+
+    fn record_relative_static_methods(
+        class_name: &str,
+        data_type: &oomir::DataType,
+        relative_static_methods: &mut HashSet<oomir::FunctionKey>,
+    ) {
+        let methods = match data_type {
+            oomir::DataType::Class { methods, .. } | oomir::DataType::Interface { methods, .. } => {
+                methods
+            }
+        };
+        for (method_name, method) in methods {
+            let oomir::DataTypeMethod::Function(function) = method else {
+                continue;
+            };
+            if function.signature.is_static && function.signature.supports_relative_pointer_abi() {
+                relative_static_methods.insert(oomir::FunctionKey::new(
+                    class_name,
+                    method_name,
+                    &function.signature,
+                ));
+            }
+        }
+    }
+
+    fn try_merge(existing: &mut oomir::DataType, incoming: &oomir::DataType) -> bool {
+        match (existing, incoming) {
+            (
+                oomir::DataType::Class {
+                    is_abstract: existing_abstract,
+                    super_class: existing_super,
+                    fields: existing_fields,
+                    methods: existing_methods,
+                    interfaces: existing_interfaces,
+                },
+                oomir::DataType::Class {
+                    is_abstract: incoming_abstract,
+                    super_class: incoming_super,
+                    fields: incoming_fields,
+                    methods: incoming_methods,
+                    interfaces: incoming_interfaces,
+                },
+            ) => {
+                if existing_abstract != incoming_abstract
+                    || existing_super != incoming_super
+                    || incoming_fields.iter().any(|(name, ty)| {
+                        existing_fields
+                            .iter()
+                            .find(|(existing_name, _)| existing_name == name)
+                            .is_some_and(|(_, existing_ty)| existing_ty != ty)
+                    })
+                    || incoming_methods.iter().any(|(name, method)| {
+                        existing_methods
+                            .get(name)
+                            .is_some_and(|existing| existing != method)
+                    })
+                {
+                    return false;
+                }
+                for (name, ty) in incoming_fields {
+                    if !existing_fields
+                        .iter()
+                        .any(|(existing_name, _)| existing_name == name)
+                    {
+                        existing_fields.push((name.clone(), ty.clone()));
+                    }
+                }
+                for (name, method) in incoming_methods {
+                    existing_methods
+                        .entry(name.clone())
+                        .or_insert_with(|| method.clone());
+                }
+                for interface in incoming_interfaces {
+                    if !existing_interfaces.contains(interface) {
+                        existing_interfaces.push(interface.clone());
+                    }
+                }
+                true
+            }
+            (
+                oomir::DataType::Interface {
+                    methods: existing_methods,
+                    interfaces: existing_interfaces,
+                    is_enum: existing_is_enum,
+                },
+                oomir::DataType::Interface {
+                    methods: incoming_methods,
+                    interfaces: incoming_interfaces,
+                    is_enum: incoming_is_enum,
+                },
+            ) => {
+                if existing_is_enum != incoming_is_enum
+                    || incoming_methods.iter().any(|(name, signature)| {
+                        existing_methods
+                            .get(name)
+                            .is_some_and(|existing| existing != signature)
+                    })
+                {
+                    return false;
+                }
+                for (name, signature) in incoming_methods {
+                    existing_methods
+                        .entry(name.clone())
+                        .or_insert_with(|| signature.clone());
+                }
+                for interface in incoming_interfaces {
+                    if !existing_interfaces.contains(interface) {
+                        existing_interfaces.push(interface.clone());
+                    }
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn into_modules(self, module_name: &str, source_file: Option<String>) -> Vec<oomir::Module> {
+        let Self {
+            variants,
+            external_interfaces,
+        } = self;
+        let shared_data_types = Arc::new(Self::shared_schemas(&variants));
+        let mut buckets = Vec::<HashMap<String, oomir::DataType>>::new();
+        let mut names = variants.into_iter().collect::<Vec<_>>();
+        names.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        for (name, variants) in names {
+            let nest_root = name.split('$').next().unwrap_or(&name);
+            let base_bucket = stable_hash::hash_value(&nest_root) as usize % MAX_CODEGEN_WORKERS;
+            for (variant, data_type) in variants.into_iter().enumerate() {
+                let bucket = base_bucket + variant * MAX_CODEGEN_WORKERS;
+                if buckets.len() <= bucket {
+                    buckets.resize_with(bucket + 1, HashMap::default);
+                }
+                buckets[bucket].insert(name.clone(), data_type);
+            }
+        }
+
+        let modules = buckets
+            .into_iter()
+            .filter(|data_types| !data_types.is_empty())
+            .map(|data_types| oomir::Module {
+                name: module_name.to_string(),
+                source_file: source_file.clone(),
+                functions: HashMap::default(),
+                data_types,
+                suppressed_data_types: HashSet::default(),
+                shared_data_types: Some(Arc::clone(&shared_data_types)),
+                relative_static_methods: Arc::new(HashSet::default()),
+                external_interfaces: external_interfaces.clone(),
+                statics: HashMap::default(),
+            })
+            .collect();
+        modules
+    }
+
+    fn shared_schemas(
+        variants: &HashMap<String, Vec<oomir::DataType>>,
+    ) -> HashMap<String, oomir::DataType> {
+        let mut schemas = HashMap::default();
+        for (name, variants) in variants {
+            let Some(first) = variants.first() else {
+                continue;
+            };
+            let mut schema = Self::schema_for(first);
+            for variant in variants.iter().skip(1) {
+                let _ = Self::try_merge(&mut schema, &Self::schema_for(variant));
+            }
+            if variants
+                .iter()
+                .any(|variant| matches!(variant, oomir::DataType::Interface { .. }))
+                && !matches!(schema, oomir::DataType::Interface { .. })
+            {
+                schema = variants
+                    .iter()
+                    .find_map(|variant| match variant {
+                        oomir::DataType::Interface {
+                            methods,
+                            interfaces,
+                            is_enum,
+                        } => Some(oomir::DataType::Interface {
+                            methods: methods.clone(),
+                            interfaces: interfaces.clone(),
+                            is_enum: *is_enum,
+                        }),
+                        _ => None,
+                    })
+                    .expect("an interface variant was observed");
+            }
+            schemas.insert(name.clone(), schema);
+        }
+        schemas
+    }
+
+    fn schema_for(data_type: &oomir::DataType) -> oomir::DataType {
+        match data_type {
+            oomir::DataType::Class {
+                is_abstract,
+                super_class,
+                fields,
+                methods,
+                interfaces,
+            } => oomir::DataType::Class {
+                is_abstract: *is_abstract,
+                super_class: super_class.clone(),
+                fields: fields.clone(),
+                methods: methods
+                    .keys()
+                    .map(|name| {
+                        (
+                            name.clone(),
+                            oomir::DataTypeMethod::SimpleConstantReturn(oomir::Type::Void, None),
+                        )
+                    })
+                    .collect(),
+                interfaces: interfaces.clone(),
+            },
+            oomir::DataType::Interface {
+                methods,
+                interfaces,
+                is_enum,
+            } => oomir::DataType::Interface {
+                methods: methods
+                    .keys()
+                    .map(|name| {
+                        (
+                            name.clone(),
+                            oomir::DataTypeMethod::SimpleConstantReturn(oomir::Type::Void, None),
+                        )
+                    })
+                    .collect(),
+                interfaces: interfaces.clone(),
+                is_enum: *is_enum,
+            },
+        }
+    }
+}
 
 fn combine_class_bundles(path: &Path, bundles: &[(String, PathBuf)]) -> std::io::Result<()> {
     let mut output = BufWriter::new(std::fs::File::create(path)?);
@@ -1243,6 +1531,9 @@ fn empty_oomir_module(tcx: TyCtxt<'_>, name: &str) -> oomir::Module {
             .map(|file_name| rustc_span::FileName::Real(file_name).short().to_string()),
         functions: HashMap::default(),
         data_types: HashMap::default(),
+        suppressed_data_types: HashSet::default(),
+        shared_data_types: None,
+        relative_static_methods: Arc::new(HashSet::default()),
         external_interfaces: HashSet::default(),
         statics: HashMap::default(),
     }
@@ -1270,17 +1561,21 @@ fn prepare_oomir_shard(shard_name: &str, mut oomir_module: oomir::Module) -> oom
             .insert("RustcCodegenJVMIntrinsics".to_string(), intrinsic_class);
     }
 
+    for data_type in oomir_module.data_types.values_mut() {
+        data_type.clean_duplicates();
+    }
+
     oomir_module
 }
 
 fn emit_oomir_shard(
-    crate_name: &str,
     shard_name: &str,
     oomir_module: oomir::Module,
     emit_runtime_views: bool,
     debug_info: lower2::DebugInfoOptions,
     emitted_class_registry: &lower2::EmittedClassRegistry,
 ) -> Vec<(String, PathBuf)> {
+    let _metrics = metrics::begin_shard(shard_name, &oomir_module);
     breadcrumbs::log!(
         breadcrumbs::LogLevel::Info,
         "backend",
@@ -1292,9 +1587,8 @@ fn emit_oomir_shard(
         )
     );
 
-    let optimise1_timer = instrumentation::Timer::phase("optimise1", Some(crate_name));
     let oomir_module = optimise1::optimise_module(oomir_module);
-    drop(optimise1_timer);
+    metrics::record_oomir_after_optimise1(&oomir_module);
 
     breadcrumbs::log!(
         breadcrumbs::LogLevel::Info,
@@ -1307,7 +1601,6 @@ fn emit_oomir_shard(
         )
     );
 
-    let lower2_timer = instrumentation::Timer::phase("lower2", Some(crate_name));
     let generated_classes = lower2::oomir_to_jvm_bytecode(
         oomir_module,
         debug_info,
@@ -1317,7 +1610,6 @@ fn emit_oomir_shard(
     .unwrap_or_else(|error| {
         panic!("failed to lower OOMIR shard {shard_name} to JVM bytecode: {error}")
     });
-    drop(lower2_timer);
     generated_classes
 }
 
@@ -1344,7 +1636,6 @@ impl CodegenBackend for MyBackend {
             let mut scanned_instances = HashSet::default();
             let emitted_class_registry = lower2::EmittedClassRegistry::default();
             let debug_info = lower2::debug_info_options(tcx);
-
             let mono_items = tcx.collect_and_partition_mono_items(());
             let partitioned_functions: HashSet<_> = mono_items
                 .codegen_units
@@ -1370,7 +1661,6 @@ impl CodegenBackend for MyBackend {
                 for _ in 0..worker_count {
                     let job_receiver = Arc::clone(&job_receiver);
                     let result_sender = result_sender.clone();
-                    let crate_name = &crate_name;
                     let emitted_class_registry = &emitted_class_registry;
                     scope.spawn(move || {
                         loop {
@@ -1384,7 +1674,6 @@ impl CodegenBackend for MyBackend {
                                 break;
                             };
                             let generated = emit_oomir_shard(
-                                crate_name,
                                 &shard_name,
                                 module,
                                 emit_runtime_views,
@@ -1399,20 +1688,12 @@ impl CodegenBackend for MyBackend {
                 }
                 drop(result_sender);
 
+                let mut canonical_data_types = CanonicalDataTypeRegistry::default();
                 let mut submitted = 0usize;
-                let mut submit =
-                    |shard_name: String, module: oomir::Module, emit_runtime_views: bool| {
-                        let module = prepare_oomir_shard(&shard_name, module);
-                        job_sender
-                            .send((submitted, shard_name, module, emit_runtime_views))
-                            .expect("OOMIR shard workers stopped unexpectedly");
-                        submitted += 1;
-                    };
 
-                // Java exports are additional roots, so keep them out of the
-                // first ordinary codegen unit and emit a small separate shard.
+                // Java exports are supplemental roots and are small enough to
+                // stream as their own job while ordinary owners are lowered.
                 let mut export_module = empty_oomir_module(tcx, &crate_module_class);
-                let lower1_timer = instrumentation::Timer::phase("lower1", Some(&crate_name));
                 lower_public_library_exports(
                     tcx,
                     &partitioned_functions,
@@ -1421,36 +1702,68 @@ impl CodegenBackend for MyBackend {
                     &mut scanned_instances,
                 );
                 emit_allocator_shims(tcx, &mut export_module);
-                drop(lower1_timer);
-                submit("java-exports".to_string(), export_module, true);
+                let mut export_module = prepare_oomir_shard("java-exports", export_module);
+                canonical_data_types.collect(&mut export_module);
+                job_sender
+                    .send((submitted, "java-exports".to_string(), export_module, true))
+                    .expect("OOMIR shard workers stopped unexpectedly");
+                submitted += 1;
 
-                for (index, cgu) in mono_items.codegen_units.into_iter().enumerate() {
-                    let items = cgu
-                        .items_in_deterministic_order(tcx)
-                        .into_iter()
-                        .map(|(item, _)| item)
-                        .collect::<Vec<_>>();
-                    for (chunk_index, chunk) in
-                        items.chunks(MAX_MONO_ITEMS_PER_OOMIR_SHARD).enumerate()
-                    {
-                        let shard_name = format!("cgu-{index}-{chunk_index}");
-                        let mut oomir_module = empty_oomir_module(tcx, &crate_module_class);
-                        let lower1_timer =
-                            instrumentation::Timer::phase("lower1", Some(&crate_name));
-                        lower_codegen_unit_items(
-                            tcx,
-                            chunk.iter().copied(),
-                            &partitioned_functions,
-                            &mut oomir_module,
-                            &mut claimed_mono_items,
-                            &mut lowered_instances,
-                            &mut scanned_instances,
-                        );
-                        drop(lower1_timer);
-                        submit(shard_name, oomir_module, false);
+                // Repartition native CGUs by final JVM owner. This prevents
+                // duplicate holder construction while preserving fine-grained
+                // streaming and dynamic worker load balancing.
+                let mut items_by_owner = BTreeMap::<String, Vec<MonoItem<'_>>>::new();
+                for cgu in mono_items.codegen_units {
+                    for (item, _) in cgu.items_in_deterministic_order(tcx) {
+                        let owner = match item {
+                            MonoItem::Fn(instance) => mono_item_name(tcx, instance)
+                                .class_to_call_on
+                                .unwrap_or_else(|| crate_module_class.clone()),
+                            MonoItem::Static(def_id) => format!(
+                                "{}$Static",
+                                lower1::jvm_names::class_for_def_id(tcx, def_id)
+                            ),
+                            MonoItem::GlobalAsm(_) => crate_module_class.clone(),
+                        };
+                        items_by_owner.entry(owner).or_default().push(item);
                     }
                 }
-                drop(submit);
+                for (index, (owner, items)) in items_by_owner.into_iter().enumerate() {
+                    let shard_name =
+                        format!("jvm-class-{index}-{}", stable_hash::short_hash(&owner, 8));
+                    let mut module = empty_oomir_module(tcx, &crate_module_class);
+                    lower_codegen_unit_items(
+                        tcx,
+                        items,
+                        &partitioned_functions,
+                        &mut module,
+                        &mut claimed_mono_items,
+                        &mut lowered_instances,
+                        &mut scanned_instances,
+                    );
+                    let mut module = prepare_oomir_shard(&shard_name, module);
+                    canonical_data_types.collect(&mut module);
+                    job_sender
+                        .send((submitted, shard_name, module, false))
+                        .expect("OOMIR shard workers stopped unexpectedly");
+                    submitted += 1;
+                }
+
+                let canonical_source_file = tcx
+                    .sess
+                    .local_crate_source_file()
+                    .map(|file_name| rustc_span::FileName::Real(file_name).short().to_string());
+                for (index, module) in canonical_data_types
+                    .into_modules(&crate_module_class, canonical_source_file)
+                    .into_iter()
+                    .enumerate()
+                {
+                    let shard_name = format!("canonical-types-{index}");
+                    job_sender
+                        .send((submitted, shard_name, module, false))
+                        .expect("OOMIR shard workers stopped unexpectedly");
+                    submitted += 1;
+                }
                 drop(job_sender);
 
                 let mut results = Vec::with_capacity(submitted);
@@ -1467,6 +1780,10 @@ impl CodegenBackend for MyBackend {
                     .flat_map(|(_, generated)| generated)
                     .collect::<Vec<_>>()
             });
+
+            if let Err(error) = metrics::finish_crate(&crate_name) {
+                eprintln!("warning: failed to write rustc_codegen_jvm metrics: {error}");
+            }
 
             Box::new((generated_classes, crate_name))
         })

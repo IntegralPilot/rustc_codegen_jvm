@@ -5074,6 +5074,19 @@ pub(super) fn convert_basic_block<'tcx>(
                                 });
                             }
                         } else if is_compiler_intrinsic
+                            && intrinsic_name == "float_to_int_unchecked"
+                            && oomir_operands.len() == 1
+                            && let Some(dest) = effective_dest.clone()
+                        {
+                            // The intrinsic's caller guarantees that the finite input is in
+                            // range. On valid inputs its result is therefore identical to the
+                            // backend's ordinary saturating float-to-int cast.
+                            instructions.push(oomir::Instruction::Cast {
+                                op: oomir_operands[0].clone(),
+                                ty: oomir_output_type.clone(),
+                                dest,
+                            });
+                        } else if is_compiler_intrinsic
                             && intrinsic_name == "disjoint_bitor"
                             && oomir_operands.len() == 2
                             && let Some(dest) = effective_dest.clone()
