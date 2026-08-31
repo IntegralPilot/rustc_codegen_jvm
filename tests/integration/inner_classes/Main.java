@@ -65,6 +65,20 @@ public class Main {
              throw new AssertionError("Nested struct payloads with different fields should not compare equal");
         }
 
+        inner_classes.WrapperChoice remoteSeven = inner_classes.inner_classes.wrap_remote_choice(
+                inner_classes.inner_classes.make_remote_choice(7));
+        inner_classes.WrapperChoice anotherRemoteSeven = inner_classes.inner_classes.wrap_remote_choice(
+                inner_classes.inner_classes.make_remote_choice(7));
+        inner_classes.WrapperChoice remoteEight = inner_classes.inner_classes.wrap_remote_choice(
+                inner_classes.inner_classes.make_remote_choice(8));
+
+        if (!inner_classes.WrapperChoice.eq(remoteSeven, anotherRemoteSeven)) {
+             throw new AssertionError("Enum equality should use shared schemas across datatype shards");
+        }
+        if (inner_classes.WrapperChoice.eq(remoteSeven, remoteEight)) {
+             throw new AssertionError("Cross-shard enum equality should compare payload fields");
+        }
+
         inner_classes.LeafEvent leaf = inner_classes.inner_classes.make_leaf_number(41);
         inner_classes.Event promoted = inner_classes.inner_classes.promote_leaf(leaf);
         if (promoted.getClass() != leaf.getClass()) {

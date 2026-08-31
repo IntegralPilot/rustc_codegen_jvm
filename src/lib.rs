@@ -331,18 +331,8 @@ impl CanonicalDataTypeRegistry {
             {
                 schema = variants
                     .iter()
-                    .find_map(|variant| match variant {
-                        oomir::DataType::Interface {
-                            methods,
-                            interfaces,
-                            is_enum,
-                        } => Some(oomir::DataType::Interface {
-                            methods: methods.clone(),
-                            interfaces: interfaces.clone(),
-                            is_enum: *is_enum,
-                        }),
-                        _ => None,
-                    })
+                    .find(|variant| matches!(variant, oomir::DataType::Interface { .. }))
+                    .map(Self::schema_for)
                     .expect("an interface variant was observed");
             }
             schemas.insert(name.clone(), schema);
@@ -391,6 +381,54 @@ impl CanonicalDataTypeRegistry {
                 is_enum: *is_enum,
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod canonical_data_type_registry_tests {
+    use super::*;
+
+    #[test]
+    fn mixed_interface_schema_keeps_only_method_stubs() {
+        let interface_method = oomir::DataTypeMethod::AdtHelperMethod {
+            kind: oomir::AdtHelperKind::StaticPartialEqEnum {
+                enum_class: "example/Mixed".to_string(),
+                variants: Vec::new(),
+            },
+        };
+        let variants = HashMap::from_iter([(
+            "example/Mixed".to_string(),
+            vec![
+                oomir::DataType::Class {
+                    is_abstract: false,
+                    super_class: None,
+                    fields: Vec::new(),
+                    methods: HashMap::default(),
+                    interfaces: Vec::new(),
+                },
+                oomir::DataType::Interface {
+                    methods: HashMap::from_iter([("eq".to_string(), interface_method)]),
+                    interfaces: Vec::new(),
+                    is_enum: true,
+                },
+            ],
+        )]);
+
+        let schemas = CanonicalDataTypeRegistry::shared_schemas(&variants);
+        let oomir::DataType::Interface {
+            methods, is_enum, ..
+        } = &schemas["example/Mixed"]
+        else {
+            panic!("the interface schema must take precedence");
+        };
+        assert!(*is_enum);
+        assert_eq!(
+            methods.get("eq"),
+            Some(&oomir::DataTypeMethod::SimpleConstantReturn(
+                oomir::Type::Void,
+                None,
+            ))
+        );
     }
 }
 

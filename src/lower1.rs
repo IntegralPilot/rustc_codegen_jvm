@@ -95,7 +95,7 @@ impl LocalBitSet {
         if let Some(last) = result.words.last_mut()
             && !local_count.is_multiple_of(u64::BITS as usize)
         {
-            *last = (1 << (local_count % u64::BITS as usize)) - 1;
+            *last = (1u64 << (local_count % u64::BITS as usize)) - 1;
         }
         result
     }
