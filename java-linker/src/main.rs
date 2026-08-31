@@ -1,17 +1,19 @@
 use std::env;
 use std::fs;
-use std::fs::OpenOptions;
 use std::fs::rename;
-use std::io::{self, BufReader, Cursor, Read, Seek, Write};
+use std::hash::{Hash, Hasher};
+use std::io::{self, BufReader, BufWriter, Cursor, Read, Seek, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 
 use rayon::prelude::*;
 use regex::Regex;
 use ristretto_classfile::attributes::{
     Attribute, BootstrapMethod, Instruction, StackFrame, VerificationType,
 };
-use ristretto_classfile::{ClassAccessFlags, ClassFile, Constant, ConstantPool, MethodAccessFlags};
+use ristretto_classfile::{
+    ClassAccessFlags, ClassFile, Constant, ConstantPool, JavaString, MethodAccessFlags,
+};
+use rustc_hash::FxHasher;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use tempfile::tempdir;
 use zip::write::{SimpleFileOptions, ZipWriter};
@@ -27,7 +29,7 @@ struct ClassInfo {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum ConstantKey {
-    Utf8(String),
+    Utf8(JavaString),
     Integer(i32),
     Float(u32),
     Long(i64),
@@ -49,7 +51,7 @@ enum ConstantKey {
 impl From<&Constant<'_>> for ConstantKey {
     fn from(constant: &Constant<'_>) -> Self {
         match constant {
-            Constant::Utf8(value) => Self::Utf8(value.to_string()),
+            Constant::Utf8(value) => Self::Utf8(value.as_ref().to_owned()),
             Constant::Integer(value) => Self::Integer(*value),
             Constant::Float(value) => Self::Float(value.to_bits()),
             Constant::Long(value) => Self::Long(*value),
@@ -603,7 +605,7 @@ fn class_file_from_data(data: &[u8]) -> io::Result<ClassFile<'static>> {
 fn method_identity(
     class_file: &ClassFile<'_>,
     method_index: usize,
-) -> io::Result<(String, String)> {
+) -> io::Result<(JavaString, JavaString)> {
     let method = &class_file.methods[method_index];
     let name = class_file
         .constant_pool
@@ -613,10 +615,10 @@ fn method_identity(
         .constant_pool
         .try_get_utf8(method.descriptor_index)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
-    Ok((name.to_rust_string(), descriptor.to_rust_string()))
+    Ok((name.to_owned(), descriptor.to_owned()))
 }
 
-fn interface_name(class_file: &ClassFile<'_>, interface_index: usize) -> io::Result<String> {
+fn interface_name(class_file: &ClassFile<'_>, interface_index: usize) -> io::Result<JavaString> {
     let constant_index = *class_file.interfaces.get(interface_index).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -626,7 +628,7 @@ fn interface_name(class_file: &ClassFile<'_>, interface_index: usize) -> io::Res
     class_file
         .constant_pool
         .try_get_class(constant_index)
-        .map(|name| name.to_rust_string())
+        .map(ToOwned::to_owned)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
 }
 
@@ -809,6 +811,13 @@ fn merge_class_data(base_data: &[u8], incoming_data: &[u8]) -> io::Result<Vec<u8
 }
 
 fn merge_duplicate_classes(classes: Vec<ClassInfo>) -> io::Result<Vec<ClassInfo>> {
+    merge_duplicate_classes_with_metrics(classes, None)
+}
+
+fn merge_duplicate_classes_with_metrics(
+    classes: Vec<ClassInfo>,
+    metrics: Option<&mut LinkerMetrics>,
+) -> io::Result<Vec<ClassInfo>> {
     let mut positions: HashMap<String, usize> = HashMap::default();
     let mut groups: Vec<Vec<ClassInfo>> = Vec::new();
     for class_info in classes {
@@ -819,6 +828,9 @@ fn merge_duplicate_classes(classes: Vec<ClassInfo>) -> io::Result<Vec<ClassInfo>
             groups.push(vec![class_info]);
         }
     }
+    if let Some(metrics) = metrics {
+        metrics.record_fragment_groups(&groups);
+    }
 
     groups
         .into_par_iter()
@@ -827,35 +839,61 @@ fn merge_duplicate_classes(classes: Vec<ClassInfo>) -> io::Result<Vec<ClassInfo>
                 return Ok(fragments.pop().unwrap());
             }
 
-            // Preserve the largest fragment's compact constant indexes. This
-            // avoids growing its near-limit methods through ldc-to-ldc_w remaps.
-            if class_fragments_can_be_reordered(&fragments)? {
-                fragments.sort_by(|left, right| right.data.len().cmp(&left.data.len()));
+            // Downstream crates can contribute a byte-for-byte identical
+            // specialization to the same upstream holder. Discard those
+            // before parsing: merge_class_files would make the same decision
+            // after allocating a ClassFile and indexing its constant pool.
+            let mut content_hashes: HashMap<u64, Vec<usize>> = HashMap::default();
+            let mut unique_fragments = Vec::<ClassInfo>::with_capacity(fragments.len());
+            for fragment in fragments {
+                let mut hasher = FxHasher::default();
+                fragment.data.hash(&mut hasher);
+                let hash = hasher.finish();
+                if content_hashes.get(&hash).is_some_and(|indexes| {
+                    indexes
+                        .iter()
+                        .any(|&index| unique_fragments[index].data == fragment.data)
+                }) {
+                    continue;
+                }
+                let index = unique_fragments.len();
+                unique_fragments.push(fragment);
+                content_hashes.entry(hash).or_default().push(index);
+            }
+            if unique_fragments.len() == 1 {
+                return Ok(unique_fragments.pop().unwrap());
             }
 
-            let mut fragments = fragments.into_iter();
-            let mut merged = fragments.next().unwrap();
-            let mut base = class_file_from_data(&merged.data).map_err(|error| {
-                io::Error::new(
-                    error.kind(),
-                    format!(
-                        "failed to parse duplicate JVM class {}: {error}",
-                        merged.jar_entry_name
-                    ),
-                )
-            })?;
+            // Parse every surviving fragment once. Previously the reorder
+            // check parsed all fragments and the merge loop parsed them all a
+            // second time.
+            let mut parsed = unique_fragments
+                .into_iter()
+                .map(|fragment| {
+                    let class_file = class_file_from_data(&fragment.data).map_err(|error| {
+                        io::Error::new(
+                            error.kind(),
+                            format!(
+                                "failed to parse duplicate JVM class {}: {error}",
+                                fragment.jar_entry_name
+                            ),
+                        )
+                    })?;
+                    Ok((fragment, class_file))
+                })
+                .collect::<io::Result<Vec<_>>>()?;
+
+            // Preserve the largest fragment's compact constant indexes. This
+            // avoids growing its near-limit methods through ldc-to-ldc_w remaps.
+            if class_fragments_can_be_reordered(&parsed)? {
+                parsed.sort_by(|(left, _), (right, _)| right.data.len().cmp(&left.data.len()));
+            }
+
+            let mut fragments = parsed.into_iter();
+            let (mut merged, mut base) = fragments.next().unwrap();
             let mut target_constants = constant_pool_index(&base.constant_pool);
             let mut changed = false;
-            for fragment in fragments {
-                let incoming = class_file_from_data(&fragment.data).map_err(|error| {
-                    io::Error::new(
-                        error.kind(),
-                        format!(
-                            "failed to parse duplicate JVM class {}: {error}",
-                            fragment.jar_entry_name
-                        ),
-                    )
-                })?;
+            for (_, incoming) in fragments {
                 changed |= merge_class_files(&mut base, &incoming, &mut target_constants).map_err(
                     |error| {
                         io::Error::new(
@@ -884,10 +922,11 @@ fn merge_duplicate_classes(classes: Vec<ClassInfo>) -> io::Result<Vec<ClassInfo>
         .collect()
 }
 
-fn class_fragments_can_be_reordered(fragments: &[ClassInfo]) -> io::Result<bool> {
+fn class_fragments_can_be_reordered(
+    fragments: &[(ClassInfo, ClassFile<'static>)],
+) -> io::Result<bool> {
     let mut methods = HashSet::default();
-    for fragment in fragments {
-        let class_file = class_file_from_data(&fragment.data)?;
+    for (_, class_file) in fragments {
         if !class_file.fields.is_empty() {
             return Ok(false);
         }
@@ -899,26 +938,6 @@ fn class_fragments_can_be_reordered(fragments: &[ClassInfo]) -> io::Result<bool>
         }
     }
     Ok(true)
-}
-
-struct InstrumentationTimer {
-    stage: &'static str,
-    start: Instant,
-}
-
-impl InstrumentationTimer {
-    fn new(stage: &'static str) -> Self {
-        Self {
-            stage,
-            start: Instant::now(),
-        }
-    }
-}
-
-impl Drop for InstrumentationTimer {
-    fn drop(&mut self) {
-        record_instrumentation_duration(self.stage, self.start.elapsed());
-    }
 }
 
 fn json_string(value: &str) -> String {
@@ -939,37 +958,146 @@ fn json_string(value: &str) -> String {
     out
 }
 
-fn json_optional_string(value: Option<&str>) -> String {
-    value.map(json_string).unwrap_or_else(|| "null".to_string())
+#[derive(Debug)]
+struct DuplicateClassMetric {
+    class: String,
+    fragments: usize,
+    input_bytes: usize,
 }
 
-fn record_instrumentation_duration(stage: &'static str, duration: Duration) {
-    let Some(path) = env::var_os("RCGJ_INSTRUMENT_PATH") else {
-        return;
-    };
-    if path.as_os_str().is_empty() {
-        return;
-    }
-    let path = PathBuf::from(path);
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
+#[derive(Debug)]
+struct LinkerMetrics {
+    input_fragments: usize,
+    input_fragment_bytes: usize,
+    unique_class_names: usize,
+    duplicate_class_names: usize,
+    duplicate_fragments: usize,
+    top_duplicate_classes: Vec<DuplicateClassMetric>,
+    merged_classes: usize,
+    merged_class_bytes: usize,
+    library_jars: usize,
+    library_jar_bytes: u64,
+    output_jar_bytes: u64,
+}
+
+impl LinkerMetrics {
+    fn enabled() -> bool {
+        env::var_os("RCGJ_METRICS_DIR").is_some_and(|directory| !directory.is_empty())
     }
 
-    let test = env::var("RCGJ_INSTRUMENT_TEST").ok();
-    let mode = env::var("RCGJ_INSTRUMENT_MODE").ok();
-    let seconds = duration.as_secs_f64();
-    let line = format!(
-        "{{\"schema_version\":1,\"kind\":\"phase\",\"stage\":{},\"crate_name\":null,\"item\":null,\"seconds\":{:.9},\"millis\":{:.6},\"pid\":{},\"test\":{},\"mode\":{}}}\n",
-        json_string(stage),
-        seconds,
-        seconds * 1000.0,
-        std::process::id(),
-        json_optional_string(test.as_deref()),
-        json_optional_string(mode.as_deref()),
-    );
+    fn from_inputs(classes: &[ClassInfo], input_jar_files: &[String]) -> Self {
+        Self {
+            input_fragments: classes.len(),
+            input_fragment_bytes: classes.iter().map(|class| class.data.len()).sum(),
+            unique_class_names: 0,
+            duplicate_class_names: 0,
+            duplicate_fragments: 0,
+            top_duplicate_classes: Vec::new(),
+            merged_classes: 0,
+            merged_class_bytes: 0,
+            library_jars: input_jar_files.len(),
+            library_jar_bytes: input_jar_files
+                .iter()
+                .filter_map(|path| fs::metadata(path).ok().map(|metadata| metadata.len()))
+                .sum(),
+            output_jar_bytes: 0,
+        }
+    }
 
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
-        let _ = file.write_all(line.as_bytes());
+    fn record_fragment_groups(&mut self, groups: &[Vec<ClassInfo>]) {
+        self.unique_class_names = groups.len();
+        self.duplicate_class_names = groups.iter().filter(|group| group.len() > 1).count();
+        self.duplicate_fragments = groups
+            .iter()
+            .map(|group| group.len().saturating_sub(1))
+            .sum();
+        self.top_duplicate_classes = groups
+            .iter()
+            .filter(|group| group.len() > 1)
+            .map(|group| DuplicateClassMetric {
+                class: group[0].jar_entry_name.clone(),
+                fragments: group.len(),
+                input_bytes: group.iter().map(|fragment| fragment.data.len()).sum(),
+            })
+            .collect();
+        self.top_duplicate_classes
+            .sort_by_key(|metric| std::cmp::Reverse((metric.fragments, metric.input_bytes)));
+        self.top_duplicate_classes.truncate(24);
+    }
+
+    fn record_merged_classes(&mut self, classes: &[ClassInfo]) {
+        self.merged_classes = classes.len();
+        self.merged_class_bytes = classes.iter().map(|class| class.data.len()).sum();
+    }
+
+    fn write(&self, output_jar: &str) -> io::Result<Option<PathBuf>> {
+        let Some(directory) = env::var_os("RCGJ_METRICS_DIR") else {
+            return Ok(None);
+        };
+        if directory.is_empty() {
+            return Ok(None);
+        }
+        let directory = PathBuf::from(directory);
+        fs::create_dir_all(&directory)?;
+        let path = directory.join(format!("{}-linker.json", std::process::id()));
+        let mut writer = BufWriter::new(fs::File::create(&path)?);
+        writeln!(writer, "{{")?;
+        writeln!(writer, "  \"schema_version\": 2,")?;
+        writeln!(writer, "  \"kind\": \"linker_work_metrics\",")?;
+        writeln!(writer, "  \"pid\": {},", std::process::id())?;
+        writeln!(writer, "  \"output_jar\": {},", json_string(output_jar))?;
+        writeln!(writer, "  \"input_fragments\": {},", self.input_fragments)?;
+        writeln!(
+            writer,
+            "  \"input_fragment_bytes\": {},",
+            self.input_fragment_bytes
+        )?;
+        writeln!(
+            writer,
+            "  \"unique_class_names\": {},",
+            self.unique_class_names
+        )?;
+        writeln!(
+            writer,
+            "  \"duplicate_class_names\": {},",
+            self.duplicate_class_names
+        )?;
+        writeln!(
+            writer,
+            "  \"duplicate_fragments\": {},",
+            self.duplicate_fragments
+        )?;
+        writeln!(writer, "  \"merged_classes\": {},", self.merged_classes)?;
+        writeln!(
+            writer,
+            "  \"merged_class_bytes\": {},",
+            self.merged_class_bytes
+        )?;
+        writeln!(writer, "  \"library_jars\": {},", self.library_jars)?;
+        writeln!(
+            writer,
+            "  \"library_jar_bytes\": {},",
+            self.library_jar_bytes
+        )?;
+        writeln!(writer, "  \"output_jar_bytes\": {},", self.output_jar_bytes)?;
+        writeln!(writer, "  \"top_duplicate_classes\": [")?;
+        for (index, metric) in self.top_duplicate_classes.iter().enumerate() {
+            writeln!(
+                writer,
+                "    {{\"class\": {}, \"fragments\": {}, \"input_bytes\": {}}}{}",
+                json_string(&metric.class),
+                metric.fragments,
+                metric.input_bytes,
+                if index + 1 == self.top_duplicate_classes.len() {
+                    ""
+                } else {
+                    ","
+                }
+            )?;
+        }
+        writeln!(writer, "  ]")?;
+        writeln!(writer, "}}")?;
+        Ok(Some(path))
     }
 }
 
@@ -1076,8 +1204,6 @@ fn main() -> Result<(), i32> {
         eprintln!("Usage: java-linker <input_files...> -o <output_jar_file>");
         return Err(1);
     }
-    let _linker_timer = InstrumentationTimer::new("java-linker");
-
     let mut input_class_files: Vec<String> = Vec::new();
     let mut input_class_bundles: Vec<String> = Vec::new();
     let mut input_jar_files: Vec<String> = Vec::new(); // Separate JARs
@@ -1145,22 +1271,16 @@ fn main() -> Result<(), i32> {
 
     // Load generated classes once. They are retained for duplicate merging and
     // final JAR output, so scanning them again here only adds I/O and parsing.
-    let app_classes = {
-        let _timer = InstrumentationTimer::new("java-linker-read-inputs");
-        collect_input_classes(&input_class_files, &input_class_bundles, &input_rlib_files).map_err(
-            |e| {
+    let app_classes =
+        collect_input_classes(&input_class_files, &input_class_bundles, &input_rlib_files)
+            .map_err(|e| {
                 eprintln!("Error collecting JVM classes: {e}");
                 1
-            },
-        )?
-    };
-    let main_classes = {
-        let _timer = InstrumentationTimer::new("java-linker-find-main");
-        find_main_classes(&app_classes).map_err(|e| {
-            eprintln!("Error during main class scan: {}", e);
-            1
-        })?
-    };
+            })?;
+    let main_classes = find_main_classes(&app_classes).map_err(|e| {
+        eprintln!("Error during main class scan: {}", e);
+        1
+    })?;
     if main_classes.len() > 1 {
         eprintln!("Error: Multiple entry-point classes found:");
         for c in main_classes {
@@ -1171,16 +1291,26 @@ fn main() -> Result<(), i32> {
     }
     let main_class_name = main_classes.into_iter().next();
 
+    let mut metrics = LinkerMetrics::enabled()
+        .then(|| LinkerMetrics::from_inputs(&app_classes, &input_jar_files));
     create_jar(
         app_classes,
         &input_jar_files,
         &output_file_path,
         main_class_name.as_deref(),
+        metrics.as_mut(),
     )
     .map_err(|e| {
         eprintln!("Error creating JAR file: {}", e);
         1 // Propagate error code
     })?;
+    if let Some(metrics) = metrics.as_mut() {
+        metrics.output_jar_bytes =
+            fs::metadata(&output_file_path).map_or(0, |metadata| metadata.len());
+        if let Err(error) = metrics.write(&output_file_path) {
+            eprintln!("Warning: Failed to write java-linker metrics: {error}");
+        }
+    }
 
     // Don't print success message if used as a linker, rustc handles that.
     // println!("JAR file created successfully: {}", output_file_path);
@@ -1265,11 +1395,12 @@ fn create_jar(
     input_jar_files: &[String],
     final_output_jar_path: &str,
     main_class_name: Option<&str>,
+    mut metrics: Option<&mut LinkerMetrics>,
 ) -> io::Result<()> {
-    let app_classes = {
-        let _timer = InstrumentationTimer::new("java-linker-merge-classes");
-        merge_duplicate_classes(app_classes)?
-    };
+    let app_classes = merge_duplicate_classes_with_metrics(app_classes, metrics.as_deref_mut())?;
+    if let Some(metrics) = metrics {
+        metrics.record_merged_classes(&app_classes);
+    }
 
     // Input JARs are bundled into the final artifact alongside generated classes.
     let library_jar_paths: Vec<PathBuf> = input_jar_files.iter().map(PathBuf::from).collect();
@@ -1283,15 +1414,12 @@ fn create_jar(
 
     let temp_dir = tempdir()?;
     let final_jar_temp_path = temp_dir.path().join("output.jar");
-    {
-        let _timer = InstrumentationTimer::new("java-linker-write-jar");
-        write_final_jar(
-            &app_classes,
-            &library_jar_paths,
-            &final_jar_temp_path,
-            main_class_name,
-        )?;
-    }
+    write_final_jar(
+        &app_classes,
+        &library_jar_paths,
+        &final_jar_temp_path,
+        main_class_name,
+    )?;
 
     if let Some(parent_dir) = Path::new(final_output_jar_path).parent() {
         fs::create_dir_all(parent_dir)?;
@@ -1787,10 +1915,10 @@ fn create_manifest_content(main_class_name: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        CLASS_BUNDLE_MAGIC, ClassInfo, class_file_from_data, collect_class_bundle_bytes,
-        instruction_byte_offsets, interface_name, jar_output_path, merge_class_data,
-        merge_duplicate_classes, merge_input_jars, method_identity, msvc_output_path,
-        parse_response_lines, remap_local_variable_ranges, write_final_jar,
+        CLASS_BUNDLE_MAGIC, ClassInfo, LinkerMetrics, class_file_from_data,
+        collect_class_bundle_bytes, instruction_byte_offsets, interface_name, jar_output_path,
+        merge_class_data, merge_duplicate_classes, merge_input_jars, method_identity,
+        msvc_output_path, parse_response_lines, remap_local_variable_ranges, write_final_jar,
     };
     use ristretto_classfile::attributes::{
         Attribute, BootstrapMethod, Instruction, LocalVariableTable,
@@ -1802,6 +1930,48 @@ mod tests {
     use std::{collections::HashSet, fs::File, io::Read, io::Write};
     use tempfile::tempdir;
     use zip::{ZipArchive, write::SimpleFileOptions, write::ZipWriter};
+
+    #[test]
+    fn linker_metrics_measure_fragment_amplification() {
+        let classes = vec![
+            ClassInfo {
+                jar_entry_name: "A.class".to_string(),
+                data: vec![1, 2],
+            },
+            ClassInfo {
+                jar_entry_name: "A.class".to_string(),
+                data: vec![3, 4, 5],
+            },
+            ClassInfo {
+                jar_entry_name: "B.class".to_string(),
+                data: vec![6],
+            },
+        ];
+        let mut metrics = LinkerMetrics::from_inputs(&classes, &[]);
+        metrics.record_fragment_groups(&[
+            vec![
+                ClassInfo {
+                    jar_entry_name: "A.class".to_string(),
+                    data: vec![1, 2],
+                },
+                ClassInfo {
+                    jar_entry_name: "A.class".to_string(),
+                    data: vec![3, 4, 5],
+                },
+            ],
+            vec![ClassInfo {
+                jar_entry_name: "B.class".to_string(),
+                data: vec![6],
+            }],
+        ]);
+        assert_eq!(metrics.input_fragments, 3);
+        assert_eq!(metrics.input_fragment_bytes, 6);
+        assert_eq!(metrics.unique_class_names, 2);
+        assert_eq!(metrics.duplicate_class_names, 1);
+        assert_eq!(metrics.duplicate_fragments, 1);
+        assert_eq!(metrics.top_duplicate_classes[0].class, "A.class");
+        assert_eq!(metrics.top_duplicate_classes[0].fragments, 2);
+    }
 
     fn abstract_class_with_method(method_name: &str) -> Vec<u8> {
         abstract_class_with_method_and_interface(method_name, None)

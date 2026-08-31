@@ -4,7 +4,11 @@
 use breadcrumbs::LogLevel;
 use ristretto_classfile::attributes::Instruction as JVMInstruction;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
-use std::fmt;
+use std::{
+    fmt,
+    hash::{Hash, Hasher},
+    sync::Arc,
+};
 
 pub mod interpret;
 
@@ -51,6 +55,15 @@ pub struct Module {
     pub source_file: Option<String>,
     pub functions: HashMap<FunctionKey, Function>,
     pub data_types: HashMap<String, DataType>,
+    /// Definitions already emitted by an earlier shard in this crate. They
+    /// remain available as lowering context, but lower2 must not rebuild them.
+    pub suppressed_data_types: HashSet<String>,
+    /// Read-only crate-wide type schemas used by canonical data-type emission
+    /// shards without copying every definition into every shard.
+    pub shared_data_types: Option<Arc<HashMap<String, DataType>>>,
+    /// Static methods removed into the canonical data-type contribution table
+    /// that still use the component-carrying internal pointer ABI.
+    pub relative_static_methods: Arc<HashSet<FunctionKey>>,
     /// JVM interfaces referenced by this shard but defined in another crate.
     pub external_interfaces: HashSet<String>,
     pub statics: HashMap<String, Static>,
@@ -68,6 +81,14 @@ impl Module {
 
     pub fn owner_class_for_function<'a>(&'a self, function: &'a Function) -> &'a str {
         function.owner_class.as_deref().unwrap_or(&self.name)
+    }
+
+    pub fn data_type(&self, name: &str) -> Option<&DataType> {
+        self.data_types.get(name).or_else(|| {
+            self.shared_data_types
+                .as_ref()
+                .and_then(|data_types| data_types.get(name))
+        })
     }
 }
 
@@ -89,20 +110,29 @@ impl Function {
 /// The identity of a method in a JVM class file. Return types are included in the
 /// descriptor for diagnostics and consistency, even though JVM invocation lookup is
 /// principally distinguished by owner, name, and parameter descriptor.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FunctionKey {
-    pub owner_class: String,
-    pub method_name: String,
-    pub descriptor: String,
+    owner_class: Arc<str>,
+    method_name: Arc<str>,
+    descriptor: Arc<str>,
+    hash: u64,
 }
 
 impl FunctionKey {
     pub fn new(owner_class: &str, method_name: &str, signature: &Signature) -> Self {
+        let descriptor = signature.to_string();
         Self {
-            owner_class: owner_class.to_string(),
-            method_name: method_name.to_string(),
-            descriptor: signature.to_string(),
+            owner_class: Arc::from(owner_class),
+            method_name: Arc::from(method_name),
+            hash: crate::stable_hash::hash_value(&(owner_class, method_name, descriptor.as_str())),
+            descriptor: Arc::from(descriptor),
         }
+    }
+}
+
+impl Hash for FunctionKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.hash);
     }
 }
 
@@ -134,7 +164,7 @@ impl Static {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum DataTypeMethod {
     Abstract(Signature),
     SimpleConstantReturn(Type, Option<Constant>),
@@ -142,7 +172,7 @@ pub enum DataTypeMethod {
     AdtHelperMethod { kind: AdtHelperKind },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct EnumVariantShape {
     /// The concrete class used by an ordinary case, or the nested enum
     /// interface used by a transparent subtype case.
@@ -153,7 +183,7 @@ pub struct EnumVariantShape {
     pub transparent: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum AdtHelperKind {
     EnumVariantIndex {
         enum_class: String,
@@ -177,7 +207,7 @@ pub enum AdtHelperKind {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DataType {
     Class {
         is_abstract: bool,
@@ -193,6 +223,40 @@ pub enum DataType {
     },
 }
 
+impl Hash for DataType {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Self::Class {
+                is_abstract,
+                super_class,
+                fields,
+                methods,
+                interfaces,
+            } => {
+                is_abstract.hash(state);
+                super_class.hash(state);
+                fields.hash(state);
+                interfaces.hash(state);
+                let mut methods = methods.iter().collect::<Vec<_>>();
+                methods.sort_unstable_by_key(|(name, _)| *name);
+                methods.hash(state);
+            }
+            Self::Interface {
+                methods,
+                interfaces,
+                is_enum,
+            } => {
+                interfaces.hash(state);
+                is_enum.hash(state);
+                let mut methods = methods.iter().collect::<Vec<_>>();
+                methods.sort_unstable_by_key(|(name, _)| *name);
+                methods.hash(state);
+            }
+        }
+    }
+}
+
 impl DataType {
     // Remove duplicate methods and fields
     pub fn clean_duplicates(&mut self) {
@@ -201,33 +265,25 @@ impl DataType {
                 is_abstract: _,
                 super_class: _,
                 fields,
-                methods,
-                interfaces: _,
+                methods: _,
+                interfaces,
             } => {
                 // Remove duplicate fields while preserving the original declaration order.
                 let mut seen_fields = HashSet::default();
                 fields.retain(|(name, _)| seen_fields.insert(name.clone()));
 
-                // Remove duplicate methods
-                let mut unique_methods = HashMap::default();
-                for (name, method) in methods.iter() {
-                    unique_methods.insert(name.clone(), method.clone());
-                }
-                *methods = unique_methods;
+                let mut seen_interfaces = HashSet::default();
+                interfaces.retain(|name| seen_interfaces.insert(name.clone()));
             }
-            DataType::Interface { methods, .. } => {
-                // Remove duplicate methods
-                let mut unique_methods = HashMap::default();
-                for (name, method) in methods.iter() {
-                    unique_methods.insert(name.clone(), method.clone());
-                }
-                *methods = unique_methods;
+            DataType::Interface { interfaces, .. } => {
+                let mut seen_interfaces = HashSet::default();
+                interfaces.retain(|name| seen_interfaces.insert(name.clone()));
             }
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Function {
     pub name: String,
     pub owner_class: Option<String>,
@@ -265,7 +321,7 @@ impl Signature {
     fn write_jvm_params(&self, result: &mut String, params: &[(String, Type)]) {
         for (_param_name, param_type) in params {
             if param_type.has_jvm_value() {
-                result.push_str(&param_type.to_jvm_descriptor());
+                param_type.write_jvm_descriptor(result);
             }
         }
     }
@@ -275,7 +331,7 @@ impl Signature {
         result.push('(');
         self.write_jvm_params(&mut result, &self.params);
         result.push(')');
-        result.push_str(&self.ret.to_jvm_return_descriptor());
+        self.ret.write_jvm_return_descriptor(&mut result);
         result
     }
 
@@ -382,18 +438,27 @@ impl Signature {
         result.push('(');
         self.write_jvm_params(&mut result, self.explicit_jvm_params());
         result.push(')');
-        result.push_str(&self.ret.to_jvm_return_descriptor());
+        self.ret.write_jvm_return_descriptor(&mut result);
         result
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodeBlock {
     pub entry: String,
     pub basic_blocks: HashMap<String, BasicBlock>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+impl Hash for CodeBlock {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.entry.hash(state);
+        let mut blocks = self.basic_blocks.iter().collect::<Vec<_>>();
+        blocks.sort_unstable_by_key(|(label, _)| *label);
+        blocks.hash(state);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BasicBlock {
     pub label: String,
     pub instructions: Vec<Instruction>,
@@ -1161,49 +1226,83 @@ impl Type {
 
     /// Returns the JVM type descriptor string (e.g., "I", "Ljava/lang/String;", "[I").
     pub fn to_jvm_descriptor(&self) -> String {
+        let mut descriptor = String::new();
+        self.write_jvm_descriptor(&mut descriptor);
+        descriptor
+    }
+
+    /// Appends this type's JVM descriptor without allocating intermediate
+    /// descriptors for nested array/reference types or signature components.
+    pub fn write_jvm_descriptor(&self, descriptor: &mut String) {
         match self {
-            Type::Void => "V".to_string(),
+            Type::Void => descriptor.push('V'),
             // Unit is only descriptor-compatible as a method return. Parameters and fields
             // omit it before descriptors are built.
-            Type::Unit => "V".to_string(),
-            Type::Boolean => "Z".to_string(),
-            Type::Char => "C".to_string(),
-            Type::I8 | Type::U8 => "B".to_string(),
-            Type::I16 => "S".to_string(),
-            Type::U16 => "C".to_string(),
-            Type::I32 | Type::U32 => "I".to_string(),
-            Type::I64 | Type::U64 => "J".to_string(),
+            Type::Unit => descriptor.push('V'),
+            Type::Boolean => descriptor.push('Z'),
+            Type::Char => descriptor.push('C'),
+            Type::I8 | Type::U8 => descriptor.push('B'),
+            Type::I16 => descriptor.push('S'),
+            Type::U16 => descriptor.push('C'),
+            Type::I32 | Type::U32 => descriptor.push('I'),
+            Type::I64 | Type::U64 => descriptor.push('J'),
             // Binary16 is stored as its raw 16-bit IEEE representation.
-            Type::F16 => "S".to_string(),
-            Type::F32 => "F".to_string(),
-            Type::F64 => "D".to_string(),
-            Type::Pointer(_) => format!("L{};", POINTER_CLASS),
-            Type::Str => format!("L{};", UTF8_VIEW_CLASS),
-            Type::Class(name) | Type::Interface(name) => format!("L{};", name.replace('.', "/")),
-            Type::Reference(inner) => inner.to_jvm_descriptor(),
+            Type::F16 => descriptor.push('S'),
+            Type::F32 => descriptor.push('F'),
+            Type::F64 => descriptor.push('D'),
+            Type::Pointer(_) => {
+                descriptor.push('L');
+                descriptor.push_str(POINTER_CLASS);
+                descriptor.push(';');
+            }
+            Type::Str => {
+                descriptor.push('L');
+                descriptor.push_str(UTF8_VIEW_CLASS);
+                descriptor.push(';');
+            }
+            Type::Class(name) | Type::Interface(name) => {
+                descriptor.push('L');
+                for character in name.chars() {
+                    descriptor.push(if character == '.' { '/' } else { character });
+                }
+                descriptor.push(';');
+            }
+            Type::Reference(inner) => inner.write_jvm_descriptor(descriptor),
             Type::MutableReference(inner) => {
                 if inner.has_jvm_value() {
-                    format!("[{}", inner.to_jvm_descriptor())
+                    descriptor.push('[');
+                    inner.write_jvm_descriptor(descriptor);
                 } else {
-                    "Ljava/lang/Object;".to_string()
+                    descriptor.push_str("Ljava/lang/Object;");
                 }
             }
             Type::Array(element_type) => {
                 if element_type.has_jvm_value() {
-                    format!("[{}", element_type.to_jvm_descriptor())
+                    descriptor.push('[');
+                    element_type.write_jvm_descriptor(descriptor);
                 } else {
-                    "[Ljava/lang/Object;".to_string()
+                    descriptor.push_str("[Ljava/lang/Object;");
                 }
             }
-            Type::Slice(_) => format!("L{};", SLICE_VIEW_CLASS),
+            Type::Slice(_) => {
+                descriptor.push('L');
+                descriptor.push_str(SLICE_VIEW_CLASS);
+                descriptor.push(';');
+            }
         }
     }
 
     pub fn to_jvm_return_descriptor(&self) -> String {
+        let mut descriptor = String::new();
+        self.write_jvm_return_descriptor(&mut descriptor);
+        descriptor
+    }
+
+    pub fn write_jvm_return_descriptor(&self, descriptor: &mut String) {
         if matches!(self, Type::Unit | Type::Void) {
-            "V".to_string()
+            descriptor.push('V');
         } else {
-            self.to_jvm_descriptor()
+            self.write_jvm_descriptor(descriptor);
         }
     }
 
@@ -1332,16 +1431,18 @@ impl Type {
             Constant::String(_) => Type::java_string(),
             Constant::Instance {
                 class_name, params, ..
-            } if class_name == POINTER_CLASS => Type::Pointer(Box::new(if params.len() == 3 {
-                params
-                    .first()
-                    .map(Type::from_constant)
-                    .unwrap_or(Type::Unit)
-            } else {
-                // Address-only constructors carry no JVM pointee value from
-                // which to infer a more specific OOMIR type.
-                Type::Unit
-            })),
+            } if class_name == POINTER_CLASS => {
+                Type::Pointer(Box::new(if params.len() == 3 {
+                    params
+                        .first()
+                        .map(Type::from_constant)
+                        .unwrap_or(Type::Unit)
+                } else {
+                    // Address-only constructors carry no JVM pointee value from
+                    // which to infer a more specific OOMIR type.
+                    Type::Unit
+                }))
+            }
             Constant::Instance { class_name, .. } => Type::Class(class_name.to_string()),
         }
     }

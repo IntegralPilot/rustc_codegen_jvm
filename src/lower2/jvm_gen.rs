@@ -31,7 +31,7 @@ fn code_attribute_with_stack_maps(
     let fixed_prefix_slots = initial_locals.len() as u16;
     let source_locations = vec![optimise2::BytecodeMetadata::default(); code.len()];
     let mut exception_table = Vec::new();
-    let optimised = optimise2::optimise(
+    let mut optimised = optimise2::optimise(
         code,
         source_locations,
         max_locals,
@@ -39,6 +39,9 @@ fn code_attribute_with_stack_maps(
         &std::collections::BTreeSet::new(),
         &mut exception_table,
     )?;
+    if let Some(metrics) = optimised.metrics.take() {
+        crate::metrics::record_optimise2_method(metrics, || format!("synthetic::{context}"));
+    }
     let mut code = optimised.instructions;
     let max_locals = optimised.max_locals;
     stackmaps::move_zero_branch_target(&mut code, context)?;
@@ -1431,7 +1434,7 @@ fn patch_branch_target(instructions: &mut [Instruction], branch_index: usize, ta
 }
 
 fn has_generated_eq(module: &oomir::Module, class_name: &str) -> bool {
-    match module.data_types.get(class_name) {
+    match module.data_type(class_name) {
         Some(oomir::DataType::Class { methods, .. }) => methods.contains_key("eq"),
         Some(oomir::DataType::Interface { methods, .. }) => methods.contains_key("eq"),
         None => false,
@@ -1738,14 +1741,14 @@ fn create_enum_adt_helper_method(
 pub(super) fn create_data_type_classfile_for_class(
     // pub(super) or pub(crate)
     class_name_jvm: &str,
-    fields: Vec<(String, Type)>,
+    fields: &[(String, Type)],
     is_abstract: bool,
-    methods: HashMap<String, DataTypeMethod>,
+    methods: &HashMap<String, DataTypeMethod>,
     super_class_name_jvm: &str,
-    implements_interfaces: Vec<String>,
+    implements_interfaces: &[String],
     module: &oomir::Module,
-    subclasses: Vec<String>,
-    nest_host: Option<String>,
+    subclasses: &[String],
+    nest_host: Option<&str>,
     debug_info: DebugInfoOptions,
     relative_static_methods: &HashSet<oomir::FunctionKey>,
 ) -> jvm::Result<Vec<u8>> {
@@ -1767,8 +1770,9 @@ pub(super) fn create_data_type_classfile_for_class(
     }
     let source_file_name = source_files.first().map(|file| (*file).to_string());
     let fields: Vec<_> = fields
-        .into_iter()
+        .iter()
         .filter(|(_, field_ty)| field_ty.has_jvm_value())
+        .cloned()
         .collect();
     let mut cp = InternedConstantPool::default();
 
@@ -1778,7 +1782,7 @@ pub(super) fn create_data_type_classfile_for_class(
 
     let mut seen_interfaces = HashSet::default();
     let mut interface_indices: Vec<u16> = Vec::with_capacity(implements_interfaces.len());
-    for interface_name in &implements_interfaces {
+    for interface_name in implements_interfaces {
         if !seen_interfaces.insert(interface_name.as_str()) {
             continue;
         }
@@ -1910,7 +1914,24 @@ pub(super) fn create_data_type_classfile_for_class(
                 jvm_methods.push(jvm_method);
             }
             DataTypeMethod::Function(function) => {
-                let mut function = function.clone();
+                let mut prepared_function = None;
+                if super::function_needs_constant_preparation(function) {
+                    prepared_function = Some(function.clone());
+                    super::prepare_function_constants(
+                        prepared_function.as_mut().unwrap(),
+                        &mut cp,
+                        class_name_jvm,
+                        &mut jvm_methods,
+                        &mut next_factory,
+                    )
+                    .map_err(|error| jvm::Error::VerificationError {
+                        context: format!("Constants for {class_name_jvm}::{method_name}"),
+                        message: format!(
+                            "Failed after creating {next_factory} constant factories: {error:?}"
+                        ),
+                    })?;
+                }
+                let function = prepared_function.as_ref().unwrap_or(function);
                 let relative_adapter_method = method_name
                     .ends_with(oomir::RELATIVE_POINTER_METHOD_SUFFIX)
                     && function.signature.supports_relative_pointer_abi();
@@ -1921,23 +1942,6 @@ pub(super) fn create_data_type_classfile_for_class(
                         &function.signature,
                     ));
                 let use_relative_pointer_abi = relative_adapter_method || relative_static_method;
-                super::prepare_function_constants(
-                    &mut function,
-                    &mut cp,
-                    class_name_jvm,
-                    &mut jvm_methods,
-                    &mut next_factory,
-                )
-                .map_err(|error| jvm::Error::VerificationError {
-                    context: format!("Constants for {class_name_jvm}::{method_name}"),
-                    message: format!(
-                        "Failed after creating {next_factory} constant factories: {error:?}"
-                    ),
-                })?;
-                let _timer = crate::instrumentation::Timer::function_lazy("lower2", None, || {
-                    format!("{class_name_jvm}::{method_name}")
-                });
-
                 // Translate the function body using its own constant pool reference
                 let owner_class = if !function.signature.is_static {
                     Some(class_name_jvm)
@@ -2137,7 +2141,7 @@ pub(super) fn create_data_type_classfile_for_class(
     if !subclasses.is_empty() || nest_host.is_some() {
         let mut inner_classes_vec: Vec<InnerClass> = Vec::with_capacity(subclasses.len());
 
-        for subclass_name in &subclasses {
+        for subclass_name in subclasses {
             // Ensure subclass class_info is in the constant pool
             let class_info_index = cp.add_class(subclass_name)?;
 
@@ -2150,7 +2154,7 @@ pub(super) fn create_data_type_classfile_for_class(
             // If the simple name looks like an anonymous class (all digits), set name_index = 0
             let name_index = if simple_name_part.chars().all(|c| c.is_ascii_digit()) {
                 0
-            } else if simple_name_part == *subclass_name && !subclass_name.contains('$') {
+            } else if simple_name_part == subclass_name && !subclass_name.contains('$') {
                 // No '$' present -> not an inner/member class; leave name_index = 0
                 0
             } else {
@@ -2173,7 +2177,7 @@ pub(super) fn create_data_type_classfile_for_class(
         // make it like [us]=class Host$[us] of class Host
         if let Some(nest_host_name) = nest_host {
             let class_info_index = cp.add_class(class_name_jvm)?;
-            let outer_class_info_index = cp.add_class(&nest_host_name)?;
+            let outer_class_info_index = cp.add_class(nest_host_name)?;
             let name_index =
                 cp.add_utf8(class_name_jvm.rsplit('$').next().unwrap_or(class_name_jvm))?;
             let access_flags = NestedClassAccessFlags::PUBLIC | NestedClassAccessFlags::STATIC;
