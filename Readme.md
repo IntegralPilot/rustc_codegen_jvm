@@ -70,7 +70,92 @@ Then, head down to [Usage](#usage) to learn how to integrate it into your projec
 
 ### Interop is deeper and more ergonomic than FFI or bridge solutions
 
-Rust enums, generics, function pointers, unions, and traits map directly onto JVM classes and interfaces (see [Interop Model](#interop-model)). Because of this, `rustc_codegen_jvm` achieves a level of ergonomic interop with Java that native FFI solutions cannot easily match. For example, you can implement a Rust trait directly on a Java class and pass it as `&dyn Trait` to Rust ([test and demo](tests/integration/trait_implementors/Main.java)), or pass a standard Java lambda directly to a Rust function expecting a `Fn` closure ([test and demo](tests/integration/lambda_callbacks/Main.java)).
+Rust enums, structs, traits, and function pointers lower to ordinary JVM
+classes and interfaces rather than opaque native handles (see
+[Interop Model](#interop-model)). This enables unusually direct interop:
+
+- **Implement a Rust trait on a JVM class** and pass it to Rust as
+  `&dyn Trait` ([test and demo](tests/integration/trait_implementors/Main.java)).
+- **Pass Java or Kotlin lambdas to Rust `Fn` closures**
+  ([test and demo](tests/integration/lambda_callbacks/Main.java)).
+- **Await Rust `async` functions from Kotlin `suspend` code** while retaining
+  Kotlin's coroutine dispatcher
+  ([test and demo](tests/kotlin/async_interop/Main.kt)).
+- **Construct, inspect, and compare Rust enums as JVM interfaces and variant
+  classes**, including transparent enum subtypes
+  ([test and demo](tests/integration/inner_classes/Main.java)).
+- **Call JVM constructors and access instance or static fields from Rust**
+  without JNI glue
+  ([test and demo](tests/integration/jvm_link_names/src/lib.rs)).
+
+For example, one Rust API can expose an enum and accept both a JVM
+implementation of a Rust trait and a standard JVM lambda. Its result can then
+cross the Rust/Kotlin async bridge. The complete example is kept executable in
+[the Kotlin interop test suite](tests/kotlin/readme_interop):
+
+**Rust**
+
+```rust
+pub trait BatchObserver {
+    fn accept(&mut self, processed: u32) -> bool;
+}
+
+pub enum PipelineResult {
+    Success(u32),
+    Rejected(i32),
+}
+
+pub fn process_batch(
+    batch_size: u32,
+    transform: &dyn Fn(u32) -> u32,
+    observer: &mut dyn BatchObserver,
+) -> PipelineResult {
+    let processed = transform(batch_size);
+    if observer.accept(processed) {
+        PipelineResult::Success(processed)
+    } else {
+        PipelineResult::Rejected(-1)
+    }
+}
+
+pub async fn confirm_batch(result: PipelineResult) -> PipelineResult {
+    result
+}
+```
+
+**Kotlin**
+
+```kotlin
+import my_crate.BatchObserver
+import my_crate.PipelineResult
+import org.rustlang.runtime.await
+
+class LimitObserver(private val limit: Int) : BatchObserver {
+    override fun accept(processed: Int): Boolean = processed <= limit
+}
+
+suspend fun main() {
+    val prepared = my_crate.my_crate.process_batch(
+        40,
+        { value -> value + 2 },
+        LimitObserver(100),
+    )
+    val outcome = my_crate.my_crate.confirm_batch(prepared)
+        .await<PipelineResult>()
+
+    when (outcome) {
+        is PipelineResult.Success -> println("completed: ${outcome.field0}")
+        is PipelineResult.Rejected -> println("rejected: ${outcome.field0}")
+        else -> error("unknown PipelineResult implementation")
+    }
+}
+```
+
+Enum variant payloads are exposed as `field0`, `field1`, and so on; named Rust
+`struct` fields retain their source names.
+
+<details>
+<summary>Expanded Java/Rust example covering methods, callbacks, enum subtypes, constructors, and fields</summary>
 
 **Java**
 ```java
@@ -277,6 +362,8 @@ pub fn update_java_counter() -> i32 {
 }
 ```
 
+</details>
+
 ### Runs everywhere a JVM does, even on legacy systems
 
 Because the compiler targets standard JVM bytecode rather than native machine code, compiled output can run on platforms far outside the reach of modern native Rust targets. It supports any environment with **JVM 8+** compatibility.
@@ -329,11 +416,13 @@ The following example programs live in `tests/`, are compiled with the standard 
 | **[Function Pointers](tests/binary/fn_pointers/src/main.rs)** | Function pointers as values, struct fields, parameters, returns, and generics. |
 | **[Iterators](tests/binary/iterators/src/main.rs)** | Combinators (`map`, `zip`, `chain`, `flatten`), double-ended traversal, and custom iterators. |
 
-### Java & Rust Interop
+### JVM Interop
 | Example | Demonstrates |
 |---|---|
+| **[Rich Enums](tests/integration/inner_classes/Main.java)** | Constructing, inspecting, comparing, and dispatching through Rust enum interfaces and transparent subtypes. |
 | **[Lambda Callbacks](tests/integration/lambda_callbacks/Main.java)** | Passing native Java lambdas directly into Rust functions expecting `Fn` closures. |
 | **[Trait Implementors](tests/integration/trait_implementors/Main.java)** | Implementing a Rust trait on a Java class and passing it to Rust dynamic dispatch (`&dyn Trait`). |
+| **[JVM Link Names](tests/integration/jvm_link_names/src/lib.rs)** | Calling JVM constructors and accessing instance and static fields directly from Rust. |
 | **[Kotlin Async](tests/kotlin/async_interop/Main.kt)** | Awaiting Rust `async` functions from Kotlin `suspend` code. |
 
 ## Features & Standard Library Support
@@ -428,8 +517,10 @@ Rust constructs map directly to JVM structures without requiring JNI wrapper cod
 | `union` | Class backed by contiguous byte-array storage with reinterpretation helpers |
 | `trait` | Java interface |
 | `fn(A, B) -> R` | Single-method Java interface (Functional Interface) |
+| `async fn(...) -> T` | Generated state-machine class implementing `RustFuture`; awaitable from Kotlin with `await<T>()` |
 | `impl` methods | JVM instance/default methods, with owner-qualified static entry points for Rust dispatch |
 | `&dyn Trait` | Java interface reference |
+| `str` / `&str` | UTF-8-preserving `org.rustlang.runtime.Utf8View` |
 | `*const T` / `*mut T` | Shared pointer wrapper (`org.rustlang.runtime.Pointer`) |
 
 ### Enums
