@@ -574,6 +574,31 @@ fn runtime_float_ops() {
 }
 
 fn runtime_new_integer_intrinsics() {
+    assert!(
+        core::intrinsics::integer_min(opaque_i32(-7), opaque_i32(4)) == -7,
+        "signed integer_min"
+    );
+    assert!(
+        core::intrinsics::integer_max(opaque_i32(-7), opaque_i32(4)) == 4,
+        "signed integer_max"
+    );
+    assert!(
+        core::intrinsics::integer_min(opaque_u64(u64::MAX), opaque_u64(3)) == 3,
+        "unsigned integer_min"
+    );
+    assert!(
+        core::intrinsics::integer_max(opaque_u64(u64::MAX), opaque_u64(3)) == u64::MAX,
+        "unsigned integer_max"
+    );
+    assert!(
+        core::intrinsics::integer_min(opaque_i128(i128::MIN), opaque_i128(17)) == i128::MIN,
+        "wide signed integer_min"
+    );
+    assert!(
+        core::intrinsics::integer_max(opaque_u128(u128::MAX), opaque_u128(17)) == u128::MAX,
+        "wide unsigned integer_max"
+    );
+
     assert!(opaque_u8(0x12).swap_bytes() == 0x12, "u8 byte swap");
     assert!(opaque_u16(0x1234).swap_bytes() == 0x3412, "u16 byte swap");
     assert!(opaque_u32(0x1234_5678).swap_bytes() == 0x7856_3412, "u32 byte swap");

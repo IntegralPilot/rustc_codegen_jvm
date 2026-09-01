@@ -181,6 +181,59 @@ fn atomic_value_as_bits(
     }
 }
 
+fn emit_value_selection(
+    condition: oomir::Operand,
+    true_value: oomir::Operand,
+    false_value: oomir::Operand,
+    output_type: &oomir::Type,
+    dest: String,
+    instructions: &mut Vec<oomir::Instruction>,
+) {
+    if output_type.is_jvm_reference_type() {
+        let selected_object = format!("{dest}_selected_object");
+        let object_ty = oomir::Type::Class("java/lang/Object".to_string());
+        instructions.push(oomir::Instruction::InvokeStatic {
+            class_name: "org/rustlang/runtime/Intrinsics".to_string(),
+            method_name: "selectUnpredictable".to_string(),
+            method_ty: oomir::Signature {
+                params: vec![
+                    ("condition".to_string(), oomir::Type::Boolean),
+                    ("true_value".to_string(), object_ty.clone()),
+                    ("false_value".to_string(), object_ty.clone()),
+                ],
+                ret: Box::new(object_ty.clone()),
+                is_static: true,
+            },
+            args: vec![condition, true_value, false_value],
+            dest: Some(selected_object.clone()),
+        });
+        instructions.push(oomir::Instruction::Cast {
+            op: oomir::Operand::Variable {
+                name: selected_object,
+                ty: object_ty,
+            },
+            ty: output_type.clone(),
+            dest,
+        });
+    } else {
+        instructions.push(oomir::Instruction::InvokeStatic {
+            class_name: "org/rustlang/runtime/Intrinsics".to_string(),
+            method_name: "selectUnpredictable".to_string(),
+            method_ty: oomir::Signature {
+                params: vec![
+                    ("condition".to_string(), oomir::Type::Boolean),
+                    ("true_value".to_string(), output_type.clone()),
+                    ("false_value".to_string(), output_type.clone()),
+                ],
+                ret: Box::new(output_type.clone()),
+                is_static: true,
+            },
+            args: vec![condition, true_value, false_value],
+            dest: Some(dest),
+        });
+    }
+}
+
 fn emit_atomic_value_from_bits<'tcx>(
     bits: oomir::Operand,
     atomic_ty: Ty<'tcx>,
@@ -1354,10 +1407,12 @@ fn emit_mutable_borrow_writeback<'tcx>(
         let base_ty = EarlyBinder::bind(tcx, base_place.ty(&mir.local_decls, tcx).ty)
             .instantiate(tcx, instance.args)
             .skip_norm_wip();
-        if matches!(
-            base_ty.kind(),
-            TyKind::Adt(adt_def, _) if adt_def.is_struct() || adt_def.is_enum()
-        ) {
+        if matches!(base_ty.kind(), TyKind::Tuple(_))
+            || matches!(
+                base_ty.kind(),
+                TyKind::Adt(adt_def, _) if adt_def.is_struct() || adt_def.is_enum()
+            )
+        {
             return instructions;
         }
     }
@@ -5640,56 +5695,47 @@ pub(super) fn convert_basic_block<'tcx>(
                         } else if is_compiler_intrinsic && intrinsic_name == "cold_path" {
                             // The JVM has no equivalent branch-prediction hint.
                         } else if is_compiler_intrinsic
+                            && matches!(intrinsic_name.as_str(), "integer_min" | "integer_max")
+                            && oomir_operands.len() == 2
+                            && let Some(dest) = effective_dest.clone()
+                        {
+                            let left = oomir_operands[0].clone();
+                            let right = oomir_operands[1].clone();
+                            let choose_left = format!("{dest}_choose_left");
+                            let (lesser, greater) = if intrinsic_name == "integer_min" {
+                                (left.clone(), right.clone())
+                            } else {
+                                (right.clone(), left.clone())
+                            };
+                            instructions.push(oomir::Instruction::Lt {
+                                dest: choose_left.clone(),
+                                op1: lesser,
+                                op2: greater,
+                            });
+                            emit_value_selection(
+                                oomir::Operand::Variable {
+                                    name: choose_left,
+                                    ty: oomir::Type::Boolean,
+                                },
+                                left,
+                                right,
+                                &oomir_output_type,
+                                dest,
+                                &mut instructions,
+                            );
+                        } else if is_compiler_intrinsic
                             && intrinsic_name == "select_unpredictable"
                             && oomir_operands.len() == 3
                             && let Some(dest) = effective_dest.clone()
                         {
-                            let condition = oomir_operands[0].clone();
-                            let true_value = oomir_operands[1].clone();
-                            let false_value = oomir_operands[2].clone();
-                            if oomir_output_type.is_jvm_reference_type() {
-                                let selected_object = format!("{dest}_selected_object");
-                                let object_ty = oomir::Type::Class("java/lang/Object".to_string());
-                                instructions.push(oomir::Instruction::InvokeStatic {
-                                    class_name: "org/rustlang/runtime/Intrinsics".to_string(),
-                                    method_name: "selectUnpredictable".to_string(),
-                                    method_ty: oomir::Signature {
-                                        params: vec![
-                                            ("condition".to_string(), oomir::Type::Boolean),
-                                            ("true_value".to_string(), object_ty.clone()),
-                                            ("false_value".to_string(), object_ty.clone()),
-                                        ],
-                                        ret: Box::new(object_ty.clone()),
-                                        is_static: true,
-                                    },
-                                    args: vec![condition, true_value, false_value],
-                                    dest: Some(selected_object.clone()),
-                                });
-                                instructions.push(oomir::Instruction::Cast {
-                                    op: oomir::Operand::Variable {
-                                        name: selected_object,
-                                        ty: object_ty,
-                                    },
-                                    ty: oomir_output_type.clone(),
-                                    dest,
-                                });
-                            } else {
-                                instructions.push(oomir::Instruction::InvokeStatic {
-                                    class_name: "org/rustlang/runtime/Intrinsics".to_string(),
-                                    method_name: "selectUnpredictable".to_string(),
-                                    method_ty: oomir::Signature {
-                                        params: vec![
-                                            ("condition".to_string(), oomir::Type::Boolean),
-                                            ("true_value".to_string(), oomir_output_type.clone()),
-                                            ("false_value".to_string(), oomir_output_type.clone()),
-                                        ],
-                                        ret: Box::new(oomir_output_type.clone()),
-                                        is_static: true,
-                                    },
-                                    args: vec![condition, true_value, false_value],
-                                    dest: Some(dest),
-                                });
-                            }
+                            emit_value_selection(
+                                oomir_operands[0].clone(),
+                                oomir_operands[1].clone(),
+                                oomir_operands[2].clone(),
+                                &oomir_output_type,
+                                dest,
+                                &mut instructions,
+                            );
                         } else if is_compiler_intrinsic
                             && intrinsic_name == "carrying_mul_add"
                             && oomir_operands.len() == 4

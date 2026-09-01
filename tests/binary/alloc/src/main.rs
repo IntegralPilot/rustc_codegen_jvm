@@ -783,6 +783,21 @@ fn test_string_utf_conversions() {
 }
 
 fn test_vecdeque() {
+    let mut original = VecDeque::new();
+    original.push_front(17);
+    original.push_front(42);
+    original.push_back(137);
+    original.push_back(137);
+    let mut cloned = original.clone();
+    assert!(cloned.len() == 4, "cloned VecDeque length");
+    while !original.is_empty() {
+        assert!(
+            original.pop_back() == cloned.pop_back(),
+            "cloned VecDeque contents"
+        );
+    }
+    assert!(cloned.is_empty(), "cloned VecDeque trailing contents");
+
     let mut dq: VecDeque<i32> = VecDeque::new();
     for i in 0..10 {
         if i % 2 == 0 {
