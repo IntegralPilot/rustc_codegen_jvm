@@ -571,6 +571,44 @@ fn runtime_float_ops() {
     assert!(algebraic_left.algebraic_mul(algebraic_right) == 56_088.0);
     assert!(algebraic_left.algebraic_div(algebraic_right) == 123.0 / 456.0);
     assert!(algebraic_left.algebraic_rem(algebraic_right) == 123.0 % 456.0);
+
+    macro_rules! test_generic_float_intrinsics {
+        ($opaque:ident, $type:ty) => {{
+            assert!(
+                core::intrinsics::sin($opaque(0.0 as $type)) == 0.0 as $type,
+                concat!(stringify!($type), " generic sin")
+            );
+            assert!(
+                core::intrinsics::cos($opaque(0.0 as $type)) == 1.0 as $type,
+                concat!(stringify!($type), " generic cos")
+            );
+            assert!(
+                core::intrinsics::exp($opaque(0.0 as $type)) == 1.0 as $type,
+                concat!(stringify!($type), " generic exp")
+            );
+            assert!(
+                core::intrinsics::exp2($opaque(3.0 as $type)) == 8.0 as $type,
+                concat!(stringify!($type), " generic exp2")
+            );
+            assert!(
+                core::intrinsics::log($opaque(1.0 as $type)) == 0.0 as $type,
+                concat!(stringify!($type), " generic log")
+            );
+            assert!(
+                core::intrinsics::log2($opaque(8.0 as $type)) == 3.0 as $type,
+                concat!(stringify!($type), " generic log2")
+            );
+            assert!(
+                core::intrinsics::log10($opaque(1.0 as $type)) == 0.0 as $type,
+                concat!(stringify!($type), " generic log10")
+            );
+        }};
+    }
+
+    test_generic_float_intrinsics!(opaque_f16, f16);
+    test_generic_float_intrinsics!(opaque_f32, f32);
+    test_generic_float_intrinsics!(opaque_f64, f64);
+    test_generic_float_intrinsics!(opaque_f128, f128);
 }
 
 fn runtime_new_integer_intrinsics() {

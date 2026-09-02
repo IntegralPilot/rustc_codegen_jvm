@@ -5464,7 +5464,10 @@ pub(super) fn convert_basic_block<'tcx>(
                                 dest: effective_dest.clone(),
                             });
                         } else if is_compiler_intrinsic
-                            && matches!(
+                            && (matches!(
+                                intrinsic_name.as_str(),
+                                "sin" | "cos" | "exp" | "exp2" | "log" | "log2" | "log10"
+                            ) || matches!(
                                 intrinsic_name.as_str(),
                                 "copysignf16"
                                     | "copysignf32"
@@ -5554,7 +5557,7 @@ pub(super) fn convert_basic_block<'tcx>(
                                     | "fmuladdf32"
                                     | "fmuladdf64"
                                     | "fmuladdf128"
-                            )
+                            ))
                         {
                             let runtime_signature = oomir::Signature {
                                 params: oomir_operands
@@ -5572,9 +5575,30 @@ pub(super) fn convert_basic_block<'tcx>(
                                 ret: Box::new(oomir_output_type.clone()),
                                 is_static: true,
                             };
+                            let runtime_method_name = if matches!(
+                                intrinsic_name.as_str(),
+                                "sin" | "cos" | "exp" | "exp2" | "log" | "log2" | "log10"
+                            ) {
+                                let suffix = match &oomir_output_type {
+                                    oomir::Type::F16 => "f16",
+                                    oomir::Type::F32 => "f32",
+                                    oomir::Type::F64 => "f64",
+                                    oomir::Type::Class(class_name)
+                                        if class_name == crate::lower2::F128_CLASS =>
+                                    {
+                                        "f128"
+                                    }
+                                    other => panic!(
+                                        "generic float intrinsic {intrinsic_name} returned {other:?}"
+                                    ),
+                                };
+                                format!("{intrinsic_name}{suffix}")
+                            } else {
+                                intrinsic_name
+                            };
                             instructions.push(oomir::Instruction::InvokeStatic {
                                 class_name: "org/rustlang/runtime/Intrinsics".to_string(),
-                                method_name: intrinsic_name,
+                                method_name: runtime_method_name,
                                 method_ty: runtime_signature,
                                 args: oomir_operands.clone(),
                                 dest: effective_dest.clone(),
