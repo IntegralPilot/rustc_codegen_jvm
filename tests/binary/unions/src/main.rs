@@ -1,5 +1,5 @@
 #![feature(register_tool)]
-#![register_tool(jvm)]
+#![register_tool(jvm_codegen)]
 
 #[derive(Copy, Clone)]
 #[repr(C)]
@@ -183,7 +183,7 @@ enum FlatLeaf {
 #[derive(Copy, Clone)]
 #[repr(C, u8)]
 enum FlatOuter {
-    #[jvm::subtype]
+    #[jvm_codegen::subtype]
     Leaf(FlatLeaf) = 1,
     Other(u16) = 2,
 }

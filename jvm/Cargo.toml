@@ -1,0 +1,17 @@
+[package]
+name = "rcj"
+version = "0.1.0"
+edition = "2024"
+description = "Ergonomic attribute macros for rustc_codegen_jvm interop (generates jvm: link_names)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/IntegralPilot/rustc_codegen_jvm"
+keywords = ["jvm", "java", "ffi", "macros"]
+categories = ["development-tools::ffi", "compilers"]
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2.0", features = ["full", "parsing", "printing", "proc-macro", "visit", "visit-mut"] }
+quote = "1.0"
+proc-macro2 = "1.0"

@@ -242,45 +242,39 @@ public class Main {
 ```
 
 **Rust**
+
+Add `jvm = { package = "rcj", git = "https://github.com/IntegralPilot/rustc_codegen_jvm" }`
+to `[dependencies]`.
+
 ```rust
 #![feature(extern_types, register_tool)]
-#![register_tool(jvm)]
+#![register_tool(jvm_codegen)]
 
-unsafe extern "C" {
-    #[link_name = "java/time/LocalDate"]
-    pub type JavaLocalDate;
+#[jvm::class("java.time.LocalDate", rename_all = "camelCase")]
+impl JavaLocalDate {
+    #[jvm::static_method]
+    pub fn of(year: i32, month: i32, day: i32) -> *mut Self {}
 
-    #[link_name = "jvm:static:java/time/LocalDate:of"]
-    fn java_local_date_of(year: i32, month: i32, day: i32) -> *const JavaLocalDate;
-
-    #[link_name = "jvm:virtual:getYear"]
-    fn java_local_date_get_year(date: &JavaLocalDate) -> i32;
-
-    #[link_name = "Main$JavaCounter"]
-    pub type JavaCounter;
-
-    #[link_name = "jvm:new:Main$JavaCounter"]
-    fn java_counter_new(value: i32) -> *mut JavaCounter;
-
-    // A return value makes this an instance-field getter.
-    #[link_name = "jvm:field:value"]
-    fn java_counter_value(counter: &JavaCounter) -> i32;
-
-    // A value parameter and () return make this an instance-field setter.
-    #[link_name = "jvm:field:value"]
-    fn java_counter_set_value(counter: &mut JavaCounter, value: i32);
-
-    #[link_name = "jvm:static-field:Main:sharedCount"]
-    fn shared_count() -> i32;
-
-    #[link_name = "jvm:static-field:Main:sharedCount"]
-    fn set_shared_count(value: i32);
+    #[jvm::method]
+    pub fn get_year(&self) -> i32 {}
 }
 
-impl JavaLocalDate {
-    pub fn year(&self) -> i32 {
-        unsafe { java_local_date_get_year(self) }
-    }
+#[jvm::class("Main$JavaCounter", rename_all = "camelCase")]
+impl JavaCounter {
+    #[jvm::constructor]
+    pub fn new(value: i32) -> *mut Self {}
+
+    #[jvm::field]
+    pub fn value(&self) -> i32 {}
+
+    #[jvm::field]
+    pub fn set_value(&mut self, value: i32) {}
+
+    #[jvm::static_field(class = "Main")]
+    pub fn shared_count() -> i32 {}
+
+    #[jvm::static_field(class = "Main")]
+    pub fn set_shared_count(value: i32) {}
 }
 
 pub struct NamedCounter {
@@ -318,7 +312,7 @@ pub enum NetworkEvent {
 
 pub enum AppEvent {
     // NetworkEvent extends AppEvent on the JVM; AppEvent$Network is omitted.
-    #[jvm::subtype]
+    #[jvm_codegen::subtype]
     Network(NetworkEvent),
     Calculation(Calculation),
 }
@@ -354,19 +348,19 @@ pub fn run_accumulation(acc: &mut dyn Accumulator) -> i32 {
 }
 
 pub fn make_java_date(year: i32, month: i32, day: i32) -> *const JavaLocalDate {
-    unsafe { java_local_date_of(year, month, day) }
+    JavaLocalDate::of(year, month, day)
 }
 
 pub fn java_date_year(date: &JavaLocalDate) -> i32 {
-    date.year()
+    date.get_year()
 }
 
 pub fn update_java_counter() -> i32 {
     unsafe {
-        let counter = java_counter_new(5);
-        java_counter_set_value(&mut *counter, java_counter_value(&*counter) + 1);
-        set_shared_count(shared_count() + 1);
-        java_counter_value(&*counter) + shared_count()
+        let counter = JavaCounter::new(5);
+        (&mut *counter).set_value((&*counter).value() + 1);
+        JavaCounter::set_shared_count(JavaCounter::shared_count() + 1);
+        (&*counter).value() + JavaCounter::shared_count()
     }
 }
 ```
@@ -431,6 +425,7 @@ The following example programs live in `tests/`, are compiled with the standard 
 | **[Rich Enums](tests/integration/inner_classes/Main.java)** | Constructing, inspecting, comparing, and dispatching through Rust enum interfaces and transparent subtypes. |
 | **[Lambda Callbacks](tests/integration/lambda_callbacks/Main.java)** | Passing native Java lambdas directly into Rust functions expecting `Fn` closures. |
 | **[Trait Implementors](tests/integration/trait_implementors/Main.java)** | Implementing a Rust trait on a Java class and passing it to Rust dynamic dispatch (`&dyn Trait`). |
+| **[JVM Binding Macros](tests/integration/jvm_macros/src/lib.rs)** | Calling constructors, methods, and fields through ergonomic `#[jvm::...]` attributes. |
 | **[JVM Link Names](tests/integration/jvm_link_names/src/lib.rs)** | Calling JVM constructors and accessing instance and static fields directly from Rust. |
 | **[Kotlin Async](tests/kotlin/async_interop/Main.kt)** | Awaiting Rust `async` functions from Kotlin `suspend` code. |
 
@@ -532,17 +527,22 @@ Rust constructs map directly to JVM structures without requiring JNI wrapper cod
 | `str` / `&str` | UTF-8-preserving `org.rustlang.runtime.Utf8View` |
 | `*const T` / `*mut T` | Shared pointer wrapper (`org.rustlang.runtime.Pointer`) |
 
+### Calling JVM APIs
+
+The [`jvm` attribute crate](jvm) generates JVM method, constructor, and field
+bindings without handwritten `link_name` strings. Raw link names remain supported.
+
 ### Enums
 
 Rust enums become unsealed Java interfaces, with a final class and public
 payload fields for each variant.
 
-`#[jvm::subtype]` lets a one-field variant use its nested enum directly, without
-a wrapper class:
+`#[jvm_codegen::subtype]` lets a one-field variant use its nested enum directly,
+without a wrapper class:
 
 ```rust
 #![feature(register_tool)]
-#![register_tool(jvm)]
+#![register_tool(jvm_codegen)]
 
 pub enum Leaf {
     A(i32),
@@ -550,7 +550,7 @@ pub enum Leaf {
 }
 
 pub enum Root {
-    #[jvm::subtype]
+    #[jvm_codegen::subtype]
     Leaf(Leaf),
     Other(i32),
 }
@@ -740,6 +740,7 @@ build.
 │   └── oomir.rs              # OOMIR definitions
 ├── java-linker/              # JAR packaging and manifest utility
 ├── cargo-jvm/                # `cargo jvm` build, run, test and package command
+├── jvm/                      # Attribute macros for JVM bindings
 ├── runtime/                  # Core Java runtime support library
 ├── std/                      # Standard library JVM patch overlays
 ├── tests/                    # Integration, binary, and multicrate tests

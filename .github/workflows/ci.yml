@@ -75,6 +75,14 @@ jobs:
       continue-on-error: true
       run: cargo test
 
+    - name: Check JVM binding macros
+      id: jvm_macro_tests
+      continue-on-error: true
+      shell: bash
+      run: |
+        cargo fmt --manifest-path jvm/Cargo.toml --check
+        cargo test --manifest-path jvm/Cargo.toml
+
     - name: Run self-tests (debug)
       id: self_tests_debug
       continue-on-error: true
@@ -90,10 +98,11 @@ jobs:
         always() &&
         (
           steps.compiler_unit_tests.outcome != 'success' ||
+          steps.jvm_macro_tests.outcome != 'success' ||
           steps.self_tests_debug.outcome != 'success' ||
           steps.self_tests_release.outcome != 'success'
         )
-      run: python -c "raise SystemExit('debug and release self-tests must both pass completely')"
+      run: python -c "raise SystemExit('compiler, macro, debug, and release tests must pass completely')"
 
   coretests:
     name: coretests (Ubuntu)

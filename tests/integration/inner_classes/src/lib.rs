@@ -1,5 +1,5 @@
 #![feature(register_tool)]
-#![register_tool(jvm)]
+#![register_tool(jvm_codegen)]
 
 pub enum TrafficLight {
     Red,
@@ -43,7 +43,7 @@ pub enum LeafEvent {
 }
 
 pub enum Event {
-    #[jvm::subtype]
+    #[jvm_codegen::subtype]
     Leaf(LeafEvent),
     Message(i32),
 }
