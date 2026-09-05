@@ -259,7 +259,7 @@ impl JavaLocalDate {
     pub fn get_year(&self) -> i32 {}
 }
 
-#[jvm::class("Main$JavaCounter", rename_all = "camelCase")]
+#[jvm::class("Main.JavaCounter", rename_all = "camelCase")]
 impl JavaCounter {
     #[jvm::constructor]
     pub fn new(value: i32) -> *mut Self {}

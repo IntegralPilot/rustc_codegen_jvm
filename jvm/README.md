@@ -35,7 +35,7 @@ impl LocalDate {
     pub fn get_year(&self) -> i32 {}
 }
 
-#[jvm::class("Main$Counter", rename_all = "camelCase")]
+#[jvm::class("Main.Counter", rename_all = "camelCase")]
 impl Counter {
     #[jvm::constructor]
     pub fn new(value: i32) -> *mut Self {}
@@ -52,6 +52,11 @@ impl Counter {
     pub fn shared_count() -> i32 {}
 }
 ```
+
+Dots before the first capitalized name separate packages; later dots denote
+nested classes. Use JVM `/` and `$` spelling for names that do not follow Java
+capitalization conventions.
+
 If you want to have multiple `impl` blocks, you need to use `#[jvm::bindings]` on subsequent blocks so the type is not declared
 twice:
 

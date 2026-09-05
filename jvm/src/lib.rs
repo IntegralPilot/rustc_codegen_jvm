@@ -167,11 +167,24 @@ fn attribute_args(attribute: &Attribute) -> syn::Result<Args> {
 
 fn normalize_class(raw: &str) -> String {
     let raw = raw.strip_prefix("jvm:class:").unwrap_or(raw);
-    match raw.rsplit_once('/') {
-        Some((package, class)) => {
-            format!("{}/{}", package.replace('.', "/"), class.replace('.', "$"))
-        }
-        None => raw.replace('.', "/"),
+    if let Some((package, class)) = raw.rsplit_once('/') {
+        return format!("{}/{}", package.replace('.', "/"), class.replace('.', "$"));
+    }
+
+    let segments = raw.split('.').collect::<Vec<_>>();
+    let class_start = segments.iter().position(|segment| {
+        segment.contains('$') || segment.chars().next().is_some_and(char::is_uppercase)
+    });
+    let Some(class_start) = class_start else {
+        return raw.replace('.', "/");
+    };
+
+    let package = segments[..class_start].join("/");
+    let class = segments[class_start..].join("$");
+    if package.is_empty() {
+        class
+    } else {
+        format!("{package}/{class}")
     }
 }
 
@@ -1076,10 +1089,19 @@ mod tests {
     }
 
     #[test]
-    fn class_names_support_explicit_nested_class_boundaries() {
+    fn class_names_recognise_packages_and_nested_classes() {
         assert_eq!(
             normalize_class("java.time.LocalDate"),
             "java/time/LocalDate"
+        );
+        assert_eq!(normalize_class("Main.Counter"), "Main$Counter");
+        assert_eq!(
+            normalize_class("java.util.Map.Entry"),
+            "java/util/Map$Entry"
+        );
+        assert_eq!(
+            normalize_class("java.lang.Thread.State"),
+            "java/lang/Thread$State"
         );
         assert_eq!(
             normalize_class("java.util.Map$Entry"),
@@ -1096,6 +1118,14 @@ mod tests {
         assert_eq!(
             normalize_class("java/util/Outer.Inner.Deep"),
             "java/util/Outer$Inner$Deep"
+        );
+        assert_eq!(
+            normalize_class("Unconventional/package/lowercase.inner"),
+            "Unconventional/package/lowercase$inner"
+        );
+        assert_eq!(
+            normalize_class("unconventional.package.lowercase"),
+            "unconventional/package/lowercase"
         );
     }
 

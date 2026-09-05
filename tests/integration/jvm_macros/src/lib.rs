@@ -10,7 +10,7 @@ impl JavaLocalDate {
     pub fn get_year(&self) -> i32 {}
 }
 
-#[jvm::class("Main$State", rename_all = "camelCase")]
+#[jvm::class("Main.State", rename_all = "camelCase")]
 impl JavaState {
     #[jvm::constructor]
     pub fn new(value: i32, wide: i64) -> *mut Self {}

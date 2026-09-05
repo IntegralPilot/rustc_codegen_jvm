@@ -1,6 +1,6 @@
 [package]
 name = "rcj"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Ergonomic attribute macros for rustc_codegen_jvm interop (generates jvm: link_names)"
 license = "MIT OR Apache-2.0"
