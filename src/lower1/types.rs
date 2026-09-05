@@ -631,7 +631,11 @@ pub(crate) fn is_jvm_subtype_variant<'tcx>(
     #[allow(deprecated)]
     tcx.get_all_attrs(variant.def_id).iter().any(|attribute| {
         let path = attribute.path();
-        path.len() == 2 && path[0].as_str() == "jvm" && path[1].as_str() == "subtype"
+        // `jvm` is retained for source compatibility. New code uses a separate
+        // tool namespace so the optional `jvm` proc-macro crate can coexist.
+        path.len() == 2
+            && matches!(path[0].as_str(), "jvm_codegen" | "jvm")
+            && path[1].as_str() == "subtype"
     })
 }
 
@@ -648,30 +652,34 @@ pub(crate) fn jvm_subtype_payload_ty<'tcx>(
     if variant.fields.len() != 1 {
         tcx.dcx().span_fatal(
             span,
-            "`#[jvm::subtype]` requires an enum variant with exactly one field",
+            "`#[jvm_codegen::subtype]` requires an enum variant with exactly one field",
         );
     }
     let payload_ty = variant.fields[FieldIdx::from_usize(0)]
         .ty(tcx, substs)
         .skip_norm_wip();
     let TyKind::Adt(inner_adt, _) = payload_ty.kind() else {
-        tcx.dcx()
-            .span_fatal(span, "`#[jvm::subtype]` payload must be another Rust enum");
+        tcx.dcx().span_fatal(
+            span,
+            "`#[jvm_codegen::subtype]` payload must be another Rust enum",
+        );
     };
     if !inner_adt.is_enum() {
-        tcx.dcx()
-            .span_fatal(span, "`#[jvm::subtype]` payload must be another Rust enum");
+        tcx.dcx().span_fatal(
+            span,
+            "`#[jvm_codegen::subtype]` payload must be another Rust enum",
+        );
     }
     if inner_adt.did() == outer_adt.did() {
         tcx.dcx().span_fatal(
             span,
-            "`#[jvm::subtype]` cannot transparently embed the enum itself",
+            "`#[jvm_codegen::subtype]` cannot transparently embed the enum itself",
         );
     }
     if inner_adt.did().krate != outer_adt.did().krate {
         tcx.dcx().span_fatal(
             span,
-            "`#[jvm::subtype]` requires both enums to be defined in the same crate",
+            "`#[jvm_codegen::subtype]` requires both enums to be defined in the same crate",
         );
     }
     Some(payload_ty)
@@ -1528,7 +1536,7 @@ fn ensure_enum_data_types<'tcx>(
                 Some(other) => tcx.dcx().span_fatal(
                     tcx.def_span(variant.def_id),
                     format!(
-                        "`#[jvm::subtype]` payload has unsupported JVM representation {other:?}"
+                        "`#[jvm_codegen::subtype]` payload has unsupported JVM representation {other:?}"
                     ),
                 ),
                 None => format!("{base_enum_name}${variant_name}"),
@@ -1546,7 +1554,7 @@ fn ensure_enum_data_types<'tcx>(
             data_types.get_mut(&shape.runtime_type)
         else {
             tcx.dcx().fatal(format!(
-                "`#[jvm::subtype]` payload {} was not lowered as an enum interface",
+                "`#[jvm_codegen::subtype]` payload {} was not lowered as an enum interface",
                 shape.runtime_type
             ));
         };

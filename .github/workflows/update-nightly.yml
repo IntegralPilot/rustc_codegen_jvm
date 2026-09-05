@@ -111,6 +111,13 @@ jobs:
       if: steps.latest.outputs.changed == 'true'
       run: cargo test
 
+    - name: Check JVM binding macros
+      if: steps.latest.outputs.changed == 'true'
+      shell: bash
+      run: |
+        cargo fmt --manifest-path jvm/Cargo.toml --check
+        cargo test --manifest-path jvm/Cargo.toml
+
     - name: Run self-tests (debug)
       if: steps.latest.outputs.changed == 'true'
       run: python Tester.py

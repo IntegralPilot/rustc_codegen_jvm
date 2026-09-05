@@ -1,5 +1,6 @@
 # Ignores relevant to Rust projects within this tree
 **/target/*
+/jvm/Cargo.lock
 
 # Ignores relevant to Java projects within this tree
 **/build/*

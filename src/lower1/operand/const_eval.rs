@@ -2821,10 +2821,9 @@ fn handle_constant_enum<'tcx>(
         generate_adt_jvm_class_name(&adt_def, substs, tcx, oomir_data_types, instance);
     force_define_named_adt(enum_ty, tcx, oomir_data_types, instance);
     if jvm_subtype_payload_ty(&adt_def, variant_def, substs, tcx).is_some() {
-        return params
-            .into_iter()
-            .next()
-            .ok_or_else(|| "`#[jvm::subtype]` constant payload has no JVM value".to_string());
+        return params.into_iter().next().ok_or_else(|| {
+            "`#[jvm_codegen::subtype]` constant payload has no JVM value".to_string()
+        });
     }
     let variant_class_name = format!(
         "{}${}", // Using '$' as inner class separator is common in JVM

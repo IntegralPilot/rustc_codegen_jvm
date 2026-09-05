@@ -6375,7 +6375,7 @@ pub(super) fn convert_rvalue_to_operand<'a>(
                                 constructor_args.into_iter().next().unwrap_or_else(|| {
                                     tcx.dcx().span_fatal(
                                         tcx.def_span(variant_def.def_id),
-                                        "`#[jvm::subtype]` payload has no JVM value",
+                                        "`#[jvm_codegen::subtype]` payload has no JVM value",
                                     )
                                 });
                             instructions.push(oomir::Instruction::Cast {
