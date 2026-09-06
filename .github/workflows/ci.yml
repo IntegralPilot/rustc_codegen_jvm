@@ -66,6 +66,9 @@ jobs:
 
     - name: Cache Cargo dependencies
       uses: Swatinem/rust-cache@v2
+      with:
+        # Older caches contain source overlays that the action treats as build artifacts.
+        prefix-key: self-tests-artifacts-v1
 
     - name: Build backend and tools
       run: python build.py ci
@@ -96,6 +99,10 @@ jobs:
       id: self_tests_release
       continue-on-error: true
       run: python Tester.py --release
+
+    - name: Remove generated sources before caching build artifacts
+      if: always()
+      run: python -c "from pathlib import Path; import shutil; p = Path('target/stdlib-overlay'); p.exists() and shutil.rmtree(p)"
 
     - name: Require 100% self-test pass rate
       if: >-

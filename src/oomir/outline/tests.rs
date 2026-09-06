@@ -215,7 +215,7 @@ public class Run {
     );
     let result = Command::new("java")
         .args(["-Xverify:all", "-Xss256k", "--class-path"])
-        .arg(format!("{}:{}", directory.display(), runtime.display()))
+        .arg(std::env::join_paths([&directory, &runtime]).unwrap())
         .arg(directory.join("Run.java"))
         .output()
         .unwrap();
