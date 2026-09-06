@@ -10,16 +10,15 @@ use rustc_middle::{
     ty::{EarlyBinder, GenericArgsRef, Instance, Ty, TyCtxt, TypingEnv},
 };
 use std::{
-    cell::RefCell,
     ops::{Deref, DerefMut},
-    rc::Rc,
+    sync::Arc,
 };
 
 pub(crate) type Module<'tcx> = oomir::Module<Definitions<'tcx>>;
-pub(crate) type Shared<'tcx> = Rc<RefCell<CrateContext<'tcx>>>;
+pub(crate) type Shared<'tcx> = Arc<rustc_data_structures::sync::Lock<CrateContext<'tcx>>>;
 pub(crate) type CheckedIntrinsic = (String, String, String);
 
-/// Shared by the lowering shards of one crate, on the rustc query thread.
+/// Shared by the lowering shards of one crate on rustc query threads.
 /// No completed function bodies or serialized output are retained here.
 #[derive(Default)]
 pub(crate) struct CrateContext<'tcx> {
@@ -207,7 +206,7 @@ mod tests {
     #[test]
     fn canonical_requests_are_shared_by_shards_and_isolated_between_crates() {
         let shared = Shared::default();
-        let mut first = Definitions::new(Rc::clone(&shared));
+        let mut first = Definitions::new(Arc::clone(&shared));
         let mut second = Definitions::new(shared);
         let mut separate = Definitions::default();
         for definitions in [&mut first, &mut second, &mut separate] {
