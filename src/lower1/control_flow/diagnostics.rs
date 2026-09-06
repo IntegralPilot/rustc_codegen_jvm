@@ -46,14 +46,25 @@ pub(in crate::lower1) fn caller_location_operand<'tcx>(
             });
 
     mir.caller_location_span(source_info, inherited_location, tcx, |span| {
-        let raw_location = crate::lower1::operand::handle_const_value(
-            None,
-            tcx.span_as_caller_location(span),
-            &location_ty,
-            tcx,
-            data_types,
-            instance,
-        );
+        // This immutable allocation depends on the resolved source span, not
+        // generic arguments. Its carrier was registered above; the first shard
+        // also owns any codec declarations produced while decoding it.
+        let raw_location = if let Some(value) = data_types.caller_location(span) {
+            oomir::Operand::Constant(value)
+        } else {
+            let value = crate::lower1::operand::handle_const_value(
+                None,
+                tcx.span_as_caller_location(span),
+                &location_ty,
+                tcx,
+                data_types,
+                instance,
+            );
+            if let oomir::Operand::Constant(value) = &value {
+                data_types.remember_caller_location(span, value.clone());
+            }
+            value
+        };
         crate::lower1::value_repr::adapt_operand_to_rust_type(
             raw_location,
             location_ty,

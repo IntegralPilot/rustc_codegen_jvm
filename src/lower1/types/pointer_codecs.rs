@@ -78,7 +78,7 @@ pub(crate) fn ensure_pointer_memory_codec<'tcx>(
 
 fn codec_is_complete(data_types: &HashMap<String, oomir::DataType>, class: &str) -> bool {
     matches!(data_types.get(class), Some(oomir::DataType::Class { methods, .. })
-        if methods.contains_key("encode") && methods.contains_key("decode") && methods.contains_key("bind"))
+        if methods.contains_key("encode") && methods.contains_key("decode"))
 }
 
 fn build_pointer_memory_codec<'tcx>(
@@ -94,7 +94,6 @@ fn build_pointer_memory_codec<'tcx>(
             | TyKind::Adt(_, _)
             | TyKind::Closure(_, _)
             | TyKind::Coroutine(_, _)
-            | TyKind::FnDef(_, _)
     ) {
         return Ok(None);
     }
@@ -107,7 +106,6 @@ fn build_pointer_memory_codec<'tcx>(
     // encode or bind. Retain the concrete class identity in the codec recipe;
     // no generated codec class or computational helper bodies are needed.
     let fieldless = match ty.kind() {
-        TyKind::FnDef(..) => true,
         TyKind::Closure(_, args) => args.as_closure().upvar_tys().is_empty(),
         TyKind::Adt(def, _) => def.is_struct() && def.non_enum_variant().fields.is_empty(),
         _ => false,
@@ -304,27 +302,30 @@ fn build_pointer_memory_codec<'tcx>(
         data_types.remove(&class_name);
         return Err(error);
     }
-    bind_instructions.push(oomir::Instruction::Return { operand: None });
-    let bind = oomir::Function {
-        name: "bind".to_string(),
-        owner_class: None,
-        debug_variables: Vec::new(),
-        signature: oomir::Signature {
-            params: vec![
-                ("pointer".to_string(), pointer_ty),
-                ("value".to_string(), value_ty),
-            ],
-            ret: Box::new(oomir::Type::Void),
-            is_static: true,
-        },
-        body: simple_body(bind_instructions).into(),
-    };
-
     let mut methods = HashMap::from_iter([
         ("encode".to_string(), DataTypeMethod::Function(encode)),
         ("decode".to_string(), DataTypeMethod::Function(decode)),
-        ("bind".to_string(), DataTypeMethod::Function(bind)),
     ]);
+    // The runtime treats a missing binder as a no-op. Do not compile a method
+    // whose only instruction would be `return`.
+    if !bind_instructions.is_empty() {
+        bind_instructions.push(oomir::Instruction::Return { operand: None });
+        let bind = oomir::Function {
+            name: "bind".to_string(),
+            owner_class: None,
+            debug_variables: Vec::new(),
+            signature: oomir::Signature {
+                params: vec![
+                    ("pointer".to_string(), pointer_ty),
+                    ("value".to_string(), value_ty),
+                ],
+                ret: Box::new(oomir::Type::Void),
+                is_static: true,
+            },
+            body: simple_body(bind_instructions).into(),
+        };
+        methods.insert("bind".to_string(), DataTypeMethod::Function(bind));
+    }
     if let TyKind::Array(element_ty, _) = ty.kind() {
         let element_size = layout_size_bytes(tcx, *element_ty)?;
         let element_codec =

@@ -6,7 +6,7 @@ use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 use rustc_middle::ty::{
     GenericArg, Instance, InstanceKind, ShimKind, TyCtxt, TyKind, TypeVisitableExt,
 };
-use rustc_span::sym;
+use rustc_span::{def_id::DefId, sym};
 
 const MAX_MONO_FN_NAME_LEN: usize = 128;
 const WEAK_LANG_ITEMS_CLASS: &str = "org/rustlang/runtime/WeakLangItems";
@@ -164,12 +164,7 @@ pub fn mono_owner_class<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> St
         // definition-crate owner so all downstream callers and exporters
         // agree even when the runtime crate has a different local alias.
         let instance_key = super::types::stable_instance_identity(tcx, def_id, instance.args);
-        let bucket = super::types::short_hash(&instance_key, 1);
-        format!(
-            "{}/mono/MonoBucket_{}",
-            jvm_names::crate_root(tcx, def_id.krate),
-            bucket
-        )
+        runtime_mono_owner(tcx, def_id, &instance_key)
     } else if let Some(trait_def_id) = tcx
         .opt_associated_item(def_id)
         .and_then(|item| item.trait_container(tcx))
@@ -182,6 +177,14 @@ pub fn mono_owner_class<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> St
     } else {
         jvm_names::owner_class_for_function(tcx, def_id)
     }
+}
+
+fn runtime_mono_owner(tcx: TyCtxt<'_>, def_id: DefId, identity: &str) -> String {
+    let bucket = super::types::short_hash(identity, 1);
+    format!(
+        "{}/mono/MonoBucket_{bucket}",
+        jvm_names::crate_root(tcx, def_id.krate),
+    )
 }
 
 /// Whether a static body belongs to a Java interface, including nested
@@ -627,7 +630,7 @@ pub fn mono_fn_name_from_instance<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'t
         && let TyKind::Coroutine(def_id, args) = drop_ty.kind()
     {
         let base = jvm_names::method_for_function(tcx, instance.def_id());
-        let coroutine = jvm_names::coroutine_class_for_args(tcx, *def_id, args, instance);
+        let coroutine = jvm_names::anonymous_class_for_args(tcx, *def_id, args, true);
         return FnNameData {
             class_to_call_on: Some(mono_owner_class(tcx, instance)),
             method_name: crate::stable_hash::readable_or_hashed_name(
@@ -639,27 +642,24 @@ pub fn mono_fn_name_from_instance<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'t
         };
     }
 
-    let class = Some(mono_owner_class(tcx, instance));
-
-    let runtime_generic = is_runtime_generic(tcx, instance);
-    let needs_definition_suffix = runtime_generic && matches!(instance.def, InstanceKind::Item(_));
-    let mut safe_base = if needs_definition_suffix {
-        // Runtime generic bodies are grouped into a small number of
-        // definition-owned MonoBucket classes. Their definition identity is the one
-        // place a suffix is required: otherwise unrelated functions such as
-        // slice::from_mut and array::from_mut can acquire the same JVM name
-        // and descriptor.
-        format!(
-            "{}_{}",
-            jvm_names::method_for_function(tcx, instance.def_id()),
-            super::types::short_hash(
-                &super::types::stable_def_identity(tcx, instance.def_id()),
-                10,
+    // Runtime generic bodies are internal methods grouped into shared owners.
+    // Hash the complete instance directly instead of constructing readable type
+    // schemas just to disambiguate their names. Public and imported names above
+    // retain their explicit ABI spelling.
+    if is_runtime_generic(tcx, instance) && matches!(instance.def, InstanceKind::Item(_)) {
+        let identity =
+            super::types::stable_instance_identity(tcx, instance.def_id(), instance.args);
+        return FnNameData {
+            class_to_call_on: Some(runtime_mono_owner(tcx, instance.def_id(), &identity)),
+            method_name: format!(
+                "{}${identity}",
+                jvm_names::method_for_function(tcx, instance.def_id()),
             ),
-        )
-    } else {
-        jvm_names::method_for_function(tcx, instance.def_id())
-    };
+        };
+    }
+
+    let class = Some(mono_owner_class(tcx, instance));
+    let mut safe_base = jvm_names::method_for_function(tcx, instance.def_id());
     if instance.args.has_param() || instance.args.has_escaping_bound_vars() {
         let hash = super::types::short_hash(
             &format!(
@@ -676,10 +676,7 @@ pub fn mono_fn_name_from_instance<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'t
     }
     let mut data_types = super::context::Definitions::default();
     let mut generic_tokens = Vec::new();
-    if needs_definition_suffix {
-        // The complete definition path above already identifies traits,
-        // impls, and nested items without adding redundant prefixes.
-    } else if let Some(item) = tcx.opt_associated_item(instance.def_id()) {
+    if let Some(item) = tcx.opt_associated_item(instance.def_id()) {
         if let Some(trait_def_id) = item.trait_container(tcx) {
             safe_base = format!(
                 "{}_{}",

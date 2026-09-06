@@ -11,10 +11,14 @@ fn scalar(types: &Types, ty: TypeId) -> jvm::Result<ScalarType> {
 impl Selector<'_> {
     pub(super) fn materialize_parameters(&mut self) -> jvm::Result<()> {
         for &param in &self.body.blocks[self.body.entry.index()].params {
-            if !matches!(
-                self.types.get(self.body.value_type(param)),
-                Some(Type::Pointer(_))
-            ) {
+            // The ABI root reserves the slot; only additional uses need an
+            // actual pointer value. Unused arguments require no materialization.
+            if self.live.uses[param.index()] == 1
+                || !matches!(
+                    self.types.get(self.body.value_type(param)),
+                    Some(Type::Pointer(_))
+                )
+            {
                 continue;
             }
             let slot = self.slot(param);
