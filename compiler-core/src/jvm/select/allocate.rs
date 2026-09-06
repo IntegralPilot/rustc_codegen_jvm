@@ -17,6 +17,7 @@ pub(super) fn allocate(
     body: &Body,
     types: &Types,
     live: &crate::opt::Live,
+    forwarded: &[bool],
     relative_pointer_abi: bool,
     debug: Option<&DebugInfo>,
     order: &[BlockId],
@@ -47,6 +48,7 @@ pub(super) fn allocate(
     let mut order = (0..body.values.len())
         .filter(|&i| {
             live.values[i]
+                && !forwarded[i]
                 && literal(body, ValueId::new(i)).is_none()
                 && result.slots[i].is_none()
                 && matches!(body.values[i].def, ValueDef::Inst(_) | ValueDef::Param(_))
@@ -267,6 +269,7 @@ mod tests {
             &body,
             &types,
             &crate::opt::live(&body, &types),
+            &vec![false; body.values.len()],
             false,
             None,
             &body.layout(),

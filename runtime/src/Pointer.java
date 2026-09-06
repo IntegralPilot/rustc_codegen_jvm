@@ -226,6 +226,7 @@ public final class Pointer {
     }
 
     private static final String MANAGED_OBJECT_VIEW_CODEC = "@managed-object";
+    private static final String ZERO_SIZED_CODEC_PREFIX = "@zero-sized:";
     private static final String RAW_POINTER_VIEW_CODEC = "@raw-pointer";
     private static final String ARRAY_REFERENCE_VIEW_CODEC_PREFIX = "@array-reference\n";
     private static final String SLICE_POINTER_VIEW_CODEC_PREFIX = "@slice-pointer\n";
@@ -1627,6 +1628,29 @@ public final class Pointer {
         private final MethodHandle unionObjects;
         private final int arrayElementSize;
         private final String arrayElementCodec;
+
+        /** A fieldless Rust ZST needs only its concrete JVM constructor. */
+        private CodecPlan(Class<?> valueType) throws ReflectiveOperationException {
+            encodeParameterType = valueType;
+            MethodHandle constructor = MethodHandles.publicLookup()
+                    .unreflectConstructor(valueType.getConstructor())
+                    .asType(MethodType.methodType(Object.class));
+            encode = value -> new byte[0];
+            decode = bytes -> {
+                try {
+                    return (Object) constructor.invokeExact();
+                } catch (RuntimeException | Error error) {
+                    throw error;
+                } catch (Throwable error) {
+                    throw new IllegalStateException("could not construct zero-sized Rust value", error);
+                }
+            };
+            bind = null;
+            unionBytes = null;
+            unionObjects = null;
+            arrayElementSize = -1;
+            arrayElementCodec = null;
+        }
 
         private CodecPlan(
                 Method encode,
@@ -11392,6 +11416,11 @@ public final class Pointer {
             return cached;
         }
         try {
+            if (codecClassName.startsWith(ZERO_SIZED_CODEC_PREFIX)) {
+                Class<?> valueType = resolvedRuntimeClass(
+                        codecClassName.substring(ZERO_SIZED_CODEC_PREFIX.length()));
+                return rememberCodecPlan(codecClassName, new CodecPlan(valueType), recent);
+            }
             Class<?> codec = resolvedRuntimeClass(codecClassName);
             Method encode = null;
             Method decode = null;
@@ -11432,13 +11461,18 @@ public final class Pointer {
             }
             CodecPlan plan = new CodecPlan(
                     encode, decode, bind, arrayElementSize, arrayElementCodec);
-            CodecPlan previous = CODEC_METHODS.putIfAbsent(codecClassName, plan);
-            CodecPlan result = previous == null ? plan : previous;
-            recent.remember(codecClassName, result);
-            return result;
+            return rememberCodecPlan(codecClassName, plan, recent);
         } catch (ReflectiveOperationException error) {
             throw new IllegalStateException("could not load Rust pointer codec " + codecClassName, error);
         }
+    }
+
+    private static CodecPlan rememberCodecPlan(
+            String name, CodecPlan plan, CodecPlanCache recent) {
+        CodecPlan previous = CODEC_METHODS.putIfAbsent(name, plan);
+        CodecPlan result = previous == null ? plan : previous;
+        recent.remember(name, result);
+        return result;
     }
 
     private static Method[] scalarEnumMethods(Class<?> type) {
@@ -11860,7 +11894,8 @@ public final class Pointer {
     }
 
     private static boolean isGeneratedAggregateCodec(String codec) {
-        return codec != null && !codec.isEmpty() && codec.charAt(0) != '@';
+        return codec != null && !codec.isEmpty()
+                && (codec.charAt(0) != '@' || codec.startsWith(ZERO_SIZED_CODEC_PREFIX));
     }
 
     private static boolean isPrimitiveScalarCarrier(Object value) {

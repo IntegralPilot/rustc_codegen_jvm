@@ -103,6 +103,8 @@ struct MyBackend;
 // unbounded number of prepared OOMIR modules on many-core hosts.
 const MAX_CODEGEN_WORKERS: usize = 4;
 const OOMIR_SHARD_QUEUE_DEPTH: usize = 1;
+const OOMIR_SHARD_ITEMS: usize = 128;
+mod partition;
 use jvm_compiler_core::classfile::bundle::{self, MAGIC as CLASS_BUNDLE_MAGIC};
 
 mod type_registry;
@@ -391,9 +393,8 @@ impl CodegenBackend for MyBackend {
                 workers.submit((submitted, "java-exports".to_string(), export_module, true));
                 submitted += 1;
 
-                // Repartition native CGUs by final JVM owner. This prevents
-                // duplicate holder construction while preserving fine-grained
-                // streaming and dynamic worker load balancing.
+                // Keep each JVM owner intact, and batch small owners so their
+                // lowering caches and type declarations can be reused.
                 let mut items_by_owner = BTreeMap::<String, Vec<MonoItem<'_>>>::new();
                 let naming = Definitions::new(Arc::clone(&shared_lowering));
                 for cgu in mono_items.codegen_units {
@@ -417,14 +418,18 @@ impl CodegenBackend for MyBackend {
                 tcx.sess.time("jvm_lower_mir", || {
                     loop {
                         let first_ordinal = submitted;
-                        submitted += items_by_owner.len();
-                        let pending = Lock::new(
-                            std::mem::take(&mut items_by_owner)
-                                .into_iter()
-                                .enumerate()
-                                .rev()
-                                .collect::<Vec<_>>(),
+                        let batches = partition::batch_owners(
+                            std::mem::take(&mut items_by_owner),
+                            OOMIR_SHARD_ITEMS,
                         );
+                        submitted += batches.len();
+                        let mut pending = batches.into_iter().enumerate().collect::<Vec<_>>();
+                        // Start large owners early, leaving small batches to
+                        // balance the tail. Ordinals still determine output order.
+                        pending.sort_unstable_by_key(|(index, (_, items))| {
+                            (items.len(), std::cmp::Reverse(*index))
+                        });
+                        let pending = Lock::new(pending);
                         // Bound live MIR shards independently of rustc's query pool.
                         par_for_each_in(0..worker_count, |_| {
                             rustc_middle::ty::print::with_no_trimmed_paths!({

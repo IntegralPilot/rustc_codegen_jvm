@@ -11,6 +11,7 @@ use rustc_hash::FxHashMap as HashMap;
 use serde::Serialize;
 use std::{
     cell::RefCell,
+    collections::BTreeMap,
     env,
     fs::File,
     io::{self, BufWriter},
@@ -230,6 +231,7 @@ struct ShardMetrics {
     selection: SelectionStats,
     top_methods: Vec<MethodShape>,
     data_type_definitions: HashMap<String, u64>,
+    generated_functions_by_kind: BTreeMap<String, u64>,
     classfiles: [ClassfileTotals; ClassOrigin::COUNT],
     classes: HashMap<String, ClassAmplification>,
 }
@@ -241,7 +243,19 @@ impl ShardMetrics {
             .keys()
             .map(|name| (name.clone(), 1))
             .collect();
+        let mut generated_functions_by_kind = BTreeMap::new();
+        for data_type in module.data_types.values() {
+            let (DataType::Class { methods, .. } | DataType::Interface { methods, .. }) = data_type;
+            for (name, method) in methods {
+                if matches!(method, DataTypeMethod::Function(_)) {
+                    *generated_functions_by_kind
+                        .entry(name.split('$').next().unwrap_or(name).to_owned())
+                        .or_default() += 1;
+                }
+            }
+        }
         Self {
+            generated_functions_by_kind,
             name: name.to_string(),
             construction: OomirStats::from_module(module),
             sealed: None,
@@ -424,6 +438,7 @@ struct CompilerMetrics {
     top_shards: Vec<ShardShape>,
     top_methods: Vec<MethodShape>,
     data_type_definitions: HashMap<String, u64>,
+    generated_functions_by_kind: BTreeMap<String, u64>,
     classfiles: [ClassfileTotals; ClassOrigin::COUNT],
     classes: HashMap<String, ClassAmplification>,
 }
@@ -448,6 +463,9 @@ impl CompilerMetrics {
         self.top_methods
             .sort_by_key(|method| std::cmp::Reverse(method.stats.ssa_instructions));
         self.top_methods.truncate(TOP_LIMIT);
+        for (name, count) in shard.generated_functions_by_kind {
+            *self.generated_functions_by_kind.entry(name).or_default() += count;
+        }
         for (name, attempts) in shard.data_type_definitions {
             *self.data_type_definitions.entry(name).or_default() += attempts;
         }
@@ -499,6 +517,7 @@ struct MetricsOutput<'a> {
     repeated_data_types: Vec<RepeatedDataType>,
     top_classfile_amplification: Vec<NamedClassAmplification>,
     largest_shards: &'a [ShardShape],
+    generated_functions_by_kind: &'a BTreeMap<String, u64>,
 }
 
 fn safe_file_component(value: &str) -> String {
@@ -552,7 +571,7 @@ fn write_output(
     class_amplification.truncate(TOP_LIMIT);
 
     let output = MetricsOutput {
-        schema_version: 3,
+        schema_version: 4,
         kind: "compiler_work_metrics",
         crate_name,
         pid: std::process::id(),
@@ -575,6 +594,7 @@ fn write_output(
         repeated_data_types,
         top_classfile_amplification: class_amplification,
         largest_shards: &metrics.top_shards,
+        generated_functions_by_kind: &metrics.generated_functions_by_kind,
     };
     let path = directory.join(format!(
         "{}-compiler-{}.json",

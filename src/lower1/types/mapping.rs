@@ -672,26 +672,10 @@ pub(super) fn ty_to_oomir_type_resolved<'tcx>(
                 ensure_fn_ptr_interface(&signature, data_types, tcx, instance_context);
             oomir::Type::Interface(interface_name)
         }
-        rustc_middle::ty::TyKind::FnDef(def_id, _args) => {
-            // Named functions are Zero-Sized Types (ZSTs).
-            // We generate a singleton class so generics like Map<Iter, MyFunc>
-            // produce unique JVM class names.
-            let safe_name = jvm_names::function_item_class_for_def_id(tcx, *def_id);
-
-            if !data_types.contains_key(&safe_name) {
-                data_types.insert(
-                    safe_name.clone(),
-                    oomir::DataType::Class {
-                        fields: vec![], // No state
-                        is_abstract: false,
-                        methods: HashMap::default(),
-                        super_class: Some("java/lang/Object".to_string()),
-                        interfaces: vec![],
-                    },
-                );
-            }
-            oomir::Type::Class(safe_name)
-        }
+        // Function items have no runtime state. Their Rust definition and
+        // generic arguments already participate in naming and call resolution;
+        // carrying a separate empty JVM object adds no information.
+        rustc_middle::ty::TyKind::FnDef(..) => oomir::Type::Unit,
         rustc_middle::ty::TyKind::Alias(_, alias_ty) => panic!(
             "unresolved type alias/projection {alias_ty:?} reached monomorphic JVM type lowering for {ty:?} in {instance_context:?}",
             ty = resolved_ty

@@ -169,9 +169,20 @@ pub fn owner_class_for_function<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> Strin
 }
 
 pub fn method_for_function<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> String {
-    def_path_segments(tcx, def_id)
-        .pop()
-        .unwrap_or_else(|| member_name(&tcx.def_path_str(def_id)))
+    let mut current = def_id;
+    loop {
+        let key = tcx.def_key(current);
+        if let Some(name) = key.disambiguated_data.data.get_opt_name() {
+            return normalize_def_path_segment(name.as_str());
+        }
+        let Some(parent) = key.parent else {
+            return member_name(&tcx.def_path_str(def_id));
+        };
+        current = DefId {
+            krate: def_id.krate,
+            index: parent,
+        };
+    }
 }
 
 pub fn synthetic_class_for_instance<'tcx>(

@@ -6,6 +6,7 @@ mod bits;
 mod calls;
 mod checked;
 mod debug;
+mod forward;
 mod general;
 mod memory;
 mod objects;
@@ -84,6 +85,9 @@ pub trait Constants {
 
 #[derive(Default)]
 pub struct Options<'a> {
+    /// Also verify SSA in optimized compiler builds. Development builds always
+    /// verify; production selection otherwise consumes trusted internal IR.
+    pub verify: bool,
     pub lines: Option<&'a SourceLines>,
     pub relative_pointer_abi: bool,
     pub constants: Option<&'a dyn Constants>,
@@ -98,6 +102,8 @@ struct Selector<'a> {
     assembly: Assembly,
     blocks: Vec<Label>,
     slots: Vec<Option<u16>>,
+    forwarded: Vec<bool>,
+    stack_value: Option<ValueId>,
     next_slot: u16,
     scratch_used: bool,
     exception_slot: Option<u16>,
@@ -110,7 +116,7 @@ struct Selector<'a> {
     bootstrap: Option<&'a mut Vec<jvm::attributes::BootstrapMethod>>,
 }
 
-/// Select one typed body into JVM code, validating its SSA and storage invariants.
+/// Select one typed body into JVM code. Development builds check SSA invariants.
 pub fn compile(
     body: &Body,
     types: &Types,
@@ -126,6 +132,7 @@ pub fn compile_with_options(
     options: Options<'_>,
 ) -> jvm::Result<MethodCode> {
     let Options {
+        verify,
         lines,
         relative_pointer_abi,
         constants,
@@ -139,11 +146,22 @@ pub fn compile_with_options(
             return Err(error("source line tables do not match SSA body"));
         }
     }
-    verify_with_debug(body, types, debug).map_err(|e| error(&e.0))?;
+    if cfg!(debug_assertions) || verify {
+        verify_with_debug(body, types, debug).map_err(|e| error(&e.0))?;
+    }
     let live =
         crate::opt::live_with_roots(body, types, debug.into_iter().flat_map(|d| d.roots(body)));
     let order = body.layout();
-    let allocation = allocate::allocate(body, types, &live, relative_pointer_abi, debug, &order)?;
+    let forwarded = forward::values(body, &live, debug);
+    let allocation = allocate::allocate(
+        body,
+        types,
+        &live,
+        &forwarded,
+        relative_pointer_abi,
+        debug,
+        &order,
+    )?;
     let mut debug = debug.map(|d| debug::Debug::new(d, body));
     let mut s = Selector {
         body,
@@ -152,6 +170,8 @@ pub fn compile_with_options(
         assembly: Assembly::default(),
         blocks: Vec::with_capacity(body.blocks.len()),
         slots: allocation.slots,
+        forwarded,
+        stack_value: None,
         next_slot: allocation.count,
         scratch_used: false,
         exception_slot: None,
@@ -273,6 +293,7 @@ pub fn compile_with_options(
         }
         let start = s.assembly.code.len();
         s.terminator(body.blocks[block.index()].terminator.unwrap())?;
+        debug_assert!(s.stack_value.is_none());
         if let Some(debug) = &mut debug {
             debug.mark(start, s.assembly.code.len());
         }
@@ -347,6 +368,12 @@ impl Selector<'_> {
         self.slots[self.body.resolve(value).index()].expect("assigned SSA slot")
     }
     fn load(&mut self, value: ValueId) -> jvm::Result<()> {
+        if let Some(stacked) = self.stack_value.take() {
+            if stacked != self.body.resolve(value) {
+                return Err(error("stack forwarding operand mismatch"));
+            }
+            return Ok(());
+        }
         match literal(self.body, value) {
             Some(Constant::Scalar(value)) => self.constant(value)?,
             Some(Constant::Null(_)) => self.assembly.code.push(Instruction::Aconst_null),

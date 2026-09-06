@@ -2,6 +2,8 @@ use crate::ir::*;
 
 pub struct Live {
     pub values: Vec<bool>,
+    /// Saturating live use counts, including ABI/debug roots and edge copies.
+    pub uses: Vec<u8>,
     pub instructions: Vec<bool>,
     pub blocks: Vec<bool>,
 }
@@ -20,6 +22,7 @@ pub fn live_with_roots(
 ) -> Live {
     let mut live = Live {
         values: vec![false; body.values.len()],
+        uses: vec![0; body.values.len()],
         instructions: vec![false; body.instructions.len()],
         blocks: body.reachable(),
     };
@@ -54,6 +57,7 @@ pub fn live_with_roots(
     pending.extend(&body.blocks[body.entry.index()].params);
     while let Some(value) = pending.pop() {
         let value = body.resolve(value);
+        live.uses[value.index()] = live.uses[value.index()].saturating_add(1);
         if std::mem::replace(&mut live.values[value.index()], true) {
             continue;
         }

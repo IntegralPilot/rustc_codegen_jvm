@@ -1,6 +1,8 @@
 use super::*;
 use crate::lower1::context::Definitions;
 
+const ZERO_SIZED_CODEC_PREFIX: &str = "@zero-sized:";
+
 pub(super) fn pointer_codec_class_name<'tcx>(
     ty: Ty<'tcx>,
     tcx: TyCtxt<'tcx>,
@@ -66,7 +68,8 @@ pub(crate) fn ensure_pointer_memory_codec<'tcx>(
     }
     let result = build_pointer_memory_codec(ty, tcx, data_types, instance_context)?;
     if let Some(codec) = &result
-        && codec_is_complete(data_types, &codec.class_name)
+        && (codec.class_name.starts_with(ZERO_SIZED_CODEC_PREFIX)
+            || codec_is_complete(data_types, &codec.class_name))
     {
         data_types.complete_codec(ty, codec.clone());
     }
@@ -95,13 +98,29 @@ fn build_pointer_memory_codec<'tcx>(
     ) {
         return Ok(None);
     }
-    exact_bytes_supported(ty, tcx, instance_context)?;
-
     let size = layout_size_bytes(tcx, ty)?;
     let value_ty = ty_to_oomir_type(ty, tcx, data_types, instance_context);
     if !value_ty.has_jvm_value() {
         return Ok(None);
     }
+    // These carriers have a public no-argument constructor and no state to
+    // encode or bind. Retain the concrete class identity in the codec recipe;
+    // no generated codec class or computational helper bodies are needed.
+    let fieldless = match ty.kind() {
+        TyKind::FnDef(..) => true,
+        TyKind::Closure(_, args) => args.as_closure().upvar_tys().is_empty(),
+        TyKind::Adt(def, _) => def.is_struct() && def.non_enum_variant().fields.is_empty(),
+        _ => false,
+    };
+    if size == 0
+        && fieldless
+        && let oomir::Type::Class(class_name) = &value_ty
+    {
+        return Ok(Some(PointerMemoryCodec {
+            class_name: format!("{ZERO_SIZED_CODEC_PREFIX}{class_name}"),
+        }));
+    }
+    exact_bytes_supported(ty, tcx, instance_context)?;
     let readable = format!(
         "{}_{}bytes",
         sanitize_name_token(&readable_pointer_codec_type_name(

@@ -91,6 +91,11 @@ impl Selector<'_> {
         self.finish_result(result)
     }
     fn finish_result(&mut self, result: ValueId) -> jvm::Result<()> {
+        if self.forwarded[result.index()] {
+            debug_assert!(self.stack_value.is_none());
+            self.stack_value = Some(result);
+            return Ok(());
+        }
         if self.live.values[result.index()] {
             self.store(result)
         } else {
