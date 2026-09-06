@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-regex = "1.11.1"
+jvm-compiler-core = { path = "../compiler-core" }
 rayon = "1.10.0"
 ristretto_classfile = "0.31.0"
 rustc-hash = "2.1.1"
