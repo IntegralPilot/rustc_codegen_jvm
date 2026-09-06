@@ -22,12 +22,6 @@ pub(in crate::lower2) struct BodyEmitter<'a> {
 }
 
 impl BodyEmitter<'_> {
-    pub fn emit(&mut self, name: &str, function: &oomir::Function) -> jvm::Result<()> {
-        let mut function = function.clone();
-        function.name = name.to_owned();
-        self.emit_owned(function)
-    }
-
     pub fn emit_owned(&mut self, function: oomir::Function) -> jvm::Result<()> {
         let function = oomir::construct::seal(function, self.context).map_err(|message| {
             jvm::Error::VerificationError {

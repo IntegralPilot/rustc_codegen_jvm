@@ -6,7 +6,7 @@ pub(in crate::lower2) fn create_data_type_classfile_for_class(
     class_name_jvm: &str,
     fields: &[(String, Type)],
     is_abstract: bool,
-    methods: &HashMap<String, DataTypeMethod>,
+    methods: HashMap<String, DataTypeMethod>,
     super_class_name_jvm: &str,
     implements_interfaces: &[String],
     module: &oomir::Module,
@@ -129,8 +129,25 @@ pub(in crate::lower2) fn create_data_type_classfile_for_class(
     let mut next_factory = 0;
 
     // Check for jvm_methods
-    for (method_name, method) in methods.iter() {
-        match method {
+    for (method_name, method) in methods {
+        let method_name = method_name.as_str();
+        if let DataTypeMethod::Function(mut function) = method {
+            function.name = method_name.to_owned();
+            body::BodyEmitter {
+                cp: &mut cp,
+                bootstrap: &mut bootstrap_methods,
+                methods: &mut jvm_methods,
+                next_factory: &mut next_factory,
+                owner: class_name_jvm,
+                kind: body::BodyOwner::Class,
+                relative_methods: relative_static_methods,
+                debug: debug_info,
+                context,
+            }
+            .emit_owned(function)?;
+            continue;
+        }
+        match &method {
             DataTypeMethod::Abstract(signature) => {
                 let name_index = cp.add_utf8(method_name)?;
                 let descriptor_index = cp.add_utf8(signature.to_string())?;
@@ -189,20 +206,7 @@ pub(in crate::lower2) fn create_data_type_classfile_for_class(
                     false,
                 )?);
             }
-            DataTypeMethod::Function(function) => {
-                body::BodyEmitter {
-                    cp: &mut cp,
-                    bootstrap: &mut bootstrap_methods,
-                    methods: &mut jvm_methods,
-                    next_factory: &mut next_factory,
-                    owner: class_name_jvm,
-                    kind: body::BodyOwner::Class,
-                    relative_methods: relative_static_methods,
-                    debug: debug_info,
-                    context,
-                }
-                .emit(method_name, function)?;
-            }
+            DataTypeMethod::Function(_) => unreachable!("body was consumed above"),
             DataTypeMethod::AdtHelperMethod { kind } => {
                 let jvm_method = match kind {
                     AdtHelperKind::EnumVariantIndex { .. }

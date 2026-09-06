@@ -302,10 +302,31 @@ pub fn oomir_to_jvm_bytecode(
         subclasses.dedup();
     }
 
-    for (dt_name_oomir, data_type) in &module.data_types {
-        if module.suppressed_data_types.contains(dt_name_oomir) {
-            continue;
-        }
+    // Retain method names for dispatch lookup while consuming each computational
+    // body once. Schema lookups never need a second copy of its instructions.
+    let methods_to_emit = module
+        .data_types
+        .iter_mut()
+        .filter_map(|(name, data_type)| {
+            if module.suppressed_data_types.contains(name) {
+                return None;
+            }
+            let (DataType::Class { methods, .. } | DataType::Interface { methods, .. }) = data_type;
+            let stubs = methods
+                .keys()
+                .map(|name| {
+                    (
+                        name.clone(),
+                        oomir::DataTypeMethod::SimpleConstantReturn(oomir::Type::Void, None),
+                    )
+                })
+                .collect();
+            Some((name.clone(), std::mem::replace(methods, stubs)))
+        })
+        .collect::<Vec<_>>();
+    for (dt_name_oomir, methods) in methods_to_emit {
+        let dt_name_oomir = dt_name_oomir.as_str();
+        let data_type = &module.data_types[dt_name_oomir];
         breadcrumbs::log!(
             breadcrumbs::LogLevel::Info,
             "bytecode-gen",
@@ -317,7 +338,7 @@ pub fn oomir_to_jvm_bytecode(
                 is_abstract,
                 super_class,
                 fields,
-                methods,
+                methods: _,
                 interfaces,
             } => {
                 let subclasses = subclasses_by_host.remove(dt_name_oomir).unwrap_or_default();
@@ -339,13 +360,13 @@ pub fn oomir_to_jvm_bytecode(
                 )?;
                 output.emit(
                     registry,
-                    dt_name_oomir.clone(),
+                    dt_name_oomir.to_owned(),
                     dt_bytecode,
                     crate::metrics::ClassOrigin::DataTypeClass,
                 )?;
             }
             DataType::Interface {
-                methods,
+                methods: _,
                 interfaces,
                 ..
             } => {
@@ -365,7 +386,7 @@ pub fn oomir_to_jvm_bytecode(
                 )?;
                 output.emit(
                     registry,
-                    dt_name_oomir.clone(),
+                    dt_name_oomir.to_owned(),
                     dt_bytecode,
                     crate::metrics::ClassOrigin::DataTypeInterface,
                 )?;
