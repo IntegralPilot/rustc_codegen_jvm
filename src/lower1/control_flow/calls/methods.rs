@@ -164,7 +164,7 @@ pub(super) fn emit<'tcx>(
             let principal = predicates.principal().unwrap().skip_binder();
             let interface_name = match receiver_operand.get_type() {
                 Some(oomir::Type::Interface(interface_name)) => interface_name,
-                _ => jvm_names::class_for_def_id(tcx, principal.def_id),
+                _ => data_types.class_name(tcx, principal.def_id),
             };
             instructions.push(oomir::Instruction::InvokeInterface {
                 class_name: interface_name,
@@ -202,7 +202,7 @@ pub(super) fn emit<'tcx>(
                     && !has_concrete_receiver_method
                 {
                     // Get the trait name and convert to interface name
-                    let interface_name = jvm_names::class_for_def_id(tcx, trait_def_id);
+                    let interface_name = data_types.class_name(tcx, trait_def_id);
                     matches!(
                         data_types.get(&interface_name),
                         Some(oomir::DataType::Interface { methods, .. })

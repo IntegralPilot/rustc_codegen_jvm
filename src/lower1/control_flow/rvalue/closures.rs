@@ -28,7 +28,7 @@ pub(crate) fn ensure_closure_fn_pointer_adapter_class<'tcx>(
         .expect("closure call ABI always has a tuple argument");
     let tuple_oomir_ty = ty_to_oomir_type(tuple_ty, tcx, data_types, instance_context);
     let target_owner = crate::lower1::naming::mono_owner_class(tcx, closure_instance);
-    let target_method = crate::lower1::generate_closure_function_name(tcx, closure_instance);
+    let target_method = data_types.closure_method_name(tcx, closure_instance);
     let descriptor = signature.to_jvm_descriptor_with_explicit_params();
     let target_name = format!("{target_owner}::{target_method}");
     let identity = format!("{target_name}:{descriptor}");
@@ -472,7 +472,7 @@ pub(super) fn ensure_closure_callable_bridge<'tcx>(
     instructions.push(oomir::Instruction::InvokeStatic {
         dest: call_dest.clone(),
         class_name: crate::lower1::naming::mono_owner_class(tcx, closure_instance),
-        method_name: crate::lower1::generate_closure_function_name(tcx, closure_instance),
+        method_name: data_types.closure_method_name(tcx, closure_instance),
         method_ty: oomir::Signature {
             params: closure_params,
             ret: callable_abi.signature.ret.clone(),

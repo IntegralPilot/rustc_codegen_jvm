@@ -22,44 +22,25 @@ pub(crate) use types::source_type;
 type Result<T> = std::result::Result<T, String>;
 
 pub(crate) fn seal(function: oomir::Function, context: &Context) -> Result<oomir::SsaFunction> {
-    let qualified_name = format!(
-        "{}::{}",
-        function.owner_class.as_deref().unwrap_or(""),
-        function.name
-    );
-    if std::env::var("RCGJ_SSA_DUMP")
-        .is_ok_and(|names| names.split(',').any(|name| qualified_name.contains(name)))
-    {
-        let path = format!(
-            concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/.generated/oomir-redesign/ssa-source-{:016x}.txt"
-            ),
-            crate::stable_hash::hash_value(&qualified_name)
+    static DUMP: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    if let Some(names) = DUMP.get_or_init(|| std::env::var("RCGJ_SSA_DUMP").ok()) {
+        let qualified_name = format!(
+            "{}::{}",
+            function.owner_class.as_deref().unwrap_or(""),
+            function.name
         );
-        let _ = std::fs::write(path, format!("{function:#?}"));
+        if names.split(',').any(|name| qualified_name.contains(name)) {
+            let path = format!(
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/.generated/oomir-redesign/ssa-source-{:016x}.txt"
+                ),
+                crate::stable_hash::hash_value(&qualified_name)
+            );
+            let _ = std::fs::write(path, format!("{function:#?}"));
+        }
     }
     let mut vocabulary = Vocabulary::default();
-    for ty in [
-        oomir::Type::Unit,
-        oomir::Type::Boolean,
-        oomir::Type::I8,
-        oomir::Type::U8,
-        oomir::Type::I16,
-        oomir::Type::U16,
-        oomir::Type::I32,
-        oomir::Type::U32,
-        oomir::Type::I64,
-        oomir::Type::U64,
-        oomir::Type::F16,
-        oomir::Type::F32,
-        oomir::Type::F64,
-        types::object(),
-        oomir::Type::Class("java/lang/String".into()),
-        oomir::Type::Class("java/lang/Throwable".into()),
-    ] {
-        vocabulary.add(&ty);
-    }
     vocabulary.signature(&function.signature);
     for variable in &function.debug_variables {
         vocabulary.add(&variable.ty);
@@ -109,7 +90,7 @@ pub(crate) fn seal(function: oomir::Function, context: &Context) -> Result<oomir
         builder,
         vocabulary: &vocabulary,
         context,
-        variables: HashMap::default(),
+        variables: Default::default(),
         named_types: HashMap::default(),
         blocks,
         constants: Vec::new(),
@@ -199,7 +180,7 @@ pub(crate) fn seal(function: oomir::Function, context: &Context) -> Result<oomir
                 .strip_prefix('_')
                 .is_some_and(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()))
                 && context.is_zero(&source)
-                && !emission.variables.contains_key(&(name.clone(), 5)))
+                && !emission.variables[5].contains_key(name))
             .then(|| (name.clone(), source))
         })
         .collect::<Vec<_>>();
@@ -267,7 +248,12 @@ pub(crate) fn seal(function: oomir::Function, context: &Context) -> Result<oomir
     let ir = builder.finish().map_err(|e| {
         let mut variables = variables
             .into_iter()
-            .map(|(name, id)| (id, name))
+            .enumerate()
+            .flat_map(|(carrier, variables)| {
+                variables
+                    .into_iter()
+                    .map(move |(name, id)| (id, (name, carrier)))
+            })
             .collect::<Vec<_>>();
         variables.sort_by_key(|(id, _)| id.index());
         format!("{}: {e}; bindings: {variables:?}", function.name)
@@ -284,7 +270,7 @@ pub(crate) fn seal(function: oomir::Function, context: &Context) -> Result<oomir
         debug_variables: Vec::new(),
         body: Arc::new(oomir::SsaBody {
             ir,
-            types: Arc::new(vocabulary.types),
+            types: vocabulary.into_types(),
             lines,
             source_file,
             constants,
@@ -297,7 +283,7 @@ struct Emission<'a> {
     builder: ir::Builder<'a>,
     vocabulary: &'a Vocabulary,
     context: &'a Context,
-    variables: HashMap<(String, u8), ir::VariableId>,
+    variables: [HashMap<String, ir::VariableId>; 6],
     named_types: HashMap<String, ir::TypeId>,
     blocks: HashMap<String, ir::BlockId>,
     constants: Vec<oomir::Constant>,
@@ -320,18 +306,20 @@ impl Emission<'_> {
         } else {
             ty
         };
-        *self
-            .variables
-            .entry((name.to_owned(), carrier))
-            .or_insert_with(|| {
-                if name.strip_prefix('_').is_some_and(|tail| {
-                    !tail.is_empty() && tail.bytes().all(|c| c.is_ascii_digit())
-                }) {
-                    self.builder.local(canonical)
-                } else {
-                    self.builder.variable(canonical)
-                }
-            })
+        let variables = &mut self.variables[carrier as usize];
+        if let Some(&variable) = variables.get(name) {
+            return variable;
+        }
+        let variable = if name
+            .strip_prefix('_')
+            .is_some_and(|tail| !tail.is_empty() && tail.bytes().all(|c| c.is_ascii_digit()))
+        {
+            self.builder.local(canonical)
+        } else {
+            self.builder.variable(canonical)
+        };
+        variables.insert(name.to_owned(), variable);
+        variable
     }
     fn write(&mut self, name: &str, value: ir::ValueId) -> Result<()> {
         let ty = self.builder.body.value_type(value);

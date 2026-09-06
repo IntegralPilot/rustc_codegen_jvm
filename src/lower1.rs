@@ -23,7 +23,6 @@ use rustc_span::def_id::DefId;
 use std::collections::VecDeque;
 use types::ty_to_oomir_type;
 
-mod closures;
 mod debug;
 pub(crate) use debug::source_location;
 use debug::{DebugScopeCache, local_variable_scope};
@@ -36,8 +35,6 @@ pub mod place;
 pub mod statics;
 pub mod types;
 mod value_repr;
-
-pub use closures::generate_closure_function_name;
 
 pub(crate) fn is_non_null_lang_item(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
     tcx.is_lang_item(def_id, LangItem::NonNull)

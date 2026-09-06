@@ -456,7 +456,7 @@ pub(super) fn ty_to_oomir_type_resolved<'tcx>(
             for binder in bound_preds.iter() {
                 match binder.skip_binder() {
                     ExistentialPredicate::Trait(trait_ref) => {
-                        let base_name = jvm_names::class_for_def_id(tcx, trait_ref.def_id);
+                        let base_name = data_types.class_name(tcx, trait_ref.def_id);
                         let safe_name = if let Some((dynamic_key, readable_suffix)) = &dynamic_name
                         {
                             crate::stable_hash::readable_or_hashed_name(
@@ -481,7 +481,7 @@ pub(super) fn ty_to_oomir_type_resolved<'tcx>(
                     }
                     ExistentialPredicate::AutoTrait(def_id) => {
                         // Auto traits like Send/Sync — treat as interfaces as well.
-                        let safe_name = jvm_names::class_for_def_id(tcx, def_id);
+                        let safe_name = data_types.class_name(tcx, def_id);
                         if should_define_named_data_type(tcx, def_id) {
                             data_types.entry(safe_name.clone()).or_insert_with(|| {
                                 oomir::DataType::Interface {
@@ -511,7 +511,8 @@ pub(super) fn ty_to_oomir_type_resolved<'tcx>(
             ty = resolved_ty,
         ),
         rustc_middle::ty::TyKind::Closure(def_id, args) => {
-            let safe_name = jvm_names::closure_class_for_args(tcx, *def_id, args, instance_context);
+            let safe_name =
+                data_types.closure_class_name(tcx, *def_id, args, instance_context, false);
 
             // Define the closure class struct if not already present
             if !data_types.contains_key(&safe_name) {
@@ -542,7 +543,7 @@ pub(super) fn ty_to_oomir_type_resolved<'tcx>(
         }
         rustc_middle::ty::TyKind::Coroutine(def_id, args) => {
             let safe_name =
-                jvm_names::coroutine_class_for_args(tcx, *def_id, args, instance_context);
+                data_types.closure_class_name(tcx, *def_id, args, instance_context, true);
 
             if data_types.contains_key(&safe_name) {
                 return oomir::Type::Class(safe_name);
