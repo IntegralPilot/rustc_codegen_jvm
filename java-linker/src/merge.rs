@@ -214,7 +214,7 @@ fn merge_class_files(
 
 pub(crate) fn serialize_class_file(class_file: &ClassFile<'static>) -> io::Result<Vec<u8>> {
     let mut data = Vec::new();
-    class_file.to_bytes(&mut data).map_err(|error| {
+    jvm_compiler_core::classfile::encode::class_file(class_file, &mut data).map_err(|error| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("failed to serialize merged JVM class: {error}"),

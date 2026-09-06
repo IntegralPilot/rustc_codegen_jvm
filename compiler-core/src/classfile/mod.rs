@@ -1,5 +1,6 @@
 pub mod bundle;
 pub mod constant_pool;
+pub mod encode;
 pub mod key;
 pub mod registry;
 pub mod summary;
