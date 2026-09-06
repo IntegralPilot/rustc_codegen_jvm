@@ -87,11 +87,10 @@ pub(super) fn serialize_class_file(
     context: &str,
 ) -> jvm::Result<Vec<u8>> {
     let mut bytecode = Vec::new();
-    if let Err(error) = class_file.to_bytes(&mut bytecode) {
+    if let Err(error) = jvm::encode::class_file(class_file, &mut bytecode) {
         let failing_method = class_file.methods.iter().find_map(|method| {
             let mut method_bytes = Vec::new();
-            method
-                .to_bytes(&mut method_bytes)
+            jvm::encode::method_info(method, &mut method_bytes)
                 .err()
                 .map(|method_error| {
                     let name = class_file
