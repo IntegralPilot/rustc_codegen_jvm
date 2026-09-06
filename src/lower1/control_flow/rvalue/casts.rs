@@ -80,7 +80,8 @@ impl<'tcx> RvalueContext<'_, 'tcx> {
                             fn_ptr_signature_from_ty(*target_mir_ty, tcx, data_types, instance);
                         let interface_name =
                             ensure_fn_ptr_interface(&signature, data_types, tcx, instance);
-                        let callable_target = fn_pointer_target(tcx, func_instance, &signature);
+                        let callable_target =
+                            fn_pointer_target(tcx, data_types, func_instance, &signature);
                         if callable_target.is_none() {
                             breadcrumbs::log!(
                                 breadcrumbs::LogLevel::Warn,
@@ -649,6 +650,7 @@ impl<'tcx> RvalueContext<'_, 'tcx> {
                                 )?;
                                 let target = fn_pointer_target(
                                     tcx,
+                                    data_types,
                                     function_instance,
                                     &callable_abi.signature,
                                 );

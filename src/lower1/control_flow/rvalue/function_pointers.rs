@@ -72,6 +72,7 @@ impl FnPointerTarget {
 /// instances dispatch through a generated JVM class or interface method.
 pub(crate) fn fn_pointer_target<'tcx>(
     tcx: TyCtxt<'tcx>,
+    data_types: &Definitions<'tcx>,
     target_instance: Instance<'tcx>,
     signature: &oomir::Signature,
 ) -> Option<FnPointerTarget> {
@@ -146,7 +147,7 @@ pub(crate) fn fn_pointer_target<'tcx>(
             }
         }
     }
-    let static_name = crate::lower1::naming::mono_fn_name_from_instance(tcx, target_instance);
+    let static_name = data_types.function_name(tcx, target_instance);
     let associated_item = tcx.opt_associated_item(target_instance.def_id());
     let dynamic_trait_impl = associated_item.as_ref().is_some_and(|item| {
         let Some(impl_def_id) = item.impl_container(tcx) else {

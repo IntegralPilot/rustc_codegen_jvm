@@ -197,10 +197,8 @@ pub(super) fn materialize_java_public_data_type<'tcx>(
 
 pub(super) fn lower_public_library_exports<'tcx>(
     tcx: TyCtxt<'tcx>,
-    partitioned_functions: &HashSet<Instance<'tcx>>,
     oomir_module: &mut lower1::context::Module<'tcx>,
     lowered_instances: &Lock<HashSet<Instance<'tcx>>>,
-    scanned_instances: &Lock<HashSet<Instance<'tcx>>>,
 ) {
     if !crate_emits_library_artifact(tcx) {
         return;
@@ -237,14 +235,9 @@ pub(super) fn lower_public_library_exports<'tcx>(
     // Rustc's collector owns ordinary Rust reachability. Java exports are
     // additional roots. Async state-machine bodies are also roots because a
     // JVM caller polls them through RustFuture rather than an ordinary MIR call.
-    lower_supplemental_instance_closure(
-        tcx,
-        function_roots,
-        partitioned_functions,
-        oomir_module,
-        lowered_instances,
-        scanned_instances,
-    );
+    for instance in function_roots {
+        lower_mono_function(tcx, instance, oomir_module, lowered_instances);
+    }
 
     let data_type_defs = java_public_surface_def_ids(tcx, JavaPublicSurface::Reachable);
 

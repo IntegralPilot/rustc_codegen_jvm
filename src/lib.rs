@@ -64,7 +64,7 @@ use rustc_codegen_ssa::{
 };
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use rustc_hir::def::DefKind;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 
 use rustc_data_structures::{
     sync::{IntoDynSyncSend, Lock, par_for_each_in},
@@ -74,10 +74,7 @@ use rustc_metadata::EncodedMetadata;
 use rustc_middle::{
     dep_graph::{WorkProduct, WorkProductId},
     mono::MonoItem,
-    ty::{
-        EarlyBinder, GenericArgs, Instance, InstanceKind, ShimKind, TyCtxt, TyKind,
-        TypeVisitableExt, TypingEnv, Unnormalized, VtblEntry,
-    },
+    ty::{GenericArgs, Instance, InstanceKind, ShimKind, TyCtxt, TyKind},
 };
 use rustc_session::{IncrCompSession, Session, config::OutputFilenames};
 use rustc_span::def_id::{DefId, LOCAL_CRATE};
@@ -228,20 +225,17 @@ fn lower_mono_function<'tcx>(
 fn lower_codegen_unit_items<'tcx>(
     tcx: TyCtxt<'tcx>,
     mono_items: impl IntoIterator<Item = MonoItem<'tcx>>,
-    partitioned_functions: &HashSet<Instance<'tcx>>,
     oomir_module: &mut lower1::context::Module<'tcx>,
     claimed_mono_items: &Lock<HashSet<MonoItem<'tcx>>>,
     lowered_instances: &Lock<HashSet<Instance<'tcx>>>,
-    scanned_instances: &Lock<HashSet<Instance<'tcx>>>,
 ) {
-    let mut function_roots = Vec::new();
     for mono_item in mono_items {
         if !claimed_mono_items.borrow_mut().insert(mono_item) {
             continue;
         }
         match mono_item {
             MonoItem::Fn(instance) => {
-                function_roots.push(instance);
+                lower_mono_function(tcx, instance, oomir_module, lowered_instances);
             }
             MonoItem::Static(def_id) => {
                 lower1::statics::lower_static(tcx, def_id, oomir_module)
@@ -256,229 +250,6 @@ fn lower_codegen_unit_items<'tcx>(
             }
         }
     }
-    lower_supplemental_instance_closure(
-        tcx,
-        function_roots,
-        partitioned_functions,
-        oomir_module,
-        lowered_instances,
-        scanned_instances,
-    );
-}
-
-fn lower_supplemental_instance_closure<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    roots: impl IntoIterator<Item = Instance<'tcx>>,
-    partitioned_functions: &HashSet<Instance<'tcx>>,
-    oomir_module: &mut lower1::context::Module<'tcx>,
-    lowered_instances: &Lock<HashSet<Instance<'tcx>>>,
-    scanned_instances: &Lock<HashSet<Instance<'tcx>>>,
-) {
-    let mut functions = roots.into_iter().collect::<VecDeque<_>>();
-    let mut queued = functions.iter().copied().collect::<HashSet<_>>();
-    while let Some(instance) = functions.pop_front() {
-        lower_mono_function(tcx, instance, oomir_module, lowered_instances);
-        if !scanned_instances.borrow_mut().insert(instance) {
-            continue;
-        }
-        for callee in direct_mir_callees(tcx, instance) {
-            if !matches!(
-                callee.def,
-                InstanceKind::Intrinsic(_)
-                    | InstanceKind::LlvmIntrinsic(_)
-                    | InstanceKind::Virtual(..)
-            ) && !partitioned_functions.contains(&callee)
-                && tcx.should_codegen_locally(callee)
-                && queued.insert(callee)
-            {
-                // Supplement generated helpers using rustc's linkage policy.
-                // Upstream exported bodies are already present in their rlibs.
-                functions.push_back(callee);
-            }
-        }
-    }
-}
-
-fn normalized_instance_ty<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    instance: Instance<'tcx>,
-    ty: rustc_middle::ty::Ty<'tcx>,
-) -> rustc_middle::ty::Ty<'tcx> {
-    let instantiated = EarlyBinder::bind(tcx, ty)
-        .instantiate(tcx, instance.args)
-        .skip_norm_wip();
-    tcx.try_normalize_erasing_regions(
-        TypingEnv::fully_monomorphized(),
-        Unnormalized::new_wip(instantiated),
-    )
-    .unwrap_or(instantiated)
-}
-
-fn unsize_vtable_callees<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    instance: Instance<'tcx>,
-    source_ty: rustc_middle::ty::Ty<'tcx>,
-    target_ty: rustc_middle::ty::Ty<'tcx>,
-) -> Vec<Instance<'tcx>> {
-    let source_ty = normalized_instance_ty(tcx, instance, source_ty);
-    let target_ty = normalized_instance_ty(tcx, instance, target_ty);
-    let pointees = match (source_ty.kind(), target_ty.kind()) {
-        (
-            TyKind::Ref(_, source, _) | TyKind::RawPtr(source, _),
-            TyKind::Ref(_, target, _) | TyKind::RawPtr(target, _),
-        ) => Some((*source, *target)),
-        _ => None,
-    };
-    let Some((source_pointee, target_pointee)) = pointees else {
-        return Vec::new();
-    };
-    let typing_env = TypingEnv::fully_monomorphized();
-    let source_tail = tcx.struct_tail_for_codegen(
-        normalized_instance_ty(tcx, instance, source_pointee),
-        typing_env,
-    );
-    let target_tail = tcx.struct_tail_for_codegen(
-        normalized_instance_ty(tcx, instance, target_pointee),
-        typing_env,
-    );
-    let TyKind::Dynamic(predicates, _) = target_tail.kind() else {
-        return Vec::new();
-    };
-    let Some(principal) = predicates.principal() else {
-        return Vec::new();
-    };
-    let trait_ref =
-        tcx.instantiate_bound_regions_with_erased(principal.with_self_ty(tcx, source_tail));
-    let mut callees = tcx
-        .vtable_entries(trait_ref)
-        .iter()
-        .filter_map(|entry| match entry {
-            VtblEntry::Method(target) if tcx.is_mir_available(target.def_id()) => Some(*target),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    if !source_tail.has_escaping_bound_vars() && source_tail.needs_drop(tcx, typing_env) {
-        callees.push(Instance::resolve_drop_glue(tcx, source_tail));
-    }
-    callees
-}
-
-fn synthetic_drop_callees_for_ty<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    ty: rustc_middle::ty::Ty<'tcx>,
-) -> Vec<Instance<'tcx>> {
-    let typing_env = TypingEnv::fully_monomorphized();
-    ty.walk()
-        .filter_map(|arg| {
-            let ty = arg.as_type()?;
-            match ty.kind() {
-                TyKind::FnDef(def_id, args) => {
-                    Instance::resolve_for_fn_ptr(tcx, typing_env, *def_id, args.no_bound_vars()?)
-                        .filter(|target| tcx.is_mir_available(target.def_id()))
-                }
-                TyKind::Slice(element)
-                    if !element.has_escaping_bound_vars()
-                        && element.needs_drop(tcx, typing_env) =>
-                {
-                    Some(Instance::resolve_drop_glue(tcx, *element))
-                }
-                TyKind::Adt(def, args) if def.is_box() => {
-                    let pointee = args.type_at(0);
-                    (!pointee.has_escaping_bound_vars() && pointee.needs_drop(tcx, typing_env))
-                        .then(|| Instance::resolve_drop_glue(tcx, pointee))
-                }
-                TyKind::Coroutine(..)
-                    if !ty.has_escaping_bound_vars() && ty.needs_drop(tcx, typing_env) =>
-                {
-                    Some(Instance::resolve_drop_glue(tcx, ty))
-                }
-                _ => None,
-            }
-        })
-        .collect()
-}
-
-fn direct_mir_callees<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> Vec<Instance<'tcx>> {
-    let has_callable_mir = match instance.def {
-        InstanceKind::Item(_) => tcx.is_mir_available(instance.def_id()),
-        InstanceKind::Shim(_) => true,
-        InstanceKind::Intrinsic(_) | InstanceKind::LlvmIntrinsic(_) | InstanceKind::Virtual(..) => {
-            false
-        }
-    };
-    if !has_callable_mir {
-        return Vec::new();
-    }
-
-    let mir = tcx.instance_mir(instance.def);
-    let typing_env = TypingEnv::post_analysis(tcx, mir.source.def_id());
-    let mut callees = mir
-        .basic_blocks
-        .iter()
-        .filter_map(|block| {
-            let terminator = block.terminator();
-            let rustc_middle::mir::TerminatorKind::Call { func, .. } = &terminator.kind else {
-                return None;
-            };
-            let instantiated_func_ty =
-                EarlyBinder::bind(tcx, func.ty(mir, tcx)).instantiate(tcx, instance.args);
-            let func_ty = tcx
-                .try_normalize_erasing_regions(typing_env, instantiated_func_ty)
-                .unwrap_or_else(|_| instantiated_func_ty.skip_norm_wip());
-            let TyKind::FnDef(def_id, args) = func_ty.kind() else {
-                return None;
-            };
-            let args = args.no_bound_vars()?;
-            let callee = Instance::try_resolve(tcx, typing_env, *def_id, args)
-                .ok()
-                .flatten()?;
-            match callee.def {
-                InstanceKind::Item(_) => tcx.is_mir_available(callee.def_id()).then_some(callee),
-                InstanceKind::Shim(_) => Some(callee),
-                InstanceKind::Intrinsic(_)
-                | InstanceKind::LlvmIntrinsic(_)
-                | InstanceKind::Virtual(..) => None,
-            }
-        })
-        .collect::<Vec<_>>();
-
-    for local in &mir.local_decls {
-        let ty = normalized_instance_ty(tcx, instance, local.ty);
-        callees.extend(synthetic_drop_callees_for_ty(tcx, ty));
-    }
-
-    for block in mir.basic_blocks.iter() {
-        if let rustc_middle::mir::TerminatorKind::Drop { place, .. } = &block.terminator().kind {
-            let dropped_ty = normalized_instance_ty(tcx, instance, place.ty(mir, tcx).ty);
-            if !dropped_ty.has_escaping_bound_vars() && dropped_ty.needs_drop(tcx, typing_env) {
-                callees.push(Instance::resolve_drop_glue(tcx, dropped_ty));
-            }
-        }
-        for statement in &block.statements {
-            let rustc_middle::mir::StatementKind::Assign(assignment) = &statement.kind else {
-                continue;
-            };
-            let (_, rvalue) = assignment.as_ref();
-            let rustc_middle::mir::Rvalue::Cast(
-                rustc_middle::mir::CastKind::PointerCoercion(
-                    rustc_middle::ty::adjustment::PointerCoercion::Unsize,
-                    _,
-                ),
-                source,
-                target_ty,
-            ) = rvalue
-            else {
-                continue;
-            };
-            callees.extend(unsize_vtable_callees(
-                tcx,
-                instance,
-                source.ty(mir, tcx),
-                *target_ty,
-            ));
-        }
-    }
-    callees
 }
 
 mod java_exports;
@@ -565,7 +336,6 @@ impl CodegenBackend for MyBackend {
             let crate_module_class = lower1::jvm_names::crate_module_class(tcx, rust_crate);
             let lowered_instances = Lock::new(HashSet::default());
             let claimed_mono_items = Lock::new(HashSet::default());
-            let scanned_instances = Lock::new(HashSet::default());
             let emitted_class_registry = lower2::EmittedClassRegistry::default();
             let debug_info = lower2::debug_info_options(tcx);
             let mono_items = tcx.collect_and_partition_mono_items(());
@@ -614,13 +384,7 @@ impl CodegenBackend for MyBackend {
                 // stream as their own job while ordinary owners are lowered.
                 let mut export_module =
                     empty_oomir_module(tcx, &crate_module_class, Arc::clone(&shared_lowering));
-                lower_public_library_exports(
-                    tcx,
-                    &partitioned_functions,
-                    &mut export_module,
-                    &lowered_instances,
-                    &scanned_instances,
-                );
+                lower_public_library_exports(tcx, &mut export_module, &lowered_instances);
                 emit_allocator_shims(tcx, &mut export_module);
                 let mut export_module = prepare_oomir_shard(export_module);
                 canonical_data_types.collect(&mut export_module);
@@ -648,50 +412,82 @@ impl CodegenBackend for MyBackend {
                     }
                 }
                 drop(naming);
-                submitted += items_by_owner.len();
-                let pending = Lock::new(
-                    items_by_owner
-                        .into_iter()
-                        .enumerate()
-                        .rev()
-                        .collect::<Vec<_>>(),
-                );
                 let canonical_data_types = Lock::new(canonical_data_types);
                 let producer = IntoDynSyncSend(workers.producer());
-                // At most four MIR shards are alive, even when rustc's query
-                // pool is larger. The emission queue applies backpressure.
                 tcx.sess.time("jvm_lower_mir", || {
-                    par_for_each_in(0..worker_count, |_| {
-                        rustc_middle::ty::print::with_no_trimmed_paths!({
-                            loop {
-                                let next = pending.borrow_mut().pop();
-                                let Some((index, (owner, items))) = next else {
-                                    break;
-                                };
-                                let shard_name = format!(
-                                    "jvm-class-{index}-{}",
-                                    stable_hash::short_hash(&owner, 8)
-                                );
-                                let mut module = empty_oomir_module(
-                                    tcx,
-                                    &crate_module_class,
-                                    Arc::clone(&shared_lowering),
-                                );
-                                lower_codegen_unit_items(
-                                    tcx,
-                                    items,
-                                    &partitioned_functions,
-                                    &mut module,
-                                    &claimed_mono_items,
-                                    &lowered_instances,
-                                    &scanned_instances,
-                                );
-                                let mut module = prepare_oomir_shard(module);
-                                canonical_data_types.borrow_mut().collect(&mut module);
-                                producer.submit((index + 1, shard_name, module, false));
-                            }
+                    loop {
+                        let first_ordinal = submitted;
+                        submitted += items_by_owner.len();
+                        let pending = Lock::new(
+                            std::mem::take(&mut items_by_owner)
+                                .into_iter()
+                                .enumerate()
+                                .rev()
+                                .collect::<Vec<_>>(),
+                        );
+                        // Bound live MIR shards independently of rustc's query pool.
+                        par_for_each_in(0..worker_count, |_| {
+                            rustc_middle::ty::print::with_no_trimmed_paths!({
+                                loop {
+                                    let next = pending.borrow_mut().pop();
+                                    let Some((index, (owner, items))) = next else {
+                                        break;
+                                    };
+                                    let ordinal = first_ordinal + index;
+                                    let shard_name = format!(
+                                        "jvm-class-{ordinal}-{}",
+                                        stable_hash::short_hash(&owner, 8)
+                                    );
+                                    let mut module = empty_oomir_module(
+                                        tcx,
+                                        &crate_module_class,
+                                        Arc::clone(&shared_lowering),
+                                    );
+                                    lower_codegen_unit_items(
+                                        tcx,
+                                        items,
+                                        &mut module,
+                                        &claimed_mono_items,
+                                        &lowered_instances,
+                                    );
+                                    let mut module = prepare_oomir_shard(module);
+                                    canonical_data_types.borrow_mut().collect(&mut module);
+                                    producer.submit((ordinal, shard_name, module, false));
+                                }
+                            });
                         });
-                    })
+                        // Rustc supplies ordinary roots. JVM-generated calls, drop
+                        // helpers and adapters request any additional bodies through
+                        // the name resolver, without rescanning every MIR local.
+                        let mut queued = HashSet::default();
+                        let naming = Definitions::new(Arc::clone(&shared_lowering));
+                        for instance in shared_lowering.take_references() {
+                            if partitioned_functions.contains(&instance)
+                                || lowered_instances.borrow().contains(&instance)
+                                || !queued.insert(instance)
+                            {
+                                continue;
+                            }
+                            let callable = match instance.def {
+                                InstanceKind::Item(_) => tcx.is_mir_available(instance.def_id()),
+                                InstanceKind::Shim(_) => true,
+                                _ => false,
+                            };
+                            if !callable || !tcx.should_codegen_locally(instance) {
+                                continue;
+                            }
+                            let owner = mono_item_name(tcx, instance, &naming)
+                                .class_to_call_on
+                                .unwrap_or_else(|| crate_module_class.clone());
+                            items_by_owner
+                                .entry(owner)
+                                .or_default()
+                                .push(MonoItem::Fn(instance));
+                        }
+                        if items_by_owner.is_empty() {
+                            break;
+                        }
+                    }
                 });
                 drop(producer);
                 let canonical_data_types = canonical_data_types.into_inner();

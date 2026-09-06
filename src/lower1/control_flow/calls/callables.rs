@@ -120,20 +120,11 @@ pub(super) fn ordinary_call<'tcx>(
         TyKind::Closure(_, args)
             if args.as_closure().upvar_tys().iter().next().is_some()
     );
-    let (class_name, function) = if is_closure_call {
-        (
-            crate::lower1::naming::mono_owner_class(tcx, func_instance),
-            data_types.closure_method_name(tcx, func_instance),
-        )
-    } else {
-        let fn_name_data = data_types.function_name(tcx, func_instance);
-        (
-            fn_name_data
-                .class_to_call_on
-                .expect("monomorphized functions have JVM owners"),
-            fn_name_data.method_name,
-        )
-    };
+    let target = data_types.function_name(tcx, func_instance);
+    let class_name = target
+        .class_to_call_on
+        .expect("monomorphized functions have JVM owners");
+    let function = target.method_name;
     if crate::lower1::naming::is_global_link_symbol_class(&class_name) {
         for (index, input_ty) in fn_inputs.iter().enumerate() {
             let TyKind::Adt(adt_def, _) = input_ty.kind() else {

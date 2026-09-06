@@ -2,7 +2,7 @@
 //! construction still owns its schema contributions independently.
 use super::*;
 use crate::lower1::{jvm_names, naming};
-use rustc_middle::ty::TyKind;
+use rustc_middle::ty::{TyKind, TypeVisitableExt};
 use rustc_span::def_id::DefId;
 
 #[derive(Default)]
@@ -28,6 +28,9 @@ impl<'tcx> Definitions<'tcx> {
         };
         if let Some(name) = self.shared.names.functions.borrow().get(&instance) {
             return name.clone();
+        }
+        if !instance.args.has_param() && !instance.args.has_escaping_bound_vars() {
+            self.shared.references.borrow_mut().push(instance);
         }
         let instance_ty = tcx
             .type_of(instance.def_id())
