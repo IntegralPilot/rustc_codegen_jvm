@@ -204,6 +204,11 @@ fn deep_graph_construction_and_verification_do_not_recurse_on_the_host_stack() {
     let body = b.finish().unwrap();
     assert_eq!(body.resolve(value), one);
     assert!(body.blocks.iter().all(|block| block.params.is_empty()));
+    assert_eq!(
+        body.values.len(),
+        2,
+        "empty blocks do not allocate SSA values"
+    );
 }
 
 #[test]

@@ -262,8 +262,21 @@ impl<'a> Builder<'a> {
     }
 
     pub fn finish(mut self) -> Result<Body, VerifyError> {
+        if !self.pending.is_empty() || self.body.blocks.len() > 1 {
+            self.complete_parameters()?;
+        }
+        // Selection checks the final body after outlining and constant
+        // preparation. Also check this intermediate form in development builds.
+        #[cfg(debug_assertions)]
+        verify(&self.body, self.types)?;
+        Ok(self.body)
+    }
+
+    fn complete_parameters(&mut self) -> Result<(), VerifyError> {
         let predecessors = self.body.predecessors();
         let reachable = self.body.reachable();
+        let mut path = Vec::new();
+        let mut visited = vec![None; self.body.blocks.len()];
         while let Some((block, var, value, index)) = self.pending.pop_front() {
             if predecessors[block.index()].is_empty() {
                 if reachable[block.index()] {
@@ -275,7 +288,8 @@ impl<'a> Builder<'a> {
                 continue;
             }
             for &(source, edge) in &predecessors[block.index()] {
-                let mut incoming = self.read_in(source, var);
+                let mut incoming =
+                    self.read_predecessor(source, var, &predecessors, &mut path, &mut visited);
                 let ty = self.variables[var.index()];
                 if self.body.value_type(incoming) != ty {
                     let inst = InstId::new(self.body.instructions.len());
@@ -299,10 +313,37 @@ impl<'a> Builder<'a> {
             }
         }
         super::parameters::remove_trivial_parameters(&mut self.body, &predecessors);
-        // Selection checks the final body after outlining and constant
-        // preparation. Also check this intermediate form in development builds.
-        #[cfg(debug_assertions)]
-        verify(&self.body, self.types)?;
-        Ok(self.body)
+        Ok(())
+    }
+
+    /// The complete CFG is available now. Forward an unchanged binding through
+    /// single-predecessor blocks without creating parameters and edge arguments
+    /// that would immediately be removed. Cache the entire path iteratively.
+    fn read_predecessor(
+        &mut self,
+        mut block: BlockId,
+        var: VariableId,
+        predecessors: &[Vec<(BlockId, EdgeId)>],
+        path: &mut Vec<BlockId>,
+        visited: &mut [Option<VariableId>],
+    ) -> ValueId {
+        let value = loop {
+            if let Some(&value) = self.bindings.get(&(block, var)) {
+                break value;
+            }
+            if block == self.body.entry
+                || predecessors[block.index()].len() != 1
+                || visited[block.index()] == Some(var)
+            {
+                break self.read_in(block, var);
+            }
+            visited[block.index()] = Some(var);
+            path.push(block);
+            block = predecessors[block.index()][0].0;
+        };
+        for block in path.drain(..) {
+            self.bindings.insert((block, var), value);
+        }
+        value
     }
 }
