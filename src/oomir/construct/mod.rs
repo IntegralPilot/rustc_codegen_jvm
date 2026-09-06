@@ -46,8 +46,28 @@ pub(crate) fn seal(function: oomir::Function, context: &Context) -> Result<oomir
         vocabulary.add(&variable.ty);
     }
     let body = &function.body;
+    let mut entry_is_target = false;
+    let mut needs_exception = false;
     for block in body.basic_blocks.values() {
         for instruction in &block.instructions {
+            use oomir::Instruction::*;
+            entry_is_target |= match instruction {
+                Jump { target } | UnwindStart { target } => target == &body.entry,
+                Label { name } => name == &body.entry,
+                Branch {
+                    true_block,
+                    false_block,
+                    ..
+                } => true_block == &body.entry || false_block == &body.entry,
+                Switch {
+                    targets, otherwise, ..
+                } => {
+                    otherwise == &body.entry
+                        || targets.iter().any(|(_, target)| target == &body.entry)
+                }
+                _ => false,
+            };
+            needs_exception |= matches!(instruction, UnwindStart { .. } | Rethrow);
             vocabulary.instruction(instruction);
             if let oomir::Instruction::ConstructObject { class_name, .. } = instruction
                 && let Some(fields) = context.constructors.get(class_name)
@@ -62,7 +82,12 @@ pub(crate) fn seal(function: oomir::Function, context: &Context) -> Result<oomir
     let mut builder = ir::Builder::new(&vocabulary.types, vocabulary.id(&function.signature.ret));
     let mut blocks = HashMap::default();
     let mut handlers = HashSet::default();
-    blocks.insert(body.entry.clone(), builder.create_block());
+    let entry = if entry_is_target {
+        builder.create_block()
+    } else {
+        builder.current()
+    };
+    blocks.insert(body.entry.clone(), entry);
     let mut names = body.basic_blocks.keys().cloned().collect::<Vec<_>>();
     names.sort_unstable();
     for name in &names {
@@ -147,10 +172,12 @@ pub(crate) fn seal(function: oomir::Function, context: &Context) -> Result<oomir
     }
     // Outlined cleanup state may travel through a normal edge before any
     // exception exists. Each real handler supplies a fresh exception definition.
-    let exception = emission.constant(oomir::Constant::Null(oomir::Type::Class(
-        "java/lang/Throwable".into(),
-    )))?;
-    emission.write("__rust_unwind_exception", exception)?;
+    if needs_exception {
+        let exception = emission.constant(oomir::Constant::Null(oomir::Type::Class(
+            "java/lang/Throwable".into(),
+        )))?;
+        emission.write("__rust_unwind_exception", exception)?;
+    }
     for (index, (name, ty)) in function.signature.params.iter().enumerate() {
         if !ty.has_jvm_value() {
             continue;
@@ -188,11 +215,13 @@ pub(crate) fn seal(function: oomir::Function, context: &Context) -> Result<oomir
         let value = emission.zero_value(&ty)?;
         emission.write(&name, value)?;
     }
-    // Arguments live in a distinct entry; source control-flow joins carry
-    // mutable bindings through their own block parameters.
-    emission
-        .builder
-        .jump(emission.blocks[&body.entry], Vec::new());
+    // Only a source entry with incoming control flow needs a separate ABI
+    // entry. Its mutable bindings must not overwrite the signature parameters.
+    if entry_is_target {
+        emission
+            .builder
+            .jump(emission.blocks[&body.entry], Vec::new());
+    }
     let body = function.body;
     let entry = body.entry;
     let mut source = body.basic_blocks;

@@ -168,6 +168,35 @@ pub(super) fn readable_tuple_abi_type_name(t: &oomir::Type) -> String {
     }
 }
 
+// Naming primitive Rust types needs neither type normalization nor generated
+// class schemas. The wide numeric carriers retain their established ABI tokens.
+fn primitive_rust_type_name(ty: Ty<'_>) -> Option<&'static str> {
+    Some(match ty.kind() {
+        TyKind::Bool => "bool",
+        TyKind::Char => "char",
+        TyKind::Str => "Str",
+        TyKind::Never => "Void",
+        TyKind::Int(IntTy::I8) => "i8",
+        TyKind::Int(IntTy::I16) => "i16",
+        TyKind::Int(IntTy::I32) => "i32",
+        TyKind::Int(IntTy::I64) => "i64",
+        TyKind::Int(IntTy::I128) => "I128",
+        TyKind::Int(IntTy::Isize) => "isize",
+        TyKind::Uint(UintTy::U8) => "u8",
+        TyKind::Uint(UintTy::U16) => "u16",
+        TyKind::Uint(UintTy::U32) => "u32",
+        TyKind::Uint(UintTy::U64) => "u64",
+        TyKind::Uint(UintTy::U128) => "U128",
+        TyKind::Uint(UintTy::Usize) => "usize",
+        TyKind::Float(FloatTy::F16) => "f16",
+        TyKind::Float(FloatTy::F32) => "f32",
+        TyKind::Float(FloatTy::F64) => "f64",
+        TyKind::Float(FloatTy::F128) => "F128",
+        TyKind::Tuple(elements) if elements.is_empty() => "Unit",
+        _ => return None,
+    })
+}
+
 /// Produce a readable type token without erasing Rust distinctions that share a
 /// JVM carrier. In particular, DST references such as `&str` are represented by
 /// the same `Utf8View` carrier as `str`, but they are different generic types and
@@ -178,6 +207,9 @@ pub(crate) fn readable_rust_type_name<'tcx>(
     data_types: &mut Definitions<'tcx>,
     instance_context: rustc_middle::ty::Instance<'tcx>,
 ) -> String {
+    if let Some(name) = primitive_rust_type_name(ty) {
+        return name.to_owned();
+    }
     let instantiated = EarlyBinder::bind(tcx, ty).instantiate(tcx, instance_context.args);
     let original_ty = instantiated.skip_norm_wip();
     let ty = tcx
@@ -303,6 +335,9 @@ pub(super) fn readable_pointer_codec_type_name<'tcx>(
     data_types: &mut Definitions<'tcx>,
     instance_context: rustc_middle::ty::Instance<'tcx>,
 ) -> String {
+    if let Some(name) = primitive_rust_type_name(ty) {
+        return name.to_owned();
+    }
     let instantiated = EarlyBinder::bind(tcx, ty).instantiate(tcx, instance_context.args);
     let ty = tcx
         .try_normalize_erasing_regions(TypingEnv::fully_monomorphized(), instantiated)

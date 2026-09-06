@@ -61,18 +61,7 @@ fn mutation_uses_its_typed_operand_when_a_temporary_name_is_reused() {
             .collect(),
         },
     };
-    let module = oomir::Module {
-        name: "test".into(),
-        source_file: None,
-        functions: HashMap::default(),
-        data_types: HashMap::default(),
-        suppressed_data_types: HashSet::default(),
-        shared_data_types: None,
-        relative_static_methods: Arc::default(),
-        external_interfaces: HashSet::default(),
-        statics: HashMap::default(),
-    };
-    let sealed = seal(function, &Context::new(&module)).unwrap();
+    let sealed = seal(function, &empty_context()).unwrap();
     assert!(sealed.body.debug.is_none());
     assert!(sealed.body.lines.is_none());
     let code = crate::lower2::select::compile(
@@ -90,4 +79,74 @@ fn mutation_uses_its_typed_operand_when_a_temporary_name_is_reused() {
         op,
         jvm_compiler_core::classfile::attributes::Instruction::Bastore
     )));
+}
+
+fn empty_context() -> Context {
+    let module = oomir::Module {
+        name: "test".into(),
+        source_file: None,
+        functions: HashMap::default(),
+        data_types: HashMap::default(),
+        suppressed_data_types: HashSet::default(),
+        shared_data_types: None,
+        relative_static_methods: Arc::default(),
+        external_interfaces: HashSet::default(),
+        statics: HashMap::default(),
+    };
+    Context::new(&module)
+}
+
+#[test]
+fn source_entry_only_needs_a_prologue_when_it_has_incoming_edges() {
+    for loops in [false, true] {
+        let value = Operand::Variable {
+            name: "_1".into(),
+            ty: Type::I32,
+        };
+        let instructions = if loops {
+            vec![
+                Instruction::Binary {
+                    op: oomir::BinaryOp::Add,
+                    dest: "_1".into(),
+                    op1: value,
+                    op2: Operand::Constant(Constant::I32(1)),
+                },
+                Instruction::Jump {
+                    target: "entry".into(),
+                },
+            ]
+        } else {
+            vec![Instruction::Return {
+                operand: Some(value),
+            }]
+        };
+        let function = Function {
+            name: "entry".into(),
+            owner_class: None,
+            debug_variables: vec![],
+            signature: Signature {
+                params: vec![("input".into(), Type::I32)],
+                ret: Box::new(Type::I32),
+                is_static: true,
+            },
+            body: CodeBlock {
+                entry: "entry".into(),
+                basic_blocks: [(
+                    "entry".into(),
+                    BasicBlock {
+                        label: "entry".into(),
+                        instructions,
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            },
+        };
+        let sealed = seal(function, &empty_context()).unwrap();
+        assert_eq!(sealed.body.ir.blocks.len(), if loops { 2 } else { 1 });
+        if !loops {
+            assert!(sealed.body.ir.instructions.is_empty());
+        }
+        ir::verify(&sealed.body.ir, &sealed.body.types).unwrap();
+    }
 }

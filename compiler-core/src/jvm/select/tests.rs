@@ -600,7 +600,7 @@ fn source_line_tables_follow_selected_instructions_and_terminators() {
     );
     assert_eq!(table[0].start_pc, 0);
     assert!(matches!(
-        code.instructions[usize::from(table[1].start_pc) + 1],
+        code.instructions[usize::from(table[1].start_pc)],
         Instruction::Ireturn
     ));
     assert!(

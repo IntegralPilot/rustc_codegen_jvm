@@ -9,6 +9,7 @@ pub(crate) fn compile(
     debug_info: DebugInfoOptions,
     relative_pointer_abi: bool,
 ) -> jvm::Result<MethodCode> {
+    static VERIFY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     struct Constants<'a>(&'a [oomir::Constant]);
     impl jvm_compiler_core::jvm::select::Constants for Constants<'_> {
         fn adapt(
@@ -42,6 +43,7 @@ pub(crate) fn compile(
         &body.types,
         constant_pool,
         jvm_compiler_core::jvm::select::Options {
+            verify: *VERIFY.get_or_init(|| std::env::var_os("RCGJ_VERIFY_SSA").is_some()),
             lines: if debug_info.line_numbers {
                 body.lines.as_ref()
             } else {
