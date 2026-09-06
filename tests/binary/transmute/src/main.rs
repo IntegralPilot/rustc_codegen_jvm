@@ -212,6 +212,66 @@ fn test_unsized_transparent_reference_transmute() {
     assert!(empty_wrapped.len() == 0);
 }
 
+#[derive(Clone, Copy)]
+#[repr(C, packed)]
+struct OffsetWord {
+    prefix: u8,
+    value: u64,
+    suffix: u8,
+}
+
+#[inline(never)]
+fn test_word_memory_bytes(input: u64) {
+    let bytes: [u8; 8] = unsafe { transmute(input) };
+    for i in 0..8 {
+        assert_eq!(bytes[i], (input >> (i * 8)) as u8);
+    }
+    let round_trip: u64 = unsafe { transmute(core::hint::black_box(bytes)) };
+    assert_eq!(round_trip, input);
+
+    let packed = OffsetWord {
+        prefix: 0xab,
+        value: input,
+        suffix: 0xcd,
+    };
+    let bytes: [u8; 10] = unsafe { transmute(packed) };
+    assert_eq!(bytes[0], 0xab);
+    assert_eq!(bytes[9], 0xcd);
+    for i in 0..8 {
+        assert_eq!(bytes[i + 1], (input >> (i * 8)) as u8);
+    }
+    let packed: OffsetWord = unsafe { transmute(core::hint::black_box(bytes)) };
+    let value = packed.value;
+    assert_eq!(value, input);
+
+    let wide = ((input as u128) << 64) | ((!input) as u128);
+    let bytes: [u8; 16] = unsafe { transmute(wide) };
+    for i in 0..16 {
+        assert_eq!(bytes[i], (wide >> (i * 8)) as u8);
+    }
+    let unsigned: u128 = unsafe { transmute(core::hint::black_box(bytes)) };
+    let signed: i128 = unsafe { transmute(core::hint::black_box(bytes)) };
+    assert_eq!(unsigned, wide);
+    assert_eq!(signed, wide as i128);
+    let signed_bytes: [u8; 16] = unsafe { transmute(core::hint::black_box(signed)) };
+    assert_eq!(signed_bytes, bytes);
+}
+
+fn test_float_memory_payloads() {
+    for bits in [
+        0u64,
+        0x8000_0000_0000_0000,
+        0x7ff0_0000_0000_0000,
+        0x7ff8_1234_5678_9abc,
+        0xfff8_9abc_def0_1234,
+    ] {
+        let value = f64::from_bits(core::hint::black_box(bits));
+        let bytes: [u8; 8] = unsafe { transmute(value) };
+        let round_trip: f64 = unsafe { transmute(core::hint::black_box(bytes)) };
+        assert_eq!(round_trip.to_bits(), bits);
+    }
+}
+
 fn main() {
     test_scalar_bits();
     test_float_bits();
@@ -221,4 +281,8 @@ fn main() {
     test_union_storage_round_trips();
     test_zero_sized_values();
     test_unsized_transparent_reference_transmute();
+    for value in [0, 1, u64::MAX, 0x8000_0000_0000_0000, 0x0123_4567_89ab_cdef] {
+        test_word_memory_bytes(core::hint::black_box(value));
+    }
+    test_float_memory_payloads();
 }

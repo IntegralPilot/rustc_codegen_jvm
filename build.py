@@ -35,13 +35,16 @@ class Config:
     # Source File Lists (used for dependency tracking)
     # Using glob patterns for automatic discovery
     RUNTIME_SOURCES = sorted(RUNTIME_DIR.glob("src/**/*.java"))
+    COMPILER_CORE_SOURCES = [ROOT_DIR / "compiler-core/Cargo.toml"] + list(
+        ROOT_DIR.glob("compiler-core/src/**/*.rs")
+    )
     BACKEND_RUST_SOURCES = [ROOT_DIR / "Cargo.toml", ROOT_DIR / "Cargo.lock"] + list(
         ROOT_DIR.glob("src/**/*.rs")
-    )
+    ) + COMPILER_CORE_SOURCES
     LINKER_RUST_SOURCES = [
         JAVA_LINKER_DIR / "Cargo.toml",
         JAVA_LINKER_DIR / "Cargo.lock",
-    ] + list(JAVA_LINKER_DIR.glob("src/**/*.rs"))
+    ] + list(JAVA_LINKER_DIR.glob("src/**/*.rs")) + COMPILER_CORE_SOURCES
     CARGO_JVM_RUST_SOURCES = [
         CARGO_JVM_DIR / "Cargo.toml",
         CARGO_JVM_DIR / "Cargo.lock",

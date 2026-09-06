@@ -1,0 +1,4 @@
+[package]
+name = "pointer_provenance"
+version = "0.1.0"
+edition = "2024"
