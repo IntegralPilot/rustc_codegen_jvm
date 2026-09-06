@@ -3,6 +3,7 @@
 //! Rust type keys are scoped to their `TyCtxt`; definitions and construction
 //! caches share a lifetime, rather than relying on a mutable map's address.
 use crate::oomir;
+use rustc_data_structures::sync::Lock;
 mod names;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use rustc_middle::{
@@ -15,18 +16,18 @@ use std::{
 };
 
 pub(crate) type Module<'tcx> = oomir::Module<Definitions<'tcx>>;
-pub(crate) type Shared<'tcx> = Arc<rustc_data_structures::sync::Lock<CrateContext<'tcx>>>;
+pub(crate) type Shared<'tcx> = Arc<CrateContext<'tcx>>;
 pub(crate) type CheckedIntrinsic = (String, String, String);
 
 /// Shared by the lowering shards of one crate on rustc query threads.
 /// No completed function bodies or serialized output are retained here.
 #[derive(Default)]
 pub(crate) struct CrateContext<'tcx> {
-    normalized: HashMap<(Ty<'tcx>, GenericArgsRef<'tcx>), Ty<'tcx>>,
-    tuple_abis: HashMap<String, Vec<oomir::Type>>,
-    allocations: HashMap<AllocId, String>,
-    checked_intrinsics: HashSet<CheckedIntrinsic>,
-    completed_codecs: HashMap<Ty<'tcx>, super::types::PointerMemoryCodec>,
+    normalized: Lock<HashMap<(Ty<'tcx>, GenericArgsRef<'tcx>), Ty<'tcx>>>,
+    tuple_abis: Lock<HashMap<String, Vec<oomir::Type>>>,
+    allocations: Lock<HashMap<AllocId, String>>,
+    checked_intrinsics: Lock<HashSet<CheckedIntrinsic>>,
+    completed_codecs: Lock<HashMap<Ty<'tcx>, super::types::PointerMemoryCodec>>,
     names: names::Names<'tcx>,
 }
 
@@ -79,23 +80,23 @@ impl<'tcx> Definitions<'tcx> {
     ) -> Ty<'tcx> {
         let args = instance.args;
         let key = (ty, args);
-        if let Some(&resolved) = self.shared.borrow().normalized.get(&key) {
+        if let Some(&resolved) = self.shared.normalized.borrow().get(&key) {
             return resolved;
         }
         let instantiated = EarlyBinder::bind(tcx, ty).instantiate(tcx, args);
         let resolved = tcx
             .try_normalize_erasing_regions(TypingEnv::fully_monomorphized(), instantiated)
             .unwrap_or_else(|_| instantiated.skip_norm_wip());
-        self.shared.borrow_mut().normalized.insert(key, resolved);
+        self.shared.normalized.borrow_mut().insert(key, resolved);
         resolved
     }
 
     pub(crate) fn tuple_name_conflicts(&self, name: &str, fields: &[oomir::Type]) -> bool {
-        let mut shared = self.shared.borrow_mut();
-        match shared.tuple_abis.get(name) {
+        let mut abis = self.shared.tuple_abis.borrow_mut();
+        match abis.get(name) {
             Some(previous) => previous != fields,
             None => {
-                shared.tuple_abis.insert(name.to_owned(), fields.to_vec());
+                abis.insert(name.to_owned(), fields.to_vec());
                 false
             }
         }
@@ -103,19 +104,19 @@ impl<'tcx> Definitions<'tcx> {
 
     pub(crate) fn allocation_identity(&self, id: AllocId, candidate: String) -> String {
         self.shared
-            .borrow_mut()
             .allocations
+            .borrow_mut()
             .entry(id)
             .or_insert(candidate)
             .clone()
     }
 
     pub(super) fn completed_codec(&self, ty: Ty<'tcx>) -> Option<super::types::PointerMemoryCodec> {
-        self.shared.borrow().completed_codecs.get(&ty).cloned()
+        self.shared.completed_codecs.borrow().get(&ty).cloned()
     }
 
     pub(super) fn complete_codec(&self, ty: Ty<'tcx>, codec: super::types::PointerMemoryCodec) {
-        self.shared.borrow_mut().completed_codecs.insert(ty, codec);
+        self.shared.completed_codecs.borrow_mut().insert(ty, codec);
     }
 
     /// The first requesting shard owns construction of this canonical helper.
@@ -123,8 +124,8 @@ impl<'tcx> Definitions<'tcx> {
         let key = (operation.to_owned(), ty.to_owned(), tuple.to_owned());
         if self
             .shared
-            .borrow_mut()
             .checked_intrinsics
+            .borrow_mut()
             .insert(key.clone())
         {
             self.checked_intrinsics.push(key);
