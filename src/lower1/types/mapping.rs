@@ -511,8 +511,7 @@ pub(super) fn ty_to_oomir_type_resolved<'tcx>(
             ty = resolved_ty,
         ),
         rustc_middle::ty::TyKind::Closure(def_id, args) => {
-            let safe_name =
-                data_types.closure_class_name(tcx, *def_id, args, instance_context, false);
+            let safe_name = data_types.closure_class_name(tcx, *def_id, args, false);
 
             // Define the closure class struct if not already present
             if !data_types.contains_key(&safe_name) {
@@ -542,8 +541,7 @@ pub(super) fn ty_to_oomir_type_resolved<'tcx>(
             oomir::Type::Class(safe_name)
         }
         rustc_middle::ty::TyKind::Coroutine(def_id, args) => {
-            let safe_name =
-                data_types.closure_class_name(tcx, *def_id, args, instance_context, true);
+            let safe_name = data_types.closure_class_name(tcx, *def_id, args, true);
 
             if data_types.contains_key(&safe_name) {
                 return oomir::Type::Class(safe_name);

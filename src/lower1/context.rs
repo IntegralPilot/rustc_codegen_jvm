@@ -28,6 +28,7 @@ pub(crate) struct CrateContext<'tcx> {
     allocations: Lock<HashMap<AllocId, String>>,
     checked_intrinsics: Lock<HashSet<CheckedIntrinsic>>,
     completed_codecs: Lock<HashMap<Ty<'tcx>, super::types::PointerMemoryCodec>>,
+    caller_locations: Lock<HashMap<rustc_span::Span, oomir::Constant>>,
     names: names::Names<'tcx>,
     references: Lock<Vec<Instance<'tcx>>>,
 }
@@ -124,6 +125,17 @@ impl<'tcx> Definitions<'tcx> {
 
     pub(super) fn complete_codec(&self, ty: Ty<'tcx>, codec: super::types::PointerMemoryCodec) {
         self.shared.completed_codecs.borrow_mut().insert(ty, codec);
+    }
+
+    pub(super) fn caller_location(&self, span: rustc_span::Span) -> Option<oomir::Constant> {
+        self.shared.caller_locations.borrow().get(&span).cloned()
+    }
+
+    pub(super) fn remember_caller_location(&self, span: rustc_span::Span, value: oomir::Constant) {
+        self.shared
+            .caller_locations
+            .borrow_mut()
+            .insert(span, value);
     }
 
     /// The first requesting shard owns construction of this canonical helper.

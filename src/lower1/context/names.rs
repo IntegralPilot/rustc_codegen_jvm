@@ -10,7 +10,7 @@ pub(super) struct Names<'tcx> {
     functions: Lock<HashMap<Instance<'tcx>, naming::FnNameData>>,
     classes: Lock<HashMap<DefId, String>>,
     readable: Lock<HashMap<DefId, String>>,
-    closures: Lock<HashMap<(DefId, GenericArgsRef<'tcx>, GenericArgsRef<'tcx>, bool), String>>,
+    closures: Lock<HashMap<(DefId, GenericArgsRef<'tcx>, bool), String>>,
 }
 
 impl<'tcx> Definitions<'tcx> {
@@ -85,18 +85,13 @@ impl<'tcx> Definitions<'tcx> {
         tcx: TyCtxt<'tcx>,
         def_id: DefId,
         args: GenericArgsRef<'tcx>,
-        instance: Instance<'tcx>,
         coroutine: bool,
     ) -> String {
-        let key = (def_id, args, instance.args, coroutine);
+        let key = (def_id, args, coroutine);
         if let Some(name) = self.shared.names.closures.borrow().get(&key) {
             return name.clone();
         }
-        let name = if coroutine {
-            jvm_names::coroutine_class_for_args(tcx, def_id, args, instance)
-        } else {
-            jvm_names::closure_class_for_args(tcx, def_id, args, instance)
-        };
+        let name = jvm_names::anonymous_class_for_args(tcx, def_id, args, coroutine);
         self.shared
             .names
             .closures
@@ -110,7 +105,7 @@ impl<'tcx> Definitions<'tcx> {
         tcx: TyCtxt<'tcx>,
         instance: Instance<'tcx>,
     ) -> String {
-        self.closure_class_name(tcx, instance.def_id(), instance.args, instance, false)
+        self.closure_class_name(tcx, instance.def_id(), instance.args, false)
             .rsplit('/')
             .next()
             .expect("closure class has a final path segment")

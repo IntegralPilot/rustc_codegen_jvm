@@ -85,6 +85,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unused_abi_parameters_need_no_pointer_or_unsigned_conversion() {
+        let mut types = Types::default();
+        let int = types.scalar(ScalarType::I32);
+        let byte = types.scalar(ScalarType::U8);
+        let pointer = types.intern(Type::Pointer(int));
+        let mut b = Builder::new(&types, int);
+        b.parameter(b.current(), pointer);
+        b.parameter(b.current(), byte);
+        let result = b.constant(int, Scalar::integer(ScalarType::I32, 7).unwrap());
+        b.terminate(Terminator::Return(Some(result)));
+        let body = b.finish().unwrap();
+        let code = compile_with_options(
+            &body,
+            &types,
+            &mut Default::default(),
+            Options {
+                relative_pointer_abi: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(code.max_locals, 6); // Pointer + two offsets + byte ABI slots.
+        assert_eq!(
+            code.instructions,
+            vec![Instruction::Bipush(7), Instruction::Ireturn]
+        );
+    }
+
+    #[test]
     fn forwards_chains_without_locals_but_preserves_multiple_uses() {
         for scalar in [
             ScalarType::I32,

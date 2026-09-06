@@ -244,10 +244,12 @@ pub fn compile_with_options(
             }
             // JVM byte/short parameters are sign-extended by Java callers.
             for &param in &body.blocks[block.index()].params {
-                if matches!(
-                    s.types.get(s.body.value_type(param)),
-                    Some(Type::Scalar(ScalarType::U8 | ScalarType::U16))
-                ) {
+                if s.live.uses[param.index()] > 1
+                    && matches!(
+                        s.types.get(s.body.value_type(param)),
+                        Some(Type::Scalar(ScalarType::U8 | ScalarType::U16))
+                    )
+                {
                     s.load(param)?;
                     s.normalize_value(param);
                     s.store(param)?;
