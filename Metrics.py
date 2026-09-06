@@ -102,43 +102,18 @@ def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
     )
     oomir_before: dict[str, int] = defaultdict(int)
     oomir_after: dict[str, int] = defaultdict(int)
-    optimise2: dict[str, int] = defaultdict(int)
-    liveness: dict[str, int] = defaultdict(int)
+    selection: dict[str, int] = defaultdict(int)
     type_cache: dict[str, int] = defaultdict(int)
     classfiles: dict[str, int] = defaultdict(int)
-    passes: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
     repeated_types: dict[str, int] = defaultdict(int)
     amplified_classes: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
     top_methods: list[dict[str, Any]] = []
     largest_shards: list[dict[str, Any]] = []
 
     for record in compilers:
-        add_fields(oomir_before, record.get("oomir_before_optimise1", {}), oomir_fields)
-        add_fields(oomir_after, record.get("oomir_after_optimise1", {}), oomir_fields)
-        compiler_optimise2 = record.get("optimise2", {})
-        add_fields(
-            optimise2,
-            compiler_optimise2,
-            (
-                "methods",
-                "input_instructions",
-                "output_instructions",
-                "input_max_locals",
-                "output_max_locals",
-            ),
-        )
-        add_fields(
-            liveness,
-            compiler_optimise2.get("liveness", {}),
-            (
-                "analyses",
-                "instructions",
-                "locals",
-                "matrix_words",
-                "successor_edges",
-                "worklist_pops",
-            ),
-        )
+        add_fields(oomir_before, record.get("oomir_construction", {}), oomir_fields)
+        add_fields(oomir_after, record.get("oomir_sealed", {}), oomir_fields)
+        add_fields(selection, record.get("selection", {}), ("methods", "ssa_instructions", "jvm_instructions", "locals"))
         add_fields(type_cache, record.get("type_lowering_cache", {}), ("hits", "misses"))
         for origin in record.get("classfiles_by_origin", []):
             add_fields(
@@ -154,20 +129,7 @@ def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
                     "name_collisions",
                 ),
             )
-        for item in compiler_optimise2.get("passes", []):
-            add_fields(
-                passes[item.get("pass", "<unknown>")],
-                item,
-                (
-                    "invocations",
-                    "input_instructions",
-                    "output_instructions",
-                    "instructions_removed",
-                    "instructions_added",
-                    "length_changing_invocations",
-                ),
-            )
-        for item in compiler_optimise2.get("top_methods_by_structural_work", []):
+        for item in record.get("top_methods", []):
             top_methods.append({"crate": record.get("crate_name", "<unknown>"), **item})
         for item in record.get("largest_shards", []):
             largest_shards.append({"crate": record.get("crate_name", "<unknown>"), **item})
@@ -210,13 +172,11 @@ def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
         "compiler_processes": len(compilers),
         "linker_processes": len(linkers),
         "parse_errors": parse_errors,
-        "oomir_before_optimise1": dict(oomir_before),
-        "oomir_after_optimise1": dict(oomir_after),
+        "oomir_construction": dict(oomir_before),
+        "oomir_sealed": dict(oomir_after),
         "type_lowering_cache": dict(type_cache),
-        "optimise2": dict(optimise2),
-        "liveness": dict(liveness),
+        "selection": dict(selection),
         "classfiles": dict(classfiles),
-        "passes": {name: dict(values) for name, values in passes.items()},
         "repeated_data_types": sorted(
             repeated_types.items(), key=lambda item: item[1], reverse=True
         )[:20],
@@ -229,13 +189,13 @@ def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
             reverse=True,
         )[:20],
         "top_methods": sorted(
-            top_methods, key=lambda item: item.get("work_units", 0), reverse=True
+            top_methods, key=lambda item: item.get("ssa_instructions", 0), reverse=True
         )[:20],
         "largest_shards": sorted(
             largest_shards,
             key=lambda item: (
-                item.get("before_optimise1", {}).get("instructions", 0),
-                item.get("before_optimise1", {}).get("data_types", 0),
+                item.get("construction", {}).get("instructions", 0),
+                item.get("construction", {}).get("data_types", 0),
             ),
             reverse=True,
         )[:20],
@@ -259,26 +219,20 @@ def format_result(result: Result, top: int) -> str:
         f"  records: {summary.get('compiler_processes', 0)} compiler, "
         f"{summary.get('linker_processes', 0)} linker",
     ]
-    before = summary.get("oomir_before_optimise1", {})
-    after = summary.get("oomir_after_optimise1", {})
+    before = summary.get("oomir_construction", {})
+    after = summary.get("oomir_sealed", {})
     lines.append(
-        "  OOMIR: "
+        "  Construction -> SSA: "
         f"{before.get('instructions', 0):,} -> {after.get('instructions', 0):,} instructions; "
         f"{before.get('data_types', 0):,} shard-local data-type definitions"
     )
-    optimise2 = summary.get("optimise2", {})
+    selection = summary.get("selection", {})
     lines.append(
-        "  optimise2: "
-        f"{optimise2.get('methods', 0):,} methods, "
-        f"{optimise2.get('input_instructions', 0):,} -> "
-        f"{optimise2.get('output_instructions', 0):,} bytecode instructions"
-    )
-    liveness = summary.get("liveness", {})
-    lines.append(
-        "  liveness: "
-        f"{liveness.get('analyses', 0):,} analyses, "
-        f"{liveness.get('matrix_words', 0):,} matrix words allocated, "
-        f"{liveness.get('worklist_pops', 0):,} worklist pops"
+        "  JVM selection: "
+        f"{selection.get('methods', 0):,} methods, "
+        f"{selection.get('ssa_instructions', 0):,} SSA instructions -> "
+        f"{selection.get('jvm_instructions', 0):,} bytecode instructions, "
+        f"{selection.get('locals', 0):,} total local slots"
     )
     cache = summary.get("type_lowering_cache", {})
     hits = cache.get("hits", 0)
@@ -293,17 +247,6 @@ def format_result(result: Result, top: int) -> str:
         f"{classes.get('exact_duplicates', 0):,} exact duplicates discarded "
         f"({classes.get('exact_duplicate_bytes', 0):,} generated bytes)"
     )
-    hottest_passes = sorted(
-        summary.get("passes", {}).items(),
-        key=lambda item: item[1].get("input_instructions", 0),
-        reverse=True,
-    )[:top]
-    lines.append("  largest optimise2 pass inputs:")
-    for name, values in hottest_passes:
-        lines.append(
-            f"    {name}: received {values.get('input_instructions', 0):,}, "
-            f"removed {values.get('instructions_removed', 0):,}"
-        )
     repeated = summary.get("repeated_data_types", [])[:top]
     if repeated:
         lines.append("  most repeated shard-local data types:")
@@ -318,11 +261,11 @@ def format_result(result: Result, top: int) -> str:
         )
     methods = summary.get("top_methods", [])[:top]
     if methods:
-        lines.append("  highest optimise2 structural work:")
+        lines.append("  largest SSA bodies:")
         lines.extend(
             f"    {item.get('crate', '<unknown>')}::{item.get('item', '<unknown>')}: "
-            f"{item.get('work_units', 0):,} work units, "
-            f"{item.get('input_instructions', 0):,} input instructions"
+            f"{item.get('ssa_instructions', 0):,} SSA instructions, "
+            f"{item.get('jvm_instructions', 0):,} JVM instructions"
             for item in methods
         )
     shards = summary.get("largest_shards", [])[:top]
@@ -330,8 +273,8 @@ def format_result(result: Result, top: int) -> str:
         lines.append("  largest OOMIR shards:")
         lines.extend(
             f"    {item.get('crate', '<unknown>')}::{item.get('shard', '<unknown>')}: "
-            f"{item.get('before_optimise1', {}).get('instructions', 0):,} instructions, "
-            f"{item.get('before_optimise1', {}).get('data_types', 0):,} data types"
+            f"{item.get('construction', {}).get('instructions', 0):,} instructions, "
+            f"{item.get('construction', {}).get('data_types', 0):,} data types"
             for item in shards
         )
     linker = summary.get("linker", {})

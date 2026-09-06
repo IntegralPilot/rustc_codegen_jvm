@@ -56,6 +56,7 @@ macro_rules! log {
     }};
 }
 
+use crate::lower1::context::Definitions;
 use oomir::Type;
 use rustc_codegen_ssa::back::archive::{ArArchiveBuilder, ArchiveBuilder, ArchiveBuilderBuilder};
 use rustc_codegen_ssa::{
@@ -80,17 +81,19 @@ use rustc_span::def_id::{DefId, LOCAL_CRATE};
 use rustc_structures::CrateType;
 use std::{
     any::Any,
-    io::{BufReader, BufWriter, Read, Write},
+    io::{BufReader, BufWriter, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, mpsc},
+    sync::Arc,
 };
 
 mod async_interop;
+mod mono;
+use mono::{mono_item_name, place_or_insert_mono_function};
 mod lower1;
 mod lower2;
 mod metrics;
 mod oomir;
-mod optimise1;
+mod pipeline;
 mod stable_hash;
 
 /// An instance of our Java bytecode codegen backend.
@@ -100,866 +103,29 @@ struct MyBackend;
 // unbounded number of prepared OOMIR modules on many-core hosts.
 const MAX_CODEGEN_WORKERS: usize = 4;
 const OOMIR_SHARD_QUEUE_DEPTH: usize = 1;
-const CLASS_BUNDLE_MAGIC: &[u8; 8] = b"RCJVMB1\0";
+use jvm_compiler_core::classfile::bundle::{self, MAGIC as CLASS_BUNDLE_MAGIC};
 
-/// Crate-wide class contributions collected while ordinary function shards
-/// continue through lower2. Method bodies move here instead of being cloned;
-/// compatible fragments are merged and emitted exactly once after discovery.
-#[derive(Default)]
-struct CanonicalDataTypeRegistry {
-    variants: HashMap<String, Vec<oomir::DataType>>,
-    external_interfaces: HashSet<String>,
-}
-
-impl CanonicalDataTypeRegistry {
-    fn collect(&mut self, module: &mut oomir::Module) {
-        self.external_interfaces
-            .extend(module.external_interfaces.iter().cloned());
-        let relative_static_methods = Arc::make_mut(&mut module.relative_static_methods);
-        for (name, data_type) in &mut module.data_types {
-            let contribution = match data_type {
-                oomir::DataType::Class {
-                    is_abstract,
-                    super_class,
-                    fields,
-                    methods,
-                    interfaces,
-                } => oomir::DataType::Class {
-                    is_abstract: *is_abstract,
-                    super_class: super_class.clone(),
-                    fields: fields.clone(),
-                    methods: std::mem::take(methods),
-                    interfaces: interfaces.clone(),
-                },
-                oomir::DataType::Interface {
-                    methods,
-                    interfaces,
-                    is_enum,
-                } => oomir::DataType::Interface {
-                    methods: std::mem::take(methods),
-                    interfaces: interfaces.clone(),
-                    is_enum: *is_enum,
-                },
-            };
-            Self::record_relative_static_methods(name, &contribution, relative_static_methods);
-            module.suppressed_data_types.insert(name.clone());
-
-            let variants = self.variants.entry(name.clone()).or_default();
-            let mut contribution = Some(contribution);
-            for existing in variants.iter_mut() {
-                if Self::try_merge(existing, contribution.as_ref().unwrap()) {
-                    contribution = None;
-                    break;
-                }
-            }
-            if let Some(contribution) = contribution {
-                variants.push(contribution);
-            }
-        }
-    }
-
-    fn record_relative_static_methods(
-        class_name: &str,
-        data_type: &oomir::DataType,
-        relative_static_methods: &mut HashSet<oomir::FunctionKey>,
-    ) {
-        let methods = match data_type {
-            oomir::DataType::Class { methods, .. } | oomir::DataType::Interface { methods, .. } => {
-                methods
-            }
-        };
-        for (method_name, method) in methods {
-            let oomir::DataTypeMethod::Function(function) = method else {
-                continue;
-            };
-            if function.signature.is_static && function.signature.supports_relative_pointer_abi() {
-                relative_static_methods.insert(oomir::FunctionKey::new(
-                    class_name,
-                    method_name,
-                    &function.signature,
-                ));
-            }
-        }
-    }
-
-    fn try_merge(existing: &mut oomir::DataType, incoming: &oomir::DataType) -> bool {
-        match (existing, incoming) {
-            (
-                oomir::DataType::Class {
-                    is_abstract: existing_abstract,
-                    super_class: existing_super,
-                    fields: existing_fields,
-                    methods: existing_methods,
-                    interfaces: existing_interfaces,
-                },
-                oomir::DataType::Class {
-                    is_abstract: incoming_abstract,
-                    super_class: incoming_super,
-                    fields: incoming_fields,
-                    methods: incoming_methods,
-                    interfaces: incoming_interfaces,
-                },
-            ) => {
-                if existing_abstract != incoming_abstract
-                    || existing_super != incoming_super
-                    || incoming_fields.iter().any(|(name, ty)| {
-                        existing_fields
-                            .iter()
-                            .find(|(existing_name, _)| existing_name == name)
-                            .is_some_and(|(_, existing_ty)| existing_ty != ty)
-                    })
-                    || incoming_methods.iter().any(|(name, method)| {
-                        existing_methods
-                            .get(name)
-                            .is_some_and(|existing| existing != method)
-                    })
-                {
-                    return false;
-                }
-                for (name, ty) in incoming_fields {
-                    if !existing_fields
-                        .iter()
-                        .any(|(existing_name, _)| existing_name == name)
-                    {
-                        existing_fields.push((name.clone(), ty.clone()));
-                    }
-                }
-                for (name, method) in incoming_methods {
-                    existing_methods
-                        .entry(name.clone())
-                        .or_insert_with(|| method.clone());
-                }
-                for interface in incoming_interfaces {
-                    if !existing_interfaces.contains(interface) {
-                        existing_interfaces.push(interface.clone());
-                    }
-                }
-                true
-            }
-            (
-                oomir::DataType::Interface {
-                    methods: existing_methods,
-                    interfaces: existing_interfaces,
-                    is_enum: existing_is_enum,
-                },
-                oomir::DataType::Interface {
-                    methods: incoming_methods,
-                    interfaces: incoming_interfaces,
-                    is_enum: incoming_is_enum,
-                },
-            ) => {
-                if existing_is_enum != incoming_is_enum
-                    || incoming_methods.iter().any(|(name, signature)| {
-                        existing_methods
-                            .get(name)
-                            .is_some_and(|existing| existing != signature)
-                    })
-                {
-                    return false;
-                }
-                for (name, signature) in incoming_methods {
-                    existing_methods
-                        .entry(name.clone())
-                        .or_insert_with(|| signature.clone());
-                }
-                for interface in incoming_interfaces {
-                    if !existing_interfaces.contains(interface) {
-                        existing_interfaces.push(interface.clone());
-                    }
-                }
-                true
-            }
-            _ => false,
-        }
-    }
-
-    fn into_modules(self, module_name: &str, source_file: Option<String>) -> Vec<oomir::Module> {
-        let Self {
-            variants,
-            external_interfaces,
-        } = self;
-        let shared_data_types = Arc::new(Self::shared_schemas(&variants));
-        let mut buckets = Vec::<HashMap<String, oomir::DataType>>::new();
-        let mut names = variants.into_iter().collect::<Vec<_>>();
-        names.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
-        for (name, variants) in names {
-            let nest_root = name.split('$').next().unwrap_or(&name);
-            let base_bucket = stable_hash::hash_value(&nest_root) as usize % MAX_CODEGEN_WORKERS;
-            for (variant, data_type) in variants.into_iter().enumerate() {
-                let bucket = base_bucket + variant * MAX_CODEGEN_WORKERS;
-                if buckets.len() <= bucket {
-                    buckets.resize_with(bucket + 1, HashMap::default);
-                }
-                buckets[bucket].insert(name.clone(), data_type);
-            }
-        }
-
-        let modules = buckets
-            .into_iter()
-            .filter(|data_types| !data_types.is_empty())
-            .map(|data_types| oomir::Module {
-                name: module_name.to_string(),
-                source_file: source_file.clone(),
-                functions: HashMap::default(),
-                data_types,
-                suppressed_data_types: HashSet::default(),
-                shared_data_types: Some(Arc::clone(&shared_data_types)),
-                relative_static_methods: Arc::new(HashSet::default()),
-                external_interfaces: external_interfaces.clone(),
-                statics: HashMap::default(),
-            })
-            .collect();
-        modules
-    }
-
-    fn shared_schemas(
-        variants: &HashMap<String, Vec<oomir::DataType>>,
-    ) -> HashMap<String, oomir::DataType> {
-        let mut schemas = HashMap::default();
-        for (name, variants) in variants {
-            let Some(first) = variants.first() else {
-                continue;
-            };
-            let mut schema = Self::schema_for(first);
-            for variant in variants.iter().skip(1) {
-                let _ = Self::try_merge(&mut schema, &Self::schema_for(variant));
-            }
-            if variants
-                .iter()
-                .any(|variant| matches!(variant, oomir::DataType::Interface { .. }))
-                && !matches!(schema, oomir::DataType::Interface { .. })
-            {
-                schema = variants
-                    .iter()
-                    .find(|variant| matches!(variant, oomir::DataType::Interface { .. }))
-                    .map(Self::schema_for)
-                    .expect("an interface variant was observed");
-            }
-            schemas.insert(name.clone(), schema);
-        }
-        schemas
-    }
-
-    fn schema_for(data_type: &oomir::DataType) -> oomir::DataType {
-        match data_type {
-            oomir::DataType::Class {
-                is_abstract,
-                super_class,
-                fields,
-                methods,
-                interfaces,
-            } => oomir::DataType::Class {
-                is_abstract: *is_abstract,
-                super_class: super_class.clone(),
-                fields: fields.clone(),
-                methods: methods
-                    .keys()
-                    .map(|name| {
-                        (
-                            name.clone(),
-                            oomir::DataTypeMethod::SimpleConstantReturn(oomir::Type::Void, None),
-                        )
-                    })
-                    .collect(),
-                interfaces: interfaces.clone(),
-            },
-            oomir::DataType::Interface {
-                methods,
-                interfaces,
-                is_enum,
-            } => oomir::DataType::Interface {
-                methods: methods
-                    .keys()
-                    .map(|name| {
-                        (
-                            name.clone(),
-                            oomir::DataTypeMethod::SimpleConstantReturn(oomir::Type::Void, None),
-                        )
-                    })
-                    .collect(),
-                interfaces: interfaces.clone(),
-                is_enum: *is_enum,
-            },
-        }
-    }
-}
-
-#[cfg(test)]
-mod canonical_data_type_registry_tests {
-    use super::*;
-
-    #[test]
-    fn mixed_interface_schema_keeps_only_method_stubs() {
-        let interface_method = oomir::DataTypeMethod::AdtHelperMethod {
-            kind: oomir::AdtHelperKind::StaticPartialEqEnum {
-                enum_class: "example/Mixed".to_string(),
-                variants: Vec::new(),
-            },
-        };
-        let variants = HashMap::from_iter([(
-            "example/Mixed".to_string(),
-            vec![
-                oomir::DataType::Class {
-                    is_abstract: false,
-                    super_class: None,
-                    fields: Vec::new(),
-                    methods: HashMap::default(),
-                    interfaces: Vec::new(),
-                },
-                oomir::DataType::Interface {
-                    methods: HashMap::from_iter([("eq".to_string(), interface_method)]),
-                    interfaces: Vec::new(),
-                    is_enum: true,
-                },
-            ],
-        )]);
-
-        let schemas = CanonicalDataTypeRegistry::shared_schemas(&variants);
-        let oomir::DataType::Interface {
-            methods, is_enum, ..
-        } = &schemas["example/Mixed"]
-        else {
-            panic!("the interface schema must take precedence");
-        };
-        assert!(*is_enum);
-        assert_eq!(
-            methods.get("eq"),
-            Some(&oomir::DataTypeMethod::SimpleConstantReturn(
-                oomir::Type::Void,
-                None,
-            ))
-        );
-    }
-}
+mod type_registry;
+use type_registry::CanonicalDataTypeRegistry;
 
 fn combine_class_bundles(path: &Path, bundles: &[(String, PathBuf)]) -> std::io::Result<()> {
     let mut output = BufWriter::new(std::fs::File::create(path)?);
     output.write_all(CLASS_BUNDLE_MAGIC)?;
     for (_, bundle_path) in bundles {
         let mut bundle = BufReader::new(std::fs::File::open(bundle_path)?);
-        let mut magic = [0u8; CLASS_BUNDLE_MAGIC.len()];
-        bundle.read_exact(&mut magic)?;
-        if &magic != CLASS_BUNDLE_MAGIC {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("{} is not a JVM class bundle", bundle_path.display()),
-            ));
-        }
+        bundle::read_magic(&mut bundle)?;
         std::io::copy(&mut bundle, &mut output)?;
     }
     output.flush()
 }
 
-fn mono_item_name<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> lower1::naming::FnNameData {
-    let instance_ty = tcx
-        .type_of(instance.def_id())
-        .instantiate(tcx, instance.args)
-        .skip_norm_wip();
-
-    if matches!(instance_ty.kind(), TyKind::Closure(..)) {
-        return lower1::naming::FnNameData {
-            class_to_call_on: Some(lower1::naming::mono_owner_class(tcx, instance)),
-            method_name: lower1::generate_closure_function_name(tcx, instance),
-        };
-    }
-
-    lower1::naming::mono_fn_name_from_instance(tcx, instance)
-}
-
-fn materialize_instance_receiver_pointer<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    instance: Instance<'tcx>,
-    receiver_ty: rustc_middle::ty::Ty<'tcx>,
-    receiver_class: &str,
-    function: &mut oomir::Function,
-    data_types: &mut HashMap<String, oomir::DataType>,
-) {
-    let Some((_, pointer_ty @ Type::Pointer(_))) = function.signature.params.first() else {
-        return;
-    };
-    let pointer_ty = pointer_ty.clone();
-    let size = lower1::types::layout_size_bytes(tcx, receiver_ty)
-        .unwrap_or_else(|error| panic!("could not determine instance receiver layout: {error}"));
-    let alignment = lower1::types::layout_align_bytes(tcx, receiver_ty)
-        .unwrap_or_else(|error| panic!("could not determine instance receiver alignment: {error}"));
-    let codec = lower1::types::pointer_memory_codec_operand(receiver_ty, tcx, data_types, instance);
-    let materialize = oomir::Instruction::InvokeStatic {
-        dest: Some(oomir::INSTANCE_RECEIVER_POINTER_LOCAL.to_string()),
-        class_name: oomir::POINTER_CLASS.to_string(),
-        method_name: "receiverCellAligned".to_string(),
-        method_ty: oomir::Signature {
-            params: vec![
-                (
-                    "value".to_string(),
-                    Type::Class("java/lang/Object".to_string()),
-                ),
-                ("size".to_string(), Type::I32),
-                ("codec".to_string(), Type::java_string()),
-                ("alignment".to_string(), Type::I32),
-            ],
-            ret: Box::new(pointer_ty),
-            is_static: true,
-        },
-        args: vec![
-            oomir::Operand::Variable {
-                name: "_1".to_string(),
-                ty: Type::Class(receiver_class.to_string()),
-            },
-            oomir::Operand::Constant(oomir::Constant::I32(
-                i32::try_from(size).expect("instance receiver exceeds the JVM address space"),
-            )),
-            codec,
-            oomir::Operand::Constant(oomir::Constant::I32(
-                i32::try_from(alignment)
-                    .expect("instance receiver alignment exceeds the JVM address space"),
-            )),
-        ],
-    };
-    let entry = function
-        .body
-        .basic_blocks
-        .get_mut(&function.body.entry)
-        .expect("OOMIR function has an entry block");
-    let insert_at = entry
-        .instructions
-        .iter()
-        .take_while(|instruction| {
-            matches!(
-                instruction,
-                oomir::Instruction::SourceLocation(_) | oomir::Instruction::LocalVariableScope(_)
-            )
-        })
-        .count();
-    entry.instructions.insert(insert_at, materialize);
-}
-
-fn place_or_insert_mono_function<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    instance: Instance<'tcx>,
-    name: &lower1::naming::FnNameData,
-    mut oomir_function: oomir::Function,
-    oomir_module: &mut oomir::Module,
-) {
-    let has_global_linkage = name
-        .class_to_call_on
-        .as_deref()
-        .is_some_and(lower1::naming::is_global_link_symbol_class);
-    if !has_global_linkage && let Some(assoc_item) = tcx.opt_associated_item(instance.def_id()) {
-        let clone_shim_self_ty = match instance.def {
-            InstanceKind::Shim(ShimKind::Clone(_, self_ty)) => Some(self_ty),
-            _ => None,
-        };
-        let provided_trait_receiver_ty = assoc_item
-            .trait_container(tcx)
-            .filter(|trait_def_id| {
-                tcx.provided_trait_methods(*trait_def_id)
-                    .any(|method| method.def_id == assoc_item.def_id)
-            })
-            .map(|_| instance.args.type_at(0));
-        let attachable_to_receiver_class = clone_shim_self_ty.is_some()
-            || (provided_trait_receiver_ty.is_some() && assoc_item.is_method())
-            || (assoc_item.trait_container(tcx).is_none()
-                && (assoc_item.trait_item_def_id().is_none() || assoc_item.is_method()));
-        if attachable_to_receiver_class {
-            let fallback_function = oomir_function.clone();
-            let container_id = assoc_item.container_id(tcx);
-            let container_ty = clone_shim_self_ty
-                .or(provided_trait_receiver_ty)
-                .unwrap_or_else(|| {
-                    tcx.type_of(container_id)
-                        .instantiate(tcx, instance.args)
-                        .skip_norm_wip()
-                });
-            let receiver_ty = assoc_item.is_method().then(|| {
-                tcx.fn_sig(instance.def_id())
-                    .instantiate(tcx, instance.args)
-                    .skip_binder()
-                    .inputs()
-                    .first()
-                    .copied()
-                    .expect("a Rust method has a receiver")
-            });
-            let has_arbitrary_self_receiver = receiver_ty.is_some_and(|receiver| {
-                let receiver_self = match receiver.kind() {
-                    TyKind::Ref(_, pointee, _) => *pointee,
-                    _ => receiver,
-                };
-                receiver_self != container_ty
-            });
-            // The method may be monomorphized in a downstream crate. Emit a
-            // receiver-class fragment there so the linker can attach it to the
-            // upstream class definition rather than leaving only a static copy.
-            let self_oomir_ty = lower1::types::force_define_named_adt(
-                container_ty,
-                tcx,
-                &mut oomir_module.data_types,
-                instance,
-            );
-
-            if !has_arbitrary_self_receiver && let Type::Class(class_name) = self_oomir_ty {
-                let can_extend_compiled_core_class = lower1::jvm_names::uses_compiled_core(tcx)
-                    && (instance.def_id().is_local()
-                        || lower1::jvm_names::compiles_external_core_instances(tcx));
-                let is_runtime_owned_class =
-                    class_name.starts_with("org/rustlang/") && !can_extend_compiled_core_class;
-                if !class_name.starts_with("java/") && !is_runtime_owned_class {
-                    if assoc_item.is_method() {
-                        oomir_function.signature.is_static = false;
-                    }
-                    oomir_function.name = lower1::naming::associated_method_name_from_instance(
-                        tcx,
-                        instance,
-                        &oomir_function.signature,
-                    );
-                    oomir_function.owner_class = None;
-
-                    let implemented_trait_def_id = assoc_item
-                        .impl_container(tcx)
-                        .and_then(|impl_def_id| tcx.impl_opt_trait_ref(impl_def_id))
-                        .map(|trait_ref| {
-                            trait_ref
-                                .instantiate(tcx, instance.args)
-                                .skip_norm_wip()
-                                .def_id
-                        })
-                        .or_else(|| assoc_item.trait_container(tcx));
-                    let implemented_trait = implemented_trait_def_id.map(|trait_def_id| {
-                        let trait_name = lower1::jvm_names::class_for_def_id(tcx, trait_def_id);
-                        ensure_trait_interface(tcx, trait_def_id, &mut oomir_module.data_types);
-                        oomir_function
-                            .signature
-                            .replace_class_in_signature(&trait_name, &class_name);
-                        trait_name
-                    });
-
-                    if assoc_item.is_method() {
-                        materialize_instance_receiver_pointer(
-                            tcx,
-                            instance,
-                            container_ty,
-                            &class_name,
-                            &mut oomir_function,
-                            &mut oomir_module.data_types,
-                        );
-                    }
-
-                    let mut has_instance_method = false;
-                    if let Some(
-                        oomir::DataType::Class {
-                            methods,
-                            interfaces,
-                            ..
-                        }
-                        | oomir::DataType::Interface {
-                            methods,
-                            interfaces,
-                            ..
-                        },
-                    ) = oomir_module.data_types.get_mut(&class_name)
-                    {
-                        let trait_method_matches_existing = implemented_trait.is_some()
-                            && methods.get(&oomir_function.name).is_some_and(|method| {
-                                matches!(method,
-                                    oomir::DataTypeMethod::Function(existing)
-                                        if existing.signature.to_string()
-                                            == oomir_function.signature.to_string())
-                            });
-                        if let Some(trait_name) = implemented_trait {
-                            if !interfaces.contains(&trait_name) {
-                                interfaces.push(trait_name);
-                            }
-                        }
-                        if trait_method_matches_existing {
-                            breadcrumbs::log!(
-                                breadcrumbs::LogLevel::Info,
-                                "mono-lowering",
-                                format!(
-                                    "Kept existing {}.{} for matching trait method; emitted {} as a static fallback",
-                                    class_name, oomir_function.name, name.method_name
-                                )
-                            );
-                            has_instance_method = true;
-                        } else {
-                            methods.insert(
-                                oomir_function.name.clone(),
-                                oomir::DataTypeMethod::Function(oomir_function.clone()),
-                            );
-
-                            breadcrumbs::log!(
-                                breadcrumbs::LogLevel::Info,
-                                "mono-lowering",
-                                format!(
-                                    "Placed mono item {} into class {}",
-                                    name.method_name, class_name
-                                )
-                            );
-                            // Rust can statically resolve an associated method
-                            // and name its monomorphized owner directly. Keep a
-                            // static copy under that canonical owner in addition
-                            // to the instance method used for JVM dispatch on the
-                            // concrete class.
-                            has_instance_method = true;
-                        }
-                    }
-
-                    if !has_instance_method {
-                        breadcrumbs::log!(
-                            breadcrumbs::LogLevel::Info,
-                            "mono-lowering",
-                            format!(
-                                "Class {} not declared for mono method {}; keeping it as an owned static function",
-                                class_name, name.method_name
-                            )
-                        );
-                    }
-                    oomir_function = fallback_function;
-                }
-            }
-        }
-    }
-
-    // Emit the canonical owner-module form used by statically resolved Rust
-    // calls. JVM module methods are static, so a Rust method's receiver must
-    // remain an explicit descriptor parameter in this form.
-    oomir_function.signature.is_static = true;
-    oomir_module.insert_function(oomir_function);
-}
-
-fn allocator_shim_target_signature(
-    method: &rustc_ast::expand::allocator::AllocatorMethod,
-) -> oomir::Signature {
-    use rustc_ast::expand::allocator::AllocatorTy;
-
-    let mut params = Vec::new();
-    for input in method.inputs {
-        match input.ty {
-            AllocatorTy::Layout => {
-                params.push((format!("{}_size", input.name), oomir::Type::U64));
-                params.push((format!("{}_align", input.name), oomir::Type::U64));
-            }
-            AllocatorTy::Ptr => params.push((
-                input.name.to_string(),
-                oomir::Type::Pointer(Box::new(oomir::Type::U8)),
-            )),
-            AllocatorTy::Usize => {
-                params.push((input.name.to_string(), oomir::Type::U64));
-            }
-            AllocatorTy::Never | AllocatorTy::ResultPtr | AllocatorTy::Unit => {
-                panic!("invalid allocator shim input type")
-            }
-        }
-    }
-
-    let ret = match method.output {
-        AllocatorTy::ResultPtr => oomir::Type::Pointer(Box::new(oomir::Type::U8)),
-        AllocatorTy::Never | AllocatorTy::Unit => oomir::Type::Void,
-        AllocatorTy::Layout | AllocatorTy::Ptr | AllocatorTy::Usize => {
-            panic!("invalid allocator shim output type")
-        }
-    };
-    oomir::Signature {
-        params,
-        ret: Box::new(ret),
-        is_static: true,
-    }
-}
-
-fn allocator_shim_source_signature(tcx: TyCtxt<'_>, source_name: &str) -> Option<oomir::Signature> {
-    let declaration = std::iter::once(LOCAL_CRATE)
-        .chain(tcx.crates(()).iter().copied())
-        .flat_map(|crate_num| tcx.foreign_modules(crate_num).values())
-        .flat_map(|module| module.foreign_items.iter().copied())
-        .find(|def_id| {
-            if tcx.def_kind(*def_id) != DefKind::Fn {
-                return false;
-            }
-            let name =
-                lower1::naming::mono_fn_name_from_instance(tcx, Instance::mono(tcx, *def_id));
-            name.method_name == source_name
-                && name
-                    .class_to_call_on
-                    .as_deref()
-                    .is_some_and(lower1::naming::is_global_link_symbol_class)
-        })?;
-    let instance = Instance::mono(tcx, declaration);
-    let instance_ty = tcx
-        .type_of(declaration)
-        .instantiate(tcx, instance.args)
-        .skip_norm_wip();
-    Some(lower1::types::fn_ptr_signature_from_ty(
-        instance_ty,
-        tcx,
-        &mut HashMap::default(),
-        instance,
-    ))
-}
-
-fn allocator_shim_call(
-    source_signature: &oomir::Signature,
-    target_signature: &oomir::Signature,
-    target_name: String,
-    result: Option<String>,
-) -> Vec<oomir::Instruction> {
-    assert_eq!(
-        source_signature.params.len(),
-        target_signature.params.len(),
-        "allocator shim source and target parameter counts differ"
-    );
-
-    let mut instructions = Vec::new();
-    let mut args = Vec::new();
-    for (index, ((_, source_ty), (_, target_ty))) in source_signature
-        .params
-        .iter()
-        .zip(&target_signature.params)
-        .enumerate()
-    {
-        let source = oomir::Operand::Variable {
-            name: format!("_{}", index + 1),
-            ty: source_ty.clone(),
-        };
-        if source_ty == target_ty {
-            args.push(source);
-        } else if let (oomir::Type::Class(class_name), oomir::Type::U64) = (source_ty, target_ty) {
-            // Rust exposes Alignment nominally, while the default allocator keeps its usize ABI.
-            let converted = format!("converted_arg_{index}");
-            instructions.push(oomir::Instruction::InvokeStatic {
-                class_name: class_name.clone(),
-                method_name: "as_usize".to_string(),
-                method_ty: oomir::Signature {
-                    params: vec![("value".to_string(), source_ty.clone())],
-                    ret: Box::new(oomir::Type::U64),
-                    is_static: true,
-                },
-                args: vec![source],
-                dest: Some(converted.clone()),
-            });
-            args.push(oomir::Operand::Variable {
-                name: converted,
-                ty: oomir::Type::U64,
-            });
-        } else {
-            panic!(
-                "unsupported allocator ABI argument conversion from {source_ty:?} to {target_ty:?}"
-            );
-        }
-    }
-
-    instructions.push(oomir::Instruction::InvokeStatic {
-        class_name: lower1::naming::global_link_symbol_class(&target_name),
-        method_name: target_name,
-        method_ty: target_signature.clone(),
-        args,
-        dest: result,
-    });
-    instructions
-}
-
-fn emit_allocator_shims(tcx: TyCtxt<'_>, oomir_module: &mut oomir::Module) {
-    use rustc_ast::expand::allocator::{
-        ALLOCATOR_METHODS, AllocatorTy, NO_ALLOC_SHIM_IS_UNSTABLE, default_fn_name, global_fn_name,
-    };
-
-    let allocator_kind = rustc_codegen_ssa::base::allocator_kind_for_codegen(tcx);
-    let methods = if let Some(kind) = allocator_kind {
-        rustc_codegen_ssa::base::allocator_shim_contents(tcx, kind)
-    } else {
-        // Native rlibs defer their allocator choice until a later link. A
-        // packaged JVM JAR is already the runnable artifact, so a crate with
-        // the allocator ABI in scope needs default wrappers in its own output.
-        let global_alloc =
-            lower1::jvm_names::member_name(&global_fn_name(ALLOCATOR_METHODS[0].name));
-        if allocator_shim_source_signature(tcx, &global_alloc).is_none() {
-            return;
-        }
-        ALLOCATOR_METHODS.to_vec()
-    };
-    for method in methods {
-        let source_name = lower1::jvm_names::member_name(&global_fn_name(method.name));
-        let target_name = lower1::jvm_names::member_name(&default_fn_name(method.name));
-        let mut signature = allocator_shim_source_signature(tcx, &source_name)
-            .unwrap_or_else(|| panic!("allocator ABI declaration `{source_name}` was not found"));
-        let target_signature = allocator_shim_target_signature(&method);
-        for ((_, source_ty), (_, target_ty)) in
-            signature.params.iter_mut().zip(&target_signature.params)
-        {
-            if let (oomir::Type::Class(class_name), oomir::Type::Pointer(_)) =
-                (&*source_ty, target_ty)
-                && oomir::is_non_null_class_name(class_name)
-            {
-                // Global-link lowering already exposes NonNull as the raw JVM pointer carrier.
-                *source_ty = target_ty.clone();
-            }
-        }
-        assert_eq!(
-            signature.ret.to_jvm_return_descriptor(),
-            target_signature.ret.to_jvm_return_descriptor(),
-            "allocator shim source and target JVM return types differ"
-        );
-        let result = matches!(method.output, AllocatorTy::ResultPtr).then(|| "result".to_string());
-        let mut instructions =
-            allocator_shim_call(&signature, &target_signature, target_name, result.clone());
-        if matches!(method.output, AllocatorTy::Never) {
-            instructions.push(oomir::Instruction::ThrowNewWithMessage {
-                exception_class: "java/lang/AssertionError".to_string(),
-                message: "Diverging allocator call returned unexpectedly".to_string(),
-            });
-        } else {
-            instructions.push(oomir::Instruction::Return {
-                operand: result.map(|name| oomir::Operand::Variable {
-                    name,
-                    ty: signature.ret.as_ref().clone(),
-                }),
-            });
-        }
-
-        let entry = "entry".to_string();
-        oomir_module.insert_function(oomir::Function {
-            owner_class: Some(lower1::naming::global_link_symbol_class(&source_name)),
-            name: source_name,
-            signature,
-            debug_variables: Vec::new(),
-            body: oomir::CodeBlock {
-                entry: entry.clone(),
-                basic_blocks: HashMap::from_iter([(
-                    entry.clone(),
-                    oomir::BasicBlock {
-                        label: entry,
-                        instructions,
-                    },
-                )]),
-            },
-        });
-    }
-
-    let entry = "entry".to_string();
-    let symbol_name = lower1::jvm_names::member_name(NO_ALLOC_SHIM_IS_UNSTABLE);
-    oomir_module.insert_function(oomir::Function {
-        owner_class: Some(lower1::naming::global_link_symbol_class(&symbol_name)),
-        name: symbol_name,
-        signature: oomir::Signature {
-            params: Vec::new(),
-            ret: Box::new(oomir::Type::Void),
-            is_static: true,
-        },
-        debug_variables: Vec::new(),
-        body: oomir::CodeBlock {
-            entry: entry.clone(),
-            basic_blocks: HashMap::from_iter([(
-                entry.clone(),
-                oomir::BasicBlock {
-                    label: entry,
-                    instructions: vec![oomir::Instruction::Return { operand: None }],
-                },
-            )]),
-        },
-    });
-}
+mod allocator_shims;
+use allocator_shims::emit_allocator_shims;
 
 fn lower_mono_function<'tcx>(
     tcx: TyCtxt<'tcx>,
     instance: Instance<'tcx>,
-    oomir_module: &mut oomir::Module,
+    oomir_module: &mut lower1::context::Module<'tcx>,
     lowered_instances: &mut HashSet<Instance<'tcx>>,
 ) {
     let is_external_runtime_item = !instance.def_id().is_local()
@@ -1050,7 +216,8 @@ fn lower_mono_function<'tcx>(
                     ],
                 },
             )]),
-        };
+        }
+        .into();
     }
     place_or_insert_mono_function(tcx, instance, &name, oomir_function, oomir_module);
 }
@@ -1059,7 +226,7 @@ fn lower_codegen_unit_items<'tcx>(
     tcx: TyCtxt<'tcx>,
     mono_items: impl IntoIterator<Item = MonoItem<'tcx>>,
     partitioned_functions: &HashSet<Instance<'tcx>>,
-    oomir_module: &mut oomir::Module,
+    oomir_module: &mut lower1::context::Module<'tcx>,
     claimed_mono_items: &mut HashSet<MonoItem<'tcx>>,
     lowered_instances: &mut HashSet<Instance<'tcx>>,
     scanned_instances: &mut HashSet<Instance<'tcx>>,
@@ -1100,7 +267,7 @@ fn lower_supplemental_instance_closure<'tcx>(
     tcx: TyCtxt<'tcx>,
     roots: impl IntoIterator<Item = Instance<'tcx>>,
     partitioned_functions: &HashSet<Instance<'tcx>>,
-    oomir_module: &mut oomir::Module,
+    oomir_module: &mut lower1::context::Module<'tcx>,
     lowered_instances: &mut HashSet<Instance<'tcx>>,
     scanned_instances: &mut HashSet<Instance<'tcx>>,
 ) {
@@ -1310,257 +477,14 @@ fn direct_mir_callees<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> Vec<
     callees
 }
 
-fn ensure_trait_interface<'tcx>(
+mod java_exports;
+use java_exports::*;
+
+fn empty_oomir_module<'tcx>(
     tcx: TyCtxt<'tcx>,
-    trait_def_id: DefId,
-    data_types: &mut HashMap<String, oomir::DataType>,
-) {
-    let interface_name = lower1::jvm_names::class_for_def_id(tcx, trait_def_id);
-    let methods = trait_interface_methods(tcx, trait_def_id, &interface_name, data_types);
-
-    match data_types.get_mut(&interface_name) {
-        Some(oomir::DataType::Interface {
-            methods: existing_methods,
-            ..
-        }) => {
-            existing_methods.extend(
-                methods
-                    .into_iter()
-                    .map(|(name, signature)| (name, oomir::DataTypeMethod::Abstract(signature))),
-            );
-        }
-        Some(oomir::DataType::Class { .. }) => {
-            breadcrumbs::log!(
-                breadcrumbs::LogLevel::Warn,
-                "mono-lowering",
-                format!(
-                    "Trait interface '{}' already exists as a class; leaving it unchanged",
-                    interface_name
-                )
-            );
-        }
-        None => {
-            data_types.insert(
-                interface_name,
-                oomir::DataType::Interface {
-                    methods: methods
-                        .into_iter()
-                        .map(|(name, signature)| (name, oomir::DataTypeMethod::Abstract(signature)))
-                        .collect(),
-                    interfaces: vec![],
-                    is_enum: false,
-                },
-            );
-        }
-    }
-}
-
-fn trait_interface_methods<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    trait_def_id: DefId,
-    interface_name: &str,
-    data_types: &mut HashMap<String, oomir::DataType>,
-) -> HashMap<String, oomir::Signature> {
-    let mut methods = HashMap::default();
-
-    for assoc_item in tcx.associated_items(trait_def_id).in_definition_order() {
-        let def_id = assoc_item.def_id;
-        // Trait functions without a receiver are statically dispatched. JVM
-        // interfaces cannot declare an abstract static method, so only methods
-        // which participate in interface dispatch belong in this table.
-        if !assoc_item.is_method() {
-            continue;
-        }
-
-        let mir_sig = tcx.type_of(def_id).skip_binder().fn_sig(tcx);
-        let params_ty = mir_sig.inputs();
-        let return_ty = mir_sig.output();
-        let explicit_inputs = params_ty.skip_binder();
-        let output = return_ty.skip_binder();
-        let instance = Instance::new_raw(
-            def_id,
-            rustc_middle::ty::GenericArgs::identity_for_item(tcx, def_id),
-        );
-        let has_open_abi_type = |ty: rustc_middle::ty::Ty<'tcx>| {
-            lower1::types::has_open_jvm_abi_type(ty, tcx, instance)
-        };
-        if explicit_inputs
-            .iter()
-            .skip(1)
-            .copied()
-            .any(has_open_abi_type)
-            || has_open_abi_type(output)
-        {
-            continue;
-        }
-        let params_oomir: Vec<(String, oomir::Type)> = explicit_inputs
-            .iter()
-            .enumerate()
-            .filter_map(|(i, ty)| {
-                if assoc_item.is_method() && i == 0 {
-                    None
-                } else {
-                    let param_name = format!("arg{}", i);
-                    let oomir_type =
-                        lower1::types::ty_to_erased_oomir_type(*ty, tcx, data_types, instance);
-                    Some((param_name, oomir_type))
-                }
-            })
-            .collect();
-        let return_oomir_ty =
-            lower1::types::ty_to_erased_oomir_type(output, tcx, data_types, instance);
-
-        let mut signature = oomir::Signature {
-            params: params_oomir,
-            ret: Box::new(return_oomir_ty),
-            is_static: false,
-        };
-        let (params_changed, _) = signature.replace_class_in_signature("Self", interface_name);
-
-        if params_changed {
-            signature.is_static = false;
-        }
-
-        methods.insert(assoc_item.name().as_str().to_string(), signature);
-    }
-
-    methods
-}
-
-fn crate_emits_library_artifact(tcx: TyCtxt<'_>) -> bool {
-    tcx.crate_types()
-        .iter()
-        .any(|crate_type| !matches!(crate_type, CrateType::Executable))
-}
-
-fn is_lowerable_java_public_function(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
-    if !matches!(tcx.def_kind(def_id), DefKind::Fn | DefKind::AssocFn) {
-        return false;
-    }
-
-    if let Some(assoc_item) = tcx.opt_associated_item(def_id) {
-        if assoc_item.trait_container(tcx).is_some() {
-            return false;
-        }
-        if tcx.crate_name(LOCAL_CRATE) == rustc_span::sym::core
-            && assoc_item.impl_container(tcx).is_some()
-        {
-            return false;
-        }
-    }
-
-    def_id.is_local()
-        && !tcx.generics_of(def_id).requires_monomorphization(tcx)
-        && tcx.is_mir_available(def_id)
-}
-
-enum JavaPublicSurface {
-    Exported,
-    Reachable,
-}
-
-fn java_public_surface_def_ids(tcx: TyCtxt<'_>, surface: JavaPublicSurface) -> Vec<DefId> {
-    let effective_visibilities = tcx.effective_visibilities(());
-    let mut def_ids: Vec<_> = effective_visibilities
-        .iter()
-        .filter_map(|(&local_def_id, _)| {
-            let is_public_enough = match surface {
-                JavaPublicSurface::Exported => effective_visibilities.is_exported(local_def_id),
-                JavaPublicSurface::Reachable => effective_visibilities.is_reachable(local_def_id),
-            };
-            is_public_enough.then_some(local_def_id.to_def_id())
-        })
-        .collect();
-
-    def_ids.sort_by_cached_key(|def_id| tcx.def_path_str(*def_id));
-    def_ids
-}
-
-fn materialize_java_public_data_type<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    def_id: DefId,
-    oomir_module: &mut oomir::Module,
-) {
-    match tcx.def_kind(def_id) {
-        DefKind::Struct | DefKind::Enum | DefKind::Union => {
-            if !tcx.generics_of(def_id).own_params.is_empty() {
-                return;
-            }
-            let item_ty = tcx.type_of(def_id).instantiate_identity().skip_norm_wip();
-            let instance_context =
-                Instance::new_raw(def_id, GenericArgs::identity_for_item(tcx, def_id));
-            lower1::types::ty_to_oomir_type(
-                item_ty,
-                tcx,
-                &mut oomir_module.data_types,
-                instance_context,
-            );
-        }
-        DefKind::Trait => ensure_trait_interface(tcx, def_id, &mut oomir_module.data_types),
-        _ => {}
-    }
-}
-
-fn lower_public_library_exports<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    partitioned_functions: &HashSet<Instance<'tcx>>,
-    oomir_module: &mut oomir::Module,
-    lowered_instances: &mut HashSet<Instance<'tcx>>,
-    scanned_instances: &mut HashSet<Instance<'tcx>>,
-) {
-    if !crate_emits_library_artifact(tcx) {
-        return;
-    }
-
-    let function_defs = java_public_surface_def_ids(tcx, JavaPublicSurface::Exported)
-        .into_iter()
-        .filter(|def_id| is_lowerable_java_public_function(tcx, *def_id))
-        .collect::<Vec<_>>();
-    let mut function_roots = function_defs
-        .iter()
-        .copied()
-        .map(|def_id| Instance::mono(tcx, def_id))
-        .collect::<Vec<_>>();
-    for function_def in &function_defs {
-        let Some(local_def) = function_def.as_local() else {
-            continue;
-        };
-        for nested_def in tcx.nested_bodies_within(local_def) {
-            let coroutine_def = nested_def.to_def_id();
-            if !tcx.coroutine_is_async(coroutine_def) {
-                continue;
-            }
-            let coroutine_ty = tcx
-                .type_of(coroutine_def)
-                .instantiate_identity()
-                .skip_norm_wip();
-            let TyKind::Coroutine(_, args) = coroutine_ty.kind() else {
-                continue;
-            };
-            function_roots.push(Instance::new_raw(coroutine_def, args));
-        }
-    }
-    // Rustc's collector owns ordinary Rust reachability. Java exports are
-    // additional roots. Async state-machine bodies are also roots because a
-    // JVM caller polls them through RustFuture rather than an ordinary MIR call.
-    lower_supplemental_instance_closure(
-        tcx,
-        function_roots,
-        partitioned_functions,
-        oomir_module,
-        lowered_instances,
-        scanned_instances,
-    );
-
-    let data_type_defs = java_public_surface_def_ids(tcx, JavaPublicSurface::Reachable);
-
-    for def_id in data_type_defs {
-        materialize_java_public_data_type(tcx, def_id, oomir_module);
-    }
-}
-
-fn empty_oomir_module(tcx: TyCtxt<'_>, name: &str) -> oomir::Module {
-    lower1::types::reset_type_lowering_cache();
+    name: &str,
+    shared: lower1::context::Shared<'tcx>,
+) -> lower1::context::Module<'tcx> {
     oomir::Module {
         name: name.to_string(),
         source_file: tcx
@@ -1568,7 +492,7 @@ fn empty_oomir_module(tcx: TyCtxt<'_>, name: &str) -> oomir::Module {
             .local_crate_source_file()
             .map(|file_name| rustc_span::FileName::Real(file_name).short().to_string()),
         functions: HashMap::default(),
-        data_types: HashMap::default(),
+        data_types: lower1::context::Definitions::new(shared),
         suppressed_data_types: HashSet::default(),
         shared_data_types: None,
         relative_static_methods: Arc::new(HashSet::default()),
@@ -1577,28 +501,8 @@ fn empty_oomir_module(tcx: TyCtxt<'_>, name: &str) -> oomir::Module {
     }
 }
 
-fn prepare_oomir_shard(shard_name: &str, mut oomir_module: oomir::Module) -> oomir::Module {
-    // Intrinsic use is registered while MIR is lowered. Drain the registry per
-    // shard so no crate-wide OOMIR state has to remain alive.
-    let needed_intrinsics = lower1::control_flow::take_needed_intrinsics();
-    if !needed_intrinsics.is_empty() {
-        breadcrumbs::log!(
-            breadcrumbs::LogLevel::Info,
-            "intrinsics",
-            format!(
-                "Emitting {} checked arithmetic intrinsics for {shard_name}: {:?}",
-                needed_intrinsics.len(),
-                needed_intrinsics
-            )
-        );
-        let intrinsic_class = lower1::control_flow::checked_intrinsics::emit_all_needed_intrinsics(
-            &needed_intrinsics,
-        );
-        oomir_module
-            .data_types
-            .insert("RustcCodegenJVMIntrinsics".to_string(), intrinsic_class);
-    }
-
+fn prepare_oomir_shard(module: lower1::context::Module<'_>) -> oomir::Module {
+    let mut oomir_module = module.map_definitions(lower1::context::Definitions::finish);
     for data_type in oomir_module.data_types.values_mut() {
         data_type.clean_duplicates();
     }
@@ -1619,20 +523,6 @@ fn emit_oomir_shard(
         "backend",
         format!(
             "OOMIR shard {shard_name} contains {} functions, {} data types, and {} statics",
-            oomir_module.functions.len(),
-            oomir_module.data_types.len(),
-            oomir_module.statics.len()
-        )
-    );
-
-    let oomir_module = optimise1::optimise_module(oomir_module);
-    metrics::record_oomir_after_optimise1(&oomir_module);
-
-    breadcrumbs::log!(
-        breadcrumbs::LogLevel::Info,
-        "optimisation",
-        format!(
-            "Optimised OOMIR shard {shard_name} contains {} functions, {} data types, and {} statics",
             oomir_module.functions.len(),
             oomir_module.data_types.len(),
             oomir_module.statics.len()
@@ -1689,49 +579,40 @@ impl CodegenBackend for MyBackend {
                 let worker_count = std::thread::available_parallelism()
                     .map_or(1, std::num::NonZeroUsize::get)
                     .min(MAX_CODEGEN_WORKERS);
-                let (job_sender, job_receiver) =
-                    mpsc::sync_channel::<(usize, String, oomir::Module, bool)>(
-                        OOMIR_SHARD_QUEUE_DEPTH,
-                    );
-                let job_receiver = Arc::new(Mutex::new(job_receiver));
-                let (result_sender, result_receiver) = mpsc::channel();
-
-                for _ in 0..worker_count {
-                    let job_receiver = Arc::clone(&job_receiver);
-                    let result_sender = result_sender.clone();
-                    let emitted_class_registry = &emitted_class_registry;
-                    scope.spawn(move || {
-                        loop {
-                            let job = {
-                                let receiver = job_receiver
-                                    .lock()
-                                    .expect("OOMIR shard receiver lock was poisoned");
-                                receiver.recv()
-                            };
-                            let Ok((ordinal, shard_name, module, emit_runtime_views)) = job else {
-                                break;
-                            };
-                            let generated = emit_oomir_shard(
+                let mut workers = pipeline::start(
+                    scope,
+                    worker_count,
+                    OOMIR_SHARD_QUEUE_DEPTH,
+                    |(ordinal, shard_name, module, emit_runtime_views): (
+                        usize,
+                        String,
+                        oomir::Module,
+                        bool,
+                    )| {
+                        (
+                            ordinal,
+                            emit_oomir_shard(
                                 &shard_name,
                                 module,
                                 emit_runtime_views,
                                 debug_info,
-                                emitted_class_registry,
-                            );
-                            result_sender
-                                .send((ordinal, generated))
-                                .expect("OOMIR shard result receiver was dropped");
-                        }
-                    });
-                }
-                drop(result_sender);
+                                &emitted_class_registry,
+                            ),
+                        )
+                    },
+                );
 
                 let mut canonical_data_types = CanonicalDataTypeRegistry::default();
+                let shared_lowering = lower1::context::Shared::default();
                 let mut submitted = 0usize;
 
                 // Java exports are supplemental roots and are small enough to
                 // stream as their own job while ordinary owners are lowered.
-                let mut export_module = empty_oomir_module(tcx, &crate_module_class);
+                let mut export_module = empty_oomir_module(
+                    tcx,
+                    &crate_module_class,
+                    std::rc::Rc::clone(&shared_lowering),
+                );
                 lower_public_library_exports(
                     tcx,
                     &partitioned_functions,
@@ -1740,11 +621,9 @@ impl CodegenBackend for MyBackend {
                     &mut scanned_instances,
                 );
                 emit_allocator_shims(tcx, &mut export_module);
-                let mut export_module = prepare_oomir_shard("java-exports", export_module);
+                let mut export_module = prepare_oomir_shard(export_module);
                 canonical_data_types.collect(&mut export_module);
-                job_sender
-                    .send((submitted, "java-exports".to_string(), export_module, true))
-                    .expect("OOMIR shard workers stopped unexpectedly");
+                workers.submit((submitted, "java-exports".to_string(), export_module, true));
                 submitted += 1;
 
                 // Repartition native CGUs by final JVM owner. This prevents
@@ -1769,7 +648,11 @@ impl CodegenBackend for MyBackend {
                 for (index, (owner, items)) in items_by_owner.into_iter().enumerate() {
                     let shard_name =
                         format!("jvm-class-{index}-{}", stable_hash::short_hash(&owner, 8));
-                    let mut module = empty_oomir_module(tcx, &crate_module_class);
+                    let mut module = empty_oomir_module(
+                        tcx,
+                        &crate_module_class,
+                        std::rc::Rc::clone(&shared_lowering),
+                    );
                     lower_codegen_unit_items(
                         tcx,
                         items,
@@ -1779,13 +662,13 @@ impl CodegenBackend for MyBackend {
                         &mut lowered_instances,
                         &mut scanned_instances,
                     );
-                    let mut module = prepare_oomir_shard(&shard_name, module);
+                    let mut module = prepare_oomir_shard(module);
                     canonical_data_types.collect(&mut module);
-                    job_sender
-                        .send((submitted, shard_name, module, false))
-                        .expect("OOMIR shard workers stopped unexpectedly");
+                    workers.submit((submitted, shard_name, module, false));
                     submitted += 1;
                 }
+
+                drop(shared_lowering);
 
                 let canonical_source_file = tcx
                     .sess
@@ -1797,21 +680,10 @@ impl CodegenBackend for MyBackend {
                     .enumerate()
                 {
                     let shard_name = format!("canonical-types-{index}");
-                    job_sender
-                        .send((submitted, shard_name, module, false))
-                        .expect("OOMIR shard workers stopped unexpectedly");
+                    workers.submit((submitted, shard_name, module, false));
                     submitted += 1;
                 }
-                drop(job_sender);
-
-                let mut results = Vec::with_capacity(submitted);
-                for _ in 0..submitted {
-                    results.push(
-                        result_receiver
-                            .recv()
-                            .expect("OOMIR shard worker stopped without a result"),
-                    );
-                }
+                let mut results = workers.finish();
                 results.sort_by_key(|(ordinal, _)| *ordinal);
                 results
                     .into_iter()
