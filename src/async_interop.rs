@@ -88,7 +88,8 @@ fn poll_function(
                     instructions,
                 },
             )]),
-        },
+        }
+        .into(),
     }
 }
 
