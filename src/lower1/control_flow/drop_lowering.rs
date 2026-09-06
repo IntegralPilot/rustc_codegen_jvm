@@ -81,8 +81,7 @@ pub(in crate::lower1) fn emit_rust_drop_value<'tcx>(
                         pointer_rust_ty = field_rust_ty;
                     }
                     let drop_instance = Instance::resolve_drop_glue(tcx, pointee_ty);
-                    let target =
-                        crate::lower1::naming::mono_fn_name_from_instance(tcx, drop_instance);
+                    let target = data_types.function_name(tcx, drop_instance);
                     let pointee_signature = oomir::Signature {
                         params: vec![("pointee".to_string(), pointer_ty)],
                         ret: Box::new(oomir::Type::Void),
@@ -376,7 +375,7 @@ pub(in crate::lower1) fn emit_rust_drop_value<'tcx>(
                 return;
             }
             let drop_instance = Instance::resolve_drop_glue(tcx, *element_ty);
-            let target = crate::lower1::naming::mono_fn_name_from_instance(tcx, drop_instance);
+            let target = data_types.function_name(tcx, drop_instance);
             let drop_mir = tcx.instance_mir(drop_instance.def);
             let drop_param_ty = EarlyBinder::bind(
                 tcx,
@@ -482,7 +481,7 @@ pub(in crate::lower1) fn emit_rust_drop_value<'tcx>(
                 ],
             });
             let drop_instance = Instance::resolve_drop_glue(tcx, rust_ty);
-            let target = crate::lower1::naming::mono_fn_name_from_instance(tcx, drop_instance);
+            let target = data_types.function_name(tcx, drop_instance);
             instructions.push(oomir::Instruction::InvokeStatic {
                 class_name: target
                     .class_to_call_on

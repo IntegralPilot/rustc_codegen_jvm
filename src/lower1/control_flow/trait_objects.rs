@@ -5,7 +5,7 @@ use rustc_middle::ty::{Instance, Ty, TyCtxt, TyKind, TypingEnv, VtblEntry};
 
 use super::super::{
     jvm_names,
-    naming::{mono_fn_name_from_instance, mono_owner_class},
+    naming::mono_owner_class,
     types::{
         pointer_view_codec_operand, readable_rust_type_name, sanitize_name_token, ty_to_oomir_type,
     },
@@ -445,7 +445,7 @@ pub(crate) fn ensure_trait_object_adapter_class_for_pointees<'tcx>(
             ret: Box::new(return_ty.clone()),
             is_static: true,
         };
-        let target_name = mono_fn_name_from_instance(tcx, *target_instance);
+        let target_name = data_types.function_name(tcx, *target_instance);
         let method_def_id = if is_coroutine {
             tcx.opt_associated_item(target_instance.def_id())
                 .and_then(|item| item.trait_item_def_id())
@@ -648,7 +648,7 @@ pub(crate) fn ensure_trait_object_adapter_class_for_pointees<'tcx>(
         && matches!(carrier_ty, oomir::Type::Pointer(_));
     if adapter_drops_payload {
         let drop_instance = Instance::resolve_drop_glue(tcx, concrete_ty);
-        let target = mono_fn_name_from_instance(tcx, drop_instance);
+        let target = data_types.function_name(tcx, drop_instance);
         let payload_name = "_trait_object_drop_payload".to_string();
         adapter_methods.insert(
             "rustDrop".to_string(),

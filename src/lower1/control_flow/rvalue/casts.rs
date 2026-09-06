@@ -75,8 +75,7 @@ impl<'tcx> RvalueContext<'_, 'tcx> {
                             substs.no_bound_vars().unwrap(),
                         )
                         .unwrap();
-                        let fn_name =
-                            crate::lower1::naming::mono_fn_name_from_instance(tcx, func_instance);
+                        let fn_name = data_types.function_name(tcx, func_instance);
                         let signature =
                             fn_ptr_signature_from_ty(*target_mir_ty, tcx, data_types, instance);
                         let interface_name =

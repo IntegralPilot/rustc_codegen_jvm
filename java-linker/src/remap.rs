@@ -219,7 +219,7 @@ pub(crate) fn import_constant(
     Ok(target_index)
 }
 
-pub(crate) fn constant_pool_index(constants: &ConstantPool<'static>) -> HashMap<ConstantKey, u16> {
+pub(crate) fn constant_pool_index(constants: &ConstantPool<'_>) -> HashMap<ConstantKey, u16> {
     let mut target_constants = HashMap::default();
     target_constants.reserve(constants.len());
     for raw_index in 1..=constants.len() {

@@ -42,6 +42,7 @@ pub(crate) fn link(
         .tempdir_in(parent)?;
     let staged = temporary.path().join("output.jar");
     let mut jar = jar::Writer::create(&staged, index.mains.iter().next().map(String::as_str))?;
+    let readers = Readers::open(&index)?;
     let mut start = 0;
     while start < index.groups.len() {
         let mut end = start;
@@ -56,18 +57,23 @@ pub(crate) fn link(
         }
         // A single oversized class group is indivisible. All other live input
         // bytes are bounded by BATCH_BYTES, independent of the whole program.
+        let chunk = (end - start).div_ceil(rayon::current_num_threads()).max(1);
         let merged = index.groups[start..end]
-            .par_iter()
-            .map_init(Readers::default, |readers, group| {
-                merge_group(readers.load(&index.paths, group)?)
+            .par_chunks(chunk)
+            .map(|groups| {
+                jar::Batch::encode(
+                    groups
+                        .iter()
+                        .map(|group| merge_group(readers.load(&index.paths, group)?)),
+                )
             })
             .collect::<io::Result<Vec<_>>>()?;
-        for class in merged {
+        for batch in merged {
             if let Some(metrics) = &mut metrics {
-                metrics.merged_classes += 1;
-                metrics.merged_class_bytes += class.data.len();
+                metrics.merged_classes += batch.classes;
+                metrics.merged_class_bytes += batch.bytes;
             }
-            jar.class(&class)?;
+            jar.batch(batch)?;
         }
         start = end;
     }

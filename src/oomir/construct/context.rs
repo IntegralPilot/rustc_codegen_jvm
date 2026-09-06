@@ -122,7 +122,7 @@ impl Context {
     ) -> Option<Vec<(String, String, oomir::Type)>> {
         let mut path = Vec::new();
         for _ in 0..64 {
-            if from.to_jvm_descriptor() == to.to_jvm_descriptor() {
+            if from.same_jvm_type(to) {
                 return Some(path);
             }
             let oomir::Type::Class(owner) = from else {

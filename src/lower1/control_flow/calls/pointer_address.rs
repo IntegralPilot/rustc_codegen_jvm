@@ -201,7 +201,7 @@ pub(super) fn map_address<'tcx>(
                 generic_args.no_bound_vars().unwrap(),
             )
             .expect("map_addr function item resolves");
-            let target = crate::lower1::naming::mono_fn_name_from_instance(tcx, mapper_instance);
+            let target = data_types.function_name(tcx, mapper_instance);
             let mapper_signature = mapper_ty.fn_sig(tcx).skip_binder();
             let mapper_input_oomir_ty = crate::lower1::types::ty_to_oomir_type(
                 mapper_signature.inputs()[0],

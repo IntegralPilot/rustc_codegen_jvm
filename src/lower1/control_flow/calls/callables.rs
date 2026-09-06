@@ -71,7 +71,7 @@ pub(super) fn function_item<'tcx>(
             &mut instructions,
         ));
     }
-    let target = crate::lower1::naming::mono_fn_name_from_instance(tcx, function_item);
+    let target = data_types.function_name(tcx, function_item);
     instructions.push(oomir::Instruction::InvokeRustStatic {
         class_name: target
             .class_to_call_on
@@ -126,7 +126,7 @@ pub(super) fn ordinary_call<'tcx>(
             crate::lower1::generate_closure_function_name(tcx, func_instance),
         )
     } else {
-        let fn_name_data = crate::lower1::naming::mono_fn_name_from_instance(tcx, func_instance);
+        let fn_name_data = data_types.function_name(tcx, func_instance);
         (
             fn_name_data
                 .class_to_call_on

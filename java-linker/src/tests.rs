@@ -694,3 +694,55 @@ fn indexed_pipeline_merges_fragments_and_preserves_output_on_failure() {
     );
     assert_eq!(std::fs::read(output).unwrap(), previous);
 }
+
+#[test]
+fn parallel_batches_preserve_every_class_and_library_precedence() {
+    let directory = tempdir().unwrap();
+    let input = directory.path().join("many.jvmbundle");
+    let mut bytes = CLASS_BUNDLE_MAGIC.to_vec();
+    let mut expected = Vec::new();
+    for n in 0..273 {
+        let mut class = class_file_from_data(&abstract_class_with_method("compiled")).unwrap();
+        let name = format!("test/Batch{n}");
+        class.this_class = class.constant_pool.add_class(&name).unwrap();
+        let class = crate::merge::serialize_class_file(&class).unwrap();
+        let fragment = bundle_fragment(&class);
+        bytes.extend_from_slice(&fragment[CLASS_BUNDLE_MAGIC.len()..]);
+        expected.push((format!("{name}.class"), class));
+    }
+    std::fs::write(&input, bytes).unwrap();
+    let library = directory.path().join("library.jar");
+    let mut zip = ZipWriter::new(File::create(&library).unwrap());
+    zip.start_file("test/Batch128.class", SimpleFileOptions::default())
+        .unwrap();
+    zip.write_all(b"stale runtime class").unwrap();
+    zip.start_file("resource.txt", SimpleFileOptions::default())
+        .unwrap();
+    zip.write_all(b"resource").unwrap();
+    zip.finish().unwrap();
+    let output = directory.path().join("out.jar");
+    crate::pipeline::link(
+        &[],
+        &[input.to_str().unwrap().into()],
+        &[],
+        &[library.to_str().unwrap().into()],
+        output.to_str().unwrap(),
+    )
+    .unwrap();
+    let mut zip = ZipArchive::new(File::open(output).unwrap()).unwrap();
+    assert_eq!(zip.len(), 275);
+    for (name, expected) in expected {
+        let mut actual = Vec::new();
+        zip.by_name(&name)
+            .unwrap()
+            .read_to_end(&mut actual)
+            .unwrap();
+        assert_eq!(actual, expected, "{name}");
+    }
+    let mut resource = String::new();
+    zip.by_name("resource.txt")
+        .unwrap()
+        .read_to_string(&mut resource)
+        .unwrap();
+    assert_eq!(resource, "resource");
+}

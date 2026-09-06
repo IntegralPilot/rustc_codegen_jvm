@@ -71,7 +71,7 @@ impl ClassOutput {
             directory,
         } = self;
         let empty = writer.is_empty();
-        drop(writer);
+        writer.finish().map_err(|e| io_error(&module, e))?;
         if empty {
             std::fs::remove_file(path).map_err(|e| io_error(&module, e))?;
             std::fs::remove_dir(directory).map_err(|e| io_error(&module, e))?;

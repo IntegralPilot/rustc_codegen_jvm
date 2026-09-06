@@ -8,6 +8,7 @@ use super::key::ConstantKey;
 pub struct InternedConstantPool {
     pool: ConstantPool<'static>,
     constants: HashMap<ConstantKey, u16>,
+    strings: HashMap<jvm::JavaString, u16>,
 }
 
 impl Default for InternedConstantPool {
@@ -15,6 +16,7 @@ impl Default for InternedConstantPool {
         Self {
             pool: ConstantPool::default(),
             constants: HashMap::default(),
+            strings: HashMap::default(),
         }
     }
 }
@@ -33,6 +35,9 @@ impl InternedConstantPool {
     }
 
     pub fn add(&mut self, constant: Constant<'static>) -> jvm::Result<u16> {
+        if let Constant::Utf8(value) = constant {
+            return self.intern_utf8(value);
+        }
         let key = ConstantKey::from(&constant);
         if let Some(index) = self.constants.get(&key) {
             return Ok(*index);
@@ -43,7 +48,17 @@ impl InternedConstantPool {
     }
 
     pub fn add_utf8<S: AsRef<str>>(&mut self, value: S) -> jvm::Result<u16> {
-        self.add(Constant::Utf8(jvm::JavaString::from(value.as_ref()).into()))
+        self.intern_utf8(jvm::JavaStr::cow_from_str(value.as_ref()))
+    }
+
+    fn intern_utf8(&mut self, value: std::borrow::Cow<'_, jvm::JavaStr>) -> jvm::Result<u16> {
+        if let Some(&index) = self.strings.get(value.as_ref()) {
+            return Ok(index);
+        }
+        let value = value.into_owned();
+        let index = self.pool.add(Constant::Utf8(value.clone().into()))?;
+        self.strings.insert(value, index);
+        Ok(index)
     }
 
     pub fn add_integer(&mut self, value: i32) -> jvm::Result<u16> {
@@ -210,4 +225,36 @@ pub fn verify_no_duplicate_constants(class_file: &ClassFile<'_>) -> jvm::Result<
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn borrowed_strings_share_indexes_with_raw_modified_utf8() {
+        let mut pool = InternedConstantPool::default();
+        for text in ["Code", "méthode", "null\0byte", "crab🦀"] {
+            let index = pool.add_utf8(text).unwrap();
+            assert_eq!(pool.add_utf8(text).unwrap(), index);
+            assert_eq!(
+                pool.add(Constant::Utf8(jvm::JavaString::from(text).into()))
+                    .unwrap(),
+                index
+            );
+            assert_eq!(pool.try_get_utf8(index).unwrap().to_rust_string(), text);
+        }
+        // An unpaired Java surrogate has no lossless Rust String equivalent.
+        let raw = jvm::JavaStr::from_mutf8(&[0xed, 0xa0, 0x80]).unwrap();
+        let index = pool.add(Constant::Utf8(raw.to_owned().into())).unwrap();
+        assert_eq!(
+            pool.add(Constant::Utf8(raw.to_owned().into())).unwrap(),
+            index
+        );
+        assert_ne!(pool.add_utf8("�").unwrap(), index);
+        assert_eq!(pool.try_get_utf8(index).unwrap().as_bytes(), raw.as_bytes());
+        let wide = pool.add_long(42).unwrap();
+        assert_eq!(pool.add_long(42).unwrap(), wide);
+        assert_eq!(pool.add_utf8("after wide").unwrap(), wide + 2);
+    }
 }

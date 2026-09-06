@@ -4,6 +4,7 @@ use super::*;
 pub(super) fn mono_item_name<'tcx>(
     tcx: TyCtxt<'tcx>,
     instance: Instance<'tcx>,
+    definitions: &Definitions<'tcx>,
 ) -> lower1::naming::FnNameData {
     let instance_ty = tcx
         .type_of(instance.def_id())
@@ -17,7 +18,7 @@ pub(super) fn mono_item_name<'tcx>(
         };
     }
 
-    lower1::naming::mono_fn_name_from_instance(tcx, instance)
+    definitions.function_name(tcx, instance)
 }
 
 fn receiver_pointer<'tcx>(

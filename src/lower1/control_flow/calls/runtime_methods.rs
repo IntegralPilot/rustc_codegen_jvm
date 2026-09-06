@@ -179,7 +179,7 @@ pub(super) fn concrete<'tcx>(
                 || receiver_self_requires_static_dispatch
                 || requires_compiled_static_dispatch(&class_type))
             .then(|| {
-                let target = crate::lower1::naming::mono_fn_name_from_instance(tcx, func_instance);
+                let target = data_types.function_name(tcx, func_instance);
                 (
                     target
                         .class_to_call_on
