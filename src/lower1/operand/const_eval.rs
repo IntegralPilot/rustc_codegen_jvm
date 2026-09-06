@@ -507,7 +507,8 @@ fn read_function_pointer_constant<'tcx>(
             instance,
         )
     } else {
-        let callable_target = fn_pointer_target(tcx, function_instance, &signature);
+        let callable_target =
+            fn_pointer_target(tcx, oomir_data_types, function_instance, &signature);
         ensure_fn_pointer_adapter_class(
             oomir_data_types,
             callable_target.as_ref(),

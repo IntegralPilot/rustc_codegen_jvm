@@ -747,6 +747,7 @@ pub(super) fn emit<'tcx>(
             } else if let Some(interface_name) = use_interface {
                 method_dispatch::interface(
                     tcx,
+                    data_types,
                     &mut instructions,
                     func_instance,
                     oomir_operands,

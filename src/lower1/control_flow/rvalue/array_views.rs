@@ -278,7 +278,8 @@ pub(super) fn emit_raw_array_pointer_unsize<'tcx>(
                     *def_id,
                     args.no_bound_vars()?,
                 )?;
-                let target = fn_pointer_target(tcx, function_instance, &callable_abi.signature);
+                let target =
+                    fn_pointer_target(tcx, data_types, function_instance, &callable_abi.signature);
                 Some(ensure_fn_pointer_adapter_class(
                     data_types,
                     target.as_ref(),

@@ -29,6 +29,13 @@ pub(crate) struct CrateContext<'tcx> {
     checked_intrinsics: Lock<HashSet<CheckedIntrinsic>>,
     completed_codecs: Lock<HashMap<Ty<'tcx>, super::types::PointerMemoryCodec>>,
     names: names::Names<'tcx>,
+    references: Lock<Vec<Instance<'tcx>>>,
+}
+
+impl<'tcx> CrateContext<'tcx> {
+    pub(crate) fn take_references(&self) -> Vec<Instance<'tcx>> {
+        std::mem::take(&mut *self.references.borrow_mut())
+    }
 }
 
 #[derive(Default)]

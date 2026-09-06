@@ -5,7 +5,6 @@ use rustc_middle::ty::{Instance, Ty, TyCtxt, TyKind, TypingEnv, VtblEntry};
 
 use super::super::{
     jvm_names,
-    naming::mono_owner_class,
     types::{
         pointer_view_codec_operand, readable_rust_type_name, sanitize_name_token, ty_to_oomir_type,
     },
@@ -205,11 +204,12 @@ pub(crate) fn ensure_trait_object_adapter_class_for_pointees<'tcx>(
                 });
             }
             let call_dest = return_ty.has_jvm_value().then(|| "_ret".to_string());
+            let target = data_types.function_name(tcx, *target_instance);
             instructions.extend([
                 oomir::Instruction::InvokeStatic {
                     dest: call_dest.clone(),
-                    class_name: mono_owner_class(tcx, *target_instance),
-                    method_name: data_types.closure_method_name(tcx, *target_instance),
+                    class_name: target.class_to_call_on.expect("closure has a JVM owner"),
+                    method_name: target.method_name,
                     method_ty: oomir::Signature {
                         params: target_params,
                         ret: Box::new(return_ty.clone()),

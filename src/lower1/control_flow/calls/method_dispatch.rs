@@ -3,6 +3,7 @@ use super::*;
 
 pub(super) fn interface<'tcx>(
     tcx: TyCtxt<'tcx>,
+    data_types: &Definitions<'tcx>,
     instructions: &mut Vec<oomir::Instruction>,
     func_instance: Instance<'tcx>,
     oomir_operands: Vec<oomir::Operand>,
@@ -22,7 +23,7 @@ pub(super) fn interface<'tcx>(
         || receiver_self_requires_static_dispatch
         || requires_compiled_static_dispatch(&dispatch_receiver_ty)
     {
-        let target = crate::lower1::naming::mono_fn_name_from_instance(tcx, func_instance);
+        let target = data_types.function_name(tcx, func_instance);
         let mut static_signature = method_signature;
         static_signature.is_static = true;
         instructions.push(oomir::Instruction::InvokeStatic {
