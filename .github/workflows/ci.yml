@@ -73,7 +73,11 @@ jobs:
     - name: Run compiler unit tests
       id: compiler_unit_tests
       continue-on-error: true
-      run: cargo test
+      shell: bash
+      run: |
+        cargo test
+        cargo test --manifest-path compiler-core/Cargo.toml
+        cargo test --manifest-path java-linker/Cargo.toml
 
     - name: Check JVM binding macros
       id: jvm_macro_tests

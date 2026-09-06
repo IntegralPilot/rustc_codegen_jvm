@@ -437,6 +437,8 @@ public final class Pointer {
     // cell per callable identity so integer, raw-pointer, and union views all
     // observe the same nonzero address and can reconstruct the callable.
     private static final Map<Object, Pointer> FUNCTION_POINTER_CELLS = new IdentityHashMap<>();
+    private static final Map<Class<?>, Map<Object, Pointer>> FUNCTION_POINTER_ADAPTER_CELLS =
+            new HashMap<>();
     private static final Map<Long, Object> FUNCTION_POINTERS_BY_ADDRESS = new HashMap<>();
     private static final ConcurrentHashMap<String, JavaStringViews> JAVA_STRING_VIEWS =
             new ConcurrentHashMap<>();
@@ -2633,20 +2635,6 @@ public final class Pointer {
         return wordSize;
     }
 
-    private static void writeMemoryWord(byte[] bytes, int offset, int size, long value) {
-        for (int index = 0; index < size; index++) {
-            bytes[offset + index] = (byte) (value >>> (index * 8));
-        }
-    }
-
-    private static long readMemoryWord(byte[] bytes, int offset, int size) {
-        long value = 0;
-        for (int index = 0; index < size; index++) {
-            value |= ((long) bytes[offset + index] & 0xffL) << (index * 8);
-        }
-        return value;
-    }
-
     private static String[] slicePointerDescriptor(String codec) {
         // The element codec may itself be a structured fat-pointer codec, so
         // only the carrier and element-size separators are structural here.
@@ -2766,16 +2754,16 @@ public final class Pointer {
             pointerMetadata = marker.address();
         }
 
-        writeMemoryWord(image, 0, wordSize, dataAddress);
-        writeMemoryWord(image, wordSize, wordSize, pointerMetadata);
+        MemoryBytes.write(image, 0, wordSize, dataAddress);
+        MemoryBytes.write(image, wordSize, wordSize, pointerMetadata);
         return image;
     }
 
     private static Object decodeFatPointer(
             byte[] bytes, int offset, int size, String codec) {
         int wordSize = fatPointerWordSize(size);
-        long dataAddress = readMemoryWord(bytes, offset, wordSize);
-        long pointerMetadata = readMemoryWord(bytes, offset + wordSize, wordSize);
+        long dataAddress = MemoryBytes.read(bytes, offset, wordSize);
+        long pointerMetadata = MemoryBytes.read(bytes, offset + wordSize, wordSize);
         if (codec.startsWith(TRAIT_POINTER_VIEW_CODEC_PREFIX)) {
             Pointer data = encodedPointer(bytes, offset, wordSize, codec, dataAddress);
             if (data == null) {
@@ -4077,24 +4065,25 @@ public final class Pointer {
         return isDirectAllocationView() ? readAlignedElement() : null;
     }
 
-    private static void discardProjectedFieldViews(Object owner) {
+    private static java.util.List<FieldCell> collectProjectedFieldViews(
+            Object owner, java.util.List<FieldCell> projected) {
         if (owner == null || !mayBeInIdentityFilter(FIELD_CELL_FILTER, owner)) {
-            return;
+            return projected;
         }
-        java.util.List<FieldCell> projected = null;
         Map<Object, Map<String, WeakReference<FieldCell>>> fieldStripe =
                 stateStripe(FIELD_CELLS, owner);
         synchronized (fieldStripe) {
             Map<String, WeakReference<FieldCell>> fields = fieldStripe.get(owner);
             if (fields == null) {
-                return;
+                return projected;
             }
             for (WeakReference<FieldCell> reference : fields.values()) {
                 FieldCell cell = reference.get();
                 if (cell != null
                         && (mayHaveStructuralView(cell)
                                 || mayBeInIdentityFilter(MEMORY_VIEW_FILTER, cell)
-                                || mayBeInIdentityFilter(MEMORY_VIEW_ORIGIN_FILTER, cell))) {
+                                || mayBeInIdentityFilter(MEMORY_VIEW_ORIGIN_FILTER, cell)
+                                || mayBeInIdentityFilter(FIELD_CELL_FILTER, cell))) {
                     if (projected == null) {
                         projected = new java.util.ArrayList<>();
                     }
@@ -4102,8 +4091,19 @@ public final class Pointer {
                 }
             }
         }
+        return projected;
+    }
+
+    private static void discardProjectedFieldViews(Object owner) {
+        java.util.List<FieldCell> projected = collectProjectedFieldViews(owner, null);
         if (projected == null) {
             return;
+        }
+        // Nested projections retain their enclosing field cell. Replacing a
+        // parent invalidates decoded views at every descendant, including when
+        // the parent itself never needed a decoded view.
+        for (int index = 0; index < projected.size(); index++) {
+            collectProjectedFieldViews(projected.get(index), projected);
         }
         for (FieldCell cell : projected) {
             Map<Object, LongRangeMap<MemoryViewState>> stripe =
@@ -4383,7 +4383,7 @@ public final class Pointer {
 
     private static final class FieldCell {
         private final Object fixedOwner;
-        private final Cell rootOwner;
+        private final Object rootOwner;
         private final FieldAccess access;
         private final int fieldNameHash;
         private volatile boolean hasStructuralView;
@@ -4403,8 +4403,20 @@ public final class Pointer {
             fieldNameHash = access.fieldNameHash;
         }
 
+        private FieldCell(FieldCell owner, FieldAccess access) {
+            fixedOwner = null;
+            rootOwner = owner;
+            this.access = access;
+            fieldNameHash = access.fieldNameHash;
+        }
+
         private Object owner() {
-            return rootOwner == null ? fixedOwner : rootOwner.value;
+            if (rootOwner == null) {
+                return fixedOwner;
+            }
+            return rootOwner instanceof Cell
+                    ? ((Cell) rootOwner).value
+                    : ((FieldCell) rootOwner).get();
         }
 
         private Object ownerIdentity() {
@@ -5142,6 +5154,17 @@ public final class Pointer {
         return metadata < 0 ? pointer : pointer.withMetadata(metadata);
     }
 
+    /** Installs a JVM carrier in a zero-sized local without changing its address.
+     * Rust stores to ZST bytes remain no-ops; local initialization must still
+     * supply the complete carrier, whose constructor may have ZST fields. */
+    public void initializeZeroSizedLocal(Object value) {
+        if (!(allocation instanceof Cell) || byteOffset != 0
+                || viewSize != 0 || allocationElementSize != 0) {
+            throw new IllegalStateException("expected a zero-sized local cell");
+        }
+        writeElement(0, value);
+    }
+
     /** Creates a write-through pointer for a JVM instance method receiver. */
     public static Pointer receiverCellAligned(
             Object value,
@@ -5275,13 +5298,13 @@ public final class Pointer {
     }
 
     /**
-     * Projects a field through a replaceable root cell. The field follows the
-     * cell's current aggregate, so field mutations are immediately visible
-     * during unwinding while a later whole-place replacement remains visible
+     * Projects a field through a replaceable root or enclosing field cell. The
+     * projection follows the current aggregate at every depth. Mutations are
+     * visible during unwinding, and later whole-place replacement remains visible
      * through previously derived field pointers.
      */
     private static Pointer rootField(
-            Cell owner,
+            Object owner,
             Class<?> ownerClass,
             String fieldName,
             long size,
@@ -5300,7 +5323,10 @@ public final class Pointer {
             cell = reference == null ? null : reference.get();
             if (cell == null) {
                 try {
-                    cell = new FieldCell(owner, fieldAccess(ownerClass, fieldName));
+                    FieldAccess access = fieldAccess(ownerClass, fieldName);
+                    cell = owner instanceof Cell
+                            ? new FieldCell((Cell) owner, access)
+                            : new FieldCell((FieldCell) owner, access);
                 } catch (NoSuchFieldException error) {
                     if (size == 0) {
                         return Pointer.cell(null, 0, codecClassName);
@@ -5387,16 +5413,16 @@ public final class Pointer {
                         "unknown Rust field " + ownerClassName + "." + fieldName, error);
             }
         }
-        if (allocation instanceof Cell
+        if ((allocation instanceof Cell || allocation instanceof FieldCell)
                 && byteOffset == 0
                 && viewSize == allocationElementSize) {
             try {
                 if (ownerClass == null) {
                     ownerClass = resolvedRuntimeClass(ownerClassName);
                 }
-                if (ownerClass.isInstance(((Cell) allocation).value)) {
+                if (ownerClass.isInstance(directCellCarrier(allocation))) {
                     return rootField(
-                                    (Cell) allocation,
+                                    allocation,
                                     ownerClass,
                                     fieldName,
                                     fieldSize,
@@ -5410,9 +5436,8 @@ public final class Pointer {
             }
         }
         boolean managedField = fieldType == null || !fieldType.isPrimitive();
-        // Replaceable root cells use rootField above. Nested, receiver-backed,
-        // and decoded carriers already have stable identity, so their primitive
-        // fields can also mutate the live JVM carrier directly.
+        // Replaceable roots and nested fields use rootField above. Receiver
+        // and decoded carriers can mutate their live JVM fields directly.
         boolean directPrimitiveField =
                 allocation instanceof FieldCell
                         || allocation instanceof ReceiverCell
@@ -6273,13 +6298,23 @@ public final class Pointer {
                     "value is not a non-null Rust function pointer");
         }
         synchronized (FUNCTION_POINTER_CELLS) {
-            Pointer existing = FUNCTION_POINTER_CELLS.get(value);
+            // Receiver erasure creates fresh wrappers around the same static code.
+            // Numeric addresses identify the adaptation and target, not each wrapper.
+            Map<Object, Pointer> cells = FUNCTION_POINTER_CELLS;
+            Object identity = value;
+            if (value instanceof FunctionPointerAdapter) {
+                identity = canonicalFunctionPointer(
+                        ((FunctionPointerAdapter) value).functionPointerTarget());
+                cells = FUNCTION_POINTER_ADAPTER_CELLS.computeIfAbsent(
+                        value.getClass(), key -> new IdentityHashMap<>());
+            }
+            Pointer existing = cells.get(identity);
             if (existing != null) {
                 return existing;
             }
             Pointer pointer = cellAligned(value, Long.BYTES, null, Long.BYTES);
             long address = pointer.address();
-            FUNCTION_POINTER_CELLS.put(value, pointer);
+            cells.put(identity, pointer);
             FUNCTION_POINTERS_BY_ADDRESS.put(address, value);
             return pointer;
         }
@@ -11295,6 +11330,9 @@ public final class Pointer {
             if (elementIndex != 0) {
                 throw new IndexOutOfBoundsException("pointer arithmetic escaped scalar storage");
             }
+            // Reinitializing the same MIR local replaces its carrier while
+            // cached nested projections still denote that storage location.
+            discardProjectedFieldViews(allocation);
             ((Cell) allocation).value = value;
             return;
         }
@@ -11530,14 +11568,6 @@ public final class Pointer {
         return value.shiftRight(byteIndex * 8).byteValue();
     }
 
-    public static byte integer128Byte(I128 value, int byteIndex) {
-        return value.byteAt(byteIndex);
-    }
-
-    public static byte integer128Byte(U128 value, int byteIndex) {
-        return value.byteAt(byteIndex);
-    }
-
     public static BigInteger bigIntegerFromBytes(
             byte[] bytes, int offset, int size, boolean signed) {
         BigInteger value = BigInteger.ZERO;
@@ -11548,14 +11578,6 @@ public final class Pointer {
             value = value.subtract(BigInteger.ONE.shiftLeft(size * 8));
         }
         return value;
-    }
-
-    public static I128 i128FromBytes(byte[] bytes, int offset, int size, boolean signed) {
-        return I128.fromBigInteger(bigIntegerFromBytes(bytes, offset, size, false));
-    }
-
-    public static U128 u128FromBytes(byte[] bytes, int offset, int size, boolean signed) {
-        return U128.fromBigInteger(bigIntegerFromBytes(bytes, offset, size, false));
     }
 
     private BigInteger bigIntegerFromPointerBytes(int size, boolean signed) {

@@ -1,0 +1,10 @@
+[package]
+name = "ssa_aggregates"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Exercise scalarized aggregate SSA in debug builds; full variable metadata
+# is covered by variable_names and the scalar/addressable-local fixtures.
+[profile.dev]
+debug = 1

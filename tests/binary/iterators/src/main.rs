@@ -424,7 +424,7 @@ fn stateful_adapters() {
         .cycle()
         .take(8)
         .fold(0, |digits, value| digits * 10 + value);
-    assert!(cycled == 12_312_312);
+    assert_eq!(cycled, 12_312_312);
 }
 
 fn slice_iterators() {
@@ -872,6 +872,11 @@ fn test_same_named_function_item_b() {
 }
 
 fn test_core_iterator_regressions() {
+    // Repeated initialization must invalidate nested decoded iterator views.
+    for index in 0..5 {
+        assert_eq!([0, 1, 2, 3, 4].into_iter().nth(index), Some(index as i32));
+    }
+
     // These cases mirror iterator compositions used by upstream coretests closely.
     assert!((0_usize..).take(10).collect::<Vec<_>>() == [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
     assert!(
