@@ -143,12 +143,13 @@ pub fn parse_jvm_class_link_name(link_name: &str) -> Result<String, String> {
     Ok(class_name.to_string())
 }
 
-fn is_external_runtime_generic<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> bool {
+fn is_runtime_generic<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> bool {
     let def_id = instance.def_id();
-    !def_id.is_local()
-        && !matches!(instance.def, InstanceKind::Intrinsic(_))
-        && jvm_names::is_runtime_crate(tcx, def_id.krate)
-        && jvm_names::compiles_external_core_instances(tcx)
+    matches!(
+        tcx.crate_name(def_id.krate),
+        sym::core | sym::alloc | sym::std
+    ) && !matches!(instance.def, InstanceKind::Intrinsic(_))
+        && jvm_names::uses_compiled_core(tcx)
         && tcx.generics_of(def_id).requires_monomorphization(tcx)
         && !instance.args.has_param()
         && !instance.args.has_escaping_bound_vars()
@@ -156,8 +157,8 @@ fn is_external_runtime_generic<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>
 
 pub fn mono_owner_class<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> String {
     let def_id = instance.def_id();
-    let external_runtime_generic = is_external_runtime_generic(tcx, instance);
-    if external_runtime_generic {
+    let runtime_generic = is_runtime_generic(tcx, instance);
+    if runtime_generic {
         // Synthetic helpers can reference an instance without adding it to
         // the current crate's mono-item set. Give every runtime instance one
         // definition-crate owner so all downstream callers and exporters
@@ -640,12 +641,11 @@ pub fn mono_fn_name_from_instance<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'t
 
     let class = Some(mono_owner_class(tcx, instance));
 
-    let external_runtime_generic = is_external_runtime_generic(tcx, instance);
-    let needs_definition_suffix =
-        external_runtime_generic && matches!(instance.def, InstanceKind::Item(_));
+    let runtime_generic = is_runtime_generic(tcx, instance);
+    let needs_definition_suffix = runtime_generic && matches!(instance.def, InstanceKind::Item(_));
     let mut safe_base = if needs_definition_suffix {
-        // Upstream generic bodies are grouped into a small number of
-        // downstream MonoBucket classes. Their definition identity is the one
+        // Runtime generic bodies are grouped into a small number of
+        // definition-owned MonoBucket classes. Their definition identity is the one
         // place a suffix is required: otherwise unrelated functions such as
         // slice::from_mut and array::from_mut can acquire the same JVM name
         // and descriptor.

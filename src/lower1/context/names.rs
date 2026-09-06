@@ -7,10 +7,10 @@ use rustc_span::def_id::DefId;
 
 #[derive(Default)]
 pub(super) struct Names<'tcx> {
-    functions: HashMap<Instance<'tcx>, naming::FnNameData>,
-    classes: HashMap<DefId, String>,
-    readable: HashMap<DefId, String>,
-    closures: HashMap<(DefId, GenericArgsRef<'tcx>, GenericArgsRef<'tcx>, bool), String>,
+    functions: Lock<HashMap<Instance<'tcx>, naming::FnNameData>>,
+    classes: Lock<HashMap<DefId, String>>,
+    readable: Lock<HashMap<DefId, String>>,
+    closures: Lock<HashMap<(DefId, GenericArgsRef<'tcx>, GenericArgsRef<'tcx>, bool), String>>,
 }
 
 impl<'tcx> Definitions<'tcx> {
@@ -19,7 +19,14 @@ impl<'tcx> Definitions<'tcx> {
         tcx: TyCtxt<'tcx>,
         instance: Instance<'tcx>,
     ) -> naming::FnNameData {
-        if let Some(name) = self.shared.borrow().names.functions.get(&instance) {
+        // An intrinsic that reaches an ordinary JVM call uses the MIR fallback
+        // body, which rustc collects as an Item rather than an Intrinsic.
+        let instance = if matches!(instance.def, rustc_middle::ty::InstanceKind::Intrinsic(_)) {
+            Instance::new_raw(instance.def_id(), instance.args)
+        } else {
+            instance
+        };
+        if let Some(name) = self.shared.names.functions.borrow().get(&instance) {
             return name.clone();
         }
         let instance_ty = tcx
@@ -35,34 +42,37 @@ impl<'tcx> Definitions<'tcx> {
             naming::mono_fn_name_from_instance(tcx, instance)
         };
         self.shared
-            .borrow_mut()
             .names
             .functions
+            .borrow_mut()
             .insert(instance, name.clone());
         name
     }
 
     pub(crate) fn class_name(&self, tcx: TyCtxt<'tcx>, def_id: DefId) -> String {
+        if let Some(name) = self.shared.names.classes.borrow().get(&def_id) {
+            return name.clone();
+        }
+        let name = jvm_names::class_for_def_id(tcx, def_id);
         self.shared
-            .borrow_mut()
             .names
             .classes
-            .entry(def_id)
-            .or_insert_with(|| jvm_names::class_for_def_id(tcx, def_id))
-            .clone()
+            .borrow_mut()
+            .insert(def_id, name.clone());
+        name
     }
 
     pub(crate) fn readable_class_name(&self, tcx: TyCtxt<'tcx>, def_id: DefId) -> String {
-        if let Some(name) = self.shared.borrow().names.readable.get(&def_id) {
+        if let Some(name) = self.shared.names.readable.borrow().get(&def_id) {
             return name.clone();
         }
         let class = self.class_name(tcx, def_id);
         let class = class.strip_prefix("org/rustlang/").unwrap_or(&class);
         let name = crate::lower1::types::sanitize_name_token(&class.replace('/', "_"));
         self.shared
-            .borrow_mut()
             .names
             .readable
+            .borrow_mut()
             .insert(def_id, name.clone());
         name
     }
@@ -76,7 +86,7 @@ impl<'tcx> Definitions<'tcx> {
         coroutine: bool,
     ) -> String {
         let key = (def_id, args, instance.args, coroutine);
-        if let Some(name) = self.shared.borrow().names.closures.get(&key) {
+        if let Some(name) = self.shared.names.closures.borrow().get(&key) {
             return name.clone();
         }
         let name = if coroutine {
@@ -85,9 +95,9 @@ impl<'tcx> Definitions<'tcx> {
             jvm_names::closure_class_for_args(tcx, def_id, args, instance)
         };
         self.shared
-            .borrow_mut()
             .names
             .closures
+            .borrow_mut()
             .insert(key, name.clone());
         name
     }

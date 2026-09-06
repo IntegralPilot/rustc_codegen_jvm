@@ -288,10 +288,11 @@ fn lower_supplemental_instance_closure<'tcx>(
                     | InstanceKind::LlvmIntrinsic(_)
                     | InstanceKind::Virtual(..)
             ) && !partitioned_functions.contains(&callee)
+                && tcx.should_codegen_locally(callee)
                 && queued.insert(callee)
             {
-                // Rustc owns ordinary reachability. Only follow supplemental
-                // instances that were not assigned to another codegen unit.
+                // Supplement generated helpers using rustc's linkage policy.
+                // Upstream exported bodies are already present in their rlibs.
                 functions.push_back(callee);
             }
         }
@@ -697,6 +698,7 @@ impl CodegenBackend for MyBackend {
 
                 drop(shared_lowering);
 
+                let canonical_timer = tcx.sess.timer("jvm_canonical_types");
                 let canonical_source_file = tcx
                     .sess
                     .local_crate_source_file()
@@ -711,6 +713,7 @@ impl CodegenBackend for MyBackend {
                     submitted += 1;
                 }
                 let mut results = tcx.sess.time("jvm_finish_emission", || workers.finish());
+                drop(canonical_timer);
                 results.sort_by_key(|(ordinal, _)| *ordinal);
                 results
                     .into_iter()
