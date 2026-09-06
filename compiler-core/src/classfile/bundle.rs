@@ -4,13 +4,13 @@ use std::{
     fs::File,
     io::{self, BufWriter, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex, Weak},
 };
 
 pub const MAGIC: &[u8; 8] = b"RCJVMB1\0";
 
 pub struct Writer {
-    output: BufWriter<File>,
+    output: Arc<Mutex<BufWriter<File>>>,
     path: Arc<PathBuf>,
     position: u64,
     records: usize,
@@ -20,14 +20,15 @@ pub struct Writer {
 pub(super) struct Record {
     path: Arc<PathBuf>,
     offset: u64,
+    pending: Weak<Mutex<BufWriter<File>>>,
 }
 
 impl Writer {
     pub fn create(path: &Path) -> io::Result<Self> {
-        let mut output = BufWriter::new(File::create(path)?);
+        let mut output = BufWriter::with_capacity(64 * 1024, File::create(path)?);
         output.write_all(MAGIC)?;
         Ok(Self {
-            output,
+            output: Arc::new(Mutex::new(output)),
             path: Arc::new(path.to_owned()),
             position: MAGIC.len() as u64,
             records: 0,
@@ -38,27 +39,58 @@ impl Writer {
         self.records == 0
     }
 
+    pub fn finish(self) -> io::Result<()> {
+        self.flush()
+    }
+
+    fn flush(&self) -> io::Result<()> {
+        self.output
+            .lock()
+            .map_err(|_| io::Error::other("bundle writer lock poisoned"))?
+            .flush()
+    }
+
     pub(super) fn append(&mut self, name: &str, bytes: &[u8]) -> io::Result<Record> {
         let name_len = u32::try_from(name.len())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         let offset = self.position + 12 + u64::from(name_len);
-        self.output.write_all(&name_len.to_le_bytes())?;
-        self.output.write_all(&(bytes.len() as u64).to_le_bytes())?;
-        self.output.write_all(name.as_bytes())?;
-        self.output.write_all(bytes)?;
-        // A published record must be visible to another worker immediately.
-        self.output.flush()?;
+        let mut output = self
+            .output
+            .lock()
+            .map_err(|_| io::Error::other("bundle writer lock poisoned"))?;
+        output.write_all(&name_len.to_le_bytes())?;
+        output.write_all(&(bytes.len() as u64).to_le_bytes())?;
+        output.write_all(name.as_bytes())?;
+        output.write_all(bytes)?;
         self.position = offset + bytes.len() as u64;
         self.records += 1;
         Ok(Record {
             path: Arc::clone(&self.path),
             offset,
+            pending: Arc::downgrade(&self.output),
         })
+    }
+}
+
+impl Drop for Writer {
+    fn drop(&mut self) {
+        // Flush before the last strong reference disappears: an exact-duplicate
+        // reader must never observe a dead Weak pointer before bytes are visible.
+        let _ = self.flush();
     }
 }
 
 impl Record {
     pub(super) fn equals(&self, bytes: &[u8]) -> io::Result<bool> {
+        // Most class names never have an exact-duplicate candidate. Only those
+        // candidates need early visibility; other writes remain buffered until
+        // the shard finishes. Weak references do not keep file handles alive.
+        if let Some(output) = self.pending.upgrade() {
+            output
+                .lock()
+                .map_err(|_| io::Error::other("bundle writer lock poisoned"))?
+                .flush()?;
+        }
         // Open only for a candidate comparison: retaining a file descriptor for
         // every owner shard would exhaust the host limit on large crates.
         let mut reader = File::open(&*self.path)?;

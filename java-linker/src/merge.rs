@@ -13,6 +13,17 @@ pub(crate) fn method_identity(
     class_file: &ClassFile<'_>,
     method_index: usize,
 ) -> io::Result<(JavaString, JavaString)> {
+    let (name, descriptor) = method_key(class_file, method_index)?;
+    Ok((name.to_owned(), descriptor.to_owned()))
+}
+
+fn method_key<'a>(
+    class_file: &'a ClassFile<'_>,
+    method_index: usize,
+) -> io::Result<(
+    &'a ristretto_classfile::JavaStr,
+    &'a ristretto_classfile::JavaStr,
+)> {
     let method = &class_file.methods[method_index];
     let name = class_file
         .constant_pool
@@ -22,7 +33,27 @@ pub(crate) fn method_identity(
         .constant_pool
         .try_get_utf8(method.descriptor_index)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
-    Ok((name.to_owned(), descriptor.to_owned()))
+    Ok((name, descriptor))
+}
+
+struct MergeIndex {
+    constants: HashMap<ConstantKey, u16>,
+    methods: HashSet<(JavaString, JavaString)>,
+    interfaces: HashSet<JavaString>,
+}
+
+impl MergeIndex {
+    fn new(base: &ClassFile<'_>) -> io::Result<Self> {
+        Ok(Self {
+            constants: constant_pool_index(&base.constant_pool),
+            methods: (0..base.methods.len())
+                .map(|i| method_identity(base, i))
+                .collect::<io::Result<_>>()?,
+            interfaces: (0..base.interfaces.len())
+                .map(|i| interface_name(base, i))
+                .collect::<io::Result<_>>()?,
+        })
+    }
 }
 
 pub(crate) fn interface_name(
@@ -42,10 +73,10 @@ pub(crate) fn interface_name(
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
 }
 
-pub(crate) fn merge_class_files(
+fn merge_class_files(
     base: &mut ClassFile<'static>,
     incoming: &ClassFile<'static>,
-    target_constants: &mut HashMap<ConstantKey, u16>,
+    index: &mut MergeIndex,
 ) -> io::Result<bool> {
     if base.class_name().ok() != incoming.class_name().ok() {
         return Err(io::Error::new(
@@ -68,37 +99,30 @@ pub(crate) fn merge_class_files(
             base_changed = true;
         }
         let original_method_count = base.methods.len();
-        let mut retained_methods = Vec::with_capacity(original_method_count);
-        for index in 0..original_method_count {
-            if method_identity(&base, index)?.0 != "<init>" {
-                retained_methods.push(base.methods[index].clone());
-            }
-        }
-        base.methods = retained_methods;
+        base.methods.retain(|method| {
+            base.constant_pool
+                .try_get_utf8(method.name_index)
+                .is_ok_and(|name| name != "<init>")
+        });
+        index.methods.retain(|(name, _)| name != "<init>");
         base_changed |= base.methods.len() != original_method_count;
     }
 
-    let mut existing_methods = HashSet::default();
-    for index in 0..base.methods.len() {
-        existing_methods.insert(method_identity(&base, index)?);
-    }
     let mut missing_method_indexes = Vec::new();
-    for index in 0..incoming.methods.len() {
-        let identity = method_identity(&incoming, index)?;
-        if !(merged_is_interface && identity.0 == "<init>") && !existing_methods.contains(&identity)
-        {
-            missing_method_indexes.push(index);
+    for method in 0..incoming.methods.len() {
+        let identity = method_identity(&incoming, method)?;
+        if !(merged_is_interface && identity.0 == "<init>") && index.methods.insert(identity) {
+            missing_method_indexes.push(method);
         }
     }
 
-    let mut existing_interfaces = HashSet::default();
-    for index in 0..base.interfaces.len() {
-        existing_interfaces.insert(interface_name(&base, index)?);
-    }
     let mut missing_interface_indexes = Vec::new();
-    for index in 0..incoming.interfaces.len() {
-        if !existing_interfaces.contains(&interface_name(&incoming, index)?) {
-            missing_interface_indexes.push(index);
+    for interface in 0..incoming.interfaces.len() {
+        if index
+            .interfaces
+            .insert(interface_name(&incoming, interface)?)
+        {
+            missing_interface_indexes.push(interface);
         }
     }
 
@@ -134,7 +158,7 @@ pub(crate) fn merge_class_files(
     let constant_indexes = import_constant_pool(
         &incoming.constant_pool,
         &mut base.constant_pool,
-        target_constants,
+        &mut index.constants,
         bootstrap_method_offset,
     )?;
 
@@ -213,8 +237,8 @@ pub(crate) fn merge_class_data(base_data: &[u8], incoming_data: &[u8]) -> io::Re
             format!("could not parse the incoming fragment: {error}"),
         )
     })?;
-    let mut target_constants = constant_pool_index(&base.constant_pool);
-    if merge_class_files(&mut base, &incoming, &mut target_constants)? {
+    let mut index = MergeIndex::new(&base)?;
+    if merge_class_files(&mut base, &incoming, &mut index)? {
         serialize_class_file(&base)
     } else {
         Ok(base_data.to_vec())
@@ -305,19 +329,18 @@ pub(crate) fn merge_group(mut fragments: Vec<ClassInfo>) -> io::Result<ClassInfo
 
     let mut fragments = parsed.into_iter();
     let (mut merged, mut base) = fragments.next().unwrap();
-    let mut target_constants = constant_pool_index(&base.constant_pool);
+    let mut index = MergeIndex::new(&base)?;
     let mut changed = false;
     for (_, incoming) in fragments {
-        changed |=
-            merge_class_files(&mut base, &incoming, &mut target_constants).map_err(|error| {
-                io::Error::new(
-                    error.kind(),
-                    format!(
-                        "failed to merge duplicate JVM class {}: {error}",
-                        merged.jar_entry_name
-                    ),
-                )
-            })?;
+        changed |= merge_class_files(&mut base, &incoming, &mut index).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "failed to merge duplicate JVM class {}: {error}",
+                    merged.jar_entry_name
+                ),
+            )
+        })?;
     }
     if changed {
         merged.data = serialize_class_file(&base).map_err(|error| {
@@ -342,7 +365,7 @@ pub(crate) fn class_fragments_can_be_reordered(
             return Ok(false);
         }
         for index in 0..class_file.methods.len() {
-            let identity = method_identity(&class_file, index)?;
+            let identity = method_key(&class_file, index)?;
             if identity.0 != "<init>" && !methods.insert(identity) {
                 return Ok(false);
             }

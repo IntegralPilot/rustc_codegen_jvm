@@ -165,7 +165,7 @@ fn lower_mono_function<'tcx>(
         return;
     }
 
-    let name = mono_item_name(tcx, instance);
+    let name = mono_item_name(tcx, instance, &oomir_module.data_types);
     let mir = tcx.instance_mir(instance.def);
     breadcrumbs::log!(
         breadcrumbs::LogLevel::Info,
@@ -630,10 +630,11 @@ impl CodegenBackend for MyBackend {
                 // duplicate holder construction while preserving fine-grained
                 // streaming and dynamic worker load balancing.
                 let mut items_by_owner = BTreeMap::<String, Vec<MonoItem<'_>>>::new();
+                let naming = Definitions::new(std::rc::Rc::clone(&shared_lowering));
                 for cgu in mono_items.codegen_units {
                     for (item, _) in cgu.items_in_deterministic_order(tcx) {
                         let owner = match item {
-                            MonoItem::Fn(instance) => mono_item_name(tcx, instance)
+                            MonoItem::Fn(instance) => mono_item_name(tcx, instance, &naming)
                                 .class_to_call_on
                                 .unwrap_or_else(|| crate_module_class.clone()),
                             MonoItem::Static(def_id) => format!(
@@ -645,6 +646,7 @@ impl CodegenBackend for MyBackend {
                         items_by_owner.entry(owner).or_default().push(item);
                     }
                 }
+                drop(naming);
                 for (index, (owner, items)) in items_by_owner.into_iter().enumerate() {
                     let shard_name =
                         format!("jvm-class-{index}-{}", stable_hash::short_hash(&owner, 8));

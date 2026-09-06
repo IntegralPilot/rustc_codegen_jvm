@@ -853,8 +853,7 @@ pub(super) fn emit<'tcx>(
         }
 
         if !generated {
-            let fn_name_data =
-                crate::lower1::naming::mono_fn_name_from_instance(tcx, func_instance);
+            let fn_name_data = data_types.function_name(tcx, func_instance);
             instructions.push(oomir::Instruction::InvokeRustStatic {
                 class_name: fn_name_data
                     .class_to_call_on

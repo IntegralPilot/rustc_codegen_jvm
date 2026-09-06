@@ -147,7 +147,7 @@ fn body(
                 "(Ljava/lang/Object;ILjava/lang/String;I)Lorg/rustlang/runtime/Pointer;",
             )?;
             code.push(Instruction::Invokestatic(method));
-        } else if actual_source.to_jvm_descriptor() != target.to_jvm_descriptor() {
+        } else if !actual_source.same_jvm_type(target) {
             code.extend(get_cast_instructions(
                 &recipe.target_name,
                 actual_source,
@@ -202,7 +202,7 @@ fn body(
         cp.add_method_ref(class, name.as_ref(), &signature.to_string())?
     };
     code.push(Instruction::Invokestatic(method));
-    if target_signature.ret.to_jvm_descriptor() != recipe.signature.ret.to_jvm_descriptor() {
+    if !target_signature.ret.same_jvm_type(&recipe.signature.ret) {
         code.extend(get_cast_instructions(
             &recipe.target_name,
             &target_signature.ret,

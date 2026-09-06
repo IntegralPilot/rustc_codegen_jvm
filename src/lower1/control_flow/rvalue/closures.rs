@@ -606,7 +606,7 @@ pub(super) fn ensure_erased_receiver_fn_pointer_bridge<'tcx>(
         .skip(1)
         .zip(target_signature.params.iter().skip(1))
     {
-        if source_ty.to_jvm_descriptor() != target_ty.to_jvm_descriptor() {
+        if !source_ty.same_jvm_type(target_ty) {
             return Err("a non-receiver parameter changes JVM ABI".to_string());
         }
     }
@@ -636,7 +636,7 @@ pub(super) fn ensure_erased_receiver_fn_pointer_bridge<'tcx>(
     let erased_pointer_to_slice = matches!(carrier_field_ty, oomir::Type::Pointer(_))
         && matches!(source_receiver_ty, oomir::Type::Slice(_) | oomir::Type::Str);
     if carrier_field_ty.to_jvm_descriptor() != "Ljava/lang/Object;"
-        && carrier_field_ty.to_jvm_descriptor() != source_receiver_ty.to_jvm_descriptor()
+        && !carrier_field_ty.same_jvm_type(source_receiver_ty)
         && !erased_pointer_to_slice
     {
         return Err(format!(

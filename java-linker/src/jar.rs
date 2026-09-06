@@ -12,6 +12,36 @@ fn options() -> SimpleFileOptions {
         .unix_permissions(0o644)
 }
 
+/// A bounded group is compressed in memory by its merge worker. The final
+/// writer appends it in one copy, without a seek/flush for every class header.
+pub(crate) struct Batch {
+    archive: ZipArchive<Cursor<Vec<u8>>>,
+    pub(crate) classes: usize,
+    pub(crate) bytes: usize,
+}
+
+impl Batch {
+    pub(crate) fn encode(
+        classes: impl IntoIterator<Item = io::Result<ClassInfo>>,
+    ) -> io::Result<Self> {
+        let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
+        let mut count = 0;
+        let mut bytes = 0;
+        for class in classes {
+            let class = class?;
+            count += 1;
+            bytes += class.data.len();
+            zip.start_file(class.jar_entry_name, options())?;
+            zip.write_all(&class.data)?;
+        }
+        Ok(Self {
+            archive: zip.finish_into_readable()?,
+            classes: count,
+            bytes,
+        })
+    }
+}
+
 impl Writer {
     pub(crate) fn create(path: &Path, main: Option<&str>) -> io::Result<Self> {
         let mut zip = ZipWriter::new(BufWriter::with_capacity(
@@ -25,11 +55,24 @@ impl Writer {
             seen: HashSet::from_iter(["META-INF/MANIFEST.MF".into(), "META-INF/".into()]),
         })
     }
+    #[cfg(test)]
     pub(crate) fn class(&mut self, class: &ClassInfo) -> io::Result<()> {
         if self.seen.insert(class.jar_entry_name.clone()) {
             self.zip.start_file(&class.jar_entry_name, options())?;
             self.zip.write_all(&class.data)?;
         }
+        Ok(())
+    }
+    pub(crate) fn batch(&mut self, batch: Batch) -> io::Result<()> {
+        for name in batch.archive.file_names() {
+            if !self.seen.insert(name.to_owned()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "duplicate compiled JAR entry",
+                ));
+            }
+        }
+        self.zip.merge_archive(batch.archive)?;
         Ok(())
     }
     pub(crate) fn finish(mut self, libraries: &[PathBuf]) -> io::Result<()> {

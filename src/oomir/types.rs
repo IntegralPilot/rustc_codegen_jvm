@@ -96,64 +96,65 @@ impl Type {
         descriptor
     }
 
-    /// Appends this type's JVM descriptor without allocating intermediate
-    /// descriptors for nested array/reference types or signature components.
+    /// Compare erased JVM carriers without constructing descriptor strings.
+    pub fn same_jvm_type(&self, other: &Self) -> bool {
+        let (arrays, primitive, name) = self.jvm_shape();
+        let (other_arrays, other_primitive, other_name) = other.jvm_shape();
+        arrays == other_arrays
+            && primitive == other_primitive
+            && (name == other_name
+                || name
+                    .bytes()
+                    .map(normalize_separator)
+                    .eq(other_name.bytes().map(normalize_separator)))
+    }
+
+    /// Array depth, primitive descriptor (or `L`), and borrowed class name.
+    fn jvm_shape(&self) -> (usize, char, &str) {
+        let mut ty = self;
+        let mut arrays = 0;
+        let (primitive, name) = loop {
+            match ty {
+                Type::Reference(inner) => ty = inner,
+                Type::Array(inner) | Type::MutableReference(inner) if inner.has_jvm_value() => {
+                    arrays += 1;
+                    ty = inner;
+                }
+                Type::Array(_) => {
+                    arrays += 1;
+                    break ('L', "java/lang/Object");
+                }
+                Type::MutableReference(_) => break ('L', "java/lang/Object"),
+                Type::Pointer(_) => break ('L', POINTER_CLASS),
+                Type::Str => break ('L', UTF8_VIEW_CLASS),
+                Type::Slice(_) => break ('L', SLICE_VIEW_CLASS),
+                Type::Class(name) | Type::Interface(name) => break ('L', name.as_str()),
+                Type::Void | Type::Unit => break ('V', ""),
+                Type::Boolean => break ('Z', ""),
+                Type::Char | Type::U16 => break ('C', ""),
+                Type::I8 | Type::U8 => break ('B', ""),
+                Type::I16 | Type::F16 => break ('S', ""),
+                Type::I32 | Type::U32 => break ('I', ""),
+                Type::I64 | Type::U64 => break ('J', ""),
+                Type::F32 => break ('F', ""),
+                Type::F64 => break ('D', ""),
+            }
+        };
+        (arrays, primitive, name)
+    }
+
+    /// Append a descriptor while borrowing class names and nested carriers.
     pub fn write_jvm_descriptor(&self, descriptor: &mut String) {
-        match self {
-            Type::Void => descriptor.push('V'),
-            // Unit is only descriptor-compatible as a method return. Parameters and fields
-            // omit it before descriptors are built.
-            Type::Unit => descriptor.push('V'),
-            Type::Boolean => descriptor.push('Z'),
-            Type::Char => descriptor.push('C'),
-            Type::I8 | Type::U8 => descriptor.push('B'),
-            Type::I16 => descriptor.push('S'),
-            Type::U16 => descriptor.push('C'),
-            Type::I32 | Type::U32 => descriptor.push('I'),
-            Type::I64 | Type::U64 => descriptor.push('J'),
-            // Binary16 is stored as its raw 16-bit IEEE representation.
-            Type::F16 => descriptor.push('S'),
-            Type::F32 => descriptor.push('F'),
-            Type::F64 => descriptor.push('D'),
-            Type::Pointer(_) => {
-                descriptor.push('L');
-                descriptor.push_str(POINTER_CLASS);
-                descriptor.push(';');
+        let (arrays, primitive, name) = self.jvm_shape();
+        descriptor.extend(std::iter::repeat_n('[', arrays));
+        descriptor.push(primitive);
+        if primitive == 'L' {
+            if name.contains('.') {
+                descriptor.extend(name.chars().map(|c| if c == '.' { '/' } else { c }));
+            } else {
+                descriptor.push_str(name);
             }
-            Type::Str => {
-                descriptor.push('L');
-                descriptor.push_str(UTF8_VIEW_CLASS);
-                descriptor.push(';');
-            }
-            Type::Class(name) | Type::Interface(name) => {
-                descriptor.push('L');
-                for character in name.chars() {
-                    descriptor.push(if character == '.' { '/' } else { character });
-                }
-                descriptor.push(';');
-            }
-            Type::Reference(inner) => inner.write_jvm_descriptor(descriptor),
-            Type::MutableReference(inner) => {
-                if inner.has_jvm_value() {
-                    descriptor.push('[');
-                    inner.write_jvm_descriptor(descriptor);
-                } else {
-                    descriptor.push_str("Ljava/lang/Object;");
-                }
-            }
-            Type::Array(element_type) => {
-                if element_type.has_jvm_value() {
-                    descriptor.push('[');
-                    element_type.write_jvm_descriptor(descriptor);
-                } else {
-                    descriptor.push_str("[Ljava/lang/Object;");
-                }
-            }
-            Type::Slice(_) => {
-                descriptor.push('L');
-                descriptor.push_str(SLICE_VIEW_CLASS);
-                descriptor.push(';');
-            }
+            descriptor.push(';');
         }
     }
 
@@ -414,6 +415,43 @@ impl Type {
             // pointer-native methods are redirected explicitly during lowering.
             Type::Pointer(inner) => inner.get_class_name(),
             _ => None,
+        }
+    }
+}
+
+fn normalize_separator(byte: u8) -> u8 {
+    if byte == b'.' { b'/' } else { byte }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Type;
+
+    #[test]
+    fn erased_carriers_preserve_arrays_zero_sized_values_and_java_names() {
+        use Type::*;
+        let cases = [
+            (I16, "S"),
+            (F16, "S"),
+            (Char, "C"),
+            (U16, "C"),
+            (Class("java.lang.É".into()), "Ljava/lang/É;"),
+            (Interface("java/lang/É".into()), "Ljava/lang/É;"),
+            (Pointer(Box::new(Unit)), "Lorg/rustlang/runtime/Pointer;"),
+            (Array(Box::new(Unit)), "[Ljava/lang/Object;"),
+            (MutableReference(Box::new(Unit)), "Ljava/lang/Object;"),
+            (
+                Array(Box::new(MutableReference(Box::new(Unit)))),
+                "[Ljava/lang/Object;",
+            ),
+            (Reference(Box::new(Array(Box::new(U8)))), "[B"),
+            (MutableReference(Box::new(Array(Box::new(I8)))), "[[B"),
+        ];
+        for (ty, expected) in &cases {
+            assert_eq!(ty.to_jvm_descriptor(), *expected);
+            for (other, other_expected) in &cases {
+                assert_eq!(ty.same_jvm_type(other), expected == other_expected);
+            }
         }
     }
 }

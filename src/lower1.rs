@@ -455,8 +455,7 @@ fn lower_body<'tcx>(
 
     // Get a function name from the instance or use the provided override.
     // Prefer monomorphized naming to disambiguate generic instantiations.
-    let fn_name_data =
-        fn_name_override.unwrap_or_else(|| naming::mono_fn_name_from_instance(tcx, instance));
+    let fn_name_data = fn_name_override.unwrap_or_else(|| data_types.function_name(tcx, instance));
     let fn_name = fn_name_data.method_name.clone();
 
     // Extract function signature

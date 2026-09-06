@@ -88,7 +88,7 @@ pub(in crate::lower1) fn emit_panic_lang_item<'tcx>(
         instructions,
         temp_prefix,
     ));
-    let target = crate::lower1::naming::mono_fn_name_from_instance(tcx, panic_instance);
+    let target = data_types.function_name(tcx, panic_instance);
     let params = args
         .iter()
         .enumerate()

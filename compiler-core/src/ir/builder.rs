@@ -299,6 +299,9 @@ impl<'a> Builder<'a> {
             }
         }
         super::parameters::remove_trivial_parameters(&mut self.body, &predecessors);
+        // Selection checks the final body after outlining and constant
+        // preparation. Also check this intermediate form in development builds.
+        #[cfg(debug_assertions)]
         verify(&self.body, self.types)?;
         Ok(self.body)
     }

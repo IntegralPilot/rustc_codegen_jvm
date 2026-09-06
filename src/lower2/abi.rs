@@ -13,9 +13,7 @@ pub(super) fn adapt(
     let from = oomir::construct::source_type(types, from);
     let to = oomir::construct::source_type(types, to);
     if from == to
-        || (from.is_jvm_reference_type()
-            && to.is_jvm_reference_type()
-            && from.to_jvm_descriptor() == to.to_jvm_descriptor())
+        || (from.is_jvm_reference_type() && to.is_jvm_reference_type() && from.same_jvm_type(&to))
     {
         return Ok(());
     }

@@ -254,35 +254,85 @@ impl Index {
     }
 }
 
-/// Each merge task reuses a small, bounded set of file handles.
+/// Keep frequently reused archives open across all merge batches. Positional
+/// reads let workers share them without reopening or racing on a seek cursor.
 #[derive(Default)]
 pub(crate) struct Readers {
-    files: HashMap<usize, fs::File>,
+    files: HashMap<usize, InputFile>,
 }
 
 impl Readers {
-    pub(crate) fn load(&mut self, paths: &[PathBuf], group: &Group) -> io::Result<Vec<ClassInfo>> {
+    pub(crate) fn open(index: &Index) -> io::Result<Self> {
+        let mut uses = vec![0usize; index.paths.len()];
+        for group in &index.groups {
+            for fragment in &group.fragments {
+                uses[fragment.file] += 1;
+            }
+        }
+        let mut frequent: Vec<_> = uses
+            .into_iter()
+            .enumerate()
+            .filter(|(_, n)| *n > 1)
+            .collect();
+        frequent.sort_unstable_by_key(|&(file, n)| (std::cmp::Reverse(n), file));
+        let files = frequent
+            .into_iter()
+            .take(64)
+            .map(|(file, _)| Ok((file, InputFile::open(&index.paths[file])?)))
+            .collect::<io::Result<_>>()?;
+        Ok(Self { files })
+    }
+
+    pub(crate) fn load(&self, paths: &[PathBuf], group: &Group) -> io::Result<Vec<ClassInfo>> {
         group
             .fragments
             .iter()
             .map(|fragment| {
-                if self.files.len() >= 8 && !self.files.contains_key(&fragment.file) {
-                    self.files.clear();
-                }
-                let file = match self.files.entry(fragment.file) {
-                    std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-                    std::collections::hash_map::Entry::Vacant(entry) => {
-                        entry.insert(fs::File::open(&paths[fragment.file])?)
-                    }
-                };
-                file.seek(SeekFrom::Start(fragment.offset))?;
                 let mut data = vec![0; fragment.len];
-                file.read_exact(&mut data)?;
+                if let Some(file) = self.files.get(&fragment.file) {
+                    file.read(&mut data, fragment.offset)?;
+                } else {
+                    InputFile::open(&paths[fragment.file])?.read(&mut data, fragment.offset)?;
+                }
                 Ok(ClassInfo {
                     jar_entry_name: group.name.clone(),
                     data,
                 })
             })
             .collect()
+    }
+}
+
+struct InputFile {
+    file: fs::File,
+    #[cfg(not(unix))]
+    cursor: std::sync::Mutex<()>,
+}
+
+impl InputFile {
+    fn open(path: &Path) -> io::Result<Self> {
+        Ok(Self {
+            file: fs::File::open(path)?,
+            #[cfg(not(unix))]
+            cursor: std::sync::Mutex::new(()),
+        })
+    }
+
+    fn read(&self, data: &mut [u8], offset: u64) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+            self.file.read_exact_at(data, offset)
+        }
+        #[cfg(not(unix))]
+        {
+            let _cursor = self
+                .cursor
+                .lock()
+                .map_err(|_| io::Error::other("input file lock poisoned"))?;
+            let mut file = &self.file;
+            file.seek(SeekFrom::Start(offset))?;
+            file.read_exact(data)
+        }
     }
 }

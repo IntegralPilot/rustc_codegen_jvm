@@ -671,8 +671,7 @@ impl<'tcx> PreparedCast<'_, 'tcx> {
             if let Some(oomir::DataType::Class { fields, .. }) = data_types.get(class_name) {
                 if let Some((_field_name, field_ty)) = fields.first().cloned() {
                     let value_ty = oomir_operand.get_type().unwrap_or(oomir_source_type);
-                    let needs_cast = field_ty != value_ty
-                        && field_ty.to_jvm_descriptor() != value_ty.to_jvm_descriptor();
+                    let needs_cast = field_ty != value_ty && !field_ty.same_jvm_type(&value_ty);
                     let erased_object_field = field_ty.to_jvm_descriptor() == "Ljava/lang/Object;";
                     let constructor_arg_ty = if erased_object_field {
                         oomir::Type::Class("java/lang/Object".to_string())
