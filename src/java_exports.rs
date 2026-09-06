@@ -199,8 +199,8 @@ pub(super) fn lower_public_library_exports<'tcx>(
     tcx: TyCtxt<'tcx>,
     partitioned_functions: &HashSet<Instance<'tcx>>,
     oomir_module: &mut lower1::context::Module<'tcx>,
-    lowered_instances: &mut HashSet<Instance<'tcx>>,
-    scanned_instances: &mut HashSet<Instance<'tcx>>,
+    lowered_instances: &Lock<HashSet<Instance<'tcx>>>,
+    scanned_instances: &Lock<HashSet<Instance<'tcx>>>,
 ) {
     if !crate_emits_library_artifact(tcx) {
         return;

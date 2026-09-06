@@ -66,7 +66,10 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use rustc_hir::def::DefKind;
 use std::collections::{BTreeMap, VecDeque};
 
-use rustc_data_structures::unord::UnordMap;
+use rustc_data_structures::{
+    sync::{IntoDynSyncSend, Lock, par_for_each_in},
+    unord::UnordMap,
+};
 use rustc_metadata::EncodedMetadata;
 use rustc_middle::{
     dep_graph::{WorkProduct, WorkProductId},
@@ -126,7 +129,7 @@ fn lower_mono_function<'tcx>(
     tcx: TyCtxt<'tcx>,
     instance: Instance<'tcx>,
     oomir_module: &mut lower1::context::Module<'tcx>,
-    lowered_instances: &mut HashSet<Instance<'tcx>>,
+    lowered_instances: &Lock<HashSet<Instance<'tcx>>>,
 ) {
     let is_external_runtime_item = !instance.def_id().is_local()
         && lower1::jvm_names::is_runtime_crate(tcx, instance.def_id().krate);
@@ -146,7 +149,7 @@ fn lower_mono_function<'tcx>(
         return;
     }
 
-    if !lowered_instances.insert(instance) {
+    if !lowered_instances.borrow_mut().insert(instance) {
         return;
     }
 
@@ -227,13 +230,13 @@ fn lower_codegen_unit_items<'tcx>(
     mono_items: impl IntoIterator<Item = MonoItem<'tcx>>,
     partitioned_functions: &HashSet<Instance<'tcx>>,
     oomir_module: &mut lower1::context::Module<'tcx>,
-    claimed_mono_items: &mut HashSet<MonoItem<'tcx>>,
-    lowered_instances: &mut HashSet<Instance<'tcx>>,
-    scanned_instances: &mut HashSet<Instance<'tcx>>,
+    claimed_mono_items: &Lock<HashSet<MonoItem<'tcx>>>,
+    lowered_instances: &Lock<HashSet<Instance<'tcx>>>,
+    scanned_instances: &Lock<HashSet<Instance<'tcx>>>,
 ) {
     let mut function_roots = Vec::new();
     for mono_item in mono_items {
-        if !claimed_mono_items.insert(mono_item) {
+        if !claimed_mono_items.borrow_mut().insert(mono_item) {
             continue;
         }
         match mono_item {
@@ -268,14 +271,14 @@ fn lower_supplemental_instance_closure<'tcx>(
     roots: impl IntoIterator<Item = Instance<'tcx>>,
     partitioned_functions: &HashSet<Instance<'tcx>>,
     oomir_module: &mut lower1::context::Module<'tcx>,
-    lowered_instances: &mut HashSet<Instance<'tcx>>,
-    scanned_instances: &mut HashSet<Instance<'tcx>>,
+    lowered_instances: &Lock<HashSet<Instance<'tcx>>>,
+    scanned_instances: &Lock<HashSet<Instance<'tcx>>>,
 ) {
     let mut functions = roots.into_iter().collect::<VecDeque<_>>();
     let mut queued = functions.iter().copied().collect::<HashSet<_>>();
     while let Some(instance) = functions.pop_front() {
         lower_mono_function(tcx, instance, oomir_module, lowered_instances);
-        if !scanned_instances.insert(instance) {
+        if !scanned_instances.borrow_mut().insert(instance) {
             continue;
         }
         for callee in direct_mir_callees(tcx, instance) {
@@ -559,9 +562,9 @@ impl CodegenBackend for MyBackend {
             let rust_crate = LOCAL_CRATE;
             let crate_name = tcx.crate_name(rust_crate).to_string();
             let crate_module_class = lower1::jvm_names::crate_module_class(tcx, rust_crate);
-            let mut lowered_instances = HashSet::default();
-            let mut claimed_mono_items = HashSet::default();
-            let mut scanned_instances = HashSet::default();
+            let lowered_instances = Lock::new(HashSet::default());
+            let claimed_mono_items = Lock::new(HashSet::default());
+            let scanned_instances = Lock::new(HashSet::default());
             let emitted_class_registry = lower2::EmittedClassRegistry::default();
             let debug_info = lower2::debug_info_options(tcx);
             let mono_items = tcx.collect_and_partition_mono_items(());
@@ -579,7 +582,7 @@ impl CodegenBackend for MyBackend {
                 let worker_count = std::thread::available_parallelism()
                     .map_or(1, std::num::NonZeroUsize::get)
                     .min(MAX_CODEGEN_WORKERS);
-                let mut workers = pipeline::start(
+                let workers = pipeline::start(
                     scope,
                     worker_count,
                     OOMIR_SHARD_QUEUE_DEPTH,
@@ -608,17 +611,14 @@ impl CodegenBackend for MyBackend {
 
                 // Java exports are supplemental roots and are small enough to
                 // stream as their own job while ordinary owners are lowered.
-                let mut export_module = empty_oomir_module(
-                    tcx,
-                    &crate_module_class,
-                    std::rc::Rc::clone(&shared_lowering),
-                );
+                let mut export_module =
+                    empty_oomir_module(tcx, &crate_module_class, Arc::clone(&shared_lowering));
                 lower_public_library_exports(
                     tcx,
                     &partitioned_functions,
                     &mut export_module,
-                    &mut lowered_instances,
-                    &mut scanned_instances,
+                    &lowered_instances,
+                    &scanned_instances,
                 );
                 emit_allocator_shims(tcx, &mut export_module);
                 let mut export_module = prepare_oomir_shard(export_module);
@@ -630,7 +630,7 @@ impl CodegenBackend for MyBackend {
                 // duplicate holder construction while preserving fine-grained
                 // streaming and dynamic worker load balancing.
                 let mut items_by_owner = BTreeMap::<String, Vec<MonoItem<'_>>>::new();
-                let naming = Definitions::new(std::rc::Rc::clone(&shared_lowering));
+                let naming = Definitions::new(Arc::clone(&shared_lowering));
                 for cgu in mono_items.codegen_units {
                     for (item, _) in cgu.items_in_deterministic_order(tcx) {
                         let owner = match item {
@@ -647,28 +647,53 @@ impl CodegenBackend for MyBackend {
                     }
                 }
                 drop(naming);
-                for (index, (owner, items)) in items_by_owner.into_iter().enumerate() {
-                    let shard_name =
-                        format!("jvm-class-{index}-{}", stable_hash::short_hash(&owner, 8));
-                    let mut module = empty_oomir_module(
-                        tcx,
-                        &crate_module_class,
-                        std::rc::Rc::clone(&shared_lowering),
-                    );
-                    lower_codegen_unit_items(
-                        tcx,
-                        items,
-                        &partitioned_functions,
-                        &mut module,
-                        &mut claimed_mono_items,
-                        &mut lowered_instances,
-                        &mut scanned_instances,
-                    );
-                    let mut module = prepare_oomir_shard(module);
-                    canonical_data_types.collect(&mut module);
-                    workers.submit((submitted, shard_name, module, false));
-                    submitted += 1;
-                }
+                submitted += items_by_owner.len();
+                let pending = Lock::new(
+                    items_by_owner
+                        .into_iter()
+                        .enumerate()
+                        .rev()
+                        .collect::<Vec<_>>(),
+                );
+                let canonical_data_types = Lock::new(canonical_data_types);
+                let producer = IntoDynSyncSend(workers.producer());
+                // At most four MIR shards are alive, even when rustc's query
+                // pool is larger. The emission queue applies backpressure.
+                tcx.sess.time("jvm_lower_mir", || {
+                    par_for_each_in(0..worker_count, |_| {
+                        rustc_middle::ty::print::with_no_trimmed_paths!({
+                            loop {
+                                let next = pending.borrow_mut().pop();
+                                let Some((index, (owner, items))) = next else {
+                                    break;
+                                };
+                                let shard_name = format!(
+                                    "jvm-class-{index}-{}",
+                                    stable_hash::short_hash(&owner, 8)
+                                );
+                                let mut module = empty_oomir_module(
+                                    tcx,
+                                    &crate_module_class,
+                                    Arc::clone(&shared_lowering),
+                                );
+                                lower_codegen_unit_items(
+                                    tcx,
+                                    items,
+                                    &partitioned_functions,
+                                    &mut module,
+                                    &claimed_mono_items,
+                                    &lowered_instances,
+                                    &scanned_instances,
+                                );
+                                let mut module = prepare_oomir_shard(module);
+                                canonical_data_types.borrow_mut().collect(&mut module);
+                                producer.submit((index + 1, shard_name, module, false));
+                            }
+                        });
+                    })
+                });
+                drop(producer);
+                let canonical_data_types = canonical_data_types.into_inner();
 
                 drop(shared_lowering);
 
@@ -685,7 +710,7 @@ impl CodegenBackend for MyBackend {
                     workers.submit((submitted, shard_name, module, false));
                     submitted += 1;
                 }
-                let mut results = workers.finish();
+                let mut results = tcx.sess.time("jvm_finish_emission", || workers.finish());
                 results.sort_by_key(|(ordinal, _)| *ordinal);
                 results
                     .into_iter()

@@ -1,13 +1,30 @@
 //! Bounded handoff between MIR construction and independent JVM emission.
 use std::{
-    sync::{Arc, Mutex, mpsc},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    },
     thread::Scope,
 };
 
 pub(crate) struct Workers<T, R> {
-    jobs: mpsc::SyncSender<T>,
+    producer: Producer<T>,
     results: mpsc::Receiver<R>,
-    submitted: usize,
+}
+
+pub(crate) struct Producer<T> {
+    jobs: mpsc::SyncSender<T>,
+    submitted: Arc<AtomicUsize>,
+}
+
+impl<T> Clone for Producer<T> {
+    fn clone(&self) -> Self {
+        Self {
+            jobs: self.jobs.clone(),
+            submitted: Arc::clone(&self.submitted),
+        }
+    }
 }
 
 pub(crate) fn start<'scope, 'env, T: Send + 'scope, R: Send + 'scope>(
@@ -45,30 +62,41 @@ pub(crate) fn start<'scope, 'env, T: Send + 'scope, R: Send + 'scope>(
     drop(receiver);
     drop(sender);
     Workers {
-        jobs,
+        producer: Producer {
+            jobs,
+            submitted: Arc::new(AtomicUsize::new(0)),
+        },
         results,
-        submitted: 0,
     }
 }
 
 impl<T, R> Workers<T, R> {
-    pub(crate) fn submit(&mut self, job: T) {
+    pub(crate) fn producer(&self) -> Producer<T> {
+        self.producer.clone()
+    }
+    pub(crate) fn submit(&self, job: T) {
+        self.producer.submit(job);
+    }
+    pub(crate) fn finish(self) -> Vec<R> {
+        let submitted = Arc::clone(&self.producer.submitted);
+        drop(self.producer);
+        let results: Vec<_> = self.results.into_iter().collect();
+        assert_eq!(
+            results.len(),
+            submitted.load(Ordering::Relaxed),
+            "JVM emission worker stopped without a result"
+        );
+        results
+    }
+}
+
+impl<T> Producer<T> {
+    pub(crate) fn submit(&self, job: T) {
         assert!(
             self.jobs.send(job).is_ok(),
             "JVM emission workers stopped unexpectedly"
         );
-        self.submitted += 1;
-    }
-
-    pub(crate) fn finish(self) -> Vec<R> {
-        drop(self.jobs);
-        let results: Vec<_> = self.results.into_iter().collect();
-        assert_eq!(
-            results.len(),
-            self.submitted,
-            "JVM emission worker stopped without a result"
-        );
-        results
+        self.submitted.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -83,7 +111,7 @@ mod tests {
         std::thread::spawn(move || {
             let failed = catch_unwind(|| {
                 std::thread::scope(|scope| {
-                    let mut workers = start(scope, 1, 1, |_: usize| -> usize {
+                    let workers = start(scope, 1, 1, |_: usize| -> usize {
                         panic!("injected worker failure")
                     });
                     for n in 0..10 {
@@ -105,7 +133,7 @@ mod tests {
     #[test]
     fn processes_each_job_and_drains_the_queue() {
         let mut results = std::thread::scope(|scope| {
-            let mut workers = start(scope, 3, 1, |n| n * n);
+            let workers = start(scope, 3, 1, |n| n * n);
             for n in 0..100 {
                 workers.submit(n);
             }
@@ -113,5 +141,23 @@ mod tests {
         });
         results.sort_unstable();
         assert_eq!(results, (0..100).map(|n| n * n).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn concurrent_producers_complete_before_the_final_count_is_checked() {
+        let mut results = std::thread::scope(|scope| {
+            let workers = start(scope, 3, 1, |n| n);
+            for group in 0..4 {
+                let producer = workers.producer();
+                scope.spawn(move || {
+                    for n in 0..100 {
+                        producer.submit(group * 100 + n);
+                    }
+                });
+            }
+            workers.finish()
+        });
+        results.sort_unstable();
+        assert_eq!(results, (0..400).collect::<Vec<_>>());
     }
 }
