@@ -1,3 +1,4 @@
+use crate::lower1::context::Definitions;
 use rustc_hash::FxHashMap as HashMap;
 
 use rustc_middle::ty::{Instance, Ty, TyCtxt, TyKind, TypingEnv, VtblEntry};
@@ -40,7 +41,7 @@ pub(super) fn ensure_trait_object_adapter_class<'tcx>(
     target_mir_ty: Ty<'tcx>,
     carrier_ty: &oomir::Type,
     interface_name: &str,
-    data_types: &mut HashMap<String, oomir::DataType>,
+    data_types: &mut Definitions<'tcx>,
     tcx: TyCtxt<'tcx>,
     instance_context: Instance<'tcx>,
 ) -> Result<String, String> {
@@ -76,7 +77,7 @@ pub(crate) fn ensure_trait_object_adapter_class_for_pointees<'tcx>(
     dynamic_ty: Ty<'tcx>,
     carrier_ty: &oomir::Type,
     interface_name: &str,
-    data_types: &mut HashMap<String, oomir::DataType>,
+    data_types: &mut Definitions<'tcx>,
     tcx: TyCtxt<'tcx>,
     instance_context: Instance<'tcx>,
 ) -> Result<String, String> {
@@ -262,7 +263,8 @@ pub(crate) fn ensure_trait_object_adapter_class_for_pointees<'tcx>(
                                 instructions,
                             },
                         )]),
-                    },
+                    }
+                    .into(),
                 }),
             );
             continue;
@@ -585,7 +587,8 @@ pub(crate) fn ensure_trait_object_adapter_class_for_pointees<'tcx>(
                             instructions,
                         },
                     )]),
-                },
+                }
+                .into(),
             }),
         );
     }
@@ -637,7 +640,8 @@ pub(crate) fn ensure_trait_object_adapter_class_for_pointees<'tcx>(
                         ],
                     },
                 )]),
-            },
+            }
+            .into(),
         }),
     );
     let adapter_drops_payload = concrete_ty.needs_drop(tcx, TypingEnv::fully_monomorphized())
@@ -694,7 +698,8 @@ pub(crate) fn ensure_trait_object_adapter_class_for_pointees<'tcx>(
                             ],
                         },
                     )]),
-                },
+                }
+                .into(),
             }),
         );
     }
@@ -729,7 +734,8 @@ pub(crate) fn ensure_trait_object_adapter_class_for_pointees<'tcx>(
                             }],
                         },
                     )]),
-                },
+                }
+                .into(),
             }),
         );
     }
