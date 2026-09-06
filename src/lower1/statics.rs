@@ -1,6 +1,6 @@
+use crate::lower1::context::Definitions;
 use crate::oomir;
 use rustc_abi::Size;
-use rustc_hash::FxHashMap as HashMap;
 use rustc_middle::ty::{Instance, TyCtxt};
 use rustc_span::def_id::DefId;
 
@@ -22,7 +22,7 @@ fn identity(tcx: TyCtxt<'_>, def_id: DefId) -> (String, String) {
 pub fn static_ref_constant<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: DefId,
-    data_types: &mut HashMap<String, oomir::DataType>,
+    data_types: &mut Definitions<'tcx>,
     instance: Instance<'tcx>,
 ) -> oomir::Constant {
     let rust_ty = tcx.type_of(def_id).skip_binder();
@@ -43,7 +43,7 @@ pub fn static_ref_constant<'tcx>(
 pub fn lower_static<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: DefId,
-    module: &mut oomir::Module,
+    module: &mut super::context::Module<'tcx>,
 ) -> Result<(), String> {
     let rust_ty = tcx.type_of(def_id).skip_binder();
     let instance = Instance::mono(tcx, def_id);

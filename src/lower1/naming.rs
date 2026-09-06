@@ -1,7 +1,6 @@
 //! Naming helpers for functions and monomorphized instances
 
 use super::jvm_names;
-use rustc_hash::FxHashMap as HashMap;
 use rustc_hir::{attrs::lang_items::LangItem, def::DefKind};
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 use rustc_middle::ty::{
@@ -579,7 +578,7 @@ fn associated_specialization_name<'tcx>(
     args: &[GenericArg<'tcx>],
 ) -> String {
     let method = jvm_names::method_for_function(tcx, canonical_def_id);
-    let mut data_types = HashMap::default();
+    let mut data_types = super::context::Definitions::default();
     let mut generic_tokens = Vec::new();
     for arg in args {
         if let Some(token) =
@@ -675,7 +674,7 @@ pub fn mono_fn_name_from_instance<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'t
             method_name: format!("{}_{}", safe_base, hash),
         };
     }
-    let mut data_types = HashMap::default();
+    let mut data_types = super::context::Definitions::default();
     let mut generic_tokens = Vec::new();
     if needs_definition_suffix {
         // The complete definition path above already identifies traits,

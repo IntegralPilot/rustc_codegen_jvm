@@ -7,22 +7,27 @@
 //! that sits between MIR and JVM bytecode. It supports a subset of Rust constructs
 //! (arithmetic, branching, returns) and can be extended to support more of Rust.
 
+use crate::lower1::context::Definitions;
 use crate::oomir;
 use control_flow::convert_basic_block;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use rustc_hir::attrs::lang_items::LangItem;
 use rustc_middle::{
     mir::{
-        BasicBlock, Body, Local, OUTERMOST_SOURCE_SCOPE, Place, ProjectionElem, SourceScope,
-        StatementKind, TerminatorKind, VarDebugInfoContents,
+        BasicBlock, Body, Local, OUTERMOST_SOURCE_SCOPE, Place, ProjectionElem, StatementKind,
+        TerminatorKind, VarDebugInfoContents,
     },
     ty::{EarlyBinder, Instance, TyCtxt},
 };
-use rustc_span::{Span, def_id::DefId, hygiene};
+use rustc_span::def_id::DefId;
 use std::collections::VecDeque;
 use types::ty_to_oomir_type;
 
 mod closures;
+mod debug;
+pub(crate) use debug::source_location;
+use debug::{DebugScopeCache, local_variable_scope};
+pub(crate) mod context;
 pub mod control_flow;
 pub mod jvm_names;
 pub mod naming;
@@ -36,44 +41,6 @@ pub use closures::generate_closure_function_name;
 
 pub(crate) fn is_non_null_lang_item(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
     tcx.is_lang_item(def_id, LangItem::NonNull)
-}
-
-pub(crate) fn source_location(
-    tcx: TyCtxt<'_>,
-    function_span: Span,
-    span: Span,
-) -> Option<oomir::SourceLocation> {
-    if span.is_dummy() {
-        return None;
-    }
-
-    let span = hygiene::walk_chain_collapsed(span, function_span);
-    let location = tcx.sess.source_map().lookup_char_pos(span.lo());
-    Some(oomir::SourceLocation {
-        file_name: location.file.name.short().to_string(),
-        line: u32::try_from(location.line).ok()?,
-    })
-}
-
-fn source_scope_contains<'tcx>(
-    mir: &Body<'tcx>,
-    ancestor: SourceScope,
-    mut scope: SourceScope,
-) -> bool {
-    loop {
-        if scope == ancestor {
-            return true;
-        }
-        let Some(parent) = mir.source_scopes[scope].parent_scope else {
-            return false;
-        };
-        scope = parent;
-    }
-}
-
-pub(crate) struct DebugScopeCache {
-    visible_without_references: Vec<Vec<usize>>,
-    variables_by_local: HashMap<usize, Vec<usize>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -204,116 +171,6 @@ impl MirControlFlow {
             reachable,
         }
     }
-}
-
-impl DebugScopeCache {
-    fn new(
-        mir: &Body<'_>,
-        debug_variables: &[oomir::DebugVariable],
-        debug_variable_scopes: &[SourceScope],
-    ) -> Self {
-        let mut visible_without_references = Vec::with_capacity(mir.source_scopes.len());
-        for scope in mir.source_scopes.indices() {
-            let mut visible_by_name = HashMap::<String, (usize, SourceScope)>::default();
-            for (index, variable_scope) in debug_variable_scopes.iter().copied().enumerate() {
-                if !source_scope_contains(mir, variable_scope, scope) {
-                    continue;
-                }
-                let Some(variable) = debug_variables.get(index) else {
-                    continue;
-                };
-                match visible_by_name.get(&variable.name).copied() {
-                    Some((_, visible_scope))
-                        if source_scope_contains(mir, visible_scope, variable_scope) =>
-                    {
-                        visible_by_name.insert(variable.name.clone(), (index, variable_scope));
-                    }
-                    None => {
-                        visible_by_name.insert(variable.name.clone(), (index, variable_scope));
-                    }
-                    _ => {}
-                }
-            }
-            let mut visible = visible_by_name
-                .into_values()
-                .map(|(index, _)| index)
-                .collect::<Vec<_>>();
-            visible.sort_unstable();
-            visible_without_references.push(visible);
-        }
-
-        let mut variables_by_local = HashMap::<usize, Vec<usize>>::default();
-        for (index, variable) in debug_variables.iter().enumerate() {
-            let local = variable
-                .oomir_name
-                .strip_prefix("_cell_")
-                .or_else(|| variable.oomir_name.strip_prefix('_'))
-                .and_then(|value| value.parse::<usize>().ok());
-            if let Some(local) = local {
-                variables_by_local.entry(local).or_default().push(index);
-            }
-        }
-
-        Self {
-            visible_without_references,
-            variables_by_local,
-        }
-    }
-}
-
-pub(crate) fn local_variable_scope(
-    cache: &DebugScopeCache,
-    scope: SourceScope,
-    referenced_locals: &HashSet<Local>,
-    debug_variables: &[oomir::DebugVariable],
-    debug_variable_scopes: &[SourceScope],
-) -> oomir::Instruction {
-    let mut visible_by_name = HashMap::<String, (usize, SourceScope)>::default();
-    for index in cache
-        .visible_without_references
-        .get(scope.index())
-        .into_iter()
-        .flatten()
-        .copied()
-    {
-        let Some(variable) = debug_variables.get(index) else {
-            continue;
-        };
-        let variable_scope = debug_variable_scopes
-            .get(index)
-            .copied()
-            .unwrap_or(OUTERMOST_SOURCE_SCOPE);
-        visible_by_name.insert(variable.name.clone(), (index, variable_scope));
-    }
-
-    for local in referenced_locals {
-        for index in cache
-            .variables_by_local
-            .get(&local.index())
-            .into_iter()
-            .flatten()
-            .copied()
-        {
-            let Some(variable) = debug_variables.get(index) else {
-                continue;
-            };
-            let variable_scope = debug_variable_scopes
-                .get(index)
-                .copied()
-                .unwrap_or(OUTERMOST_SOURCE_SCOPE);
-            // MIR optimizations can move a binding's definition or use into
-            // its parent source scope. A referenced debug local is still the
-            // visible binding and shadows an outer binding by source name.
-            visible_by_name.insert(variable.name.clone(), (index, variable_scope));
-        }
-    }
-
-    let mut visible = visible_by_name
-        .into_values()
-        .map(|(index, _)| index)
-        .collect::<Vec<_>>();
-    visible.sort_unstable();
-    oomir::Instruction::LocalVariableScope(visible)
 }
 
 fn available_pointer_locals_at_block_entries<'tcx>(
@@ -569,7 +426,29 @@ pub fn mir_to_oomir<'tcx>(
     mir: &Body<'tcx>,
     fn_name_override: Option<naming::FnNameData>,
     is_static: bool,
-    data_types: &mut HashMap<String, oomir::DataType>,
+    data_types: &mut Definitions<'tcx>,
+    external_interfaces: &mut HashSet<String>,
+) -> oomir::Function {
+    data_types.with_body(mir, |data_types| {
+        lower_body(
+            tcx,
+            instance,
+            mir,
+            fn_name_override,
+            is_static,
+            data_types,
+            external_interfaces,
+        )
+    })
+}
+
+fn lower_body<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
+    mir: &Body<'tcx>,
+    fn_name_override: Option<naming::FnNameData>,
+    is_static: bool,
+    data_types: &mut Definitions<'tcx>,
     external_interfaces: &mut HashSet<String>,
 ) -> oomir::Function {
     use rustc_middle::ty::TyKind;
@@ -579,7 +458,6 @@ pub fn mir_to_oomir<'tcx>(
     let fn_name_data =
         fn_name_override.unwrap_or_else(|| naming::mono_fn_name_from_instance(tcx, instance));
     let fn_name = fn_name_data.method_name.clone();
-    let _stable_cell_analysis = place::enter_stable_cell_analysis(mir);
 
     // Extract function signature
     // Closures require special handling - we must use as_closure().sig() instead of fn_sig()
@@ -703,75 +581,77 @@ pub fn mir_to_oomir<'tcx>(
 
     let mut debug_variables = Vec::new();
     let mut debug_variable_scopes = Vec::new();
-    let mut seen_debug_variables = HashSet::default();
-    for variable in &mir.var_debug_info {
-        let VarDebugInfoContents::Place(debug_place) = &variable.value else {
-            continue;
-        };
-        if variable.composite.is_some() || !debug_place.projection.is_empty() {
-            continue;
+    if crate::lower2::debug_info_options(tcx).local_variables {
+        let mut seen_debug_variables = HashSet::default();
+        for variable in &mir.var_debug_info {
+            let VarDebugInfoContents::Place(debug_place) = &variable.value else {
+                continue;
+            };
+            if variable.composite.is_some() || !debug_place.projection.is_empty() {
+                continue;
+            }
+
+            let source_name = variable.name.to_string();
+            if source_name.is_empty() {
+                continue;
+            }
+            let local = debug_place.local;
+            let value_type = place::get_place_type(
+                &rustc_middle::mir::Place::from(local),
+                mir,
+                tcx,
+                instance,
+                data_types,
+            );
+            let (oomir_name, debug_type) = if data_types.local_uses_stable_cell(local) {
+                (
+                    place::local_cell_name(local),
+                    oomir::Type::Pointer(Box::new(value_type)),
+                )
+            } else {
+                (format!("_{}", local.index()), value_type)
+            };
+            if !debug_type.has_jvm_value()
+                || !seen_debug_variables.insert((
+                    source_name.clone(),
+                    oomir_name.clone(),
+                    variable.source_info.scope,
+                ))
+            {
+                continue;
+            }
+            debug_variables.push(oomir::DebugVariable {
+                name: source_name,
+                oomir_name,
+                ty: debug_type,
+            });
+            debug_variable_scopes.push(variable.source_info.scope);
         }
 
-        let source_name = variable.name.to_string();
-        if source_name.is_empty() {
-            continue;
+        // Preserve descriptor parameters even when rustc did not create a
+        // VarDebugInfo entry (notably the JVM `String[] args` main parameter).
+        for (index, (param_name, param_type)) in signature.params.iter().enumerate() {
+            if param_name == oomir::CALLER_LOCATION_PARAM_NAME || !param_type.has_jvm_value() {
+                continue;
+            }
+            let oomir_name = if signature.is_static && fn_name == "main" && index == 0 {
+                "param_0".to_string()
+            } else {
+                format!("_{}", index + 1)
+            };
+            if debug_variables
+                .iter()
+                .any(|variable| variable.oomir_name == oomir_name)
+            {
+                continue;
+            }
+            debug_variables.push(oomir::DebugVariable {
+                name: param_name.clone(),
+                oomir_name,
+                ty: param_type.clone(),
+            });
+            debug_variable_scopes.push(OUTERMOST_SOURCE_SCOPE);
         }
-        let local = debug_place.local;
-        let value_type = place::get_place_type(
-            &rustc_middle::mir::Place::from(local),
-            mir,
-            tcx,
-            instance,
-            data_types,
-        );
-        let (oomir_name, debug_type) = if place::local_uses_stable_cell(local, mir) {
-            (
-                place::local_cell_name(local),
-                oomir::Type::Pointer(Box::new(value_type)),
-            )
-        } else {
-            (format!("_{}", local.index()), value_type)
-        };
-        if !debug_type.has_jvm_value()
-            || !seen_debug_variables.insert((
-                source_name.clone(),
-                oomir_name.clone(),
-                variable.source_info.scope,
-            ))
-        {
-            continue;
-        }
-        debug_variables.push(oomir::DebugVariable {
-            name: source_name,
-            oomir_name,
-            ty: debug_type,
-        });
-        debug_variable_scopes.push(variable.source_info.scope);
-    }
-
-    // Preserve descriptor parameters even when rustc did not create a
-    // VarDebugInfo entry (notably the JVM `String[] args` main parameter).
-    for (index, (param_name, param_type)) in signature.params.iter().enumerate() {
-        if param_name == oomir::CALLER_LOCATION_PARAM_NAME || !param_type.has_jvm_value() {
-            continue;
-        }
-        let oomir_name = if signature.is_static && fn_name == "main" && index == 0 {
-            "param_0".to_string()
-        } else {
-            format!("_{}", index + 1)
-        };
-        if debug_variables
-            .iter()
-            .any(|variable| variable.oomir_name == oomir_name)
-        {
-            continue;
-        }
-        debug_variables.push(oomir::DebugVariable {
-            name: param_name.clone(),
-            oomir_name,
-            ty: param_type.clone(),
-        });
-        debug_variable_scopes.push(OUTERMOST_SOURCE_SCOPE);
     }
     let debug_scope_cache = DebugScopeCache::new(mir, &debug_variables, &debug_variable_scopes);
 
@@ -798,7 +678,6 @@ pub fn mir_to_oomir<'tcx>(
             external_interfaces,
             &mut mutable_borrows,
             &debug_variables,
-            &debug_variable_scopes,
             &debug_scope_cache,
             available_pointer_locals[bb.index()].to_hash_set(),
         ); // Pass return type here
@@ -834,7 +713,7 @@ pub fn mir_to_oomir<'tcx>(
 
         // Get the tuple parameter type (should be the first parameter in the signature)
         let tuple_param_index = if closure_has_captures { 1 } else { 0 };
-        let tuple_param_local = if closure_has_captures { "_2" } else { "_1" };
+        let tuple_param_local = format!("param_{tuple_param_index}");
         if let Some((_tuple_param_name, tuple_param_ty)) = signature.params.get(tuple_param_index) {
             // Check if it's a tuple/struct type that we need to unpack
             if let oomir::Type::Class(class_name) = tuple_param_ty {
@@ -864,7 +743,7 @@ pub fn mir_to_oomir<'tcx>(
 
     let carrier_locals = class_locals_needing_initial_carriers(mir, &mir_control_flow);
     for local in carrier_locals {
-        if place::local_uses_stable_cell(local, mir) {
+        if data_types.local_uses_stable_cell(local) {
             continue;
         }
         let oomir::Type::Class(class_name) = place::get_place_type(
@@ -897,7 +776,7 @@ pub fn mir_to_oomir<'tcx>(
     }
 
     for (local, _) in mir.local_decls.iter_enumerated() {
-        if !place::local_uses_stable_cell(local, mir) {
+        if !data_types.local_uses_stable_cell(local) {
             continue;
         }
         let value_type = place::get_place_type(
@@ -990,20 +869,21 @@ pub fn mir_to_oomir<'tcx>(
     if let Some(location) = source_location(tcx, mir.span, mir.span) {
         instrs.insert(0, oomir::Instruction::SourceLocation(location));
     }
-    let no_referenced_debug_locals = HashSet::default();
-    instrs.insert(
-        usize::from(matches!(
-            instrs.first(),
-            Some(oomir::Instruction::SourceLocation(_))
-        )),
-        local_variable_scope(
-            &debug_scope_cache,
-            OUTERMOST_SOURCE_SCOPE,
-            &no_referenced_debug_locals,
-            &debug_variables,
-            &debug_variable_scopes,
-        ),
-    );
+    if !debug_variables.is_empty() {
+        let no_referenced_debug_locals = HashSet::default();
+        instrs.insert(
+            usize::from(matches!(
+                instrs.first(),
+                Some(oomir::Instruction::SourceLocation(_))
+            )),
+            local_variable_scope(
+                &debug_scope_cache,
+                OUTERMOST_SOURCE_SCOPE,
+                &no_referenced_debug_locals,
+                &debug_variables,
+            ),
+        );
+    }
 
     // add instrs to the start of the entry block
     if !instrs.is_empty() {
@@ -1022,6 +902,6 @@ pub fn mir_to_oomir<'tcx>(
         owner_class: fn_name_data.class_to_call_on,
         signature,
         debug_variables,
-        body: codeblock,
+        body: codeblock.into(),
     }
 }
