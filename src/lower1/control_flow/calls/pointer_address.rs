@@ -182,7 +182,7 @@ pub(super) fn map_address<'tcx>(
             }
             instructions.push(oomir::Instruction::InvokeRustStatic {
                 class_name: crate::lower1::naming::mono_owner_class(tcx, closure_instance),
-                method_name: crate::lower1::generate_closure_function_name(tcx, closure_instance),
+                method_name: data_types.closure_method_name(tcx, closure_instance),
                 method_ty: oomir::Signature {
                     params: closure_params,
                     ret: Box::new(closure_output_oomir_ty.clone()),

@@ -77,10 +77,6 @@ pub(crate) fn stable_instance_identity<'tcx>(
     format!("{hash:016x}")
 }
 
-pub(super) fn readable_qualified_def_path(tcx: TyCtxt<'_>, def_id: DefId) -> String {
-    readable_qualified_jvm_class(&jvm_names::class_for_def_id(tcx, def_id))
-}
-
 pub(super) fn readable_qualified_function_item_path(tcx: TyCtxt<'_>, def_id: DefId) -> String {
     readable_qualified_jvm_class(&jvm_names::function_item_class_for_def_id(tcx, def_id))
 }
@@ -253,7 +249,7 @@ pub(crate) fn readable_rust_type_name<'tcx>(
                 .iter()
                 .filter_map(|predicate| match predicate.skip_binder() {
                     ExistentialPredicate::AutoTrait(def_id) => {
-                        Some(readable_qualified_def_path(tcx, def_id))
+                        Some(data_types.readable_class_name(tcx, def_id))
                     }
                     _ => None,
                 })
@@ -269,7 +265,7 @@ pub(crate) fn readable_rust_type_name<'tcx>(
             // Retain their qualified Rust path so unrelated types with the
             // same final segment (such as slice::Iter and btree_set::Iter) do
             // not erase to the same JVM class name.
-            let base = readable_qualified_def_path(tcx, adt_def.did());
+            let base = data_types.readable_class_name(tcx, adt_def.did());
             let args = substs
                 .iter()
                 .filter_map(|arg| {
@@ -362,7 +358,7 @@ pub(super) fn readable_pointer_codec_type_name<'tcx>(
                 .iter()
                 .filter_map(|predicate| match predicate.skip_binder() {
                     ExistentialPredicate::AutoTrait(def_id) => {
-                        Some(readable_qualified_def_path(tcx, def_id))
+                        Some(data_types.readable_class_name(tcx, def_id))
                     }
                     _ => None,
                 })
@@ -374,7 +370,7 @@ pub(super) fn readable_pointer_codec_type_name<'tcx>(
             }
         }
         TyKind::Adt(adt_def, substs) => {
-            let base = readable_qualified_def_path(tcx, adt_def.did());
+            let base = data_types.readable_class_name(tcx, adt_def.did());
             let args = substs
                 .iter()
                 .filter_map(|arg| {
@@ -467,12 +463,8 @@ pub(crate) fn sanitize_name_token(s: &str) -> String {
     }
 }
 
-pub(super) fn adt_base_jvm_name<'tcx>(adt_def: &AdtDef<'tcx>, tcx: TyCtxt<'tcx>) -> String {
-    jvm_names::class_for_def_id(tcx, adt_def.did())
-}
-
-/// Generate a JVM-safe class name for an ADT (struct/enum) including readable generic
-/// substitution tokens. Falls back to a hashed last segment when the full name is too long.
+/// Generate a JVM-safe ADT name, retaining raw tokens for the long-name hash.
+/// A token may recursively name a large generic type; calculate it only once.
 pub(crate) fn generate_adt_jvm_class_name<'tcx>(
     adt_def: &AdtDef<'tcx>,
     substs: GenericArgsRef<'tcx>,
@@ -480,70 +472,26 @@ pub(crate) fn generate_adt_jvm_class_name<'tcx>(
     data_types: &mut Definitions<'tcx>,
     instance_context: rustc_middle::ty::Instance<'tcx>,
 ) -> String {
-    let base_jvm = adt_base_jvm_name(adt_def, tcx);
-
-    // Build readable generic tokens from substitutions (if any)
-    let mut generic_tokens: Vec<String> = Vec::new();
-    for arg in substs.iter() {
-        if let Some(arg_ty) = arg.as_type() {
-            let token = readable_rust_type_name(arg_ty, tcx, data_types, instance_context);
-            generic_tokens.push(sanitize_name_token(&token));
-        } else if let Some(constant) = arg.as_const() {
-            let token = readable_rust_const_name(constant, tcx, instance_context);
-            generic_tokens.push(sanitize_name_token(&token));
-        } else {
-            // Regions are erased and therefore do not participate in JVM
-            // specialization identity.
-        }
+    let base = data_types.class_name(tcx, adt_def.did());
+    let tokens = substs
+        .iter()
+        .filter_map(|arg| readable_rust_generic_arg_name(arg, tcx, data_types, instance_context))
+        .collect::<Vec<_>>();
+    let mut name = base.clone();
+    for token in &tokens {
+        name.push('_');
+        name.push_str(&sanitize_name_token(token));
     }
-
-    // Attach generics to the last path segment for readability
-    let (prefix, last_segment) = match base_jvm.rsplit_once('/') {
-        Some((p, l)) => (p.to_string(), l.to_string()),
-        None => ("".to_string(), base_jvm.clone()),
-    };
-
-    let mut last_with_gens = last_segment.clone();
-    if !generic_tokens.is_empty() {
-        last_with_gens = format!("{}_{}", last_segment, generic_tokens.join("_"));
+    if name.len() <= MAX_TUPLE_NAME_LEN {
+        return name;
     }
-
-    let mut jvm_name_full = if prefix.is_empty() {
-        last_with_gens.clone()
-    } else {
-        format!("{}/{}", prefix, last_with_gens)
-    };
-
-    // If the name is too long, fall back to hashed form
-    if jvm_name_full.len() > MAX_TUPLE_NAME_LEN {
-        let mut name_parts = String::new();
-        name_parts.push_str(&base_jvm);
-        name_parts.push_str("_");
-        for arg in substs.iter() {
-            if let Some(arg_ty) = arg.as_type() {
-                name_parts.push_str(&readable_rust_type_name(
-                    arg_ty,
-                    tcx,
-                    data_types,
-                    instance_context,
-                ));
-            } else if let Some(constant) = arg.as_const() {
-                name_parts.push_str(&readable_rust_const_name(constant, tcx, instance_context));
-            } else {
-                continue;
-            }
-            name_parts.push('_');
-        }
-        let hash = short_hash(&name_parts, 10);
-        let hashed_last = format!("{}_{}", last_segment, hash);
-        jvm_name_full = if prefix.is_empty() {
-            hashed_last
-        } else {
-            format!("{}/{}", prefix, hashed_last)
-        };
+    let mut identity = base.clone();
+    identity.push('_');
+    for token in tokens {
+        identity.push_str(&token);
+        identity.push('_');
     }
-
-    jvm_name_full
+    format!("{base}_{}", short_hash(&identity, 10))
 }
 
 /// Generates a readable JVM class name for a tuple type. Rust types that share

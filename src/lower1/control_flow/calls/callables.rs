@@ -123,7 +123,7 @@ pub(super) fn ordinary_call<'tcx>(
     let (class_name, function) = if is_closure_call {
         (
             crate::lower1::naming::mono_owner_class(tcx, func_instance),
-            crate::lower1::generate_closure_function_name(tcx, func_instance),
+            data_types.closure_method_name(tcx, func_instance),
         )
     } else {
         let fn_name_data = data_types.function_name(tcx, func_instance);

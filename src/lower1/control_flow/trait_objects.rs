@@ -209,10 +209,7 @@ pub(crate) fn ensure_trait_object_adapter_class_for_pointees<'tcx>(
                 oomir::Instruction::InvokeStatic {
                     dest: call_dest.clone(),
                     class_name: mono_owner_class(tcx, *target_instance),
-                    method_name: super::super::generate_closure_function_name(
-                        tcx,
-                        *target_instance,
-                    ),
+                    method_name: data_types.closure_method_name(tcx, *target_instance),
                     method_ty: oomir::Signature {
                         params: target_params,
                         ret: Box::new(return_ty.clone()),

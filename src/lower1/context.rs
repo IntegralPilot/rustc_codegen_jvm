@@ -3,6 +3,7 @@
 //! Rust type keys are scoped to their `TyCtxt`; definitions and construction
 //! caches share a lifetime, rather than relying on a mutable map's address.
 use crate::oomir;
+mod names;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use rustc_middle::{
     mir::{self, interpret::AllocId},
@@ -27,7 +28,7 @@ pub(crate) struct CrateContext<'tcx> {
     allocations: HashMap<AllocId, String>,
     checked_intrinsics: HashSet<CheckedIntrinsic>,
     completed_codecs: HashMap<Ty<'tcx>, super::types::PointerMemoryCodec>,
-    function_names: HashMap<Instance<'tcx>, super::naming::FnNameData>,
+    names: names::Names<'tcx>,
 }
 
 #[derive(Default)]
@@ -42,24 +43,6 @@ pub(crate) struct Definitions<'tcx> {
 }
 
 impl<'tcx> Definitions<'tcx> {
-    /// Naming builds temporary type descriptions but contributes no schemas to
-    /// this shard. Reuse that pure result for callers and the eventual body.
-    pub(crate) fn function_name(
-        &self,
-        tcx: TyCtxt<'tcx>,
-        instance: Instance<'tcx>,
-    ) -> super::naming::FnNameData {
-        if let Some(name) = self.shared.borrow().function_names.get(&instance) {
-            return name.clone();
-        }
-        let name = super::naming::mono_fn_name_from_instance(tcx, instance);
-        self.shared
-            .borrow_mut()
-            .function_names
-            .insert(instance, name.clone());
-        name
-    }
-
     pub(crate) fn new(shared: Shared<'tcx>) -> Self {
         Self {
             shared,

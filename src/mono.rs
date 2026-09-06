@@ -6,18 +6,6 @@ pub(super) fn mono_item_name<'tcx>(
     instance: Instance<'tcx>,
     definitions: &Definitions<'tcx>,
 ) -> lower1::naming::FnNameData {
-    let instance_ty = tcx
-        .type_of(instance.def_id())
-        .instantiate(tcx, instance.args)
-        .skip_norm_wip();
-
-    if matches!(instance_ty.kind(), TyKind::Closure(..)) {
-        return lower1::naming::FnNameData {
-            class_to_call_on: Some(lower1::naming::mono_owner_class(tcx, instance)),
-            method_name: lower1::generate_closure_function_name(tcx, instance),
-        };
-    }
-
     definitions.function_name(tcx, instance)
 }
 
