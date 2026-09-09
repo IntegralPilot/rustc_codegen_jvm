@@ -1685,10 +1685,7 @@ fn test_compile_time_type_info() {
     }
 
     match const { Type::of::<&mut u64>() }.kind {
-        TypeKind::Reference(reference) => {
-            assert!(reference.pointee == TypeId::of::<u64>());
-            assert!(reference.mutable);
-        }
+        TypeKind::Reference => {}
         _ => panic!("wrong reference type information"),
     }
 
@@ -1698,10 +1695,7 @@ fn test_compile_time_type_info() {
     }
 
     match const { Type::of::<*const u8>() }.kind {
-        TypeKind::Pointer(pointer) => {
-            assert!(pointer.pointee == TypeId::of::<u8>());
-            assert!(!pointer.mutable);
-        }
+        TypeKind::Pointer => {}
         _ => panic!("wrong pointer type information"),
     }
 
