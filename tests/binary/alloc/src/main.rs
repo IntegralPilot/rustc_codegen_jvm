@@ -1677,10 +1677,7 @@ fn test_compile_time_type_info() {
 
     // These values are fully evaluated by rustc before the backend sees them.
     match const { Type::of::<[u16; 4]>() }.kind {
-        TypeKind::Array(array) => {
-            assert!(array.element_ty == TypeId::of::<u16>());
-            assert!(array.len == 4);
-        }
+        TypeKind::Array => {}
         _ => panic!("wrong array type information"),
     }
 
@@ -1690,7 +1687,7 @@ fn test_compile_time_type_info() {
     }
 
     match const { Type::of::<[usize]>() }.kind {
-        TypeKind::Slice(slice) => assert!(slice.element_ty == TypeId::of::<usize>()),
+        TypeKind::Slice => {}
         _ => panic!("wrong slice type information"),
     }
 
