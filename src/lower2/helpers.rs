@@ -3,7 +3,6 @@ use super::{constant_pool::InternedConstantPool, oomir};
 use super::jvm::{self, attributes::Instruction};
 use oomir::Type;
 
-use super::consts::{get_int_const_instr, get_long_const_instr};
 use super::{F128_CLASS, I128_CLASS, U128_CLASS};
 
 /// Returns the number of JVM local variable slots a type occupies (0, 1, or 2).
@@ -15,222 +14,10 @@ pub fn get_type_size(ty: &Type) -> u16 {
     }
 }
 
-fn constant_load_stack_floor(constant: &oomir::Constant) -> u16 {
-    use oomir::Constant;
-    match constant {
-        Constant::Unit => 0,
-        Constant::I64(_) | Constant::U64(_) | Constant::F64(_) => 2,
-        Constant::Array(_, elements) => elements
-            .iter()
-            .map(|element| 3 + constant_load_stack_floor(element))
-            .max()
-            .unwrap_or(1),
-        Constant::Slice(element_type, elements) => {
-            let backing = Constant::Array(element_type.clone(), elements.clone());
-            (2 + constant_load_stack_floor(&backing)).max(4)
-        }
-        Constant::SliceRef { backing, .. } => (2 + constant_load_stack_floor(backing)).max(4),
-        Constant::RepeatedBytePointer { .. } => 10,
-        Constant::ByteArrayPointer { bytes, .. } => {
-            let backing = Constant::Array(
-                Box::new(Type::U8),
-                bytes.iter().copied().map(Constant::U8).collect(),
-            );
-            (6 + constant_load_stack_floor(&backing)).max(10)
-        }
-        Constant::InternedPointer { value, .. } => (3 + constant_load_stack_floor(value)).max(8),
-        Constant::Instance { params, .. } => {
-            let mut stack = 2;
-            let mut peak = stack;
-            for param in params {
-                peak = peak.max(stack + constant_load_stack_floor(param));
-                stack += get_type_size(&Type::from_constant(param));
-            }
-            peak
-        }
-        Constant::StaticCall { args, ty, .. } => {
-            let mut stack = 0;
-            let mut peak = 0;
-            for arg in args {
-                peak = peak.max(stack + constant_load_stack_floor(arg));
-                stack += get_type_size(&Type::from_constant(arg));
-            }
-            peak.max(get_type_size(ty))
-        }
-        Constant::StaticRef { ty, .. } | Constant::FactoryCall { ty, .. } => get_type_size(ty),
-        _ => 1,
-    }
-}
-
-fn operand_load_stack_floor(operand: &oomir::Operand) -> u16 {
-    match operand {
-        oomir::Operand::Constant(constant) => constant_load_stack_floor(constant),
-        oomir::Operand::Variable { ty, .. } => get_type_size(ty),
-    }
-}
-
-fn operand_sequence_stack_floor<'a>(
-    operands: impl IntoIterator<Item = &'a oomir::Operand>,
-    initial_stack: u16,
-) -> u16 {
-    let mut stack = initial_stack;
-    let mut peak = stack;
-    for operand in operands {
-        peak = peak.max(stack + operand_load_stack_floor(operand));
-        stack += operand.get_type().as_ref().map(get_type_size).unwrap_or(0);
-    }
-    peak
-}
-
-pub fn oomir_function_stack_floor(function: &oomir::Function) -> u16 {
-    let mut floor = 0;
-    for block in function.body.basic_blocks.values() {
-        for instruction in &block.instructions {
-            match instruction {
-                oomir::Instruction::Add { op1, op2, .. }
-                | oomir::Instruction::Sub { op1, op2, .. }
-                | oomir::Instruction::Mul { op1, op2, .. }
-                | oomir::Instruction::Div { op1, op2, .. }
-                | oomir::Instruction::Rem { op1, op2, .. }
-                | oomir::Instruction::Eq { op1, op2, .. }
-                | oomir::Instruction::Ne { op1, op2, .. }
-                | oomir::Instruction::Lt { op1, op2, .. }
-                | oomir::Instruction::Le { op1, op2, .. }
-                | oomir::Instruction::Gt { op1, op2, .. }
-                | oomir::Instruction::Ge { op1, op2, .. }
-                | oomir::Instruction::BitAnd { op1, op2, .. }
-                | oomir::Instruction::BitOr { op1, op2, .. }
-                | oomir::Instruction::BitXor { op1, op2, .. }
-                | oomir::Instruction::Shl { op1, op2, .. }
-                | oomir::Instruction::Shr { op1, op2, .. } => {
-                    floor = floor.max(operand_sequence_stack_floor([op1, op2], 0));
-                }
-                oomir::Instruction::Not { src, .. }
-                | oomir::Instruction::Neg { src, .. }
-                | oomir::Instruction::Move { src, .. } => {
-                    floor = floor.max(operand_load_stack_floor(src));
-                }
-                oomir::Instruction::Branch { condition, .. } => {
-                    floor = floor.max(operand_load_stack_floor(condition));
-                }
-                oomir::Instruction::Return {
-                    operand: Some(operand),
-                } => {
-                    floor = floor.max(operand_load_stack_floor(operand));
-                }
-                oomir::Instruction::ConstructObject { args, .. } => {
-                    floor = floor.max(operand_sequence_stack_floor(
-                        args.iter().map(|(operand, _)| operand),
-                        2,
-                    ));
-                }
-                oomir::Instruction::InvokeStatic { args, .. }
-                | oomir::Instruction::InvokeRustStatic { args, .. } => {
-                    floor = floor.max(operand_sequence_stack_floor(args, 0));
-                }
-                oomir::Instruction::CallIndirect {
-                    function_ptr, args, ..
-                } => {
-                    floor = floor.max(operand_load_stack_floor(function_ptr));
-                    floor = floor.max(operand_sequence_stack_floor(args, 1));
-                }
-                oomir::Instruction::InvokeInterface { operand, args, .. }
-                | oomir::Instruction::InvokeVirtual { operand, args, .. } => {
-                    floor = floor.max(operand_load_stack_floor(operand));
-                    floor = floor.max(operand_sequence_stack_floor(args, 1));
-                }
-                oomir::Instruction::ThrowNewWithMessage { .. } => {
-                    floor = floor.max(3);
-                }
-                oomir::Instruction::Switch { discr, .. } => {
-                    floor = floor.max(operand_load_stack_floor(discr));
-                }
-                oomir::Instruction::NewArray { size, .. } => {
-                    floor = floor.max(operand_load_stack_floor(size));
-                }
-                oomir::Instruction::ArrayStore { index, value, .. } => {
-                    floor = floor.max(operand_sequence_stack_floor([index, value], 1));
-                }
-                oomir::Instruction::ArrayFill { value, .. } => {
-                    floor = floor.max(1 + operand_load_stack_floor(value));
-                }
-                oomir::Instruction::ArrayGet { array, index, .. } => {
-                    floor = floor.max(operand_sequence_stack_floor([array, index], 0));
-                }
-                oomir::Instruction::Length { array, .. }
-                | oomir::Instruction::GetField { object: array, .. }
-                | oomir::Instruction::GetJvmField { object: array, .. }
-                | oomir::Instruction::Cast { op: array, .. } => {
-                    floor = floor.max(operand_load_stack_floor(array));
-                }
-                oomir::Instruction::SetField { value, .. } => {
-                    floor = floor.max(1 + operand_load_stack_floor(value));
-                }
-                oomir::Instruction::SetStaticField { value, .. } => {
-                    floor = floor.max(operand_load_stack_floor(value));
-                }
-                oomir::Instruction::SetJvmField { object, value, .. } => {
-                    floor = floor.max(operand_sequence_stack_floor([object, value], 0));
-                }
-                _ => {}
-            }
-        }
-    }
-    floor
-}
-
-/// Deferred thin pointers add two `long` components at internal call sites
-/// and generated-class constructors.
-/// Ristretto's generic max-stack estimator does not know about this lower2 ABI
-/// expansion, so reserve the extra JVM slots described by the OOMIR calls.
-pub fn relative_pointer_call_stack_extra(function: &oomir::Function) -> u16 {
-    let mut max_pointers = function
-        .signature
-        .explicit_jvm_params()
-        .iter()
-        .filter(|(_, ty)| matches!(ty, Type::Pointer(_)))
-        .count();
-    for block in function.body.basic_blocks.values() {
-        for instruction in &block.instructions {
-            let pointer_count = match instruction {
-                oomir::Instruction::InvokeStatic { args, .. }
-                | oomir::Instruction::InvokeRustStatic { args, .. }
-                | oomir::Instruction::CallIndirect { args, .. } => args
-                    .iter()
-                    .filter(|arg| matches!(arg.get_type(), Some(Type::Pointer(_))))
-                    .count(),
-                oomir::Instruction::ConstructObject { args, .. } => args
-                    .iter()
-                    .filter(|(_, ty)| matches!(ty, Type::Pointer(_)))
-                    .count(),
-                oomir::Instruction::InvokeVirtual {
-                    class_name,
-                    method_name,
-                    operand,
-                    args,
-                    ..
-                } if class_name == oomir::POINTER_CLASS && method_name == "samePointer" => {
-                    usize::from(matches!(operand.get_type(), Some(Type::Pointer(_))))
-                        + args
-                            .iter()
-                            .filter(|arg| matches!(arg.get_type(), Some(Type::Pointer(_))))
-                            .count()
-                }
-                _ => 0,
-            };
-            max_pointers = max_pointers.max(pointer_count);
-        }
-    }
-    max_pointers
-        .saturating_mul(4)
-        .try_into()
-        .unwrap_or(u16::MAX)
-}
-
-/// Gets the appropriate type-specific load instruction.
-pub fn get_load_instruction(ty: &Type, index: u16) -> Result<Instruction, jvm::Error> {
-    Ok(match ty {
-        // Integer-like types
+pub fn local_kind(ty: &Type) -> Option<jvm_compiler_core::jvm::locals::LocalKind> {
+    use jvm_compiler_core::jvm::locals::LocalKind as K;
+    Some(match ty {
+        Type::Unit | Type::Void => return None,
         Type::I8
         | Type::U8
         | Type::I16
@@ -239,45 +26,10 @@ pub fn get_load_instruction(ty: &Type, index: u16) -> Result<Instruction, jvm::E
         | Type::I32
         | Type::U32
         | Type::Boolean
-        | Type::Char => {
-            match index {
-                0 => Instruction::Iload_0,
-                1 => Instruction::Iload_1,
-                2 => Instruction::Iload_2,
-                3 => Instruction::Iload_3,
-                // For indices that can fit into u8, use Iload, otherwise use Iload_w.
-                _ if index <= u8::MAX as u16 => Instruction::Iload(index as u8),
-                _ => Instruction::Iload_w(index),
-            }
-        }
-        // Long type
-        Type::I64 | Type::U64 => match index {
-            0 => Instruction::Lload_0,
-            1 => Instruction::Lload_1,
-            2 => Instruction::Lload_2,
-            3 => Instruction::Lload_3,
-            _ if index <= u8::MAX as u16 => Instruction::Lload(index as u8),
-            _ => Instruction::Lload_w(index),
-        },
-        // Float type
-        Type::F32 => match index {
-            0 => Instruction::Fload_0,
-            1 => Instruction::Fload_1,
-            2 => Instruction::Fload_2,
-            3 => Instruction::Fload_3,
-            _ if index <= u8::MAX as u16 => Instruction::Fload(index as u8),
-            _ => Instruction::Fload_w(index),
-        },
-        // Double type
-        Type::F64 => match index {
-            0 => Instruction::Dload_0,
-            1 => Instruction::Dload_1,
-            2 => Instruction::Dload_2,
-            3 => Instruction::Dload_3,
-            _ if index <= u8::MAX as u16 => Instruction::Dload(index as u8),
-            _ => Instruction::Dload_w(index),
-        },
-        // Reference-like types
+        | Type::Char => K::Int,
+        Type::I64 | Type::U64 => K::Long,
+        Type::F32 => K::Float,
+        Type::F64 => K::Double,
         Type::Reference(_)
         | Type::Pointer(_)
         | Type::MutableReference(_)
@@ -285,113 +37,17 @@ pub fn get_load_instruction(ty: &Type, index: u16) -> Result<Instruction, jvm::E
         | Type::Slice(_)
         | Type::Str
         | Type::Class(_)
-        | Type::Interface(_) => match index {
-            0 => Instruction::Aload_0,
-            1 => Instruction::Aload_1,
-            2 => Instruction::Aload_2,
-            3 => Instruction::Aload_3,
-            _ if index <= u8::MAX as u16 => Instruction::Aload(index as u8),
-            _ => Instruction::Aload_w(index),
-        },
-        // For void, return an error
-        Type::Unit | Type::Void => {
-            return Err(jvm::Error::VerificationError {
-                context: "get_load_instruction".to_string(),
-                message: "Cannot load void type".to_string(),
-            });
-        }
+        | Type::Interface(_) => K::Reference,
     })
 }
 
-/// Gets the appropriate type-specific store instruction.
-pub fn get_store_instruction(ty: &Type, index: u16) -> Result<Instruction, jvm::Error> {
-    use Type::*;
-    let instr = match ty {
-        I8 | U8 | I16 | U16 | F16 | I32 | U32 | Boolean | Char => {
-            if index <= 3 {
-                match index {
-                    0 => Instruction::Istore_0,
-                    1 => Instruction::Istore_1,
-                    2 => Instruction::Istore_2,
-                    3 => Instruction::Istore_3,
-                    _ => unreachable!(),
-                }
-            } else if index <= u8::MAX as u16 {
-                Instruction::Istore(index as u8)
-            } else {
-                Instruction::Istore_w(index)
-            }
-        }
-        I64 | U64 => {
-            if index <= 3 {
-                match index {
-                    0 => Instruction::Lstore_0,
-                    1 => Instruction::Lstore_1,
-                    2 => Instruction::Lstore_2,
-                    3 => Instruction::Lstore_3,
-                    _ => unreachable!(),
-                }
-            } else if index <= u8::MAX as u16 {
-                Instruction::Lstore(index as u8)
-            } else {
-                Instruction::Lstore_w(index)
-            }
-        }
-        F32 => {
-            if index <= 3 {
-                match index {
-                    0 => Instruction::Fstore_0,
-                    1 => Instruction::Fstore_1,
-                    2 => Instruction::Fstore_2,
-                    3 => Instruction::Fstore_3,
-                    _ => unreachable!(),
-                }
-            } else if index <= u8::MAX as u16 {
-                Instruction::Fstore(index as u8)
-            } else {
-                Instruction::Fstore_w(index)
-            }
-        }
-        F64 => {
-            if index <= 3 {
-                match index {
-                    0 => Instruction::Dstore_0,
-                    1 => Instruction::Dstore_1,
-                    2 => Instruction::Dstore_2,
-                    3 => Instruction::Dstore_3,
-                    _ => unreachable!(),
-                }
-            } else if index <= u8::MAX as u16 {
-                Instruction::Dstore(index as u8)
-            } else {
-                Instruction::Dstore_w(index)
-            }
-        }
-        Reference(_) | Pointer(_) | MutableReference(_) | Array(_) | Slice(_) | Str | Class(_)
-        | Interface(_) => {
-            if index <= 3 {
-                match index {
-                    0 => Instruction::Astore_0,
-                    1 => Instruction::Astore_1,
-                    2 => Instruction::Astore_2,
-                    3 => Instruction::Astore_3,
-                    _ => unreachable!(),
-                }
-            } else if index <= u8::MAX as u16 {
-                Instruction::Astore(index as u8)
-            } else {
-                Instruction::Astore_w(index)
-            }
-        }
-        Unit | Void => {
-            return Err(jvm::Error::VerificationError {
-                context: "get_store_instructions".to_string(),
-                message: "Cannot store void type".to_string(),
-            });
-        }
-    };
-
-    Ok(instr)
+pub fn get_load_instruction(ty: &Type, index: u16) -> jvm::Result<Instruction> {
+    local_kind(ty)
+        .map(|kind| kind.load(index))
+        .ok_or_else(|| jvm::Error::VerificationError {
+            context: "local load".into(),
+            message: "Cannot load a type without a JVM value".into(),
+        })
 }
 
 /// Returns a sequence of instructions to cast a value of type `src` on the stack
@@ -558,178 +214,18 @@ pub fn get_cast_instructions(
     })
 }
 
-/// Semantic Rust primitive casts.  The JVM descriptor alone is insufficient here:
-/// `u32` is carried in an `int`, `u64` in a `long`, and `f16` in a `short` bit-pattern.
 fn primitive_to_primitive(
     src: &Type,
     dest: &Type,
     cp: &mut InternedConstantPool,
-) -> Result<Vec<Instruction>, jvm::Error> {
-    use Instruction as JI;
-
-    fn int_width(ty: &Type) -> Option<u32> {
-        match ty {
-            Type::Boolean => Some(1),
-            Type::I8 | Type::U8 => Some(8),
-            Type::I16 | Type::U16 | Type::Char => Some(16),
-            Type::I32 | Type::U32 => Some(32),
-            Type::I64 | Type::U64 => Some(64),
-            _ => None,
-        }
-    }
-
-    fn is_unsigned(ty: &Type) -> bool {
-        matches!(
-            ty,
-            Type::Boolean | Type::U8 | Type::U16 | Type::U32 | Type::U64 | Type::Char
-        )
-    }
-
-    fn narrow(ty: &Type) -> Option<Instruction> {
-        match ty {
-            Type::I8 | Type::U8 => Some(JI::I2b),
-            Type::I16 => Some(JI::I2s),
-            Type::U16 | Type::Char => Some(JI::I2c),
-            _ => None,
-        }
-    }
-
-    fn numbers_call(
-        cp: &mut InternedConstantPool,
-        name: &str,
-        descriptor: &str,
-    ) -> Result<Instruction, jvm::Error> {
-        let class = cp.add_class("org/rustlang/runtime/Numbers")?;
-        let method = cp.add_method_ref(class, name, descriptor)?;
-        Ok(JI::Invokestatic(method))
-    }
-
-    // binary16 is stored as raw bits. Decode before a cast out, and round once on a cast in.
-    if src == &Type::F16 {
-        let mut result = vec![numbers_call(cp, "f16ToF32", "(S)F")?];
-        result.extend(primitive_to_primitive(&Type::F32, dest, cp)?);
-        return Ok(result);
-    }
-    if dest == &Type::F16 {
-        return match src {
-            Type::F32 => Ok(vec![numbers_call(cp, "f32ToF16", "(F)S")?]),
-            Type::F64 => Ok(vec![numbers_call(cp, "f64ToF16", "(D)S")?]),
-            _ if int_width(src).is_some() => {
-                let mut result = primitive_to_primitive(src, &Type::F64, cp)?;
-                result.push(numbers_call(cp, "f64ToF16", "(D)S")?);
-                Ok(result)
-            }
-            _ => Err(jvm::Error::VerificationError {
-                context: "primitive_to_primitive".into(),
-                message: format!("No path {src:?}→F16"),
-            }),
-        };
-    }
-
-    if matches!(src, Type::F32 | Type::F64) && matches!(dest, Type::F32 | Type::F64) {
-        return Ok(match (src, dest) {
-            (Type::F32, Type::F64) => vec![JI::F2d],
-            (Type::F64, Type::F32) => vec![JI::D2f],
-            _ => Vec::new(),
-        });
-    }
-
-    if matches!(src, Type::F32 | Type::F64) && int_width(dest).is_some() {
-        let prefix = if src == &Type::F32 { "f32" } else { "f64" };
-        let source_descriptor = if src == &Type::F32 { "F" } else { "D" };
-        let (suffix, return_descriptor, direct) = match dest {
-            Type::I8 => ("ToI8", "B", None),
-            Type::I16 => ("ToI16", "S", None),
-            Type::I32 => (
-                "",
-                "",
-                Some(if src == &Type::F32 { JI::F2i } else { JI::D2i }),
-            ),
-            Type::I64 => (
-                "",
-                "",
-                Some(if src == &Type::F32 { JI::F2l } else { JI::D2l }),
-            ),
-            Type::U8 | Type::Boolean => ("ToU8", "B", None),
-            Type::U16 | Type::Char => ("ToU16", "C", None),
-            Type::U32 => ("ToU32", "I", None),
-            Type::U64 => ("ToU64", "J", None),
-            _ => unreachable!(),
-        };
-        if let Some(op) = direct {
-            return Ok(vec![op]);
-        }
-        return Ok(vec![numbers_call(
-            cp,
-            &format!("{prefix}{suffix}"),
-            &format!("({source_descriptor}){return_descriptor}"),
-        )?]);
-    }
-
-    if int_width(src).is_some() && matches!(dest, Type::F32 | Type::F64) {
-        let to_f32 = dest == &Type::F32;
-        return Ok(match src {
-            Type::U32 => vec![numbers_call(
-                cp,
-                if to_f32 { "u32ToF32" } else { "u32ToF64" },
-                if to_f32 { "(I)F" } else { "(I)D" },
-            )?],
-            Type::U64 => vec![numbers_call(
-                cp,
-                if to_f32 { "u64ToF32" } else { "u64ToF64" },
-                if to_f32 { "(J)F" } else { "(J)D" },
-            )?],
-            Type::I64 => vec![if to_f32 { JI::L2f } else { JI::L2d }],
-            Type::U8 => vec![
-                get_int_const_instr(cp, 0xff),
-                JI::Iand,
-                if to_f32 { JI::I2f } else { JI::I2d },
-            ],
-            _ => vec![if to_f32 { JI::I2f } else { JI::I2d }],
-        });
-    }
-
-    if let (Some(src_width), Some(dest_width)) = (int_width(src), int_width(dest)) {
-        let mut result = Vec::new();
-        if dest_width <= 32 {
-            if src_width == 64 {
-                result.push(JI::L2i);
-            }
-            // The JVM sign-extends a byte local when it is loaded. Preserve the
-            // Rust u8 value before widening it to any larger integer type.
-            if src == &Type::U8 && dest_width > 8 {
-                result.push(get_int_const_instr(cp, 0xff));
-                result.push(JI::Iand);
-            }
-            if let Some(op) = narrow(dest) {
-                result.push(op);
-            }
-            return Ok(result);
-        }
-
-        if src_width < 64 {
-            match src {
-                Type::U8 => {
-                    result.push(get_int_const_instr(cp, 0xff));
-                    result.push(JI::Iand);
-                    result.push(JI::I2l);
-                }
-                Type::U32 => {
-                    result.push(JI::I2l);
-                    result.push(get_long_const_instr(cp, 0xffff_ffff));
-                    result.push(JI::Land);
-                }
-                _ if is_unsigned(src) => result.push(JI::I2l),
-                _ => result.push(JI::I2l),
-            }
-        }
-        return Ok(result);
-    }
-
-    Err(jvm::Error::VerificationError {
-        context: "primitive_to_primitive".into(),
-        message: format!("No path {src:?}→{dest:?}"),
-    })
+) -> jvm::Result<Vec<Instruction>> {
+    let scalar = |ty: &Type| {
+        oomir::scalar::scalar_type(ty).ok_or_else(|| jvm::Error::VerificationError {
+            context: "primitive cast".into(),
+            message: format!("non-scalar primitive cast type {ty:?}"),
+        })
+    };
+    jvm_compiler_core::jvm::casts::primitive(&scalar(src)?, &scalar(dest)?, cp)
 }
 
 fn prim_to_int128(
@@ -874,13 +370,6 @@ fn int128_to_prim(
     }
 }
 
-pub fn get_operand_type(operand: &oomir::Operand) -> Type {
-    match operand {
-        oomir::Operand::Variable { ty, .. } => ty.clone(),
-        oomir::Operand::Constant(c) => Type::from_constant(c),
-    }
-}
-
 // Helper to check if types are compatible enough for JVM assignments (e.g., U8 -> I32)
 pub fn are_types_jvm_compatible(src: &oomir::Type, dest: &oomir::Type) -> bool {
     if src == dest {
@@ -905,5 +394,31 @@ pub fn are_types_jvm_compatible(src: &oomir::Type, dest: &oomir::Type) -> bool {
         | (oomir::Type::Pointer(_), oomir::Type::Class(source)) => source == oomir::POINTER_CLASS,
         // TODO: Add more other compatibility rules (e.g., Interface implementations).
         _ => false,
+    }
+}
+
+pub(super) fn return_instruction_for_type(ty: &oomir::Type) -> Instruction {
+    match ty {
+        oomir::Type::I8
+        | oomir::Type::U8
+        | oomir::Type::I16
+        | oomir::Type::U16
+        | oomir::Type::F16
+        | oomir::Type::I32
+        | oomir::Type::U32
+        | oomir::Type::Boolean
+        | oomir::Type::Char => Instruction::Ireturn,
+        oomir::Type::I64 | oomir::Type::U64 => Instruction::Lreturn,
+        oomir::Type::F32 => Instruction::Freturn,
+        oomir::Type::F64 => Instruction::Dreturn,
+        oomir::Type::Str
+        | oomir::Type::Class(_)
+        | oomir::Type::Array(_)
+        | oomir::Type::Slice(_)
+        | oomir::Type::Reference(_)
+        | oomir::Type::Pointer(_)
+        | oomir::Type::MutableReference(_)
+        | oomir::Type::Interface(_) => Instruction::Areturn,
+        oomir::Type::Void | oomir::Type::Unit => Instruction::Return,
     }
 }

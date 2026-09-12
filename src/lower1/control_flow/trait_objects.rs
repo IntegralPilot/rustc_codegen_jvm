@@ -1,10 +1,10 @@
+use crate::lower1::context::Definitions;
 use rustc_hash::FxHashMap as HashMap;
 
 use rustc_middle::ty::{Instance, Ty, TyCtxt, TyKind, TypingEnv, VtblEntry};
 
 use super::super::{
     jvm_names,
-    naming::{mono_fn_name_from_instance, mono_owner_class},
     types::{
         pointer_view_codec_operand, readable_rust_type_name, sanitize_name_token, ty_to_oomir_type,
     },
@@ -40,7 +40,7 @@ pub(super) fn ensure_trait_object_adapter_class<'tcx>(
     target_mir_ty: Ty<'tcx>,
     carrier_ty: &oomir::Type,
     interface_name: &str,
-    data_types: &mut HashMap<String, oomir::DataType>,
+    data_types: &mut Definitions<'tcx>,
     tcx: TyCtxt<'tcx>,
     instance_context: Instance<'tcx>,
 ) -> Result<String, String> {
@@ -76,7 +76,7 @@ pub(crate) fn ensure_trait_object_adapter_class_for_pointees<'tcx>(
     dynamic_ty: Ty<'tcx>,
     carrier_ty: &oomir::Type,
     interface_name: &str,
-    data_types: &mut HashMap<String, oomir::DataType>,
+    data_types: &mut Definitions<'tcx>,
     tcx: TyCtxt<'tcx>,
     instance_context: Instance<'tcx>,
 ) -> Result<String, String> {
@@ -204,14 +204,12 @@ pub(crate) fn ensure_trait_object_adapter_class_for_pointees<'tcx>(
                 });
             }
             let call_dest = return_ty.has_jvm_value().then(|| "_ret".to_string());
+            let target = data_types.function_name(tcx, *target_instance);
             instructions.extend([
                 oomir::Instruction::InvokeStatic {
                     dest: call_dest.clone(),
-                    class_name: mono_owner_class(tcx, *target_instance),
-                    method_name: super::super::generate_closure_function_name(
-                        tcx,
-                        *target_instance,
-                    ),
+                    class_name: target.class_to_call_on.expect("closure has a JVM owner"),
+                    method_name: target.method_name,
                     method_ty: oomir::Signature {
                         params: target_params,
                         ret: Box::new(return_ty.clone()),
@@ -262,7 +260,8 @@ pub(crate) fn ensure_trait_object_adapter_class_for_pointees<'tcx>(
                                 instructions,
                             },
                         )]),
-                    },
+                    }
+                    .into(),
                 }),
             );
             continue;
@@ -443,7 +442,7 @@ pub(crate) fn ensure_trait_object_adapter_class_for_pointees<'tcx>(
             ret: Box::new(return_ty.clone()),
             is_static: true,
         };
-        let target_name = mono_fn_name_from_instance(tcx, *target_instance);
+        let target_name = data_types.function_name(tcx, *target_instance);
         let method_def_id = if is_coroutine {
             tcx.opt_associated_item(target_instance.def_id())
                 .and_then(|item| item.trait_item_def_id())
@@ -585,7 +584,8 @@ pub(crate) fn ensure_trait_object_adapter_class_for_pointees<'tcx>(
                             instructions,
                         },
                     )]),
-                },
+                }
+                .into(),
             }),
         );
     }
@@ -637,14 +637,15 @@ pub(crate) fn ensure_trait_object_adapter_class_for_pointees<'tcx>(
                         ],
                     },
                 )]),
-            },
+            }
+            .into(),
         }),
     );
     let adapter_drops_payload = concrete_ty.needs_drop(tcx, TypingEnv::fully_monomorphized())
         && matches!(carrier_ty, oomir::Type::Pointer(_));
     if adapter_drops_payload {
         let drop_instance = Instance::resolve_drop_glue(tcx, concrete_ty);
-        let target = mono_fn_name_from_instance(tcx, drop_instance);
+        let target = data_types.function_name(tcx, drop_instance);
         let payload_name = "_trait_object_drop_payload".to_string();
         adapter_methods.insert(
             "rustDrop".to_string(),
@@ -694,7 +695,8 @@ pub(crate) fn ensure_trait_object_adapter_class_for_pointees<'tcx>(
                             ],
                         },
                     )]),
-                },
+                }
+                .into(),
             }),
         );
     }
@@ -729,7 +731,8 @@ pub(crate) fn ensure_trait_object_adapter_class_for_pointees<'tcx>(
                             }],
                         },
                     )]),
-                },
+                }
+                .into(),
             }),
         );
     }

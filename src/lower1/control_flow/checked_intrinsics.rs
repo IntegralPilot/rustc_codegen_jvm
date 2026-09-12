@@ -74,17 +74,20 @@ pub fn emit_checked_arithmetic_intrinsic(
     let mut instrs = Vec::new();
 
     instrs.push(match operation {
-        "add" => Instruction::Add {
+        "add" => Instruction::Binary {
+            op: crate::oomir::BinaryOp::Add,
             dest: result.into(),
             op1: a_op.clone(),
             op2: b_op.clone(),
         },
-        "sub" => Instruction::Sub {
+        "sub" => Instruction::Binary {
+            op: crate::oomir::BinaryOp::Sub,
             dest: result.into(),
             op1: a_op.clone(),
             op2: b_op.clone(),
         },
-        "mul" => Instruction::Mul {
+        "mul" => Instruction::Binary {
+            op: crate::oomir::BinaryOp::Mul,
             dest: result.into(),
             op1: a_op.clone(),
             op2: b_op.clone(),
@@ -93,12 +96,14 @@ pub fn emit_checked_arithmetic_intrinsic(
     });
 
     match (operation, is_unsigned(ty)) {
-        ("add", true) => instrs.push(Instruction::Lt {
+        ("add", true) => instrs.push(Instruction::Binary {
+            op: crate::oomir::BinaryOp::Lt,
             dest: overflow.into(),
             op1: result_op.clone(),
             op2: a_op.clone(),
         }),
-        ("sub", true) => instrs.push(Instruction::Lt {
+        ("sub", true) => instrs.push(Instruction::Binary {
+            op: crate::oomir::BinaryOp::Lt,
             dest: overflow.into(),
             op1: a_op.clone(),
             op2: b_op.clone(),
@@ -109,7 +114,8 @@ pub fn emit_checked_arithmetic_intrinsic(
             let xor_left = "overflow_xor_left";
             let xor_right = "overflow_xor_right";
             let sign_bits = "overflow_sign_bits";
-            instrs.push(Instruction::BitXor {
+            instrs.push(Instruction::Binary {
+                op: crate::oomir::BinaryOp::BitXor,
                 dest: xor_left.into(),
                 op1: a_op.clone(),
                 op2: if operation == "add" {
@@ -118,7 +124,8 @@ pub fn emit_checked_arithmetic_intrinsic(
                     b_op.clone()
                 },
             });
-            instrs.push(Instruction::BitXor {
+            instrs.push(Instruction::Binary {
+                op: crate::oomir::BinaryOp::BitXor,
                 dest: xor_right.into(),
                 op1: if operation == "add" {
                     b_op.clone()
@@ -127,12 +134,14 @@ pub fn emit_checked_arithmetic_intrinsic(
                 },
                 op2: result_op.clone(),
             });
-            instrs.push(Instruction::BitAnd {
+            instrs.push(Instruction::Binary {
+                op: crate::oomir::BinaryOp::BitAnd,
                 dest: sign_bits.into(),
                 op1: variable(xor_left, ty),
                 op2: variable(xor_right, ty),
             });
-            instrs.push(Instruction::Lt {
+            instrs.push(Instruction::Binary {
+                op: crate::oomir::BinaryOp::Lt,
                 dest: overflow.into(),
                 op1: variable(sign_bits, ty),
                 op2: Operand::Constant(zero.clone()),
@@ -147,17 +156,20 @@ pub fn emit_checked_arithmetic_intrinsic(
             let check = format!("{fn_name}_mul_check");
             let no_overflow = format!("{fn_name}_mul_no_overflow");
             let end = format!("{fn_name}_mul_end");
-            instrs.push(Instruction::Eq {
+            instrs.push(Instruction::Binary {
+                op: crate::oomir::BinaryOp::Eq,
                 dest: a_zero.into(),
                 op1: a_op.clone(),
                 op2: Operand::Constant(zero.clone()),
             });
-            instrs.push(Instruction::Eq {
+            instrs.push(Instruction::Binary {
+                op: crate::oomir::BinaryOp::Eq,
                 dest: b_zero.into(),
                 op1: b_op.clone(),
                 op2: Operand::Constant(zero.clone()),
             });
-            instrs.push(Instruction::BitOr {
+            instrs.push(Instruction::Binary {
+                op: crate::oomir::BinaryOp::BitOr,
                 dest: either_zero.into(),
                 op1: variable(a_zero, &Type::Boolean),
                 op2: variable(b_zero, &Type::Boolean),
@@ -170,12 +182,14 @@ pub fn emit_checked_arithmetic_intrinsic(
             instrs.push(Instruction::Label { name: check });
             let quotient = "mul_quotient";
             let quotient_differs = "mul_quotient_differs";
-            instrs.push(Instruction::Div {
+            instrs.push(Instruction::Binary {
+                op: crate::oomir::BinaryOp::Div,
                 dest: quotient.into(),
                 op1: result_op.clone(),
                 op2: b_op.clone(),
             });
-            instrs.push(Instruction::Ne {
+            instrs.push(Instruction::Binary {
+                op: crate::oomir::BinaryOp::Ne,
                 dest: quotient_differs.into(),
                 op1: variable(quotient, ty),
                 op2: a_op.clone(),
@@ -189,22 +203,26 @@ pub fn emit_checked_arithmetic_intrinsic(
                 let a_min = "mul_a_min";
                 let b_minus_one = "mul_b_minus_one";
                 let min_times_minus_one = "mul_min_times_minus_one";
-                instrs.push(Instruction::Eq {
+                instrs.push(Instruction::Binary {
+                    op: crate::oomir::BinaryOp::Eq,
                     dest: a_min.into(),
                     op1: a_op.clone(),
                     op2: Operand::Constant(min),
                 });
-                instrs.push(Instruction::Eq {
+                instrs.push(Instruction::Binary {
+                    op: crate::oomir::BinaryOp::Eq,
                     dest: b_minus_one.into(),
                     op1: b_op.clone(),
                     op2: Operand::Constant(minus_one),
                 });
-                instrs.push(Instruction::BitAnd {
+                instrs.push(Instruction::Binary {
+                    op: crate::oomir::BinaryOp::BitAnd,
                     dest: min_times_minus_one.into(),
                     op1: variable(a_min, &Type::Boolean),
                     op2: variable(b_minus_one, &Type::Boolean),
                 });
-                instrs.push(Instruction::BitOr {
+                instrs.push(Instruction::Binary {
+                    op: crate::oomir::BinaryOp::BitOr,
                     dest: overflow.into(),
                     op1: variable(quotient_differs, &Type::Boolean),
                     op2: variable(min_times_minus_one, &Type::Boolean),
@@ -256,7 +274,8 @@ pub fn emit_checked_arithmetic_intrinsic(
                 },
             )]),
             entry: "entry".to_string(),
-        },
+        }
+        .into(),
     }
 }
 

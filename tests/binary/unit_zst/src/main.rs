@@ -16,7 +16,16 @@ struct ResidualHolder {
     value: Option<Infallible>,
 }
 
+#[derive(Clone, Copy)]
 struct Marker;
+
+fn pointer_round_trip<T: Copy>(value: T) -> T {
+    let mut slot = core::mem::MaybeUninit::<T>::uninit();
+    unsafe {
+        slot.as_mut_ptr().write(value);
+        core::ptr::read(slot.as_ptr())
+    }
+}
 
 fn consume_unit(_: (), value: i32) -> i32 {
     value
@@ -105,6 +114,13 @@ fn main() {
     assert!(array[0].is_none());
     assert!(array[1].is_none());
     assert!(consume_marker(marker()) == 42);
+    assert!(consume_marker(pointer_round_trip(marker())) == 42);
+    let nested = pointer_round_trip((marker(), marker()));
+    assert!(consume_marker(nested.0) + consume_marker(nested.1) == 84);
+    let empty_closure = pointer_round_trip(|| 42);
+    assert!(empty_closure() == 42);
+    let function_item = pointer_round_trip(produce_unit);
+    function_item();
     let captured_marker = marker();
     let marker_closure = move || consume_marker(captured_marker);
     assert!(marker_closure() == 42);
