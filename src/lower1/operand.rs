@@ -1,8 +1,8 @@
 use super::place::{get_place_type, place_to_string};
+use crate::lower1::context::Definitions;
 use crate::oomir;
 
 use super::place::emit_instructions_to_get_on_own;
-use rustc_hash::FxHashMap as HashMap;
 use rustc_middle::{
     mir::{
         Body, Const, ConstOperand, ConstValue, Operand as MirOperand, Place,
@@ -10,10 +10,6 @@ use rustc_middle::{
     },
     ty::{ConstKind, EarlyBinder, Instance, Ty, TyCtxt, TyKind, TypingEnv},
 };
-use std::sync::atomic::{AtomicUsize, Ordering};
-
-static COPY_OPERAND_COUNTER: AtomicUsize = AtomicUsize::new(0);
-static LOAD_OPERAND_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 pub(super) mod const_eval;
 
@@ -42,7 +38,7 @@ fn default_operand_for_oomir_type(ty: &oomir::Type) -> oomir::Operand {
 fn default_operand_for_rust_type<'tcx>(
     ty: Ty<'tcx>,
     tcx: TyCtxt<'tcx>,
-    data_types: &mut HashMap<String, oomir::DataType>,
+    data_types: &mut Definitions<'tcx>,
     instance: Instance<'tcx>,
 ) -> oomir::Operand {
     let instantiated = EarlyBinder::bind(tcx, ty)
@@ -64,7 +60,7 @@ pub fn convert_operand<'tcx>(
     tcx: TyCtxt<'tcx>,
     instance: Instance<'tcx>,
     mir: &Body<'tcx>,
-    data_types: &mut HashMap<String, oomir::DataType>,
+    data_types: &mut Definitions<'tcx>,
     instructions: &mut Vec<oomir::Instruction>,
 ) -> oomir::Operand {
     match mir_op {
@@ -185,7 +181,7 @@ pub fn convert_operand<'tcx>(
                 ty: final_type.clone(),
             };
             if projected_load {
-                let load_id = LOAD_OPERAND_COUNTER.fetch_add(1, Ordering::Relaxed);
+                let load_id = data_types.next_temporary();
                 let load_dest = format!("{final_var_name}_operand_{load_id}");
                 instructions.push(oomir::Instruction::Move {
                     dest: load_dest.clone(),
@@ -215,7 +211,7 @@ pub fn convert_operand<'tcx>(
                 return loaded;
             }
 
-            let copy_id = COPY_OPERAND_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let copy_id = data_types.next_temporary();
             let object_ty = oomir::Type::Class("java/lang/Object".to_string());
             let object_dest = format!("{final_var_name}_copy_object_{copy_id}");
             let copy_dest = format!("{final_var_name}_copy_{copy_id}");
@@ -254,7 +250,7 @@ pub fn handle_const_value<'tcx>(
     const_val: ConstValue,
     ty: &Ty<'tcx>,
     tcx: TyCtxt<'tcx>,
-    data_types: &mut HashMap<String, oomir::DataType>,
+    data_types: &mut Definitions<'tcx>,
     instance: Instance<'tcx>,
 ) -> oomir::Operand {
     let instantiated_ty = EarlyBinder::bind(tcx, *ty)
@@ -418,7 +414,7 @@ pub fn get_placeholder_operand<'tcx>(
     mir: &Body<'tcx>,
     tcx: TyCtxt<'tcx>,
     instance: Instance<'tcx>,
-    data_types: &mut HashMap<String, oomir::DataType>,
+    data_types: &mut Definitions<'tcx>,
 ) -> oomir::Operand {
     let dest_oomir_type = get_place_type(dest_place, mir, tcx, instance, data_types);
     breadcrumbs::log!(
@@ -431,30 +427,4 @@ pub fn get_placeholder_operand<'tcx>(
         )
     );
     default_operand_for_oomir_type(&dest_oomir_type)
-}
-
-// For when you have an OOMIR Operand but just want the inner number it holds (only works for Consts)
-// I8, I16, I32, I64, Char: Returns inner value
-// F32, F64: Returns rounded inner value
-// Boolean: Returns 1 for true, 0 for false
-// Others: Returns None
-pub fn extract_number_from_operand(operand: oomir::Operand) -> Option<i64> {
-    match operand {
-        oomir::Operand::Constant(constant) => match constant {
-            oomir::Constant::I8(val) => Some(val as i64),
-            oomir::Constant::U8(val) => Some(val as i64),
-            oomir::Constant::I16(val) => Some(val as i64),
-            oomir::Constant::U16(val) => Some(val as i64),
-            oomir::Constant::I32(val) => Some(val as i64),
-            oomir::Constant::U32(val) => Some(val as i64),
-            oomir::Constant::I64(val) => Some(val),
-            oomir::Constant::U64(val) => i64::try_from(val).ok(),
-            oomir::Constant::Boolean(val) => Some(if val { 1 } else { 0 }),
-            oomir::Constant::Char(val) => Some(val as i64),
-            oomir::Constant::F32(val) => Some(val.round() as i64),
-            oomir::Constant::F64(val) => Some(val.round() as i64),
-            _ => None,
-        },
-        oomir::Operand::Variable { .. } => None, // can't be known at compiletime
-    }
 }

@@ -2,6 +2,7 @@
 rustflags = [
   "-C", "link-args=../../../runtime/build/libs/runtime-0.1.0.jar",
   "-C", "strip=none",
+  "-Z", "unstable-options", "--jobs-frontend=4",
   "-Z", "share-generics=yes",
   "-Z", "inline-mir=no"
 ]

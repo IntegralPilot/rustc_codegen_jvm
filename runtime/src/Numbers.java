@@ -20,6 +20,8 @@ public final class Numbers {
     public static float objectToF32(Object value) { return ((Number) value).floatValue(); }
     public static double objectToF64(Object value) { return ((Number) value).doubleValue(); }
 
+    public static short f16Neg(short value) { return (short) (value ^ 0x8000); }
+
     public static char f16ToBits(short value) { return (char) value; }
     public static short f16FromBits(char value) { return (short) value; }
 
