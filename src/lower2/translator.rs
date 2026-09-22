@@ -729,6 +729,12 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         Ok(())
     }
 
+    fn has_deferred_pointer_components(&self, name: &str) -> bool {
+        // Alias analysis can mark a Rust receiver as deferred, but JVM `this`
+        // and its aliases still occupy object slots, not pointer/offset slots.
+        self.deferred_pointer_variables.contains(name) && !self.direct_this_aliases.contains(name)
+    }
+
     fn load_deferred_pointer_components(
         &mut self,
         operand: &oomir::Operand,
@@ -736,10 +742,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         let oomir::Operand::Variable { name, ty } = operand else {
             return Ok(false);
         };
-        if !matches!(ty, Type::Pointer(_))
-            || self.direct_this_aliases.contains(name)
-            || !self.deferred_pointer_variables.contains(name)
-        {
+        if !matches!(ty, Type::Pointer(_)) || !self.has_deferred_pointer_components(name) {
             return Ok(false);
         }
 
@@ -838,9 +841,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
         else {
             return Ok(false);
         };
-        if self.direct_this_aliases.contains(source_name)
-            || !self.deferred_pointer_variables.contains(source_name)
-        {
+        if !self.has_deferred_pointer_components(source_name) {
             return Ok(false);
         }
 
@@ -5676,7 +5677,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     },
             } if class_name == oomir::POINTER_CLASS
                 && is_deferred_pointer_query(method_name)
-                && self.deferred_pointer_variables.contains(source_name) =>
+                && self.has_deferred_pointer_components(source_name) =>
             {
                 if !self.translate_deferred_pointer_query(
                     dest,
@@ -5705,7 +5706,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             } if class_name == oomir::POINTER_CLASS
                 && method_name == "retype"
                 && args.len() == 2
-                && self.deferred_pointer_variables.contains(source_name) =>
+                && self.has_deferred_pointer_components(source_name) =>
             {
                 if !self.translate_deferred_pointer_retype(
                     dest,
@@ -5734,7 +5735,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
             } if class_name == oomir::POINTER_CLASS
                 && is_deferred_pointer_arithmetic(method_name)
                 && args.len() == 1
-                && self.deferred_pointer_variables.contains(source_name) =>
+                && self.has_deferred_pointer_components(source_name) =>
             {
                 if !self.translate_deferred_pointer_arithmetic(
                     dest,
@@ -5764,7 +5765,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     },
             } if class_name == oomir::POINTER_CLASS
                 && is_deferred_pointer_getter(method_name, args)
-                && self.deferred_pointer_variables.contains(source_name) =>
+                && self.has_deferred_pointer_components(source_name) =>
             {
                 if !self.load_deferred_pointer_components(operand)? {
                     return Err(jvm::Error::VerificationError {
@@ -6105,7 +6106,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     OO::Variable {
                         name,
                         ty: Type::Pointer(_)
-                    } if self.deferred_pointer_variables.contains(name)
+                    } if self.has_deferred_pointer_components(name)
                 ) =>
             {
                 if !self.translate_deferred_pointer_query(
@@ -6158,7 +6159,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     OO::Variable {
                         name,
                         ty: Type::Pointer(_)
-                    } if self.deferred_pointer_variables.contains(name)
+                    } if self.has_deferred_pointer_components(name)
                 ) =>
             {
                 if !self.translate_deferred_pointer_retype(
@@ -6188,7 +6189,7 @@ impl<'a, 'cp> FunctionTranslator<'a, 'cp> {
                     OO::Variable {
                         name,
                         ty: Type::Pointer(_)
-                    } if self.deferred_pointer_variables.contains(name)
+                    } if self.has_deferred_pointer_components(name)
                 ) =>
             {
                 if !self.translate_deferred_pointer_arithmetic(

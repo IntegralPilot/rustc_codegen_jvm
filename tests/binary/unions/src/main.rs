@@ -1,6 +1,8 @@
 #![feature(register_tool)]
 #![register_tool(jvm_codegen)]
 
+mod receivers;
+
 #[derive(Copy, Clone)]
 #[repr(C)]
 struct TwoGroupsOfOneByte {
@@ -194,6 +196,7 @@ union FlatOuterStorage {
 }
 
 fn main() {
+    receivers::run();
     let bytes = Bytes {
         group1: TwoGroupsOfOneByte { a: 0x01, b: 0x02 },
     };
