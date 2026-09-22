@@ -164,9 +164,13 @@ pub(in crate::lower1) fn emit_mutable_borrow_writeback<'tcx>(
         if matches!(base_ty.kind(), TyKind::Tuple(_))
             || matches!(
                 base_ty.kind(),
-                TyKind::Adt(adt_def, _) if adt_def.is_struct() || adt_def.is_enum()
+                TyKind::Adt(adt_def, _)
+                    if adt_def.is_struct() || adt_def.is_enum() || adt_def.is_union()
             )
         {
+            // Field pointers already write through to their original storage.
+            // Reassigning a union field here also detaches references returned
+            // by the call from the decoded view they still borrow.
             return instructions;
         }
     }

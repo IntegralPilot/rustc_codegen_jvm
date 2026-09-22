@@ -4017,6 +4017,9 @@ public final class Pointer {
     /** Commits direct field mutations made through the current decoded view. */
     public void commitMemoryView() {
         discardProjectedFieldViews(managedViewObject());
+        // rootField projections belong to the replaceable storage cell, while
+        // direct generated writes mutate the object held by that cell.
+        discardProjectedFieldViews(allocation);
         if (boundMemoryViewState() == null) {
             // Direct JVM aggregate carriers are already authoritative. Drop
             // byte-projected field views decoded before the mutation so a
