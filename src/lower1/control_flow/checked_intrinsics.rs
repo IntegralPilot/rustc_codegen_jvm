@@ -23,7 +23,6 @@ fn variable(name: &str, ty: &Type) -> Operand {
 fn integer_constants(ty: &Type) -> (Constant, Constant, Constant) {
     let wide = |class_name: &str, value: &str| Constant::Instance {
         class_name: class_name.to_string(),
-        fields: HashMap::default(),
         params: vec![Constant::String(value.to_string())],
         param_types: Vec::new(),
     };

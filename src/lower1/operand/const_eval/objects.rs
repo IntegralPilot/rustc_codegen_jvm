@@ -8,9 +8,8 @@ pub(crate) fn constant_contains_function_pointer(constant: &oomir::Constant) -> 
             values.iter().any(constant_contains_function_pointer)
         }
         oomir::Constant::SliceRef { backing, .. } => constant_contains_function_pointer(backing),
-        oomir::Constant::Instance { fields, params, .. } => {
-            fields.values().any(constant_contains_function_pointer)
-                || params.iter().any(constant_contains_function_pointer)
+        oomir::Constant::Instance { params, .. } => {
+            params.iter().any(constant_contains_function_pointer)
         }
         oomir::Constant::StaticCall { args, .. } => {
             args.iter().any(constant_contains_function_pointer)
@@ -30,7 +29,6 @@ pub(crate) fn handle_constant_struct<'tcx>(
     instance: Instance<'tcx>,
 ) -> Result<oomir::Constant, String> {
     let variant = adt_def.variant(VariantIdx::from_usize(0)); // Structs have one variant
-    let mut fields_map = HashMap::default();
     let mut params = Vec::new();
     let mut param_types = Vec::new();
 
@@ -70,15 +68,13 @@ pub(crate) fn handle_constant_struct<'tcx>(
             instance,
         )?;
         param_types.push(ty_to_oomir_type(field_ty, tcx, oomir_data_types, instance));
-        params.push(field_const.clone());
-        fields_map.insert(field_name, field_const);
+        params.push(field_const);
     }
 
     let class_name = generate_adt_jvm_class_name(&adt_def, substs, tcx, oomir_data_types, instance);
 
     Ok(oomir::Constant::Instance {
         class_name,
-        fields: fields_map,
         params,
         param_types,
     })
@@ -331,7 +327,6 @@ pub(crate) fn handle_constant_enum<'tcx>(
 
     let variant_def = adt_def.variant(active_variant_idx);
 
-    let mut fields_map = HashMap::default();
     let mut params = Vec::new();
     let mut param_types = Vec::new();
     for (i, field_def) in variant_def.fields.iter().enumerate() {
@@ -380,8 +375,7 @@ pub(crate) fn handle_constant_enum<'tcx>(
             instance,
         )?;
         param_types.push(field_oomir_ty);
-        params.push(field_const.clone());
-        fields_map.insert(field_name, field_const);
+        params.push(field_const);
     }
 
     // 4. Construct the OOMIR constant
@@ -401,7 +395,6 @@ pub(crate) fn handle_constant_enum<'tcx>(
 
     Ok(oomir::Constant::Instance {
         class_name: variant_class_name,
-        fields: fields_map,
         params,
         param_types,
     })

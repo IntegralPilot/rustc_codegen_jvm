@@ -18,10 +18,10 @@ use super::super::{
     control_flow::trait_objects::ensure_trait_object_adapter_class_for_pointees,
     jvm_names, ty_to_oomir_type,
     types::{
-        UNION_BYTES_FIELD, UNION_OBJECTS_FIELD, ensure_fn_ptr_interface, ensure_union_data_type,
-        enum_variant_field_name, fn_ptr_signature_from_ty, force_define_named_adt,
-        generate_adt_jvm_class_name, generate_tuple_jvm_class_name, jvm_subtype_payload_ty,
-        pointer_memory_codec_operand, pointer_view_codec_operand, union_from_method_name,
+        ensure_fn_ptr_interface, ensure_union_data_type, enum_variant_field_name,
+        fn_ptr_signature_from_ty, force_define_named_adt, generate_adt_jvm_class_name,
+        generate_tuple_jvm_class_name, jvm_subtype_payload_ty, pointer_memory_codec_operand,
+        pointer_view_codec_operand, union_from_method_name,
     },
 };
 use crate::oomir;
@@ -304,7 +304,6 @@ fn pointer_constant_for_pointee<'tcx>(
     };
     Ok(oomir::Constant::Instance {
         class_name: oomir::POINTER_CLASS.to_string(),
-        fields: HashMap::default(),
         params: vec![
             if oomir::Type::from_constant(&value).has_jvm_value() {
                 value
@@ -615,7 +614,6 @@ fn read_trait_object_reference_from_memory<'tcx>(
     )?;
     Ok(oomir::Constant::Instance {
         class_name: adapter_class,
-        fields: HashMap::default(),
         params: vec![concrete_pointer],
         param_types: vec![carrier_ty],
     })

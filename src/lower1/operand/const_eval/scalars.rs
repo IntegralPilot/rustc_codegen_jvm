@@ -44,11 +44,10 @@ pub(crate) fn read_scalar_int_constant<'tcx>(
                 ));
             }
         };
-        let mut fields = HashMap::default();
         let mut params = Vec::new();
         let mut param_types = Vec::new();
         let mut non_zst_captures = 0usize;
-        for (index, capture_ty) in closure_args.as_closure().upvar_tys().iter().enumerate() {
+        for capture_ty in closure_args.as_closure().upvar_tys().iter() {
             let capture_ty = EarlyBinder::bind(tcx, capture_ty)
                 .instantiate(tcx, instance.args)
                 .skip_norm_wip();
@@ -69,7 +68,6 @@ pub(crate) fn read_scalar_int_constant<'tcx>(
                 non_zst_captures += 1;
                 read_scalar_int_constant(tcx, scalar_int, capture_ty, oomir_data_types, instance)?
             };
-            fields.insert(format!("arg{index}"), capture.clone());
             params.push(capture);
             param_types.push(capture_jvm_ty);
         }
@@ -80,7 +78,6 @@ pub(crate) fn read_scalar_int_constant<'tcx>(
         }
         return Ok(oomir::Constant::Instance {
             class_name,
-            fields,
             params,
             param_types,
         });
@@ -201,11 +198,9 @@ pub(crate) fn instance_constant_with_declared_fields(
                 .unwrap_or_else(|| oomir::Type::from_constant(value))
         })
         .collect();
-    let fields = named_values.iter().cloned().collect::<HashMap<_, _>>();
     let params = named_values.into_iter().map(|(_, value)| value).collect();
     oomir::Constant::Instance {
         class_name,
-        fields,
         params,
         param_types,
     }
@@ -304,10 +299,6 @@ pub(crate) fn read_zero_sized_constant<'tcx>(
             );
             Ok(oomir::Constant::Instance {
                 class_name,
-                fields: HashMap::from_iter([
-                    (UNION_BYTES_FIELD.to_string(), bytes.clone()),
-                    (UNION_OBJECTS_FIELD.to_string(), objects.clone()),
-                ]),
                 params: vec![bytes, objects],
                 param_types: Vec::new(),
             })
@@ -428,7 +419,6 @@ pub(crate) fn scalar_int_to_oomir_constant<'tcx>(
                 let param = oomir::Constant::String(signed.to_string());
                 oomir::Constant::Instance {
                     class_name: crate::lower2::I128_CLASS.into(),
-                    fields: HashMap::default(),
                     params: vec![param],
                     param_types: Vec::new(),
                 }
@@ -443,7 +433,6 @@ pub(crate) fn scalar_int_to_oomir_constant<'tcx>(
                 let param = oomir::Constant::String(bits.to_string());
                 oomir::Constant::Instance {
                     class_name: crate::lower2::U128_CLASS.into(),
-                    fields: HashMap::default(),
                     params: vec![param],
                     param_types: Vec::new(),
                 }
@@ -459,7 +448,6 @@ pub(crate) fn scalar_int_to_oomir_constant<'tcx>(
                 let bits = scalar_int.to_u128();
                 oomir::Constant::Instance {
                     class_name: crate::lower2::F128_CLASS.into(),
-                    fields: HashMap::default(),
                     params: vec![
                         oomir::Constant::I64((bits >> 64) as i64),
                         oomir::Constant::I64(bits as i64),

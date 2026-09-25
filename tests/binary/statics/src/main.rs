@@ -1,3 +1,5 @@
+mod nested_constants;
+
 struct Settings {
     base: i32,
     enabled: bool,
@@ -65,6 +67,7 @@ mod nested {
 }
 
 fn main() {
+    nested_constants::run();
     assert!(ANSWER == 42);
     assert!(*ANSWER_REF == ANSWER);
     assert!(SETTINGS.enabled);

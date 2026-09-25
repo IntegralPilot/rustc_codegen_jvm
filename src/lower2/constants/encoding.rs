@@ -315,7 +315,6 @@ pub fn load_constant(
         }
         OC::Instance {
             class_name,
-            fields,
             params,
             param_types,
         } => {
@@ -385,15 +384,6 @@ pub fn load_constant(
                 return Ok(());
             }
 
-            if params.is_empty() && !fields.is_empty() {
-                return Err(jvm::Error::VerificationError {
-                    context: format!("Attempting to load constant {:?}", constant),
-                    message: format!(
-                        "Constant::Instance for fielded class '{}' has no constructor parameters",
-                        class_name
-                    ),
-                });
-            }
             let constructor_params = params
                 .iter()
                 .enumerate()
@@ -440,11 +430,6 @@ pub fn load_constant(
             // d. Emit 'invokespecial' to call the constructor
             // Consumes the top ref and all params, initializes the object pointed to by the second ref.
             instructions.push(JI::Invokespecial(constructor_ref_index)); // Stack: [initialized_ref]
-
-            // The generated constructor initializes all fields from `params`.
-            // `fields` carries named OOMIR metadata and must not be written a
-            // second time here (doing so duplicates referenced object graphs).
-            let _ = fields;
         }
     };
 

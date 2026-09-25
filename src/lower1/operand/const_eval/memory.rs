@@ -1,5 +1,6 @@
 //! Compile-time memory decoding.
 use super::*;
+use rustc_middle::ty::TypeVisitableExt;
 
 /// Reads a constant value of type `ty` from the `allocation` starting at `offset`.
 pub(crate) fn read_constant_value_from_memory<'tcx>(
@@ -10,6 +11,13 @@ pub(crate) fn read_constant_value_from_memory<'tcx>(
     oomir_data_types: &mut Definitions<'tcx>,
     instance: Instance<'tcx>,
 ) -> Result<oomir::Constant, String> {
+    // CTFE statics and fields can retain associated-type projections even
+    // though their layout is concrete. Decode the normalized representation.
+    let ty = if ty.has_aliases() {
+        oomir_data_types.normalize(tcx, ty, instance)
+    } else {
+        ty
+    };
     let pci = TypingEnv::fully_monomorphized().as_query_input(ty);
     let layout = tcx
         .layout_of(pci)
@@ -432,10 +440,6 @@ pub(crate) fn read_constant_value_from_memory<'tcx>(
                 );
                 Ok(oomir::Constant::Instance {
                     class_name,
-                    fields: HashMap::from_iter([
-                        (UNION_BYTES_FIELD.to_string(), bytes.clone()),
-                        (UNION_OBJECTS_FIELD.to_string(), objects.clone()),
-                    ]),
                     params: vec![bytes, objects],
                     param_types: Vec::new(),
                 })
@@ -448,7 +452,6 @@ pub(crate) fn read_constant_value_from_memory<'tcx>(
             if field_tys.is_empty() {
                 return Ok(oomir::Constant::Unit);
             }
-            let mut fields_map = HashMap::default();
             let mut params = Vec::new();
             let mut param_types = Vec::new();
             match layout.fields {
@@ -469,8 +472,7 @@ pub(crate) fn read_constant_value_from_memory<'tcx>(
                             oomir_data_types,
                             instance,
                         ));
-                        params.push(field_const.clone());
-                        fields_map.insert(format!("field{}", i), field_const);
+                        params.push(field_const);
                     }
                 }
                 _ => return Err("Unsupported tuple layout".to_string()),
@@ -479,7 +481,6 @@ pub(crate) fn read_constant_value_from_memory<'tcx>(
                 generate_tuple_jvm_class_name(field_tys, tcx, oomir_data_types, instance);
             Ok(oomir::Constant::Instance {
                 class_name: tuple_class_name,
-                fields: fields_map,
                 params,
                 param_types,
             })
@@ -495,7 +496,6 @@ pub(crate) fn read_constant_value_from_memory<'tcx>(
                 }
             };
             let capture_tys = closure_args.as_closure().upvar_tys();
-            let mut fields = HashMap::default();
             let mut params = Vec::new();
             let mut param_types = Vec::new();
             for (index, capture_ty) in capture_tys.iter().enumerate() {
@@ -514,12 +514,10 @@ pub(crate) fn read_constant_value_from_memory<'tcx>(
                     oomir_data_types,
                     instance,
                 ));
-                fields.insert(format!("arg{index}"), capture.clone());
                 params.push(capture);
             }
             Ok(oomir::Constant::Instance {
                 class_name,
-                fields,
                 params,
                 param_types,
             })

@@ -708,7 +708,6 @@ pub(crate) fn mir_int_to_oomir_const<'tcx>(
                 // MIR carries integer bits in a u128; preserve the signed
                 // two's-complement interpretation for i128 constants.
                 params: vec![oomir::Constant::String((value as i128).to_string())],
-                fields: HashMap::default(),
                 param_types: Vec::new(),
             }, // Handle large integers
         },
@@ -720,7 +719,6 @@ pub(crate) fn mir_int_to_oomir_const<'tcx>(
             UintTy::U128 => oomir::Constant::Instance {
                 class_name: crate::lower2::U128_CLASS.to_string(),
                 params: vec![oomir::Constant::String(value.to_string())],
-                fields: HashMap::default(),
                 param_types: Vec::new(),
             },
         },

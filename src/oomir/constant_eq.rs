@@ -209,17 +209,15 @@ impl PartialEq for Constant {
             (
                 Self::Instance {
                     class_name: a0,
-                    fields: a1,
                     params: a2,
                     param_types: a3,
                 },
                 Self::Instance {
                     class_name: b0,
-                    fields: b1,
                     params: b2,
                     param_types: b3,
                 },
-            ) => a0 == b0 && a1 == b1 && a2 == b2 && a3 == b3,
+            ) => a0 == b0 && a2 == b2 && a3 == b3,
             _ => false,
         }
     }

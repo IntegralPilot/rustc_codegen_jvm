@@ -107,11 +107,8 @@ pub enum Constant {
     Instance {
         /// The fully qualified JVM class name (e.g., "MyStruct", "MyEnum$VariantA").
         class_name: String,
-        /// The constant values of the fields, keyed by field name.
-        /// Enum fields use their public JVM ABI names (`value`, `_0`, or the
-        /// source name for a struct-like variant).
-        fields: HashMap<String, Constant>,
-        /// Any parameters to the constructor.
+        /// Field values in constructor order. Store each child only once: a
+        /// second named-field copy grows exponentially for nested aggregates.
         params: Vec<Constant>,
         /// The declared JVM type of each constructor parameter. This can differ
         /// from the concrete constant type when, for example, an enum variant
@@ -273,17 +270,10 @@ impl std::hash::Hash for Constant {
             }
             Constant::Instance {
                 class_name,
-                fields,
                 params,
                 param_types,
             } => {
                 class_name.hash(state);
-                let mut fields = fields.iter().collect::<Vec<_>>();
-                fields.sort_unstable_by_key(|(key, _)| *key);
-                for (key, value) in fields {
-                    key.hash(state);
-                    value.hash(state);
-                }
                 params.hash(state);
                 param_types.hash(state);
             }

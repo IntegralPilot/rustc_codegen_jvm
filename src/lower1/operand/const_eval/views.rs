@@ -359,11 +359,8 @@ pub(crate) fn read_slice_backed_value<'tcx>(
                     ));
                 }
             };
-            let mut fields = HashMap::default();
-            fields.insert(field.ident(tcx).to_string(), inner.clone());
             Ok(oomir::Constant::Instance {
                 class_name,
-                fields,
                 params: vec![inner],
                 param_types: vec![ty_to_oomir_type(field_ty, tcx, oomir_data_types, instance)],
             })

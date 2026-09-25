@@ -311,12 +311,10 @@ pub(super) fn create_constant_factory(
         },
         oomir::Constant::Instance {
             class_name,
-            fields,
             params,
             param_types,
         } => oomir::Constant::Instance {
             class_name: class_name.clone(),
-            fields: fields.clone(),
             param_types: param_types.clone(),
             params: params
                 .iter()
