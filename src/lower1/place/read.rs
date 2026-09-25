@@ -92,16 +92,18 @@ pub(crate) fn emit_instructions_to_get_recursive<'tcx>(
                     continue;
                 }
 
-                let has_slice_tail = matches!(current_type, oomir::Type::Pointer(_))
-                    && has_slice_or_str_struct_tail(tcx, base_rust_ty);
-                if has_slice_tail {
+                let pointer_field = matches!(&current_type, oomir::Type::Pointer(inner)
+                    if matches!(inner.as_ref(), oomir::Type::Class(_)))
+                    && (matches!(base_rust_ty.kind(), TyKind::Tuple(_))
+                        || matches!(base_rust_ty.kind(), TyKind::Adt(def, _) if def.is_struct()));
+                if pointer_field {
                     let layout = tcx
                         .layout_of(
                             TypingEnv::fully_monomorphized().as_query_input(base_rust_ty),
                         )
                         .unwrap_or_else(|error| {
                             panic!(
-                                "could not determine slice-tailed struct layout for {base_rust_ty:?}: {error:?}"
+                                "could not determine struct field layout for {base_rust_ty:?}: {error:?}"
                             )
                         });
                     let field_offset = layout.fields.offset(field_index.index()).bytes_usize();
@@ -114,7 +116,7 @@ pub(crate) fn emit_instructions_to_get_recursive<'tcx>(
                         unreachable!();
                     };
                     let oomir::Type::Class(owner_class) = base_pointee_ty.as_ref() else {
-                        panic!("slice-tailed Rust struct did not map to a JVM class");
+                        panic!("Rust struct pointer did not map to a JVM class");
                     };
                     let owner_class = owner_class.clone();
                     let field_name = field_name_for_projection(
@@ -124,9 +126,9 @@ pub(crate) fn emit_instructions_to_get_recursive<'tcx>(
                         tcx,
                         data_types,
                     )
-                    .unwrap_or_else(|error| panic!("Error getting DST field name: {error}"));
+                    .unwrap_or_else(|error| panic!("Error getting struct field name: {error}"));
                     let field_offset = Operand::Constant(oomir::Constant::U64(
-                        u64::try_from(field_offset).expect("Rust DST field offset exceeds u64"),
+                        u64::try_from(field_offset).expect("Rust struct field offset exceeds u64"),
                     ));
 
                     if field_rust_ty.is_str() {
@@ -250,9 +252,9 @@ pub(crate) fn emit_instructions_to_get_recursive<'tcx>(
                                 Operand::Constant(oomir::Constant::U64(
                                     u64::try_from(
                                         super::super::types::layout_size_bytes(tcx, field_rust_ty)
-                                            .expect("sized DST field must have a layout"),
+                                            .expect("sized struct field must have a layout"),
                                     )
-                                    .expect("Rust DST field layout exceeds u64"),
+                                    .expect("Rust struct field layout exceeds u64"),
                                 )),
                                 pointer_view_codec_operand(
                                     field_rust_ty,
@@ -526,7 +528,27 @@ pub(crate) fn emit_instructions_to_get_recursive<'tcx>(
                 };
                 let preserve_slice_tailed_pointer = pointer_pointee
                     .is_some_and(|pointee| has_slice_or_str_struct_tail(tcx, pointee));
-                if preserve_slice_tailed_pointer {
+                let projects_field = matches!(base_rust_ty.kind(), TyKind::RawPtr(..))
+                    && matches!(
+                        place.projection.get(proj_index + 1),
+                        Some(ProjectionElem::Field(..))
+                    )
+                    && matches!(&type_before_proj, oomir::Type::Pointer(inner)
+                        if matches!(inner.as_ref(), oomir::Type::Class(_)))
+                    && pointer_pointee.is_some_and(|ty| {
+                        matches!(ty.kind(), TyKind::Tuple(_))
+                            || matches!(ty.kind(), TyKind::Adt(def, _) if def.is_struct())
+                    })
+                    && match place.projection.get(proj_index + 1) {
+                        Some(ProjectionElem::Field(_, ty)) => {
+                            ty_to_oomir_type(*ty, tcx, data_types, instance).is_jvm_primitive()
+                        }
+                        _ => false,
+                    };
+                // A raw field projection must not read neighboring, possibly
+                // uninitialized fields. References already guarantee a valid
+                // enclosing value, so retain their direct object access.
+                if preserve_slice_tailed_pointer || projects_field {
                     continue;
                 }
                 if matches!(type_before_proj, oomir::Type::Slice(_))

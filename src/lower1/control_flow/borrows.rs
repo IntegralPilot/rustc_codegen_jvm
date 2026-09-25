@@ -143,6 +143,16 @@ pub(in crate::lower1) fn emit_mutable_borrow_writeback<'tcx>(
         return instructions;
     }
     let original_place = origin.original_place;
+    if matches!(
+        original_place.projection.first(),
+        Some(rustc_middle::mir::ProjectionElem::Deref)
+    ) {
+        // A reborrow of existing pointer storage already writes through. The
+        // borrowed pointer local may itself be changed through another alias;
+        // copying it back would then overwrite the old pointee or read a stale
+        // local instead of its stable cell.
+        return instructions;
+    }
     let carrier_name = origin.carrier_name;
     let carrier_pointee_ty = origin.pointee_type;
     if data_types.local_uses_stable_cell(original_place.local) {

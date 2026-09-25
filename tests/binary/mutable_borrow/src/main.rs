@@ -1,3 +1,5 @@
+mod ssa_pointers;
+
 // Simple struct
 struct Point {
     x: i32,
@@ -136,6 +138,7 @@ fn check_maybe_uninit_pointer_write_through() {
 }
 
 fn main() {
+    ssa_pointers::run();
     // 1. Initial setup
     let mut point = Point { x: 1, y: 5 };
     assert!(point.x == 1 && point.y == 5);

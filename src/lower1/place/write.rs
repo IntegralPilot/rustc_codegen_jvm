@@ -84,8 +84,10 @@ pub(crate) fn emit_instructions_to_set_value<'tcx>(
         // Taking an element through `&[T; N]` or `&mut [T; N]` only needs the
         // borrowed sequence carrier. Reading `*reference` first would
         // materialize an array value and detach pointer-backed references such
-        // as `array::from_mut` from their original storage.
-        let direct_slice_base =
+        // as `array::from_mut` from their original storage. Likewise,
+        // projecting a struct field must retain its pointer instead of reading
+        // neighboring fields that may not have been initialized yet.
+        let direct_pointer_base =
             base_place
                 .projection
                 .split_last()
@@ -97,11 +99,26 @@ pub(crate) fn emit_instructions_to_set_value<'tcx>(
                         local: base_place.local,
                         projection: tcx.mk_place_elems(prefix),
                     };
-                    matches!(
-                        get_place_type(&reference_place, mir, tcx, instance, data_types),
-                        oomir::Type::Slice(_)
-                    )
-                    .then(|| {
+                    let reference_type =
+                        get_place_type(&reference_place, mir, tcx, instance, data_types);
+                    let reference_rust_ty =
+                        EarlyBinder::bind(tcx, reference_place.ty(&mir.local_decls, tcx).ty)
+                            .instantiate(tcx, instance.args)
+                            .skip_norm_wip();
+                    let pointer_field = matches!(reference_rust_ty.kind(), TyKind::RawPtr(..))
+                        && matches!(last_projection, ProjectionElem::Field(_, ty)
+                        if ty_to_oomir_type(*ty, tcx, data_types, instance).is_jvm_primitive())
+                        && matches!(&reference_type, oomir::Type::Pointer(inner)
+                            if matches!(inner.as_ref(), oomir::Type::Class(_)))
+                        && {
+                            let ty =
+                                EarlyBinder::bind(tcx, base_place.ty(&mir.local_decls, tcx).ty)
+                                    .instantiate(tcx, instance.args)
+                                    .skip_norm_wip();
+                            matches!(ty.kind(), TyKind::Tuple(_))
+                                || matches!(ty.kind(), TyKind::Adt(def, _) if def.is_struct())
+                        };
+                    (matches!(reference_type, oomir::Type::Slice(_)) || pointer_field).then(|| {
                         emit_instructions_to_get_on_own(
                             &reference_place,
                             tcx,
@@ -111,7 +128,7 @@ pub(crate) fn emit_instructions_to_set_value<'tcx>(
                         )
                     })
                 });
-        let (base_var_name, get_base_instructions, base_oomir_type) = direct_slice_base
+        let (base_var_name, get_base_instructions, base_oomir_type) = direct_pointer_base
             .unwrap_or_else(|| {
                 emit_instructions_to_get_on_own(&base_place, tcx, instance, mir, data_types)
             });
@@ -132,14 +149,16 @@ pub(crate) fn emit_instructions_to_set_value<'tcx>(
                 let base_rust_ty = EarlyBinder::bind(tcx, base_place.ty(&mir.local_decls, tcx).ty)
                     .instantiate(tcx, instance.args)
                     .skip_norm_wip();
-                if matches!(base_oomir_type, oomir::Type::Pointer(_))
-                    && has_slice_or_str_struct_tail(tcx, base_rust_ty)
+                if matches!(&base_oomir_type, oomir::Type::Pointer(inner)
+                    if matches!(inner.as_ref(), oomir::Type::Class(_)))
+                    && (matches!(base_rust_ty.kind(), TyKind::Tuple(_))
+                        || matches!(base_rust_ty.kind(), TyKind::Adt(def, _) if def.is_struct()))
                 {
                     let layout = tcx
                         .layout_of(TypingEnv::fully_monomorphized().as_query_input(base_rust_ty))
                         .unwrap_or_else(|error| {
                             panic!(
-                                "could not determine slice-tailed struct layout for field assignment to {base_rust_ty:?}: {error:?}"
+                                "could not determine struct field layout for field assignment to {base_rust_ty:?}: {error:?}"
                             )
                         });
                     let field_offset = layout.fields.offset(field_index.index()).bytes_usize();
@@ -152,7 +171,7 @@ pub(crate) fn emit_instructions_to_set_value<'tcx>(
                         unreachable!();
                     };
                     let oomir::Type::Class(owner_class) = base_pointee_ty.as_ref() else {
-                        panic!("slice-tailed Rust struct did not map to a JVM class");
+                        panic!("Rust struct pointer did not map to a JVM class");
                     };
                     let owner_class = owner_class.clone();
                     let field_name = field_name_for_projection(
@@ -162,7 +181,7 @@ pub(crate) fn emit_instructions_to_set_value<'tcx>(
                         tcx,
                         data_types,
                     )
-                    .unwrap_or_else(|error| panic!("Error getting DST field name: {error}"));
+                    .unwrap_or_else(|error| panic!("Error getting struct field name: {error}"));
                     let typed_pointer_name = format!("{base_var_name}_typed_field_pointer");
                     instructions.push(Instruction::InvokeVirtual {
                         dest: Some(typed_pointer_name.clone()),
@@ -185,14 +204,14 @@ pub(crate) fn emit_instructions_to_set_value<'tcx>(
                             Operand::Constant(oomir::Constant::String(field_name)),
                             Operand::Constant(oomir::Constant::U64(
                                 u64::try_from(field_offset)
-                                    .expect("Rust DST field offset exceeds u64"),
+                                    .expect("Rust struct field offset exceeds u64"),
                             )),
                             Operand::Constant(oomir::Constant::U64(
                                 u64::try_from(
                                     super::super::types::layout_size_bytes(tcx, field_rust_ty)
-                                        .expect("sized DST field must have a layout"),
+                                        .expect("sized struct field must have a layout"),
                                 )
-                                .expect("Rust DST field layout exceeds u64"),
+                                .expect("Rust struct field layout exceeds u64"),
                             )),
                             pointer_view_codec_operand(field_rust_ty, tcx, data_types, instance),
                         ],
