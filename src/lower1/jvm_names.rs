@@ -82,70 +82,25 @@ pub fn disambiguated_def_path_token(tcx: TyCtxt<'_>, def_id: DefId) -> String {
         .join("_")
 }
 
-pub fn closure_class_for_args<'tcx>(
+/// Anonymous carriers are internal ABI identities; constructing their names
+/// must not instantiate the captured types or build a second type schema.
+pub fn anonymous_class_for_args<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: DefId,
     args: GenericArgsRef<'tcx>,
-    instance_context: Instance<'tcx>,
+    coroutine: bool,
 ) -> String {
-    let base = disambiguated_def_path_token(tcx, def_id);
-    let mut data_types = rustc_hash::FxHashMap::default();
-    let generic_tokens = args
-        .as_closure()
-        .parent_args()
-        .iter()
-        .copied()
-        .filter_map(|arg| {
-            super::types::readable_rust_generic_arg_name(
-                arg,
-                tcx,
-                &mut data_types,
-                instance_context,
-            )
-            .map(|token| super::types::sanitize_name_token(&token))
-        })
-        .collect::<Vec<_>>();
-    let suffix = if generic_tokens.is_empty() {
-        base
+    let kind = if coroutine { "Coroutine" } else { "Closure" };
+    // Synthetic capture and signature arguments can differ between the
+    // defining MIR and an opaque return type's revealed view. The definition
+    // and its enclosing generic arguments uniquely determine the carrier.
+    let parent_args = if coroutine {
+        args.as_coroutine().parent_args()
     } else {
-        format!("{base}_{}", generic_tokens.join("_"))
+        args.as_closure().parent_args()
     };
-    let identity = super::types::stable_instance_key(tcx, def_id, args);
-    let name = crate::stable_hash::readable_or_hashed_name("Closure", &suffix, &identity, 160);
-    format!("{}/{}", crate_root(tcx, def_id.krate), name)
-}
-
-pub fn coroutine_class_for_args<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    def_id: DefId,
-    args: GenericArgsRef<'tcx>,
-    instance_context: Instance<'tcx>,
-) -> String {
-    let base = disambiguated_def_path_token(tcx, def_id);
-    let mut data_types = rustc_hash::FxHashMap::default();
-    let generic_tokens = args
-        .as_coroutine()
-        .parent_args()
-        .iter()
-        .copied()
-        .filter_map(|arg| {
-            super::types::readable_rust_generic_arg_name(
-                arg,
-                tcx,
-                &mut data_types,
-                instance_context,
-            )
-            .map(|token| super::types::sanitize_name_token(&token))
-        })
-        .collect::<Vec<_>>();
-    let suffix = if generic_tokens.is_empty() {
-        base
-    } else {
-        format!("{base}_{}", generic_tokens.join("_"))
-    };
-    let identity = super::types::stable_instance_key(tcx, def_id, args);
-    let name = crate::stable_hash::readable_or_hashed_name("Coroutine", &suffix, &identity, 160);
-    format!("{}/{}", crate_root(tcx, def_id.krate), name)
+    let identity = super::types::stable_instance_identity(tcx, def_id, tcx.mk_args(parent_args));
+    format!("{}/{kind}_{identity}", crate_root(tcx, def_id.krate))
 }
 
 pub fn owner_class_for_function<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> String {
@@ -169,9 +124,20 @@ pub fn owner_class_for_function<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> Strin
 }
 
 pub fn method_for_function<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> String {
-    def_path_segments(tcx, def_id)
-        .pop()
-        .unwrap_or_else(|| member_name(&tcx.def_path_str(def_id)))
+    let mut current = def_id;
+    loop {
+        let key = tcx.def_key(current);
+        if let Some(name) = key.disambiguated_data.data.get_opt_name() {
+            return normalize_def_path_segment(name.as_str());
+        }
+        let Some(parent) = key.parent else {
+            return member_name(&tcx.def_path_str(def_id));
+        };
+        current = DefId {
+            krate: def_id.krate,
+            index: parent,
+        };
+    }
 }
 
 pub fn synthetic_class_for_instance<'tcx>(

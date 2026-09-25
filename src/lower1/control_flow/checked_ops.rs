@@ -1,7 +1,9 @@
-use super::{checked_intrinsic_registry, checked_intrinsics};
+use super::checked_intrinsics;
+use crate::lower1::context::Definitions;
 use crate::oomir::{Instruction, Operand, Type};
 
 pub fn emit_checked_arithmetic_oomir_instructions(
+    data_types: &mut Definitions<'_>,
     dest_base_name: &str,
     op1: &Operand,
     op2: &Operand,
@@ -38,7 +40,7 @@ pub fn emit_checked_arithmetic_oomir_instructions(
         checked_intrinsics::get_intrinsic_function_name(operation, ty_suffix, result_tuple_class);
 
     // Register that this intrinsic is needed
-    checked_intrinsic_registry::register_intrinsic(operation, ty_suffix, result_tuple_class);
+    data_types.request_checked_intrinsic(operation, ty_suffix, result_tuple_class);
 
     // Emit a call to the intrinsic static method: pair = RustcCodegenJVMIntrinsics.fn_name(a, b)
     generated_instructions.push(Instruction::InvokeStatic {
