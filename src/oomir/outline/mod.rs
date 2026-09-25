@@ -27,6 +27,7 @@ fn cost(op: Op, source: &SsaBody) -> usize {
         },
         Op::Call { .. } | Op::Project { .. } | Op::FunctionPointer { .. } => 8,
         Op::GetField { .. } | Op::SetField { .. } | Op::Load(_) | Op::Store { .. } => 4,
+        Op::LoadField { .. } | Op::StoreField { .. } => 8,
         _ => 1,
     }
 }

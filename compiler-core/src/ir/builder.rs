@@ -31,6 +31,13 @@ impl<'a> Builder<'a> {
             constants: FxHashMap::default(),
         }
     }
+    /// Reuse sealed-block construction to promote proven local storage.
+    pub(crate) fn from_body(body: Body, types: &'a Types) -> Self {
+        let mut builder = Self::new(types, body.return_type);
+        builder.current = body.entry;
+        builder.body = body;
+        builder
+    }
     pub fn current(&self) -> BlockId {
         self.current
     }

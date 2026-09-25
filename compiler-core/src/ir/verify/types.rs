@@ -5,6 +5,7 @@ pub(super) fn verify_types(inst: &Inst, body: &Body, types: &Types) -> Result<()
     let result = inst.result.map(|v| body.value_type(v));
     let ty = |v| body.value_type(v);
     match inst.op {
+        Op::Nop => check!(result.is_none(), "nop produces a value"),
         Op::ArrayLength(value) => check!(
             result.and_then(|t| types.get(t)) == Some(Type::Scalar(ScalarType::I32))
                 && matches!(
@@ -250,7 +251,11 @@ pub(super) fn verify_types(inst: &Inst, body: &Body, types: &Types) -> Result<()
             }
         }
         Op::Opaque(value) => check!(result == Some(ty(value)), "opaque value type mismatch"),
-        Op::Project { base, projection } => {
+        Op::Project { base, projection }
+        | Op::LoadField { base, projection }
+        | Op::StoreField {
+            base, projection, ..
+        } => {
             let projection = body
                 .projections
                 .get(projection.index())
@@ -263,10 +268,26 @@ pub(super) fn verify_types(inst: &Inst, body: &Body, types: &Types) -> Result<()
                 !field.is_static && types.get(ty(base)) == Some(Type::Pointer(field.owner)),
                 "projection owner mismatch"
             );
-            check!(
-                result.and_then(|id| types.get(id)) == Some(Type::Pointer(field.ty)),
-                "projection result mismatch"
-            );
+            if !matches!(inst.op, Op::Project { .. }) {
+                check!(
+                    matches!(types.get(field.ty), Some(Type::Scalar(_))),
+                    "promoted field access requires a scalar field"
+                );
+            }
+            match inst.op {
+                Op::Project { .. } => check!(
+                    result.and_then(|id| types.get(id)) == Some(Type::Pointer(field.ty)),
+                    "projection result mismatch"
+                ),
+                Op::LoadField { .. } => {
+                    check!(result == Some(field.ty), "field load type mismatch")
+                }
+                Op::StoreField { value, .. } => check!(
+                    result.is_none() && ty(value) == field.ty,
+                    "field store type mismatch"
+                ),
+                _ => unreachable!(),
+            }
             check!(
                 projection.offset <= i64::MAX as u64 && projection.size <= i64::MAX as u64,
                 "projection exceeds runtime address space"

@@ -101,31 +101,14 @@ impl Selector<'_> {
     }
 
     pub(super) fn memory(&mut self, inst: Inst) -> jvm::Result<bool> {
+        if self.field_memory(inst)? {
+            return Ok(true);
+        }
         match inst.op {
             Op::Opaque(value) => self.load(value)?,
             Op::Project { base, projection } => {
-                let projection = &self.body.projections[projection.index()];
-                let field = &self.body.fields[projection.field.index()];
-                let Some(Type::Class(symbol)) = self.types.get(field.owner) else {
-                    return Err(error("projection requires class layout"));
-                };
                 self.load(base)?;
-                self.assembly.code.extend([
-                    Instruction::Ldc_w(
-                        self.cp
-                            .add_string(self.types.symbol_name(symbol).unwrap())?,
-                    ),
-                    Instruction::Ldc_w(self.cp.add_string(&field.name)?),
-                    get_long_const_instr(self.cp, projection.offset as i64),
-                    get_long_const_instr(self.cp, projection.size as i64),
-                    match &projection.codec {
-                        Some(codec) => Instruction::Ldc_w(self.cp.add_string(codec)?),
-                        None => Instruction::Aconst_null,
-                    },
-                ]);
-                let owner = self.cp.add_class(POINTER_CLASS)?;
-                let method = self.cp.add_method_ref(owner, "projectStructField", "(Ljava/lang/String;Ljava/lang/String;JJLjava/lang/String;)Lorg/rustlang/runtime/Pointer;")?;
-                self.assembly.code.push(Instruction::Invokevirtual(method));
+                self.project_field(projection)?;
             }
             Op::Offset {
                 pointer,
@@ -232,6 +215,31 @@ impl Selector<'_> {
         Ok(true)
     }
 
+    /// Project the pointer already on the operand stack.
+    pub(super) fn project_field(&mut self, projection: ProjectionId) -> jvm::Result<()> {
+        let projection = &self.body.projections[projection.index()];
+        let field = &self.body.fields[projection.field.index()];
+        let Some(Type::Class(symbol)) = self.types.get(field.owner) else {
+            return Err(error("projection requires class layout"));
+        };
+        self.assembly.code.extend([
+            Instruction::Ldc_w(
+                self.cp
+                    .add_string(self.types.symbol_name(symbol).unwrap())?,
+            ),
+            Instruction::Ldc_w(self.cp.add_string(&field.name)?),
+            get_long_const_instr(self.cp, projection.offset as i64),
+            get_long_const_instr(self.cp, projection.size as i64),
+            match &projection.codec {
+                Some(codec) => Instruction::Ldc_w(self.cp.add_string(codec)?),
+                None => Instruction::Aconst_null,
+            },
+        ]);
+        let owner = self.cp.add_class(POINTER_CLASS)?;
+        let method = self.cp.add_method_ref(owner, "projectStructField", "(Ljava/lang/String;Ljava/lang/String;JJLjava/lang/String;)Lorg/rustlang/runtime/Pointer;")?;
+        self.assembly.code.push(Instruction::Invokevirtual(method));
+        Ok(())
+    }
     pub(super) fn read_memory(&mut self, ty: TypeId) -> jvm::Result<()> {
         let class = match self.types.get(ty) {
             Some(Type::Class(symbol) | Type::Interface(symbol)) => {

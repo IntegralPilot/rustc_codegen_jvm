@@ -85,6 +85,8 @@ impl Assembly {
             match &mut self.code[index] {
                 Instruction::Goto_w(t) => *t = i32::from(target),
                 Instruction::Ifeq(t)
+                | Instruction::Ifnull(t)
+                | Instruction::Ifnonnull(t)
                 | Instruction::Ifne(t)
                 | Instruction::Iflt(t)
                 | Instruction::Ifle(t)

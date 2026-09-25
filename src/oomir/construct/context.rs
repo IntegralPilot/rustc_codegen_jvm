@@ -1,11 +1,16 @@
-//! Representation recipes retain only zero-sized and single-value carriers.
+//! Shared field layouts, subtype relationships and representation recipes.
 use super::*;
+
+pub(super) struct FieldLayout {
+    pub members: Vec<(String, oomir::Type)>,
+    pub direct: bool,
+}
 
 pub(crate) struct Context {
     pub(super) zero_sized: HashSet<String>,
     pub(super) interfaces: HashSet<String>,
     pub(super) wrappers: HashMap<String, Vec<(String, oomir::Type)>>,
-    pub(super) constructors: HashMap<String, Vec<oomir::Type>>,
+    pub(super) fields: HashMap<String, FieldLayout>,
     parents: HashMap<String, Vec<String>>,
 }
 impl Context {
@@ -33,7 +38,7 @@ impl Context {
             zero_sized: HashSet::default(),
             interfaces: module.external_interfaces.clone(),
             wrappers: HashMap::default(),
-            constructors: HashMap::default(),
+            fields: HashMap::default(),
             parents: HashMap::default(),
         };
         let mut memo = HashMap::default();
@@ -65,13 +70,16 @@ impl Context {
                     is_abstract: false,
                     ..
                 } => {
-                    context.constructors.insert(
+                    context.fields.insert(
                         name.clone(),
-                        fields
-                            .iter()
-                            .filter(|(_, ty)| ty.has_jvm_value())
-                            .map(|(_, ty)| ty.clone())
-                            .collect(),
+                        FieldLayout {
+                            members: fields
+                                .iter()
+                                .filter(|(_, ty)| ty.has_jvm_value())
+                                .cloned()
+                                .collect(),
+                            direct: false,
+                        },
                     );
                     let count = fields
                         .iter()
@@ -85,6 +93,46 @@ impl Context {
                     }
                 }
                 _ => {}
+            }
+        }
+        // Slice/str tails need byte projection: their enclosing JVM carrier
+        // may not exist (for example a raw cast from a tuple to a Rust DST).
+        // Arrays are conservatively retained on the general path too, since
+        // this representation vocabulary does not distinguish sized tails.
+        fn direct_tail(
+            name: &str,
+            fields: &HashMap<String, FieldLayout>,
+            seen: &mut HashMap<String, bool>,
+        ) -> bool {
+            if let Some(&direct) = seen.get(name) {
+                return direct;
+            }
+            seen.insert(name.into(), false);
+            let direct = fields
+                .get(name)
+                .is_some_and(|layout| match layout.members.last() {
+                    None => true,
+                    Some((_, oomir::Type::Class(tail))) => direct_tail(tail, fields, seen),
+                    Some((
+                        _,
+                        oomir::Type::Slice(_)
+                        | oomir::Type::Str
+                        | oomir::Type::Array(_)
+                        | oomir::Type::MutableReference(_)
+                        | oomir::Type::Interface(_),
+                    )) => false,
+                    _ => true,
+                });
+            *seen.get_mut(name).unwrap() = direct;
+            direct
+        }
+        let mut direct = HashMap::default();
+        for name in context.fields.keys() {
+            direct_tail(name, &context.fields, &mut direct);
+        }
+        for (name, direct) in direct {
+            if let Some(layout) = context.fields.get_mut(&name) {
+                layout.direct = direct;
             }
         }
         context

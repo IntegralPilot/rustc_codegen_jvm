@@ -5,6 +5,7 @@ use jvm::attributes::{ArrayType, BootstrapMethod};
 impl Selector<'_> {
     pub(super) fn general(&mut self, inst: Inst) -> jvm::Result<bool> {
         match inst.op {
+            Op::Nop => {}
             Op::Exception => self.assembly.code.push(
                 Kind::Reference.load(
                     self.exception_slot

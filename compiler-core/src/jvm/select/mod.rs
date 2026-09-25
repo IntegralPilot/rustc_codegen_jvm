@@ -6,6 +6,7 @@ mod bits;
 mod calls;
 mod checked;
 mod debug;
+mod fields;
 mod forward;
 mod general;
 mod memory;

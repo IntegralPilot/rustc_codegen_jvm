@@ -63,6 +63,7 @@ pub(super) fn remove_trivial_parameters(body: &mut Body, predecessors: &[Vec<(Bl
             tails[source as usize] = node;
         }
     }
+    let reachable = body.reachable();
     let mut queue: VecDeque<_> = (0..params.len() as u32).collect();
     let mut queued = vec![true; params.len()];
     while let Some(number) = queue.pop_front() {
@@ -74,7 +75,12 @@ pub(super) fn remove_trivial_parameters(body: &mut Body, predecessors: &[Vec<(Bl
         }
         let mut unique = None;
         let mut trivial = true;
-        for &(_, edge) in &predecessors[param.block.index()] {
+        for &(source, edge) in &predecessors[param.block.index()] {
+            // Constant-folded branches can leave syntactic predecessors with
+            // undefined bindings. They cannot contribute to a reachable join.
+            if reachable[param.block.index()] && !reachable[source.index()] {
+                continue;
+            }
             let arg = body.resolve_mut(body.edges[edge.index()].args[param.index]);
             if arg == param.value {
                 continue;

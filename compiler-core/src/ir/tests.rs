@@ -330,3 +330,27 @@ fn source_local_initial_state_is_explicit_and_temporaries_remain_strict() {
         }
     }
 }
+
+#[test]
+fn unreachable_predecessors_do_not_hide_a_trivial_join() {
+    let mut types = Types::default();
+    let int = types.scalar(ScalarType::I64);
+    let mut b = Builder::new(&types, int);
+    let value = b.parameter(b.current(), int);
+    let live = b.create_block();
+    let dead = b.create_block();
+    let join = b.create_block();
+    let joined = b.parameter(join, int);
+    b.jump(live, vec![]);
+    b.switch_to(live);
+    b.jump(join, vec![value]);
+    b.switch_to(dead);
+    let different = b.constant(int, Scalar::integer(ScalarType::I64, 42).unwrap());
+    b.jump(join, vec![different]);
+    b.switch_to(join);
+    b.terminate(Terminator::Return(Some(joined)));
+    let body = b.finish().unwrap();
+    verify(&body, &types).unwrap();
+    assert_eq!(body.resolve(joined), value);
+    assert!(body.blocks[join.index()].params.is_empty());
+}

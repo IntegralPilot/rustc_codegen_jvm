@@ -65,7 +65,9 @@ fn first_operand(body: &Body, op: Op) -> Option<ValueId> {
         | Op::Load(value)
         | Op::Length(value)
         | Op::SetStatic { value, .. } => Some(value),
-        Op::Project { base, .. } => Some(base),
+        Op::Project { base, .. } | Op::LoadField { base, .. } | Op::StoreField { base, .. } => {
+            Some(base)
+        }
         Op::Offset { pointer, .. } | Op::Store { pointer, .. } => Some(pointer),
         Op::ViewData { view, .. } => Some(view),
         Op::GetField { object, field } | Op::SetField { object, field, .. }

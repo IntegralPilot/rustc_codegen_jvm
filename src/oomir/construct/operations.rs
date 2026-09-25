@@ -12,6 +12,7 @@ impl Emission<'_> {
         kind: CallKind,
         values: Vec<ValueId>,
     ) -> Result<Option<ValueId>> {
+        let initial_cell = self.initial_cell(&owner, &name, kind, returns, &values);
         let declared_result = returns;
         let returns = if owner == oomir::POINTER_CLASS
             && matches!(name.as_str(), "addr" | "expose_provenance" | "metadata")
@@ -52,6 +53,9 @@ impl Emission<'_> {
         let result =
             (self.vocabulary.types.get(returns) != Some(ir::Type::Unit)).then_some(returns);
         let value = self.emit(Op::Call { method, kind, args }, result);
+        if let (Some(cell), Some(initial)) = (value, initial_cell) {
+            self.cells.push((cell, initial));
+        }
         value
             .map(|value| self.adapt(value, declared_result))
             .transpose()
@@ -294,6 +298,11 @@ impl Emission<'_> {
                 operand,
                 dest,
             } => {
+                if class_name == oomir::POINTER_CLASS
+                    && self.pointer_operation(&method_name, &method_ty, &operand, &args, &dest)?
+                {
+                    return Ok(());
+                }
                 self.invoke(
                     class_name,
                     method_name,
@@ -395,11 +404,12 @@ impl Emission<'_> {
                     .collect::<Vec<_>>();
                 let fields = self
                     .context
-                    .constructors
+                    .fields
                     .get(&class_name)
+                    .map(|layout| &layout.members)
                     .filter(|fields| fields.len() == args.len());
                 for (index, (operand, ty)) in args.into_iter().enumerate() {
-                    let ty = fields.map_or(ty, |fields| fields[index].clone());
+                    let ty = fields.map_or(ty, |fields| fields[index].1.clone());
                     {
                         params.push(self.ty(&ty));
                         let value = self.operand(operand)?;

@@ -14,6 +14,7 @@ impl Op {
     pub fn remap(self, map: &mut impl Remap) -> Self {
         use Op::*;
         match self {
+            Nop => Nop,
             Constant(c) => Constant(map.constant(c)),
             Exception => Exception,
             Binary { op, left, right } => Binary {
@@ -56,6 +57,19 @@ impl Op {
             Project { base, projection } => Project {
                 base: map.value(base),
                 projection: map.projection(projection),
+            },
+            LoadField { base, projection } => LoadField {
+                base: map.value(base),
+                projection: map.projection(projection),
+            },
+            StoreField {
+                base,
+                projection,
+                value,
+            } => StoreField {
+                base: map.value(base),
+                projection: map.projection(projection),
+                value: map.value(value),
             },
             Offset {
                 pointer,

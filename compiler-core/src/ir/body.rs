@@ -90,6 +90,8 @@ impl StorageSlot {
 /// Operands are SSA handles. Type/member/pointer semantics survive until selection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Op {
+    /// Removed effect; keeps source positions stable during promotion.
+    Nop,
     Constant(ConstId),
     /// Exception delivered by the current unwind edge.
     Exception,
@@ -137,6 +139,16 @@ pub enum Op {
     Project {
         base: ValueId,
         projection: ProjectionId,
+    },
+    /// Access a scalar field without allocating its intermediate pointer view.
+    LoadField {
+        base: ValueId,
+        projection: ProjectionId,
+    },
+    StoreField {
+        base: ValueId,
+        projection: ProjectionId,
+        value: ValueId,
     },
     Offset {
         pointer: ValueId,
@@ -192,12 +204,15 @@ impl Op {
     pub fn may_throw(self, body: &Body, types: &Types) -> bool {
         match self {
             Self::Constant(id) => matches!(body.constants[id.index()], Constant::External { .. }),
-            Self::Exception
+            Self::Nop
+            | Self::Exception
             | Self::Reinterpret(_)
             | Self::Not(_)
             | Self::Neg(_)
             | Self::Bit { .. }
             | Self::Overflow { .. } => false,
+            // A typed field address has no source-language effects until used.
+            Self::Project { .. } => false,
             Self::Binary {
                 op: BinaryOp::Div | BinaryOp::Rem,
                 left,
@@ -234,7 +249,11 @@ impl Op {
                 visit(pointer);
                 visit(value);
             }
-            Self::Project { base, .. } => visit(base),
+            Self::Project { base, .. } | Self::LoadField { base, .. } => visit(base),
+            Self::StoreField { base, value, .. } => {
+                visit(base);
+                visit(value);
+            }
             Self::ViewData { view, .. } => visit(view),
             Self::View { data, length } => {
                 visit(data);
@@ -269,7 +288,8 @@ impl Op {
                 visit(index);
                 visit(value);
             }
-            Self::Constant(_)
+            Self::Nop
+            | Self::Constant(_)
             | Self::Exception
             | Self::LoadSlot(_)
             | Self::AddressOfSlot(_)

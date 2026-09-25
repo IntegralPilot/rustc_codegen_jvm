@@ -13,6 +13,7 @@ mod arithmetic;
 mod arrays;
 mod context;
 mod operations;
+mod pointers;
 mod types;
 mod wrappers;
 pub(crate) use context::Context;
@@ -70,9 +71,9 @@ pub(crate) fn seal(function: oomir::Function, context: &Context) -> Result<oomir
             needs_exception |= matches!(instruction, UnwindStart { .. } | Rethrow);
             vocabulary.instruction(instruction);
             if let oomir::Instruction::ConstructObject { class_name, .. } = instruction
-                && let Some(fields) = context.constructors.get(class_name)
+                && let Some(fields) = context.fields.get(class_name)
             {
-                for ty in fields {
+                for (_, ty) in &fields.members {
                     vocabulary.add(ty);
                 }
             }
@@ -126,6 +127,7 @@ pub(crate) fn seal(function: oomir::Function, context: &Context) -> Result<oomir
         debug: ir::DebugInfo::default(),
         debug_names: HashMap::default(),
         handlers,
+        cells: Vec::new(),
     };
     // Record declared source representations for zero-sized local initialization.
     for name in &names {
@@ -272,9 +274,10 @@ pub(crate) fn seal(function: oomir::Function, context: &Context) -> Result<oomir
         constants,
         debug,
         variables,
+        cells,
         ..
     } = emission;
-    let ir = builder.finish().map_err(|e| {
+    let mut ir = builder.finish().map_err(|e| {
         let mut variables = variables
             .into_iter()
             .enumerate()
@@ -287,6 +290,11 @@ pub(crate) fn seal(function: oomir::Function, context: &Context) -> Result<oomir
         variables.sort_by_key(|(id, _)| id.index());
         format!("{}: {e}; bindings: {variables:?}", function.name)
     })?;
+    jvm_compiler_core::opt::promote_fields(&mut ir, &vocabulary.types);
+    if debug.locals.is_empty() && !cells.is_empty() {
+        ir = jvm_compiler_core::opt::promote_cells(ir, &vocabulary.types, &cells)
+            .map_err(|e| format!("{}: cell promotion: {e}", function.name))?;
+    }
     let lines = lines.map(|mut lines| {
         lines.instructions.resize(ir.instructions.len(), None);
         lines.terminators.resize(ir.blocks.len(), None);
@@ -323,6 +331,7 @@ struct Emission<'a> {
     debug: ir::DebugInfo,
     debug_names: HashMap<String, Vec<u32>>,
     handlers: HashMap<String, ir::BlockId>,
+    cells: Vec<(ir::ValueId, ir::ValueId)>,
 }
 impl Emission<'_> {
     fn ty(&self, ty: &oomir::Type) -> ir::TypeId {
