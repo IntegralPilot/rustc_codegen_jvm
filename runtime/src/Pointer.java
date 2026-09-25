@@ -565,6 +565,9 @@ public final class Pointer {
             ((ReceiverCell) allocation).hasMemoryView = present;
         } else if (allocation instanceof FieldCell) {
             ((FieldCell) allocation).hasMemoryView = present;
+            if (present) {
+                markProjectedViewParents((FieldCell) allocation);
+            }
         }
     }
 
@@ -3365,6 +3368,7 @@ public final class Pointer {
         }
         if (allocation instanceof FieldCell) {
             ((FieldCell) allocation).hasStructuralView = true;
+            markProjectedViewParents((FieldCell) allocation);
             return;
         }
         markIdentityFilter(STRUCTURAL_VIEW_FILTER, allocation);
@@ -3865,6 +3869,8 @@ public final class Pointer {
                 reverseStripe.put(allocation, views);
             }
             views.put(value, Boolean.TRUE);
+            ((FieldCell) allocation).hasMemoryOrigins = true;
+            markProjectedViewParents((FieldCell) allocation);
         }
     }
 
@@ -3879,6 +3885,7 @@ public final class Pointer {
             views.remove(value);
             if (views.isEmpty()) {
                 stripe.remove(allocation);
+                ((FieldCell) allocation).hasMemoryOrigins = false;
             }
         }
     }
@@ -3889,6 +3896,7 @@ public final class Pointer {
         java.util.List<Object> views;
         synchronized (reverseStripe) {
             Map<Object, Boolean> indexed = reverseStripe.remove(allocation);
+            ((FieldCell) allocation).hasMemoryOrigins = false;
             if (indexed == null || indexed.isEmpty()) {
                 return;
             }
@@ -4092,9 +4100,57 @@ public final class Pointer {
         return isDirectAllocationView() ? readAlignedElement() : null;
     }
 
+    // Runtime-owned cells can answer exactly without saturating the shared
+    // identity filter as short-lived field pointers accumulate in long runs.
+    private static boolean mayHaveFieldCells(Object owner) {
+        if (owner instanceof Cell) {
+            return ((Cell) owner).hasFieldCells;
+        }
+        if (owner instanceof FieldCell) {
+            return ((FieldCell) owner).hasFieldCells;
+        }
+        return owner != null && mayBeInIdentityFilter(FIELD_CELL_FILTER, owner);
+    }
+
+    private static void markFieldCells(Object owner) {
+        if (owner instanceof Cell) {
+            ((Cell) owner).hasFieldCells = true;
+        } else if (owner instanceof FieldCell) {
+            ((FieldCell) owner).hasFieldCells = true;
+        } else {
+            markIdentityFilter(FIELD_CELL_FILTER, owner);
+        }
+    }
+
+    // Only view creation marks ancestors. Ordinary typed field projections
+    // need no invalidation traversal until a descendant has a decoded view.
+    // Marks remain conservative after invalidation, avoiding subtree counts
+    // and any work on the common projection path.
+    private static void markProjectedViewParents(FieldCell field) {
+        Object parent = field.rootOwner;
+        while (parent instanceof FieldCell) {
+            FieldCell cell = (FieldCell) parent;
+            cell.hasProjectedViews = true;
+            parent = cell.rootOwner;
+        }
+        if (parent instanceof Cell) {
+            ((Cell) parent).hasProjectedViews = true;
+        }
+    }
+
+    private static boolean mayHaveProjectedViews(Object owner) {
+        if (owner instanceof Cell) {
+            return ((Cell) owner).hasProjectedViews;
+        }
+        if (owner instanceof FieldCell) {
+            return ((FieldCell) owner).hasProjectedViews;
+        }
+        return mayHaveFieldCells(owner);
+    }
+
     private static java.util.List<FieldCell> collectProjectedFieldViews(
             Object owner, java.util.List<FieldCell> projected) {
-        if (owner == null || !mayBeInIdentityFilter(FIELD_CELL_FILTER, owner)) {
+        if (!mayHaveProjectedViews(owner)) {
             return projected;
         }
         Map<Object, Map<String, WeakReference<FieldCell>>> fieldStripe =
@@ -4107,10 +4163,10 @@ public final class Pointer {
             for (WeakReference<FieldCell> reference : fields.values()) {
                 FieldCell cell = reference.get();
                 if (cell != null
-                        && (mayHaveStructuralView(cell)
-                                || mayBeInIdentityFilter(MEMORY_VIEW_FILTER, cell)
-                                || mayBeInIdentityFilter(MEMORY_VIEW_ORIGIN_FILTER, cell)
-                                || mayBeInIdentityFilter(FIELD_CELL_FILTER, cell))) {
+                        && (cell.hasStructuralView
+                                || cell.hasMemoryView
+                                || cell.hasMemoryOrigins
+                                || cell.hasProjectedViews)) {
                     if (projected == null) {
                         projected = new java.util.ArrayList<>();
                     }
@@ -4145,6 +4201,7 @@ public final class Pointer {
                     stateStripe(STRUCTURAL_VIEWS, cell);
             synchronized (stripe) {
                 stripe.remove(cell);
+                cell.hasStructuralView = false;
             }
         }
         for (FieldCell cell : projected) {
@@ -4153,7 +4210,7 @@ public final class Pointer {
     }
 
     private static boolean hasProjectedFieldCells(Object owner) {
-        if (owner == null || !mayBeInIdentityFilter(FIELD_CELL_FILTER, owner)) {
+        if (!mayHaveFieldCells(owner)) {
             return false;
         }
         Map<Object, Map<String, WeakReference<FieldCell>>> stripe =
@@ -4383,6 +4440,8 @@ public final class Pointer {
         private Object value;
         private volatile boolean hasStructuralView;
         private volatile boolean hasMemoryView;
+        private volatile boolean hasFieldCells;
+        private volatile boolean hasProjectedViews;
 
         private Cell(Object value) {
             this.value = value;
@@ -4412,6 +4471,9 @@ public final class Pointer {
         private final Object fixedOwner;
         private final Object rootOwner;
         private final FieldAccess access;
+        private volatile boolean hasFieldCells;
+        private volatile boolean hasProjectedViews;
+        private volatile boolean hasMemoryOrigins;
         private final int fieldNameHash;
         private volatile boolean hasStructuralView;
         private volatile boolean hasMemoryView;
@@ -4501,8 +4563,12 @@ public final class Pointer {
         private final MethodHandle byteOffsetSetter;
         private final int fieldNameHash;
         private final boolean primitive;
+        // Field metadata is shared; constructing this per projection hashes
+        // long generated class names on every Rust aggregate field access.
+        private final String cacheKey;
 
         private FieldAccess(Field field) {
+            cacheKey = field.getDeclaringClass().getName() + '\n' + field.getName();
             fieldNameHash = field.getName().hashCode();
             primitive = field.getType().isPrimitive();
             try {
@@ -5295,7 +5361,7 @@ public final class Pointer {
                 }
                 fields.put(fieldName, new WeakReference<>(cell));
             }
-            markIdentityFilter(FIELD_CELL_FILTER, owner);
+            markFieldCells(owner);
         }
         return new Pointer(cell, size, 0, size, codecClassName);
     }
@@ -5336,7 +5402,17 @@ public final class Pointer {
             String fieldName,
             long size,
             String codecClassName) {
-        String cacheKey = ownerClass.getName() + '\n' + fieldName;
+        FieldAccess access;
+        try {
+            access = fieldAccess(ownerClass, fieldName);
+        } catch (NoSuchFieldException error) {
+            if (size == 0) {
+                return Pointer.cell(null, 0, codecClassName);
+            }
+            throw new IllegalArgumentException(
+                    "unknown Rust field " + ownerClass.getName() + "." + fieldName, error);
+        }
+        String cacheKey = access.cacheKey;
         FieldCell cell;
         Map<Object, Map<String, WeakReference<FieldCell>>> stripe =
                 stateStripe(FIELD_CELLS, owner);
@@ -5349,22 +5425,12 @@ public final class Pointer {
             WeakReference<FieldCell> reference = fields.get(cacheKey);
             cell = reference == null ? null : reference.get();
             if (cell == null) {
-                try {
-                    FieldAccess access = fieldAccess(ownerClass, fieldName);
-                    cell = owner instanceof Cell
-                            ? new FieldCell((Cell) owner, access)
-                            : new FieldCell((FieldCell) owner, access);
-                } catch (NoSuchFieldException error) {
-                    if (size == 0) {
-                        return Pointer.cell(null, 0, codecClassName);
-                    }
-                    throw new IllegalArgumentException(
-                            "unknown Rust field " + ownerClass.getName() + "." + fieldName,
-                            error);
-                }
+                cell = owner instanceof Cell
+                        ? new FieldCell((Cell) owner, access)
+                        : new FieldCell((FieldCell) owner, access);
                 fields.put(cacheKey, new WeakReference<>(cell));
             }
-            markIdentityFilter(FIELD_CELL_FILTER, owner);
+            markFieldCells(owner);
         }
         return new Pointer(cell, checkedArrayLength(size), 0, size, codecClassName);
     }
@@ -5374,25 +5440,6 @@ public final class Pointer {
             Class<?> ownerClass = resolvedRuntimeClass(ownerClassName);
             Object candidate = getObjectAs(ownerClassName);
             return ownerClass.isInstance(candidate) ? candidate : null;
-        } catch (ClassNotFoundException error) {
-            throw new IllegalArgumentException(
-                    "unknown Rust aggregate class " + ownerClassName, error);
-        }
-    }
-
-    private Object directStructView(String ownerClassName) {
-        try {
-            Class<?> ownerClass = resolvedRuntimeClass(ownerClassName);
-            Object direct = directCellValueOrSelf();
-            if (ownerClass.isInstance(direct)) {
-                return direct;
-            }
-            try {
-                Object candidate = getObject();
-                return ownerClass.isInstance(candidate) ? candidate : null;
-            } catch (IllegalStateException incompatibleView) {
-                return null;
-            }
         } catch (ClassNotFoundException error) {
             throw new IllegalArgumentException(
                     "unknown Rust aggregate class " + ownerClassName, error);
@@ -5470,9 +5517,16 @@ public final class Pointer {
                         || allocation instanceof ReceiverCell
                         || boundMemoryViewState() != null;
         if ((managedField || directPrimitiveField) && hasStableManagedCarrier()) {
-            Object owner = fieldType != null && fieldType.isPrimitive()
-                    ? directStructView(ownerClassName)
-                    : compatibleStructView(ownerClassName);
+            Object owner;
+            try {
+                owner = managedField || isStructuralViewCodec(viewCodecClassName)
+                        ? compatibleStructView(ownerClassName)
+                        : directAggregate(ownerClass != null
+                                ? ownerClass : resolvedRuntimeClass(ownerClassName));
+            } catch (ClassNotFoundException error) {
+                throw new IllegalArgumentException(
+                        "unknown Rust aggregate class " + ownerClassName, error);
+            }
             if (owner != null) {
                 return field(owner, fieldName, fieldSize, fieldCodecClassName)
                         .withMetadata(metadata)
@@ -10104,6 +10158,30 @@ public final class Pointer {
             return allocation;
         }
         return this;
+    }
+
+    /**
+     * Returns an existing aggregate carrier without decoding surrounding bytes.
+     * A single field access is valid even when neighboring fields are still
+     * uninitialized, so callers must project the field if this returns null.
+     */
+    public Object directAggregate(Class<?> type) {
+        Object bound = activeBoundMemoryViewValue(materializedViewSize());
+        if (type.isInstance(bound)) {
+            return bound;
+        }
+        if (traitObjectCarrier() != null
+                || zeroSizedSourceViewSize() >= 0
+                || isStructuralViewCodec(viewCodecClassName)
+                || !isDirectAllocationView()
+                || mayHaveStructuralView(allocation)) {
+            return null;
+        }
+        Object direct = directCellValueOrSelf();
+        if (direct == this && allocation instanceof Object[]) {
+            direct = readAlignedElement();
+        }
+        return direct != this && type.isInstance(direct) ? direct : null;
     }
 
     public Object getObjectAs(String targetClassName) {
