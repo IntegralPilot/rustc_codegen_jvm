@@ -1,5 +1,6 @@
 use crate::lower1::context::Definitions;
 use rustc_abi::{BackendRepr, TagEncoding, VariantIdx, Variants};
+use rustc_middle::ty::consts::ConstExt;
 use rustc_middle::ty::{EarlyBinder, Instance, Ty, TyCtxt, TyKind, TypingEnv};
 
 use crate::oomir;

@@ -6,6 +6,7 @@ use rustc_abi::{FieldIdx, TagEncoding, VariantIdx, Variants};
 use rustc_data_structures::stable_hash::{StableHash, StableHasher};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use rustc_hashes::Hash64;
+use rustc_middle::ty::consts::ConstExt;
 use rustc_middle::ty::layout::TyAndLayout;
 use rustc_middle::ty::print::{with_no_trimmed_paths, with_resolve_crate_name};
 use rustc_middle::ty::{

@@ -13,6 +13,7 @@ use crate::oomir;
 
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use rustc_hir::{attrs::lang_items::LangItem, def::DefKind};
+use rustc_middle::ty::consts::ConstExt;
 use rustc_middle::{
     mir::{
         BasicBlock, BasicBlockData, Body, Local, Location, NonDivergingIntrinsic,

@@ -23,6 +23,7 @@ use super::{
 use crate::lower1::context::Definitions;
 use rustc_abi::FieldIdx;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use rustc_middle::ty::consts::ConstExt;
 use rustc_middle::{
     mir::{
         BinOp, Body, BorrowKind as MirBorrowKind, CastKind, Operand as MirOperand, Place,

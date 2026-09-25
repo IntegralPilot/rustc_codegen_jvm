@@ -4,8 +4,8 @@ diff --git a/lib.rs b/lib.rs
 @@ -1,3 +1,4 @@
  #![cfg(test)]
 +#![feature(restricted_std)]
- #![allow(unused_attributes)]
  #![unstable(feature = "alloctests", issue = "none")]
+ #![no_std]
 diff --git a/tests/lib.rs b/tests/lib.rs
 --- a/tests/lib.rs
 +++ b/tests/lib.rs
@@ -16,8 +16,8 @@ diff --git a/tests/lib.rs b/tests/lib.rs
  #![deny(implicit_provenance_casts)]
  #![deny(unsafe_op_in_unsafe_fn)]
  #![feature(alloc_io)]
- #![feature(allocator_api)]
-@@ -59,5 +60,6 @@
+ #![feature(allocator_ext)]
+@@ -61,5 +62,6 @@
  #![feature(vec_deque_retain_range)]
  #![feature(vec_peek_mut)]
  #![feature(vec_try_remove)]

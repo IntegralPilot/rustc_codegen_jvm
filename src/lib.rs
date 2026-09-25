@@ -577,7 +577,6 @@ impl CodegenBackend for MyBackend {
                     bytecode: None,
                     dwarf_object: None,
                     llvm_ir: None,
-                    links_from_incr_cache: Vec::new(),
                     assembly: None,
                 });
             }
