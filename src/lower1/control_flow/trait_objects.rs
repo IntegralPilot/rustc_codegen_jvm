@@ -80,6 +80,10 @@ pub(crate) fn ensure_trait_object_adapter_class_for_pointees<'tcx>(
     tcx: TyCtxt<'tcx>,
     instance_context: Instance<'tcx>,
 ) -> Result<String, String> {
+    // Unsizing may leave associated pointee types in MIR. Vtable and drop-glue
+    // queries require their concrete types, not just a computable layout.
+    let concrete_ty = data_types.normalize(tcx, concrete_ty, instance_context);
+    let dynamic_ty = data_types.normalize(tcx, dynamic_ty, instance_context);
     let TyKind::Dynamic(predicates, _) = dynamic_ty.kind() else {
         return Err(format!(
             "trait-object target is not dynamic: {dynamic_ty:?}"
