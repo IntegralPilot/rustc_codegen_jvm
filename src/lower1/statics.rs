@@ -12,6 +12,13 @@ use super::{
     },
 };
 
+pub(super) fn is_nested(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
+    matches!(
+        tcx.def_kind(def_id),
+        rustc_hir::def::DefKind::Static { nested: true, .. }
+    )
+}
+
 fn identity(tcx: TyCtxt<'_>, def_id: DefId) -> (String, String) {
     (
         format!("{}$Static", jvm_names::class_for_def_id(tcx, def_id)),
@@ -45,6 +52,11 @@ pub fn lower_static<'tcx>(
     def_id: DefId,
     module: &mut super::context::Module<'tcx>,
 ) -> Result<(), String> {
+    // Synthetic statics have allocation data but no declared Rust type. Their
+    // typed views are materialized by constant lowering at each reference.
+    if is_nested(tcx, def_id) {
+        return Ok(());
+    }
     let rust_ty = tcx.type_of(def_id).skip_binder();
     let instance = Instance::mono(tcx, def_id);
     let value_type = ty_to_oomir_type(rust_ty, tcx, &mut module.data_types, instance);

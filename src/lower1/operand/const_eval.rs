@@ -149,9 +149,10 @@ pub fn read_pointer_constant<'tcx>(
 
 fn pointer_references_static(tcx: TyCtxt<'_>, pointer: Pointer<CtfeProvenance>) -> bool {
     let (provenance, _) = pointer.into_raw_parts();
-    provenance
-        .get_alloc_id()
-        .is_some_and(|alloc_id| matches!(tcx.global_alloc(alloc_id), GlobalAlloc::Static(_)))
+    provenance.get_alloc_id().is_some_and(|alloc_id| {
+        matches!(tcx.global_alloc(alloc_id), GlobalAlloc::Static(def_id)
+            if !crate::lower1::statics::is_nested(tcx, def_id))
+    })
 }
 
 fn pointer_references_vtable(tcx: TyCtxt<'_>, pointer: Pointer<CtfeProvenance>) -> bool {
@@ -178,7 +179,7 @@ fn anonymous_memory_pointer_constant<'tcx>(
     let Some(alloc_id) = provenance.get_alloc_id() else {
         return Ok(None);
     };
-    let GlobalAlloc::Memory(const_allocation) = tcx.global_alloc(alloc_id) else {
+    let GlobalAlloc::Memory(const_allocation) = resolve_allocation(tcx, alloc_id)? else {
         return Ok(None);
     };
     let allocation = const_allocation.inner();
@@ -239,7 +240,7 @@ fn anonymous_memory_pointer_constant<'tcx>(
                 &pointee,
             )
         });
-    let identity = oomir_data_types.allocation_identity(alloc_id, identity_candidate);
+    let identity = allocation_identity(tcx, oomir_data_types, alloc_id, identity_candidate);
     if bytes.iter().all(|candidate| *candidate == byte) {
         Ok(Some(oomir::Constant::RepeatedBytePointer {
             identity,
@@ -333,7 +334,7 @@ fn interned_pointer_for_memory_view<'tcx>(
     let Some(alloc_id) = provenance.get_alloc_id() else {
         return Ok(None);
     };
-    let GlobalAlloc::Memory(const_allocation) = tcx.global_alloc(alloc_id) else {
+    let GlobalAlloc::Memory(const_allocation) = resolve_allocation(tcx, alloc_id)? else {
         return Ok(None);
     };
     let allocation = const_allocation.inner();
@@ -380,7 +381,7 @@ fn interned_pointer_for_memory_view<'tcx>(
             );
             format!("{}::allocation::{hash}", tcx.crate_name(LOCAL_CRATE))
         });
-    let identity = oomir_data_types.allocation_identity(alloc_id, identity_candidate);
+    let identity = allocation_identity(tcx, oomir_data_types, alloc_id, identity_candidate);
     Ok(Some(oomir::Constant::InternedPointer {
         identity,
         value: Box::new(value),
@@ -406,7 +407,7 @@ fn interned_pointer_for_full_allocation<'tcx>(
     let Some(alloc_id) = provenance.get_alloc_id() else {
         return Ok(None);
     };
-    let GlobalAlloc::Memory(const_allocation) = tcx.global_alloc(alloc_id) else {
+    let GlobalAlloc::Memory(const_allocation) = resolve_allocation(tcx, alloc_id)? else {
         return Ok(None);
     };
     let layout = tcx
@@ -437,7 +438,7 @@ fn interned_pointer_for_full_allocation<'tcx>(
                 &pointee,
             )
         });
-    let identity = oomir_data_types.allocation_identity(alloc_id, identity_candidate);
+    let identity = allocation_identity(tcx, oomir_data_types, alloc_id, identity_candidate);
     Ok(Some(oomir::Constant::InternedPointer {
         identity,
         value: Box::new(value),
@@ -632,7 +633,7 @@ fn read_pointee_constant<'tcx>(
         .get_alloc_id()
         .ok_or_else(|| format!("Pointer provenance {:?} has no allocation id", provenance))?;
 
-    match tcx.global_alloc(alloc_id) {
+    match resolve_allocation(tcx, alloc_id)? {
         GlobalAlloc::Memory(const_alloc) => {
             let allocation = const_alloc.inner();
             if pointee_ty.is_str() {
@@ -733,6 +734,9 @@ fn read_pointee_constant<'tcx>(
         GlobalAlloc::TypeId { ty } => Err(format!("Unsupported constant pointer to TypeId {ty:?}")),
     }
 }
+
+mod allocations;
+use allocations::{allocation_identity, resolve_allocation};
 
 mod views;
 pub(crate) use views::*;

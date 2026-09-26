@@ -33,6 +33,15 @@ impl Marker for Numbers {
 static PROJECTED: <Numbers as Marker>::Data = Wrap([3, 5, 7, 11]);
 static PROJECTED_REFS: [&<Numbers as Marker>::Data; 2] = [&PROJECTED, &PROJECTED];
 
+// The backing arrays are rustc-generated nested statics without declared types.
+static BRANDS: &[[u8; 4]] = &[*b"mif1", *b"msf1"];
+static NESTED_REFS: &[&[u32]] = &[&[3, 5], &[7, 11, 13]];
+
+#[inline(never)]
+fn brands() -> &'static [[u8; 4]] {
+    BRANDS
+}
+
 pub fn run() {
     let unpack = |value| unwrap_four(unwrap_four(unwrap_four(unwrap_four(value))));
     let mut first = unpack(black_box(table()));
@@ -44,4 +53,9 @@ pub fn run() {
     assert_eq!(PROJECTED.0, [3, 5, 7, 11]);
     assert_eq!(PROJECTED_REFS[1].0, PROJECTED.0);
     assert!(core::ptr::eq(PROJECTED_REFS[0], PROJECTED_REFS[1]));
+    assert!(brands().contains(b"msf1"));
+    assert!(!brands().contains(b"nope"));
+    assert!(core::ptr::eq(black_box(brands()).as_ptr(), BRANDS.as_ptr()));
+    assert_eq!(NESTED_REFS[0], [3, 5]);
+    assert_eq!(NESTED_REFS[1], [7, 11, 13]);
 }

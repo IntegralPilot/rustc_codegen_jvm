@@ -9,7 +9,7 @@ pub(crate) fn read_slice_constant<'tcx>(
     oomir_data_types: &mut Definitions<'tcx>,
     instance: Instance<'tcx>,
 ) -> Result<oomir::Constant, String> {
-    let allocation = match tcx.global_alloc(alloc_id) {
+    let allocation = match resolve_allocation(tcx, alloc_id)? {
         GlobalAlloc::Memory(allocation) => allocation.inner(),
         GlobalAlloc::Static(def_id) => {
             return read_slice_from_static(
@@ -236,7 +236,7 @@ pub(crate) fn preserve_slice_allocation<'tcx>(
                 )
             },
         );
-    let identity = oomir_data_types.allocation_identity(alloc_id, identity_candidate);
+    let identity = allocation_identity(tcx, oomir_data_types, alloc_id, identity_candidate);
     let backing = oomir::Constant::InternedPointer {
         identity,
         value: Box::new(allocation_value),
@@ -535,7 +535,7 @@ pub(crate) fn read_str_from_fat_pointer<'tcx>(
             provenance
         )
     })?;
-    match tcx.global_alloc(alloc_id) {
+    match resolve_allocation(tcx, alloc_id)? {
         GlobalAlloc::Memory(const_alloc) => {
             read_string_from_allocation(const_alloc.inner(), data_offset, Some(len))
         }
@@ -614,7 +614,7 @@ pub(crate) fn read_slice_from_fat_pointer<'tcx>(
             provenance
         )
     })?;
-    match tcx.global_alloc(alloc_id) {
+    match resolve_allocation(tcx, alloc_id)? {
         GlobalAlloc::Memory(const_alloc) => {
             let const_alloc = const_alloc.inner();
             let value = read_slice_backed_value(
@@ -696,7 +696,7 @@ pub(crate) fn read_slice_tailed_pointer_from_fat_pointer<'tcx>(
             provenance
         )
     })?;
-    match tcx.global_alloc(alloc_id) {
+    match resolve_allocation(tcx, alloc_id)? {
         GlobalAlloc::Memory(const_allocation) => slice_tailed_pointer_constant(
             tcx,
             alloc_id,
