@@ -38,6 +38,16 @@ fn create_chunked_array_factory(
     methods: &mut Vec<jvm::Method>,
     next_factory: &mut usize,
 ) -> jvm::Result<oomir::Constant> {
+    if oomir::is_packed_byte_array(element_type, elements) {
+        return create_byte_array_factory(
+            cp,
+            owner_class,
+            element_type,
+            elements,
+            methods,
+            next_factory,
+        );
+    }
     let mut prepared: Cow<'_, [oomir::Constant]> = Cow::Borrowed(elements);
     for (index, element) in elements.iter().enumerate() {
         if constant_instruction_cost(element) > MAX_INLINE_CONSTANT_INSTRUCTIONS {
@@ -131,6 +141,47 @@ fn create_chunked_array_factory(
         owner_class: owner_class.to_string(),
         method_name,
         ty: array_type,
+    })
+}
+
+fn create_byte_array_factory(
+    cp: &mut InternedConstantPool,
+    owner_class: &str,
+    element_type: &oomir::Type,
+    elements: &[oomir::Constant],
+    methods: &mut Vec<jvm::Method>,
+    next_factory: &mut usize,
+) -> jvm::Result<oomir::Constant> {
+    let owner = cp.add_class(owner_class)?;
+    let mut instructions = Vec::new();
+    append_empty_array(&mut instructions, cp, element_type, elements.len())?;
+    let chunk_size = (MAX_INLINE_CONSTANT_INSTRUCTIONS / 4).max(1) * oomir::PACKED_BYTE_CHUNK;
+    for (chunk_index, chunk) in elements.chunks(chunk_size).enumerate() {
+        let name = format!("_constant_fill_{}", *next_factory);
+        *next_factory += 1;
+        let mut fill = vec![Instruction::Aload_0];
+        super::arrays::fill_packed_bytes(
+            &mut fill,
+            cp,
+            chunk_index * chunk_size,
+            chunk.len(),
+            |index| oomir::constant_byte(&chunk[index]).unwrap(),
+        )?;
+        fill.extend([Instruction::Pop, Instruction::Return]);
+        add_constant_helper_method(cp, methods, &name, "([B)V", 1, fill)?;
+        instructions.push(Instruction::Dup);
+        instructions.push(Instruction::Invokestatic(
+            cp.add_method_ref(owner, &name, "([B)V")?,
+        ));
+    }
+    instructions.push(Instruction::Areturn);
+    let name = format!("_constant_factory_{}", *next_factory);
+    *next_factory += 1;
+    add_constant_helper_method(cp, methods, &name, "()[B", 0, instructions)?;
+    Ok(oomir::Constant::FactoryCall {
+        owner_class: owner_class.to_string(),
+        method_name: name,
+        ty: oomir::Type::Array(Box::new(element_type.clone())),
     })
 }
 

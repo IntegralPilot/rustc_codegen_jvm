@@ -61,6 +61,12 @@ pub(super) fn load_array(
     element_type: &oomir::Type,
     elements: &[oomir::Constant],
 ) -> jvm::Result<()> {
+    if oomir::is_packed_byte_array(element_type, elements) {
+        append_empty_array(instructions, cp, element_type, elements.len())?;
+        return fill_packed_bytes(instructions, cp, 0, elements.len(), |index| {
+            oomir::constant_byte(&elements[index]).unwrap()
+        });
+    }
     load_array_with(
         instructions,
         cp,
@@ -87,6 +93,10 @@ pub(super) fn load_bytes(
     cp: &mut InternedConstantPool,
     bytes: &[u8],
 ) -> jvm::Result<()> {
+    if bytes.len() >= 32 {
+        append_empty_array(instructions, cp, &oomir::Type::U8, bytes.len())?;
+        return fill_packed_bytes(instructions, cp, 0, bytes.len(), |index| bytes[index]);
+    }
     load_array_with(
         instructions,
         cp,
@@ -97,4 +107,25 @@ pub(super) fn load_bytes(
             Ok(())
         },
     )
+}
+
+/// Fill ranges of the array on the stack, retaining that array as the result.
+pub(super) fn fill_packed_bytes(
+    instructions: &mut Vec<Instruction>,
+    cp: &mut InternedConstantPool,
+    start: usize,
+    length: usize,
+    byte: impl Fn(usize) -> u8,
+) -> jvm::Result<()> {
+    let owner = cp.add_class("org/rustlang/runtime/MemoryBytes")?;
+    let fill = cp.add_method_ref(owner, "fillConstant", "([BILjava/lang/String;)V")?;
+    for offset in (0..length).step_by(oomir::PACKED_BYTE_CHUNK) {
+        let end = length.min(offset + oomir::PACKED_BYTE_CHUNK);
+        let packed: String = (offset..end).map(|index| char::from(byte(index))).collect();
+        instructions.push(Instruction::Dup);
+        instructions.push(get_int_const_instr(cp, i32::try_from(start + offset)?));
+        instructions.push(Instruction::Ldc_w(cp.add_string(packed)?));
+        instructions.push(Instruction::Invokestatic(fill));
+    }
+    Ok(())
 }

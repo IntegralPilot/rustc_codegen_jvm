@@ -18,6 +18,7 @@ use std::{
 mod constant_cost;
 mod constant_eq;
 pub(crate) use constant_cost::constant_instruction_cost;
+pub(crate) use constant_cost::{PACKED_BYTE_CHUNK, constant_byte, is_packed_byte_array};
 pub mod scalar;
 mod visit;
 

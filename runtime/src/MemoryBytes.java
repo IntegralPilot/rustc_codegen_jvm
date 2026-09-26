@@ -4,6 +4,13 @@ package org.rustlang.runtime;
 public final class MemoryBytes {
     private MemoryBytes() {}
 
+    /** Copy an embedded Latin-1 byte chunk without allocating a temporary array. */
+    public static void fillConstant(byte[] target, int offset, String chunk) {
+        for (int index = 0; index < chunk.length(); index++) {
+            target[offset + index] = (byte) chunk.charAt(index);
+        }
+    }
+
     public static void write(byte[] bytes, int offset, int size, long value) {
         for (int index = 0; index < size; index++) {
             bytes[offset + index] = (byte) (value >>> (index * 8));

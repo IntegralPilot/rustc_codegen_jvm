@@ -20,3 +20,6 @@ use prepare::MAX_INLINE_CONSTANT_INSTRUCTIONS;
 pub(super) use prepare::{function_needs_constant_preparation, prepare_function_constants};
 mod statics;
 pub(super) use statics::create_static_initializer_method;
+
+#[cfg(test)]
+mod tests;
