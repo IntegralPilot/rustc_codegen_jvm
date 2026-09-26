@@ -119,6 +119,16 @@ pub(super) fn ensure_adt_data_type<'tcx>(
             );
         }
     }
+    ensure_managed_drop(rust_ty, jvm_name, tcx, data_types, instance_context);
+}
+
+pub(super) fn ensure_managed_drop<'tcx>(
+    rust_ty: Ty<'tcx>,
+    jvm_name: &str,
+    tcx: TyCtxt<'tcx>,
+    data_types: &mut Definitions<'tcx>,
+    instance_context: rustc_middle::ty::Instance<'tcx>,
+) {
     let needs_managed_drop = !rust_ty.has_param()
         && !rust_ty.has_escaping_bound_vars()
         && rust_ty.needs_drop(tcx, TypingEnv::fully_monomorphized())

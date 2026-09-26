@@ -255,6 +255,8 @@ fn switch_body(types: &Types, ty: TypeId, scalar: ScalarType, keys: &[i128]) -> 
 #[test]
 fn jvm_verifies_and_executes_ssa_loops_parallel_copies_scalars_and_throw_points() {
     let mut types = Types::default();
+    let object_name = types.symbol("java/lang/Object");
+    let object = types.intern(Type::Class(object_name));
     let int = types.scalar(ScalarType::I32);
     let long = types.scalar(ScalarType::I64);
     let boolean = types.scalar(ScalarType::Bool);
@@ -435,6 +437,16 @@ fn jvm_verifies_and_executes_ssa_loops_parallel_copies_scalars_and_throw_points(
             "(DD)D",
             binary_body(&types, double, double, BinaryOp::Div),
         ),
+        (
+            "eqObject",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Z",
+            binary_body(&types, object, boolean, BinaryOp::Eq),
+        ),
+        (
+            "neObject",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Z",
+            binary_body(&types, object, boolean, BinaryOp::Ne),
+        ),
     ];
     let mut cp = InternedConstantPool::default();
     let this_class = cp.add_class("SsaFixture").unwrap();
@@ -481,6 +493,13 @@ fn jvm_verifies_and_executes_ssa_loops_parallel_copies_scalars_and_throw_points(
 public class Run {
     static void check(boolean b) { if (!b) throw new AssertionError(); }
     public static void main(String[] args) {
+        Object first = new Object(), second = new Object();
+        Object[] objects = {first, first, second, null};
+        for (Object a : objects) for (Object b : objects) {
+            if (SsaFixture.eqObject(a, b) != (a == b)
+                    || SsaFixture.neObject(a, b) != (a != b))
+                throw new AssertionError("reference comparison");
+        }
         for (int a=-128; a<128; a++) {
             check(SsaFixture.popByte((byte)a)==Integer.bitCount(a&255));
             check(SsaFixture.leadingByte((byte)a)==Integer.numberOfLeadingZeros(a&255)-24);

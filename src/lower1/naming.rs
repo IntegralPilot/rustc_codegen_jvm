@@ -646,7 +646,14 @@ pub fn mono_fn_name_from_instance<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'t
     // Hash the complete instance directly instead of constructing readable type
     // schemas just to disambiguate their names. Public and imported names above
     // retain their explicit ABI spelling.
-    if is_runtime_generic(tcx, instance) && matches!(instance.def, InstanceKind::Item(_)) {
+    // Drop glue can name a callback whose return type owns that same callback.
+    // Naming it through fresh type definitions would recursively build drop glue.
+    if is_runtime_generic(tcx, instance)
+        && matches!(
+            instance.def,
+            InstanceKind::Item(_) | InstanceKind::Shim(ShimKind::DropGlue(..))
+        )
+    {
         let identity =
             super::types::stable_instance_identity(tcx, instance.def_id(), instance.args);
         return FnNameData {
