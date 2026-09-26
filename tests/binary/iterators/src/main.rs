@@ -7,6 +7,8 @@ use std::string::String;
 use std::vec;
 use std::vec::Vec;
 
+mod nested_iterators;
+
 #[derive(Clone, Copy)]
 struct Marker;
 
@@ -940,6 +942,7 @@ fn test_core_iterator_regressions() {
 }
 
 fn main() {
+    nested_iterators::run();
     test_core_iterator_regressions();
     array_iteration();
     ascii_escape_iterator();

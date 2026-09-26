@@ -38,7 +38,7 @@ pub(super) fn enum_variant_drop_glue_function<'tcx>(
         // function, leaving otherwise irrelevant bound lifetimes in a payload
         // type. `needs_drop` cannot query a type with escaping bound vars, but
         // lifetimes do not affect either JVM representation or drop glue.
-        let drop_field_ty = erase_all_regions(tcx, field_ty);
+        let drop_field_ty = erase_escaping_regions(tcx, field_ty);
         if drop_field_ty.needs_drop(tcx, TypingEnv::fully_monomorphized()) {
             emit_managed_value_drop(
                 drop_field_ty,
@@ -99,8 +99,17 @@ pub(super) fn enum_transparent_variant_drop_glue_function<'tcx>(
     }
 }
 
-pub(super) fn erase_all_regions<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Ty<'tcx> {
-    ty.fold_with(&mut AllRegionEraser { tcx })
+fn erase_escaping_regions<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Ty<'tcx> {
+    // Preserve regions owned by nested function/closure binders: erasing those
+    // changes their trait implementations and can prevent projection resolution.
+    tcx.replace_escaping_bound_vars_uncached(
+        ty,
+        rustc_middle::ty::FnMutDelegate {
+            regions: &mut |_| tcx.lifetimes.re_erased,
+            types: &mut |ty| panic!("unexpected bound type in drop glue: {ty:?}"),
+            consts: &mut |ct| panic!("unexpected bound constant in drop glue: {ct:?}"),
+        },
+    )
 }
 
 pub(super) fn emit_managed_value_drop<'tcx>(

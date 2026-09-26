@@ -7,7 +7,7 @@ pub(crate) fn fn_ptr_signature_from_ty<'tcx>(
     data_types: &mut Definitions<'tcx>,
     instance_context: rustc_middle::ty::Instance<'tcx>,
 ) -> oomir::Signature {
-    let sig = ty.fn_sig(tcx).skip_binder();
+    let sig = tcx.instantiate_bound_regions_with_erased(ty.fn_sig(tcx));
     let params = sig
         .inputs()
         .iter()

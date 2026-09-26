@@ -10,8 +10,8 @@ use rustc_middle::ty::consts::ConstExt;
 use rustc_middle::ty::layout::TyAndLayout;
 use rustc_middle::ty::print::{with_no_trimmed_paths, with_resolve_crate_name};
 use rustc_middle::ty::{
-    AdtDef, EarlyBinder, ExistentialPredicate, FloatTy, GenericArgs, GenericArgsRef, IntTy, Region,
-    Ty, TyCtxt, TyKind, TypeFoldable, TypeFolder, TypeVisitableExt, TypingEnv, UintTy,
+    AdtDef, EarlyBinder, ExistentialPredicate, FloatTy, GenericArgs, GenericArgsRef, IntTy, Ty,
+    TyCtxt, TyKind, TypeVisitableExt, TypingEnv, UintTy,
 };
 use rustc_span::{Symbol, def_id::DefId, sym};
 
@@ -192,20 +192,6 @@ enum UnionEnumTag {
         niche_end_variant: VariantIdx,
         niche_start: u128,
     },
-}
-
-struct AllRegionEraser<'tcx> {
-    tcx: TyCtxt<'tcx>,
-}
-
-impl<'tcx> TypeFolder<TyCtxt<'tcx>> for AllRegionEraser<'tcx> {
-    fn cx(&self) -> TyCtxt<'tcx> {
-        self.tcx
-    }
-
-    fn fold_region(&mut self, _region: Region<'tcx>) -> Region<'tcx> {
-        self.tcx.lifetimes.re_erased
-    }
 }
 
 #[derive(Clone)]

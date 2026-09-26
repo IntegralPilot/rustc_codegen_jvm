@@ -80,14 +80,11 @@ pub(super) fn emit<'tcx>(
         let instance_ty = func_instance.ty(tcx, typing_env);
         let (fn_inputs, fn_output) = match instance_ty.kind() {
             TyKind::Closure(_, args) => {
-                let sig = args.as_closure().sig();
-                (
-                    sig.inputs().skip_binder().to_vec(),
-                    sig.output().skip_binder(),
-                )
+                let sig = tcx.instantiate_bound_regions_with_erased(args.as_closure().sig());
+                (sig.inputs().to_vec(), sig.output())
             }
             TyKind::FnDef(..) | TyKind::FnPtr(..) => {
-                let sig = instance_ty.fn_sig(tcx).skip_binder();
+                let sig = tcx.instantiate_bound_regions_with_erased(instance_ty.fn_sig(tcx));
                 (sig.inputs().to_vec(), sig.output())
             }
             _ => {
@@ -325,7 +322,7 @@ pub(super) fn emit<'tcx>(
             );
         }
     } else {
-        let indirect_sig = func_ty.fn_sig(tcx).skip_binder();
+        let indirect_sig = tcx.instantiate_bound_regions_with_erased(func_ty.fn_sig(tcx));
         for (index, target_ty) in indirect_sig.inputs().iter().enumerate() {
             let Some(source) = oomir_operands.get(index).cloned() else {
                 break;
