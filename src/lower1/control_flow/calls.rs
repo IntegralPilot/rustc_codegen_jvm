@@ -61,7 +61,9 @@ pub(super) fn emit<'tcx>(
         }
     });
 
-    let typing_env = TypingEnv::post_analysis(tcx, mir.source.def_id());
+    // These calls are already instantiated for codegen. Generic predicates
+    // from the source MIR can hide concrete impls behind its parameter bounds.
+    let typing_env = TypingEnv::fully_monomorphized();
     let instantiated_func_ty =
         EarlyBinder::bind(tcx, func.ty(mir, tcx)).instantiate(tcx, instance.args);
     let func_ty = tcx

@@ -1,5 +1,6 @@
 mod associated_drop;
 mod recursive_callback;
+mod scoped_types;
 
 trait Calculator {
     // Performs a primary calculation
@@ -306,6 +307,7 @@ fn second_tuple_value(value: (&dyn second_tuple_trait::SameName,)) -> i32 {
 fn main() {
     associated_drop::run();
     recursive_callback::run();
+    scoped_types::run();
     assert!(41i32.carrier_value() == 42);
     assert!([2, 3, 5].carrier_value() == 10);
     assert!("carrier".carrier_value() == 7);

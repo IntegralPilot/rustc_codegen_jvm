@@ -60,7 +60,26 @@ pub fn class_for_def_id<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> String {
         return root;
     }
     segments.insert(0, root);
-    segments.join("/")
+    let mut name = segments.join("/");
+    // Local types can have the same spelling in different blocks or generated
+    // anonymous consts (notably serde derives). Named path segments alone lose
+    // those scopes. Keep public module paths readable and qualify local types
+    // by their definition identity, stable across downstream monomorphizations.
+    if matches!(
+        tcx.def_kind(def_id),
+        DefKind::Struct | DefKind::Enum | DefKind::Union | DefKind::Trait
+    ) {
+        let mut scope = tcx.opt_parent(def_id);
+        while let Some(parent) = scope {
+            if !matches!(tcx.def_kind(parent), DefKind::Mod) {
+                name.push('$');
+                name.push_str(&super::types::stable_def_identity(tcx, def_id));
+                break;
+            }
+            scope = tcx.opt_parent(parent);
+        }
+    }
+    name
 }
 
 pub fn function_item_class_for_def_id<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> String {
