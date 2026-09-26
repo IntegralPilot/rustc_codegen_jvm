@@ -160,7 +160,7 @@ pub(super) fn append_field_equality_check(
 
 pub(super) fn create_enum_adt_helper_method(
     cp: &mut InternedConstantPool,
-    module: &oomir::Module,
+    _module: &oomir::Module,
     owner_name: &str,
     method_name: &str,
     kind: &AdtHelperKind,
@@ -222,72 +222,9 @@ pub(super) fn create_enum_adt_helper_method(
                 ],
             )
         }
-        AdtHelperKind::StaticPartialEqEnum {
-            enum_class,
-            variants,
-        } => {
-            let mut instructions = vec![Instruction::Aload_0, Instruction::Aload_1];
-            let same_reference_fixup = instructions.len();
-            instructions.push(Instruction::If_acmpne(0));
-            instructions.push(Instruction::Iconst_1);
-            instructions.push(Instruction::Ireturn);
-            let first_variant = instructions.len() as u16;
-            patch_branch_target(&mut instructions, same_reference_fixup, first_variant);
-
-            let mut false_fixups = Vec::new();
-            for variant in variants {
-                let runtime_type_idx = cp.add_class(&variant.runtime_type)?;
-                instructions.push(Instruction::Aload_0);
-                instructions.push(Instruction::Instanceof(runtime_type_idx));
-                let next_variant_fixup = instructions.len();
-                instructions.push(Instruction::Ifeq(0));
-
-                instructions.push(Instruction::Aload_1);
-                instructions.push(Instruction::Instanceof(runtime_type_idx));
-                false_fixups.push(instructions.len());
-                instructions.push(Instruction::Ifeq(0));
-
-                if variant.transparent {
-                    instructions.push(Instruction::Aload_0);
-                    instructions.push(Instruction::Checkcast(runtime_type_idx));
-                    instructions.push(Instruction::Aload_1);
-                    instructions.push(Instruction::Checkcast(runtime_type_idx));
-                    let inner_eq_descriptor =
-                        format!("(L{};L{};)Z", variant.runtime_type, variant.runtime_type);
-                    let inner_eq =
-                        cp.add_interface_method_ref(runtime_type_idx, "eq", &inner_eq_descriptor)?;
-                    instructions.push(Instruction::Invokestatic(inner_eq));
-                    instructions.push(Instruction::Ireturn);
-                } else {
-                    for (field_name, field_ty) in &variant.fields {
-                        if field_ty.has_jvm_value() {
-                            append_field_equality_check(
-                                module,
-                                cp,
-                                &mut instructions,
-                                &mut false_fixups,
-                                runtime_type_idx,
-                                field_name,
-                                field_ty,
-                            )?;
-                        }
-                    }
-                    instructions.push(Instruction::Iconst_1);
-                    instructions.push(Instruction::Ireturn);
-                }
-
-                let next_variant = instructions.len() as u16;
-                patch_branch_target(&mut instructions, next_variant_fixup, next_variant);
-            }
-            let false_target = instructions.len() as u16;
-            instructions.push(Instruction::Iconst_0);
-            instructions.push(Instruction::Ireturn);
-            for fixup in false_fixups {
-                patch_branch_target(&mut instructions, fixup, false_target);
-            }
-            (format!("(L{enum_class};L{enum_class};)Z"), 2, instructions)
-        }
-        AdtHelperKind::PartialEqClass { .. } | AdtHelperKind::Component { .. } => {
+        AdtHelperKind::PartialEqClass { .. }
+        | AdtHelperKind::Component { .. }
+        | AdtHelperKind::StaticPartialEqEnum { .. } => {
             return Err(jvm::Error::VerificationError {
                 context: format!("Enum helper {owner_name}::{method_name}"),
                 message: "class-only helper requested from enum helper generator".to_string(),

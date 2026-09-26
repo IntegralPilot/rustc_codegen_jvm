@@ -190,18 +190,34 @@ pub(in crate::lower2) fn create_data_type_classfile_for_interface(
             }
             DataTypeMethod::Function(_) => unreachable!("body was consumed above"),
             DataTypeMethod::AdtHelperMethod { kind } => {
+                if let AdtHelperKind::StaticPartialEqEnum {
+                    enum_class,
+                    variants,
+                } = kind
+                {
+                    jvm_methods.extend(create_enum_equality_methods(
+                        &mut cp,
+                        module,
+                        interface_name_jvm,
+                        method_name,
+                        enum_class,
+                        variants,
+                    )?);
+                    continue;
+                }
                 let method = match kind {
                     AdtHelperKind::EnumVariantIndex { .. }
                     | AdtHelperKind::EnumDiscriminant { .. }
-                    | AdtHelperKind::EnumIsVariant { .. }
-                    | AdtHelperKind::StaticPartialEqEnum { .. } => create_enum_adt_helper_method(
+                    | AdtHelperKind::EnumIsVariant { .. } => create_enum_adt_helper_method(
                         &mut cp,
                         module,
                         interface_name_jvm,
                         method_name,
                         kind,
                     )?,
-                    AdtHelperKind::PartialEqClass { .. } | AdtHelperKind::Component { .. } => {
+                    AdtHelperKind::PartialEqClass { .. }
+                    | AdtHelperKind::Component { .. }
+                    | AdtHelperKind::StaticPartialEqEnum { .. } => {
                         return Err(jvm::Error::VerificationError {
                             context: format!("Interface {interface_name_jvm}"),
                             message: "class-only helper cannot be emitted on an interface"

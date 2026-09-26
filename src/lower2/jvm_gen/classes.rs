@@ -208,17 +208,32 @@ pub(in crate::lower2) fn create_data_type_classfile_for_class(
             }
             DataTypeMethod::Function(_) => unreachable!("body was consumed above"),
             DataTypeMethod::AdtHelperMethod { kind } => {
+                if let AdtHelperKind::StaticPartialEqEnum {
+                    enum_class,
+                    variants,
+                } = kind
+                {
+                    jvm_methods.extend(create_enum_equality_methods(
+                        &mut cp,
+                        module,
+                        class_name_jvm,
+                        method_name,
+                        enum_class,
+                        variants,
+                    )?);
+                    continue;
+                }
                 let jvm_method = match kind {
                     AdtHelperKind::EnumVariantIndex { .. }
                     | AdtHelperKind::EnumDiscriminant { .. }
-                    | AdtHelperKind::EnumIsVariant { .. }
-                    | AdtHelperKind::StaticPartialEqEnum { .. } => create_enum_adt_helper_method(
+                    | AdtHelperKind::EnumIsVariant { .. } => create_enum_adt_helper_method(
                         &mut cp,
                         module,
                         class_name_jvm,
                         method_name,
                         kind,
                     )?,
+                    AdtHelperKind::StaticPartialEqEnum { .. } => unreachable!("handled above"),
                     AdtHelperKind::PartialEqClass { fields } => {
                         let method_desc = format!("(L{};)Z", class_name_jvm);
                         let name_index = cp.add_utf8(method_name)?;

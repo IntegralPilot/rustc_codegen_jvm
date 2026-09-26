@@ -13,6 +13,8 @@ pub(super) use strings::create_utf8_view_classfile;
 mod bridges;
 pub(super) use bridges::create_relative_pointer_bridge;
 use bridges::create_static_instance_bridge;
+mod enum_equality;
+use enum_equality::create_enum_equality_methods;
 mod enums;
 use enums::{append_field_equality_check, create_enum_adt_helper_method, patch_branch_target};
 mod classes;
