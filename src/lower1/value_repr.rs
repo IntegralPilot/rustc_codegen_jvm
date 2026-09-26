@@ -130,12 +130,7 @@ fn materialize_direct_fieldless_enum_constant<'tcx>(
     let TyKind::Adt(adt_def, _) = target_rust_ty.kind() else {
         return None;
     };
-    if !adt_def.is_enum()
-        || adt_def
-            .variants()
-            .iter()
-            .any(|variant| !variant.fields.is_empty())
-    {
+    if !adt_def.is_enum() {
         return None;
     }
     let layout = tcx
@@ -144,6 +139,7 @@ fn materialize_direct_fieldless_enum_constant<'tcx>(
     let Variants::Multiple {
         tag,
         tag_encoding: TagEncoding::Direct,
+        tag_field,
         ..
     } = layout.variants
     else {
@@ -155,6 +151,7 @@ fn materialize_direct_fieldless_enum_constant<'tcx>(
     } else {
         (1_u128 << bit_width) - 1
     };
+    let bits = bits.checked_shr(layout.fields.offset(tag_field.into()).bits() as u32)?;
     let variant = adt_def
         .discriminants(tcx)
         .find_map(|(variant, discriminant)| {

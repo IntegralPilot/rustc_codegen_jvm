@@ -3,6 +3,8 @@
 
 use core::mem::MaybeUninit;
 
+mod scalar_constants;
+
 fn generic_uninit_slice_data<T>(values: &mut [MaybeUninit<T>]) -> *mut T {
     values.as_mut_ptr().cast::<T>()
 }
@@ -2401,6 +2403,7 @@ fn exposed_allocation_churn() {
 }
 
 fn main() {
+    scalar_constants::run();
     generic_fat_pointer_casts();
     basic_raw_pointer_round_trip();
     array_pointer_arithmetic();

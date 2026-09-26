@@ -1,3 +1,5 @@
+mod uninhabited;
+
 struct ConfigData {
     id: u32,
     enabled: bool,
@@ -63,6 +65,7 @@ impl Drop for CustomDropEnum {
 }
 
 fn main() {
+    uninhabited::run();
     drop(CustomDropEnum::First(DropTracer(1)));
     assert!(ENUM_WRAPPER_DROPS.load(Ordering::SeqCst) == 1);
     assert!(ENUM_PAYLOAD_DROPS.load(Ordering::SeqCst) == 1);

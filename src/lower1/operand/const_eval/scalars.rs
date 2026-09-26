@@ -11,6 +11,9 @@ pub(crate) fn read_scalar_int_constant<'tcx>(
     let ty = EarlyBinder::bind(tcx, ty)
         .instantiate(tcx, instance.args)
         .skip_norm_wip();
+    if let TyKind::Pat(base_ty, _) = ty.kind() {
+        return read_scalar_int_constant(tcx, scalar_int, *base_ty, oomir_data_types, instance);
+    }
     if tcx
         .layout_of(TypingEnv::fully_monomorphized().as_query_input(ty))
         .map(|layout| layout.is_zst())
@@ -228,6 +231,12 @@ pub(crate) fn read_zero_sized_constant<'tcx>(
     let oomir_ty = ty_to_oomir_type(ty, tcx, oomir_data_types, instance);
     if !oomir_ty.has_jvm_value() {
         return Ok(oomir::Constant::Unit);
+    }
+    if layout.is_uninhabited() && oomir_ty.is_jvm_reference_type() {
+        // MIR can retain ZeroSized operands in impossible branches, such as
+        // constructing a memory-map wrapper after its never-returning stub.
+        // There is no instance to construct; keep only its JVM reference type.
+        return Ok(oomir::Constant::Null(oomir_ty));
     }
 
     match ty.kind() {
