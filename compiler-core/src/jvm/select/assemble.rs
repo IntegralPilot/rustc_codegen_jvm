@@ -84,21 +84,11 @@ impl Assembly {
             let target = u16::try_from(target)?;
             match &mut self.code[index] {
                 Instruction::Goto_w(t) => *t = i32::from(target),
-                Instruction::Ifeq(t)
-                | Instruction::Ifnull(t)
-                | Instruction::Ifnonnull(t)
-                | Instruction::Ifne(t)
-                | Instruction::Iflt(t)
-                | Instruction::Ifle(t)
-                | Instruction::Ifgt(t)
-                | Instruction::Ifge(t)
-                | Instruction::If_icmpeq(t)
-                | Instruction::If_icmpne(t)
-                | Instruction::If_icmplt(t)
-                | Instruction::If_icmple(t)
-                | Instruction::If_icmpgt(t)
-                | Instruction::If_icmpge(t) => *t = target,
-                _ => unreachable!("invalid symbolic branch"),
+                instruction => {
+                    *instruction =
+                        crate::jvm::flow::set_conditional_branch_target(instruction, target)
+                            .ok_or_else(|| error("invalid symbolic branch"))?;
+                }
             }
         }
         Ok(self.code)

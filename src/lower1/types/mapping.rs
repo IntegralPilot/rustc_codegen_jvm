@@ -304,48 +304,13 @@ pub(super) fn ty_to_oomir_type_resolved<'tcx>(
                 );
             }
 
-            let needs_managed_drop = !resolved_ty.has_param()
-                && !resolved_ty.has_escaping_bound_vars()
-                && resolved_ty.needs_drop(tcx, TypingEnv::fully_monomorphized())
-                && matches!(
-                    data_types.get(&tuple_class_name),
-                    Some(oomir::DataType::Class { methods, .. })
-                        if !methods.contains_key(MANAGED_DROP_METHOD)
-                );
-            if needs_managed_drop {
-                if let Some(oomir::DataType::Class {
-                    methods,
-                    interfaces,
-                    ..
-                }) = data_types.get_mut(&tuple_class_name)
-                {
-                    methods.insert(
-                        MANAGED_DROP_METHOD.to_string(),
-                        DataTypeMethod::SimpleConstantReturn(oomir::Type::Void, None),
-                    );
-                    if !interfaces
-                        .iter()
-                        .any(|interface| interface == MANAGED_DROP_INTERFACE)
-                    {
-                        interfaces.push(MANAGED_DROP_INTERFACE.to_string());
-                    }
-                }
-                let drop_method = managed_drop_glue_function(
-                    resolved_ty,
-                    &tuple_class_name,
-                    tcx,
-                    data_types,
-                    instance_context,
-                );
-                if let Some(oomir::DataType::Class { methods, .. }) =
-                    data_types.get_mut(&tuple_class_name)
-                {
-                    methods.insert(
-                        MANAGED_DROP_METHOD.to_string(),
-                        DataTypeMethod::Function(drop_method),
-                    );
-                }
-            }
+            ensure_managed_drop(
+                resolved_ty,
+                &tuple_class_name,
+                tcx,
+                data_types,
+                instance_context,
+            );
 
             // Return the OOMIR type as a Class reference
             oomir::Type::Class(tuple_class_name)
@@ -538,6 +503,7 @@ pub(super) fn ty_to_oomir_type_resolved<'tcx>(
                     },
                 );
             }
+            ensure_managed_drop(resolved_ty, &safe_name, tcx, data_types, instance_context);
             oomir::Type::Class(safe_name)
         }
         rustc_middle::ty::TyKind::Coroutine(def_id, args) => {
