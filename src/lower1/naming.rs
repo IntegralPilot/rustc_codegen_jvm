@@ -29,6 +29,7 @@ pub struct FnNameData {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JvmStaticImport {
     pub class_name: String,
+    pub interface: bool,
     pub method_name: String,
     /// Optional legacy descriptor used only to verify the inferred Rust ABI.
     pub descriptor: Option<String>,
@@ -127,14 +128,17 @@ fn validate_jvm_internal_class_name(class_name: &str) -> Result<(), String> {
 
 /// Parses the `#[link_name]` carried by an `extern type` as a JVM class.
 ///
-/// The plain JVM internal name is canonical. `jvm:class:` is also accepted so
-/// callers can use an explicitly JVM-namespaced spelling if desired.
+/// A plain internal name or `jvm:class:` declares a class; `jvm:interface:`
+/// explicitly declares an interface without requiring its classfile at build time.
 pub fn parse_jvm_class_link_name(link_name: &str) -> Result<String, String> {
-    let class_name = if let Some(class_name) = link_name.strip_prefix("jvm:class:") {
+    let class_name = if let Some(class_name) = link_name
+        .strip_prefix("jvm:class:")
+        .or_else(|| link_name.strip_prefix("jvm:interface:"))
+    {
         class_name
     } else if link_name.starts_with("jvm:") {
         return Err(format!(
-            "unsupported JVM extern-type link name `{link_name}`; expected `jvm:class:<internal-class>`"
+            "unsupported JVM extern-type link name `{link_name}`; expected `jvm:class:<internal-class>` or `jvm:interface:<internal-interface>`"
         ));
     } else {
         link_name
@@ -234,7 +238,7 @@ pub fn parse_jvm_link_name(link_name: &str) -> Result<Option<JvmImport>, String>
     })?;
 
     match invocation {
-        "static" => {
+        "static" | "static-interface" => {
             let mut parts = import.splitn(3, ':');
             let class_name = parts.next().unwrap_or_default();
             let method_name = parts.next().unwrap_or_default();
@@ -255,6 +259,7 @@ pub fn parse_jvm_link_name(link_name: &str) -> Result<Option<JvmImport>, String>
 
             Ok(Some(JvmImport::Static(JvmStaticImport {
                 class_name: class_name.to_string(),
+                interface: invocation == "static-interface",
                 method_name: method_name.to_string(),
                 descriptor: descriptor.map(str::to_string),
             })))
@@ -312,7 +317,7 @@ pub fn parse_jvm_link_name(link_name: &str) -> Result<Option<JvmImport>, String>
             })))
         }
         _ => Err(format!(
-            "unsupported JVM import invocation `{invocation}`; expected `jvm:static`, `jvm:virtual`, `jvm:field`, `jvm:static-field`, or `jvm:new`"
+            "unsupported JVM import invocation `{invocation}`; expected `jvm:static`, `jvm:static-interface`, `jvm:virtual`, `jvm:field`, `jvm:static-field`, or `jvm:new`"
         )),
     }
 }
@@ -353,6 +358,9 @@ fn jvm_receiver_class_from_instance<'tcx>(
             "the receiver extern type of a `{import_kind}` import must have a `#[link_name]`"
         ));
     };
+    if import_kind == "jvm:field" && link_name.as_str().starts_with("jvm:interface:") {
+        return Err("JVM interfaces have no instance fields".to_string());
+    }
     parse_jvm_class_link_name(link_name.as_str())
 }
 
@@ -431,6 +439,9 @@ fn jvm_constructor_return_class_from_instance<'tcx>(
             "the returned extern type of a `jvm:new` import must have a `#[link_name]`".to_string(),
         );
     };
+    if link_name.as_str().starts_with("jvm:interface:") {
+        return Err("a `jvm:new` import cannot construct a JVM interface".to_string());
+    }
     parse_jvm_class_link_name(link_name.as_str())
 }
 
@@ -782,6 +793,7 @@ mod tests {
             parse_jvm_link_name("jvm:static:org/rustlang/runtime/PanicSupport:raise"),
             Ok(Some(JvmImport::Static(JvmStaticImport {
                 class_name: "org/rustlang/runtime/PanicSupport".to_string(),
+                interface: false,
                 method_name: "raise".to_string(),
                 descriptor: None,
             })))
@@ -796,6 +808,7 @@ mod tests {
             ),
             Ok(Some(JvmImport::Static(JvmStaticImport {
                 class_name: "org/rustlang/runtime/PanicSupport".to_string(),
+                interface: false,
                 method_name: "raise".to_string(),
                 descriptor: Some("(Lorg/rustlang/runtime/Pointer;)V".to_string()),
             })))
@@ -811,6 +824,33 @@ mod tests {
                 descriptor: None,
             })))
         );
+    }
+
+    #[test]
+    fn parses_foreign_interface_imports() {
+        assert_eq!(
+            parse_jvm_class_link_name("jvm:interface:example/Measure"),
+            Ok("example/Measure".to_string())
+        );
+        for descriptor in [None, Some("(J)J")] {
+            let suffix = descriptor
+                .map(|value| format!(":{value}"))
+                .unwrap_or_default();
+            assert_eq!(
+                parse_jvm_link_name(&format!(
+                    "jvm:static-interface:example/Measure:measure{suffix}"
+                )),
+                Ok(Some(JvmImport::Static(JvmStaticImport {
+                    class_name: "example/Measure".to_string(),
+                    interface: true,
+                    method_name: "measure".to_string(),
+                    descriptor: descriptor.map(str::to_string),
+                })))
+            );
+        }
+        for malformed in ["jvm:interface:", "jvm:interface:java.lang.Runnable"] {
+            assert!(parse_jvm_class_link_name(malformed).is_err());
+        }
     }
 
     #[test]

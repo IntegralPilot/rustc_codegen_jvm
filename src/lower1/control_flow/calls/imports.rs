@@ -3,6 +3,7 @@ use super::*;
 
 pub(super) fn emit<'tcx>(
     tcx: TyCtxt<'tcx>,
+    data_types: &Definitions<'tcx>,
     instructions: &mut Vec<oomir::Instruction>,
     terminator: &rustc_middle::mir::Terminator<'tcx>,
     func_instance: Instance<'tcx>,
@@ -13,6 +14,12 @@ pub(super) fn emit<'tcx>(
 ) {
     match jvm_import {
         crate::lower1::naming::JvmImport::Static(jvm_import) => {
+            if jvm_import.interface {
+                data_types
+                    .foreign_interfaces
+                    .borrow_mut()
+                    .insert(jvm_import.class_name.clone());
+            }
             method_signature.is_static = true;
             let rust_descriptor = method_signature.to_jvm_descriptor_with_explicit_params();
             if let Some(explicit_descriptor) = &jvm_import.descriptor

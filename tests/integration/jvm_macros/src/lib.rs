@@ -1,6 +1,8 @@
 #![feature(extern_types, register_tool)]
 #![register_tool(jvm_codegen)]
 
+mod interfaces;
+
 #[jvm::class("java.time.LocalDate", rename_all = "camelCase")]
 impl JavaLocalDate {
     #[jvm::static_method("of")]
@@ -66,6 +68,7 @@ pub enum MacroRoot {
 }
 
 pub fn exercise() -> i64 {
+    interfaces::exercise();
     unsafe {
         let leap = JavaLocalDate::of(2024, 2, 29);
         assert_eq!((&*leap).get_year(), 2024);

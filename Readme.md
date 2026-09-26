@@ -531,6 +531,8 @@ Rust constructs map directly to JVM structures without requiring JNI wrapper cod
 
 The [`jvm` attribute crate](jvm) generates JVM method, constructor, and field
 bindings without handwritten `link_name` strings. Raw link names remain supported.
+Use `#[jvm::class]` for foreign classes and `#[jvm::interface]` for foreign
+interfaces; the declaration selects class or interface method dispatch.
 
 ### Enums
 

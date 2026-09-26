@@ -209,6 +209,7 @@ pub(super) fn emit<'tcx>(
         if let Some(jvm_import) = jvm_import {
             imports::emit(
                 tcx,
+                data_types,
                 &mut instructions,
                 terminator,
                 func_instance,

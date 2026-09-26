@@ -57,6 +57,42 @@ Dots before the first capitalized name separate packages; later dots denote
 nested classes. Use JVM `/` and `$` spelling for names that do not follow Java
 capitalization conventions.
 
+## Interfaces
+
+Declare foreign interfaces with `#[jvm::interface]` so the backend knows which
+invocation opcode and constant-pool entry to use without inspecting a classpath:
+
+```rust,ignore
+#![feature(extern_types)]
+
+#[jvm::interface("java.util.Comparator", rename_all = "camelCase")]
+impl Comparator {
+    #[jvm::static_method]
+    pub fn natural_order() -> *mut Self {}
+
+    #[jvm::method]
+    pub fn reversed(&self) -> *mut Self {}
+}
+```
+
+Instance methods, including default methods, use `invokeinterface`. Static
+methods use `invokestatic` with an interface method reference. Outside an
+interface declaration, add `interface = true` to `#[jvm::static_method]` or to a
+named `#[jvm::bindings("java.util.Comparator", interface = true)]` impl containing
+static interface bindings. An explicitly different owner in such an impl keeps
+its own class/interface choice.
+
+Both declaration attributes also accept opaque unit structs and foreign types.
+The raw forms are `#[link_name = "jvm:interface:java/util/Comparator"]` on an
+extern type and `jvm:static-interface:<owner>:<method>[:<descriptor>]` on a static
+function import. Instance imports keep `jvm:virtual:<method>[:<descriptor>]`;
+the receiver's declared type determines class versus interface dispatch.
+
+`#[jvm::constructor]` is for classes and emits `new`, `dup`, and `invokespecial`.
+Interfaces cannot have constructors or instance fields. General `invokespecial`
+calls to superclass or interface-default implementations are not exposed;
+ordinary default-method calls use normal interface dispatch.
+
 If you want to have multiple `impl` blocks, you need to use `#[jvm::bindings]` on subsequent blocks so the type is not declared
 twice:
 

@@ -278,7 +278,10 @@ fn empty_oomir_module<'tcx>(
     }
 }
 
-fn prepare_oomir_shard(module: lower1::context::Module<'_>) -> oomir::Module {
+fn prepare_oomir_shard(mut module: lower1::context::Module<'_>) -> oomir::Module {
+    module.external_interfaces.extend(std::mem::take(
+        &mut *module.data_types.foreign_interfaces.borrow_mut(),
+    ));
     let mut oomir_module = module.map_definitions(lower1::context::Definitions::finish);
     for data_type in oomir_module.data_types.values_mut() {
         data_type.clean_duplicates();

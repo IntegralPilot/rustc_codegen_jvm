@@ -66,6 +66,24 @@ mod qualified {
     pub struct Builder;
 }
 
+#[jvm::interface("java.util.Comparator")]
+impl Comparator {
+    #[jvm::method]
+    fn compare(&self, left: *const JString, right: *const JString) -> i32 {}
+
+    #[jvm::static_method]
+    fn natural_order() -> *mut Self {}
+}
+
+#[jvm::interface("java.lang.Runnable")]
+struct Runnable;
+
+#[jvm::bindings("java.util.Comparator", interface = true)]
+impl Comparator {
+    #[jvm::static_method("reverseOrder")]
+    fn reverse_order() -> *mut Self {}
+}
+
 #[jvm::bindings]
 impl qualified::Builder {
     #[jvm::method("length")]

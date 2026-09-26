@@ -42,6 +42,9 @@ impl<'tcx> CrateContext<'tcx> {
 #[derive(Default)]
 pub(crate) struct Definitions<'tcx> {
     values: HashMap<String, oomir::DataType>,
+    // Owner metadata for imports and generated function-pointer adapters;
+    // foreign interfaces must never acquire generated classfile definitions.
+    pub(crate) foreign_interfaces: Lock<HashSet<String>>,
     pub(super) representations: HashMap<Ty<'tcx>, oomir::Type>,
     pub(super) enums_in_progress: HashSet<String>,
     shared: Shared<'tcx>,
@@ -55,6 +58,7 @@ impl<'tcx> Definitions<'tcx> {
         Self {
             shared,
             values: HashMap::default(),
+            foreign_interfaces: Lock::default(),
             representations: HashMap::default(),
             enums_in_progress: HashSet::default(),
             checked_intrinsics: Vec::new(),

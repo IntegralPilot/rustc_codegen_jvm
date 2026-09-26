@@ -4,7 +4,7 @@ use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::{format_ident, quote};
 use syn::{
-    Attribute, FnArg, Ident, ImplItem, ImplItemFn, ItemFn, LitStr, Meta, Pat, ReturnType,
+    Attribute, FnArg, Ident, ImplItem, ImplItemFn, ItemFn, LitBool, LitStr, Meta, Pat, ReturnType,
     Signature, Token, Type,
     parse::{Parse, ParseStream, Parser},
     visit::Visit,
@@ -34,6 +34,7 @@ struct Args {
     name: Option<LitStr>,
     descriptor: Option<LitStr>,
     rename_all: Option<LitStr>,
+    interface: Option<LitBool>,
 }
 
 impl Parse for Args {
@@ -45,6 +46,16 @@ impl Parse for Args {
             } else {
                 let key: Ident = input.parse()?;
                 input.parse::<Token![=]>()?;
+                if key == "interface" {
+                    if result.interface.replace(input.parse()?).is_some() {
+                        return Err(syn::Error::new_spanned(key, "duplicate JVM option"));
+                    }
+                    if input.is_empty() {
+                        break;
+                    }
+                    input.parse::<Token![,]>()?;
+                    continue;
+                }
                 let value: LitStr = input.parse()?;
                 let slot = match key.to_string().as_str() {
                     "class" => &mut result.class,
@@ -54,7 +65,7 @@ impl Parse for Args {
                     _ => {
                         return Err(syn::Error::new_spanned(
                             key,
-                            "unknown JVM option; expected `class`, `name`, `descriptor`, or `rename_all`",
+                            "unknown JVM option; expected `class`, `name`, `descriptor`, `rename_all`, or `interface`",
                         ));
                     }
                 };
@@ -87,7 +98,14 @@ impl Args {
         name: bool,
         descriptor: bool,
         rename_all: bool,
+        interface: bool,
     ) -> syn::Result<()> {
+        if !interface && let Some(value) = &self.interface {
+            return Err(syn::Error::new_spanned(
+                value,
+                "`interface` is only supported on type declarations, binding impls, and static methods",
+            ));
+        }
         for (allowed, option, spelling) in [
             (class, self.class.as_ref(), "class"),
             (name, self.name.as_ref(), "name"),
@@ -258,7 +276,7 @@ fn parse_rename_rule(args: &Args) -> syn::Result<RenameRule> {
 }
 
 fn class_config(args: &Args, required: bool) -> syn::Result<(Option<String>, RenameRule)> {
-    args.ensure_options(true, false, false, true)?;
+    args.ensure_options(true, false, false, true, true)?;
     if args.positional.len() > 1 {
         return Err(syn::Error::new_spanned(
             &args.positional[1],
@@ -298,7 +316,7 @@ fn binding_link(
 ) -> syn::Result<String> {
     match kind {
         BindingKind::StaticMethod => {
-            args.ensure_options(true, true, true, false)?;
+            args.ensure_options(true, true, true, false, true)?;
             let inferred = inferred_name(signature, kind, rename);
             let (class, name, descriptor) = if args.positional.is_empty() {
                 (
@@ -341,13 +359,18 @@ fn binding_link(
                 )
             })?;
             let class = normalize_class(&class);
+            let invocation = if args.interface.as_ref().is_some_and(|value| value.value) {
+                "static-interface"
+            } else {
+                "static"
+            };
             Ok(match descriptor {
-                Some(descriptor) => format!("jvm:static:{class}:{name}:{descriptor}"),
-                None => format!("jvm:static:{class}:{name}"),
+                Some(descriptor) => format!("jvm:{invocation}:{class}:{name}:{descriptor}"),
+                None => format!("jvm:{invocation}:{class}:{name}"),
             })
         }
         BindingKind::Method => {
-            args.ensure_options(false, true, true, false)?;
+            args.ensure_options(false, true, true, false, false)?;
             let (name, descriptor) = if args.positional.is_empty() {
                 (
                     named_value(args.name.as_ref(), "method name")?
@@ -375,7 +398,7 @@ fn binding_link(
             })
         }
         BindingKind::Constructor => {
-            args.ensure_options(true, false, false, false)?;
+            args.ensure_options(true, false, false, false, false)?;
             if args.positional.len() > 1 {
                 return Err(syn::Error::new_spanned(
                     &args.positional[1],
@@ -397,7 +420,7 @@ fn binding_link(
             Ok(format!("jvm:new:{}", normalize_class(&class)))
         }
         BindingKind::Field => {
-            args.ensure_options(false, true, false, false)?;
+            args.ensure_options(false, true, false, false, false)?;
             if args.positional.len() > 1 {
                 return Err(syn::Error::new_spanned(
                     &args.positional[1],
@@ -410,7 +433,7 @@ fn binding_link(
             Ok(format!("jvm:field:{name}"))
         }
         BindingKind::StaticField => {
-            args.ensure_options(true, true, false, false)?;
+            args.ensure_options(true, true, false, false, false)?;
             let inferred = inferred_name(signature, kind, rename);
             let (class, name) = if args.positional.is_empty() {
                 (
@@ -782,6 +805,7 @@ fn expand_class_impl(
     mut impl_block: syn::ItemImpl,
     outer_class: Option<String>,
     rename: RenameRule,
+    interface: bool,
 ) -> syn::Result<(syn::ItemImpl, Vec<Ident>)> {
     let concrete = concrete_impl_type(&impl_block)?;
     let mut expanded = Vec::with_capacity(impl_block.items.len());
@@ -815,7 +839,7 @@ fn expand_class_impl(
         }
         function.attrs = kept_attributes;
 
-        let Some((kind, args)) = binding else {
+        let Some((kind, mut args)) = binding else {
             if function.block.stmts.is_empty() {
                 return Err(syn::Error::new_spanned(
                     &function.sig,
@@ -825,6 +849,27 @@ fn expand_class_impl(
             expanded.push(ImplItem::Fn(function));
             continue;
         };
+        if interface {
+            if matches!(kind, BindingKind::Constructor | BindingKind::Field) {
+                return Err(syn::Error::new_spanned(
+                    &function.sig,
+                    "JVM interfaces have no constructors or instance fields",
+                ));
+            }
+            // An explicitly named other owner retains its own class/interface
+            // choice. Only members of this enclosing interface inherit it.
+            let explicit_owner = args.class.as_ref().or_else(|| {
+                (args.positional.len() > usize::from(outer_class.is_some()))
+                    .then(|| args.positional.first())
+                    .flatten()
+            });
+            let uses_own_owner = explicit_owner.is_none_or(|owner| {
+                outer_class.as_deref() == Some(normalize_class(&owner.value()).as_str())
+            });
+            if kind == BindingKind::StaticMethod && args.interface.is_none() && uses_own_owner {
+                args.interface = Some(LitBool::new(true, Span::call_site()));
+            }
+        }
         validate_binding_shape(kind, &function.sig, true)?;
         let link = binding_link(kind, &args, &function.sig, outer_class.as_deref(), rename)?;
         expanded.push(ImplItem::Fn(wrap_impl_function(
@@ -889,9 +934,28 @@ fn run_binding_macro(args: TokenStream, item: TokenStream, kind: BindingKind) ->
 /// converts inferred Rust member names while leaving explicit names unchanged.
 #[proc_macro_attribute]
 pub fn class(args: TokenStream, item: TokenStream) -> TokenStream {
+    declare_type(args, item, false)
+}
+
+/// Declares an opaque JVM interface. Instance bindings use `invokeinterface`;
+/// static bindings use interface method references. No classpath scan is needed.
+#[proc_macro_attribute]
+pub fn interface(args: TokenStream, item: TokenStream) -> TokenStream {
+    declare_type(args, item, true)
+}
+
+fn declare_type(args: TokenStream, item: TokenStream, interface: bool) -> TokenStream {
     let args = match Args::parse_macro(args) {
         Ok(args) => args,
         Err(error) => return error.to_compile_error().into(),
+    };
+    let interface = interface || args.interface.as_ref().is_some_and(|value| value.value);
+    let type_link = |class: &str| {
+        if interface {
+            format!("jvm:interface:{class}")
+        } else {
+            class.to_string()
+        }
     };
     let tokens = TokenStream2::from(item);
 
@@ -905,9 +969,10 @@ pub fn class(args: TokenStream, item: TokenStream) -> TokenStream {
             Err(error) => return error.to_compile_error().into(),
         };
         let class = class.unwrap();
-        return match expand_class_impl(impl_block, Some(class.clone()), rename) {
+        return match expand_class_impl(impl_block, Some(class.clone()), rename, interface) {
             Ok((expanded, imports)) => {
                 let imports = direct_import_uses(&imports);
+                let class = type_link(&class);
                 quote! {
                     unsafe extern "C" {
                         #[link_name = #class]
@@ -935,7 +1000,7 @@ pub fn class(args: TokenStream, item: TokenStream) -> TokenStream {
         .to_compile_error()
         .into();
     }
-    let class = class.unwrap();
+    let class = type_link(&class.unwrap());
 
     if let Ok(mut foreign_type) = syn::parse2::<syn::ForeignItemType>(tokens.clone()) {
         let link_attribute: Attribute = syn::parse_quote!(#[link_name = #class]);
@@ -1007,7 +1072,12 @@ pub fn bindings(args: TokenStream, item: TokenStream) -> TokenStream {
             .into();
         }
     };
-    match expand_class_impl(impl_block, class, rename) {
+    match expand_class_impl(
+        impl_block,
+        class,
+        rename,
+        args.interface.as_ref().is_some_and(|value| value.value),
+    ) {
         Ok((expanded, imports)) => {
             let imports = direct_import_uses(&imports);
             quote! {
@@ -1058,6 +1128,9 @@ pub fn field(args: TokenStream, item: TokenStream) -> TokenStream {
 pub fn static_field(args: TokenStream, item: TokenStream) -> TokenStream {
     run_binding_macro(args, item, BindingKind::StaticField)
 }
+
+#[cfg(test)]
+mod interface_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1238,11 +1311,16 @@ mod tests {
             }
         };
         assert!(
-            expand_class_impl(item, Some("java/lang/String".to_string()), RenameRule::None)
-                .err()
-                .unwrap()
-                .to_string()
-                .contains("need a `#[jvm::method]`")
+            expand_class_impl(
+                item,
+                Some("java/lang/String".to_string()),
+                RenameRule::None,
+                false
+            )
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("need a `#[jvm::method]`")
         );
     }
 }

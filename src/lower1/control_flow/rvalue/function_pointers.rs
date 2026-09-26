@@ -81,6 +81,12 @@ pub(crate) fn fn_pointer_target<'tcx>(
     if let Some(import) = jvm_import {
         match import {
             crate::lower1::naming::JvmImport::Static(import) => {
+                if import.interface {
+                    data_types
+                        .foreign_interfaces
+                        .borrow_mut()
+                        .insert(import.class_name.clone());
+                }
                 let rust_descriptor = signature.to_jvm_descriptor_with_explicit_params();
                 if let Some(explicit_descriptor) = import.descriptor
                     && rust_descriptor != explicit_descriptor

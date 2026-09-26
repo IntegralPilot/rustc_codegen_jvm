@@ -132,6 +132,14 @@ pub(super) fn ty_to_oomir_type_resolved<'tcx>(
             };
             let class_name = crate::lower1::naming::parse_jvm_class_link_name(link_name.as_str())
                 .unwrap_or_else(|message| tcx.dcx().span_fatal(span, message));
+            if link_name.as_str().starts_with("jvm:interface:") {
+                data_types
+                    .foreign_interfaces
+                    .borrow_mut()
+                    .insert(class_name.clone());
+            }
+            // Both kinds are opaque object references. Their owner kind is
+            // tracked separately for method references and invocation opcodes.
             oomir::Type::Class(class_name)
         }
         rustc_middle::ty::TyKind::Pat(inner_ty, _) => {
