@@ -1,5 +1,7 @@
 use core::mem::{size_of, transmute};
 
+mod u16_arrays;
+
 #[repr(u8)]
 enum Sparse {
     One = 1,
@@ -273,6 +275,7 @@ fn test_float_memory_payloads() {
 }
 
 fn main() {
+    u16_arrays::run();
     test_scalar_bits();
     test_float_bits();
     test_fieldless_enums_and_transparent_wrappers();

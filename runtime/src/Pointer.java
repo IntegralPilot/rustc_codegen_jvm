@@ -3177,6 +3177,8 @@ public final class Pointer {
                     elementValue = Byte.valueOf(element.getI8());
                 } else if (component == short.class) {
                     elementValue = Short.valueOf(element.getI16());
+                } else if (component == char.class) {
+                    elementValue = Character.valueOf((char) element.getI16());
                 } else if (component == int.class) {
                     elementValue = Integer.valueOf(element.getI32());
                 } else if (component == long.class) {
