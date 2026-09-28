@@ -682,12 +682,18 @@ mod tests {
 
     #[test]
     fn generated_jvm_identifiers_preserve_rust_underscores() {
+        for name in ["Len", "Len_", "Len__", "___"] {
+            assert_eq!(jvm_names::member_name(name), name);
+        }
         assert_eq!(jvm_names::member_name("many___parts"), "many___parts");
         assert_eq!(
             jvm_names::member_name("__compiler_builtin"),
             "__compiler_builtin"
         );
         assert_eq!(jvm_names::member_name("part::<item>"), "part_item");
+        assert_eq!(jvm_names::member_name("part::<item_>"), "part_item_");
+        assert_eq!(jvm_names::member_name(""), "jvm_unnamed");
+        assert_eq!(jvm_names::member_name("::<>::"), "jvm_unnamed");
     }
 
     #[test]

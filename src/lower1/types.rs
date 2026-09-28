@@ -216,11 +216,15 @@ mod tests {
 
     #[test]
     fn generated_name_tokens_preserve_rust_underscores() {
-        assert_eq!(sanitize_name_token("Tuple_"), "Tuple");
+        for name in ["Tuple", "Tuple_", "Tuple__", "___"] {
+            assert_eq!(sanitize_name_token(name), name);
+        }
         assert_eq!(
             sanitize_name_token("Result<Type__Name::Error>"),
             "Result_Type__Name_Error"
         );
-        assert_eq!(sanitize_name_token("___"), "Type");
+        assert_eq!(sanitize_name_token("Result<Type_>"), "Result_Type_");
+        assert_eq!(sanitize_name_token(""), "Type");
+        assert_eq!(sanitize_name_token("::<>::"), "Type");
     }
 }
