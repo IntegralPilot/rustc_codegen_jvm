@@ -2,6 +2,7 @@
 #![feature(internal_output_capture)]
 
 mod raw_pointer_tls;
+mod shutdown;
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -44,6 +45,7 @@ fn main() {
     concurrent_spawn_hook_lifetimes();
     concurrent_stdout_locking();
     concurrent_caught_panics();
+    shutdown::run();
 }
 
 fn random_state_thread_local_cleanup() {

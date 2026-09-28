@@ -113,6 +113,9 @@ public final class ThreadSupport {
             record.thread = stackSize == 0
                     ? new Thread(body, "rust-thread-" + id)
                     : new Thread(null, body, "rust-thread-" + id, stackSize);
+            // Rust workers do not keep the process alive after main returns.
+            // Set this before start; joining still waits for completion.
+            record.thread.setDaemon(true);
             THREADS.put(id, record);
             record.thread.start();
             return id;
