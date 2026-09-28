@@ -123,7 +123,7 @@ pub(super) fn ty_to_oomir_type_resolved<'tcx>(
         // Rust still enforces the extern type's DST restrictions; the backend
         // only supplies its JVM ABI.
         rustc_middle::ty::TyKind::Foreign(def_id) => {
-            let Some((link_name, span)) = rustc_hir::find_attr!(
+            let Some((link_name, span)) = rustc_attr_ir::find_attr!(
                 tcx,
                 *def_id,
                 LinkName { name, span } => (*name, *span)

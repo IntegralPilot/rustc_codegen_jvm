@@ -10,8 +10,8 @@
 use crate::lower1::context::Definitions;
 use crate::oomir;
 use control_flow::convert_basic_block;
+use rustc_attr_ir::lang_items::LangItem;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
-use rustc_hir::attrs::lang_items::LangItem;
 use rustc_middle::{
     mir::{
         BasicBlock, Body, Local, OUTERMOST_SOURCE_SCOPE, Place, ProjectionElem, StatementKind,

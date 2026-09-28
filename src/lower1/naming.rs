@@ -1,7 +1,8 @@
 //! Naming helpers for functions and monomorphized instances
 
 use super::jvm_names;
-use rustc_hir::{attrs::lang_items::LangItem, def::DefKind};
+use rustc_attr_ir::lang_items::LangItem;
+use rustc_hir::def::DefKind;
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 use rustc_middle::ty::{
     GenericArg, Instance, InstanceKind, ShimKind, TyCtxt, TyKind, TypeVisitableExt,
@@ -347,7 +348,7 @@ fn jvm_receiver_class_from_instance<'tcx>(
             "the first parameter of a `{import_kind}` import must be a pointer or reference to a linked `extern type`"
         ));
     };
-    let Some(link_name) = rustc_hir::find_attr!(
+    let Some(link_name) = rustc_attr_ir::find_attr!(
         tcx,
         *def_id,
         LinkName { name, .. } => *name
@@ -428,7 +429,7 @@ fn jvm_constructor_return_class_from_instance<'tcx>(
                 .to_string(),
         );
     };
-    let Some(link_name) = rustc_hir::find_attr!(
+    let Some(link_name) = rustc_attr_ir::find_attr!(
         tcx,
         *def_id,
         LinkName { name, .. } => *name
@@ -519,7 +520,9 @@ pub fn associated_method_name_from_instance<'tcx>(
 pub fn avoid_object_method_collision(method_name: String, descriptor: &str) -> String {
     if RESERVED_OBJECT_METHODS
         .iter()
-        .any(|(name, reserved_descriptor)| method_name == *name && descriptor == *reserved_descriptor)
+        .any(|(name, reserved_descriptor)| {
+            method_name == *name && descriptor == *reserved_descriptor
+        })
     {
         format!("{method_name}$rust")
     } else {

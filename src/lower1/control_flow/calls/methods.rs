@@ -552,7 +552,7 @@ pub(super) fn emit<'tcx>(
                     TyKind::Adt(adt_def, _)
                         if tcx.is_lang_item(
                             adt_def.did(),
-                            rustc_hir::attrs::lang_items::LangItem::Option,
+                            rustc_attr_ir::lang_items::LangItem::Option,
                         )
                 )
             {

@@ -380,10 +380,7 @@ pub(super) fn ensure_enum_data_types<'tcx>(
             methods,
             base_enum_name,
             variants_info.clone(),
-            tcx.is_lang_item(
-                adt_def.did(),
-                rustc_hir::attrs::lang_items::LangItem::Option,
-            ),
+            tcx.is_lang_item(adt_def.did(), rustc_attr_ir::lang_items::LangItem::Option),
         );
         methods
             .entry(enum_scoped_method_name(
