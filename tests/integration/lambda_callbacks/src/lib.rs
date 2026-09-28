@@ -68,6 +68,24 @@ pub fn rust_fn_pointer_dyn_test(value: i32) -> i32 {
     apply_i32(&callback, value)
 }
 
+pub fn rust_fn_pointer_dyn_mut_test(value: i32) -> i32 {
+    let mut callback: fn(i32) -> i32 = add_three;
+    apply_mut_i32(&mut callback, value)
+}
+
+pub fn rust_fn_pointer_dyn_reload_test(value: i32) -> i32 {
+    let mut callback: fn(i32) -> i32 = add_three;
+    let slot = &raw mut callback;
+    let erased = slot as *mut dyn Fn(i32) -> i32;
+    // The adapter must read the current pointer on each call, including when
+    // another raw alias updates the function pointer in its original storage.
+    unsafe {
+        let first = (&*erased)(value);
+        slot.write(|value| value * 2);
+        first + (&*erased)(value)
+    }
+}
+
 pub fn rust_function_pointer() -> fn(i32) -> i32 {
     add_three
 }

@@ -1,5 +1,9 @@
+#![feature(unsized_fn_params)]
+#![allow(internal_features)]
+
 mod associated_drop;
 mod bound_lifetimes;
+mod boxed_supertrait;
 mod recursive_callback;
 mod scoped_types;
 
@@ -306,6 +310,7 @@ fn second_tuple_value(value: (&dyn second_tuple_trait::SameName,)) -> i32 {
 }
 
 fn main() {
+    boxed_supertrait::run();
     associated_drop::run();
     bound_lifetimes::run();
     recursive_callback::run();

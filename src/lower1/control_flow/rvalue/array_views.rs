@@ -228,23 +228,69 @@ pub(super) fn emit_raw_array_pointer_unsize<'tcx>(
     let source_oomir_ty = ty_to_oomir_type(source_ty, tcx, data_types, instance);
     let target_oomir_ty = ty_to_oomir_type(target_ty, tcx, data_types, instance);
 
+    let callable_abi = matches!(target_pointee.kind(), TyKind::Dynamic(..))
+        .then(|| {
+            crate::lower1::types::callable_trait_object_abi(
+                target_pointer_ty,
+                tcx,
+                data_types,
+                instance,
+            )
+        })
+        .flatten();
+    let callable_closure_bridge = callable_abi.as_ref().is_some_and(|callable_abi| {
+        ensure_closure_callable_bridge(source_pointee, &callable_abi, data_types, tcx, instance)
+    });
+    let callable_fn_def_adapter = if callable_closure_bridge {
+        None
+    } else {
+        callable_abi.as_ref().and_then(|callable_abi| {
+            let TyKind::FnDef(def_id, args) = source_pointee.kind() else {
+                return None;
+            };
+            let function_instance = Instance::resolve_for_fn_ptr(
+                tcx,
+                TypingEnv::post_analysis(tcx, instance.def_id()),
+                *def_id,
+                args.no_bound_vars()?,
+            )?;
+            let target =
+                fn_pointer_target(tcx, data_types, function_instance, &callable_abi.signature);
+            Some(ensure_fn_pointer_adapter_class(
+                data_types,
+                target.as_ref(),
+                &callable_abi.signature,
+                &callable_abi.interface_name,
+                tcx,
+                instance,
+            ))
+        })
+    };
+
     if matches!(target_pointee.kind(), TyKind::Dynamic(..))
         && let oomir::Type::Interface(interface_name) = &target_oomir_ty
     {
-        let adapter_class = ensure_trait_object_adapter_class(
-            source_pointer_ty,
-            target_pointer_ty,
-            &source_oomir_ty,
-            interface_name,
-            data_types,
-            tcx,
-            instance,
-        )
-        .ok()?;
+        let (adapter_class, args) = if let Some(adapter_class) = callable_fn_def_adapter {
+            // Function items use the flattened JVM callable ABI, not the
+            // individual Fn/FnMut/FnOnce methods in their Rust vtable.
+            (adapter_class, Vec::new())
+        } else {
+            let adapter_class = ensure_trait_object_adapter_class(
+                source_pointer_ty,
+                target_pointer_ty,
+                &source_oomir_ty,
+                interface_name,
+                data_types,
+                tcx,
+                instance,
+            )
+            .ok()?;
+            (adapter_class, vec![(source, source_oomir_ty)])
+        };
         instructions.push(oomir::Instruction::ConstructObject {
             dest: dest.to_string(),
             class_name: adapter_class,
-            args: vec![(source, source_oomir_ty)],
+            args,
         });
         return Some(oomir::Operand::Variable {
             name: dest.to_string(),
@@ -256,40 +302,6 @@ pub(super) fn emit_raw_array_pointer_unsize<'tcx>(
         && matches!(source_oomir_ty, oomir::Type::Pointer(_))
         && matches!(target_oomir_ty, oomir::Type::Pointer(_))
     {
-        let callable_abi = crate::lower1::types::callable_trait_object_abi(
-            target_pointer_ty,
-            tcx,
-            data_types,
-            instance,
-        );
-        let callable_closure_bridge = callable_abi.as_ref().is_some_and(|callable_abi| {
-            ensure_closure_callable_bridge(source_pointee, &callable_abi, data_types, tcx, instance)
-        });
-        let callable_fn_def_adapter = if callable_closure_bridge {
-            None
-        } else {
-            callable_abi.as_ref().and_then(|callable_abi| {
-                let TyKind::FnDef(def_id, args) = source_pointee.kind() else {
-                    return None;
-                };
-                let function_instance = Instance::resolve_for_fn_ptr(
-                    tcx,
-                    TypingEnv::post_analysis(tcx, instance.def_id()),
-                    *def_id,
-                    args.no_bound_vars()?,
-                )?;
-                let target =
-                    fn_pointer_target(tcx, data_types, function_instance, &callable_abi.signature);
-                Some(ensure_fn_pointer_adapter_class(
-                    data_types,
-                    target.as_ref(),
-                    &callable_abi.signature,
-                    &callable_abi.interface_name,
-                    tcx,
-                    instance,
-                ))
-            })
-        };
         let erased_pointer_dest = format!("{dest}_pointer");
         instructions.push(oomir::Instruction::InvokeVirtual {
             dest: Some(erased_pointer_dest.clone()),

@@ -48,6 +48,10 @@ public class Main {
         if (lambda_callbacks.lambda_callbacks.rust_fn_pointer_dyn_test(39) != 42) {
             throw new AssertionError("Rust function-pointer dyn Fn bridge failed");
         }
+        if (lambda_callbacks.lambda_callbacks.rust_fn_pointer_dyn_mut_test(39) != 42
+                || lambda_callbacks.lambda_callbacks.rust_fn_pointer_dyn_reload_test(13) != 42) {
+            throw new AssertionError("Rust function-pointer callable adapters failed");
+        }
 
         FnPtr_int_to_int rustFunction = lambda_callbacks.lambda_callbacks.rust_function_pointer();
         FnPtr_int_to_int rustClosure = lambda_callbacks.lambda_callbacks.rust_non_capturing_closure_pointer();

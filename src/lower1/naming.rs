@@ -644,13 +644,18 @@ pub fn mono_fn_name_from_instance<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'t
             tcx.def_kind(tcx.parent(instance.def_id())),
             DefKind::Fn | DefKind::AssocFn | DefKind::Closure
         );
-    let method_name = if internal {
+    let mut method_name = if internal {
         let identity =
             super::types::stable_instance_identity(tcx, instance.def_id(), instance.args);
         format!("{base}${identity}")
     } else {
         base
     };
+    // A by-value trait method's vtable shim has a pointer receiver and a
+    // different body from the original method, even with identical DefId/args.
+    if matches!(instance.def, InstanceKind::Shim(ShimKind::VTable(_))) {
+        method_name.push_str("$vtable");
+    }
     FnNameData {
         class_to_call_on,
         method_name,

@@ -17,7 +17,7 @@ use rustc_middle::{
         BasicBlock, Body, Local, OUTERMOST_SOURCE_SCOPE, Place, ProjectionElem, StatementKind,
         TerminatorKind, VarDebugInfoContents,
     },
-    ty::{EarlyBinder, Instance, TyCtxt},
+    ty::{EarlyBinder, Instance, InstanceKind, ShimKind, TyCtxt},
 };
 use rustc_span::def_id::DefId;
 use std::collections::VecDeque;
@@ -470,14 +470,16 @@ fn lower_body<'tcx>(
             let sig = tcx.instantiate_bound_regions_with_erased(args.as_closure().sig());
             (sig.inputs().to_vec(), sig.output())
         }
-        TyKind::FnDef(_def_id, _args) => {
+        TyKind::FnDef(_def_id, _args)
+            if !matches!(instance.def, InstanceKind::Shim(ShimKind::VTable(_))) =>
+        {
             // For FnDef, compute the signature from the instantiated item type
             let sig = tcx.instantiate_bound_regions_with_erased(instance_ty.fn_sig(tcx));
             (sig.inputs().to_vec(), sig.output())
         }
         _ => {
-            // Compiler-generated callable bodies such as coroutines have no
-            // `FnSig`; their MIR argument locals and return place define the ABI.
+            // Coroutines have no `FnSig`, and vtable shims replace by-value
+            // self with *mut Self. Their MIR locals define the actual ABI.
             let params = (1..=mir.arg_count)
                 .map(|index| mir.local_decls[Local::from_usize(index)].ty)
                 .collect();

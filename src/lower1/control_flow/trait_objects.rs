@@ -2,7 +2,9 @@ use crate::lower1::context::Definitions;
 use rustc_hash::FxHashMap as HashMap;
 
 use rustc_middle::ty::consts::ConstExt;
-use rustc_middle::ty::{Instance, Ty, TyCtxt, TyKind, TypingEnv, VtblEntry};
+use rustc_middle::ty::{
+    Instance, InstanceKind, ShimKind, Ty, TyCtxt, TyKind, TypingEnv, VtblEntry,
+};
 
 use super::super::{
     jvm_names,
@@ -128,8 +130,93 @@ pub(crate) fn ensure_trait_object_adapter_class_for_pointees<'tcx>(
 
     let mut adapter_methods = HashMap::default();
     let mut interface_methods = HashMap::default();
+    let callable_fn_pointer = callable_abi
+        .as_ref()
+        .filter(|_| matches!(concrete_ty.kind(), TyKind::FnPtr(..)));
+    if let Some(callable) = callable_fn_pointer {
+        // Fn/FnMut/FnOnce share one flattened JVM call method. Forward through
+        // the stored function pointer instead of adding Rust's tuple-taking
+        // vtable shims as extra abstract methods on the functional interface.
+        let payload = oomir::Operand::Variable {
+            name: "_callable".to_string(),
+            ty: carrier_ty.clone(),
+        };
+        let mut instructions = vec![oomir::Instruction::GetField {
+            dest: "_callable".to_string(),
+            object: oomir::Operand::Variable {
+                name: "_1".to_string(),
+                ty: oomir::Type::Class(class_name.clone()),
+            },
+            field_name: "value".to_string(),
+            field_ty: carrier_ty.clone(),
+            owner_class: class_name.clone(),
+        }];
+        let function = if matches!(carrier_ty, oomir::Type::Pointer(_)) {
+            crate::lower1::place::emit_pointer_read(
+                payload,
+                &oomir::Type::Interface(callable.interface_name.clone()),
+                "_function",
+                &mut instructions,
+            )
+        } else {
+            payload
+        };
+        let result = callable
+            .signature
+            .ret
+            .has_jvm_value()
+            .then(|| "_ret".to_string());
+        instructions.push(oomir::Instruction::CallIndirect {
+            dest: result.clone(),
+            function_ptr: Box::new(function),
+            args: callable
+                .signature
+                .params
+                .iter()
+                .enumerate()
+                .map(|(index, (_, ty))| oomir::Operand::Variable {
+                    name: format!("_{}", index + 2),
+                    ty: ty.clone(),
+                })
+                .collect(),
+            signature: callable.signature.clone(),
+        });
+        instructions.push(oomir::Instruction::Return {
+            operand: result.map(|name| oomir::Operand::Variable {
+                name,
+                ty: callable.signature.ret.as_ref().clone(),
+            }),
+        });
+        let mut signature = callable.signature.clone();
+        signature.is_static = false;
+        signature.params.insert(
+            0,
+            ("self".to_string(), oomir::Type::Class(class_name.clone())),
+        );
+        adapter_methods.insert(
+            "call".to_string(),
+            oomir::DataTypeMethod::Function(oomir::Function {
+                name: "call".to_string(),
+                owner_class: None,
+                debug_variables: Vec::new(),
+                signature,
+                body: oomir::CodeBlock {
+                    entry: "bb0".to_string(),
+                    basic_blocks: HashMap::from_iter([(
+                        "bb0".to_string(),
+                        oomir::BasicBlock {
+                            label: "bb0".to_string(),
+                            instructions,
+                        },
+                    )]),
+                }
+                .into(),
+            }),
+        );
+    }
     for entry in trait_ref
         .into_iter()
+        .filter(|_| callable_fn_pointer.is_none())
         .flat_map(|trait_ref| tcx.vtable_entries(trait_ref).iter())
     {
         let VtblEntry::Method(target_instance) = entry else {
@@ -279,7 +366,11 @@ pub(crate) fn ensure_trait_object_adapter_class_for_pointees<'tcx>(
             continue;
         }
         let is_coroutine = matches!(target_instance_ty.kind(), TyKind::Coroutine(..));
-        let (target_inputs, target_output) = if is_coroutine {
+        let (target_inputs, target_output) = if is_coroutine
+            || matches!(target_instance.def, InstanceKind::Shim(ShimKind::VTable(_)))
+        {
+            // Vtable shims receive by-value self indirectly, unlike the trait
+            // declaration. Match the signature used when lowering their MIR.
             let body = tcx.instance_mir(target_instance.def);
             let inputs = (1..=body.arg_count)
                 .map(|index| {
