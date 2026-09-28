@@ -2796,21 +2796,9 @@ public final class Pointer {
             if (data == null) {
                 data = pointerObjectFromAddress(dataAddress);
             }
-            Pointer marker = pointerObjectFromAddress(pointerMetadata);
-            TraitMetadataInfo info = TRAIT_METADATA_INFO.get(marker.numericAddress());
-            data.traitMetadataMarker(marker);
-            if (info != null) {
-                data.traitPointeeSize(info.size);
-                data.traitPointeeAlignment(info.alignment);
-                data.traitAdapterClassName(info.adapterClassName);
-                data.traitPointeeCodecClassName(info.pointeeCodecClassName);
-            } else {
-                data.traitPointeeSize(marker.traitPointeeSize());
-                data.traitPointeeAlignment(marker.traitPointeeAlignment());
-                data.traitAdapterClassName(marker.traitAdapterClassName());
-                data.traitPointeeCodecClassName(marker.traitPointeeCodecClassName());
-            }
-            return data;
+            // A vtable can come from a constant independently of the data.
+            // Rebuild the dispatch carrier as well as the two Rust words.
+            return fromRawTraitParts(data, pointerObjectFromAddress(pointerMetadata));
         }
 
         if (codec.startsWith(STRUCT_TAIL_POINTER_VIEW_CODEC_PREFIX)) {
@@ -7072,16 +7060,21 @@ public final class Pointer {
                 pointeeCodecClassName = info.pointeeCodecClassName;
             }
             Pointer source = pointeeSize >= 0
-                    ? data.retype(pointeeSize, pointeeCodecClassName)
+                    ? dataPointerView(data, pointeeSize, pointeeCodecClassName)
                     : restoreErasedView(data);
             Pointer result = source.retype(0);
             result.traitMetadataMarker(marker);
             result.traitPointeeSize(pointeeSize);
             result.traitPointeeAlignment(pointeeAlignment);
             result.traitAdapterClassName(adapterClassName);
+            result.traitPointeeCodecClassName(pointeeCodecClassName);
             if (adapterClassName != null) {
                 Class<?> adapter = resolvedRuntimeClass(adapterClassName);
-                Object carrier = constructorWithArity(adapter, 1).newInstance(source);
+                Object carrier = TraitObjectCarrier.class.isAssignableFrom(adapter)
+                        ? constructorWithArity(adapter, 1).newInstance(source)
+                        : adapter.isInstance(data.traitObjectCarrier())
+                                ? data.traitObjectCarrier()
+                                : source.getObjectAs(adapterClassName);
                 result.traitObjectCarrier(carrier);
             }
             return result;
