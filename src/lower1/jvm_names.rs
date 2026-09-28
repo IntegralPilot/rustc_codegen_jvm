@@ -61,13 +61,13 @@ pub fn class_for_def_id<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> String {
     }
     segments.insert(0, root);
     let mut name = segments.join("/");
-    // Local types can have the same spelling in different blocks or generated
-    // anonymous consts (notably serde derives). Named path segments alone lose
-    // those scopes. Keep public module paths readable and qualify local types
-    // by their definition identity, stable across downstream monomorphizations.
+    // Local types and statics can have the same spelling in different blocks,
+    // impls, or generated anonymous consts. Named path segments alone lose
+    // those scopes. Keep module paths readable and qualify local definitions
+    // by their identity, stable across downstream monomorphizations.
     if matches!(
         tcx.def_kind(def_id),
-        DefKind::Struct | DefKind::Enum | DefKind::Union | DefKind::Trait
+        DefKind::Struct | DefKind::Enum | DefKind::Union | DefKind::Trait | DefKind::Static { .. }
     ) {
         let mut scope = tcx.opt_parent(def_id);
         while let Some(parent) = scope {

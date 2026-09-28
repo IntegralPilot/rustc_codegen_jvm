@@ -1,4 +1,5 @@
 mod nested_constants;
+mod scoped_statics;
 
 struct Settings {
     base: i32,
@@ -68,6 +69,7 @@ mod nested {
 
 fn main() {
     nested_constants::run();
+    scoped_statics::run();
     assert!(ANSWER == 42);
     assert!(*ANSWER_REF == ANSWER);
     assert!(SETTINGS.enabled);
