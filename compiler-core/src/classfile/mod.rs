@@ -1,3 +1,4 @@
+pub mod archive;
 pub mod bundle;
 pub mod constant_pool;
 pub mod encode;

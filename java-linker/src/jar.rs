@@ -160,3 +160,29 @@ pub(crate) fn create_manifest_content(main_class_name: Option<&str>) -> String {
     manifest.push_str("\r\n");
     manifest
 }
+
+/// Stream the exceptional relocation pass; hold at most one decoded class.
+pub(crate) fn redirect(
+    input: &Path,
+    output: &Path,
+    relocations: &split::Relocations,
+) -> io::Result<()> {
+    let mut input = ZipArchive::new(BufReader::new(fs::File::open(input)?))?;
+    let mut output = ZipWriter::new(BufWriter::new(fs::File::create(output)?));
+    for i in 0..input.len() {
+        let mut entry = input.by_index(i)?;
+        if entry.name().ends_with(".class") {
+            let mut data = Vec::new();
+            entry.read_to_end(&mut data)?;
+            let mut class = class_file_from_data(&data)?;
+            if split::redirect(&mut class, relocations)? {
+                output.start_file(entry.name(), options())?;
+                output.write_all(&serialize_class_file(&class)?)?;
+                continue;
+            }
+        }
+        drop(entry);
+        output.raw_copy_file(input.by_index_raw(i)?)?;
+    }
+    output.finish()?.flush()
+}

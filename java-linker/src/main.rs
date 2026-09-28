@@ -17,6 +17,8 @@ use zip::{CompressionMethod, ZipArchive};
 
 use jvm_compiler_core::classfile::bundle::{self, MAGIC as CLASS_BUNDLE_MAGIC};
 
+mod import;
+use import::ConstantImporter;
 mod remap;
 use remap::*;
 mod merge;
@@ -30,6 +32,9 @@ mod jar;
 use jar::*;
 mod inputs;
 mod pipeline;
+mod split;
+#[cfg(test)]
+mod split_tests;
 #[cfg(test)]
 mod tests;
 

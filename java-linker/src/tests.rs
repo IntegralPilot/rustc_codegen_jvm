@@ -150,9 +150,10 @@ fn abstract_class_with_lambda_bootstrap(method_name: &str) -> Vec<u8> {
     let target_handle = constant_pool
         .add_method_handle(ReferenceKind::InvokeStatic, target_method)
         .unwrap();
-    constant_pool
+    let call = constant_pool
         .add_invoke_dynamic(0, "run", "()Ljava/lang/Runnable;")
         .unwrap();
+    let code_name = constant_pool.add_utf8("Code").unwrap();
     let bootstrap_name = constant_pool.add_utf8("BootstrapMethods").unwrap();
     let class_file = ClassFile {
         version: Version::Java8 { minor: 0 },
@@ -163,10 +164,21 @@ fn abstract_class_with_lambda_bootstrap(method_name: &str) -> Vec<u8> {
         this_class,
         super_class,
         methods: vec![Method {
-            access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::ABSTRACT,
+            access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
             name_index,
             descriptor_index,
-            attributes: Vec::new(),
+            attributes: vec![Attribute::Code {
+                name_index: code_name,
+                max_stack: 1,
+                max_locals: 0,
+                code: vec![
+                    Instruction::Invokedynamic(call),
+                    Instruction::Pop,
+                    Instruction::Return,
+                ],
+                exception_table: vec![],
+                attributes: vec![],
+            }],
         }],
         attributes: vec![Attribute::BootstrapMethods {
             name_index: bootstrap_name,
@@ -745,4 +757,53 @@ fn parallel_batches_preserve_every_class_and_library_precedence() {
         .read_to_string(&mut resource)
         .unwrap();
     assert_eq!(resource, "resource");
+}
+
+#[test]
+fn merging_ignores_unreferenced_constants_even_near_the_class_limit() {
+    let mut first = class_file_from_data(&abstract_class_with_method("first")).unwrap();
+    let mut second = class_file_from_data(&abstract_class_with_method("second")).unwrap();
+    for value in 0..40_000 {
+        first.constant_pool.add_integer(value).unwrap();
+        second.constant_pool.add_integer(value + 40_000).unwrap();
+    }
+    let first = crate::merge::serialize_class_file(&first).unwrap();
+    let second = crate::merge::serialize_class_file(&second).unwrap();
+    let merged = class_file_from_data(&merge_class_data(&first, &second).unwrap()).unwrap();
+    assert_eq!(merged.methods.len(), 2);
+    assert!(merged.constant_pool.len() < 40_020);
+}
+
+#[test]
+fn discarded_lambda_body_does_not_import_its_bootstrap_or_constants() {
+    let first = abstract_class_with_lambda_bootstrap("same");
+    let mut incoming =
+        class_file_from_data(&abstract_class_with_lambda_bootstrap("discarded")).unwrap();
+    incoming.methods[0].name_index = incoming.constant_pool.add_utf8("same").unwrap();
+    // A different target would require a new bootstrap entry if the discarded
+    // method's constants were imported. A complementary method triggers merging.
+
+    let spare = class_file_from_data(&abstract_class_with_method("spare")).unwrap();
+    let extra = merge_class_data(
+        &crate::merge::serialize_class_file(&incoming).unwrap(),
+        &crate::merge::serialize_class_file(&spare).unwrap(),
+    )
+    .unwrap();
+    let merged = class_file_from_data(&merge_class_data(&first, &extra).unwrap()).unwrap();
+    let bootstraps = merged
+        .attributes
+        .iter()
+        .find_map(|a| match a {
+            Attribute::BootstrapMethods { methods, .. } => Some(methods),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(bootstraps.len(), 1);
+    assert_eq!(merged.methods.len(), 2);
+    assert!(
+        !merged
+            .constant_pool
+            .iter()
+            .any(|c| matches!(c, Constant::Utf8(s) if s.as_ref() == "test/Target_discarded"))
+    );
 }

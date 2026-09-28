@@ -4,221 +4,6 @@ pub(crate) fn constant_pool_error(context: &str, error: impl std::fmt::Display) 
     io::Error::new(io::ErrorKind::InvalidData, format!("{context}: {error}"))
 }
 
-pub(crate) fn import_constant(
-    source_index: u16,
-    source: &ConstantPool<'static>,
-    target: &mut ConstantPool<'static>,
-    target_constants: &mut HashMap<ConstantKey, u16>,
-    indexes: &mut HashMap<u16, u16>,
-    bootstrap_method_offset: u16,
-) -> io::Result<u16> {
-    if let Some(index) = indexes.get(&source_index) {
-        return Ok(*index);
-    }
-
-    let constant = source
-        .try_get(source_index)
-        .map_err(|error| constant_pool_error("invalid incoming constant-pool reference", error))?
-        .clone()
-        .into_owned();
-    let imported = match constant {
-        Constant::Class(index) => Constant::Class(import_constant(
-            index,
-            source,
-            target,
-            target_constants,
-            indexes,
-            bootstrap_method_offset,
-        )?),
-        Constant::String(index) => Constant::String(import_constant(
-            index,
-            source,
-            target,
-            target_constants,
-            indexes,
-            bootstrap_method_offset,
-        )?),
-        Constant::MethodType(index) => Constant::MethodType(import_constant(
-            index,
-            source,
-            target,
-            target_constants,
-            indexes,
-            bootstrap_method_offset,
-        )?),
-        Constant::Module(index) => Constant::Module(import_constant(
-            index,
-            source,
-            target,
-            target_constants,
-            indexes,
-            bootstrap_method_offset,
-        )?),
-        Constant::Package(index) => Constant::Package(import_constant(
-            index,
-            source,
-            target,
-            target_constants,
-            indexes,
-            bootstrap_method_offset,
-        )?),
-        Constant::FieldRef {
-            class_index,
-            name_and_type_index,
-        } => Constant::FieldRef {
-            class_index: import_constant(
-                class_index,
-                source,
-                target,
-                target_constants,
-                indexes,
-                bootstrap_method_offset,
-            )?,
-            name_and_type_index: import_constant(
-                name_and_type_index,
-                source,
-                target,
-                target_constants,
-                indexes,
-                bootstrap_method_offset,
-            )?,
-        },
-        Constant::MethodRef {
-            class_index,
-            name_and_type_index,
-        } => Constant::MethodRef {
-            class_index: import_constant(
-                class_index,
-                source,
-                target,
-                target_constants,
-                indexes,
-                bootstrap_method_offset,
-            )?,
-            name_and_type_index: import_constant(
-                name_and_type_index,
-                source,
-                target,
-                target_constants,
-                indexes,
-                bootstrap_method_offset,
-            )?,
-        },
-        Constant::InterfaceMethodRef {
-            class_index,
-            name_and_type_index,
-        } => Constant::InterfaceMethodRef {
-            class_index: import_constant(
-                class_index,
-                source,
-                target,
-                target_constants,
-                indexes,
-                bootstrap_method_offset,
-            )?,
-            name_and_type_index: import_constant(
-                name_and_type_index,
-                source,
-                target,
-                target_constants,
-                indexes,
-                bootstrap_method_offset,
-            )?,
-        },
-        Constant::NameAndType {
-            name_index,
-            descriptor_index,
-        } => Constant::NameAndType {
-            name_index: import_constant(
-                name_index,
-                source,
-                target,
-                target_constants,
-                indexes,
-                bootstrap_method_offset,
-            )?,
-            descriptor_index: import_constant(
-                descriptor_index,
-                source,
-                target,
-                target_constants,
-                indexes,
-                bootstrap_method_offset,
-            )?,
-        },
-        Constant::MethodHandle {
-            reference_kind,
-            reference_index,
-        } => Constant::MethodHandle {
-            reference_kind,
-            reference_index: import_constant(
-                reference_index,
-                source,
-                target,
-                target_constants,
-                indexes,
-                bootstrap_method_offset,
-            )?,
-        },
-        Constant::Dynamic {
-            bootstrap_method_attr_index,
-            name_and_type_index,
-        } => Constant::Dynamic {
-            bootstrap_method_attr_index: bootstrap_method_attr_index
-                .checked_add(bootstrap_method_offset)
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "merged bootstrap-method index exceeds the JVM limit",
-                    )
-                })?,
-            name_and_type_index: import_constant(
-                name_and_type_index,
-                source,
-                target,
-                target_constants,
-                indexes,
-                bootstrap_method_offset,
-            )?,
-        },
-        Constant::InvokeDynamic {
-            bootstrap_method_attr_index,
-            name_and_type_index,
-        } => Constant::InvokeDynamic {
-            bootstrap_method_attr_index: bootstrap_method_attr_index
-                .checked_add(bootstrap_method_offset)
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "merged bootstrap-method index exceeds the JVM limit",
-                    )
-                })?,
-            name_and_type_index: import_constant(
-                name_and_type_index,
-                source,
-                target,
-                target_constants,
-                indexes,
-                bootstrap_method_offset,
-            )?,
-        },
-        primitive => primitive,
-    };
-
-    let key = ConstantKey::from(&imported);
-    let target_index = if let Some(index) = target_constants.get(&key) {
-        *index
-    } else {
-        let index = target
-            .add(imported)
-            .map_err(|error| constant_pool_error("merged JVM constant pool is full", error))?;
-        target_constants.insert(key, index);
-        index
-    };
-    indexes.insert(source_index, target_index);
-    Ok(target_index)
-}
-
 pub(crate) fn constant_pool_index(constants: &ConstantPool<'_>) -> HashMap<ConstantKey, u16> {
     let mut target_constants = HashMap::default();
     target_constants.reserve(constants.len());
@@ -235,47 +20,31 @@ pub(crate) fn constant_pool_index(constants: &ConstantPool<'_>) -> HashMap<Const
     target_constants
 }
 
-pub(crate) fn import_constant_pool(
-    source: &ConstantPool<'static>,
-    target: &mut ConstantPool<'static>,
-    target_constants: &mut HashMap<ConstantKey, u16>,
-    bootstrap_method_offset: u16,
-) -> io::Result<HashMap<u16, u16>> {
-    let mut indexes = HashMap::default();
-    target_constants.reserve(source.len());
-    for raw_index in 1..=source.len() {
-        let index = u16::try_from(raw_index).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "incoming JVM constant pool exceeds the index limit",
-            )
-        })?;
-        if source.try_get(index).is_ok() {
-            import_constant(
-                index,
-                source,
-                target,
-                target_constants,
-                &mut indexes,
-                bootstrap_method_offset,
-            )?;
-        }
-    }
-    Ok(indexes)
+pub(crate) trait ConstantIndexes {
+    fn remap(&self, index: u16) -> io::Result<u16>;
 }
 
-pub(crate) fn remapped_constant_index(index: u16, indexes: &HashMap<u16, u16>) -> io::Result<u16> {
-    indexes.get(&index).copied().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("missing imported constant-pool index for #{index}"),
-        )
-    })
+impl ConstantIndexes for HashMap<u16, u16> {
+    fn remap(&self, index: u16) -> io::Result<u16> {
+        self.get(&index).copied().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("missing imported constant-pool index for #{index}"),
+            )
+        })
+    }
+}
+
+pub(crate) fn remapped_constant_index(
+    index: u16,
+    indexes: &impl ConstantIndexes,
+) -> io::Result<u16> {
+    indexes.remap(index)
 }
 
 pub(crate) fn remap_verification_type(
     verification_type: &mut VerificationType,
-    indexes: &HashMap<u16, u16>,
+    indexes: &impl ConstantIndexes,
 ) -> io::Result<()> {
     if let VerificationType::Object { cpool_index } = verification_type {
         *cpool_index = remapped_constant_index(*cpool_index, indexes)?;
@@ -285,7 +54,7 @@ pub(crate) fn remap_verification_type(
 
 pub(crate) fn remap_stack_frame(
     frame: &mut StackFrame,
-    indexes: &HashMap<u16, u16>,
+    indexes: &impl ConstantIndexes,
 ) -> io::Result<()> {
     match frame {
         StackFrame::SameLocals1StackItemFrame { stack, .. }
@@ -313,7 +82,7 @@ pub(crate) fn remap_stack_frame(
 
 pub(crate) fn remap_instruction(
     instruction: &mut Instruction,
-    indexes: &HashMap<u16, u16>,
+    indexes: &impl ConstantIndexes,
 ) -> io::Result<()> {
     match instruction {
         Instruction::Ldc(index) => {
@@ -425,7 +194,7 @@ pub(crate) fn remap_local_variable_ranges(
 
 pub(crate) fn remap_attribute(
     attribute: &mut Attribute,
-    indexes: &HashMap<u16, u16>,
+    indexes: &impl ConstantIndexes,
 ) -> io::Result<()> {
     match attribute {
         Attribute::Code {

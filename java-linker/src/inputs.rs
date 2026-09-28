@@ -1,37 +1,5 @@
 use crate::*;
 
-pub(crate) fn gnu_long_name(table: &[u8], offset_text: &str, path: &Path) -> io::Result<String> {
-    let offset = offset_text.trim().parse::<usize>().map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "invalid GNU ar long-name offset '{}' in {}: {}",
-                offset_text,
-                path.display(),
-                e
-            ),
-        )
-    })?;
-
-    if offset >= table.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "GNU ar long-name offset {} is outside table in {}",
-                offset,
-                path.display()
-            ),
-        ));
-    }
-
-    let tail = &table[offset..];
-    let end = tail
-        .windows(2)
-        .position(|window| window == b"/\n")
-        .unwrap_or(tail.len());
-    Ok(String::from_utf8_lossy(&tail[..end]).to_string())
-}
-
 use jvm_compiler_core::classfile::summary;
 use std::io::SeekFrom;
 
@@ -175,82 +143,20 @@ impl Index {
         file: usize,
         end: u64,
     ) -> io::Result<()> {
-        let mut magic = [0; 8];
-        reader.read_exact(&mut magic)?;
-        if &magic != b"!<arch>\n" {
-            return Err(invalid("not an ar archive"));
-        }
-        let mut offset = 8;
-        let mut long_names = Vec::new();
-        while offset < end {
-            let mut start = range_end(offset, 60, end)?;
-            reader.seek(SeekFrom::Start(offset))?;
-            let mut header = [0; 60];
-            reader.read_exact(&mut header)?;
-            if &header[58..] != b"`\n" {
-                return Err(invalid("invalid ar member header"));
-            }
-            let text = |slice| {
-                std::str::from_utf8(slice)
-                    .map(str::trim)
-                    .map_err(|_| invalid("invalid ar header text"))
-            };
-            let raw_name = text(&header[..16])?;
-            let size = text(&header[48..58])?
-                .parse::<u64>()
-                .map_err(|_| invalid("invalid ar member size"))?;
-            let member_end = range_end(start, size, end)?;
-            let name = match raw_name {
-                "/" | "/SYM64/" => "__symbols".into(),
-                "//" => "__names".into(),
-                name if name.starts_with("#1/") => {
-                    let len = name[3..]
-                        .trim()
-                        .parse::<u64>()
-                        .map_err(|_| invalid("invalid BSD ar name length"))?;
-                    let data_start = range_end(start, len, member_end)?;
-                    let mut bytes = vec![
-                        0;
-                        usize::try_from(len).map_err(|_| invalid(
-                            "ar name exceeds host address space"
-                        ))?
-                    ];
-                    reader.read_exact(&mut bytes)?;
-                    start = data_start;
-                    String::from_utf8_lossy(&bytes)
-                        .trim_end_matches('\0')
-                        .to_owned()
-                }
-                name if name.starts_with('/') => {
-                    gnu_long_name(&long_names, &name[1..], &self.paths[file])?
-                }
-                name => name.trim_end_matches('/').to_owned(),
-            };
-            let len = member_end - start;
-            if name == "__names" {
-                long_names.resize(
-                    usize::try_from(len).map_err(|_| invalid("ar name table too large"))?,
-                    0,
-                );
-                reader.read_exact(&mut long_names)?;
-            } else if name != "__symbols" && len >= 4 {
+        jvm_compiler_core::classfile::archive::members(reader, end, |reader, name, start, len| {
+            if len >= 4 {
+                reader.seek(SeekFrom::Start(start))?;
                 let mut prefix = [0; 8];
                 let count = len.min(8) as usize;
                 reader.read_exact(&mut prefix[..count])?;
                 if count == 8 && &prefix == CLASS_BUNDLE_MAGIC {
-                    self.bundle(reader, file, start, member_end)?;
+                    self.bundle(reader, file, start, start + len)?;
                 } else if name.ends_with(".class") || prefix[..4] == *b"\xca\xfe\xba\xbe" {
                     self.record(reader, file, start, len, None)?;
                 }
             }
-            offset = member_end
-                .checked_add(member_end % 2)
-                .ok_or_else(|| invalid("ar alignment overflow"))?;
-            if offset > end {
-                return Err(invalid("missing ar member padding"));
-            }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 }
 

@@ -130,72 +130,25 @@ fn merge_class_files(
         return Ok(base_changed);
     }
 
-    let base_bootstrap_count = base
+    let mut bootstrap_methods = base
         .attributes
-        .iter()
+        .iter_mut()
         .find_map(|attribute| match attribute {
-            Attribute::BootstrapMethods { methods, .. } => Some(methods.len()),
+            Attribute::BootstrapMethods { methods, .. } => Some(std::mem::take(methods)),
             _ => None,
         })
-        .unwrap_or(0);
-    let bootstrap_method_offset = u16::try_from(base_bootstrap_count).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "base class has too many bootstrap methods",
-        )
-    })?;
-    let incoming_bootstrap_methods = incoming.attributes.iter().find_map(|attribute| {
-        let Attribute::BootstrapMethods {
-            name_index,
-            methods,
-        } = attribute
-        else {
-            return None;
-        };
-        Some((*name_index, methods.clone()))
-    });
-
-    let constant_indexes = import_constant_pool(
-        &incoming.constant_pool,
+        .unwrap_or_default();
+    let constant_indexes = ConstantImporter::new(
+        incoming,
         &mut base.constant_pool,
         &mut index.constants,
-        bootstrap_method_offset,
-    )?;
-
+        &mut bootstrap_methods,
+    );
     for index in missing_interface_indexes {
         base.interfaces.push(remapped_constant_index(
             incoming.interfaces[index],
             &constant_indexes,
         )?);
-    }
-
-    if let Some((name_index, mut methods)) = incoming_bootstrap_methods {
-        for BootstrapMethod {
-            bootstrap_method_ref,
-            arguments,
-        } in &mut methods
-        {
-            *bootstrap_method_ref =
-                remapped_constant_index(*bootstrap_method_ref, &constant_indexes)?;
-            for argument in arguments {
-                *argument = remapped_constant_index(*argument, &constant_indexes)?;
-            }
-        }
-        if let Some(Attribute::BootstrapMethods {
-            methods: base_methods,
-            ..
-        }) = base
-            .attributes
-            .iter_mut()
-            .find(|attribute| matches!(attribute, Attribute::BootstrapMethods { .. }))
-        {
-            base_methods.extend(methods);
-        } else {
-            base.attributes.push(Attribute::BootstrapMethods {
-                name_index: remapped_constant_index(name_index, &constant_indexes)?,
-                methods,
-            });
-        }
     }
 
     for index in missing_method_indexes {
@@ -209,6 +162,33 @@ fn merge_class_files(
         base.methods.push(method);
     }
 
+    drop(constant_indexes);
+    if !bootstrap_methods.is_empty() {
+        if let Some(Attribute::BootstrapMethods { methods, .. }) = base
+            .attributes
+            .iter_mut()
+            .find(|a| matches!(a, Attribute::BootstrapMethods { .. }))
+        {
+            *methods = bootstrap_methods;
+        } else {
+            let name = Constant::Utf8(JavaString::from("BootstrapMethods").into());
+            let key = ConstantKey::from(&name);
+            let name_index = if let Some(&index) = index.constants.get(&key) {
+                index
+            } else {
+                let name_index = base
+                    .constant_pool
+                    .add(name)
+                    .map_err(|e| constant_pool_error("bootstrap attribute name", e))?;
+                index.constants.insert(key, name_index);
+                name_index
+            };
+            base.attributes.push(Attribute::BootstrapMethods {
+                name_index,
+                methods: bootstrap_methods,
+            });
+        }
+    }
     Ok(true)
 }
 
@@ -272,9 +252,19 @@ pub(crate) fn merge_duplicate_classes_with_metrics(
     groups.into_iter().map(merge_group).collect()
 }
 
-pub(crate) fn merge_group(mut fragments: Vec<ClassInfo>) -> io::Result<ClassInfo> {
+#[cfg(test)]
+pub(crate) fn merge_group(fragments: Vec<ClassInfo>) -> io::Result<ClassInfo> {
+    Ok(merge_group_with_relocations(fragments, None)?
+        .pop()
+        .unwrap())
+}
+
+pub(crate) fn merge_group_with_relocations(
+    fragments: Vec<ClassInfo>,
+    relocations: Option<&std::sync::Mutex<split::Relocations>>,
+) -> io::Result<Vec<ClassInfo>> {
     if fragments.len() == 1 {
-        return Ok(fragments.pop().unwrap());
+        return Ok(fragments);
     }
 
     // Downstream crates can contribute a byte-for-byte identical
@@ -299,7 +289,7 @@ pub(crate) fn merge_group(mut fragments: Vec<ClassInfo>) -> io::Result<ClassInfo
         content_hashes.entry(hash).or_default().push(index);
     }
     if unique_fragments.len() == 1 {
-        return Ok(unique_fragments.pop().unwrap());
+        return Ok(unique_fragments);
     }
 
     // Parse every surviving fragment once. Previously the reorder
@@ -327,20 +317,33 @@ pub(crate) fn merge_group(mut fragments: Vec<ClassInfo>) -> io::Result<ClassInfo
         parsed.sort_by(|(left, _), (right, _)| right.data.len().cmp(&left.data.len()));
     }
 
-    let mut fragments = parsed.into_iter();
-    let (mut merged, mut base) = fragments.next().unwrap();
+    let (mut merged, mut base) = parsed.remove(0);
     let mut index = MergeIndex::new(&base)?;
     let mut changed = false;
-    for (_, incoming) in fragments {
-        changed |= merge_class_files(&mut base, &incoming, &mut index).map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!(
-                    "failed to merge duplicate JVM class {}: {error}",
-                    merged.jar_entry_name
-                ),
-            )
-        })?;
+    for (_, incoming) in &parsed {
+        match merge_class_files(&mut base, incoming, &mut index) {
+            Ok(value) => changed |= value,
+            Err(error) => {
+                if let Some(relocations) = relocations
+                    && error.to_string().contains("constant pool is full")
+                    && split::eligible(&base)
+                    && parsed.iter().all(|(_, c)| split::eligible(c))
+                {
+                    let original = class_file_from_data(&merged.data)?;
+                    return split::holders(
+                        std::iter::once(&original).chain(parsed.iter().map(|(_, c)| c)),
+                        &mut relocations.lock().unwrap(),
+                    );
+                }
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "failed to merge duplicate JVM class {}: {error}",
+                        merged.jar_entry_name
+                    ),
+                ));
+            }
+        }
     }
     if changed {
         merged.data = serialize_class_file(&base).map_err(|error| {
@@ -353,7 +356,7 @@ pub(crate) fn merge_group(mut fragments: Vec<ClassInfo>) -> io::Result<ClassInfo
             )
         })?;
     }
-    Ok(merged)
+    Ok(vec![merged])
 }
 
 pub(crate) fn class_fragments_can_be_reordered(

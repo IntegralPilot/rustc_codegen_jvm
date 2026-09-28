@@ -43,6 +43,7 @@ pub(crate) fn link(
     let staged = temporary.path().join("output.jar");
     let mut jar = jar::Writer::create(&staged, index.mains.iter().next().map(String::as_str))?;
     let readers = Readers::open(&index)?;
+    let relocations = std::sync::Mutex::new(split::Relocations::default());
     let mut start = 0;
     while start < index.groups.len() {
         let mut end = start;
@@ -61,11 +62,15 @@ pub(crate) fn link(
         let merged = index.groups[start..end]
             .par_chunks(chunk)
             .map(|groups| {
-                jar::Batch::encode(
-                    groups
-                        .iter()
-                        .map(|group| merge_group(readers.load(&index.paths, group)?)),
-                )
+                jar::Batch::encode(groups.iter().flat_map(|group| {
+                    let result = readers.load(&index.paths, group).and_then(|fragments| {
+                        merge_group_with_relocations(fragments, Some(&relocations))
+                    });
+                    match result {
+                        Ok(classes) => classes.into_iter().map(Ok).collect::<Vec<_>>(),
+                        Err(error) => vec![Err(error)],
+                    }
+                }))
             })
             .collect::<io::Result<Vec<_>>>()?;
         for batch in merged {
@@ -78,7 +83,14 @@ pub(crate) fn link(
         start = end;
     }
     jar.finish(&libraries.iter().map(PathBuf::from).collect::<Vec<_>>())?;
-    rename(staged, output)?;
+    let relocations = relocations.into_inner().unwrap();
+    if relocations.is_empty() {
+        rename(staged, output)?;
+    } else {
+        let relocated = temporary.path().join("relocated.jar");
+        jar::redirect(&staged, &relocated, &relocations)?;
+        rename(relocated, output)?;
+    }
     if let Some(metrics) = &mut metrics {
         metrics.output_jar_bytes = fs::metadata(output)?.len();
         if let Err(error) = metrics.write(&output.to_string_lossy()) {
