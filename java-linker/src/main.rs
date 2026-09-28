@@ -32,6 +32,9 @@ mod jar;
 use jar::*;
 mod inputs;
 mod pipeline;
+mod namespaces;
+#[cfg(test)]
+mod namespaces_tests;
 mod split;
 #[cfg(test)]
 mod split_tests;

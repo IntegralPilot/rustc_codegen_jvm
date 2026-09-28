@@ -22,7 +22,7 @@ pub(super) fn adapt(
         && !from.to_jvm_descriptor().starts_with('[')
     {
         let descriptor = to.to_jvm_descriptor();
-        code.push(Instruction::Ldc_w(cp.add_string(&descriptor)?));
+        code.push(Instruction::Ldc_w(cp.add_name_string(&descriptor)?));
         let class = cp.add_class(oomir::POINTER_CLASS)?;
         let method = cp.add_method_ref(
             class,

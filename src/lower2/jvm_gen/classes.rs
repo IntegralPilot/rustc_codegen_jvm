@@ -335,7 +335,7 @@ pub(in crate::lower2) fn create_data_type_classfile_for_class(
             let outer_class_info_index = this_class_index;
 
             // Derive simple name: part after last '$'. If there's no '$', treat as unnamed (0).
-            let simple_name_part = subclass_name.rsplit('$').next().unwrap_or(subclass_name);
+            let simple_name_part = jvm::names::inner_name(subclass_name);
 
             // If the simple name looks like an anonymous class (all digits), set name_index = 0
             let name_index = if simple_name_part.chars().all(|c| c.is_ascii_digit()) {
@@ -364,8 +364,7 @@ pub(in crate::lower2) fn create_data_type_classfile_for_class(
         if let Some(nest_host_name) = nest_host {
             let class_info_index = cp.add_class(class_name_jvm)?;
             let outer_class_info_index = cp.add_class(nest_host_name)?;
-            let name_index =
-                cp.add_utf8(class_name_jvm.rsplit('$').next().unwrap_or(class_name_jvm))?;
+            let name_index = cp.add_utf8(jvm::names::inner_name(class_name_jvm))?;
             let access_flags = NestedClassAccessFlags::PUBLIC | NestedClassAccessFlags::STATIC;
             inner_classes_vec.push(InnerClass {
                 class_info_index,

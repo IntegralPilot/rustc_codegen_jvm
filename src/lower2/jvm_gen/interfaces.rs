@@ -241,8 +241,7 @@ pub(in crate::lower2) fn create_data_type_classfile_for_interface(
             classes.push(InnerClass {
                 class_info_index: cp.add_class(&subclass_name)?,
                 outer_class_info_index: this_class_index,
-                name_index: cp
-                    .add_utf8(subclass_name.rsplit('$').next().unwrap_or(&subclass_name))?,
+                name_index: cp.add_utf8(jvm::names::inner_name(&subclass_name))?,
                 access_flags: NestedClassAccessFlags::PUBLIC | NestedClassAccessFlags::STATIC,
             });
         }
@@ -250,12 +249,7 @@ pub(in crate::lower2) fn create_data_type_classfile_for_interface(
             classes.push(InnerClass {
                 class_info_index: this_class_index,
                 outer_class_info_index: cp.add_class(&nest_host_name)?,
-                name_index: cp.add_utf8(
-                    interface_name_jvm
-                        .rsplit('$')
-                        .next()
-                        .unwrap_or(interface_name_jvm),
-                )?,
+                name_index: cp.add_utf8(jvm::names::inner_name(interface_name_jvm))?,
                 access_flags: NestedClassAccessFlags::PUBLIC | NestedClassAccessFlags::STATIC,
             });
         }

@@ -188,7 +188,9 @@ impl CanonicalDataTypeRegistry {
         let mut names = variants.into_iter().collect::<Vec<_>>();
         names.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
         for (name, variants) in names {
-            let nest_root = name.split('$').next().unwrap_or(&name);
+            let nest_root = jvm_compiler_core::classfile::names::nesting_separators(&name)
+                .next()
+                .map_or(name.as_str(), |index| &name[..index]);
             let base_bucket = stable_hash::hash_value(&nest_root) as usize % MAX_CODEGEN_WORKERS;
             for (variant, data_type) in variants.into_iter().enumerate() {
                 let bucket = base_bucket + variant * MAX_CODEGEN_WORKERS;

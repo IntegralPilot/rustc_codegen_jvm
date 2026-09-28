@@ -285,7 +285,7 @@ pub fn oomir_to_jvm_bytecode(
     let mut subclasses_by_host = HashMap::<String, Vec<String>>::default();
     let mut nest_host_by_class = HashMap::<String, String>::default();
     for class_name in module.data_types.keys() {
-        for (separator, _) in class_name.match_indices('$') {
+        for separator in jvm::names::nesting_separators(class_name) {
             let host = &class_name[..separator];
             if data_type_names.contains(host) {
                 subclasses_by_host
@@ -294,7 +294,7 @@ pub fn oomir_to_jvm_bytecode(
                     .push(class_name.clone());
             }
         }
-        if let Some(separator) = class_name.rfind('$') {
+        if let Some(separator) = jvm::names::nesting_separators(class_name).last() {
             let host = &class_name[..separator];
             if data_type_names.contains(host) {
                 nest_host_by_class.insert(class_name.clone(), host.to_string());

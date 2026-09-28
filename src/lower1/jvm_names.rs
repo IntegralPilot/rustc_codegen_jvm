@@ -39,7 +39,15 @@ pub fn crate_root<'tcx>(tcx: TyCtxt<'tcx>, krate: CrateNum) -> String {
     if is_runtime_crate_name(crate_name) {
         format!("org/rustlang/{}", jvm_identifier(crate_name.as_str()))
     } else {
-        jvm_identifier(crate_name.as_str())
+        // Dependencies with the same name can have incompatible definitions.
+        // Qualify even when this compilation sees only one version: downstream
+        // monomorphizations must agree with the defining crate's artifact.
+        // The final linker removes this reserved marker for unambiguous crates.
+        format!(
+            "{}$crate{:016x}$",
+            jvm_identifier(crate_name.as_str()),
+            tcx.stable_crate_id(krate),
+        )
     }
 }
 
@@ -218,7 +226,7 @@ fn jvm_identifier(raw: &str) -> String {
     let mut previous_was_separator = false;
 
     for ch in raw.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '_' {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$') {
             out.push(ch);
             previous_was_separator = false;
         } else if !previous_was_separator && !out.is_empty() {

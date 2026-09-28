@@ -36,9 +36,10 @@ impl Selector<'_> {
                     .code
                     .push(get_int_const_instr(self.cp, size as i32));
                 self.assembly.code.push(match codec {
-                    Some(id) => {
-                        Instruction::Ldc_w(self.cp.add_string(self.types.symbol_name(id).unwrap())?)
-                    }
+                    Some(id) => Instruction::Ldc_w(
+                        self.cp
+                            .add_name_string(self.types.symbol_name(id).unwrap())?,
+                    ),
                     None => Instruction::Aconst_null,
                 });
                 let owner = self.cp.add_class(POINTER_CLASS)?;

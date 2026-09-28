@@ -73,7 +73,10 @@ impl Selector<'_> {
                     .code
                     .push(get_int_const_instr(self.cp, storage.size as i32));
                 self.assembly.code.push(if let Some(codec) = storage.codec {
-                    Instruction::Ldc_w(self.cp.add_string(self.types.symbol_name(codec).unwrap())?)
+                    Instruction::Ldc_w(
+                        self.cp
+                            .add_name_string(self.types.symbol_name(codec).unwrap())?,
+                    )
                 } else {
                     Instruction::Aconst_null
                 });
@@ -225,13 +228,13 @@ impl Selector<'_> {
         self.assembly.code.extend([
             Instruction::Ldc_w(
                 self.cp
-                    .add_string(self.types.symbol_name(symbol).unwrap())?,
+                    .add_name_string(self.types.symbol_name(symbol).unwrap())?,
             ),
-            Instruction::Ldc_w(self.cp.add_string(&field.name)?),
+            Instruction::Ldc_w(self.cp.add_name_string(&field.name)?),
             get_long_const_instr(self.cp, projection.offset as i64),
             get_long_const_instr(self.cp, projection.size as i64),
             match &projection.codec {
-                Some(codec) => Instruction::Ldc_w(self.cp.add_string(codec)?),
+                Some(codec) => Instruction::Ldc_w(self.cp.add_name_string(codec)?),
                 None => Instruction::Aconst_null,
             },
         ]);
@@ -258,7 +261,7 @@ impl Selector<'_> {
             ) {
                 self.assembly
                     .code
-                    .push(Instruction::Ldc_w(self.cp.add_string(class)?));
+                    .push(Instruction::Ldc_w(self.cp.add_name_string(class)?));
                 self.cp.add_method_ref(
                     owner,
                     "getObjectAs",

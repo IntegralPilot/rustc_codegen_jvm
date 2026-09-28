@@ -83,8 +83,23 @@ impl InternedConstantPool {
     }
 
     pub fn add_string<S: AsRef<str>>(&mut self, value: S) -> jvm::Result<u16> {
-        let string_index = self.add_utf8(value)?;
+        let value = value.as_ref();
+        let string_index = if value.starts_with(super::names::STRING_TAG) {
+            self.add_utf8(format!("{}{value}", super::names::LITERAL_STRING))?
+        } else {
+            self.add_utf8(value)?
+        };
         self.add(Constant::String(string_index))
+    }
+
+    /// Compiler-generated reflection names/descriptors need the same namespace
+    /// relocation as class references. Rust string literals use `add_string`.
+    pub fn add_name_string(&mut self, value: &str) -> jvm::Result<u16> {
+        if !value.contains(super::names::CRATE_MARKER) {
+            return self.add_string(value);
+        }
+        let index = self.add_utf8(format!("{}{value}", super::names::NAME_STRING))?;
+        self.add(Constant::String(index))
     }
 
     pub fn add_field_ref<N: AsRef<str>, D: AsRef<str>>(

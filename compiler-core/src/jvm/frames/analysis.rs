@@ -280,7 +280,8 @@ pub(super) fn nested_parent_class(class_name: &str) -> Option<&str> {
     if class_name.starts_with('[') {
         return None;
     }
-    let (parent, _) = class_name.rsplit_once('$')?;
+    let separator = crate::classfile::names::nesting_separators(class_name).last()?;
+    let parent = &class_name[..separator];
     if parent.is_empty() {
         None
     } else {

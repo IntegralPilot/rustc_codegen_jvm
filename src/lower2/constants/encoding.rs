@@ -110,7 +110,7 @@ pub fn load_constant(
             instructions.push(get_long_const_instr(cp, *view_size as i64));
             instructions.push(get_long_const_instr(cp, *alignment as i64));
             if let Some(codec) = view_codec {
-                let codec_index = cp.add_string(codec)?;
+                let codec_index = cp.add_name_string(codec)?;
                 instructions.push(if let Ok(index) = u8::try_from(codec_index) {
                     JI::Ldc(index)
                 } else {
@@ -150,7 +150,7 @@ pub fn load_constant(
             instructions.push(get_long_const_instr(cp, *view_size as i64));
             instructions.push(get_long_const_instr(cp, *alignment as i64));
             if let Some(codec) = view_codec {
-                let codec_index = cp.add_string(codec)?;
+                let codec_index = cp.add_name_string(codec)?;
                 instructions.push(if let Ok(index) = u8::try_from(codec_index) {
                     JI::Ldc(index)
                 } else {
@@ -267,7 +267,7 @@ pub fn load_constant(
             instructions.push(JI::Invokestatic(from_java));
         }
         OC::String(s) => {
-            let index = cp.add_string(s)?;
+            let index = cp.add_name_string(s)?;
             instructions.push(if let Ok(idx8) = u8::try_from(index) {
                 JI::Ldc(idx8)
             } else {

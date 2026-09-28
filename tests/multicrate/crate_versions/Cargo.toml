@@ -1,0 +1,8 @@
+[package]
+name = "crate_versions"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+old = { package = "versioned", path = "old" }
+new = { package = "versioned", path = "new" }

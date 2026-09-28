@@ -29,6 +29,7 @@ pub(crate) fn link(
     }
     let mut metrics =
         LinkerMetrics::enabled().then(|| LinkerMetrics::from_index(&index, libraries));
+    let namespaces = namespaces::Namespaces::collect(index.groups.iter().map(|g| g.name.as_str()));
     let output = Path::new(output);
     let parent = output
         .parent()
@@ -41,7 +42,8 @@ pub(crate) fn link(
         .prefix(".jvm-link-")
         .tempdir_in(parent)?;
     let staged = temporary.path().join("output.jar");
-    let mut jar = jar::Writer::create(&staged, index.mains.iter().next().map(String::as_str))?;
+    let main = index.mains.iter().next().map(|name| namespaces.name(name));
+    let mut jar = jar::Writer::create(&staged, main.as_deref())?;
     let readers = Readers::open(&index)?;
     let relocations = std::sync::Mutex::new(split::Relocations::default());
     let mut start = 0;
@@ -67,7 +69,10 @@ pub(crate) fn link(
                         merge_group_with_relocations(fragments, Some(&relocations))
                     });
                     match result {
-                        Ok(classes) => classes.into_iter().map(Ok).collect::<Vec<_>>(),
+                        Ok(classes) => classes
+                            .into_iter()
+                            .map(|class| namespaces.class(class))
+                            .collect::<Vec<_>>(),
                         Err(error) => vec![Err(error)],
                     }
                 }))
@@ -83,7 +88,7 @@ pub(crate) fn link(
         start = end;
     }
     jar.finish(&libraries.iter().map(PathBuf::from).collect::<Vec<_>>())?;
-    let relocations = relocations.into_inner().unwrap();
+    let relocations = namespaces.relocations(relocations.into_inner().unwrap());
     if relocations.is_empty() {
         rename(staged, output)?;
     } else {

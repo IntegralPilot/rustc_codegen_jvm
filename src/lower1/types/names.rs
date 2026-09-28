@@ -227,8 +227,12 @@ pub(crate) fn readable_rust_type_name<'tcx>(
                 .join("_")
         ),
         TyKind::Dynamic(predicates, _) => {
-            let mut base =
-                readable_oomir_type_name(&ty_to_oomir_type(ty, tcx, data_types, instance_context));
+            let mut base = readable_tuple_abi_type_name(&ty_to_oomir_type(
+                ty,
+                tcx,
+                data_types,
+                instance_context,
+            ));
             // Regions do not affect the JVM descriptor, but bound-region structure
             // can affect Rust-level operations such as TypeId. Preserve that hidden
             // distinction only for dynamic types whose predicates contain regions.
@@ -359,8 +363,12 @@ pub(super) fn readable_pointer_codec_type_name<'tcx>(
                 .join("_and_")
         ),
         TyKind::Dynamic(predicates, _) => {
-            let base =
-                readable_oomir_type_name(&ty_to_oomir_type(ty, tcx, data_types, instance_context));
+            let base = readable_tuple_abi_type_name(&ty_to_oomir_type(
+                ty,
+                tcx,
+                data_types,
+                instance_context,
+            ));
             let auto_traits = predicates
                 .iter()
                 .filter_map(|predicate| match predicate.skip_binder() {
@@ -447,12 +455,12 @@ pub(crate) fn readable_rust_generic_arg_name<'tcx>(
     }
 }
 
-// Sanitize token so it contains only ASCII alphanumeric characters and underscores.
+// Preserve reserved crate markers in nested generic names until final linking.
 pub(crate) fn sanitize_name_token(s: &str) -> String {
     let mut token = String::with_capacity(s.len());
     let mut previous_was_separator = false;
     for ch in s.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '_' {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$') {
             token.push(ch);
             previous_was_separator = false;
         } else if !previous_was_separator && !token.is_empty() {
