@@ -206,11 +206,18 @@ impl Vocabulary {
         }
         self.add(&signature.ret);
     }
-    pub fn instruction(&mut self, instruction: &oomir::Instruction) {
+    pub fn instruction(
+        &mut self,
+        instruction: &oomir::Instruction,
+        named: &mut HashMap<String, ir::TypeId>,
+    ) {
         use oomir::Instruction::*;
         instruction.visit_operands(|operand| match operand {
-            oomir::Operand::Variable { ty, .. } => {
-                self.add(ty);
+            oomir::Operand::Variable { name, ty } => {
+                let id = self.add(ty);
+                if self.types.get(id).unwrap().carrier() == 5 {
+                    named.entry(name.clone()).or_insert(id);
+                }
             }
             oomir::Operand::Constant(constant) => {
                 self.add(&oomir::Type::from_constant(constant));

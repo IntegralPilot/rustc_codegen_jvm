@@ -1,11 +1,13 @@
 //! Shared field layouts, subtype relationships and representation recipes.
 use super::*;
 
+#[derive(Debug, Clone)]
 pub(super) struct FieldLayout {
     pub members: Vec<(String, oomir::Type)>,
     pub direct: bool,
 }
 
+#[derive(Debug, Clone)]
 pub(crate) struct Context {
     pub(super) zero_sized: HashSet<String>,
     pub(super) interfaces: HashSet<String>,

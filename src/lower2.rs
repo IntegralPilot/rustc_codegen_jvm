@@ -52,7 +52,11 @@ pub fn oomir_to_jvm_bytecode(
     emit_runtime_views: bool,
     registry: &EmittedClassRegistry,
 ) -> jvm::Result<Vec<(String, PathBuf)>> {
-    let context = oomir::construct::Context::new(&module);
+    let context = if let Some(shared) = &module.shared_context {
+        std::borrow::Cow::Borrowed(shared.get_or_init(|| oomir::construct::Context::new(&module)))
+    } else {
+        std::borrow::Cow::Owned(oomir::construct::Context::new(&module))
+    };
 
     let function_relative_methods = module
         .functions

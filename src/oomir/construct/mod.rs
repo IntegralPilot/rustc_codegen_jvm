@@ -47,10 +47,15 @@ pub(crate) fn seal(function: oomir::Function, context: &Context) -> Result<oomir
         vocabulary.add(&variable.ty);
     }
     let body = &function.body;
+    let mut names = body.basic_blocks.keys().cloned().collect::<Vec<_>>();
+    names.sort_unstable();
+    let mut named_types = HashMap::default();
+    let mut labels = Vec::new();
+    let mut handlers = HashSet::default();
     let mut entry_is_target = false;
     let mut needs_exception = false;
-    for block in body.basic_blocks.values() {
-        for instruction in &block.instructions {
+    for name in &names {
+        for instruction in &body.basic_blocks[name].instructions {
             use oomir::Instruction::*;
             entry_is_target |= match instruction {
                 Jump { target } | UnwindStart { target } => target == &body.entry,
@@ -69,7 +74,26 @@ pub(crate) fn seal(function: oomir::Function, context: &Context) -> Result<oomir
                 _ => false,
             };
             needs_exception |= matches!(instruction, UnwindStart { .. } | Rethrow);
-            vocabulary.instruction(instruction);
+            vocabulary.instruction(instruction, &mut named_types);
+            match instruction {
+                UnwindStart { target } => {
+                    handlers.insert(target.clone());
+                }
+                Label { name } => labels.push(name.clone()),
+                NewArray {
+                    dest, element_type, ..
+                } => {
+                    let ty = vocabulary.add(&oomir::Type::Array(Box::new(element_type.clone())));
+                    named_types.entry(dest.clone()).or_insert(ty);
+                }
+                ConstructObject {
+                    dest, class_name, ..
+                } => {
+                    let ty = vocabulary.add(&oomir::Type::Class(class_name.clone()));
+                    named_types.entry(dest.clone()).or_insert(ty);
+                }
+                _ => {}
+            }
             if let oomir::Instruction::ConstructObject { class_name, .. } = instruction
                 && let Some(fields) = context.fields.get(class_name)
             {
@@ -82,28 +106,15 @@ pub(crate) fn seal(function: oomir::Function, context: &Context) -> Result<oomir
     vocabulary.add_wrappers(context);
     let mut builder = ir::Builder::new(&vocabulary.types, vocabulary.id(&function.signature.ret));
     let mut blocks = HashMap::default();
-    let mut handlers = HashSet::default();
     let entry = if entry_is_target {
         builder.create_block()
     } else {
         builder.current()
     };
     blocks.insert(body.entry.clone(), entry);
-    let mut names = body.basic_blocks.keys().cloned().collect::<Vec<_>>();
-    names.sort_unstable();
-    for name in &names {
+    for name in names.iter().chain(&labels) {
         if !blocks.contains_key(name) {
             blocks.insert(name.clone(), builder.create_block());
-        }
-        for instruction in &body.basic_blocks[name].instructions {
-            if let oomir::Instruction::UnwindStart { target } = instruction {
-                handlers.insert(target.clone());
-            }
-            if let oomir::Instruction::Label { name } = instruction {
-                if !blocks.contains_key(name) {
-                    blocks.insert(name.clone(), builder.create_block());
-                }
-            }
         }
     }
     let mut handlers = handlers.into_iter().collect::<Vec<_>>();
@@ -117,7 +128,7 @@ pub(crate) fn seal(function: oomir::Function, context: &Context) -> Result<oomir
         vocabulary: &vocabulary,
         context,
         variables: Default::default(),
-        named_types: HashMap::default(),
+        named_types,
         blocks,
         constants: Vec::new(),
         unwind: None,
@@ -129,34 +140,6 @@ pub(crate) fn seal(function: oomir::Function, context: &Context) -> Result<oomir
         handlers,
         cells: Vec::new(),
     };
-    // Record declared source representations for zero-sized local initialization.
-    for name in &names {
-        for instruction in &body.basic_blocks[name].instructions {
-            instruction.visit_operands(|operand| {
-                if let oomir::Operand::Variable { name, ty } = operand {
-                    let ty = vocabulary.id(ty);
-                    if vocabulary.types.get(ty).unwrap().carrier() == 5 {
-                        emission.named_types.entry(name.clone()).or_insert(ty);
-                    }
-                }
-            });
-            let hint = match instruction {
-                oomir::Instruction::NewArray {
-                    dest, element_type, ..
-                } => Some((dest, oomir::Type::Array(Box::new(element_type.clone())))),
-                oomir::Instruction::ConstructObject {
-                    dest, class_name, ..
-                } => Some((dest, oomir::Type::Class(class_name.clone()))),
-                _ => None,
-            };
-            if let Some((name, ty)) = hint {
-                emission
-                    .named_types
-                    .entry(name.clone())
-                    .or_insert(vocabulary.id(&ty));
-            }
-        }
-    }
     for (index, variable) in function.debug_variables.iter().enumerate() {
         emission
             .debug
@@ -227,7 +210,7 @@ pub(crate) fn seal(function: oomir::Function, context: &Context) -> Result<oomir
     let body = function.body;
     let entry = body.entry;
     let mut source = body.basic_blocks;
-    names.sort_by_key(|name| (name != &entry, name.clone()));
+    names.sort_by(|a, b| (a != &entry).cmp(&(b != &entry)).then_with(|| a.cmp(b)));
     for name in names {
         emission.builder.switch_to(emission.blocks[&name]);
         emission.unwind = None;

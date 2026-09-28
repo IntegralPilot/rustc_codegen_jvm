@@ -278,6 +278,7 @@ fn empty_oomir_module<'tcx>(
         data_types: lower1::context::Definitions::new(shared),
         suppressed_data_types: HashSet::default(),
         shared_data_types: None,
+        shared_context: None,
         relative_static_methods: Arc::new(HashSet::default()),
         external_interfaces: HashSet::default(),
         statics: HashMap::default(),

@@ -51,6 +51,8 @@ pub struct Module<D = HashMap<String, DataType>> {
     /// Read-only crate-wide type schemas used by canonical data-type emission
     /// shards without copying every definition into every shard.
     pub shared_data_types: Option<Arc<HashMap<String, DataType>>>,
+    /// Canonical emission shards use the same immutable representation tables.
+    pub shared_context: Option<Arc<std::sync::OnceLock<construct::Context>>>,
     /// Static methods removed into the canonical data-type contribution table
     /// that still use the component-carrying internal pointer ABI.
     pub relative_static_methods: Arc<HashSet<FunctionKey>>,
@@ -70,6 +72,7 @@ impl<D> Module<D> {
             data_types: map(self.data_types),
             suppressed_data_types: self.suppressed_data_types,
             shared_data_types: self.shared_data_types,
+            shared_context: self.shared_context,
             relative_static_methods: self.relative_static_methods,
             external_interfaces: self.external_interfaces,
             statics: self.statics,

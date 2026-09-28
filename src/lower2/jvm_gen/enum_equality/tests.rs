@@ -11,6 +11,7 @@ fn large_enum_equality_verifies_and_executes() {
         data_types: HashMap::default(),
         suppressed_data_types: HashSet::default(),
         shared_data_types: None,
+        shared_context: None,
         relative_static_methods: Default::default(),
         external_interfaces: HashSet::default(),
         statics: HashMap::default(),

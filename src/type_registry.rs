@@ -182,6 +182,7 @@ impl CanonicalDataTypeRegistry {
             variants,
             external_interfaces,
         } = self;
+        let shared_context = Arc::new(std::sync::OnceLock::new());
         let shared_data_types = Arc::new(Self::shared_schemas(&variants));
         let mut buckets = Vec::<HashMap<String, oomir::DataType>>::new();
         let mut names = variants.into_iter().collect::<Vec<_>>();
@@ -201,19 +202,64 @@ impl CanonicalDataTypeRegistry {
         let modules = buckets
             .into_iter()
             .filter(|data_types| !data_types.is_empty())
-            .map(|data_types| oomir::Module {
-                name: module_name.to_string(),
-                source_file: source_file.clone(),
-                functions: HashMap::default(),
-                data_types,
-                suppressed_data_types: HashSet::default(),
-                shared_data_types: Some(Arc::clone(&shared_data_types)),
-                relative_static_methods: Arc::new(HashSet::default()),
-                external_interfaces: external_interfaces.clone(),
-                statics: HashMap::default(),
+            .map(|data_types| {
+                // Bodies may differ while their representation facts agree.
+                // Only incompatible local layouts need a separate context.
+                let context = data_types
+                    .iter()
+                    .all(|(name, data)| Self::same_layout(data, &shared_data_types[name]))
+                    .then(|| Arc::clone(&shared_context));
+                oomir::Module {
+                    name: module_name.to_string(),
+                    source_file: source_file.clone(),
+                    functions: HashMap::default(),
+                    data_types,
+                    suppressed_data_types: HashSet::default(),
+                    shared_data_types: Some(Arc::clone(&shared_data_types)),
+                    shared_context: context,
+                    relative_static_methods: Arc::new(HashSet::default()),
+                    external_interfaces: external_interfaces.clone(),
+                    statics: HashMap::default(),
+                }
             })
             .collect();
         modules
+    }
+
+    /// The SSA context inspects layout and ancestry, never method bodies.
+    fn same_layout(left: &oomir::DataType, right: &oomir::DataType) -> bool {
+        use oomir::DataType::*;
+        match (left, right) {
+            (
+                Class {
+                    fields: a,
+                    is_abstract: aa,
+                    super_class: sa,
+                    interfaces: ia,
+                    ..
+                },
+                Class {
+                    fields: b,
+                    is_abstract: ab,
+                    super_class: sb,
+                    interfaces: ib,
+                    ..
+                },
+            ) => (a, aa, sa, ia) == (b, ab, sb, ib),
+            (
+                Interface {
+                    interfaces: a,
+                    is_enum: ea,
+                    ..
+                },
+                Interface {
+                    interfaces: b,
+                    is_enum: eb,
+                    ..
+                },
+            ) => (a, ea) == (b, eb),
+            _ => false,
+        }
     }
 
     pub(super) fn shared_schemas(
