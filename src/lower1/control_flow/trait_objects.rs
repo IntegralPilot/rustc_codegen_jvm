@@ -146,10 +146,10 @@ pub(crate) fn ensure_trait_object_adapter_class_for_pointees<'tcx>(
                     "closure vtable entry does not target a callable trait: {target_instance:?}"
                 ));
             };
-            let closure_signature = closure_args.as_closure().sig();
+            let closure_signature =
+                tcx.instantiate_bound_regions_with_erased(closure_args.as_closure().sig());
             let tuple_ty = *closure_signature
                 .inputs()
-                .skip_binder()
                 .first()
                 .ok_or_else(|| {
                     format!("closure call signature has no argument tuple: {target_instance:?}")
@@ -299,7 +299,8 @@ pub(crate) fn ensure_trait_object_adapter_class_for_pointees<'tcx>(
             .skip_norm_wip();
             (inputs, output)
         } else {
-            let signature = target_instance_ty.fn_sig(tcx).skip_binder();
+            let signature =
+                tcx.instantiate_bound_regions_with_erased(target_instance_ty.fn_sig(tcx));
             (signature.inputs().to_vec(), signature.output())
         };
         let target_params = target_inputs

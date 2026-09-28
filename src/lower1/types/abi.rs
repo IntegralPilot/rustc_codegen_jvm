@@ -97,7 +97,7 @@ pub(crate) fn callable_trait_object_abi<'tcx>(
     let TyKind::Dynamic(predicates, _) = dynamic_ty.kind() else {
         return None;
     };
-    let principal = predicates.principal()?.skip_binder();
+    let principal = tcx.instantiate_bound_regions_with_erased(predicates.principal()?);
     let lang_items = tcx.lang_items();
     if ![
         lang_items.fn_trait(),
@@ -111,7 +111,9 @@ pub(crate) fn callable_trait_object_abi<'tcx>(
 
     let tuple_ty = principal.args.iter().find_map(|arg| arg.as_type())?;
     let output_ty = predicates.iter().find_map(|predicate| {
-        let ExistentialPredicate::Projection(projection) = predicate.skip_binder() else {
+        let ExistentialPredicate::Projection(projection) =
+            tcx.instantiate_bound_regions_with_erased(predicate)
+        else {
             return None;
         };
         (tcx.lang_items().fn_once_output() == Some(projection.def_id))

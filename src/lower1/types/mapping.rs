@@ -368,7 +368,9 @@ pub(super) fn ty_to_oomir_type_resolved<'tcx>(
                 let mut dynamic_key = String::new();
                 let mut readable_parts = Vec::new();
                 for predicate in bound_preds.iter() {
-                    match predicate.skip_binder() {
+                    // These arguments are lowered independently of the trait
+                    // binder. Preserve nested binders while erasing this one.
+                    match tcx.instantiate_bound_regions_with_erased(predicate) {
                         ExistentialPredicate::Trait(trait_ref) => {
                             dynamic_key.push_str("trait=");
                             dynamic_key.push_str(&stable_def_path(tcx, trait_ref.def_id));

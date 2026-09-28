@@ -1,4 +1,5 @@
 mod associated_drop;
+mod bound_lifetimes;
 mod recursive_callback;
 mod scoped_types;
 
@@ -306,6 +307,7 @@ fn second_tuple_value(value: (&dyn second_tuple_trait::SameName,)) -> i32 {
 
 fn main() {
     associated_drop::run();
+    bound_lifetimes::run();
     recursive_callback::run();
     scoped_types::run();
     assert!(41i32.carrier_value() == 42);

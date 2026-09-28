@@ -14,7 +14,7 @@ pub(super) fn function_item<'tcx>(
 ) {
     let tuple_operand = explicit_method_args[0].clone();
     let function_ty = function_item.ty(tcx, typing_env);
-    let function_sig = function_ty.fn_sig(tcx).skip_binder();
+    let function_sig = tcx.instantiate_bound_regions_with_erased(function_ty.fn_sig(tcx));
     let value_input_count = function_sig
         .inputs()
         .iter()

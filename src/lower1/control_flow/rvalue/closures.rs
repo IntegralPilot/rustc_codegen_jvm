@@ -21,8 +21,8 @@ pub(crate) fn ensure_closure_fn_pointer_adapter_class<'tcx>(
         "only non-capturing closures can be coerced to function pointers"
     );
 
-    let closure_sig = closure_args.as_closure().sig();
-    let closure_inputs = closure_sig.inputs().skip_binder();
+    let closure_sig = tcx.instantiate_bound_regions_with_erased(closure_args.as_closure().sig());
+    let closure_inputs = closure_sig.inputs();
     let tuple_ty = *closure_inputs
         .first()
         .expect("closure call ABI always has a tuple argument");
@@ -240,10 +240,9 @@ pub(super) fn ensure_non_capturing_closure_fn_pointer_bridge<'tcx>(
         );
     }
 
-    let closure_sig = closure_args.as_closure().sig();
+    let closure_sig = tcx.instantiate_bound_regions_with_erased(closure_args.as_closure().sig());
     let tuple_ty = *closure_sig
         .inputs()
-        .skip_binder()
         .first()
         .expect("closure call ABI always has a tuple argument");
     let tuple_oomir_ty = ty_to_oomir_type(tuple_ty, tcx, data_types, instance_context);
@@ -544,8 +543,8 @@ pub(super) fn closure_callable_abi<'tcx>(
     let TyKind::Closure(_, closure_args) = closure_ty.kind() else {
         return None;
     };
-    let closure_signature = closure_args.as_closure().sig();
-    let tuple_ty = *closure_signature.inputs().skip_binder().first()?;
+    let closure_signature = tcx.instantiate_bound_regions_with_erased(closure_args.as_closure().sig());
+    let tuple_ty = *closure_signature.inputs().first()?;
     let TyKind::Tuple(tuple_elements) = tuple_ty.kind() else {
         return None;
     };
@@ -557,7 +556,7 @@ pub(super) fn closure_callable_abi<'tcx>(
             ty.has_jvm_value().then(|| (format!("arg{index}"), ty))
         })
         .collect();
-    let output_ty = closure_signature.output().skip_binder();
+    let output_ty = closure_signature.output();
     let signature = oomir::Signature {
         params,
         ret: Box::new(ty_to_oomir_type(output_ty, tcx, data_types, instance)),

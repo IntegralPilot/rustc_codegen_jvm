@@ -1,3 +1,5 @@
+pub mod bound_lifetimes;
+
 /// A Java class can implement this generated interface and Rust will dispatch
 /// through it exactly as it would through any other `dyn Accumulator`.
 pub trait Accumulator {

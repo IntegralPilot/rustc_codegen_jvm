@@ -132,9 +132,10 @@ pub(super) fn map_address<'tcx>(
     let mapped_address_ty = match mapper_ty.kind() {
         TyKind::Closure(closure_def_id, closure_args) => {
             let closure_instance = Instance::new_raw(*closure_def_id, *closure_args);
-            let closure_signature = closure_args.as_closure().sig();
-            let closure_inputs = closure_signature.inputs().skip_binder().to_vec();
-            let closure_output = closure_signature.output().skip_binder();
+            let closure_signature =
+                tcx.instantiate_bound_regions_with_erased(closure_args.as_closure().sig());
+            let closure_inputs = closure_signature.inputs();
+            let closure_output = closure_signature.output();
             let closure_output_oomir_ty =
                 crate::lower1::types::ty_to_oomir_type(closure_output, tcx, data_types, instance);
             let closure_arg_ty = *closure_inputs
@@ -203,7 +204,7 @@ pub(super) fn map_address<'tcx>(
             )
             .expect("map_addr function item resolves");
             let target = data_types.function_name(tcx, mapper_instance);
-            let mapper_signature = mapper_ty.fn_sig(tcx).skip_binder();
+            let mapper_signature = tcx.instantiate_bound_regions_with_erased(mapper_ty.fn_sig(tcx));
             let mapper_input_oomir_ty = crate::lower1::types::ty_to_oomir_type(
                 mapper_signature.inputs()[0],
                 tcx,

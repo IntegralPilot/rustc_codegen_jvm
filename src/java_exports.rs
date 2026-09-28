@@ -63,11 +63,11 @@ pub(super) fn trait_interface_methods<'tcx>(
             continue;
         }
 
-        let mir_sig = tcx.type_of(def_id).skip_binder().fn_sig(tcx);
-        let params_ty = mir_sig.inputs();
-        let return_ty = mir_sig.output();
-        let explicit_inputs = params_ty.skip_binder();
-        let output = return_ty.skip_binder();
+        let mir_sig = tcx.instantiate_bound_regions_with_erased(
+            tcx.type_of(def_id).skip_binder().fn_sig(tcx),
+        );
+        let explicit_inputs = mir_sig.inputs();
+        let output = mir_sig.output();
         let instance = Instance::new_raw(
             def_id,
             rustc_middle::ty::GenericArgs::identity_for_item(tcx, def_id),
