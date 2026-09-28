@@ -160,8 +160,8 @@ pub(crate) fn ensure_exact_transmute_helper<'tcx>(
             "transmute layout sizes differ: {source_ty:?} is {source_size} bytes, {target_ty:?} is {target_size} bytes"
         ));
     }
-    exact_bytes_supported(source_ty, tcx, instance_context)?;
-    exact_bytes_supported(target_ty, tcx, instance_context)?;
+    exact_bytes_supported(source_ty, tcx, instance_context, data_types)?;
+    exact_bytes_supported(target_ty, tcx, instance_context, data_types)?;
 
     // Optimized downstream MIR can materialize a dependency-private ADT by
     // transmuting its scalar representation instead of constructing it. Emit

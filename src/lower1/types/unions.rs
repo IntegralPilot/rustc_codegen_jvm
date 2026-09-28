@@ -312,11 +312,16 @@ pub(crate) fn ensure_union_data_type<'tcx>(
         .instantiate(tcx, substs)
         .skip_norm_wip();
     let union_ty = resolve_union_ty(tcx, union_ty, instance_context).unwrap_or(union_ty);
+    // Every shard declares the same carrier, but exactly one owns its bodies.
+    // Claim before recursion; other workers only need its known signatures.
+    if !data_types.claim_union_body(union_ty) {
+        return union_class;
+    }
     // Unresolved generic unions use one byte plus the object slot at offset zero.
     // Concrete monomorphizations replace this with their exact rustc layout.
     let union_size = layout_size_bytes(tcx, union_ty).unwrap_or(1);
     let object_storage_size =
-        union_object_storage_size(union_ty, union_size, tcx, instance_context);
+        union_object_storage_size(union_ty, union_size, tcx, instance_context, data_types);
 
     let variant = adt_def.variant(0usize.into());
     let mut methods = HashMap::default();

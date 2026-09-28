@@ -23,10 +23,15 @@ pub(crate) type CheckedIntrinsic = (String, String, String);
 /// No completed function bodies or serialized output are retained here.
 #[derive(Default)]
 pub(crate) struct CrateContext<'tcx> {
+    pub(crate) upstream_symbols: HashSet<u64>,
+    provided_symbols: Lock<HashSet<u64>>,
     normalized: Lock<HashMap<(Ty<'tcx>, GenericArgsRef<'tcx>), Ty<'tcx>>>,
     tuple_abis: Lock<HashMap<String, Vec<oomir::Type>>>,
     allocations: Lock<HashMap<AllocId, String>>,
     checked_intrinsics: Lock<HashSet<CheckedIntrinsic>>,
+    union_bodies: Lock<HashSet<Ty<'tcx>>>,
+    storage_objects: Lock<HashMap<Ty<'tcx>, bool>>,
+    byte_support: Lock<HashMap<Ty<'tcx>, Result<(), String>>>,
     completed_codecs: Lock<HashMap<Ty<'tcx>, super::types::PointerMemoryCodec>>,
     caller_locations: Lock<HashMap<rustc_span::Span, oomir::Constant>>,
     names: names::Names<'tcx>,
@@ -34,6 +39,24 @@ pub(crate) struct CrateContext<'tcx> {
 }
 
 impl<'tcx> CrateContext<'tcx> {
+    pub(crate) fn with_upstream_symbols(tcx: TyCtxt<'tcx>) -> Self {
+        Self {
+            upstream_symbols: crate::symbols::upstream(tcx)
+                .expect("could not read JVM symbol indexes"),
+            ..Self::default()
+        }
+    }
+    pub(crate) fn provided_symbols(&self) -> Vec<u64> {
+        let mut symbols = self
+            .provided_symbols
+            .borrow()
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        symbols.sort_unstable();
+        symbols
+    }
+
     pub(crate) fn take_references(&self) -> Vec<Instance<'tcx>> {
         std::mem::take(&mut *self.references.borrow_mut())
     }
@@ -46,7 +69,7 @@ pub(crate) struct Definitions<'tcx> {
     // foreign interfaces must never acquire generated classfile definitions.
     pub(crate) foreign_interfaces: Lock<HashSet<String>>,
     pub(super) representations: HashMap<Ty<'tcx>, oomir::Type>,
-    pub(super) enums_in_progress: HashSet<String>,
+    pub(super) defined_enums: HashSet<String>,
     shared: Shared<'tcx>,
     checked_intrinsics: Vec<CheckedIntrinsic>,
     next_temporary: usize,
@@ -60,7 +83,7 @@ impl<'tcx> Definitions<'tcx> {
             values: HashMap::default(),
             foreign_interfaces: Lock::default(),
             representations: HashMap::default(),
-            enums_in_progress: HashSet::default(),
+            defined_enums: HashSet::default(),
             checked_intrinsics: Vec::new(),
             next_temporary: 0,
             body: BodyFacts::default(),
@@ -121,6 +144,30 @@ impl<'tcx> Definitions<'tcx> {
             .entry(id)
             .or_insert(candidate)
             .clone()
+    }
+
+    pub(crate) fn has_upstream_body(&self, key: u64) -> bool {
+        self.shared.upstream_symbols.contains(&key)
+    }
+    pub(crate) fn record_provided_body(&self, key: u64) {
+        self.shared.provided_symbols.borrow_mut().insert(key);
+    }
+
+    pub(crate) fn claim_union_body(&self, ty: Ty<'tcx>) -> bool {
+        self.shared.union_bodies.borrow_mut().insert(ty)
+    }
+
+    pub(crate) fn storage_objects(&self, ty: Ty<'tcx>) -> Option<bool> {
+        self.shared.storage_objects.borrow().get(&ty).copied()
+    }
+    pub(crate) fn remember_storage_objects(&self, ty: Ty<'tcx>, value: bool) {
+        self.shared.storage_objects.borrow_mut().insert(ty, value);
+    }
+    pub(crate) fn byte_support(&self, ty: Ty<'tcx>) -> Option<Result<(), String>> {
+        self.shared.byte_support.borrow().get(&ty).cloned()
+    }
+    pub(crate) fn remember_byte_support(&self, ty: Ty<'tcx>, value: Result<(), String>) {
+        self.shared.byte_support.borrow_mut().insert(ty, value);
     }
 
     pub(super) fn completed_codec(&self, ty: Ty<'tcx>) -> Option<super::types::PointerMemoryCodec> {

@@ -91,16 +91,6 @@ pub fn function_item_class_for_def_id<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) ->
     }
 }
 
-pub fn disambiguated_def_path_token(tcx: TyCtxt<'_>, def_id: DefId) -> String {
-    tcx.def_path(def_id)
-        .data
-        .iter()
-        .map(|component| jvm_identifier(component.as_sym(true).as_str()))
-        .filter(|segment| !segment.is_empty())
-        .collect::<Vec<_>>()
-        .join("_")
-}
-
 /// Anonymous carriers are internal ABI identities; constructing their names
 /// must not instantiate the captured types or build a second type schema.
 pub fn anonymous_class_for_args<'tcx>(

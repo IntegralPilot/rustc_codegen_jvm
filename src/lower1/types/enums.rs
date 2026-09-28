@@ -258,9 +258,7 @@ pub(super) fn ensure_enum_data_types<'tcx>(
     data_types: &mut Definitions<'tcx>,
     instance_context: rustc_middle::ty::Instance<'tcx>,
 ) {
-    let should_lower = data_types
-        .enums_in_progress
-        .insert(base_enum_name.to_owned());
+    let should_lower = data_types.defined_enums.insert(base_enum_name.to_owned());
     if !should_lower {
         return;
     }
@@ -523,7 +521,7 @@ pub(super) fn ensure_enum_data_types<'tcx>(
         existing_methods.extend(methods);
     }
 
-    data_types.enums_in_progress.remove(base_enum_name);
+    // Keep the completed definition: subsequent constants only need its schema.
 }
 
 pub(crate) fn adapt_simple_enum_operand(

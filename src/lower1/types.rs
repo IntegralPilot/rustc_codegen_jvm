@@ -69,8 +69,7 @@ use names::*;
 pub(crate) use names::{
     generate_adt_jvm_class_name, generate_tuple_jvm_class_name, get_field_name_from_index,
     readable_rust_generic_arg_name, readable_rust_type_name, sanitize_name_token, short_hash,
-    stable_def_identity, stable_def_path, stable_instance_identity, stable_instance_key,
-    stable_normalized_instance_key, stable_type_identity,
+    stable_def_identity, stable_def_path, stable_instance_identity, stable_type_identity,
 };
 
 pub const UNION_BYTES_FIELD: &str = "_bytes";

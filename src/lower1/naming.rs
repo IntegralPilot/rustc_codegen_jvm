@@ -147,28 +147,20 @@ pub fn parse_jvm_class_link_name(link_name: &str) -> Result<String, String> {
     Ok(class_name.to_string())
 }
 
-fn is_runtime_generic<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> bool {
-    let def_id = instance.def_id();
-    matches!(
-        tcx.crate_name(def_id.krate),
-        sym::core | sym::alloc | sym::std
-    ) && !matches!(instance.def, InstanceKind::Intrinsic(_))
-        && jvm_names::uses_compiled_core(tcx)
-        && tcx.generics_of(def_id).requires_monomorphization(tcx)
-        && !instance.args.has_param()
-        && !instance.args.has_escaping_bound_vars()
-}
-
 pub fn mono_owner_class<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> String {
     let def_id = instance.def_id();
-    let runtime_generic = is_runtime_generic(tcx, instance);
-    if runtime_generic {
-        // Synthetic helpers can reference an instance without adding it to
-        // the current crate's mono-item set. Give every runtime instance one
-        // definition-crate owner so all downstream callers and exporters
-        // agree even when the runtime crate has a different local alias.
-        let instance_key = super::types::stable_instance_identity(tcx, def_id, instance.args);
-        runtime_mono_owner(tcx, def_id, &instance_key)
+    // The runtime polls an async body through a carrier companion, independently of
+    // crate/module layout and generic method-holder partitioning.
+    if matches!(tcx.def_kind(def_id), DefKind::Closure) && tcx.coroutine_is_async(def_id) {
+        return format!(
+            "{}$Body",
+            jvm_names::anonymous_class_for_args(tcx, def_id, instance.args, true)
+        );
+    }
+    if tcx.generics_of(def_id).requires_monomorphization(tcx) {
+        // Definition-crate ownership agrees across all downstream emitters.
+        let identity = super::types::stable_instance_identity(tcx, def_id, instance.args);
+        generic_mono_owner(tcx, def_id, &identity)
     } else if let Some(trait_def_id) = tcx
         .opt_associated_item(def_id)
         .and_then(|item| item.trait_container(tcx))
@@ -183,11 +175,14 @@ pub fn mono_owner_class<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> St
     }
 }
 
-fn runtime_mono_owner(tcx: TyCtxt<'_>, def_id: DefId, identity: &str) -> String {
-    let bucket = super::types::short_hash(identity, 1);
+fn generic_mono_owner(tcx: TyCtxt<'_>, def_id: DefId, identity: &str) -> String {
+    // Bound class-header and ZIP-entry overhead without concentrating a whole
+    // module's specializations in one constant pool. The linker splits any
+    // bucket that still overflows; method identities remain independent of it.
     format!(
-        "{}/mono/MonoBucket_{bucket}",
+        "{}/mono/Mono_{}",
         jvm_names::crate_root(tcx, def_id.krate),
+        &identity[..3],
     )
 }
 
@@ -565,7 +560,7 @@ fn associated_method_base_name_from_instance<'tcx>(
         {
             jvm_names::method_for_function(tcx, trait_item_def_id)
         } else {
-            associated_specialization_name(tcx, instance, trait_item_def_id, &specialization_args)
+            associated_specialization_name(tcx, trait_item_def_id, &specialization_args)
         };
     }
 
@@ -582,40 +577,24 @@ fn associated_method_base_name_from_instance<'tcx>(
     {
         jvm_names::method_for_function(tcx, instance.def_id())
     } else {
-        associated_specialization_name(tcx, instance, instance.def_id(), &specialization_args)
+        associated_specialization_name(tcx, instance.def_id(), &specialization_args)
     }
 }
 
 fn associated_specialization_name<'tcx>(
     tcx: TyCtxt<'tcx>,
-    instance: Instance<'tcx>,
     canonical_def_id: rustc_span::def_id::DefId,
     args: &[GenericArg<'tcx>],
 ) -> String {
     let method = jvm_names::method_for_function(tcx, canonical_def_id);
-    let mut data_types = super::context::Definitions::default();
-    let mut generic_tokens = Vec::new();
-    for arg in args {
-        if let Some(token) =
-            super::types::readable_rust_generic_arg_name(*arg, tcx, &mut data_types, instance)
-        {
-            generic_tokens.push(super::types::sanitize_name_token(&token));
-        }
-    }
-    let identity = super::types::stable_def_identity(tcx, canonical_def_id);
-    crate::stable_hash::readable_or_hashed_name(
-        &method,
-        &generic_tokens.join("_"),
-        &identity,
-        MAX_MONO_FN_NAME_LEN,
-    )
+    let identity = super::types::stable_instance_identity(tcx, canonical_def_id, tcx.mk_args(args));
+    format!("{method}${identity}")
 }
 
 /// Generate a JVM-safe function name for a (possibly monomorphized) function instance.
 ///
-/// Attempts to generate a readable name by appending sanitized generic type names
-/// (e.g., `my_func_i32_String`). Falls back to a hash of the type descriptors if the
-/// resulting name becomes too long.
+/// Public free functions keep their names. Internal implementations use stable
+/// Rust identities without lowering types merely to describe a symbol.
 pub fn mono_fn_name_from_instance<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> FnNameData {
     let is_core_panic_impl_declaration = tcx.is_foreign_item(instance.def_id())
         && tcx.opt_item_name(instance.def_id()) == Some(sym::panic_impl)
@@ -653,118 +632,28 @@ pub fn mono_fn_name_from_instance<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'t
         };
     }
 
-    // Runtime generic bodies are internal methods grouped into shared owners.
-    // Hash the complete instance directly instead of constructing readable type
-    // schemas just to disambiguate their names. Public and imported names above
-    // retain their explicit ABI spelling.
-    // Drop glue can name a callback whose return type owns that same callback.
-    // Naming it through fresh type definitions would recursively build drop glue.
-    if is_runtime_generic(tcx, instance)
-        && matches!(
-            instance.def,
-            InstanceKind::Item(_) | InstanceKind::Shim(ShimKind::DropGlue(..))
-        )
-    {
+    let class_to_call_on = Some(mono_owner_class(tcx, instance));
+    let base = jvm_names::method_for_function(tcx, instance.def_id());
+    // Internal names identify the Rust definition and its substitutions.
+    // Deriving a readable name must never construct carrier/codec bodies.
+    let internal = tcx
+        .generics_of(instance.def_id())
+        .requires_monomorphization(tcx)
+        || tcx.opt_associated_item(instance.def_id()).is_some()
+        || matches!(
+            tcx.def_kind(tcx.parent(instance.def_id())),
+            DefKind::Fn | DefKind::AssocFn | DefKind::Closure
+        );
+    let method_name = if internal {
         let identity =
             super::types::stable_instance_identity(tcx, instance.def_id(), instance.args);
-        return FnNameData {
-            class_to_call_on: Some(runtime_mono_owner(tcx, instance.def_id(), &identity)),
-            method_name: format!(
-                "{}${identity}",
-                jvm_names::method_for_function(tcx, instance.def_id()),
-            ),
-        };
-    }
-
-    let class = Some(mono_owner_class(tcx, instance));
-    let mut safe_base = jvm_names::method_for_function(tcx, instance.def_id());
-    if instance.args.has_param() || instance.args.has_escaping_bound_vars() {
-        let hash = super::types::short_hash(
-            &format!(
-                "{}_nonconcrete_{}",
-                safe_base,
-                super::types::stable_normalized_instance_key(tcx, instance.def_id(), instance.args,)
-            ),
-            10,
-        );
-        return FnNameData {
-            class_to_call_on: class,
-            method_name: format!("{}_{}", safe_base, hash),
-        };
-    }
-    let mut data_types = super::context::Definitions::default();
-    let mut generic_tokens = Vec::new();
-    if let Some(item) = tcx.opt_associated_item(instance.def_id()) {
-        if let Some(trait_def_id) = item.trait_container(tcx) {
-            safe_base = format!(
-                "{}_{}",
-                jvm_names::method_for_function(tcx, trait_def_id),
-                safe_base
-            );
-        } else if let Some(impl_def_id) = item.impl_container(tcx) {
-            let self_ty = tcx
-                .type_of(impl_def_id)
-                .instantiate(tcx, instance.args)
-                .skip_norm_wip();
-            let self_token = super::types::readable_rust_generic_arg_name(
-                self_ty.into(),
-                tcx,
-                &mut data_types,
-                instance,
-            )
-            .map(|token| super::types::sanitize_name_token(&token))
-            .unwrap_or_else(|| "Self".to_string());
-            let trait_prefix = tcx.impl_opt_trait_ref(impl_def_id).map(|trait_ref| {
-                let trait_ref = trait_ref.instantiate(tcx, instance.args).skip_norm_wip();
-                let self_arg = trait_ref.args[0];
-                for arg in trait_ref.args.iter().skip(1) {
-                    if arg == self_arg {
-                        continue;
-                    }
-                    if let Some(token) = super::types::readable_rust_generic_arg_name(
-                        arg,
-                        tcx,
-                        &mut data_types,
-                        instance,
-                    ) {
-                        generic_tokens.push(super::types::sanitize_name_token(&token));
-                    }
-                }
-                jvm_names::method_for_function(tcx, trait_ref.def_id)
-            });
-            safe_base = if let Some(trait_prefix) = trait_prefix {
-                format!("{trait_prefix}_{self_token}_{safe_base}")
-            } else {
-                format!("{self_token}_{safe_base}")
-            };
-        }
-    } else if matches!(
-        tcx.def_kind(tcx.parent(instance.def_id())),
-        DefKind::Fn | DefKind::AssocFn | DefKind::Closure
-    ) {
-        safe_base = jvm_names::disambiguated_def_path_token(tcx, instance.def_id());
-    }
-
-    // Collect type and const generics. Regions are erased by the JVM ABI.
-    for arg in instance.args.iter() {
-        if let Some(token) =
-            super::types::readable_rust_generic_arg_name(arg, tcx, &mut data_types, instance)
-        {
-            generic_tokens.push(super::types::sanitize_name_token(&token));
-        }
-    }
-
-    // Upstream generic symbols include the instantiating crate, so use the
-    // definition path plus the complete suffix as the cross-crate JVM identity.
-    let identity = super::types::stable_def_identity(tcx, instance.def_id());
+        format!("{base}${identity}")
+    } else {
+        base
+    };
     FnNameData {
-        class_to_call_on: class,
-        method_name: crate::stable_hash::readable_or_hashed_name(
-            &safe_base,
-            &generic_tokens.join("_"),
-            &identity,
-            MAX_MONO_FN_NAME_LEN,
-        ),
+        class_to_call_on,
+        method_name,
     }
 }
 

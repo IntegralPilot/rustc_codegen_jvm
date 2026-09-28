@@ -95,6 +95,7 @@ mod metrics;
 mod oomir;
 mod pipeline;
 mod stable_hash;
+mod symbols;
 
 /// An instance of our Java bytecode codegen backend.
 struct MyBackend;
@@ -167,6 +168,10 @@ fn lower_mono_function<'tcx>(
         return;
     }
 
+    let symbol = symbols::key(tcx, instance);
+    if !instance.def_id().is_local() && oomir_module.data_types.has_upstream_body(symbol) {
+        return;
+    }
     let name = mono_item_name(tcx, instance, &oomir_module.data_types);
     let mir = tcx.instance_mir(instance.def);
     breadcrumbs::log!(
@@ -222,6 +227,7 @@ fn lower_mono_function<'tcx>(
         .into();
     }
     place_or_insert_mono_function(tcx, instance, &name, oomir_function, oomir_module);
+    oomir_module.data_types.record_provided_body(symbol);
 }
 
 fn lower_codegen_unit_items<'tcx>(
@@ -382,7 +388,8 @@ impl CodegenBackend for MyBackend {
                 );
 
                 let mut canonical_data_types = CanonicalDataTypeRegistry::default();
-                let shared_lowering = lower1::context::Shared::default();
+                let shared_lowering =
+                    Arc::new(lower1::context::CrateContext::with_upstream_symbols(tcx));
                 let mut submitted = 0usize;
 
                 // Java exports are supplemental roots and are small enough to
@@ -500,6 +507,7 @@ impl CodegenBackend for MyBackend {
                 drop(producer);
                 let canonical_data_types = canonical_data_types.into_inner();
 
+                let provided_symbols = shared_lowering.provided_symbols();
                 drop(shared_lowering);
 
                 let canonical_timer = tcx.sess.timer("jvm_canonical_types");
@@ -519,17 +527,20 @@ impl CodegenBackend for MyBackend {
                 let mut results = tcx.sess.time("jvm_finish_emission", || workers.finish());
                 drop(canonical_timer);
                 results.sort_by_key(|(ordinal, _)| *ordinal);
-                results
-                    .into_iter()
-                    .flat_map(|(_, generated)| generated)
-                    .collect::<Vec<_>>()
+                (
+                    results
+                        .into_iter()
+                        .flat_map(|(_, generated)| generated)
+                        .collect::<Vec<_>>(),
+                    provided_symbols,
+                )
             });
 
             if let Err(error) = metrics::finish_crate(&crate_name) {
                 eprintln!("warning: failed to write rustc_codegen_jvm metrics: {error}");
             }
 
-            Box::new((generated_classes, crate_name))
+            Box::new(generated_classes)
         })
     }
 
@@ -542,8 +553,8 @@ impl CodegenBackend for MyBackend {
         _crate_info: &CrateInfo,
     ) -> (CompiledModules, UnordMap<WorkProductId, WorkProduct>) {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let (generated_classes, _) = *ongoing_codegen
-                .downcast::<(Vec<(String, PathBuf)>, String)>()
+            let (generated_classes, provided_symbols) = *ongoing_codegen
+                .downcast::<(Vec<(String, PathBuf)>, Vec<u64>)>()
                 .expect("in join_codegen: ongoing_codegen is not a generated-class list");
 
             let temporary_directories: HashSet<_> = generated_classes
@@ -576,6 +587,21 @@ impl CodegenBackend for MyBackend {
                     name: cgu_name,
                     kind: ModuleKind::Regular,
                     object: Some(file_path),
+                    global_asm_object: None,
+                    bytecode: None,
+                    dwarf_object: None,
+                    llvm_ir: None,
+                    assembly: None,
+                });
+            }
+            if !provided_symbols.is_empty() {
+                let name = "jvm_symbols".to_string();
+                let path = outputs.temp_path_ext_for_cgu("jvmsymbols", &name);
+                symbols::write(&path, &provided_symbols).expect("could not write JVM symbol index");
+                compiled_modules.push(CompiledModule {
+                    name,
+                    kind: ModuleKind::Regular,
+                    object: Some(path),
                     global_asm_object: None,
                     bytecode: None,
                     dwarf_object: None,

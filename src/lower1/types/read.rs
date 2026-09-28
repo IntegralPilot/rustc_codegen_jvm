@@ -420,7 +420,7 @@ pub(super) fn emit_ty_from_union_bytes<'tcx>(
         TyKind::Adt(adt_def, _) if adt_def.is_union() => {
             let union_size = layout_size_bytes(tcx, ty)?;
             let object_storage_size =
-                union_object_storage_size(ty, union_size, tcx, instance_context);
+                union_object_storage_size(ty, union_size, tcx, instance_context, data_types);
             let union_oomir_ty = ty_to_oomir_type(ty, tcx, data_types, instance_context);
             let oomir::Type::Class(union_class) = &union_oomir_ty else {
                 return Err(format!("union {ty:?} did not map to a JVM class"));

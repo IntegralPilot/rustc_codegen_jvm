@@ -118,7 +118,7 @@ fn build_pointer_memory_codec<'tcx>(
             class_name: format!("{ZERO_SIZED_CODEC_PREFIX}{class_name}"),
         }));
     }
-    exact_bytes_supported(ty, tcx, instance_context)?;
+    exact_bytes_supported(ty, tcx, instance_context, data_types)?;
     let readable = format!(
         "{}_{}bytes",
         sanitize_name_token(&readable_pointer_codec_type_name(
@@ -201,7 +201,8 @@ fn build_pointer_memory_codec<'tcx>(
     }
 
     let bytes_ty = byte_array_type();
-    let object_storage_size = union_object_storage_size(ty, size, tcx, instance_context);
+    let object_storage_size =
+        union_object_storage_size(ty, size, tcx, instance_context, data_types);
 
     let mut encode_instructions = vec![
         oomir::Instruction::NewArray {

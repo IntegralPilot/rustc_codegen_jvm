@@ -88,34 +88,6 @@ pub(super) fn readable_qualified_jvm_class(class_name: &str) -> String {
     sanitize_name_token(&canonical.replace('/', "_"))
 }
 
-pub(crate) fn stable_instance_key<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    def_id: DefId,
-    args: GenericArgsRef<'tcx>,
-) -> String {
-    let crate_name = tcx.crate_name(def_id.krate).to_string();
-    let path = with_resolve_crate_name!(with_no_trimmed_paths!(
-        tcx.def_path_str_with_args(def_id, args)
-    ));
-    path.strip_prefix(&format!("{crate_name}::"))
-        .unwrap_or(&path)
-        .to_string()
-}
-
-pub(crate) fn stable_normalized_instance_key<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    def_id: DefId,
-    args: GenericArgsRef<'tcx>,
-) -> String {
-    let args = tcx
-        .try_normalize_erasing_regions(
-            TypingEnv::fully_monomorphized(),
-            rustc_middle::ty::Unnormalized::new_wip(args),
-        )
-        .unwrap_or(args);
-    stable_instance_key(tcx, def_id, args)
-}
-
 // Produce a compact, human readable token for an OOMIR type to use in tuple class names.
 pub(crate) fn readable_oomir_type_name(t: &oomir::Type) -> String {
     use oomir::Type;

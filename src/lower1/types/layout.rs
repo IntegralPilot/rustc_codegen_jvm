@@ -21,6 +21,9 @@ pub(super) fn normalize_union_ty<'tcx>(
     tcx: TyCtxt<'tcx>,
     ty: Ty<'tcx>,
 ) -> Result<Ty<'tcx>, String> {
+    if !ty.has_aliases() && !ty.has_escaping_bound_vars() {
+        return Ok(tcx.erase_and_anonymize_regions(ty));
+    }
     tcx.try_normalize_erasing_regions(
         TypingEnv::fully_monomorphized(),
         rustc_middle::ty::Unnormalized::new_wip(ty),
@@ -33,6 +36,9 @@ pub(super) fn resolve_union_ty<'tcx>(
     ty: Ty<'tcx>,
     instance_context: rustc_middle::ty::Instance<'tcx>,
 ) -> Result<Ty<'tcx>, String> {
+    if !ty.has_param() && !ty.has_escaping_bound_vars() {
+        return normalize_union_ty(tcx, ty);
+    }
     let instantiated = rustc_middle::ty::EarlyBinder::bind(tcx, ty)
         .instantiate(tcx, instance_context.args)
         .skip_norm_wip();
@@ -44,8 +50,12 @@ pub(super) fn needs_union_object_storage_inner<'tcx>(
     tcx: TyCtxt<'tcx>,
     instance_context: rustc_middle::ty::Instance<'tcx>,
     visiting: &mut HashSet<Ty<'tcx>>,
+    data_types: &Definitions<'tcx>,
 ) -> Result<bool, String> {
     let ty = resolve_union_ty(tcx, ty, instance_context)?;
+    if let Some(value) = data_types.storage_objects(ty) {
+        return Ok(value);
+    }
     if layout_size_bytes(tcx, ty)? == 0 {
         return Ok(false);
     }
@@ -55,13 +65,18 @@ pub(super) fn needs_union_object_storage_inner<'tcx>(
     let needs_objects = match ty.kind() {
         TyKind::Bool | TyKind::Char | TyKind::Int(_) | TyKind::Uint(_) | TyKind::Float(_) => false,
         TyKind::Pat(inner, _) | TyKind::Array(inner, _) => {
-            needs_union_object_storage_inner(*inner, tcx, instance_context, visiting)?
+            needs_union_object_storage_inner(*inner, tcx, instance_context, visiting, data_types)?
         }
         TyKind::Tuple(elements) => {
             let mut needs_objects = false;
             for element in elements.iter() {
-                needs_objects |=
-                    needs_union_object_storage_inner(element, tcx, instance_context, visiting)?;
+                needs_objects |= needs_union_object_storage_inner(
+                    element,
+                    tcx,
+                    instance_context,
+                    visiting,
+                    data_types,
+                )?;
                 if needs_objects {
                     break;
                 }
@@ -71,8 +86,13 @@ pub(super) fn needs_union_object_storage_inner<'tcx>(
         TyKind::Closure(_, args) => {
             let mut needs_objects = false;
             for capture in args.as_closure().upvar_tys() {
-                needs_objects |=
-                    needs_union_object_storage_inner(capture, tcx, instance_context, visiting)?;
+                needs_objects |= needs_union_object_storage_inner(
+                    capture,
+                    tcx,
+                    instance_context,
+                    visiting,
+                    data_types,
+                )?;
                 if needs_objects {
                     break;
                 }
@@ -89,8 +109,13 @@ pub(super) fn needs_union_object_storage_inner<'tcx>(
                 .flat_map(|variant| variant.fields.iter())
             {
                 let field_ty = field.ty(tcx, args).skip_norm_wip();
-                needs_objects |=
-                    needs_union_object_storage_inner(field_ty, tcx, instance_context, visiting)?;
+                needs_objects |= needs_union_object_storage_inner(
+                    field_ty,
+                    tcx,
+                    instance_context,
+                    visiting,
+                    data_types,
+                )?;
                 if needs_objects {
                     break;
                 }
@@ -106,6 +131,7 @@ pub(super) fn needs_union_object_storage_inner<'tcx>(
         _ => true,
     };
     visiting.remove(&ty);
+    data_types.remember_storage_objects(ty, needs_objects);
     Ok(needs_objects)
 }
 
@@ -114,9 +140,12 @@ pub(super) fn union_object_storage_size<'tcx>(
     rust_size: usize,
     tcx: TyCtxt<'tcx>,
     instance_context: rustc_middle::ty::Instance<'tcx>,
+    data_types: &Definitions<'tcx>,
 ) -> usize {
     let mut visiting = HashSet::default();
-    if needs_union_object_storage_inner(ty, tcx, instance_context, &mut visiting).unwrap_or(true) {
+    if needs_union_object_storage_inner(ty, tcx, instance_context, &mut visiting, data_types)
+        .unwrap_or(true)
+    {
         rust_size.max(1)
     } else {
         0
@@ -571,6 +600,22 @@ pub(super) fn exact_bytes_supported<'tcx>(
     ty: Ty<'tcx>,
     tcx: TyCtxt<'tcx>,
     instance_context: rustc_middle::ty::Instance<'tcx>,
+    data_types: &Definitions<'tcx>,
+) -> Result<(), String> {
+    let ty = resolve_union_ty(tcx, ty, instance_context)?;
+    if let Some(result) = data_types.byte_support(ty) {
+        return result;
+    }
+    let result = exact_bytes_supported_inner(ty, tcx, instance_context, data_types);
+    data_types.remember_byte_support(ty, result.clone());
+    result
+}
+
+fn exact_bytes_supported_inner<'tcx>(
+    ty: Ty<'tcx>,
+    tcx: TyCtxt<'tcx>,
+    instance_context: rustc_middle::ty::Instance<'tcx>,
+    data_types: &Definitions<'tcx>,
 ) -> Result<(), String> {
     let ty = resolve_union_ty(tcx, ty, instance_context)?;
     // ZSTs contribute no bits to an enclosing layout. Their nominal JVM
@@ -590,20 +635,24 @@ pub(super) fn exact_bytes_supported<'tcx>(
         )
         | TyKind::Float(FloatTy::F16 | FloatTy::F32 | FloatTy::F64 | FloatTy::F128) => Ok(()),
         TyKind::RawPtr(_, _) | TyKind::Ref(_, _, _) | TyKind::FnPtr(..) => Ok(()),
-        TyKind::Pat(inner, _) => exact_bytes_supported(*inner, tcx, instance_context),
-        TyKind::Tuple(elements) => elements
-            .iter()
-            .try_for_each(|element| exact_bytes_supported(element, tcx, instance_context)),
+        TyKind::Pat(inner, _) => exact_bytes_supported(*inner, tcx, instance_context, data_types),
+        TyKind::Tuple(elements) => elements.iter().try_for_each(|element| {
+            exact_bytes_supported(element, tcx, instance_context, data_types)
+        }),
         TyKind::Closure(_, closure_args) => closure_args
             .as_closure()
             .upvar_tys()
             .iter()
-            .try_for_each(|capture| exact_bytes_supported(capture, tcx, instance_context)),
+            .try_for_each(|capture| {
+                exact_bytes_supported(capture, tcx, instance_context, data_types)
+            }),
         TyKind::Coroutine(def_id, args) => {
             args.as_coroutine()
                 .upvar_tys()
                 .iter()
-                .try_for_each(|capture| exact_bytes_supported(capture, tcx, instance_context))?;
+                .try_for_each(|capture| {
+                    exact_bytes_supported(capture, tcx, instance_context, data_types)
+                })?;
             tcx.coroutine_layout(*def_id, args)
                 .map_err(|error| format!("could not get coroutine layout for {ty:?}: {error:?}"))?
                 .field_tys
@@ -612,14 +661,14 @@ pub(super) fn exact_bytes_supported<'tcx>(
                     let saved_ty = EarlyBinder::bind(tcx, saved.ty)
                         .instantiate(tcx, args)
                         .skip_norm_wip();
-                    exact_bytes_supported(saved_ty, tcx, instance_context)
+                    exact_bytes_supported(saved_ty, tcx, instance_context, data_types)
                 })
         }
         TyKind::Array(element, length) => {
             length
                 .try_to_target_usize(tcx)
                 .ok_or_else(|| format!("array length is not concrete for {ty:?}"))?;
-            exact_bytes_supported(*element, tcx, instance_context)
+            exact_bytes_supported(*element, tcx, instance_context, data_types)
         }
         TyKind::Adt(adt_def, substs)
             if adt_def.is_struct() || adt_def.is_enum() || adt_def.is_union() =>
@@ -637,7 +686,7 @@ pub(super) fn exact_bytes_supported<'tcx>(
                     if matches!(field_ty.kind(), TyKind::Dynamic(..)) {
                         Ok(())
                     } else {
-                        exact_bytes_supported(field_ty, tcx, instance_context)
+                        exact_bytes_supported(field_ty, tcx, instance_context, data_types)
                     }
                 })
         }

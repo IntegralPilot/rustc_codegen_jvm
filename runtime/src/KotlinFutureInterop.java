@@ -249,13 +249,9 @@ public final class KotlinFutureInterop {
 
         private static Method findResumeMethod(Class<?> futureClass, Class<?> pinClass)
                 throws ReflectiveOperationException {
-            String packageName = futureClass.getPackage().getName();
-            String crateName = packageName.contains(".")
-                    ? packageName.substring(0, packageName.indexOf('.'))
-                    : packageName;
-            Class<?> moduleClass = Class.forName(
-                    crateName + "." + crateName, true, futureClass.getClassLoader());
-            for (Method method : moduleClass.getMethods()) {
+            Class<?> bodyClass = Class.forName(
+                    futureClass.getName() + "$Body", true, futureClass.getClassLoader());
+            for (Method method : bodyClass.getMethods()) {
                 Class<?>[] parameters = method.getParameterTypes();
                 if (Modifier.isStatic(method.getModifiers())
                         && parameters.length == 2
