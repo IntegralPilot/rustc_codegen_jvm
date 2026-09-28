@@ -1,3 +1,4 @@
+mod cyclic;
 mod nested_constants;
 mod scoped_statics;
 
@@ -68,6 +69,7 @@ mod nested {
 }
 
 fn main() {
+    cyclic::run();
     nested_constants::run();
     scoped_statics::run();
     assert!(ANSWER == 42);

@@ -30,13 +30,14 @@ fn add_constant_helper_method(
     Ok(())
 }
 
-fn create_chunked_array_factory(
+pub(super) fn create_chunked_array_factory(
     cp: &mut InternedConstantPool,
     owner_class: &str,
     element_type: &oomir::Type,
     elements: &[oomir::Constant],
     methods: &mut Vec<jvm::Method>,
     next_factory: &mut usize,
+    storage_field: Option<u16>,
 ) -> jvm::Result<oomir::Constant> {
     if oomir::is_packed_byte_array(element_type, elements) {
         return create_byte_array_factory(
@@ -46,6 +47,7 @@ fn create_chunked_array_factory(
             elements,
             methods,
             next_factory,
+            storage_field,
         );
     }
     let mut prepared: Cow<'_, [oomir::Constant]> = Cow::Borrowed(elements);
@@ -125,7 +127,11 @@ fn create_chunked_array_factory(
     *next_factory += 1;
     let descriptor = format!("(){array_descriptor}");
     let mut instructions = Vec::new();
-    append_empty_array(&mut instructions, cp, element_type, prepared.len())?;
+    if let Some(field) = storage_field {
+        instructions.push(Instruction::Getstatic(field));
+    } else {
+        append_empty_array(&mut instructions, cp, element_type, prepared.len())?;
+    }
     instructions.push(Instruction::Astore_0);
     let owner = cp.add_class(owner_class)?;
     for fill_method in fill_methods {
@@ -151,10 +157,15 @@ fn create_byte_array_factory(
     elements: &[oomir::Constant],
     methods: &mut Vec<jvm::Method>,
     next_factory: &mut usize,
+    storage_field: Option<u16>,
 ) -> jvm::Result<oomir::Constant> {
     let owner = cp.add_class(owner_class)?;
     let mut instructions = Vec::new();
-    append_empty_array(&mut instructions, cp, element_type, elements.len())?;
+    if let Some(field) = storage_field {
+        instructions.push(Instruction::Getstatic(field));
+    } else {
+        append_empty_array(&mut instructions, cp, element_type, elements.len())?;
+    }
     let chunk_size = (MAX_INLINE_CONSTANT_INSTRUCTIONS / 4).max(1) * oomir::PACKED_BYTE_CHUNK;
     for (chunk_index, chunk) in elements.chunks(chunk_size).enumerate() {
         let name = format!("_constant_fill_{}", *next_factory);
@@ -200,6 +211,7 @@ pub(super) fn create_shared_array_factory(
         elements,
         methods,
         next_factory,
+        None,
     )?;
     let oomir::Constant::FactoryCall {
         method_name: builder_method,
@@ -262,6 +274,7 @@ pub(super) fn create_constant_factory(
             elements,
             methods,
             next_factory,
+            None,
         );
     }
     if let oomir::Constant::Slice(element_type, elements) = constant
@@ -274,6 +287,7 @@ pub(super) fn create_constant_factory(
             elements,
             methods,
             next_factory,
+            None,
         )?;
         return create_constant_factory(
             cp,

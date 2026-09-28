@@ -10,6 +10,9 @@ pub(in crate::lower2) fn create_static_initializer_method(
     next_factory: &mut usize,
 ) -> jvm::Result<jvm::Method> {
     let mut instructions = Vec::new();
+    // Publish addresses before evaluating any initializer. Rust statics can
+    // point to themselves or form cycles across independently initialized JVM
+    // classes; their references must never capture an uninitialized field.
     for static_value in statics {
         if static_value.is_thread_local {
             return Err(jvm::Error::VerificationError {
@@ -21,27 +24,10 @@ pub(in crate::lower2) fn create_static_initializer_method(
             });
         }
 
-        let initializer = create_constant_factory(
-            cp,
-            owner_class,
-            &static_value.initializer,
-            methods,
-            next_factory,
-        )?;
-        let initializer_type = oomir::Type::from_constant(&initializer);
-        load_constant(&mut instructions, cp, &initializer)?;
-
-        if matches!(static_value.storage_type, oomir::Type::Pointer(_)) {
-            if initializer_type.has_jvm_value() {
-                instructions.extend(get_cast_instructions(
-                    "<clinit>",
-                    &initializer_type,
-                    &oomir::Type::Class("java/lang/Object".to_string()),
-                    cp,
-                )?);
-            } else {
-                instructions.push(Instruction::Aconst_null);
-            }
+        if let oomir::Constant::Array(element_type, elements) = &static_value.initializer {
+            append_empty_array(&mut instructions, cp, element_type, elements.len())?;
+        } else {
+            instructions.push(Instruction::Aconst_null);
             load_constant(
                 &mut instructions,
                 cp,
@@ -98,6 +84,57 @@ pub(in crate::lower2) fn create_static_initializer_method(
             &static_value.storage_type.to_jvm_descriptor(),
         )?;
         instructions.push(Instruction::Putstatic(field_ref));
+    }
+
+    for static_value in statics {
+        let field_ref = cp.add_field_ref(
+            this_class_index,
+            &static_value.field_name,
+            &static_value.storage_type.to_jvm_descriptor(),
+        )?;
+        let initializer =
+            if let oomir::Constant::Array(element_type, elements) = &static_value.initializer {
+                // Fill the published array in place, including large chunked
+                // constants, without allocating and copying a second array.
+                factories::create_chunked_array_factory(
+                    cp,
+                    owner_class,
+                    element_type,
+                    elements,
+                    methods,
+                    next_factory,
+                    Some(field_ref),
+                )?
+            } else {
+                instructions.push(Instruction::Getstatic(field_ref));
+                create_constant_factory(
+                    cp,
+                    owner_class,
+                    &static_value.initializer,
+                    methods,
+                    next_factory,
+                )?
+            };
+        load_constant(&mut instructions, cp, &initializer)?;
+        if matches!(static_value.storage_type, oomir::Type::Pointer(_)) {
+            let initializer_type = oomir::Type::from_constant(&initializer);
+            if initializer_type.has_jvm_value() {
+                instructions.extend(get_cast_instructions(
+                    "<clinit>",
+                    &initializer_type,
+                    &oomir::Type::Class("java/lang/Object".to_string()),
+                    cp,
+                )?);
+            } else {
+                instructions.push(Instruction::Aconst_null);
+            }
+            let pointer_class = cp.add_class(oomir::POINTER_CLASS)?;
+            let initialize =
+                cp.add_method_ref(pointer_class, "initializeStatic", "(Ljava/lang/Object;)V")?;
+            instructions.push(Instruction::Invokevirtual(initialize));
+        } else {
+            instructions.push(Instruction::Pop);
+        }
     }
     instructions.push(Instruction::Return);
 

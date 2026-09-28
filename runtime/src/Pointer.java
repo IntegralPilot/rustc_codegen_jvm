@@ -5247,6 +5247,19 @@ public final class Pointer {
         return metadata < 0 ? pointer : pointer.withMetadata(metadata);
     }
 
+    /** Populate published static storage without changing the address captured
+     * by self-references or by another static's initializer. Includes ZST carriers. */
+    public void initializeStatic(Object value) {
+        if (!(allocation instanceof Cell) || byteOffset != 0
+                || viewSize != allocationElementSize) {
+            throw new IllegalStateException("expected a complete static cell");
+        }
+        writeElement(0, value);
+        metadata = mayCarryStructuralMetadata(value, allocationElementSize)
+                ? inferredStructuralMetadata(value)
+                : -1;
+    }
+
     /** Installs a JVM carrier in a zero-sized local without changing its address.
      * Rust stores to ZST bytes remain no-ops; local initialization must still
      * supply the complete carrier, whose constructor may have ZST fields. */
