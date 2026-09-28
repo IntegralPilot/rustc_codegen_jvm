@@ -1,6 +1,8 @@
 #![feature(thread_spawn_hook)]
 #![feature(internal_output_capture)]
 
+mod raw_pointer_tls;
+
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher, Hasher, RandomState};
@@ -28,6 +30,7 @@ thread_local! {
 }
 
 fn main() {
+    raw_pointer_tls::run();
     spawn_join_and_names();
     scoped_threads();
     mutex_and_poisoning();

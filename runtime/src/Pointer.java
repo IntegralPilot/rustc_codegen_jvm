@@ -11890,8 +11890,22 @@ public final class Pointer {
      * through a transparent JVM wrapper such as {@code Pin<&mut (T,)>}.
      */
     private Pointer nominalManagedPointee(String targetClassName) {
-        Object value = getObject();
-        if (value == null) {
+        // Copying a raw pointer must not dereference it: null, dangling,
+        // one-past-end, and uninitialized pointees are all valid here. Only
+        // inspect existing managed carriers to recover transparent wrappers.
+        Object value = directCellValueOrSelf();
+        if (value == this
+                && allocation instanceof Object[]
+                && allocationElementSize > 0
+                && byteOffset >= 0
+                && byteOffset % allocationElementSize == 0) {
+            long index = byteOffset / allocationElementSize;
+            Object[] elements = (Object[]) allocation;
+            if (index < elements.length) {
+                value = elements[(int) index];
+            }
+        }
+        if (value == this || value == null) {
             return this;
         }
         try {
