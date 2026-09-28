@@ -3,6 +3,7 @@
 
 use core::mem::MaybeUninit;
 
+mod function_arrays;
 mod reconstructed_traits;
 mod scalar_constants;
 
@@ -2405,6 +2406,7 @@ fn exposed_allocation_churn() {
 
 fn main() {
     reconstructed_traits::run();
+    function_arrays::run();
     scalar_constants::run();
     generic_fat_pointer_casts();
     basic_raw_pointer_round_trip();

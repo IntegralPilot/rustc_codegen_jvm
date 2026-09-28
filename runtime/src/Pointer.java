@@ -6385,7 +6385,7 @@ public final class Pointer {
             // Receiver erasure creates fresh wrappers around the same static code.
             // Numeric addresses identify the adaptation and target, not each wrapper.
             Map<Object, Pointer> cells = FUNCTION_POINTER_CELLS;
-            Object identity = value;
+            Object identity = FunctionPointers.identity(value);
             if (value instanceof FunctionPointerAdapter) {
                 identity = canonicalFunctionPointer(
                         ((FunctionPointerAdapter) value).functionPointerTarget());
@@ -10036,7 +10036,9 @@ public final class Pointer {
         if (direct != this && direct instanceof TraitObjectCarrier) {
             return direct;
         }
-        if (direct != this && MANAGED_OBJECT_VIEW_CODEC.equals(viewCodecClassName)) {
+        if (direct != this
+                && MANAGED_OBJECT_VIEW_CODEC.equals(viewCodecClassName)
+                && isDirectAllocationView()) {
             return direct;
         }
         if (viewSize == 0 && zeroSizedSourceViewSize() >= 0) {

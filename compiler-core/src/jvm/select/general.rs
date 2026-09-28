@@ -83,7 +83,7 @@ impl Selector<'_> {
                 let sam = &self.body.methods[signature.index()];
                 let target = &self.body.methods[target.index()];
                 let descriptor = method_descriptor(self.types, sam)?;
-                let class = self.cp.add_class("java/lang/invoke/LambdaMetafactory")?;
+                let class = self.cp.add_class("org/rustlang/runtime/FunctionPointers")?;
                 let method = self.cp.add_method_ref(class, "metafactory", METAFACTORY)?;
                 let bootstrap_method_ref = self
                     .cp

@@ -472,6 +472,33 @@ pub(crate) fn ensure_fn_pointer_adapter_class<'tcx>(
         function.name = relative_method_name.clone();
         oomir::DataTypeMethod::Function(function)
     });
+    let code_identity = match target_function {
+        Some(FnPointerTarget::Static(_) | FnPointerTarget::ImportedStatic(_)) => identity,
+        _ => format!("{class_name}::call:{descriptor}"),
+    };
+    let oomir::DataTypeMethod::Function(mut identity_method) = call_method.clone() else {
+        unreachable!("function-pointer adapters are OOMIR functions");
+    };
+    identity_method.name = "functionPointerIdentity".into();
+    identity_method.signature.params.truncate(1);
+    identity_method.signature.ret = Box::new(oomir::Type::java_string());
+    identity_method.body = oomir::CodeBlock {
+        entry: "bb0".into(),
+        basic_blocks: HashMap::from_iter([(
+            "bb0".into(),
+            oomir::BasicBlock {
+                label: "bb0".into(),
+                instructions: vec![oomir::Instruction::Return {
+                    operand: Some(oomir::Operand::Constant(oomir::Constant::String(
+                        code_identity,
+                    ))),
+                }],
+            },
+        )]),
+    }
+    .into();
+    let identity_method = oomir::DataTypeMethod::Function(identity_method);
+    let identity_interface = "org/rustlang/runtime/StaticFunctionPointer".to_string();
 
     match data_types.get_mut(&class_name) {
         Some(oomir::DataType::Class {
@@ -479,6 +506,12 @@ pub(crate) fn ensure_fn_pointer_adapter_class<'tcx>(
             interfaces,
             ..
         }) => {
+            methods
+                .entry("functionPointerIdentity".into())
+                .or_insert(identity_method);
+            if !interfaces.contains(&identity_interface) {
+                interfaces.push(identity_interface);
+            }
             methods.entry("call".to_string()).or_insert(call_method);
             if let Some(relative_call_method) = relative_call_method {
                 methods
@@ -503,7 +536,10 @@ pub(crate) fn ensure_fn_pointer_adapter_class<'tcx>(
             );
         }
         None => {
-            let mut methods = HashMap::from_iter([("call".to_string(), call_method)]);
+            let mut methods = HashMap::from_iter([
+                ("call".to_string(), call_method),
+                ("functionPointerIdentity".into(), identity_method),
+            ]);
             if let Some(relative_call_method) = relative_call_method {
                 methods.insert(relative_method_name, relative_call_method);
             }
@@ -514,7 +550,7 @@ pub(crate) fn ensure_fn_pointer_adapter_class<'tcx>(
                     is_abstract: false,
                     methods,
                     super_class: Some("java/lang/Object".to_string()),
-                    interfaces: vec![interface_name.to_string()],
+                    interfaces: vec![interface_name.to_string(), identity_interface],
                 },
             );
         }
