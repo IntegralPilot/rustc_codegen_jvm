@@ -43,7 +43,14 @@ pub(super) fn concrete<'tcx>(
                 "startsWithChar".to_string(),
             ))
         }
-        oomir::Type::Str if declared_method_name == "starts_with" => {
+        // Other Pattern implementations (character slices, predicates, &&str)
+        // must use compiled Rust rather than the string-only runtime helper.
+        oomir::Type::Str
+            if declared_method_name == "starts_with"
+                && oomir_operands.get(1).is_some_and(|operand| {
+                    matches!(operand.get_type(), Some(oomir::Type::Str))
+                }) =>
+        {
             Some((oomir::UTF8_VIEW_CLASS.to_string(), "startsWith".to_string()))
         }
         oomir::Type::Str

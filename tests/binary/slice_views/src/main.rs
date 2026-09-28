@@ -1,3 +1,5 @@
+mod str_patterns;
+
 fn sum(values: &[i32]) -> i32 {
     let mut total = 0;
     let mut index = 0;
@@ -288,6 +290,7 @@ fn main() {
     check_shim_boundary_match();
     check_utf8_string_bridge();
     check_utf8_char_prefix();
+    str_patterns::run();
     check_utf8_byte_contents();
     check_slice_to_str_view();
     check_slice_to_array_conversions();
