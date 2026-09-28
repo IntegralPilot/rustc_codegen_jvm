@@ -1,4 +1,5 @@
 mod borrowed_enum;
+mod constant_options;
 
 #[derive(Copy, Clone)]
 enum ComputeStep<T> {
@@ -342,6 +343,7 @@ fn higher_ranked_maybe_uninit_slice() {
 
 fn main() {
     borrowed_enum::run();
+    constant_options::run();
     higher_ranked_maybe_uninit_slice();
     function_pointer_address_roundtrips();
 

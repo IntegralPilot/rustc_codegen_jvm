@@ -2,7 +2,8 @@ use crate::lower1::context::Definitions;
 use rustc_abi::{BackendRepr, FieldIdx, FieldsShape, Size, TagEncoding, VariantIdx, Variants};
 use rustc_hash::FxHashMap as HashMap;
 use rustc_middle::mir::interpret::{
-    AllocId, AllocRange, Allocation, CtfeProvenance, GlobalAlloc, Pointer, Provenance, Scalar,
+    AllocId, AllocInit, AllocRange, Allocation, CtfeProvenance, GlobalAlloc, Pointer, Provenance,
+    Scalar,
 };
 use rustc_middle::ty::consts::ConstExt;
 use rustc_middle::ty::layout::TyAndLayout;
@@ -67,9 +68,7 @@ fn anonymous_memory_identity(
     Some(format!("{}::memory::{hash}", tcx.crate_name(LOCAL_CRATE)))
 }
 
-/// Decode the optimized `ConstValue::Slice` representation. Rust uses that
-/// representation for every reference whose pointee has a slice tail, not
-/// merely for `&str` and `&[T]`.
+/// Decode a pointer-valued scalar, including aggregates with a scalar ABI.
 pub fn read_pointer_constant<'tcx>(
     tcx: TyCtxt<'tcx>,
     pointer: Pointer<CtfeProvenance>,
@@ -89,10 +88,6 @@ pub fn read_pointer_constant<'tcx>(
     if let TyKind::Pat(inner, _) = ty.kind() {
         return read_pointer_constant(tcx, pointer, *inner, oomir_data_types, instance);
     }
-    if let Some(field_ty) = scalar_struct_field_ty(tcx, ty)? {
-        return read_pointer_constant(tcx, pointer, field_ty, oomir_data_types, instance);
-    }
-
     match ty.kind() {
         TyKind::FnPtr(..) => {
             read_function_pointer_constant(tcx, pointer, ty, oomir_data_types, instance)
@@ -143,7 +138,39 @@ pub fn read_pointer_constant<'tcx>(
                 )
             }
         }
-        _ => read_pointee_constant(tcx, pointer, ty, oomir_data_types, instance),
+        _ => {
+            let layout = tcx
+                .layout_of(TypingEnv::fully_monomorphized().as_query_input(ty))
+                .map_err(|error| format!("Could not determine scalar constant layout: {error:?}"))?;
+            if !matches!(layout.backend_repr, BackendRepr::Scalar(_))
+                || layout.size != tcx.data_layout.pointer_size()
+            {
+                return Err(format!("Unexpected pointer scalar for constant type {ty:?}"));
+            }
+            // This pointer is the aggregate's contents, not its address. Put
+            // the scalar in temporary storage so the normal decoder preserves
+            // enum niches, field types, and function-pointer provenance.
+            let mut allocation =
+                ConstAllocation::new(layout.size, layout.align.abi, AllocInit::Uninit, ());
+            allocation
+                .write_scalar(
+                    &tcx.data_layout,
+                    AllocRange {
+                        start: Size::ZERO,
+                        size: layout.size,
+                    },
+                    Scalar::from_pointer(pointer, &tcx.data_layout),
+                )
+                .map_err(|error| format!("Could not store pointer scalar: {error:?}"))?;
+            read_constant_value_from_memory(
+                tcx,
+                &allocation,
+                Size::ZERO,
+                ty,
+                oomir_data_types,
+                instance,
+            )
+        }
     }
 }
 
