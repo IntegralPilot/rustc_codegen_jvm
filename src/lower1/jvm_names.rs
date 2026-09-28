@@ -235,7 +235,9 @@ fn jvm_identifier(raw: &str) -> String {
         }
     }
 
-    while out.ends_with('_') {
+    // Only remove a separator inserted for punctuation. A source underscore
+    // is significant (for example zlib's distinct `Len` and `Len_` variants).
+    if previous_was_separator {
         out.pop();
     }
 

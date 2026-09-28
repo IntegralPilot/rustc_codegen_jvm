@@ -41,15 +41,15 @@ pub(crate) fn enum_scoped_method_name(enum_class: &str, method: &str) -> String 
 }
 
 pub(crate) fn union_from_method_name(field_name: &str) -> String {
-    format!("from_{}", jvm_names::member_name(field_name))
+    format!("$union$from${}", jvm_names::member_name(field_name))
 }
 
 pub(crate) fn union_getter_method_name(field_name: &str) -> String {
-    format!("get_{}", jvm_names::member_name(field_name))
+    format!("$union$get${}", jvm_names::member_name(field_name))
 }
 
 pub(crate) fn union_setter_method_name(field_name: &str) -> String {
-    format!("set_{}", jvm_names::member_name(field_name))
+    format!("$union$set${}", jvm_names::member_name(field_name))
 }
 
 pub(crate) fn is_jvm_subtype_variant<'tcx>(

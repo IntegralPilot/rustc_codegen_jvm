@@ -1,3 +1,4 @@
+mod trailing_underscores;
 mod uninhabited;
 
 struct ConfigData {
@@ -65,6 +66,7 @@ impl Drop for CustomDropEnum {
 }
 
 fn main() {
+    trailing_underscores::run();
     uninhabited::run();
     drop(CustomDropEnum::First(DropTracer(1)));
     assert!(ENUM_WRAPPER_DROPS.load(Ordering::SeqCst) == 1);

@@ -468,7 +468,7 @@ pub(crate) fn sanitize_name_token(s: &str) -> String {
             previous_was_separator = true;
         }
     }
-    while token.ends_with('_') {
+    if previous_was_separator {
         token.pop();
     }
     if token.is_empty() {
