@@ -6,6 +6,7 @@ use core::mem::MaybeUninit;
 mod function_arrays;
 mod reconstructed_traits;
 mod scalar_constants;
+mod swapped_references;
 
 fn generic_uninit_slice_data<T>(values: &mut [MaybeUninit<T>]) -> *mut T {
     values.as_mut_ptr().cast::<T>()
@@ -2406,6 +2407,7 @@ fn exposed_allocation_churn() {
 
 fn main() {
     reconstructed_traits::run();
+    swapped_references::run();
     function_arrays::run();
     scalar_constants::run();
     generic_fat_pointer_casts();

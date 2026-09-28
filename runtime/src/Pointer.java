@@ -11380,8 +11380,7 @@ public final class Pointer {
                         directPrimitiveElementSize,
                         source[index] & 0xff);
             }
-        } else if (allocationCodecClassName == null
-                || isBuiltInCodec(allocationCodecClassName)) {
+        } else if (allocationCodecClassName == null) {
             for (int index = 0; index < source.length; index++) {
                 storeByte(byteOffset + index, source[index] & 0xff);
             }
@@ -11393,11 +11392,12 @@ public final class Pointer {
                         Math.toIntExact(Math.floorDiv(absoluteOffset, allocationElementSize));
                 int withinElement = (int) Math.floorMod(absoluteOffset, allocationElementSize);
                 Object current = readElement(elementIndex);
-                CodecPlan plan = codecPlan(allocationCodecClassName);
+                CodecPlan plan = isBuiltInCodec(allocationCodecClassName)
+                        ? null : codecPlan(allocationCodecClassName);
                 int chunk = Math.min(
                         source.length - consumed,
                         allocationElementSize - withinElement);
-                if (plan.isArrayCodecFor(current)) {
+                if (plan != null && plan.isArrayCodecFor(current)) {
                     storeArrayCodecRange(
                             current,
                             withinElement,
@@ -11408,7 +11408,11 @@ public final class Pointer {
                     consumed += chunk;
                     continue;
                 }
-                byte[] image = encodeAggregate(allocationCodecClassName, current);
+                // Decode built-in pointer carriers with their pointee codec
+                // too. Rebuilding an address byte by byte loses its typed view
+                // and cannot represent an intermediate dangling reference.
+                byte[] image = encodeMemoryValue(
+                        current, allocationElementSize, allocationCodecClassName);
                 transferEncodedPointers(
                         allocation,
                         (long) elementIndex * allocationElementSize,
@@ -11427,7 +11431,8 @@ public final class Pointer {
                 transferEncodedReferences(source, image);
                 chunk = Math.min(source.length - consumed, image.length - withinElement);
                 System.arraycopy(source, consumed, image, withinElement, chunk);
-                Object decoded = decodeAggregate(allocationCodecClassName, image);
+                Object decoded = decodeMemoryValue(image, 0, allocationElementSize,
+                        allocationCodecClassName, current == null ? Object.class : current.getClass());
                 discardEncodedReferences(image);
                 writeElementPreservingIdentity(
                         elementIndex,
