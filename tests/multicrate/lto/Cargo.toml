@@ -1,0 +1,15 @@
+[package]
+name = "lto"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+lto_provider = { path = "provider" }
+
+# Exercise both modes: dependency class bundles must survive either LTO flag.
+[profile.dev]
+lto = "thin"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1

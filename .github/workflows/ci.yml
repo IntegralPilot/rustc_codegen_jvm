@@ -9,8 +9,12 @@ on:
 
 jobs:
   typst:
-    name: Typst documents (Ubuntu)
+    name: Typst documents (${{ matrix.profile }}, Ubuntu)
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [debug, release]
     timeout-minutes: 45
     permissions:
       contents: read
@@ -71,13 +75,13 @@ jobs:
       run: python build.py ci
 
     - name: Compile and render Typst documents
-      run: python tests/typst/run.py
+      run: python tests/typst/run.py ${{ matrix.profile == 'release' && '--release' || '' }}
 
     - name: Upload Typst output and diagnostics
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: typst-documents
+        name: typst-documents-${{ matrix.profile }}
         path: target/typst/reports/
         if-no-files-found: warn
 

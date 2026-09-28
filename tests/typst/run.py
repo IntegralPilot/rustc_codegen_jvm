@@ -83,6 +83,7 @@ def main() -> int:
     parser.add_argument("--target-dir", type=Path, default=ROOT / "target/typst/build")
     parser.add_argument("--reports", type=Path, default=ROOT / "target/typst/reports")
     parser.add_argument("--timeout", type=float, default=180)
+    parser.add_argument("--release", action="store_true", help="Build with Cargo's release profile")
     parser.add_argument("--case", action="append", choices=CASES, dest="cases")
     args = parser.parse_args()
     if args.timeout <= 0:
@@ -97,7 +98,8 @@ def main() -> int:
         parser.error(f"missing Typst reporter checkout: {source}")
     # Cargo does not track changes to the backend library or bundled runtime.
     # Rebuild JVM artifacts each time, retaining compiled host build tools.
-    jvm_target = target / TARGET_SPEC.stem
+    profile = "release" if args.release else "debug"
+    jvm_target = target / TARGET_SPEC.stem / profile
     if jvm_target.exists():
         shutil.rmtree(jvm_target)
     reports.mkdir(parents=True, exist_ok=True)
@@ -120,6 +122,8 @@ def main() -> int:
         "-Zjson-target-spec", "-Zbuild-std=std,panic_unwind",
         "-Zbuild-std-features=panic-unwind", "--target-dir", str(target), "-j2",
     ]
+    if args.release:
+        command.append("--release")
     revision = subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=source, text=True
     ).strip()
@@ -127,6 +131,7 @@ def main() -> int:
         "passed": False,
         "source_revision": revision,
         "toolchain": toolchain,
+        "profile": profile,
         "build_command": command,
     }
     original = entry.read_bytes()
@@ -147,7 +152,7 @@ def main() -> int:
             print((reports / "build.stderr.log").read_text(), file=sys.stderr)
             return 1
 
-        jar = target / "jvm-unknown-jvm/debug/typst-shared.jar"
+        jar = jvm_target / "typst-shared.jar"
         report["documents"] = {
             case: run_document(jar, case, reports, args.timeout)
             for case in args.cases or CASES

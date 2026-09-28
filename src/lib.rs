@@ -59,7 +59,6 @@ macro_rules! log {
 
 use crate::lower1::context::Definitions;
 use oomir::Type;
-use rustc_codegen_ssa::back::archive::{ArArchiveBuilder, ArchiveBuilder, ArchiveBuilderBuilder};
 use rustc_codegen_ssa::{
     CompiledModule, CompiledModules, CrateInfo, ModuleKind, traits::CodegenBackend,
 };
@@ -125,6 +124,8 @@ fn combine_class_bundles(path: &Path, bundles: &[(String, PathBuf)]) -> std::io:
 
 mod allocator_shims;
 use allocator_shims::emit_allocator_shims;
+mod archive;
+use archive::RlibArchiveBuilder;
 
 fn lower_mono_function<'tcx>(
     tcx: TyCtxt<'tcx>,
@@ -666,23 +667,4 @@ use std::alloc::Layout;
 /// corresponding to the provided layout failed.
 pub fn custom_alloc_error_hook(layout: Layout) {
     panic!("Memory allocation failed: {} bytes", layout.size());
-}
-
-struct RlibArchiveBuilder;
-impl ArchiveBuilderBuilder for RlibArchiveBuilder {
-    fn new_archive_builder<'a>(&self, sess: &'a Session) -> Box<dyn ArchiveBuilder + 'a> {
-        Box::new(ArArchiveBuilder::new(
-            sess,
-            &rustc_codegen_ssa::back::archive::DEFAULT_OBJECT_READER,
-        ))
-    }
-    fn create_dll_import_lib(
-        &self,
-        _sess: &Session,
-        _lib_name: &str,
-        _dll_imports: std::vec::Vec<rustc_codegen_ssa::back::archive::ImportLibraryItem>,
-        _tmpdir: &Path,
-    ) {
-        unimplemented!("creating dll imports is not supported");
-    }
 }
