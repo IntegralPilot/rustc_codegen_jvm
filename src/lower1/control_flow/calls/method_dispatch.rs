@@ -11,7 +11,7 @@ pub(super) fn interface<'tcx>(
     method_signature: oomir::Signature,
     receiver_operand: oomir::Operand,
     method_args: Vec<oomir::Operand>,
-    declared_method_name: String,
+    interface_method_name: String,
     dispatch_receiver_ty: oomir::Type,
     receiver_self_requires_static_dispatch: bool,
     uses_concrete_trait_default: bool,
@@ -39,7 +39,7 @@ pub(super) fn interface<'tcx>(
         // The method is from an interface - use InvokeInterface
         instructions.push(oomir::Instruction::InvokeInterface {
             class_name: interface_name,
-            method_name: declared_method_name,
+            method_name: interface_method_name,
             method_ty: method_signature,
             args: method_args,
             dest: effective_dest,

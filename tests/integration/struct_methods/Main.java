@@ -8,6 +8,7 @@ public class Main {
         assertFieldConstructor();
         assertStaticAssociatedFunctions();
         assertInstanceAndStaticSelfMethods();
+        assertRustFinalizeIsNotJavaFinalizer();
         assertFieldlessNoArgsConstructorRemains();
         assertConstantStructUsesDeclarationOrder();
 
@@ -84,6 +85,31 @@ public class Main {
         struct_methods.EmptyMarker marker = new struct_methods.EmptyMarker();
         if (marker == null) {
             throw new AssertionError("fieldless Rust structs should keep a no-args constructor");
+        }
+    }
+
+    private static void assertRustFinalizeIsNotJavaFinalizer() throws Exception {
+        for (Method method : struct_methods.NamedCounter.class.getDeclaredMethods()) {
+            if (method.getName().equals("finalize") && method.getParameterCount() == 0
+                    && method.getReturnType() == void.class) {
+                throw new AssertionError("Rust finalize must not override Object.finalize");
+            }
+        }
+
+        struct_methods.NamedCounter counter = new struct_methods.NamedCounter(
+                org.rustlang.runtime.Utf8View.fromJavaString("Finalizer"), 0, 99, true);
+        struct_methods.NamedCounter.class.getMethod("finalize$rust").invoke(counter);
+        struct_methods.NamedCounter.class.getMethod("finalize$rust", struct_methods.NamedCounter.class)
+                .invoke(null, counter);
+        counter.finish();
+        if (counter.count != 3) {
+            throw new AssertionError("renamed finalize must work through instance, static and Rust calls");
+        }
+        if (struct_methods.struct_methods.finish_number() != 8) {
+            throw new AssertionError("renamed finalize must work through a Rust trait adapter");
+        }
+        if (struct_methods.Finalize.class.getMethod("finalize$rust").getReturnType() != void.class) {
+            throw new AssertionError("exported traits must use the same renamed finalize method");
         }
     }
 

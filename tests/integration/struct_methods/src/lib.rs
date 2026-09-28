@@ -44,6 +44,14 @@ impl NamedCounter {
         self.count
     }
 
+    pub fn finalize(&mut self) {
+        self.count += 1;
+    }
+
+    pub fn finish(&mut self) {
+        self.finalize();
+    }
+
     pub fn increment(&mut self) -> bool {
         if !self.enabled {
             return false;
@@ -59,4 +67,25 @@ pub fn accept_empty_marker(_marker: EmptyMarker) {
 
 pub fn default_profile() -> OrderedConstant {
     DEFAULT_PROFILE
+}
+
+pub trait Finalize {
+    fn finalize(&mut self);
+}
+
+impl Finalize for u32 {
+    fn finalize(&mut self) {
+        *self += 1;
+    }
+}
+
+#[inline(never)]
+pub fn finish_trait(value: &mut dyn Finalize) {
+    value.finalize();
+}
+
+pub fn finish_number() -> u32 {
+    let mut number = 7;
+    finish_trait(&mut number);
+    number
 }

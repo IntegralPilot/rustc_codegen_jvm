@@ -551,7 +551,12 @@ pub(crate) fn ensure_trait_object_adapter_class_for_pointees<'tcx>(
         } else {
             target_instance.def_id()
         };
-        let method_name = jvm_names::method_for_function(tcx, method_def_id);
+        let mut method_signature = target_signature.clone();
+        method_signature.is_static = false;
+        let method_name = super::super::naming::avoid_object_method_collision(
+            jvm_names::method_for_function(tcx, method_def_id),
+            &method_signature.to_string(),
+        );
 
         let mut call_args = vec![receiver_operand.clone()];
         call_args.extend(

@@ -11,7 +11,10 @@ use rustc_span::{def_id::DefId, sym};
 const MAX_MONO_FN_NAME_LEN: usize = 128;
 const WEAK_LANG_ITEMS_CLASS: &str = "org/rustlang/runtime/WeakLangItems";
 const GLOBAL_LINK_SYMBOLS_PACKAGE: &str = "org/rustlang/runtime/symbols";
-const FINAL_OBJECT_METHODS: &[(&str, &str)] = &[
+// Rust methods must neither override final Object methods nor opt an object
+// into Java finalization. Rust destruction is handled by explicit drop glue.
+const RESERVED_OBJECT_METHODS: &[(&str, &str)] = &[
+    ("finalize", "()V"),
     ("getClass", "()Ljava/lang/Class;"),
     ("notify", "()V"),
     ("notifyAll", "()V"),
@@ -510,10 +513,13 @@ pub fn associated_method_name_from_instance<'tcx>(
     signature: &crate::oomir::Signature,
 ) -> String {
     let method_name = associated_method_base_name_from_instance(tcx, instance);
-    let descriptor = signature.to_string();
-    if FINAL_OBJECT_METHODS
+    avoid_object_method_collision(method_name, &signature.to_string())
+}
+
+pub fn avoid_object_method_collision(method_name: String, descriptor: &str) -> String {
+    if RESERVED_OBJECT_METHODS
         .iter()
-        .any(|(name, final_descriptor)| method_name == *name && descriptor == *final_descriptor)
+        .any(|(name, reserved_descriptor)| method_name == *name && descriptor == *reserved_descriptor)
     {
         format!("{method_name}$rust")
     } else {

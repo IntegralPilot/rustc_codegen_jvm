@@ -44,6 +44,10 @@ pub(super) fn emit<'tcx>(
             &method_signature,
         );
         let declared_method_name = item.name().as_str().to_string();
+        let interface_method_name = crate::lower1::naming::avoid_object_method_collision(
+            declared_method_name.clone(),
+            &method_signature.to_string(),
+        );
         let is_provided_trait_method = item.trait_container(tcx).is_some_and(|trait_def_id| {
             tcx.provided_trait_methods(trait_def_id).any(|provided| {
                 provided.def_id == item.def_id || item.trait_item_def_id() == Some(provided.def_id)
@@ -152,7 +156,7 @@ pub(super) fn emit<'tcx>(
             };
             instructions.push(oomir::Instruction::InvokeInterface {
                 class_name: interface_name,
-                method_name: declared_method_name,
+                method_name: interface_method_name,
                 method_ty: method_signature,
                 args: method_args,
                 dest: effective_dest,
@@ -168,7 +172,7 @@ pub(super) fn emit<'tcx>(
             };
             instructions.push(oomir::Instruction::InvokeInterface {
                 class_name: interface_name,
-                method_name: declared_method_name,
+                method_name: interface_method_name,
                 method_ty: method_signature,
                 args: method_args,
                 dest: effective_dest,
@@ -206,7 +210,7 @@ pub(super) fn emit<'tcx>(
                     matches!(
                         data_types.get(&interface_name),
                         Some(oomir::DataType::Interface { methods, .. })
-                            if methods.contains_key(&declared_method_name)
+                            if methods.contains_key(&interface_method_name)
                     )
                     .then_some(interface_name)
                 } else {
@@ -755,7 +759,7 @@ pub(super) fn emit<'tcx>(
                     method_signature,
                     receiver_operand,
                     method_args,
-                    declared_method_name,
+                    interface_method_name,
                     dispatch_receiver_ty,
                     receiver_self_requires_static_dispatch,
                     uses_concrete_trait_default,

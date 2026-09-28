@@ -112,7 +112,11 @@ pub(super) fn trait_interface_methods<'tcx>(
             signature.is_static = false;
         }
 
-        methods.insert(assoc_item.name().as_str().to_string(), signature);
+        let method_name = lower1::naming::avoid_object_method_collision(
+            assoc_item.name().as_str().to_string(),
+            &signature.to_jvm_descriptor_with_explicit_params(),
+        );
+        methods.insert(method_name, signature);
     }
 
     methods
