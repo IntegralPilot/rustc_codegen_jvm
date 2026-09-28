@@ -459,25 +459,21 @@ fn lower_body<'tcx>(
     // Closures require special handling - we must use as_closure().sig() instead of fn_sig()
     // Instantiate the function's item type with this instance's generic args, so
     // generic functions get concrete param/return types.
+    // Instantiate its bound lifetimes before lowering parameters and results,
+    // including callbacks that refer to the enclosing signature's lifetimes.
     let instance_ty = tcx
         .type_of(instance.def_id())
         .instantiate(tcx, instance.args)
         .skip_norm_wip();
     let (params_ty, return_ty): (Vec<_>, _) = match instance_ty.kind() {
         TyKind::Closure(_def_id, args) => {
-            let sig = args.as_closure().sig();
-            (
-                sig.inputs().skip_binder().iter().copied().collect(),
-                sig.output().skip_binder(),
-            )
+            let sig = tcx.instantiate_bound_regions_with_erased(args.as_closure().sig());
+            (sig.inputs().to_vec(), sig.output())
         }
         TyKind::FnDef(_def_id, _args) => {
             // For FnDef, compute the signature from the instantiated item type
-            let sig = instance_ty.fn_sig(tcx);
-            (
-                sig.inputs().skip_binder().iter().copied().collect(),
-                sig.output().skip_binder(),
-            )
+            let sig = tcx.instantiate_bound_regions_with_erased(instance_ty.fn_sig(tcx));
+            (sig.inputs().to_vec(), sig.output())
         }
         _ => {
             // Compiler-generated callable bodies such as coroutines have no

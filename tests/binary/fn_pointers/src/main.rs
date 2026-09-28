@@ -1,3 +1,5 @@
+mod borrowed_enum;
+
 #[derive(Copy, Clone)]
 enum ComputeStep<T> {
     Unary(fn(T) -> T),
@@ -339,6 +341,7 @@ fn higher_ranked_maybe_uninit_slice() {
 }
 
 fn main() {
+    borrowed_enum::run();
     higher_ranked_maybe_uninit_slice();
     function_pointer_address_roundtrips();
 
