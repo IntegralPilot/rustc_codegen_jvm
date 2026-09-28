@@ -1,0 +1,705 @@
+[
+  {
+    "height": 1191,
+    "layout": [
+      {
+        "at": [
+          39.685,
+          39.685
+        ],
+        "items": [
+          {
+            "at": [
+              0.0,
+              9.03
+            ],
+            "size": 14.0,
+            "text": "1"
+          },
+          {
+            "at": [
+              11.396,
+              9.03
+            ],
+            "size": 14.0,
+            "text": "Compiler Report"
+          }
+        ],
+        "transform": [
+          1.0,
+          0.0,
+          0.0,
+          1.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "at": [
+          39.685,
+          56.215
+        ],
+        "items": [
+          {
+            "at": [
+              0.0,
+              6.58
+            ],
+            "size": 10.0,
+            "text": "This paragraph contains "
+          },
+          {
+            "at": [
+              103.312,
+              6.58
+            ],
+            "size": 10.0,
+            "text": "bold text"
+          },
+          {
+            "at": [
+              143.772,
+              6.58
+            ],
+            "size": 10.0,
+            "text": ", "
+          },
+          {
+            "at": [
+              148.953,
+              6.58
+            ],
+            "size": 10.0,
+            "text": "emphasis"
+          },
+          {
+            "at": [
+              185.553,
+              6.58
+            ],
+            "size": 10.0,
+            "text": ", "
+          },
+          {
+            "at": [
+              190.734,
+              6.58
+            ],
+            "size": 8.0,
+            "text": "inline code"
+          },
+          {
+            "at": [
+              244.64,
+              6.58
+            ],
+            "size": 10.0,
+            "text": ", and a "
+          },
+          {
+            "at": [
+              275.402,
+              6.58
+            ],
+            "size": 10.0,
+            "text": "link"
+          },
+          {
+            "at": [
+              291.292,
+              6.58
+            ],
+            "size": 10.0,
+            "text": ". Typography: office, "
+          }
+        ],
+        "transform": [
+          1.0,
+          0.0,
+          0.0,
+          1.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "at": [
+          39.685,
+          75.875
+        ],
+        "size": 10.0,
+        "text": "affine, résumé, naïve, Grüße, 1234567890."
+      },
+      {
+        "at": [
+          39.685,
+          90.275
+        ],
+        "items": [
+          {
+            "at": [
+              0.0,
+              7.74
+            ],
+            "size": 12.0,
+            "text": "1.1"
+          },
+          {
+            "at": [
+              18.864,
+              7.74
+            ],
+            "size": 12.0,
+            "text": "Structure"
+          }
+        ],
+        "transform": [
+          1.0,
+          0.0,
+          0.0,
+          1.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "at": [
+          39.685,
+          105.515
+        ],
+        "items": [
+          {
+            "at": [
+              0.0,
+              6.58
+            ],
+            "size": 10.0,
+            "text": "•"
+          },
+          {
+            "at": [
+              8.51,
+              6.58
+            ],
+            "size": 10.0,
+            "text": "A short item"
+          },
+          {
+            "at": [
+              0.0,
+              19.66
+            ],
+            "size": 10.0,
+            "text": "•"
+          },
+          {
+            "at": [
+              8.51,
+              13.08
+            ],
+            "items": [
+              {
+                "at": [
+                  0.0,
+                  6.58
+                ],
+                "size": 10.0,
+                "text": "A second item with "
+              },
+              {
+                "at": [
+                  82.15,
+                  6.58
+                ],
+                "size": 10.0,
+                "text": "styled content"
+              },
+              {
+                "at": [
+                  0.0,
+                  13.08
+                ],
+                "items": [
+                  {
+                    "at": [
+                      0.0,
+                      6.58
+                    ],
+                    "size": 10.0,
+                    "text": "‣"
+                  },
+                  {
+                    "at": [
+                      8.75,
+                      6.58
+                    ],
+                    "size": 10.0,
+                    "text": "A nested item"
+                  }
+                ],
+                "transform": [
+                  1.0,
+                  0.0,
+                  0.0,
+                  1.0,
+                  0.0,
+                  0.0
+                ]
+              }
+            ],
+            "transform": [
+              1.0,
+              0.0,
+              0.0,
+              1.0,
+              0.0,
+              0.0
+            ]
+          }
+        ],
+        "transform": [
+          1.0,
+          0.0,
+          0.0,
+          1.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "at": [
+          39.685,
+          150.255
+        ],
+        "items": [
+          {
+            "at": [
+              0.0,
+              6.58
+            ],
+            "size": 10.0,
+            "text": "1."
+          },
+          {
+            "at": [
+              11.85,
+              6.58
+            ],
+            "size": 10.0,
+            "text": "First ordered item"
+          },
+          {
+            "at": [
+              0.0,
+              13.08
+            ],
+            "items": [
+              {
+                "at": [
+                  0.0,
+                  6.58
+                ],
+                "size": 10.0,
+                "text": "2."
+              },
+              {
+                "at": [
+                  11.85,
+                  6.58
+                ],
+                "size": 10.0,
+                "text": "Second ordered item"
+              }
+            ],
+            "transform": [
+              1.0,
+              0.0,
+              0.0,
+              1.0,
+              0.0,
+              0.0
+            ]
+          }
+        ],
+        "transform": [
+          1.0,
+          0.0,
+          0.0,
+          1.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "at": [
+          39.685,
+          181.915
+        ],
+        "items": [
+          {
+            "at": [
+              8.0,
+              14.58
+            ],
+            "size": 10.0,
+            "text": "A coloured block with a footnote"
+          },
+          {
+            "at": [
+              142.87,
+              14.58
+            ],
+            "size": 10.0,
+            "text": "1"
+          },
+          {
+            "at": [
+              145.94,
+              14.58
+            ],
+            "size": 10.0,
+            "text": " and enough text to exercise line wrapping across its "
+          },
+          {
+            "at": [
+              8.0,
+              27.66
+            ],
+            "size": 10.0,
+            "text": "width."
+          }
+        ],
+        "transform": [
+          1.0,
+          0.0,
+          0.0,
+          1.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "at": [
+          39.685,
+          229.575
+        ],
+        "items": [
+          {
+            "at": [
+              0.0,
+              6.58
+            ],
+            "size": 10.0,
+            "text": "Section 1."
+          },
+          {
+            "at": [
+              45.665,
+              6.58
+            ],
+            "size": 10.0,
+            "text": " Layout handles text wrapping, "
+          },
+          {
+            "at": [
+              0.0,
+              19.66
+            ],
+            "size": 10.0,
+            "text": "justification, and paragraph spacing across "
+          },
+          {
+            "at": [
+              0.0,
+              32.74
+            ],
+            "size": 10.0,
+            "text": "columns. The quick brown fox jumps over "
+          },
+          {
+            "at": [
+              0.0,
+              45.82
+            ],
+            "size": 10.0,
+            "text": "the lazy dog."
+          },
+          {
+            "at": [
+              0.0,
+              64.4
+            ],
+            "size": 10.0,
+            "text": "Section 2."
+          },
+          {
+            "at": [
+              45.665,
+              64.4
+            ],
+            "size": 10.0,
+            "text": " Layout handles text wrapping, "
+          },
+          {
+            "at": [
+              0.0,
+              77.48
+            ],
+            "size": 10.0,
+            "text": "justification, and paragraph spacing across "
+          },
+          {
+            "at": [
+              0.0,
+              90.56
+            ],
+            "size": 10.0,
+            "text": "columns. The quick brown fox jumps over "
+          },
+          {
+            "at": [
+              0.0,
+              103.64
+            ],
+            "size": 10.0,
+            "text": "the lazy dog."
+          },
+          {
+            "at": [
+              0.0,
+              122.22
+            ],
+            "size": 10.0,
+            "text": "Section 3."
+          },
+          {
+            "at": [
+              45.665,
+              122.22
+            ],
+            "size": 10.0,
+            "text": " Layout handles text wrapping, "
+          },
+          {
+            "at": [
+              0.0,
+              135.3
+            ],
+            "size": 10.0,
+            "text": "justification, and paragraph spacing across "
+          },
+          {
+            "at": [
+              0.0,
+              148.38
+            ],
+            "size": 10.0,
+            "text": "columns. The quick brown fox jumps over "
+          },
+          {
+            "at": [
+              0.0,
+              161.46
+            ],
+            "size": 10.0,
+            "text": "the lazy dog."
+          },
+          {
+            "at": [
+              0.0,
+              180.04
+            ],
+            "size": 10.0,
+            "text": "Section 4."
+          },
+          {
+            "at": [
+              45.665,
+              180.04
+            ],
+            "size": 10.0,
+            "text": " Layout handles text wrapping, "
+          },
+          {
+            "at": [
+              0.0,
+              193.12
+            ],
+            "size": 10.0,
+            "text": "justification, and paragraph spacing across "
+          },
+          {
+            "at": [
+              0.0,
+              206.2
+            ],
+            "size": 10.0,
+            "text": "columns. The quick brown fox jumps over "
+          },
+          {
+            "at": [
+              0.0,
+              219.28
+            ],
+            "size": 10.0,
+            "text": "the lazy dog."
+          },
+          {
+            "at": [
+              0.0,
+              237.86
+            ],
+            "size": 10.0,
+            "text": "Section 5."
+          },
+          {
+            "at": [
+              45.665,
+              237.86
+            ],
+            "size": 10.0,
+            "text": " Layout handles text wrapping, "
+          },
+          {
+            "at": [
+              0.0,
+              250.94
+            ],
+            "size": 10.0,
+            "text": "justification, and paragraph spacing across "
+          },
+          {
+            "at": [
+              0.0,
+              264.02
+            ],
+            "size": 10.0,
+            "text": "columns. The quick brown fox jumps over "
+          },
+          {
+            "at": [
+              0.0,
+              277.1
+            ],
+            "size": 10.0,
+            "text": "the lazy dog."
+          },
+          {
+            "at": [
+              193.087,
+              0.0
+            ],
+            "items": [
+              {
+                "at": [
+                  0.0,
+                  6.58
+                ],
+                "size": 10.0,
+                "text": "Section 6."
+              },
+              {
+                "at": [
+                  45.665,
+                  6.58
+                ],
+                "size": 10.0,
+                "text": " Layout handles text wrapping, "
+              },
+              {
+                "at": [
+                  0.0,
+                  19.66
+                ],
+                "size": 10.0,
+                "text": "justification, and paragraph spacing across "
+              },
+              {
+                "at": [
+                  0.0,
+                  32.74
+                ],
+                "size": 10.0,
+                "text": "columns. The quick brown fox jumps over "
+              },
+              {
+                "at": [
+                  0.0,
+                  45.82
+                ],
+                "size": 10.0,
+                "text": "the lazy dog."
+              }
+            ],
+            "transform": [
+              1.0,
+              0.0,
+              0.0,
+              1.0,
+              0.0,
+              0.0
+            ]
+          }
+        ],
+        "transform": [
+          1.0,
+          0.0,
+          0.0,
+          1.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "at": [
+          39.685,
+          549.998
+        ],
+        "items": [
+          {
+            "at": [
+              0.0,
+              0.0
+            ],
+            "items": [
+              {
+                "at": [
+                  8.5,
+                  5.593
+                ],
+                "size": 8.5,
+                "text": "1"
+              },
+              {
+                "at": [
+                  11.535,
+                  5.593
+                ],
+                "size": 8.5,
+                "text": "Footnote text verifies placement."
+              }
+            ],
+            "transform": [
+              1.0,
+              0.0,
+              0.0,
+              1.0,
+              0.0,
+              0.0
+            ]
+          }
+        ],
+        "transform": [
+          1.0,
+          0.0,
+          0.0,
+          1.0,
+          0.0,
+          0.0
+        ]
+      }
+    ],
+    "text": "1Compiler ReportThis paragraph contains bold text, emphasis, inline code, and a link. Typography: office, affine, résumé, naïve, Grüße, 1234567890.1.1Structure•A short item•A second item with styled content‣A nested item1.First ordered item2.Second ordered itemA coloured block with a footnote1 and enough text to exercise line wrapping across its width.Section 1. Layout handles text wrapping, justification, and paragraph spacing across columns. The quick brown fox jumps over the lazy dog.Section 2. Layout handles text wrapping, justification, and paragraph spacing across columns. The quick brown fox jumps over the lazy dog.Section 3. Layout handles text wrapping, justification, and paragraph spacing across columns. The quick brown fox jumps over the lazy dog.Section 4. Layout handles text wrapping, justification, and paragraph spacing across columns. The quick brown fox jumps over the lazy dog.Section 5. Layout handles text wrapping, justification, and paragraph spacing across columns. The quick brown fox jumps over the lazy dog.Section 6. Layout handles text wrapping, justification, and paragraph spacing across columns. The quick brown fox jumps over the lazy dog.1Footnote text verifies placement.",
+    "width": 907
+  }
+]
