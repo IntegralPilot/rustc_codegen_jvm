@@ -32,6 +32,8 @@ impl DynValue for LocalI64 {
 }
 
 fn main() {
+    assert_eq!(provider::zero_sized::check::<u32>(None), Ok(()));
+    assert_eq!(provider::zero_sized::check(Some(17_u32)), Err(17));
     // Instantiation the provider exercised itself.
     assert!(provider_score() == 42);
 

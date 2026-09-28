@@ -239,6 +239,16 @@ pub(crate) fn read_zero_sized_constant<'tcx>(
         return Ok(oomir::Constant::Null(oomir_ty));
     }
 
+    // A zero-sized Rust constant can still construct a nominal JVM object.
+    // Private types in upstream generic bodies may never have been emitted by
+    // their defining crate, so materialize their schema before constructing it.
+    if matches!(ty.kind(), TyKind::Adt(..))
+        && let oomir::Type::Class(class_name) = &oomir_ty
+        && !oomir_data_types.contains_key(class_name)
+    {
+        force_define_named_adt(ty, tcx, oomir_data_types, instance);
+    }
+
     match ty.kind() {
         TyKind::FnDef(..) => {
             let oomir::Type::Class(class_name) = oomir_ty else {
