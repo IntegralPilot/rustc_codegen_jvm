@@ -8,6 +8,79 @@ on:
   workflow_dispatch:
 
 jobs:
+  typst:
+    name: Typst Hello World (Ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      PYTHONUTF8: '1'
+      CARGO_INCREMENTAL: '0'
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Checkout pinned Typst reporter
+      uses: actions/checkout@v4
+      with:
+        repository: LDemetrios/typst-shared-library
+        # cargo-jvm-experiment revision used to reproduce issue #61.
+        ref: 55b485f923034f90792cb065ee68bf9f5856bdeb
+        path: target/typst/source
+        persist-credentials: false
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.x'
+
+    - name: Read pinned Rust toolchain
+      id: rust-toolchain
+      shell: bash
+      run: |
+        python - <<'PY'
+        import os, tomllib
+        with open("rust-toolchain.toml", "rb") as file:
+            toolchain = tomllib.load(file)["toolchain"]
+        with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+            output.write(f"channel={toolchain['channel']}\n")
+            output.write(f"components={','.join(toolchain.get('components', []))}\n")
+        PY
+
+    - name: Set up pinned Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: ${{ steps.rust-toolchain.outputs.channel }}
+        components: ${{ steps.rust-toolchain.outputs.components }}
+
+    - name: Set up Java
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: '25'
+
+    - name: Cache Cargo dependencies
+      uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: typst
+        cache-targets: false
+
+    - name: Build backend and tools
+      run: python build.py ci
+
+    - name: Compile and render Typst Hello World
+      run: python tests/typst/run.py
+
+    - name: Upload Typst output and diagnostics
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: typst-hello-world
+        path: target/typst/reports/
+        if-no-files-found: warn
+
   self-tests:
     name: self-tests (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
