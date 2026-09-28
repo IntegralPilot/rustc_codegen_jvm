@@ -3,6 +3,8 @@
 
 use core::mem::MaybeUninit;
 
+mod atomic_views;
+mod borrowed_union_gc;
 mod function_arrays;
 mod reconstructed_traits;
 mod scalar_constants;
@@ -2407,6 +2409,8 @@ fn exposed_allocation_churn() {
 
 fn main() {
     reconstructed_traits::run();
+    atomic_views::run();
+    borrowed_union_gc::run();
     swapped_references::run();
     function_arrays::run();
     scalar_constants::run();

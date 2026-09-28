@@ -4025,6 +4025,12 @@ public final class Pointer {
             if (allocation != null && viewSize > 0 && hasStableManagedCarrier()) {
                 discardMemoryViewsOverlapping(byteOffset, materializedViewSize());
             }
+            // An enum payload can be projected from a decoded carrier without
+            // decoding this field separately. Nested direct writes still need
+            // to reach the enclosing enum's original byte storage.
+            if (allocation instanceof FieldCell) {
+                commitOriginMemoryView(((FieldCell) allocation).owner());
+            }
             return;
         }
         if (allocation == null || viewCodecClassName == null) {
@@ -4457,9 +4463,23 @@ public final class Pointer {
         }
     }
 
+    private static Object memoryViewAllocation(Object value) {
+        if (!mayBeInIdentityFilter(MEMORY_VIEW_ORIGIN_FILTER, value)) {
+            return null;
+        }
+        Map<Object, MemoryViewOrigin> stripe = stateStripe(MEMORY_VIEW_ORIGINS, value);
+        synchronized (stripe) {
+            MemoryViewOrigin origin = stripe.get(value);
+            return origin == null ? null : origin.allocation.get();
+        }
+    }
+
     private static final class FieldCell {
         private final Object fixedOwner;
         private final Object rootOwner;
+        // Direct enum-payload borrows have no parent Pointer. Retain the
+        // decoded owner's storage while this field cell remains reachable.
+        private final Object memoryBacking;
         private final FieldAccess access;
         private volatile boolean hasFieldCells;
         private volatile boolean hasProjectedViews;
@@ -4471,6 +4491,7 @@ public final class Pointer {
         private FieldCell(Object owner, FieldAccess access) {
             fixedOwner = owner;
             rootOwner = null;
+            memoryBacking = memoryViewAllocation(owner);
             this.access = access;
             fieldNameHash = access.fieldNameHash;
         }
@@ -4478,6 +4499,7 @@ public final class Pointer {
         private FieldCell(Cell owner, FieldAccess access) {
             fixedOwner = null;
             rootOwner = owner;
+            memoryBacking = null;
             this.access = access;
             fieldNameHash = access.fieldNameHash;
         }
@@ -4485,6 +4507,7 @@ public final class Pointer {
         private FieldCell(FieldCell owner, FieldAccess access) {
             fixedOwner = null;
             rootOwner = owner;
+            memoryBacking = null;
             this.access = access;
             fieldNameHash = access.fieldNameHash;
         }
@@ -4535,10 +4558,14 @@ public final class Pointer {
             } catch (Throwable error) {
                 throw new IllegalStateException("could not write Rust field pointer", error);
             }
-            commitFieldOwner(owner);
+            // Replacing one field invalidates its descendants, not live views
+            // of sibling fields (for example an inline vector's data when its
+            // length changes before writing a newly inserted element).
+            discardProjectedFieldViews(this);
+            commitOriginMemoryView(owner);
             Object identity = ownerIdentity();
             if (identity != owner) {
-                commitFieldOwner(identity);
+                commitOriginMemoryView(identity);
             }
         }
 
@@ -5456,6 +5483,37 @@ public final class Pointer {
                 || allocation instanceof FieldCell;
     }
 
+    // A union (possibly inside transparent wrappers) has no independently
+    // mutable Java fields for the Rust value. Its decoded carrier can remain
+    // authoritative, which is also necessary for atomics inside MaybeUninit.
+    private static final ClassValue<Boolean> BYTE_STORAGE_CARRIERS = new ClassValue<Boolean>() {
+        protected Boolean computeValue(Class<?> type) {
+            Set<Class<?>> visited = new HashSet<>();
+            while (visited.add(type)) {
+                Field[] fields = PUBLIC_INSTANCE_FIELDS.get(type);
+                if (fields.length == 2) {
+                    Field bytes = optionalInstanceField(type, "_bytes");
+                    Field objects = optionalInstanceField(type, "_objects");
+                    return bytes != null && bytes.getType() == byte[].class
+                            && objects != null && objects.getType() == Object[].class;
+                }
+                if (fields.length != 1) {
+                    return false;
+                }
+                type = fields[0].getType();
+            }
+            return false;
+        }
+    };
+
+    private boolean hasByteStorageCarrier() {
+        if (byteOffset != 0 || viewSize != allocationElementSize) {
+            return false;
+        }
+        Object value = directCellValueOrSelf();
+        return value != null && value != this && BYTE_STORAGE_CARRIERS.get(value.getClass());
+    }
+
     public Pointer projectStructField(
             String ownerClassName,
             String fieldName,
@@ -5513,8 +5571,9 @@ public final class Pointer {
             }
         }
         boolean managedField = fieldType == null || !fieldType.isPrimitive();
-        // Replaceable roots and nested fields use rootField above. Receiver
-        // and decoded carriers can mutate their live JVM fields directly.
+        // Replaceable roots and nested fields use rootField above. Only an
+        // existing carrier may supply a live field here: decoding the whole
+        // parent would write back stale siblings when just this field changes.
         boolean directPrimitiveField =
                 allocation instanceof FieldCell
                         || allocation instanceof ReceiverCell
@@ -5522,7 +5581,11 @@ public final class Pointer {
         if ((managedField || directPrimitiveField) && hasStableManagedCarrier()) {
             Object owner;
             try {
-                owner = managedField || isStructuralViewCodec(viewCodecClassName)
+                owner = isGeneratedAggregateCodec(viewCodecClassName)
+                                && !isDirectAllocationView() && !hasByteStorageCarrier()
+                        ? transparentManagedView(ownerClass != null
+                                ? ownerClass : resolvedRuntimeClass(ownerClassName))
+                        : managedField || isStructuralViewCodec(viewCodecClassName)
                         ? compatibleStructView(ownerClassName)
                         : directAggregate(ownerClass != null
                                 ? ownerClass : resolvedRuntimeClass(ownerClassName));
@@ -7113,7 +7176,10 @@ public final class Pointer {
 
     private Pointer inheritAddressOrigin(Pointer source, long additionalOffset) {
         Pointer origin = source.addressOrigin();
-        if (origin == null) {
+        // A decoded carrier's origin is weakly indexed. Keep its backing cell
+        // alive while any projected pointer can still mutate that carrier;
+        // flattening past it lets GC detach live aliases from their storage.
+        if (origin == null || source.boundMemoryViewState() != null) {
             setAddressOrigin(source, additionalOffset);
         } else {
             setAddressOrigin(

@@ -1,6 +1,7 @@
 #![feature(register_tool)]
 #![register_tool(jvm_codegen)]
 
+mod borrowed_enum;
 mod helper_names;
 mod receivers;
 
@@ -198,6 +199,7 @@ union FlatOuterStorage {
 
 fn main() {
     helper_names::run();
+    borrowed_enum::run();
     receivers::run();
     let bytes = Bytes {
         group1: TwoGroupsOfOneByte { a: 0x01, b: 0x02 },
