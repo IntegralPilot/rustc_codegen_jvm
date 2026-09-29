@@ -13,7 +13,6 @@ import java.lang.invoke.MethodHandles;
 import java.lang.invoke.MethodType;
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
-import java.util.AbstractMap;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -474,7 +473,7 @@ public final class Pointer {
     private static final RebuildableIdentityFilter MEMORY_VIEW_FILTER =
             new RebuildableIdentityFilter();
     private static final RebuildableIdentityFilter MEMORY_VIEW_ORIGIN_FILTER =
-            new RebuildableIdentityFilter();
+            new RebuildableIdentityFilter(REPEATED_ARRAY_FILTER_WORDS, MEMORY_VIEW_ORIGIN_FILTER_REBUILD_MARKS);
     private static final AtomicLongArray MEMORY_VIEW_EPOCHS =
             new AtomicLongArray(STATE_STRIPE_COUNT);
     private static final RebuildableIdentityFilter ENCODED_REFERENCE_FILTER =
@@ -580,7 +579,6 @@ public final class Pointer {
                 || owner == referencedAllocation) {
             return;
         }
-        markIdentityFilter(ENCODED_REFERENCE_FILTER, owner);
         Map<Object, Object> stripe =
                 stateStripe(ENCODED_REFERENCES, owner);
         synchronized (stripe) {
@@ -597,8 +595,9 @@ public final class Pointer {
                 }
                 references.allocations.put(referencedAllocation, Boolean.TRUE);
             }
+            markIdentityFilter(ENCODED_REFERENCE_FILTER, owner);
         }
-        maybeRebuildEncodedReferenceFilter();
+        maybeRebuildIdentityFilter(ENCODED_REFERENCE_FILTER, ENCODED_REFERENCES);
     }
 
     private static void transferEncodedReferences(Object sourceOwner, Object targetOwner) {
@@ -927,7 +926,6 @@ public final class Pointer {
         if (owner == null || target == null || size <= 0 || codec == null) {
             return;
         }
-        markIdentityFilter(ENCODED_POINTER_FILTER, owner);
         Map<Object, LongRangeMap<EncodedPointerState>> stripe =
                 stateStripe(ENCODED_POINTERS, owner);
         synchronized (stripe) {
@@ -940,8 +938,9 @@ public final class Pointer {
             pointers.put(
                     offset,
                     new EncodedPointerState(owner, size, codec, target));
+            markIdentityFilter(ENCODED_POINTER_FILTER, owner);
         }
-        maybeRebuildEncodedPointerFilter();
+        maybeRebuildIdentityFilter(ENCODED_POINTER_FILTER, ENCODED_POINTERS);
     }
 
     private static Pointer encodedPointer(
@@ -1016,7 +1015,6 @@ public final class Pointer {
         if (copied == null) {
             return;
         }
-        markIdentityFilter(ENCODED_POINTER_FILTER, targetOwner);
         Map<Object, LongRangeMap<EncodedPointerState>> targetStripe =
                 stateStripe(ENCODED_POINTERS, targetOwner);
         synchronized (targetStripe) {
@@ -1038,6 +1036,7 @@ public final class Pointer {
                                 entry.codec,
                                 entry.target));
             }
+            markIdentityFilter(ENCODED_POINTER_FILTER, targetOwner);
         }
     }
 
@@ -1088,293 +1087,6 @@ public final class Pointer {
             if (pointers.isEmpty()) {
                 stripe.remove(owner);
             }
-        }
-    }
-
-    private static final class WeakIdentityMap<V> extends AbstractMap<Object, V> {
-        private static final class OpenWeakReference extends WeakReference<Object> {
-            private final int identityHash;
-
-            private OpenWeakReference(Object key, ReferenceQueue<Object> queue) {
-                super(key, queue);
-                identityHash = System.identityHashCode(key);
-            }
-        }
-
-        private final ReferenceQueue<Object> collectedKeys = new ReferenceQueue<>();
-        private OpenWeakReference[] keys;
-        private Object[] values;
-        private int size;
-        private int used;
-        private int readsUntilCleanup = 256;
-
-        private WeakIdentityMap() {
-            this(16);
-        }
-
-        private WeakIdentityMap(int initialCapacity) {
-            int capacity = 16;
-            while (capacity < initialCapacity) {
-                capacity <<= 1;
-            }
-            keys = newTable(capacity);
-            values = new Object[capacity];
-        }
-
-        private static OpenWeakReference[] newTable(int length) {
-            return new OpenWeakReference[length];
-        }
-
-        private static int tableIndex(int hash, int length) {
-            hash ^= hash >>> 16;
-            hash *= 0x7feb352d;
-            hash ^= hash >>> 15;
-            return hash & (length - 1);
-        }
-
-        /** Removes an entry without leaving a tombstone in its probe chain. */
-        private void deleteEntry(int deleted) {
-            if (values[deleted] != null) {
-                size--;
-            }
-            keys[deleted] = null;
-            values[deleted] = null;
-            used--;
-
-            int mask = keys.length - 1;
-            for (int index = (deleted + 1) & mask;
-                    keys[index] != null;
-                    index = (index + 1) & mask) {
-                OpenWeakReference reference = keys[index];
-                int home = tableIndex(reference.identityHash, keys.length);
-                if ((index < home && (home <= deleted || deleted <= index))
-                        || (home <= deleted && deleted <= index)) {
-                    keys[deleted] = reference;
-                    values[deleted] = values[index];
-                    keys[index] = null;
-                    values[index] = null;
-                    deleted = index;
-                }
-            }
-        }
-
-        private void reset() {
-            keys = newTable(16);
-            values = new Object[16];
-            size = 0;
-            used = 0;
-            readsUntilCleanup = 256;
-            while (collectedKeys.poll() != null) {
-                // Entries no longer exist after reset.
-            }
-        }
-
-        private void discardCollectedKeys() {
-            OpenWeakReference collected;
-            while ((collected = (OpenWeakReference) collectedKeys.poll()) != null) {
-                int index = tableIndex(collected.identityHash, keys.length);
-                while (keys[index] != null) {
-                    if (keys[index] == collected) {
-                        deleteEntry(index);
-                        break;
-                    }
-                    index = (index + 1) & (keys.length - 1);
-                }
-            }
-        }
-
-        private void maybeDiscardCollectedKeys() {
-            if (--readsUntilCleanup == 0) {
-                discardCollectedKeys();
-                readsUntilCleanup = 256;
-            }
-        }
-
-        private void rehashForInsert() {
-            discardCollectedKeys();
-            readsUntilCleanup = 256;
-            int newLength =
-                    size * 4 >= keys.length * 3
-                            ? keys.length << 1
-                            : keys.length;
-            OpenWeakReference[] oldKeys = keys;
-            Object[] oldValues = values;
-            keys = newTable(newLength);
-            values = new Object[newLength];
-            size = 0;
-            used = 0;
-            for (int oldIndex = 0; oldIndex < oldKeys.length; oldIndex++) {
-                OpenWeakReference reference = oldKeys[oldIndex];
-                Object key = reference == null ? null : reference.get();
-                if (key == null) {
-                    continue;
-                }
-                int index = tableIndex(reference.identityHash, keys.length);
-                while (keys[index] != null) {
-                    index = (index + 1) & (keys.length - 1);
-                }
-                keys[index] = reference;
-                values[index] = oldValues[oldIndex];
-                size++;
-                used++;
-            }
-        }
-
-        @SuppressWarnings("unchecked")
-        private V valueAt(int index) {
-            return (V) values[index];
-        }
-
-        @Override
-        public V get(Object key) {
-            maybeDiscardCollectedKeys();
-            int index = tableIndex(System.identityHashCode(key), keys.length);
-            while (true) {
-                OpenWeakReference reference = keys[index];
-                if (reference == null) {
-                    return null;
-                }
-                Object live = reference.get();
-                if (live == null) {
-                    // The key can be collected after the batched queue drain;
-                    // leave a tombstone until the next maintenance pass.
-                } else if (live == key) {
-                    return valueAt(index);
-                }
-                index = (index + 1) & (keys.length - 1);
-            }
-        }
-
-        @Override
-        public V put(Object key, V value) {
-            discardCollectedKeys();
-            readsUntilCleanup = 256;
-            if (used * 4 >= keys.length * 3) {
-                rehashForInsert();
-            }
-            int index = tableIndex(System.identityHashCode(key), keys.length);
-            while (true) {
-                OpenWeakReference reference = keys[index];
-                if (reference == null) {
-                    used++;
-                    keys[index] = new OpenWeakReference(key, collectedKeys);
-                    values[index] = value;
-                    size++;
-                    return null;
-                }
-                Object live = reference.get();
-                if (live == null) {
-                    deleteEntry(index);
-                    continue;
-                } else if (live == key) {
-                    V previous = valueAt(index);
-                    values[index] = value;
-                    return previous;
-                }
-                index = (index + 1) & (keys.length - 1);
-            }
-        }
-
-        @Override
-        public V remove(Object key) {
-            discardCollectedKeys();
-            readsUntilCleanup = 256;
-            int index = tableIndex(System.identityHashCode(key), keys.length);
-            while (true) {
-                OpenWeakReference reference = keys[index];
-                if (reference == null) {
-                    return null;
-                }
-                Object live = reference.get();
-                if (live == null) {
-                    deleteEntry(index);
-                    continue;
-                } else if (live == key) {
-                    V previous = valueAt(index);
-                    deleteEntry(index);
-                    if (size == 0) {
-                        reset();
-                    }
-                    return previous;
-                }
-                index = (index + 1) & (keys.length - 1);
-            }
-        }
-
-        @Override
-        public int size() {
-            discardCollectedKeys();
-            for (int index = 0; index < keys.length; ) {
-                OpenWeakReference reference = keys[index];
-                if (reference != null && reference.get() == null) {
-                    deleteEntry(index);
-                } else {
-                    index++;
-                }
-            }
-            return size;
-        }
-
-        @Override
-        public boolean isEmpty() {
-            discardCollectedKeys();
-            if (size == 0) {
-                return true;
-            }
-            for (int index = 0; index < keys.length; ) {
-                OpenWeakReference reference = keys[index];
-                if (reference == null) {
-                    index++;
-                    continue;
-                }
-                if (reference.get() != null) {
-                    return false;
-                }
-                deleteEntry(index);
-            }
-            reset();
-            return true;
-        }
-
-        @Override
-        public Set<Map.Entry<Object, V>> entrySet() {
-            discardCollectedKeys();
-            Set<Map.Entry<Object, V>> entries = new HashSet<>();
-            for (int index = 0; index < keys.length; ) {
-                OpenWeakReference reference = keys[index];
-                Object key = reference == null ? null : reference.get();
-                if (key == null) {
-                    if (reference != null) {
-                        deleteEntry(index);
-                        continue;
-                    }
-                } else {
-                    entries.add(new java.util.AbstractMap.SimpleImmutableEntry<>(
-                            key, valueAt(index)));
-                }
-                index++;
-            }
-            return entries;
-        }
-
-        private long markLiveKeys(AtomicLongArray filter) {
-            discardCollectedKeys();
-            long count = 0;
-            for (int index = 0; index < keys.length; ) {
-                OpenWeakReference reference = keys[index];
-                Object key = reference == null ? null : reference.get();
-                if (key == null) {
-                    if (reference != null) {
-                        deleteEntry(index);
-                        continue;
-                    }
-                } else {
-                    markIdentityFilter(filter, key);
-                    count++;
-                }
-                index++;
-            }
-            return count;
         }
     }
 
@@ -3171,7 +2883,7 @@ public final class Pointer {
             }
         }
         if (created) {
-            maybeRebuildStructuralViewFilter();
+            maybeRebuildIdentityFilter(STRUCTURAL_VIEW_FILTER, STRUCTURAL_VIEWS);
         }
         return state;
     }
@@ -3221,12 +2933,17 @@ public final class Pointer {
     }
 
     private static void markIdentityFilter(RebuildableIdentityFilter filter, Object value) {
-        AtomicLongArray primary = filter.primary;
-        boolean added = markIdentityFilter(primary, value);
-        AtomicLongArray secondary = filter.secondary;
-        if (secondary != null && secondary != primary) {
-            markIdentityFilter(secondary, value);
-        }
+        // The caller holds the owning stripe during publication.
+        // Also mark the replacement filter if a rebuild has passed that stripe.
+        // Recheck primary because the rebuild can publish it and clear secondary between reads.
+        boolean added = false;
+        AtomicLongArray primary;
+        do {
+            primary = filter.primary;
+            added |= markIdentityFilter(primary, value);
+            AtomicLongArray secondary = filter.secondary;
+            if (secondary != null && secondary != primary) markIdentityFilter(secondary, value);
+        } while (primary != filter.primary);
         if (added) {
             filter.marks.incrementAndGet();
         }
@@ -3244,119 +2961,23 @@ public final class Pointer {
                 && mayBeInIdentityFilter(secondary, value);
     }
 
-    private static void maybeRebuildMemoryViewFilter() {
-        if (MEMORY_VIEW_FILTER.marks.get() < MEMORY_VIEW_FILTER.rebuildMarks
-                || !MEMORY_VIEW_FILTER.rebuilding.compareAndSet(0, 1)) {
-            return;
-        }
+    private static void maybeRebuildIdentityFilter(
+            RebuildableIdentityFilter filter, Map<Object, ?>[] stripes) {
+        if (filter.marks.get() < filter.rebuildMarks
+                || !filter.rebuilding.compareAndSet(0, 1)) return;
         try {
-            AtomicLongArray rebuilt =
-                    new AtomicLongArray(MEMORY_VIEW_FILTER.wordCount);
-            MEMORY_VIEW_FILTER.secondary = rebuilt;
-            for (Map<Object, LongRangeMap<MemoryViewState>> stripe : MEMORY_VIEWS) {
+            AtomicLongArray rebuilt = new AtomicLongArray(filter.wordCount);
+            filter.secondary = rebuilt;
+            for (Map<Object, ?> stripe : stripes) {
                 synchronized (stripe) {
-                    ((WeakIdentityMap<LongRangeMap<MemoryViewState>>) stripe)
-                            .markLiveKeys(rebuilt);
+                    ((WeakIdentityMap<?>) stripe).forEachLiveKey(key -> markIdentityFilter(rebuilt, key));
                 }
             }
-            MEMORY_VIEW_FILTER.primary = rebuilt;
-            MEMORY_VIEW_FILTER.secondary = null;
-            MEMORY_VIEW_FILTER.marks.set(0);
+            filter.primary = rebuilt;
+            filter.secondary = null;
+            filter.marks.set(0);
         } finally {
-            MEMORY_VIEW_FILTER.rebuilding.set(0);
-        }
-    }
-
-    private static void maybeRebuildMemoryViewOriginFilter() {
-        if (MEMORY_VIEW_ORIGIN_FILTER.marks.get()
-                        < MEMORY_VIEW_ORIGIN_FILTER_REBUILD_MARKS
-                || !MEMORY_VIEW_ORIGIN_FILTER.rebuilding.compareAndSet(0, 1)) {
-            return;
-        }
-        try {
-            AtomicLongArray rebuilt =
-                    new AtomicLongArray(MEMORY_VIEW_ORIGIN_FILTER.wordCount);
-            MEMORY_VIEW_ORIGIN_FILTER.secondary = rebuilt;
-            for (Map<Object, MemoryViewOrigin> stripe : MEMORY_VIEW_ORIGINS) {
-                synchronized (stripe) {
-                    ((WeakIdentityMap<MemoryViewOrigin>) stripe)
-                            .markLiveKeys(rebuilt);
-                }
-            }
-            MEMORY_VIEW_ORIGIN_FILTER.primary = rebuilt;
-            MEMORY_VIEW_ORIGIN_FILTER.secondary = null;
-            MEMORY_VIEW_ORIGIN_FILTER.marks.set(0);
-        } finally {
-            MEMORY_VIEW_ORIGIN_FILTER.rebuilding.set(0);
-        }
-    }
-
-    private static void maybeRebuildStructuralViewFilter() {
-        if (STRUCTURAL_VIEW_FILTER.marks.get() < STRUCTURAL_VIEW_FILTER.rebuildMarks
-                || !STRUCTURAL_VIEW_FILTER.rebuilding.compareAndSet(0, 1)) {
-            return;
-        }
-        try {
-            AtomicLongArray rebuilt =
-                    new AtomicLongArray(STRUCTURAL_VIEW_FILTER.wordCount);
-            STRUCTURAL_VIEW_FILTER.secondary = rebuilt;
-            for (Map<Object, Map<Long, StructuralViewState>> stripe : STRUCTURAL_VIEWS) {
-                synchronized (stripe) {
-                    ((WeakIdentityMap<Map<Long, StructuralViewState>>) stripe)
-                            .markLiveKeys(rebuilt);
-                }
-            }
-            STRUCTURAL_VIEW_FILTER.primary = rebuilt;
-            STRUCTURAL_VIEW_FILTER.secondary = null;
-            STRUCTURAL_VIEW_FILTER.marks.set(0);
-        } finally {
-            STRUCTURAL_VIEW_FILTER.rebuilding.set(0);
-        }
-    }
-
-    private static void maybeRebuildEncodedReferenceFilter() {
-        if (ENCODED_REFERENCE_FILTER.marks.get() < ENCODED_REFERENCE_FILTER.rebuildMarks
-                || !ENCODED_REFERENCE_FILTER.rebuilding.compareAndSet(0, 1)) {
-            return;
-        }
-        try {
-            AtomicLongArray rebuilt =
-                    new AtomicLongArray(ENCODED_REFERENCE_FILTER.wordCount);
-            ENCODED_REFERENCE_FILTER.secondary = rebuilt;
-            for (Map<Object, Object> stripe : ENCODED_REFERENCES) {
-                synchronized (stripe) {
-                    ((WeakIdentityMap<Object>) stripe).markLiveKeys(rebuilt);
-                }
-            }
-            ENCODED_REFERENCE_FILTER.primary = rebuilt;
-            ENCODED_REFERENCE_FILTER.secondary = null;
-            ENCODED_REFERENCE_FILTER.marks.set(0);
-        } finally {
-            ENCODED_REFERENCE_FILTER.rebuilding.set(0);
-        }
-    }
-
-    private static void maybeRebuildEncodedPointerFilter() {
-        if (ENCODED_POINTER_FILTER.marks.get()
-                        < ENCODED_POINTER_FILTER.rebuildMarks
-                || !ENCODED_POINTER_FILTER.rebuilding.compareAndSet(0, 1)) {
-            return;
-        }
-        try {
-            AtomicLongArray rebuilt =
-                    new AtomicLongArray(ENCODED_POINTER_FILTER.wordCount);
-            ENCODED_POINTER_FILTER.secondary = rebuilt;
-            for (Map<Object, LongRangeMap<EncodedPointerState>> stripe : ENCODED_POINTERS) {
-                synchronized (stripe) {
-                    ((WeakIdentityMap<LongRangeMap<EncodedPointerState>>) stripe)
-                            .markLiveKeys(rebuilt);
-                }
-            }
-            ENCODED_POINTER_FILTER.primary = rebuilt;
-            ENCODED_POINTER_FILTER.secondary = null;
-            ENCODED_POINTER_FILTER.marks.set(0);
-        } finally {
-            ENCODED_POINTER_FILTER.rebuilding.set(0);
+            filter.rebuilding.set(0);
         }
     }
 
@@ -3626,7 +3247,6 @@ public final class Pointer {
                 new MemoryViewState(materializedSize, viewCodecClassName, decoded, image);
         advanceMemoryViewEpoch(allocation);
         setDirectCellHasMemoryView(allocation, true);
-        markIdentityFilter(MEMORY_VIEW_FILTER, allocation);
         synchronized (stripe) {
             LongRangeMap<MemoryViewState> views = stripe.get(allocation);
             if (views == null) {
@@ -3634,12 +3254,10 @@ public final class Pointer {
                 stripe.put(allocation, views);
             }
             views.put(byteOffset, state);
+            markIdentityFilter(MEMORY_VIEW_FILTER, allocation);
         }
         advanceMemoryViewEpoch(allocation);
-        // Mark again after publishing the map entry so a concurrent filter
-        // rebuild cannot miss an insertion whose stripe it already scanned.
-        markIdentityFilter(MEMORY_VIEW_FILTER, allocation);
-        maybeRebuildMemoryViewFilter();
+        maybeRebuildIdentityFilter(MEMORY_VIEW_FILTER, MEMORY_VIEWS);
         setBoundMemoryViewState(state);
         registerMemoryViewOrigin(decoded);
         bindDecodedMemoryView(decoded);
@@ -3680,7 +3298,7 @@ public final class Pointer {
             markIdentityFilter(MEMORY_VIEW_ORIGIN_FILTER, value);
             previous = stripe.put(value, new MemoryViewOrigin(this));
         }
-        maybeRebuildMemoryViewOriginFilter();
+        maybeRebuildIdentityFilter(MEMORY_VIEW_ORIGIN_FILTER, MEMORY_VIEW_ORIGINS);
         Object previousAllocation = previous == null ? null : previous.allocation.get();
         if (previousAllocation instanceof FieldCell && previousAllocation != allocation) {
             removeMemoryOriginView(previousAllocation, value);
