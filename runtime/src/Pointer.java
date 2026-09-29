@@ -2683,6 +2683,12 @@ public final class Pointer {
                 || !mayBeInIdentityFilter(MEMORY_VIEW_FILTER, allocation)) {
             return;
         }
+        synchronized (atomicStripe(this)) {
+            flushMemoryViewsOverlappingLocked(offset, size, overwrite);
+        }
+    }
+
+    private void flushMemoryViewsOverlappingLocked(long offset, int size, boolean overwrite) {
         long observedEpoch = memoryViewEpoch(allocation);
         MemoryViewAbsenceCache absence = MEMORY_VIEW_ABSENCE.get();
         if (absence.matches(allocation, observedEpoch)) {
@@ -2726,6 +2732,12 @@ public final class Pointer {
                 || !mayBeInIdentityFilter(MEMORY_VIEW_FILTER, allocation)) {
             return;
         }
+        synchronized (atomicStripe(this)) {
+            flushAllMemoryViewsLocked();
+        }
+    }
+
+    private void flushAllMemoryViewsLocked() {
         LongRangeMap<MemoryViewState> pending;
         Map<Object, LongRangeMap<MemoryViewState>> stripe =
                 stateStripe(MEMORY_VIEWS, allocation);
@@ -8631,7 +8643,8 @@ public final class Pointer {
         return stripes;
     }
 
-    /** Maps aliases of a Rust atomic location to the same striped monitor. */
+    /** Lock the allocation during atomic access and aggregate decoding or publication.
+     * A decoded view can overlap several atomic fields, so offset locks are insufficient. */
     private static Object atomicStripe(Pointer pointer) {
         return ATOMIC_STRIPES[atomicStripeIndex(pointer)];
     }
@@ -8645,20 +8658,25 @@ public final class Pointer {
     }
 
     private static int atomicStripeIndex(Pointer pointer) {
-        Object identity = pointer.allocation;
-        int memberHash = 0;
+        return atomicStripeIndex(pointer.allocation, pointer.exposedAddress);
+    }
+
+    private static Object atomicStripe(Object root, long offset) {
+        return root instanceof Pointer
+                ? ATOMIC_STRIPES[atomicStripeIndex(((Pointer) root).allocation, ((Pointer) root).exposedAddress + offset)]
+                : ATOMIC_STRIPES[atomicStripeIndex(root, offset)];
+    }
+
+    private static int atomicStripeIndex(Object identity, long exposedAddress) {
         if (identity instanceof ReceiverCell) {
             identity = ((ReceiverCell) identity).value;
         } else if (identity instanceof FieldCell) {
             FieldCell cell = (FieldCell) identity;
             identity = cell.owner();
-            memberHash = cell.fieldNameHash;
         }
         long key = identity == null
-                ? pointer.exposedAddress
-                : ((long) System.identityHashCode(identity) << 32)
-                        ^ ((long) memberHash << 1)
-                        ^ pointer.byteOffset;
+                ? exposedAddress
+                : System.identityHashCode(identity);
         key ^= key >>> 33;
         key *= 0xff51afd7ed558ccdL;
         key ^= key >>> 33;
@@ -8684,49 +8702,109 @@ public final class Pointer {
         return (value << shift) >> shift;
     }
 
-    private static void atomicStoreLocked(Pointer pointer, long value, int byteCount) {
-        pointer.prepareMemoryWrite(pointer.byteOffset, byteCount);
-        pointer.storeBytes(truncateAtomic(value, byteCount), byteCount);
-    }
-
-    private static long atomicLoadStriped(Pointer pointer, int byteCount) {
-        synchronized (atomicStripe(pointer)) {
-            long value = truncateAtomic(pointer.loadUnsigned(byteCount), byteCount);
-            return value;
-        }
-    }
-
     public static long atomicLoad(Pointer pointer, int byteCount, int ordering) {
-        checkedAtomicByteCount(byteCount);
-        if (isSequentiallyConsistent(ordering)) {
-            synchronized (ATOMIC_SEQUENCE_LOCK) {
-                return atomicLoadStriped(pointer, byteCount);
-            }
-        }
-        return atomicLoadStriped(pointer, byteCount);
-    }
-
-    private static void atomicStoreStriped(Pointer pointer, long value, int byteCount) {
-        synchronized (atomicStripe(pointer)) {
-            atomicStoreLocked(pointer, value, byteCount);
-        }
+        return atomicLoad(pointer, 0L, byteCount, ordering);
     }
 
     public static void atomicStore(Pointer pointer, long value, int byteCount, int ordering) {
+        atomicStore(pointer, 0L, value, byteCount, ordering);
+    }
+
+    public static long atomicExchange(Pointer pointer, long value, int byteCount, int ordering) {
+        return atomicExchange(pointer, 0L, value, byteCount, ordering);
+    }
+
+    public static long atomicAdd(Pointer pointer, long value, int byteCount, int ordering) {
+        return atomicAdd(pointer, 0L, value, byteCount, ordering);
+    }
+
+    public static long atomicSubtract(Pointer pointer, long value, int byteCount, int ordering) {
+        return atomicSubtract(pointer, 0L, value, byteCount, ordering);
+    }
+
+    public static long atomicAnd(Pointer pointer, long value, int byteCount, int ordering) {
+        return atomicAnd(pointer, 0L, value, byteCount, ordering);
+    }
+
+    public static long atomicNand(Pointer pointer, long value, int byteCount, int ordering) {
+        return atomicNand(pointer, 0L, value, byteCount, ordering);
+    }
+
+    public static long atomicOr(Pointer pointer, long value, int byteCount, int ordering) {
+        return atomicOr(pointer, 0L, value, byteCount, ordering);
+    }
+
+    public static long atomicXor(Pointer pointer, long value, int byteCount, int ordering) {
+        return atomicXor(pointer, 0L, value, byteCount, ordering);
+    }
+
+    public static long atomicMax(Pointer pointer, long value, int byteCount, int ordering) {
+        return atomicMax(pointer, 0L, value, byteCount, ordering);
+    }
+
+    public static long atomicMin(Pointer pointer, long value, int byteCount, int ordering) {
+        return atomicMin(pointer, 0L, value, byteCount, ordering);
+    }
+
+    public static long atomicUnsignedMax(Pointer pointer, long value, int byteCount, int ordering) {
+        return atomicUnsignedMax(pointer, 0L, value, byteCount, ordering);
+    }
+
+    public static long atomicUnsignedMin(Pointer pointer, long value, int byteCount, int ordering) {
+        return atomicUnsignedMin(pointer, 0L, value, byteCount, ordering);
+    }
+
+    public static long atomicCompareExchange(Pointer pointer, long expected,
+            long value,
+            int byteCount,
+            int successOrdering,
+            int failureOrdering) {
+        return atomicCompareExchange(pointer, 0L, expected, value, byteCount, successOrdering, failureOrdering);
+    }
+
+    private static void atomicStoreLocked(Object root, long offset, long value, int byteCount) {
+        storeLocationBits(root, offset, truncateAtomic(value, byteCount), byteCount);
+    }
+
+    private static long atomicLoadStriped(Object root, long offset, int byteCount) {
+        synchronized (atomicStripe(root, offset)) {
+            return truncateAtomic(loadLocationBits(root, offset, byteCount), byteCount);
+        }
+    }
+
+    public static long atomicLoad(Object root, long offset, int byteCount, int ordering) {
+        root = normalizeLocationOrigin(root);
         checkedAtomicByteCount(byteCount);
         if (isSequentiallyConsistent(ordering)) {
             synchronized (ATOMIC_SEQUENCE_LOCK) {
-                atomicStoreStriped(pointer, value, byteCount);
+                return atomicLoadStriped(root, offset, byteCount);
+            }
+        }
+        return atomicLoadStriped(root, offset, byteCount);
+    }
+
+    private static void atomicStoreStriped(Object root, long offset, long value, int byteCount) {
+        synchronized (atomicStripe(root, offset)) {
+            atomicStoreLocked(root, offset, value, byteCount);
+        }
+    }
+
+    public static void atomicStore(Object root, long offset, long value, int byteCount, int ordering) {
+        root = normalizeLocationOrigin(root);
+        checkedAtomicByteCount(byteCount);
+        if (isSequentiallyConsistent(ordering)) {
+            synchronized (ATOMIC_SEQUENCE_LOCK) {
+                atomicStoreStriped(root, offset, value, byteCount);
             }
             return;
         }
-        atomicStoreStriped(pointer, value, byteCount);
+        atomicStoreStriped(root, offset, value, byteCount);
     }
 
     private static long atomicRmwStriped(
-            Pointer pointer, long operand, int byteCount, int operation) {
-        synchronized (atomicStripe(pointer)) {
-            long oldValue = truncateAtomic(pointer.loadUnsigned(byteCount), byteCount);
+            Object root, long offset, long operand, int byteCount, int operation) {
+        synchronized (atomicStripe(root, offset)) {
+            long oldValue = truncateAtomic(loadLocationBits(root, offset, byteCount), byteCount);
             long right = truncateAtomic(operand, byteCount);
             long newValue;
             switch (operation) {
@@ -8772,97 +8850,99 @@ public final class Pointer {
                 default:
                     throw new IllegalArgumentException("unknown Rust atomic operation " + operation);
             }
-            atomicStoreLocked(pointer, newValue, byteCount);
+            atomicStoreLocked(root, offset, newValue, byteCount);
             return oldValue;
         }
     }
 
     private static long atomicRmw(
-            Pointer pointer, long operand, int byteCount, int operation, int ordering) {
+            Object root, long offset, long operand, int byteCount, int operation, int ordering) {
+        root = normalizeLocationOrigin(root);
         checkedAtomicByteCount(byteCount);
         if (isSequentiallyConsistent(ordering)) {
             synchronized (ATOMIC_SEQUENCE_LOCK) {
-                return atomicRmwStriped(pointer, operand, byteCount, operation);
+                return atomicRmwStriped(root, offset, operand, byteCount, operation);
             }
         }
-        return atomicRmwStriped(pointer, operand, byteCount, operation);
+        return atomicRmwStriped(root, offset, operand, byteCount, operation);
     }
 
     public static long atomicExchange(
-            Pointer pointer, long value, int byteCount, int ordering) {
-        return atomicRmw(pointer, value, byteCount, 0, ordering);
+            Object root, long offset, long value, int byteCount, int ordering) {
+        return atomicRmw(root, offset, value, byteCount, 0, ordering);
     }
 
-    public static long atomicAdd(Pointer pointer, long value, int byteCount, int ordering) {
-        return atomicRmw(pointer, value, byteCount, 1, ordering);
+    public static long atomicAdd(Object root, long offset, long value, int byteCount, int ordering) {
+        return atomicRmw(root, offset, value, byteCount, 1, ordering);
     }
 
     public static long atomicSubtract(
-            Pointer pointer, long value, int byteCount, int ordering) {
-        return atomicRmw(pointer, value, byteCount, 2, ordering);
+            Object root, long offset, long value, int byteCount, int ordering) {
+        return atomicRmw(root, offset, value, byteCount, 2, ordering);
     }
 
-    public static long atomicAnd(Pointer pointer, long value, int byteCount, int ordering) {
-        return atomicRmw(pointer, value, byteCount, 3, ordering);
+    public static long atomicAnd(Object root, long offset, long value, int byteCount, int ordering) {
+        return atomicRmw(root, offset, value, byteCount, 3, ordering);
     }
 
-    public static long atomicNand(Pointer pointer, long value, int byteCount, int ordering) {
-        return atomicRmw(pointer, value, byteCount, 4, ordering);
+    public static long atomicNand(Object root, long offset, long value, int byteCount, int ordering) {
+        return atomicRmw(root, offset, value, byteCount, 4, ordering);
     }
 
-    public static long atomicOr(Pointer pointer, long value, int byteCount, int ordering) {
-        return atomicRmw(pointer, value, byteCount, 5, ordering);
+    public static long atomicOr(Object root, long offset, long value, int byteCount, int ordering) {
+        return atomicRmw(root, offset, value, byteCount, 5, ordering);
     }
 
-    public static long atomicXor(Pointer pointer, long value, int byteCount, int ordering) {
-        return atomicRmw(pointer, value, byteCount, 6, ordering);
+    public static long atomicXor(Object root, long offset, long value, int byteCount, int ordering) {
+        return atomicRmw(root, offset, value, byteCount, 6, ordering);
     }
 
-    public static long atomicMax(Pointer pointer, long value, int byteCount, int ordering) {
-        return atomicRmw(pointer, value, byteCount, 7, ordering);
+    public static long atomicMax(Object root, long offset, long value, int byteCount, int ordering) {
+        return atomicRmw(root, offset, value, byteCount, 7, ordering);
     }
 
-    public static long atomicMin(Pointer pointer, long value, int byteCount, int ordering) {
-        return atomicRmw(pointer, value, byteCount, 8, ordering);
+    public static long atomicMin(Object root, long offset, long value, int byteCount, int ordering) {
+        return atomicRmw(root, offset, value, byteCount, 8, ordering);
     }
 
     public static long atomicUnsignedMax(
-            Pointer pointer, long value, int byteCount, int ordering) {
-        return atomicRmw(pointer, value, byteCount, 9, ordering);
+            Object root, long offset, long value, int byteCount, int ordering) {
+        return atomicRmw(root, offset, value, byteCount, 9, ordering);
     }
 
     public static long atomicUnsignedMin(
-            Pointer pointer, long value, int byteCount, int ordering) {
-        return atomicRmw(pointer, value, byteCount, 10, ordering);
+            Object root, long offset, long value, int byteCount, int ordering) {
+        return atomicRmw(root, offset, value, byteCount, 10, ordering);
     }
 
     private static long atomicCompareExchangeStriped(
-            Pointer pointer, long expected, long value, int byteCount) {
-        synchronized (atomicStripe(pointer)) {
-            long oldValue = truncateAtomic(pointer.loadUnsigned(byteCount), byteCount);
+            Object root, long offset, long expected, long value, int byteCount) {
+        synchronized (atomicStripe(root, offset)) {
+            long oldValue = truncateAtomic(loadLocationBits(root, offset, byteCount), byteCount);
             if (oldValue == truncateAtomic(expected, byteCount)) {
-                atomicStoreLocked(pointer, value, byteCount);
+                atomicStoreLocked(root, offset, value, byteCount);
             }
             return oldValue;
         }
     }
 
     public static long atomicCompareExchange(
-            Pointer pointer,
+            Object root, long offset,
             long expected,
             long value,
             int byteCount,
             int successOrdering,
             int failureOrdering) {
+        root = normalizeLocationOrigin(root);
         checkedAtomicByteCount(byteCount);
         boolean sequentiallyConsistent = isSequentiallyConsistent(successOrdering)
                 | isSequentiallyConsistent(failureOrdering);
         if (sequentiallyConsistent) {
             synchronized (ATOMIC_SEQUENCE_LOCK) {
-                return atomicCompareExchangeStriped(pointer, expected, value, byteCount);
+                return atomicCompareExchangeStriped(root, offset, expected, value, byteCount);
             }
         }
-        return atomicCompareExchangeStriped(pointer, expected, value, byteCount);
+        return atomicCompareExchangeStriped(root, offset, expected, value, byteCount);
     }
 
     public static void atomicFence(int ordering) {

@@ -7,6 +7,8 @@ public class Main {
         ArrayViews.check();
         CellArrayViews.check();
         MemoryViews.check();
+        AtomicViews.check();
+        AtomicLocations.check();
         RangeCodecs.check();
         PrimitiveArrayCodecs.check();
         TypedFields.check();
@@ -18,6 +20,7 @@ public class Main {
         BorrowedFields.check();
         BorrowedLocals.check();
         CodecAdapters.check();
+        MetadataFilters.check();
         StructuralViews.check();
         Field field = Pointer.class.getDeclaredField("EXPOSED_ADDRESSES");
         field.setAccessible(true);
