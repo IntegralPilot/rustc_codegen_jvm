@@ -4,6 +4,8 @@ import org.rustlang.runtime.Pointer;
 
 public class Main {
     public static void main(String[] args) throws Exception {
+        ArrayViews.check();
+        MemoryViews.check();
         StructuralViews.check();
         Field field = Pointer.class.getDeclaredField("EXPOSED_ADDRESSES");
         field.setAccessible(true);

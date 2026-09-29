@@ -174,7 +174,9 @@ pub fn convert_operand<'tcx>(
                 emit_instructions_to_get_on_own(place, tcx, instance, mir, data_types);
 
             let projected_load = !get_instructions.is_empty();
+            let read_start = instructions.len();
             instructions.extend(get_instructions);
+            let read_end = instructions.len();
 
             let mut loaded = oomir::Operand::Variable {
                 name: final_var_name.clone(),
@@ -208,6 +210,12 @@ pub fn convert_operand<'tcx>(
                 || matches!(final_type, oomir::Type::Pointer(_))
                 || matches!(rust_ty.kind(), TyKind::Ref(..) | TyKind::RawPtr(..))
             {
+                return loaded;
+            }
+            if super::place::detach_pointer_read(
+                &mut instructions[read_start..read_end],
+                &final_var_name,
+            ) {
                 return loaded;
             }
 

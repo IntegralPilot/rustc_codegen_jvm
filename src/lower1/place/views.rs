@@ -97,8 +97,19 @@ pub(crate) fn emit_pointer_read_copy(
         return emit_pointer_read(pointer, pointee_ty, dest, instructions);
     }
 
+    let read_start = instructions.len();
     let loaded_dest = format!("{dest}_loaded");
     let loaded = emit_pointer_read(pointer, pointee_ty, &loaded_dest, instructions);
+    if detach_pointer_read(&mut instructions[read_start..], &loaded_dest) {
+        instructions.push(Instruction::Move {
+            dest: dest.to_string(),
+            src: loaded,
+        });
+        return Operand::Variable {
+            name: dest.to_string(),
+            ty: pointee_ty.clone(),
+        };
+    }
     let object_dest = format!("{dest}_copy_object");
     let object_ty = oomir::Type::Class("java/lang/Object".to_string());
     instructions.push(Instruction::InvokeStatic {
@@ -124,6 +135,38 @@ pub(crate) fn emit_pointer_read_copy(
         name: dest.to_string(),
         ty: pointee_ty.clone(),
     }
+}
+
+/// A value copy can decode directly into its owned carrier. Only fuse the final
+/// load: earlier pointer reads may be needed as live views for field projections.
+pub(crate) fn detach_pointer_read(instructions: &mut [Instruction], value_name: &str) -> bool {
+    let Some(
+        [
+            Instruction::InvokeVirtual {
+                dest: Some(result),
+                class_name,
+                method_name,
+                ..
+            },
+            Instruction::Cast {
+                dest,
+                op: Operand::Variable { name, .. },
+                ..
+            },
+        ],
+    ) = instructions.last_chunk_mut::<2>()
+    else {
+        return false;
+    };
+    if class_name != oomir::POINTER_CLASS
+        || method_name != "getObjectAs"
+        || result != name
+        || dest != value_name
+    {
+        return false;
+    }
+    *method_name = "getObjectCopyAs".to_string();
+    true
 }
 
 pub(crate) fn emit_pointer_write(

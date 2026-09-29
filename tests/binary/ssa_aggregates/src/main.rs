@@ -1,3 +1,5 @@
+mod byte_copies;
+
 #[derive(Clone, Copy)]
 struct Pair { byte: u8, wide: i64 }
 #[derive(Clone, Copy)]
@@ -191,6 +193,7 @@ fn replace_link(mut local: Link, next: Link) -> (i64, Link) {
 #[inline(never)]
 fn reborrow_link(value: &mut Link, next: i64) { reborrow_opaque(value).value = next; }
 fn main() {
+    byte_copies::check();
     let mut opaque = OpaqueTarget { bytes: [19; 17] };
     let pointer = raw_identity(&raw mut opaque);
     let pointer = non_null_identity(std::ptr::NonNull::new(pointer).unwrap());

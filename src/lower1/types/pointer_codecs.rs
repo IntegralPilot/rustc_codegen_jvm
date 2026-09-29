@@ -254,7 +254,15 @@ fn build_pointer_memory_codec<'tcx>(
         "_objects",
         object_storage_size,
     )];
-    let decode_storage = JvmUnionStorage::at_start("_1", "_objects");
+    // Plain values can be decoded directly from a window of their allocation.
+    // Keep pointer-bearing codecs on independent images: their object sidecar
+    // and provenance handling still require the existing snapshot path.
+    let decode_at_offset = object_storage_size == 0;
+    let decode_storage = if decode_at_offset {
+        JvmUnionStorage::at_offset("_1", "_objects", operand_var("_2", oomir::Type::I32))
+    } else {
+        JvmUnionStorage::at_start("_1", "_objects")
+    };
     let mut decode_counter = 0;
     let decoded = match emit_ty_from_union_bytes(
         ty,
@@ -276,11 +284,23 @@ fn build_pointer_memory_codec<'tcx>(
         operand: value_ty.has_jvm_value().then_some(decoded),
     });
     let decode = oomir::Function {
-        name: "decode".to_string(),
+        name: if decode_at_offset {
+            "decodeAt"
+        } else {
+            "decode"
+        }
+        .to_string(),
         owner_class: None,
         debug_variables: Vec::new(),
         signature: oomir::Signature {
-            params: vec![("bytes".to_string(), bytes_ty)],
+            params: if decode_at_offset {
+                vec![
+                    ("bytes".to_string(), bytes_ty.clone()),
+                    ("offset".to_string(), oomir::Type::I32),
+                ]
+            } else {
+                vec![("bytes".to_string(), bytes_ty.clone())]
+            },
             ret: Box::new(value_ty.clone()),
             is_static: true,
         },
@@ -305,8 +325,45 @@ fn build_pointer_memory_codec<'tcx>(
     }
     let mut methods = HashMap::from_iter([
         ("encode".to_string(), DataTypeMethod::Function(encode)),
-        ("decode".to_string(), DataTypeMethod::Function(decode)),
+        (decode.name.clone(), DataTypeMethod::Function(decode)),
     ]);
+    if decode_at_offset {
+        let decoded = operand_var("_decoded", value_ty.clone());
+        let decode = oomir::Function {
+            name: "decode".to_string(),
+            owner_class: None,
+            debug_variables: Vec::new(),
+            signature: oomir::Signature {
+                params: vec![("bytes".to_string(), bytes_ty.clone())],
+                ret: Box::new(value_ty.clone()),
+                is_static: true,
+            },
+            body: simple_body(vec![
+                oomir::Instruction::InvokeStatic {
+                    dest: Some("_decoded".to_string()),
+                    class_name: class_name.clone(),
+                    method_name: "decodeAt".to_string(),
+                    method_ty: oomir::Signature {
+                        params: vec![
+                            ("bytes".to_string(), bytes_ty.clone()),
+                            ("offset".to_string(), oomir::Type::I32),
+                        ],
+                        ret: Box::new(value_ty.clone()),
+                        is_static: true,
+                    },
+                    args: vec![
+                        operand_var("_1", bytes_ty),
+                        oomir::Operand::Constant(oomir::Constant::I32(0)),
+                    ],
+                },
+                oomir::Instruction::Return {
+                    operand: Some(decoded),
+                },
+            ])
+            .into(),
+        };
+        methods.insert("decode".to_string(), DataTypeMethod::Function(decode));
+    }
     // The runtime treats a missing binder as a no-op. Do not compile a method
     // whose only instruction would be `return`.
     if !bind_instructions.is_empty() {

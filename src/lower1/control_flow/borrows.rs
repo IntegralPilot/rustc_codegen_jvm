@@ -280,6 +280,15 @@ pub(in crate::lower1) fn emit_pointer_origin_refreshes<'tcx>(
     mir: &Body<'tcx>,
     data_types: &mut Definitions<'tcx>,
 ) -> Vec<oomir::Instruction> {
+    if matches!(
+        updated_place.projection.first(),
+        Some(rustc_middle::mir::ProjectionElem::Deref)
+    ) {
+        // A reborrow retains the original pointer's storage. A store through
+        // that pointer is already visible to its aliases; reading the value
+        // back and storing it again only creates a redundant decoded view.
+        return Vec::new();
+    }
     let matching_origins = available_pointer_locals
         .iter()
         .filter_map(|local| pointer_origins.get(local))
