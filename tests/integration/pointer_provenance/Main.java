@@ -5,11 +5,14 @@ import org.rustlang.runtime.Pointer;
 public class Main {
     public static void main(String[] args) throws Exception {
         ArrayViews.check();
+        CellArrayViews.check();
         MemoryViews.check();
         RangeCodecs.check();
+        PrimitiveArrayCodecs.check();
         TypedFields.check();
         FieldProjections.check();
         CyclicFieldViews.check();
+        OwnedFields.check();
         BorrowedFields.check();
         CodecAdapters.check();
         StructuralViews.check();

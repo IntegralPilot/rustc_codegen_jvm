@@ -4985,7 +4985,6 @@ public final class Pointer {
                     });
         }
         if (value != null
-                && !value.getClass().isArray()
                 && pointer.allocation != null
                 && pointer.allocation.getClass().isArray()
                 && !pointer.allocation.getClass().getComponentType().isPrimitive()
@@ -5092,6 +5091,16 @@ public final class Pointer {
                     recordAlignment(value, checkedAlignment);
                     return array(value, 0, checkedSize, elementCodecClassName);
                 });
+        if (Array.getLength(value) == 1
+                && pointer.allocation != null
+                && value.getClass().getComponentType().isArray()
+                && value.getClass().getComponentType() == pointer.allocation.getClass()) {
+            // CTFE can share an array with its sole element, which can also be an array.
+            // Preserve the element value and the original allocation identity.
+            return cellAligned(pointer.allocation, checkedSize,
+                            elementCodecClassName, checkedAlignment)
+                    .inheritAddressOrigin(pointer, 0);
+        }
         return pointer.retype(checkedSize, elementCodecClassName);
     }
 
@@ -9099,6 +9108,167 @@ public final class Pointer {
     }
 
     /** Copying a value never establishes a mutable decoded-view binding. */
+    public static Object loadStorageCopy(Object root, long offset, String target) {
+        if (root instanceof Storage) {
+            Storage storage = (Storage) root;
+            if (offset == 0 && directStorage(storage)) {
+                return copyManagedValue(((Cell) storage).value);
+            }
+            root = storage.boundary();
+        }
+        Pointer base = (Pointer) root;
+        if (base.allocation instanceof byte[] && base.rareState == null
+                && base.addressState == null && base.viewSize > 0
+                && isGeneratedAggregateCodec(base.viewCodecClassName)) {
+            MemoryCodec plan = codecPlan(base.viewCodecClassName);
+            if (plan.decodeAt() != null && target != null
+                    && matchesBinaryClassName(target, plan.encodeParameterType.getName())) {
+                byte[] bytes = (byte[]) base.allocation;
+                long absolute = Math.addExact(base.byteOffset, offset);
+                int start = Math.toIntExact(absolute);
+                int size = base.materializedViewSize();
+                if (start < 0 || start > bytes.length - size) {
+                    throw new IndexOutOfBoundsException("aggregate read exceeds byte-addressable Rust storage");
+                }
+                base.flushMemoryViewsOverlapping(absolute, size);
+                return plan.decodeAt().decode(bytes, start);
+            }
+        }
+        return fromStorageLocation(base, offset).getObjectCopyAs(target);
+    }
+
+    /** Owned field read without parent and projected address wrappers on byte storage. */
+    public static Object loadStorageFieldCopy(Object root, long offset, String owner,
+            String field, long fieldOffset, long size, String codec, String target) {
+        if (size > 0 && size <= Integer.MAX_VALUE
+                && (root instanceof byte[] || (root instanceof Pointer
+                    && ((Pointer) root).allocation instanceof byte[]
+                    && ((Pointer) root).traitMetadataCarrier() == null))) {
+            return loadTypedStorageCopy(root, Math.addExact(offset, fieldOffset),
+                    (int) size, codec, target);
+        }
+        return fromStorageLocation(root, offset)
+                .projectStructField(owner, field, fieldOffset, size, codec).getObjectCopyAs(target);
+    }
+
+    /** Store an owned field through its exact layout without two projected wrappers. */
+    public static void storeStorageField(Object root, long offset, String owner, String field,
+            long fieldOffset, long size, String codec, Object value) {
+        if (size > 0 && size <= Integer.MAX_VALUE
+                && (root instanceof byte[]
+                    || (root instanceof Pointer && ((Pointer) root).allocation instanceof byte[]
+                        && ((Pointer) root).traitMetadataCarrier() == null))) {
+            storeTypedStorage(root, Math.addExact(offset, fieldOffset), (int) size, codec, value);
+            return;
+        }
+        fromStorageLocation(root, offset).projectStructField(owner, field, fieldOffset, size, codec).set(value);
+    }
+
+    /** Read a borrowed value without a temporary Pointer. Keep binding and commit behavior for decoded views. */
+    public static Object loadTypedStorage(Object root, long offset, int size, String codec, String target) {
+        if (root instanceof Storage) {
+            Storage storage = (Storage) root;
+            if (offset == 0 && size == storage.size
+                    && java.util.Objects.equals(codec, storage.codec) && directStorage(storage)) {
+                Object value = ((Cell) storage).value;
+                if (target != null && !target.isEmpty() || value == null || !value.getClass().isArray()) return value;
+            }
+        }
+        if (root instanceof Pointer) {
+            Pointer pointer = (Pointer) root;
+            if (size > 0 && pointer.viewSize == size
+                    && java.util.Objects.equals(codec, pointer.viewCodecClassName)
+                    && pointer.rareState == null && pointer.addressState == null
+                    && pointer.isDirectAllocationView() && !mayHaveStructuralView(pointer.allocation)) {
+                Object value = loadObjectLocation(pointer, offset, target);
+                if (target != null && !target.isEmpty() || value == null || !value.getClass().isArray()) return value;
+            }
+        }
+        return fromTypedStorageLocation(root, offset, size, codec).getObjectAs(target);
+    }
+
+    /** The copy's layout is compiler metadata, independent of the backing view. */
+    public static Object loadTypedStorageCopy(Object root, long offset, int size,
+            String codec, String target) {
+        if (root instanceof Storage) {
+            Storage storage = (Storage) root;
+            if (offset == 0 && size == storage.size
+                    && java.util.Objects.equals(codec, storage.codec) && directStorage(storage)) {
+                return copyManagedValue(((Cell) storage).value);
+            }
+            root = storage.boundary();
+        }
+        if (root instanceof byte[] && size > 0 && isGeneratedAggregateCodec(codec)
+                && !mayBeInIdentityFilter(MEMORY_VIEW_FILTER, root)
+                && !mayBeInIdentityFilter(MEMORY_VIEW_ORIGIN_FILTER, root)) {
+            MemoryCodec plan = codecPlan(codec);
+            if (plan.decodeAt() != null && target != null
+                    && matchesBinaryClassName(target, plan.encodeParameterType.getName())) {
+                byte[] bytes = (byte[]) root;
+                int start = Math.toIntExact(offset);
+                if (start < 0 || start > bytes.length - size) {
+                    throw new IndexOutOfBoundsException("aggregate read exceeds byte-addressable Rust storage");
+                }
+                return plan.decodeAt().decode(bytes, start);
+            }
+        }
+        Pointer base = root instanceof Pointer ? (Pointer) root : fromLocation(root, 0, 1);
+        if (base.allocation instanceof byte[] && base.rareState == null
+                && base.addressState == null && size > 0 && isGeneratedAggregateCodec(codec)) {
+            MemoryCodec plan = codecPlan(codec);
+            if (plan.decodeAt() != null && target != null
+                    && matchesBinaryClassName(target, plan.encodeParameterType.getName())) {
+                byte[] bytes = (byte[]) base.allocation;
+                long absolute = Math.addExact(base.byteOffset, offset);
+                int start = Math.toIntExact(absolute);
+                if (start < 0 || start > bytes.length - size) {
+                    throw new IndexOutOfBoundsException("aggregate read exceeds byte-addressable Rust storage");
+                }
+                base.flushMemoryViewsOverlapping(absolute, size);
+                return plan.decodeAt().decode(bytes, start);
+            }
+        }
+        Pointer escaped = base.escapedFieldStorage(offset);
+        return (escaped == null ? base.byteOffsetRetype(offset, size, codec)
+                : escaped.retype(size, codec)).getObjectCopyAs(target);
+    }
+
+    /** Write with compiler-owned layout metadata, materializing only at a general boundary. */
+    public static void storeTypedStorage(Object root, long offset, int size, String codec, Object value) {
+        if (root instanceof Storage) {
+            Storage storage = (Storage) root;
+            if (offset == 0 && size == storage.size
+                    && java.util.Objects.equals(codec, storage.codec) && directStorage(storage)) {
+                Cell cell = storage;
+                cell.value = convertDirectValue(cell.value, value, size);
+                return;
+            }
+        }
+        if (root instanceof byte[] && size > 0 && isGeneratedAggregateCodec(codec)
+                && !mayBeInIdentityFilter(MEMORY_VIEW_FILTER, root)
+                && !mayBeInIdentityFilter(MEMORY_VIEW_ORIGIN_FILTER, root)
+                && !mayBeInIdentityFilter(MEMORY_VIEW_ORIGIN_FILTER, value)) {
+            MemoryCodec plan = codecPlan(codec);
+            CodecCalls.RangeEncoder encode = plan.encodeAt();
+            if (encode != null) {
+                byte[] bytes = (byte[]) root;
+                int start = Math.toIntExact(offset);
+                if (start < 0 || start > bytes.length - size) {
+                    throw new IndexOutOfBoundsException("aggregate store exceeds byte-addressable Rust storage");
+                }
+                discardEncodedPointers(bytes, start, size);
+                encode.encode(value, bytes, start);
+                return;
+            }
+        }
+        if (root instanceof Pointer
+                && ((Pointer) root).storeAggregateRange(offset, size, codec, value)) {
+            return;
+        }
+        fromTypedStorageLocation(root, offset, size, codec).set(value);
+    }
+
+    /** Write an exact byte window without a temporary address or encoded image. */
     private boolean storeAggregateRange(long offset, long byteSize, String codec, Object value) {
         if (!(allocation instanceof byte[]) || rareState != null || addressState != null
                 || byteSize <= 0 || !isGeneratedAggregateCodec(codec)
@@ -9120,6 +9290,64 @@ public final class Pointer {
         return true;
     }
 
+    public static Object directStorageAggregate(Object root, long offset, Class<?> type) {
+        if (root instanceof Storage) {
+            Storage storage = (Storage) root;
+            if (offset == 0 && directStorage(storage)) {
+                Object value = ((Cell) storage).value;
+                return type.isInstance(value) ? value : null;
+            }
+            root = storage.boundary();
+        }
+        if (root instanceof byte[]) return null;
+        Pointer base = (Pointer) root;
+        if (offset == 0) {
+            Object direct = base.directAggregate(type);
+            if (direct != null) return direct;
+        }
+        Object embedded = base.directCellArrayElement(offset, type);
+        if (embedded != null || offset == 0) return embedded;
+        if (base.rareState != null || base.addressState != null
+                || !(base.allocation instanceof Object[])
+                || base.allocationElementSize <= 0
+                || !base.isDirectAllocationView()
+                || mayHaveStructuralView(base.allocation)) return null;
+        long absolute = Math.addExact(base.byteOffset, offset);
+        if (absolute % base.allocationElementSize != 0) return null;
+        base.flushMemoryViewsOverlapping(absolute, base.allocationElementSize);
+        Object value = base.readElement(Math.toIntExact(absolute / base.allocationElementSize));
+        return type.isInstance(value) ? value : null;
+    }
+
+    /** Borrow an aggregate element directly from a Cell that owns a fixed array. */
+    private Object directCellArrayElement(long offset, Class<?> type) {
+        if (!(allocation instanceof Cell) || addressState != null
+                || traitObjectCarrier() != null || traitMetadataCarrier() != null
+                || zeroSizedSourceViewSize() >= 0 || mayHaveStructuralView(allocation)
+                || !isGeneratedAggregateCodec(allocationCodecClassName)
+                || !isGeneratedAggregateCodec(viewCodecClassName)) return null;
+        MemoryCodec plan = codecPlan(allocationCodecClassName);
+        int stride = plan.arrayElementSize;
+        if (stride <= 0 || viewSize != stride
+                || !java.util.Objects.equals(viewCodecClassName, plan.arrayElementCodec)) return null;
+        long absolute = Math.addExact(byteOffset, offset);
+        if (absolute < 0 || absolute % stride != 0) return null;
+        Object value = ((Cell) allocation).value;
+        if (!(value instanceof Object[]) || !plan.encodeParameterType.isInstance(value)
+                || (long) ((Object[]) value).length * stride != allocationElementSize
+                || absolute / stride >= ((Object[]) value).length) return null;
+        flushMemoryViewsOverlapping(absolute, stride);
+        // Read the current carrier again. A byte alias or whole-array assignment can replace it.
+        value = ((Cell) allocation).value;
+        if (!(value instanceof Object[]) || !plan.encodeParameterType.isInstance(value)
+                || (long) ((Object[]) value).length * stride != allocationElementSize
+                || absolute / stride >= ((Object[]) value).length) return null;
+        Object element = independentRepeatedArrayElement(value, (int) (absolute / stride));
+        // Nested array values require their separate origin-registration rules.
+        return element != null && !element.getClass().isArray() && type.isInstance(element) ? element : null;
+    }
+
+    /** Keep a scalar projection on its typed owner while its layout is exact. */
     public static Object storageFieldRoot(Object root, long offset, String owner,
             String field, long fieldOffset, long size, String codec) {
         // Scalar components supply their own width. Byte storage needs no layout carrier.
@@ -9708,7 +9936,7 @@ public final class Pointer {
 
     /** Reads an owned aggregate value without creating a live alias of byte storage. */
     public Object getObjectCopyAs(String targetClassName) {
-        if (allocation instanceof byte[] && rareState == null && viewSize > 0
+        if (viewSize > 0 && !isDirectAllocationView()
                 && isGeneratedAggregateCodec(viewCodecClassName)) {
             MemoryCodec plan = codecPlan(viewCodecClassName);
             if (targetClassName != null
@@ -9724,8 +9952,8 @@ public final class Pointer {
                     flushMemoryViewsOverlapping(byteOffset, size);
                     return plan.decodeAt().decode(bytes, offset);
                 }
-                // Pointer-bearing and external codecs still use an independent
-                // image carrying the source's reference/provenance metadata.
+                // Owned reads need an independent image with provenance metadata.
+                // A live decoded view could overwrite source padding when flushed.
                 return decodeAggregate(viewCodecClassName, loadRange(materializedViewSize()));
             }
         }
