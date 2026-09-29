@@ -40,10 +40,7 @@ pub(super) fn allocator_shim_target_signature(
     }
 }
 
-pub(super) fn allocator_shim_source_signature(
-    tcx: TyCtxt<'_>,
-    source_name: &str,
-) -> Option<oomir::Signature> {
+fn allocator_shim_source<'tcx>(tcx: TyCtxt<'tcx>, source_name: &str) -> Option<Instance<'tcx>> {
     let declaration = std::iter::once(LOCAL_CRATE)
         .chain(tcx.crates(()).iter().copied())
         .flat_map(|crate_num| tcx.foreign_modules(crate_num).values())
@@ -60,20 +57,13 @@ pub(super) fn allocator_shim_source_signature(
                     .as_deref()
                     .is_some_and(lower1::naming::is_global_link_symbol_class)
         })?;
-    let instance = Instance::mono(tcx, declaration);
-    let instance_ty = tcx
-        .type_of(declaration)
-        .instantiate(tcx, instance.args)
-        .skip_norm_wip();
-    Some(lower1::types::fn_ptr_signature_from_ty(
-        instance_ty,
-        tcx,
-        &mut lower1::context::Definitions::default(),
-        instance,
-    ))
+    Some(Instance::mono(tcx, declaration))
 }
 
-pub(super) fn allocator_shim_call(
+fn allocator_shim_call<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    source_instance: Instance<'tcx>,
+    data_types: &mut lower1::context::Definitions<'tcx>,
     source_signature: &oomir::Signature,
     target_signature: &oomir::Signature,
     target_name: String,
@@ -87,6 +77,11 @@ pub(super) fn allocator_shim_call(
 
     let mut instructions = Vec::new();
     let mut args = Vec::new();
+    let source_type = tcx
+        .type_of(source_instance.def_id())
+        .instantiate(tcx, source_instance.args)
+        .skip_norm_wip();
+    let rust_signature = tcx.instantiate_bound_regions_with_erased(source_type.fn_sig(tcx));
     for (index, ((_, source_ty), (_, target_ty))) in source_signature
         .params
         .iter()
@@ -99,12 +94,33 @@ pub(super) fn allocator_shim_call(
         };
         if source_ty == target_ty {
             args.push(source);
-        } else if let (oomir::Type::Class(class_name), oomir::Type::U64) = (source_ty, target_ty) {
+        } else if let (oomir::Type::Class(_), oomir::Type::U64) = (source_ty, target_ty) {
             // Rust exposes Alignment nominally, while the default allocator keeps its usize ABI.
+            let rustc_middle::ty::TyKind::Adt(adt, _) = rust_signature.inputs()[index].kind()
+            else {
+                panic!("allocator alignment is not an ADT");
+            };
+            let conversion = tcx
+                .inherent_impls(adt.did())
+                .iter()
+                .find_map(|&implementation| {
+                    tcx.associated_items(implementation)
+                        .in_definition_order()
+                        .find(|item| {
+                            item.is_method() && tcx.item_name(item.def_id).as_str() == "as_usize"
+                        })
+                        .map(|item| Instance::mono(tcx, item.def_id))
+                })
+                .expect("allocator alignment has no as_usize conversion");
+            // Resolve through the same dependency collector as ordinary calls:
+            // MIR inlining can remove every Rust call to this helper.
+            let conversion_name = data_types.function_name(tcx, conversion);
             let converted = format!("converted_arg_{index}");
             instructions.push(oomir::Instruction::InvokeStatic {
-                class_name: class_name.clone(),
-                method_name: "as_usize".to_string(),
+                class_name: conversion_name
+                    .class_to_call_on
+                    .expect("alignment method has an owner"),
+                method_name: conversion_name.method_name,
                 method_ty: oomir::Signature {
                     params: vec![("value".to_string(), source_ty.clone())],
                     ret: Box::new(oomir::Type::U64),
@@ -151,7 +167,7 @@ pub(super) fn emit_allocator_shims<'tcx>(
         // the allocator ABI in scope needs default wrappers in its own output.
         let global_alloc =
             lower1::jvm_names::member_name(&global_fn_name(ALLOCATOR_METHODS[0].name));
-        if allocator_shim_source_signature(tcx, &global_alloc).is_none() {
+        if allocator_shim_source(tcx, &global_alloc).is_none() {
             return;
         }
         ALLOCATOR_METHODS.to_vec()
@@ -159,8 +175,18 @@ pub(super) fn emit_allocator_shims<'tcx>(
     for method in methods {
         let source_name = lower1::jvm_names::member_name(&global_fn_name(method.name));
         let target_name = lower1::jvm_names::member_name(&default_fn_name(method.name));
-        let mut signature = allocator_shim_source_signature(tcx, &source_name)
+        let source_instance = allocator_shim_source(tcx, &source_name)
             .unwrap_or_else(|| panic!("allocator ABI declaration `{source_name}` was not found"));
+        let source_type = tcx
+            .type_of(source_instance.def_id())
+            .instantiate(tcx, source_instance.args)
+            .skip_norm_wip();
+        let mut signature = lower1::types::fn_ptr_signature_from_ty(
+            source_type,
+            tcx,
+            &mut oomir_module.data_types,
+            source_instance,
+        );
         let target_signature = allocator_shim_target_signature(&method);
         for ((_, source_ty), (_, target_ty)) in
             signature.params.iter_mut().zip(&target_signature.params)
@@ -179,8 +205,15 @@ pub(super) fn emit_allocator_shims<'tcx>(
             "allocator shim source and target JVM return types differ"
         );
         let result = matches!(method.output, AllocatorTy::ResultPtr).then(|| "result".to_string());
-        let mut instructions =
-            allocator_shim_call(&signature, &target_signature, target_name, result.clone());
+        let mut instructions = allocator_shim_call(
+            tcx,
+            source_instance,
+            &mut oomir_module.data_types,
+            &signature,
+            &target_signature,
+            target_name,
+            result.clone(),
+        );
         if matches!(method.output, AllocatorTy::Never) {
             instructions.push(oomir::Instruction::ThrowNewWithMessage {
                 exception_class: "java/lang/AssertionError".to_string(),
