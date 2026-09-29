@@ -3189,6 +3189,12 @@ public final class Pointer {
 
     private static Object adaptStructuralField(Object value, Class<?> targetType)
             throws ReflectiveOperationException {
+        return adaptStructuralField(value, targetType, null);
+    }
+
+    private static Object adaptStructuralField(
+            Object value, Class<?> targetType, Object traitTailCarrier)
+            throws ReflectiveOperationException {
         if (value == null) {
             return defaultValue(targetType);
         }
@@ -3206,7 +3212,7 @@ public final class Pointer {
         if (targetType.isArray() && isSliceViewCarrierType(value.getClass())) {
             return sliceBackingForArray(value, targetType);
         }
-        return constructStructuralView(value, targetType);
+        return constructStructuralView(value, targetType, traitTailCarrier);
     }
 
     private static ConstructorPlan structuralConstructor(Class<?> targetClass, int fieldCount) {
@@ -3250,14 +3256,16 @@ public final class Pointer {
                     try {
                         Field sourceField = instanceField(source.getClass(), fieldName);
                         args[index] = adaptStructuralField(
-                                sourceField.get(source), parameters[index].getType());
+                                sourceField.get(source), parameters[index].getType(),
+                                index == parameters.length - 1 ? traitTailCarrier : null);
                     } catch (NoSuchFieldException error) {
                         if (parameters.length != 1) {
                             throw error;
                         }
                         // Transparent DST wrappers can add more than one nominal
                         // layer around the same slice tail (for example OsStr).
-                        args[index] = adaptStructuralField(source, parameters[index].getType());
+                        args[index] = adaptStructuralField(
+                                source, parameters[index].getType(), traitTailCarrier);
                     }
                 }
             }
