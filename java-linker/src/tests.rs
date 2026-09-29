@@ -268,6 +268,15 @@ fn recognizes_msvc_output_argument_case_insensitively() {
 }
 
 #[test]
+fn measures_short_branch_near_end_of_large_method_without_encoding_its_target() {
+    let mut code = vec![Instruction::Iinc_w(0, 1); 7_000];
+    // The target is three bytes ahead. Treating its instruction index as a byte offset exceeds the branch limit.
+    code.extend([Instruction::Goto(7_001), Instruction::Return]);
+    let offsets = instruction_byte_offsets(&code).unwrap();
+    assert_eq!(&offsets[7_000..], &[42_000, 42_003, 42_004]);
+}
+
+#[test]
 fn remaps_local_variable_ranges_when_ldc_widens() {
     let old_offsets = instruction_byte_offsets(&[Instruction::Ldc(1), Instruction::Return])
         .expect("old bytecode offsets");

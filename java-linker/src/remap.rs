@@ -116,28 +116,15 @@ pub(crate) fn remap_instruction(
 }
 
 pub(crate) fn instruction_byte_offsets(instructions: &[Instruction]) -> io::Result<Vec<u16>> {
-    let mut bytes = Cursor::new(Vec::new());
+    // Branch operands are instruction indexes. Measure encoded sizes without treating those indexes as byte offsets.
+    let mut position = 0;
     let mut offsets = Vec::with_capacity(instructions.len() + 1);
     for instruction in instructions {
-        offsets.push(u16::try_from(bytes.position()).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "JVM method exceeds the bytecode offset limit",
-            )
-        })?);
-        instruction.to_bytes(&mut bytes).map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("could not measure JVM instruction: {error}"),
-            )
-        })?;
+        offsets
+            .push(u16::try_from(position).map_err(|e| constant_pool_error("bytecode offset", e))?);
+        position += jvm_compiler_core::jvm::encoding::instruction_size_at(instruction, position);
     }
-    offsets.push(u16::try_from(bytes.position()).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "JVM method exceeds the bytecode offset limit",
-        )
-    })?);
+    offsets.push(u16::try_from(position).map_err(|e| constant_pool_error("bytecode size", e))?);
     Ok(offsets)
 }
 
@@ -197,6 +184,23 @@ pub(crate) fn remap_attribute(
     indexes: &impl ConstantIndexes,
 ) -> io::Result<()> {
     match attribute {
+        Attribute::InnerClasses {
+            name_index,
+            classes,
+        } => {
+            *name_index = indexes.remap(*name_index)?;
+            for class in classes {
+                for index in [
+                    &mut class.class_info_index,
+                    &mut class.outer_class_info_index,
+                    &mut class.name_index,
+                ] {
+                    if *index != 0 {
+                        *index = indexes.remap(*index)?;
+                    }
+                }
+            }
+        }
         Attribute::Code {
             name_index,
             code,
@@ -205,12 +209,18 @@ pub(crate) fn remap_attribute(
             ..
         } => {
             *name_index = remapped_constant_index(*name_index, indexes)?;
-            let old_byte_offsets = instruction_byte_offsets(code)?;
+            let old_byte_offsets = attributes
+                .iter()
+                .any(|a| matches!(a, Attribute::LocalVariableTable { .. }))
+                .then(|| instruction_byte_offsets(code))
+                .transpose()?;
             for instruction in code.iter_mut() {
                 remap_instruction(instruction, indexes)?;
             }
-            let new_byte_offsets = instruction_byte_offsets(code)?;
-            remap_local_variable_ranges(attributes, &old_byte_offsets, &new_byte_offsets)?;
+            if let Some(old_byte_offsets) = old_byte_offsets {
+                let new_byte_offsets = instruction_byte_offsets(code)?;
+                remap_local_variable_ranges(attributes, &old_byte_offsets, &new_byte_offsets)?;
+            }
             for exception in exception_table {
                 if exception.catch_type != 0 {
                     exception.catch_type = remapped_constant_index(exception.catch_type, indexes)?;
