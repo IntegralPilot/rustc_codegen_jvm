@@ -12,8 +12,11 @@ public class Main {
         TypedFields.check();
         FieldProjections.check();
         CyclicFieldViews.check();
+        AddressOrder.check();
+        LocationQueries.check();
         OwnedFields.check();
         BorrowedFields.check();
+        BorrowedLocals.check();
         CodecAdapters.check();
         StructuralViews.check();
         Field field = Pointer.class.getDeclaredField("EXPOSED_ADDRESSES");

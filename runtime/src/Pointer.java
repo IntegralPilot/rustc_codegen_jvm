@@ -6642,17 +6642,24 @@ public final class Pointer {
     }
 
     public long align_offset(long alignment) {
+        return alignmentOffset(numericAddress(), viewSize, alignment);
+    }
+
+    private static long alignmentOffset(long address, long stride, long alignment) {
         if (alignment <= 0 || (alignment & (alignment - 1)) != 0) {
             throw new IllegalArgumentException("Rust pointer alignment must be a power of two");
         }
-        long current = numericAddress();
-        long attempts = viewSize == 0 ? 1 : alignment;
-        for (long elements = 0; elements < attempts; elements++) {
-            if ((current + (long) elements * viewSize) % alignment == 0) {
-                return elements;
-            }
-        }
-        return -1;
+        if (stride < 0) throw new IllegalArgumentException("negative Rust pointee size");
+        long divisor = stride == 0 ? alignment : Math.min(Long.lowestOneBit(stride), alignment);
+        if ((address & (divisor - 1)) != 0) return -1;
+        long mask = alignment / divisor - 1;
+        if (mask == 0) return 0;
+        // Solve address + n * stride = 0 modulo the power-of-two alignment.
+        // Divide by the gcd to get an odd stride with an inverse modulo 2^64.
+        long odd = stride / divisor;
+        long inverse = odd;
+        for (int i = 0; i < 6; i++) inverse *= 2 - odd * inverse;
+        return -(address >>> Long.numberOfTrailingZeros(divisor)) * inverse & mask;
     }
 
     public static long align_offset(Pointer pointer, long alignment) {
@@ -6959,6 +6966,7 @@ public final class Pointer {
         if (other != null
                 && allocation != null
                 && allocation == other.allocation
+                && allocationElementSize > 0 && other.allocationElementSize > 0
                 && addressOrigin() == null
                 && other.addressOrigin() == null
                 && byteOffset >= 0
@@ -7155,7 +7163,7 @@ public final class Pointer {
     private long numericAddress() {
         Pointer origin = addressOrigin();
         if (origin != null) {
-            return Math.addExact(origin.numericAddress(), addressOriginOffset());
+            return origin.numericAddress() + addressOriginOffset();
         }
         if (allocation == null) {
             return exposedAddress;
@@ -7167,11 +7175,12 @@ public final class Pointer {
         Long cachedBase =
                 cachedAllocationBase(ALLOCATION_BASE_CACHE, allocation);
         if (cachedBase != null) {
-            return Math.addExact(cachedBase.longValue(), byteOffset);
+            return cachedBase.longValue() + byteOffset;
         }
         synchronized (ALLOCATIONS) {
             AllocationInfo info = allocationInfo(allocation);
-            return Math.addExact(allocationBase(info), byteOffset);
+            // Address arithmetic can wrap. Memory accesses check their own ranges.
+            return allocationBase(info) + byteOffset;
         }
     }
 
@@ -7181,6 +7190,10 @@ public final class Pointer {
 
     /** Must be called while holding {@link #ALLOCATIONS}. */
     private long allocationBase(AllocationInfo info) {
+        return allocationBase(allocation, allocationElementSize, info);
+    }
+
+    private static long allocationBase(Object allocation, int allocationElementSize, AllocationInfo info) {
         Long cached = cachedAllocationBase(ALLOCATION_BASE_CACHE, allocation);
         if (cached != null) {
             return cached.longValue();
@@ -7238,9 +7251,7 @@ public final class Pointer {
         }
         Pointer origin = pointer.addressOrigin();
         if (origin != null) {
-            long address = Math.addExact(
-                    encodedAddress(origin, owner),
-                    pointer.addressOriginOffset());
+            long address = encodedAddress(origin, owner) + pointer.addressOriginOffset();
             pointer.setPublishedAddress(address);
             return address;
         }
@@ -7251,8 +7262,7 @@ public final class Pointer {
                 PUBLISHED_ALLOCATION_BASE_CACHE, pointer.allocation);
         long address;
         if (publishedBase != null) {
-            address = Math.addExact(
-                    publishedBase.longValue(), pointer.byteOffset);
+            address = publishedBase.longValue() + pointer.byteOffset;
         } else {
             synchronized (ALLOCATIONS) {
                 AllocationInfo info = allocationInfo(pointer.allocation);
@@ -7261,7 +7271,7 @@ public final class Pointer {
                         PUBLISHED_ALLOCATION_BASE_CACHE,
                         pointer.allocation,
                         base);
-                address = Math.addExact(base, pointer.byteOffset);
+                address = base + pointer.byteOffset;
             }
         }
         pointer.setPublishedAddress(address);
@@ -7368,7 +7378,7 @@ public final class Pointer {
     public long address() {
         Pointer origin = addressOrigin();
         if (origin != null) {
-            long address = Math.addExact(origin.address(), addressOriginOffset());
+            long address = origin.address() + addressOriginOffset();
             setPublishedAddress(address);
             return address;
         }
@@ -8868,6 +8878,37 @@ public final class Pointer {
         }
     }
 
+    /** Thin-pointer comparison on storage components, preserving exposed addresses. */
+    public static boolean sameLocation(Object left, long leftOffset, Object right, long rightOffset) {
+        if (left == right) return leftOffset == rightOffset;
+        if (left instanceof Pointer && right instanceof Pointer) {
+            Pointer a = (Pointer) left;
+            Pointer b = (Pointer) right;
+            if (a.allocation != null && a.allocation == b.allocation) {
+                return a.byteOffset + leftOffset == b.byteOffset + rightOffset;
+            }
+        }
+        return locationAddress(left) + leftOffset == locationAddress(right) + rightOffset;
+    }
+
+    private static long locationAddress(Object root) {
+        return locationAddr(root, 0);
+    }
+
+    /** Read an address word without materializing or exposing a Rust pointer. */
+    public static long locationAddr(Object root, long offset) {
+        if (root == null) return offset;
+        if (root instanceof Pointer) return ((Pointer) root).numericAddress() + offset;
+        Object normalized = normalizeLocationOrigin(root);
+        if (normalized instanceof Pointer) return ((Pointer) normalized).numericAddress() + offset;
+        Long cached = cachedAllocationBase(ALLOCATION_BASE_CACHE, root);
+        if (cached != null) return cached.longValue() + offset;
+        int size = root instanceof Storage ? ((Storage) root).size : inferredArrayElementSize(root);
+        synchronized (ALLOCATIONS) {
+            return allocationBase(root, size, allocationInfo(root)) + offset;
+        }
+    }
+
     private static Object normalizeLocationOrigin(Object root) {
         if (root == null || root instanceof Pointer || root instanceof Storage
                 || !mayBeInIdentityFilter(MEMORY_VIEW_ORIGIN_FILTER, root)) return root;
@@ -8881,6 +8922,72 @@ public final class Pointer {
     }
 
     /** Pointer differences use allocation identity, never exposed address lookup. */
+    public static long byteOffsetLocations(Object root, long offset, Object origin, long originOffset) {
+        root = normalizeLocationOrigin(root);
+        origin = normalizeLocationOrigin(origin);
+        Object allocation = root instanceof Pointer ? ((Pointer) root).provenanceAllocation() : root;
+        Object originAllocation = origin instanceof Pointer
+                ? ((Pointer) origin).provenanceAllocation() : origin;
+        if (allocation != originAllocation) {
+            throw new IllegalArgumentException("byte_offset_from requires pointers into one allocation");
+        }
+        long start = root instanceof Pointer
+                ? Math.addExact(((Pointer) root).provenanceByteOffset(), offset) : offset;
+        long end = origin instanceof Pointer
+                ? Math.addExact(((Pointer) origin).provenanceByteOffset(), originOffset) : originOffset;
+        return Math.subtractExact(start, end);
+    }
+
+    public static long offsetLocations(Object root, long offset, Object origin, long originOffset, long stride) {
+        if (stride == -1) stride = locationStride(root);
+        if (stride == 0) throw new ArithmeticException("offset_from is undefined for zero-sized pointees");
+        long bytes = byteOffsetLocations(root, offset, origin, originOffset);
+        if (bytes % stride != 0) {
+            throw new ArithmeticException("pointer distance is not a whole number of elements");
+        }
+        return bytes / stride;
+    }
+
+    private static long unsignedLocationDistance(long distance) {
+        if (distance < 0) {
+            throw new ArithmeticException("offset_from_unsigned requires self at or after origin");
+        }
+        return distance;
+    }
+
+    public static long byteOffsetLocationsUnsigned(Object root, long offset, Object origin, long originOffset) {
+        return unsignedLocationDistance(byteOffsetLocations(root, offset, origin, originOffset));
+    }
+
+    public static long offsetLocationsUnsigned(Object root, long offset, Object origin, long originOffset, long stride) {
+        return unsignedLocationDistance(offsetLocations(root, offset, origin, originOffset, stride));
+    }
+
+    public static long alignLocation(Object root, long offset, long stride, long alignment) {
+        return alignmentOffset(locationAddr(root, offset), stride == -1 ? locationStride(root) : stride, alignment);
+    }
+
+    /** Compare decomposed data addresses without creating temporary carriers. */
+    public static int compareLocations(Object left, long leftOffset, Object right, long rightOffset) {
+        if (left == right && left != null && leftOffset >= 0 && rightOffset >= 0
+                && (left instanceof Storage || (left.getClass().isArray()
+                    && !mayBeInIdentityFilter(MEMORY_VIEW_ORIGIN_FILTER, left)))) {
+            return Long.compareUnsigned(leftOffset, rightOffset);
+        }
+        if (left instanceof Pointer && right instanceof Pointer) {
+            Pointer a = (Pointer) left, b = (Pointer) right;
+            long x = a.byteOffset + leftOffset, y = b.byteOffset + rightOffset;
+            if (a.allocation != null && a.allocation == b.allocation
+                    && a.allocationElementSize > 0 && b.allocationElementSize > 0
+                    && a.addressOrigin() == null && b.addressOrigin() == null && x >= 0 && y >= 0) {
+                return Long.compareUnsigned(x, y);
+            }
+        }
+        // Other offsets and allocations require the full unsigned-address and provenance checks.
+        return Long.compareUnsigned(locationAddress(left) + leftOffset, locationAddress(right) + rightOffset);
+    }
+
+    /** Element layout retained by a general storage root. */
     public static long locationStride(Object root) {
         return root instanceof Storage ? ((Storage) root).size : ((Pointer) root).viewSize;
     }
