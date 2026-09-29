@@ -2227,8 +2227,7 @@ public final class Pointer {
      * Large Rust lookup tables otherwise rebuild their complete object graph
      * on every use because ordinary array constants require value semantics.
      */
-    public static Object sharedConstant(
-            String identity, String ownerClassName, String factoryMethodName) {
+    public static Object sharedConstant(String identity, MethodHandle factory) {
         Object cached = SHARED_CONSTANTS.get(identity);
         if (cached != null) {
             return cached;
@@ -2239,10 +2238,7 @@ public final class Pointer {
                 return cached;
             }
             try {
-                Method factory = resolvedRuntimeClass(ownerClassName)
-                        .getDeclaredMethod(factoryMethodName);
-                factory.setAccessible(true);
-                Object value = factory.invoke(null);
+                Object value = factory.invoke();
                 if (value == null) {
                     throw new IllegalStateException(
                             "shared Rust constant factory returned null");
@@ -2256,12 +2252,9 @@ public final class Pointer {
                     markIdentityFilter(SHARED_CONSTANT_ARRAY_FILTER, value);
                 }
                 return value;
-            } catch (InvocationTargetException error) {
-                rethrowUnchecked(error.getCause());
+            } catch (Throwable error) {
+                rethrowUnchecked(error);
                 return null;
-            } catch (ReflectiveOperationException error) {
-                throw new IllegalStateException(
-                        "could not materialize shared Rust constant " + identity, error);
             }
         }
     }
@@ -5863,37 +5856,40 @@ public final class Pointer {
             long alignment) {
         int checkedSize = checkedArrayLength(viewSize);
         int checkedAlignment = checkedAlignment(alignment);
-        Pointer pointer = CONSTANT_CELLS.computeIfAbsent(
-                identity,
-                ignored -> {
-                    Object storedValue = value;
-                    if (storedValue != null && storedValue.getClass().isArray()) {
-                        // A Rust fixed array is one value, but its elements must
-                        // remain individually addressable after pointer casts.
-                        // Keep the JVM array instead of creating a scalar Cell.
-                        if (storedValue instanceof byte[]) {
-                            byte[] existing = CONSTANT_ALLOCATIONS.putIfAbsent(
-                                    identity, (byte[]) storedValue);
-                            if (existing != null) {
-                                storedValue = existing;
+        Pointer pointer = CONSTANT_CELLS.get(identity);
+        if (pointer == null) {
+            pointer = CONSTANT_CELLS.computeIfAbsent(
+                    identity,
+                    ignored -> {
+                        Object storedValue = value;
+                        if (storedValue != null && storedValue.getClass().isArray()) {
+                            // A Rust fixed array is one value, but its elements must
+                            // remain individually addressable after pointer casts.
+                            // Keep the JVM array instead of creating a scalar Cell.
+                            if (storedValue instanceof byte[]) {
+                                byte[] existing = CONSTANT_ALLOCATIONS.putIfAbsent(
+                                        identity, (byte[]) storedValue);
+                                if (existing != null) {
+                                    storedValue = existing;
+                                }
                             }
+                            recordAlignment(storedValue, checkedAlignment);
+                            return new Pointer(
+                                    storedValue,
+                                    inferredArrayElementSize(storedValue),
+                                    0,
+                                    checkedSize,
+                                    null,
+                                    viewCodecClassName,
+                                    -1);
                         }
-                        recordAlignment(storedValue, checkedAlignment);
-                        return new Pointer(
+                        return cellAligned(
                                 storedValue,
-                                inferredArrayElementSize(storedValue),
-                                0,
                                 checkedSize,
-                                null,
                                 viewCodecClassName,
-                                -1);
-                    }
-                    return cellAligned(
-                            storedValue,
-                            checkedSize,
-                            viewCodecClassName,
-                            checkedAlignment);
-                });
+                                checkedAlignment);
+                    });
+        }
         if (value != null
                 && !value.getClass().isArray()
                 && pointer.allocation != null

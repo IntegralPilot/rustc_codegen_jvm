@@ -5,14 +5,25 @@ pub(super) const MAX_INLINE_CONSTANT_INSTRUCTIONS: usize = 1_024;
 
 use crate::oomir::constant_instruction_cost;
 
+fn shared_pointer(constant: &oomir::Constant) -> bool {
+    // These already denote one stable CTFE allocation. Cache the materializer
+    // too, so repeated loads do not build values which the runtime discards.
+    // Tiny values need less bytecode inline than two factory methods. Include
+    // allocation size because packed byte tables use few instructions but can
+    // still allocate megabytes on every load.
+    matches!(constant, oomir::Constant::InternedPointer { value, allocation_size, .. }
+        if *allocation_size >= 16 || constant_instruction_cost(value) >= 32)
+}
+
 /// Ordinary scalar bodies never allocate analysis state for constants.
 pub(in crate::lower2) fn function_needs_constant_preparation(
     function: &oomir::SsaFunction,
 ) -> bool {
     let body = &function.body;
-    body.constants
-        .iter()
-        .any(|constant| constant_instruction_cost(constant) > MAX_INLINE_CONSTANT_INSTRUCTIONS)
+    body.constants.iter().any(|constant| {
+        shared_pointer(constant)
+            || constant_instruction_cost(constant) > MAX_INLINE_CONSTANT_INSTRUCTIONS
+    })
 }
 
 /// Propagate escapes backwards through SSA aliases, block parameters and
@@ -83,14 +94,31 @@ pub(in crate::lower2) fn prepare_function_constants(
     next_factory: &mut usize,
 ) -> jvm::Result<()> {
     let body = &mut function.body;
-    let shared = shared_arrays(body);
+    let shared = body
+        .constants
+        .iter()
+        .any(|constant| {
+            matches!(constant, oomir::Constant::Array(..))
+                && constant_instruction_cost(constant) > MAX_INLINE_CONSTANT_INSTRUCTIONS
+        })
+        .then(|| shared_arrays(body));
     let body = std::sync::Arc::make_mut(body);
     for (index, constant) in body.constants.iter_mut().enumerate() {
+        if shared_pointer(constant) {
+            *constant = super::factories::create_shared_pointer_factory(
+                cp,
+                owner_class,
+                constant,
+                methods,
+                next_factory,
+            )?;
+            continue;
+        }
         if constant_instruction_cost(constant) <= MAX_INLINE_CONSTANT_INSTRUCTIONS {
             continue;
         }
         *constant = if let oomir::Constant::Array(element, values) = constant
-            && shared[index]
+            && shared.as_ref().is_some_and(|shared| shared[index])
         {
             create_shared_array_factory(cp, owner_class, element, values, methods, next_factory)?
         } else {

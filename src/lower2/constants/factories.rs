@@ -10,7 +10,19 @@ fn add_constant_helper_method(
     max_locals: u16,
     instructions: Vec<Instruction>,
 ) -> jvm::Result<()> {
-    let max_stack = instructions.max_stack(cp)?.saturating_mul(2).max(4);
+    let initial = jvm_compiler_core::jvm::frames::initial_locals_for_descriptor(
+        descriptor, true, None, false,
+    )?;
+    let max_stack = jvm_compiler_core::jvm::frames::analyze(
+        &instructions,
+        &initial,
+        &[],
+        usize::from(max_locals),
+        cp,
+        method_name,
+        &[],
+    )?
+    .max_stack;
     let code = Attribute::Code {
         name_index: cp.add_utf8("Code")?,
         max_stack,
@@ -60,6 +72,7 @@ pub(super) fn create_chunked_array_factory(
     }
 
     let array_type = oomir::Type::Array(Box::new(element_type.clone()));
+    let identity = crate::stable_hash::short_hash_value(&(element_type, elements), 16);
     let array_descriptor = array_type.to_jvm_descriptor();
     let fill_descriptor = format!("({array_descriptor})V");
     let store_instruction = element_type.get_jvm_array_store_instruction();
@@ -81,7 +94,7 @@ pub(super) fn create_chunked_array_factory(
                 end += 1;
             }
 
-            let method_name = format!("_constant_fill_{}", *next_factory);
+            let method_name = format!("_constant_fill_{identity}_{}", *next_factory);
             *next_factory += 1;
             let mut instructions = Vec::new();
             for (index, element) in prepared[start..end].iter().enumerate() {
@@ -123,7 +136,7 @@ pub(super) fn create_chunked_array_factory(
         }
     }
 
-    let method_name = format!("_constant_factory_{}", *next_factory);
+    let method_name = format!("_constant_factory_{identity}_{}", *next_factory);
     *next_factory += 1;
     let descriptor = format!("(){array_descriptor}");
     let mut instructions = Vec::new();
@@ -160,6 +173,7 @@ fn create_byte_array_factory(
     storage_field: Option<u16>,
 ) -> jvm::Result<oomir::Constant> {
     let owner = cp.add_class(owner_class)?;
+    let identity = crate::stable_hash::short_hash_value(&(element_type, elements), 16);
     let mut instructions = Vec::new();
     if let Some(field) = storage_field {
         instructions.push(Instruction::Getstatic(field));
@@ -168,7 +182,7 @@ fn create_byte_array_factory(
     }
     let chunk_size = (MAX_INLINE_CONSTANT_INSTRUCTIONS / 4).max(1) * oomir::PACKED_BYTE_CHUNK;
     for (chunk_index, chunk) in elements.chunks(chunk_size).enumerate() {
-        let name = format!("_constant_fill_{}", *next_factory);
+        let name = format!("_constant_fill_{identity}_{}", *next_factory);
         *next_factory += 1;
         let mut fill = vec![Instruction::Aload_0];
         super::arrays::fill_packed_bytes(
@@ -186,7 +200,7 @@ fn create_byte_array_factory(
         ));
     }
     instructions.push(Instruction::Areturn);
-    let name = format!("_constant_factory_{}", *next_factory);
+    let name = format!("_constant_factory_{identity}_{}", *next_factory);
     *next_factory += 1;
     add_constant_helper_method(cp, methods, &name, "()[B", 0, instructions)?;
     Ok(oomir::Constant::FactoryCall {
@@ -213,32 +227,56 @@ pub(super) fn create_shared_array_factory(
         next_factory,
         None,
     )?;
+    let identity = crate::stable_hash::short_hash_value(&(element_type, elements), 16);
+    share_factory(cp, owner_class, &identity, builder, methods, next_factory)
+}
+
+pub(super) fn create_shared_pointer_factory(
+    cp: &mut InternedConstantPool,
+    owner_class: &str,
+    constant: &oomir::Constant,
+    methods: &mut Vec<jvm::Method>,
+    next_factory: &mut usize,
+) -> jvm::Result<oomir::Constant> {
+    let builder = create_constant_factory(cp, owner_class, constant, methods, next_factory)?;
+    let identity = crate::stable_hash::short_hash_value(constant, 16);
+    share_factory(cp, owner_class, &identity, builder, methods, next_factory)
+}
+
+fn share_factory(
+    cp: &mut InternedConstantPool,
+    owner_class: &str,
+    constant_identity: &str,
+    builder: oomir::Constant,
+    methods: &mut Vec<jvm::Method>,
+    next_factory: &mut usize,
+) -> jvm::Result<oomir::Constant> {
     let oomir::Constant::FactoryCall {
         method_name: builder_method,
         ty,
         ..
     } = builder
     else {
-        unreachable!("chunked array construction always returns a factory call");
+        unreachable!("shared constant construction requires a factory call");
     };
 
-    let method_name = format!("_constant_factory_{}", *next_factory);
+    let method_name = format!("_constant_shared_{constant_identity}_{}", *next_factory);
     *next_factory += 1;
     let descriptor = format!("(){}", ty.to_jvm_descriptor());
-    let identity = format!("{owner_class}#{builder_method}");
+    let identity = format!("{owner_class}#{constant_identity}");
     let mut instructions = Vec::new();
-    for value in [&identity, owner_class, &builder_method] {
-        load_constant(
-            &mut instructions,
-            cp,
-            &oomir::Constant::String(value.to_string()),
-        )?;
-    }
+    load_constant(&mut instructions, cp, &oomir::Constant::String(identity))?;
+    // A method handle preserves the full descriptor and follows linker
+    // renames/splitting. Reflecting on a textual name loses both properties.
+    let owner = cp.add_class(owner_class)?;
+    let method = cp.add_method_ref(owner, &builder_method, &descriptor)?;
+    let factory = cp.add_method_handle(jvm::ReferenceKind::InvokeStatic, method)?;
+    instructions.push(Instruction::Ldc_w(factory));
     let pointer_class = cp.add_class(oomir::POINTER_CLASS)?;
     let shared_constant = cp.add_method_ref(
         pointer_class,
         "sharedConstant",
-        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/Object;",
+        "(Ljava/lang/String;Ljava/lang/invoke/MethodHandle;)Ljava/lang/Object;",
     )?;
     instructions.push(Instruction::Invokestatic(shared_constant));
     instructions.extend(get_cast_instructions(
@@ -412,7 +450,8 @@ pub(super) fn create_constant_factory(
     };
 
     let return_type = oomir::Type::from_constant(&prepared);
-    let method_name = format!("_constant_factory_{}", *next_factory);
+    let identity = crate::stable_hash::short_hash_value(constant, 16);
+    let method_name = format!("_constant_factory_{identity}_{}", *next_factory);
     *next_factory += 1;
     let descriptor = format!("(){}", return_type.to_jvm_descriptor());
     let mut instructions = Vec::new();
