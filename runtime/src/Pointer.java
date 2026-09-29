@@ -1,7 +1,5 @@
 package org.rustlang.runtime;
 
-import java.lang.invoke.CallSite;
-import java.lang.invoke.LambdaMetafactory;
 import java.lang.ref.ReferenceQueue;
 import java.lang.ref.WeakReference;
 import java.lang.reflect.Array;
@@ -262,7 +260,7 @@ public final class Pointer {
             new TreeMap<>();
     private static final ReferenceQueue<Object> ALLOCATION_RANGE_QUEUE =
             new ReferenceQueue<>();
-    private static final ConcurrentHashMap<String, CodecPlan> CODEC_METHODS =
+    private static final ConcurrentHashMap<String, MemoryCodec> CODEC_METHODS =
             new ConcurrentHashMap<>();
     private static final ThreadLocal<CodecPlanCache> RECENT_CODEC_PLANS =
             new ThreadLocal<CodecPlanCache>() {
@@ -1622,176 +1620,20 @@ public final class Pointer {
         }
     }
 
-    private static final class CodecPlan {
-        private final Class<?> encodeParameterType;
-        private final CodecEncoder encode;
-        private final CodecDecoder decode;
-        private final CodecRangeDecoder decodeAt;
-        private final CodecBinder bind;
-        private final MethodHandle unionBytes;
-        private final MethodHandle unionObjects;
-        private final int arrayElementSize;
-        private final String arrayElementCodec;
-
-        /** A fieldless Rust ZST needs only its concrete JVM constructor. */
-        private CodecPlan(Class<?> valueType) throws ReflectiveOperationException {
-            encodeParameterType = valueType;
-            MethodHandle constructor = MethodHandles.publicLookup()
-                    .unreflectConstructor(valueType.getConstructor())
-                    .asType(MethodType.methodType(Object.class));
-            encode = value -> new byte[0];
-            decode = bytes -> {
-                try {
-                    return (Object) constructor.invokeExact();
-                } catch (RuntimeException | Error error) {
-                    throw error;
-                } catch (Throwable error) {
-                    throw new IllegalStateException("could not construct zero-sized Rust value", error);
-                }
-            };
-            bind = null;
-            decodeAt = null;
-            unionBytes = null;
-            unionObjects = null;
-            arrayElementSize = -1;
-            arrayElementCodec = null;
-        }
-
-        private CodecPlan(
-                Method encode,
-                Method decode,
-                Method decodeAt,
-                Method bind,
-                Method arrayElementSize,
-                Method arrayElementCodec)
-                throws IllegalAccessException {
-            encodeParameterType = encode.getParameterTypes()[0];
-            MethodHandles.Lookup lookup = MethodHandles.lookup();
-            try {
-                this.encode = (CodecEncoder)
-                        lambdaAdapter(
-                                lookup,
-                                "encode",
-                                CodecEncoder.class,
-                                MethodType.methodType(byte[].class, Object.class),
-                                lookup.unreflect(encode),
-                                MethodType.methodType(
-                                        byte[].class, encode.getParameterTypes()[0]));
-                this.decode = (CodecDecoder)
-                        lambdaAdapter(
-                                lookup,
-                                "decode",
-                                CodecDecoder.class,
-                                MethodType.methodType(Object.class, byte[].class),
-                                lookup.unreflect(decode),
-                                MethodType.methodType(
-                                        decode.getReturnType(), byte[].class));
-                this.decodeAt = decodeAt == null ? null : (CodecRangeDecoder)
-                        lambdaAdapter(
-                                lookup,
-                                "decode",
-                                CodecRangeDecoder.class,
-                                MethodType.methodType(Object.class, byte[].class, int.class),
-                                lookup.unreflect(decodeAt),
-                                MethodType.methodType(
-                                        decodeAt.getReturnType(), byte[].class, int.class));
-                this.bind = bind == null
-                        ? null
-                        : (CodecBinder)
-                                lambdaAdapter(
-                                        lookup,
-                                        "bind",
-                                        CodecBinder.class,
-                                        MethodType.methodType(
-                                                void.class, Pointer.class, Object.class),
-                                        lookup.unreflect(bind),
-                                        MethodType.methodType(
-                                                void.class,
-                                                Pointer.class,
-                                                bind.getParameterTypes()[1]));
-                MethodHandle directUnionBytes = null;
-                MethodHandle directUnionObjects = null;
-                try {
-                    Field bytes = encodeParameterType.getField("_bytes");
-                    Field objects = encodeParameterType.getField("_objects");
-                    if (bytes.getType() == byte[].class
-                            && objects.getType() == Object[].class) {
-                        directUnionBytes = lookup.unreflectGetter(bytes).asType(
-                                MethodType.methodType(byte[].class, Object.class));
-                        directUnionObjects = lookup.unreflectGetter(objects).asType(
-                                MethodType.methodType(Object[].class, Object.class));
-                    }
-                } catch (NoSuchFieldException ignored) {
-                    // Ordinary generated aggregates use their encode/decode methods.
-                }
-                unionBytes = directUnionBytes;
-                unionObjects = directUnionObjects;
-                if (arrayElementSize == null || arrayElementCodec == null) {
-                    this.arrayElementSize = -1;
-                    this.arrayElementCodec = null;
-                } else {
-                    this.arrayElementSize =
-                            (int) lookup.unreflect(arrayElementSize).invokeExact();
-                    this.arrayElementCodec =
-                            (String) lookup.unreflect(arrayElementCodec).invokeExact();
-                }
-            } catch (Throwable error) {
-                throw new IllegalAccessException(
-                        "could not create pointer codec call adapter: " + error);
-            }
-        }
-
-        private byte[] directUnionBytes(Object value) {
-            if (unionBytes == null || value == null
-                    || !encodeParameterType.isInstance(value)) {
-                return null;
-            }
-            try {
-                return (byte[]) unionBytes.invokeExact(value);
-            } catch (RuntimeException | Error error) {
-                throw error;
-            } catch (Throwable error) {
-                throw new IllegalStateException(
-                        "could not access generated Rust union storage", error);
-            }
-        }
-
-        private Object[] directUnionObjects(Object value) {
-            if (unionObjects == null || value == null
-                    || !encodeParameterType.isInstance(value)) {
-                return null;
-            }
-            try {
-                return (Object[]) unionObjects.invokeExact(value);
-            } catch (RuntimeException | Error error) {
-                throw error;
-            } catch (Throwable error) {
-                throw new IllegalStateException(
-                        "could not access generated Rust union references", error);
-            }
-        }
-
-        private boolean isArrayCodecFor(Object value) {
-            return arrayElementSize > 0
-                    && value != null
-                    && value.getClass().isArray();
-        }
-    }
-
     /** Two-entry per-thread cache for the codecs used by tight pointer loops. */
     private static final class CodecPlanCache {
         private String firstName;
-        private CodecPlan firstPlan;
+        private MemoryCodec firstPlan;
         private String secondName;
-        private CodecPlan secondPlan;
+        private MemoryCodec secondPlan;
 
-        private CodecPlan get(String name) {
+        private MemoryCodec get(String name) {
             if (name == firstName || (firstName != null && firstName.equals(name))) {
                 return firstPlan;
             }
             if (name == secondName || (secondName != null && secondName.equals(name))) {
                 String previousName = firstName;
-                CodecPlan previousPlan = firstPlan;
+                MemoryCodec previousPlan = firstPlan;
                 firstName = secondName;
                 firstPlan = secondPlan;
                 secondName = previousName;
@@ -1801,7 +1643,7 @@ public final class Pointer {
             return null;
         }
 
-        private void remember(String name, CodecPlan plan) {
+        private void remember(String name, MemoryCodec plan) {
             secondName = firstName;
             secondPlan = firstPlan;
             firstName = name;
@@ -1847,40 +1689,6 @@ public final class Pointer {
             firstLoader = loader;
             firstClass = resolved;
         }
-    }
-
-    private interface CodecEncoder {
-        byte[] encode(Object value);
-    }
-
-    private interface CodecDecoder {
-        Object decode(byte[] bytes);
-    }
-
-    private interface CodecRangeDecoder {
-        Object decode(byte[] bytes, int offset);
-    }
-
-    private interface CodecBinder {
-        void bind(Pointer pointer, Object value);
-    }
-
-    private static Object lambdaAdapter(
-            MethodHandles.Lookup lookup,
-            String methodName,
-            Class<?> interfaceType,
-            MethodType erasedType,
-            MethodHandle implementation,
-            MethodType instantiatedType)
-            throws Throwable {
-        CallSite site = LambdaMetafactory.metafactory(
-                lookup,
-                methodName,
-                MethodType.methodType(interfaceType),
-                erasedType,
-                implementation,
-                instantiatedType);
-        return site.getTarget().invoke();
     }
 
     private static final class RepeatedArrayState {
@@ -2504,11 +2312,13 @@ public final class Pointer {
                     elementCodec)
                     .flushAllMemoryViews();
         }
-        if (array instanceof byte[] && elementSize == 1 && elementCodec == null) {
-            System.arraycopy(array, 0, bytes, offset, length);
+        Class<?> component = array.getClass().getComponentType();
+        if (elementCodec == null && component.isPrimitive()
+                && elementSize == ArrayMemoryCodec.elementSize(component)) {
+            ArrayMemoryCodec.write(array, bytes, offset);
             return;
         }
-        CodecPlan aggregatePlan = isGeneratedAggregateCodec(elementCodec)
+        MemoryCodec aggregatePlan = isGeneratedAggregateCodec(elementCodec)
                 ? codecPlan(elementCodec)
                 : null;
         for (int index = 0; index < length; index++) {
@@ -2545,11 +2355,12 @@ public final class Pointer {
     public static void decodeArrayMemory(
             byte[] bytes, int offset, Object array, int elementSize, String elementCodec) {
         int length = Array.getLength(array);
-        if (array instanceof byte[] && elementSize == 1 && elementCodec == null) {
-            System.arraycopy(bytes, offset, array, 0, length);
+        Class<?> componentType = array.getClass().getComponentType();
+        if (elementCodec == null && componentType.isPrimitive()
+                && elementSize == ArrayMemoryCodec.elementSize(componentType)) {
+            ArrayMemoryCodec.read(bytes, offset, array);
             return;
         }
-        Class<?> componentType = array.getClass().getComponentType();
         for (int index = 0; index < length; index++) {
             Object element = decodeMemoryValue(
                     bytes, offset + index * elementSize, elementSize, elementCodec, componentType);
@@ -3937,7 +3748,7 @@ public final class Pointer {
                 || isBuiltInCodec(viewCodecClassName)) {
             return;
         }
-        CodecBinder bind = codecPlan(viewCodecClassName).bind;
+        CodecCalls.Binder bind = codecPlan(viewCodecClassName).bind();
         if (bind == null) {
             return;
         }
@@ -8601,7 +8412,7 @@ public final class Pointer {
     }
 
     private static long loadArrayCodecBits(
-            Object array, int byteOffset, int byteCount, CodecPlan arrayPlan) {
+            Object array, int byteOffset, int byteCount, MemoryCodec arrayPlan) {
         if (!arrayPlan.isArrayCodecFor(array)) {
             throw new IllegalArgumentException("pointer codec is not a fixed-array codec");
         }
@@ -8633,7 +8444,7 @@ public final class Pointer {
             byte[] image;
             boolean temporary = false;
             if (isGeneratedAggregateCodec(arrayPlan.arrayElementCodec)) {
-                CodecPlan elementPlan = codecPlan(arrayPlan.arrayElementCodec);
+                MemoryCodec elementPlan = codecPlan(arrayPlan.arrayElementCodec);
                 if (elementPlan.isArrayCodecFor(element)) {
                     long selected =
                             loadArrayCodecBits(element, withinElement, chunk, elementPlan);
@@ -8643,7 +8454,7 @@ public final class Pointer {
                 }
                 image = elementPlan.directUnionBytes(element);
                 if (image == null) {
-                    image = elementPlan.encode.encode(element);
+                    image = elementPlan.encode().encode(element);
                     temporary = true;
                 }
             } else {
@@ -8676,7 +8487,7 @@ public final class Pointer {
             byte[] target,
             int targetOffset,
             int byteCount,
-            CodecPlan arrayPlan) {
+            MemoryCodec arrayPlan) {
         if (!arrayPlan.isArrayCodecFor(array)) {
             throw new IllegalArgumentException("pointer codec is not a fixed-array codec");
         }
@@ -8711,7 +8522,7 @@ public final class Pointer {
             byte[] image;
             boolean temporary = false;
             if (isGeneratedAggregateCodec(arrayPlan.arrayElementCodec)) {
-                CodecPlan elementPlan = codecPlan(arrayPlan.arrayElementCodec);
+                MemoryCodec elementPlan = codecPlan(arrayPlan.arrayElementCodec);
                 if (elementPlan.isArrayCodecFor(element)) {
                     loadArrayCodecRange(
                             element,
@@ -8725,7 +8536,7 @@ public final class Pointer {
                 }
                 image = elementPlan.directUnionBytes(element);
                 if (image == null) {
-                    image = elementPlan.encode.encode(element);
+                    image = elementPlan.encode().encode(element);
                     temporary = true;
                 }
             } else {
@@ -8762,7 +8573,7 @@ public final class Pointer {
     }
 
     private static void storeArrayCodecBits(
-            Object array, int byteOffset, long incoming, int byteCount, CodecPlan arrayPlan) {
+            Object array, int byteOffset, long incoming, int byteCount, MemoryCodec arrayPlan) {
         if (!arrayPlan.isArrayCodecFor(array)) {
             throw new IllegalArgumentException("pointer codec is not a fixed-array codec");
         }
@@ -8799,7 +8610,7 @@ public final class Pointer {
             }
 
             if (isGeneratedAggregateCodec(arrayPlan.arrayElementCodec)) {
-                CodecPlan elementPlan = codecPlan(arrayPlan.arrayElementCodec);
+                MemoryCodec elementPlan = codecPlan(arrayPlan.arrayElementCodec);
                 if (elementPlan.isArrayCodecFor(element)) {
                     storeArrayCodecBits(
                             element, withinElement, selected, chunk, elementPlan);
@@ -8850,7 +8661,7 @@ public final class Pointer {
             byte[] source,
             int sourceOffset,
             int byteCount,
-            CodecPlan arrayPlan) {
+            MemoryCodec arrayPlan) {
         if (!arrayPlan.isArrayCodecFor(array)) {
             throw new IllegalArgumentException("pointer codec is not a fixed-array codec");
         }
@@ -8889,7 +8700,7 @@ public final class Pointer {
             }
 
             if (isGeneratedAggregateCodec(arrayPlan.arrayElementCodec)) {
-                CodecPlan elementPlan = codecPlan(arrayPlan.arrayElementCodec);
+                MemoryCodec elementPlan = codecPlan(arrayPlan.arrayElementCodec);
                 if (elementPlan.isArrayCodecFor(element)) {
                     storeArrayCodecRange(
                             element,
@@ -9096,14 +8907,14 @@ public final class Pointer {
                     encoded = encodeFatPointer(
                             value, allocationElementSize, allocationCodecClassName);
                 } else if (isGeneratedAggregateCodec(allocationCodecClassName)) {
-                    CodecPlan plan = codecPlan(allocationCodecClassName);
+                    MemoryCodec plan = codecPlan(allocationCodecClassName);
                     if (plan.isArrayCodecFor(value)) {
                         return loadArrayCodecBits(
                                 value, withinElement, byteCount, plan);
                     }
                     directUnionBytes = plan.directUnionBytes(value);
                     encoded = directUnionBytes == null
-                            ? plan.encode.encode(value)
+                            ? plan.encode().encode(value)
                             : directUnionBytes;
                 }
                 if (encoded != null) {
@@ -9194,12 +9005,12 @@ public final class Pointer {
             return result;
         }
         if (isGeneratedAggregateCodec(allocationCodecClassName)) {
-            CodecPlan plan = codecPlan(allocationCodecClassName);
+            MemoryCodec plan = codecPlan(allocationCodecClassName);
             if (plan.isArrayCodecFor(value)) {
                 return (int) loadArrayCodecBits(value, withinElement, 1, plan);
             }
             byte[] direct = plan.directUnionBytes(value);
-            byte[] bytes = direct == null ? plan.encode.encode(value) : direct;
+            byte[] bytes = direct == null ? plan.encode().encode(value) : direct;
             if (withinElement >= bytes.length) {
                 if (direct == null) {
                     discardEncodedReferences(bytes);
@@ -9305,7 +9116,7 @@ public final class Pointer {
                 image = encodeFatPointer(value, allocationElementSize, allocationCodecClassName);
             } else if (!directPrimitiveArray
                     && isGeneratedAggregateCodec(allocationCodecClassName)) {
-                CodecPlan plan = codecPlan(allocationCodecClassName);
+                MemoryCodec plan = codecPlan(allocationCodecClassName);
                 if (plan.isArrayCodecFor(value)) {
                     loadArrayCodecRange(
                             value,
@@ -9330,7 +9141,7 @@ public final class Pointer {
                     consumed += chunk;
                     continue;
                 }
-                image = plan.encode.encode(value);
+                image = plan.encode().encode(value);
             }
             if (image != null) {
                 if (withinElement + chunk > image.length) {
@@ -9412,7 +9223,7 @@ public final class Pointer {
                     encoded = encodeFatPointer(
                             current, allocationElementSize, allocationCodecClassName);
                 } else if (isGeneratedAggregateCodec(allocationCodecClassName)) {
-                    CodecPlan plan = codecPlan(allocationCodecClassName);
+                    MemoryCodec plan = codecPlan(allocationCodecClassName);
                     if (plan.isArrayCodecFor(current)) {
                         discardEncodedPointers(
                                 allocation, absoluteByteOffset, byteCount);
@@ -9428,7 +9239,7 @@ public final class Pointer {
                         direct[0] = (byte) bits;
                         return;
                     }
-                    encoded = plan.encode.encode(current);
+                    encoded = plan.encode().encode(current);
                 }
                 if (encoded != null) {
                     if (withinElement + byteCount > encoded.length) {
@@ -9543,7 +9354,7 @@ public final class Pointer {
             return;
         }
         if (isGeneratedAggregateCodec(allocationCodecClassName)) {
-            CodecPlan plan = codecPlan(allocationCodecClassName);
+            MemoryCodec plan = codecPlan(allocationCodecClassName);
             if (plan.isArrayCodecFor(current)) {
                 prepareMemoryWrite(absoluteByteOffset, 1);
                 discardEncodedPointers(allocation, absoluteByteOffset, 1);
@@ -9558,7 +9369,7 @@ public final class Pointer {
                 direct[0] = (byte) value;
                 return;
             }
-            byte[] bytes = plan.encode.encode(current);
+            byte[] bytes = plan.encode().encode(current);
             if (withinElement >= bytes.length) {
                 throw new IndexOutOfBoundsException("aggregate codec returned a short memory image");
             }
@@ -10312,10 +10123,10 @@ public final class Pointer {
     public Object getObjectCopyAs(String targetClassName) {
         if (allocation instanceof byte[] && rareState == null && viewSize > 0
                 && isGeneratedAggregateCodec(viewCodecClassName)) {
-            CodecPlan plan = codecPlan(viewCodecClassName);
+            MemoryCodec plan = codecPlan(viewCodecClassName);
             if (targetClassName != null
                     && matchesBinaryClassName(targetClassName, plan.encodeParameterType.getName())) {
-                if (plan.decodeAt != null) {
+                if (allocation instanceof byte[] && rareState == null && plan.decodeAt() != null) {
                     byte[] bytes = (byte[]) allocation;
                     int offset = Math.toIntExact(byteOffset);
                     int size = materializedViewSize();
@@ -10324,7 +10135,7 @@ public final class Pointer {
                                 "aggregate read exceeds byte-addressable Rust storage");
                     }
                     flushMemoryViewsOverlapping(byteOffset, size);
-                    return plan.decodeAt.decode(bytes, offset);
+                    return plan.decodeAt().decode(bytes, offset);
                 }
                 // Pointer-bearing and external codecs still use an independent
                 // image carrying the source's reference/provenance metadata.
@@ -10800,8 +10611,8 @@ public final class Pointer {
         if (sourceCarrier == null || destinationCarrier == null) {
             return false;
         }
-        CodecPlan sourcePlan = codecPlan(source.allocationCodecClassName);
-        CodecPlan destinationPlan = codecPlan(destination.allocationCodecClassName);
+        MemoryCodec sourcePlan = codecPlan(source.allocationCodecClassName);
+        MemoryCodec destinationPlan = codecPlan(destination.allocationCodecClassName);
         byte[] sourceBytes = sourcePlan.directUnionBytes(sourceCarrier);
         byte[] destinationBytes = destinationPlan.directUnionBytes(destinationCarrier);
         if (sourceBytes == null || destinationBytes == null) {
@@ -11554,7 +11365,7 @@ public final class Pointer {
                         Math.toIntExact(Math.floorDiv(absoluteOffset, allocationElementSize));
                 int withinElement = (int) Math.floorMod(absoluteOffset, allocationElementSize);
                 Object current = readElement(elementIndex);
-                CodecPlan plan = isBuiltInCodec(allocationCodecClassName)
+                MemoryCodec plan = isBuiltInCodec(allocationCodecClassName)
                         ? null : codecPlan(allocationCodecClassName);
                 int chunk = Math.min(
                         source.length - consumed,
@@ -11659,84 +11470,31 @@ public final class Pointer {
         }
     }
 
-    private static CodecPlan codecPlan(String codecClassName) {
+    private static MemoryCodec codecPlan(String codecClassName) {
         if (codecClassName == null) {
             throw new IllegalStateException("pointer view has no aggregate codec");
         }
         CodecPlanCache recent = RECENT_CODEC_PLANS.get();
-        CodecPlan local = recent.get(codecClassName);
+        MemoryCodec local = recent.get(codecClassName);
         if (local != null) {
             return local;
         }
-        CodecPlan cached = CODEC_METHODS.get(codecClassName);
+        MemoryCodec cached = CODEC_METHODS.get(codecClassName);
         if (cached != null) {
             recent.remember(codecClassName, cached);
             return cached;
         }
         try {
-            if (codecClassName.startsWith(ZERO_SIZED_CODEC_PREFIX)) {
-                Class<?> valueType = resolvedRuntimeClass(
-                        codecClassName.substring(ZERO_SIZED_CODEC_PREFIX.length()));
-                return rememberCodecPlan(codecClassName, new CodecPlan(valueType), recent);
-            }
-            Class<?> codec = resolvedRuntimeClass(codecClassName);
-            Method encode = null;
-            Method decode = null;
-            Method decodeAt = null;
-            Method bind = null;
-            Method arrayElementSize = null;
-            Method arrayElementCodec = null;
-            for (Method method : codec.getMethods()) {
-                if (method.getName().equals("encode") && method.getParameterTypes().length == 1) {
-                    encode = method;
-                } else if (method.getName().equals("decode")
-                        && method.getParameterTypes().length == 1) {
-                    decode = method;
-                } else if (method.getName().equals("decodeAt")
-                        && java.util.Arrays.equals(method.getParameterTypes(),
-                                new Class<?>[] {byte[].class, int.class})) {
-                    decodeAt = method;
-                } else if (method.getName().equals("bind")
-                        && method.getParameterTypes().length == 2) {
-                    bind = method;
-                } else if (method.getName().equals("_rustArrayElementSize")
-                        && method.getParameterTypes().length == 0) {
-                    arrayElementSize = method;
-                } else if (method.getName().equals("_rustArrayElementCodec")
-                        && method.getParameterTypes().length == 0) {
-                    arrayElementCodec = method;
-                }
-            }
-            if (encode == null || decode == null) {
-                throw new NoSuchMethodException(
-                        "pointer codec must define public static encode/decode methods");
-            }
-            encode.setAccessible(true);
-            decode.setAccessible(true);
-            if (decodeAt != null) {
-                decodeAt.setAccessible(true);
-            }
-            if (bind != null) {
-                bind.setAccessible(true);
-            }
-            if (arrayElementSize != null) {
-                arrayElementSize.setAccessible(true);
-            }
-            if (arrayElementCodec != null) {
-                arrayElementCodec.setAccessible(true);
-            }
-            CodecPlan plan = new CodecPlan(
-                    encode, decode, decodeAt, bind, arrayElementSize, arrayElementCodec);
-            return rememberCodecPlan(codecClassName, plan, recent);
+            return rememberCodecPlan(codecClassName, MemoryCodec.load(codecClassName, RUNTIME_CLASS_LOADER), recent);
         } catch (ReflectiveOperationException error) {
             throw new IllegalStateException("could not load Rust pointer codec " + codecClassName, error);
         }
     }
 
-    private static CodecPlan rememberCodecPlan(
-            String name, CodecPlan plan, CodecPlanCache recent) {
-        CodecPlan previous = CODEC_METHODS.putIfAbsent(name, plan);
-        CodecPlan result = previous == null ? plan : previous;
+    private static MemoryCodec rememberCodecPlan(
+            String name, MemoryCodec plan, CodecPlanCache recent) {
+        MemoryCodec previous = CODEC_METHODS.putIfAbsent(name, plan);
+        MemoryCodec result = previous == null ? plan : previous;
         recent.remember(name, result);
         return result;
     }
@@ -11810,7 +11568,7 @@ public final class Pointer {
 
     private static byte[] encodeAggregate(String codecClassName, Object value) {
         try {
-            return codecPlan(codecClassName).encode.encode(value);
+            return codecPlan(codecClassName).encode().encode(value);
         } catch (Throwable error) {
             throw new IllegalStateException(
                     "could not encode Rust aggregate memory with "
@@ -11823,7 +11581,7 @@ public final class Pointer {
 
     private static Object decodeAggregate(String codecClassName, byte[] bytes) {
         try {
-            return codecPlan(codecClassName).decode.decode(bytes);
+            return codecPlan(codecClassName).decode().decode(bytes);
         } catch (Throwable error) {
             throw new IllegalStateException("could not decode Rust aggregate memory", error);
         }

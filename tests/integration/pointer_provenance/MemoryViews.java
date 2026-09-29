@@ -6,13 +6,21 @@ public final class MemoryViews {
     public static final class Pair {
         public int first;
         public int second;
+
+        public Pair() { }
+
+        public Pair(int first, int second) {
+            this.first = first;
+            this.second = second;
+        }
     }
 
     public static final class PairCodec {
         static int encodes;
+        static int rangeEncodes;
         static byte[] decodedStorage;
 
-        public static byte[] encode(Pair value) {
+        public static byte[] e$pair(Pair value) {
             encodes++;
             byte[] bytes = new byte[8];
             MemoryBytes.write(bytes, 0, 4, value.first);
@@ -20,25 +28,34 @@ public final class MemoryViews {
             return bytes;
         }
 
-        public static Pair decode(byte[] bytes) {
-            return decodeAt(bytes, 0);
+        public static Pair d$pair(byte[] bytes) {
+            return a$pair(bytes, 0);
         }
 
-        public static Pair decodeAt(byte[] bytes, int offset) {
+        public static Pair a$pair(byte[] bytes, int offset) {
             decodedStorage = bytes;
             Pair value = new Pair();
             value.first = (int) MemoryBytes.read(bytes, offset, 4);
             value.second = (int) MemoryBytes.read(bytes, offset + 4, 4);
             return value;
         }
+
+        public static void w$pair(Pair value, byte[] bytes, int offset) {
+            rangeEncodes++;
+            MemoryBytes.write(bytes, offset, 4, value.first);
+            MemoryBytes.write(bytes, offset + 4, 4, value.second);
+        }
     }
+
+    private static final String PAIR_CODEC =
+            "MemoryViews$PairCodec#pair#LMemoryViews$Pair;";
 
     public static void main(String[] args) {
         check();
     }
 
     private static Pair view(Pointer bytes) {
-        return (Pair) bytes.retype(8, PairCodec.class.getName()).getObject();
+        return (Pair) bytes.retype(8, PAIR_CODEC).getObject();
     }
 
     public static void check() {
@@ -78,7 +95,7 @@ public final class MemoryViews {
         }
 
         left.first = 71;
-        Pointer copiedPointer = bytes.retype(8, PairCodec.class.getName());
+        Pointer copiedPointer = bytes.retype(8, PAIR_CODEC);
         Pair snapshot = (Pair) copiedPointer.getObjectCopyAs(Pair.class.getName());
         if (PairCodec.decodedStorage != storage) {
             throw new AssertionError("plain aggregate read copied its source buffer");
@@ -90,7 +107,7 @@ public final class MemoryViews {
         if (view(bytes).first != 71) {
             throw new AssertionError("value copy retained a live alias");
         }
-        Pair offsetCopy = (Pair) bytes.byte_offset(8).retype(8, PairCodec.class.getName())
+        Pair offsetCopy = (Pair) bytes.byte_offset(8).retype(8, PAIR_CODEC)
                 .getObjectCopyAs(Pair.class.getName());
         if (offsetCopy.first != 101 || offsetCopy.second != 59
                 || PairCodec.decodedStorage != storage) {
@@ -119,7 +136,7 @@ public final class MemoryViews {
         Pair fields = new Pair();
         fields.first = 17;
         fields.second = 23;
-        Pointer root = Pointer.cell(fields, 8, PairCodec.class.getName());
+        Pointer root = Pointer.cell(fields, 8, PAIR_CODEC);
         Pointer first = root.projectStructField(Pair.class.getName(), "first", 0, 4, null);
         if (first.add(0).offset_from(first) != 0 || first.add(1).getI32() != 23) {
             throw new AssertionError("pointer arithmetic lost the containing allocation");
