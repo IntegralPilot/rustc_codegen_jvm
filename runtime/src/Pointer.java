@@ -2360,6 +2360,7 @@ public final class Pointer {
             if (traitInterface == null) {
                 data = data.retype(elementSize, elementCodec);
             } else {
+                data = independentFieldMetadata(data);
                 Pointer marker = pointerObjectFromAddress(pointerMetadata);
                 TraitMetadataInfo info = TRAIT_METADATA_INFO.get(marker.numericAddress());
                 data.traitMetadataMarker(marker);
@@ -3485,7 +3486,7 @@ public final class Pointer {
             // decoding this field separately. Nested direct writes still need
             // to reach the enclosing enum's original byte storage.
             if (allocation instanceof FieldCell) {
-                commitOriginMemoryView(((FieldCell) allocation).owner());
+                ((FieldCell) allocation).commitOwners();
             }
             return;
         }
@@ -3556,21 +3557,54 @@ public final class Pointer {
     // identity filter as short-lived field pointers accumulate in long runs.
     private static boolean mayHaveFieldCells(Object owner) {
         if (owner instanceof Cell) {
-            return ((Cell) owner).hasFieldCells;
+            return ((Cell) owner).fields != null;
         }
         if (owner instanceof FieldCell) {
-            return ((FieldCell) owner).hasFieldCells;
+            return ((FieldCell) owner).fields != null;
         }
         return owner != null && mayBeInIdentityFilter(FIELD_CELL_FILTER, owner);
     }
 
-    private static void markFieldCells(Object owner) {
-        if (owner instanceof Cell) {
-            ((Cell) owner).hasFieldCells = true;
-        } else if (owner instanceof FieldCell) {
-            ((FieldCell) owner).hasFieldCells = true;
-        } else {
-            markIdentityFilter(FIELD_CELL_FILTER, owner);
+    private static final class FieldCellCache extends WeakReference<FieldCell> {
+        private volatile FieldCellCache next;
+
+        private FieldCellCache(FieldCell field, FieldCellCache next) {
+            super(field);
+            this.next = next;
+        }
+    }
+
+    private static FieldCellCache ownedFields(Object owner) {
+        return owner instanceof Cell ? ((Cell) owner).fields : ((FieldCell) owner).fields;
+    }
+
+    /** Keep cached field cells weak. A decoded value can refer to its owner.
+     * A strong field cache would retain that cycle through the global view map. */
+    private static FieldCell ownedField(Object owner, FieldAccess access) {
+        for (FieldCellCache entry = ownedFields(owner); entry != null; entry = entry.next) {
+            FieldCell field = entry.get();
+            if (field != null && (field.access == access || field.access.cacheKey.equals(access.cacheKey)))
+                return field;
+        }
+        synchronized (owner) {
+            FieldCellCache head = ownedFields(owner), previous = null;
+            for (FieldCellCache entry = head; entry != null; entry = entry.next) {
+                FieldCell field = entry.get();
+                if (field != null) {
+                    if (field.access == access || field.access.cacheKey.equals(access.cacheKey)) return field;
+                    previous = entry;
+                } else if (previous == null) {
+                    head = entry.next;
+                } else {
+                    // Keep the next link for readers that still hold this dead entry.
+                    previous.next = entry.next;
+                }
+            }
+            FieldCell field = new FieldCell(owner, access, true);
+            FieldCellCache entry = new FieldCellCache(field, head);
+            if (owner instanceof Cell) ((Cell) owner).fields = entry;
+            else ((FieldCell) owner).fields = entry;
+            return field;
         }
     }
 
@@ -3605,6 +3639,12 @@ public final class Pointer {
         if (!mayHaveProjectedViews(owner)) {
             return projected;
         }
+        if (owner instanceof Cell || owner instanceof FieldCell) {
+            for (FieldCellCache entry = ownedFields(owner); entry != null; entry = entry.next) {
+                projected = collectProjectedFieldView(entry.get(), projected);
+            }
+            return projected;
+        }
         Map<Object, Map<String, WeakReference<FieldCell>>> fieldStripe =
                 stateStripe(FIELD_CELLS, owner);
         synchronized (fieldStripe) {
@@ -3613,18 +3653,18 @@ public final class Pointer {
                 return projected;
             }
             for (WeakReference<FieldCell> reference : fields.values()) {
-                FieldCell cell = reference.get();
-                if (cell != null
-                        && (cell.hasStructuralView
-                                || cell.hasMemoryView
-                                || cell.hasMemoryOrigins
-                                || cell.hasProjectedViews)) {
-                    if (projected == null) {
-                        projected = new java.util.ArrayList<>();
-                    }
-                    projected.add(cell);
-                }
+                projected = collectProjectedFieldView(reference.get(), projected);
             }
+        }
+        return projected;
+    }
+
+    private static java.util.List<FieldCell> collectProjectedFieldView(
+            FieldCell cell, java.util.List<FieldCell> projected) {
+        if (cell != null && (cell.hasStructuralView || cell.hasMemoryView
+                || cell.hasMemoryOrigins || cell.hasProjectedViews)) {
+            if (projected == null) projected = new java.util.ArrayList<>();
+            projected.add(cell);
         }
         return projected;
     }
@@ -3662,6 +3702,12 @@ public final class Pointer {
     }
 
     private static boolean hasProjectedFieldCells(Object owner) {
+        if (owner instanceof Cell || owner instanceof FieldCell) {
+            for (FieldCellCache entry = ownedFields(owner); entry != null; entry = entry.next) {
+                if (entry.get() != null) return true;
+            }
+            return false;
+        }
         if (!mayHaveFieldCells(owner)) {
             return false;
         }
@@ -3892,7 +3938,7 @@ public final class Pointer {
         private Object value;
         private volatile boolean hasStructuralView;
         private volatile boolean hasMemoryView;
-        private volatile boolean hasFieldCells;
+        private volatile FieldCellCache fields;
         private volatile boolean hasProjectedViews;
 
         private Cell(Object value) {
@@ -3931,13 +3977,17 @@ public final class Pointer {
     }
 
     private static final class FieldCell {
+        // Share only the same immutable origin and offset.
+        private volatile AddressOriginState cachedAddressOrigin;
+        // Cache thin projections only. Exclude published addresses, decoded views, and dynamic metadata.
+        private volatile Pointer cachedProjection;
         private final Object fixedOwner;
         private final Object rootOwner;
         // Direct enum-payload borrows have no parent Pointer. Retain the
         // decoded owner's storage while this field cell remains reachable.
         private final Object memoryBacking;
         private final FieldAccess access;
-        private volatile boolean hasFieldCells;
+        private volatile FieldCellCache fields;
         private volatile boolean hasProjectedViews;
         private volatile boolean hasMemoryOrigins;
         private final int fieldNameHash;
@@ -3945,25 +3995,13 @@ public final class Pointer {
         private volatile boolean hasMemoryView;
 
         private FieldCell(Object owner, FieldAccess access) {
-            fixedOwner = owner;
-            rootOwner = null;
-            memoryBacking = memoryViewAllocation(owner);
-            this.access = access;
-            fieldNameHash = access.fieldNameHash;
+            this(owner, access, false);
         }
 
-        private FieldCell(Cell owner, FieldAccess access) {
-            fixedOwner = null;
-            rootOwner = owner;
-            memoryBacking = null;
-            this.access = access;
-            fieldNameHash = access.fieldNameHash;
-        }
-
-        private FieldCell(FieldCell owner, FieldAccess access) {
-            fixedOwner = null;
-            rootOwner = owner;
-            memoryBacking = null;
+        private FieldCell(Object owner, FieldAccess access, boolean rooted) {
+            fixedOwner = rooted ? null : owner;
+            rootOwner = rooted ? owner : null;
+            memoryBacking = rooted ? null : memoryViewAllocation(owner);
             this.access = access;
             fieldNameHash = access.fieldNameHash;
         }
@@ -4018,10 +4056,23 @@ public final class Pointer {
             // of sibling fields (for example an inline vector's data when its
             // length changes before writing a newly inserted element).
             discardProjectedFieldViews(this);
-            commitOriginMemoryView(owner);
-            Object identity = ownerIdentity();
-            if (identity != owner) {
-                commitOriginMemoryView(identity);
+            commitOwners();
+        }
+
+        private void commitOwners() {
+            // An enum payload can belong to a decoded enum that owns the byte storage.
+            // Intermediate field carriers need not have registered views.
+            FieldCell current = this;
+            while (true) {
+                Object owner = current.owner();
+                commitOriginMemoryView(owner);
+                if (current.rootOwner instanceof FieldCell) {
+                    current = (FieldCell) current.rootOwner;
+                } else {
+                    Object identity = current.ownerIdentity();
+                    if (identity != owner) commitOriginMemoryView(identity);
+                    return;
+                }
             }
         }
 
@@ -4423,9 +4474,15 @@ public final class Pointer {
     private volatile RarePointerState rareState;
     private long metadata = -1;
 
+    /** Immutable provenance can be shared without coupling derived views. */
     private static final class AddressOriginState {
-        private Pointer addressOrigin;
-        private long addressOriginOffset;
+        private final Pointer addressOrigin;
+        private final long addressOriginOffset;
+
+        private AddressOriginState(Pointer origin, long offset) {
+            addressOrigin = origin;
+            addressOriginOffset = offset;
+        }
     }
 
     private static final class RarePointerState {
@@ -4442,19 +4499,6 @@ public final class Pointer {
         private long traitPointeeAlignment = -1;
         private String traitAdapterClassName;
         private String traitPointeeCodecClassName;
-    }
-
-    private AddressOriginState mutableAddressState() {
-        AddressOriginState current = addressState;
-        if (current != null) {
-            return current;
-        }
-        synchronized (this) {
-            if (addressState == null) {
-                addressState = new AddressOriginState();
-            }
-            return addressState;
-        }
     }
 
     private RarePointerState mutableRareState() {
@@ -4572,9 +4616,21 @@ public final class Pointer {
     }
 
     private void setAddressOrigin(Pointer origin, long offset) {
-        AddressOriginState current = mutableAddressState();
-        current.addressOrigin = origin;
-        current.addressOriginOffset = offset;
+        AddressOriginState current = addressState;
+        if (current != null && current.addressOrigin == origin && current.addressOriginOffset == offset) {
+            return;
+        }
+        FieldCell field = byteOffset == 0 && allocation instanceof FieldCell ? (FieldCell) allocation : null;
+        if (field != null) {
+            current = field.cachedAddressOrigin;
+            if (current != null && current.addressOrigin == origin && current.addressOriginOffset == offset) {
+                addressState = current;
+                return;
+            }
+        }
+        current = new AddressOriginState(origin, offset);
+        addressState = current;
+        if (field != null) field.cachedAddressOrigin = current;
     }
 
     private long publishedAddress() {
@@ -4820,8 +4876,17 @@ public final class Pointer {
     /** Returns a stable, write-through pointer to a generated Rust value field. */
     public static Pointer field(
             Object owner, String fieldName, int size, String codecClassName) {
+        return field(owner, fieldName, size, codecClassName, true);
+    }
+
+    private static Pointer field(
+            Object owner, String fieldName, int size, String codecClassName, boolean cache) {
         if (owner == null) {
             throw new NullPointerException("Rust field pointer requires an owner");
+        }
+        // Erased zero-sized fields have no Java member. Avoid reflection errors and cache entries.
+        if (size == 0 && optionalInstanceField(owner.getClass(), fieldName) == null) {
+            return Pointer.cell(null, 0, codecClassName);
         }
         FieldCell cell;
         Map<Object, Map<String, WeakReference<FieldCell>>> stripe =
@@ -4847,9 +4912,15 @@ public final class Pointer {
                 }
                 fields.put(fieldName, new WeakReference<>(cell));
             }
-            markFieldCells(owner);
+            markIdentityFilter(FIELD_CELL_FILTER, owner);
         }
-        return new Pointer(cell, size, 0, size, codecClassName);
+        Pointer cached = cell.cachedProjection;
+        if (cache && cached != null && cached.metadata == -1 && cached.rareState == null
+                && cached.addressState == null && cached.viewSize == size
+                && java.util.Objects.equals(cached.viewCodecClassName, codecClassName)) return cached;
+        Pointer result = new Pointer(cell, size, 0, size, codecClassName);
+        if (cache) cell.cachedProjection = result;
+        return result;
     }
 
     public static Pointer field(
@@ -4888,37 +4959,46 @@ public final class Pointer {
             String fieldName,
             long size,
             String codecClassName) {
+        return rootField(owner, ownerClass, fieldName, size, codecClassName, null, 0);
+    }
+
+    private static Pointer rootField(Object owner, Class<?> ownerClass, String fieldName,
+            long size, String codecClassName, Pointer source, long displacement) {
+        // Zero-sized fields have no Java member.
+        if (size == 0 && optionalInstanceField(ownerClass, fieldName) == null) {
+            return finishFieldProjection(Pointer.cell(null, 0, codecClassName), source, displacement);
+        }
         FieldAccess access;
         try {
             access = fieldAccess(ownerClass, fieldName);
         } catch (NoSuchFieldException error) {
             if (size == 0) {
-                return Pointer.cell(null, 0, codecClassName);
+                return finishFieldProjection(Pointer.cell(null, 0, codecClassName), source, displacement);
             }
             throw new IllegalArgumentException(
                     "unknown Rust field " + ownerClass.getName() + "." + fieldName, error);
         }
-        String cacheKey = access.cacheKey;
-        FieldCell cell;
-        Map<Object, Map<String, WeakReference<FieldCell>>> stripe =
-                stateStripe(FIELD_CELLS, owner);
-        synchronized (stripe) {
-            Map<String, WeakReference<FieldCell>> fields = stripe.get(owner);
-            if (fields == null) {
-                fields = new HashMap<>();
-                stripe.put(owner, fields);
-            }
-            WeakReference<FieldCell> reference = fields.get(cacheKey);
-            cell = reference == null ? null : reference.get();
-            if (cell == null) {
-                cell = owner instanceof Cell
-                        ? new FieldCell((Cell) owner, access)
-                        : new FieldCell((FieldCell) owner, access);
-                fields.put(cacheKey, new WeakReference<>(cell));
-            }
-            markFieldCells(owner);
+        FieldCell cell = ownedField(owner, access);
+        Pointer cached = cell.cachedProjection;
+        boolean reusable = source != null && source.metadata == -1 && source.rareState == null;
+        if (reusable && cached != null && cached.metadata == -1 && cached.rareState == null
+                && cached.viewSize == size && java.util.Objects.equals(cached.viewCodecClassName, codecClassName)) {
+            AddressOriginState origin = source.addressState;
+            Pointer ownerOrigin = origin == null || origin.addressOrigin == null ? source : origin.addressOrigin;
+            long offset = origin == null || origin.addressOrigin == null ? displacement
+                    : Math.addExact(origin.addressOriginOffset, displacement);
+            AddressOriginState previous = cached.addressState;
+            if (previous != null && previous.addressOrigin == ownerOrigin && previous.addressOriginOffset == offset)
+                return cached;
         }
-        return new Pointer(cell, checkedArrayLength(size), 0, size, codecClassName);
+        Pointer result = finishFieldProjection(
+                new Pointer(cell, checkedArrayLength(size), 0, size, codecClassName), source, displacement);
+        if (reusable) cell.cachedProjection = result;
+        return result;
+    }
+
+    private static Pointer finishFieldProjection(Pointer pointer, Pointer source, long displacement) {
+        return source == null ? pointer : pointer.withMetadata(source.metadata).inheritAddressOrigin(source, displacement);
     }
 
     private Object compatibleStructView(String ownerClassName) {
@@ -4990,20 +5070,11 @@ public final class Pointer {
             long fieldOffset,
             long fieldSize,
             String fieldCodecClassName) {
-        Class<?> ownerClass = null;
-        Class<?> fieldType = null;
-        if (fieldSize != 0 || traitMetadataCarrier() != null) {
-            try {
-                ownerClass = resolvedRuntimeClass(ownerClassName);
-                fieldType = instanceField(ownerClass, fieldName).getType();
-            } catch (ClassNotFoundException error) {
-                throw new IllegalArgumentException(
-                        "unknown Rust aggregate class " + ownerClassName, error);
-            } catch (NoSuchFieldException error) {
-                throw new IllegalArgumentException(
-                        "unknown Rust field " + ownerClassName + "." + fieldName, error);
-            }
+        // Rust field offsets locate byte storage without Java reflection or a decoded parent.
+        if (allocation instanceof byte[] && traitMetadataCarrier() == null) {
+            return byteOffsetRetype(fieldOffset, fieldSize, fieldCodecClassName);
         }
+        Class<?> ownerClass = null;
         if ((allocation instanceof Cell || allocation instanceof FieldCell)
                 && byteOffset == 0
                 && viewSize == allocationElementSize) {
@@ -5017,13 +5088,24 @@ public final class Pointer {
                                     ownerClass,
                                     fieldName,
                                     fieldSize,
-                                    fieldCodecClassName)
-                            .withMetadata(metadata)
-                            .inheritAddressOrigin(this, fieldOffset);
+                                    fieldCodecClassName, this, fieldOffset);
                 }
             } catch (ClassNotFoundException error) {
                 throw new IllegalArgumentException(
                         "unknown Rust aggregate class " + ownerClassName, error);
+            }
+        }
+        Class<?> fieldType = null;
+        if (fieldSize != 0 || traitMetadataCarrier() != null) {
+            try {
+                if (ownerClass == null) ownerClass = resolvedRuntimeClass(ownerClassName);
+                fieldType = instanceField(ownerClass, fieldName).getType();
+            } catch (ClassNotFoundException error) {
+                throw new IllegalArgumentException(
+                        "unknown Rust aggregate class " + ownerClassName, error);
+            } catch (NoSuchFieldException error) {
+                throw new IllegalArgumentException(
+                        "unknown Rust field " + ownerClassName + "." + fieldName, error);
             }
         }
         boolean managedField = fieldType == null || !fieldType.isPrimitive();
@@ -5050,7 +5132,7 @@ public final class Pointer {
                         "unknown Rust aggregate class " + ownerClassName, error);
             }
             if (owner != null) {
-                return field(owner, fieldName, fieldSize, fieldCodecClassName)
+                return field(owner, fieldName, checkedArrayLength(fieldSize), fieldCodecClassName, false)
                         .withMetadata(metadata)
                         .inheritAddressOrigin(this, fieldOffset);
             }
@@ -5161,8 +5243,7 @@ public final class Pointer {
                                     -1)
                             .withMetadata(origin.metadata);
                     if (activeMemoryViewMatches(array, origin)) {
-                        return source.byte_offset(relativeOffset)
-                                .retype(elementSize, codecClassName);
+                        return source.byteOffsetRetype(relativeOffset, elementSize, codecClassName);
                     }
                     return new Pointer(
                                     array,
@@ -6257,6 +6338,7 @@ public final class Pointer {
                         && (pointeeAlignment & (pointeeAlignment - 1)) != 0)) {
             throw new IllegalArgumentException("invalid trait-object pointee layout");
         }
+        pointer = independentFieldMetadata(pointer);
         pointer.traitObjectCarrier(carrier);
         pointer.traitPointeeSize(pointeeSize);
         pointer.traitPointeeAlignment(pointeeAlignment);
@@ -6308,6 +6390,7 @@ public final class Pointer {
                     "struct-tail trait pointer does not carry dynamic metadata");
         }
         TraitObjectCarrier traitCarrier = (TraitObjectCarrier) carrier;
+        pointer = independentFieldMetadata(pointer);
         pointer.traitMetadataCarrier(carrier);
         pointer.traitMetadataMarker(tailPointer.traitMetadataMarker());
         pointer.traitPointeeSize(tailPointer.traitPointeeSize() >= 0
@@ -6634,36 +6717,45 @@ public final class Pointer {
     }
 
     private Pointer inheritAddressOrigin(Pointer source, long additionalOffset) {
-        Pointer origin = source.addressOrigin();
-        // A decoded carrier's origin is weakly indexed. Keep its backing cell
-        // alive while any projected pointer can still mutate that carrier;
-        // flattening past it lets GC detach live aliases from their storage.
-        if (origin == null || source.boundMemoryViewState() != null) {
+        AddressOriginState current = source.addressState;
+        // Keep decoded backing cells alive for as long as a projected alias.
+        if (current == null || current.addressOrigin == null || source.boundMemoryViewState() != null) {
             setAddressOrigin(source, additionalOffset);
+        } else if (additionalOffset == 0) {
+            addressState = current;
         } else {
-            setAddressOrigin(
-                    origin,
-                    Math.addExact(source.addressOriginOffset(), additionalOffset));
+            setAddressOrigin(current.addressOrigin,
+                    Math.addExact(current.addressOriginOffset, additionalOffset));
         }
         return this;
     }
 
     private Pointer copyAddressOrigin(Pointer source, long additionalOffset) {
-        Pointer origin = source.addressOrigin();
-        if (origin != null) {
-            setAddressOrigin(
-                    origin,
-                    Math.addExact(source.addressOriginOffset(), additionalOffset));
+        AddressOriginState current = source.addressState;
+        if (current != null && current.addressOrigin != null) {
+            if (additionalOffset == 0) {
+                addressState = current;
+            } else {
+                // Origin offsets are address words and must support wrapping arithmetic.
+                setAddressOrigin(current.addressOrigin,
+                        current.addressOriginOffset + additionalOffset);
+            }
         }
         return this;
     }
 
+    private static Pointer independentFieldMetadata(Pointer pointer) {
+        // Detach metadata even if this field pointer is no longer the cached projection.
+        return pointer.allocation instanceof FieldCell
+                ? pointer.retype(pointer.viewSize, pointer.viewCodecClassName) : pointer;
+    }
+
     public static Pointer withMetadata(Pointer pointer, long metadata) {
-        return pointer.withMetadata(metadata);
+        return (pointer.metadata == metadata ? pointer : independentFieldMetadata(pointer)).withMetadata(metadata);
     }
 
     public static Pointer withMetadata(Pointer pointer, int metadata) {
-        return pointer.withMetadata(Integer.toUnsignedLong(metadata));
+        return withMetadata(pointer, Integer.toUnsignedLong(metadata));
     }
 
     public long metadata() {
@@ -11474,7 +11566,7 @@ public final class Pointer {
             if (match == null) {
                 return this;
             }
-            return field(value, match.getName(), viewSize, viewCodecClassName)
+            return field(value, match.getName(), checkedArrayLength(viewSize), viewCodecClassName, false)
                     .withMetadata(metadata)
                     .inheritAddressOrigin(this, 0);
         } catch (ClassNotFoundException error) {

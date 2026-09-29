@@ -6,6 +6,8 @@ public class Main {
     public static void main(String[] args) throws Exception {
         ArrayViews.check();
         MemoryViews.check();
+        FieldProjections.check();
+        CyclicFieldViews.check();
         CodecAdapters.check();
         StructuralViews.check();
         Field field = Pointer.class.getDeclaredField("EXPOSED_ADDRESSES");
