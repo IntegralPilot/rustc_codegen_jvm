@@ -649,8 +649,12 @@ fn borrowed_metadata_matches_full_reader_and_rejects_truncation() {
     assert_eq!(
         summary::read(&bytes).unwrap(),
         summary::Summary {
+            private: false,
+            opaque_reflection: false,
+            method_demands: false,
             name: name.into(),
-            has_main: true
+            has_main: true,
+            carrier: None,
         }
     );
     for length in 0..bytes.len() {
