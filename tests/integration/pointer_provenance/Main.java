@@ -6,6 +6,7 @@ public class Main {
     public static void main(String[] args) throws Exception {
         ArrayViews.check();
         CellArrayViews.check();
+        SliceAliases.check();
         MemoryViews.check();
         AtomicViews.check();
         AtomicLocations.check();
@@ -16,6 +17,7 @@ public class Main {
         CyclicFieldViews.check();
         AddressOrder.check();
         LocationQueries.check();
+        SliceLocations.check();
         OwnedFields.check();
         BorrowedFields.check();
         BorrowedLocals.check();

@@ -1145,9 +1145,13 @@ public final class Pointer {
         }
 
         private boolean matches(Pointer pointer) {
+            return matches(pointer, pointer.byteOffset);
+        }
+
+        private boolean matches(Pointer pointer, long offset) {
             return allocation.get() == pointer.allocation
                     && allocationElementSize == pointer.allocationElementSize
-                    && byteOffset == pointer.byteOffset
+                    && byteOffset == offset
                     && viewSize == pointer.viewSize
                     && java.util.Objects.equals(
                             allocationCodecClassName, pointer.allocationCodecClassName)
@@ -1493,6 +1497,71 @@ public final class Pointer {
         }
         for (int index = 0; index < length; index++) {
             arraySet(array, index, copyValue ? copyManagedValue(value) : value);
+        }
+    }
+
+    // Primitive repeat initialization keeps values unboxed and preserves live aliases.
+    public static void fillArray(boolean[] array, boolean value) {
+        if (hasScalarWriteTracking(array)) {
+            for (int index = 0; index < array.length; index++) sliceSetBoolean(array, index, value);
+        } else {
+            Arrays.fill(array, value);
+        }
+    }
+
+    public static void fillArray(byte[] array, byte value) {
+        if (hasScalarWriteTracking(array)) {
+            for (int index = 0; index < array.length; index++) sliceSetI8(array, index, value);
+        } else {
+            Arrays.fill(array, value);
+        }
+    }
+
+    public static void fillArray(short[] array, short value) {
+        if (hasScalarWriteTracking(array)) {
+            for (int index = 0; index < array.length; index++) sliceSetI16(array, index, value);
+        } else {
+            Arrays.fill(array, value);
+        }
+    }
+
+    public static void fillArray(char[] array, char value) {
+        if (hasScalarWriteTracking(array)) {
+            for (int index = 0; index < array.length; index++) sliceSetU16(array, index, value);
+        } else {
+            Arrays.fill(array, value);
+        }
+    }
+
+    public static void fillArray(int[] array, int value) {
+        if (hasScalarWriteTracking(array)) {
+            for (int index = 0; index < array.length; index++) sliceSetI32(array, index, value);
+        } else {
+            Arrays.fill(array, value);
+        }
+    }
+
+    public static void fillArray(long[] array, long value) {
+        if (hasScalarWriteTracking(array)) {
+            for (int index = 0; index < array.length; index++) sliceSetI64(array, index, value);
+        } else {
+            Arrays.fill(array, value);
+        }
+    }
+
+    public static void fillArray(float[] array, float value) {
+        if (hasScalarWriteTracking(array)) {
+            for (int index = 0; index < array.length; index++) sliceSetF32(array, index, value);
+        } else {
+            Arrays.fill(array, value);
+        }
+    }
+
+    public static void fillArray(double[] array, double value) {
+        if (hasScalarWriteTracking(array)) {
+            for (int index = 0; index < array.length; index++) sliceSetF64(array, index, value);
+        } else {
+            Arrays.fill(array, value);
         }
     }
 
@@ -2844,6 +2913,30 @@ public final class Pointer {
     private Object decodedMemoryView() {
         synchronized (atomicStripe(this)) {
             return decodedMemoryViewLocked();
+        }
+    }
+
+    /** Reuse a decoded element only while its registered origin still matches.
+     * Keep the enclosing pointer bound to its own element. */
+    private Object cachedSliceElement(long displacement) {
+        if (!(allocation instanceof byte[]) || viewSize <= 0
+                || !isGeneratedAggregateCodec(viewCodecClassName)
+                || traitObjectCarrier() != null || traitMetadataCarrier() != null
+                || isDirectAllocationView()) return null;
+        long absolute = Math.addExact(byteOffset, displacement);
+        synchronized (atomicStripe(this)) {
+            Map<Object, LongRangeMap<MemoryViewState>> stripe = stateStripe(MEMORY_VIEWS, allocation);
+            synchronized (stripe) {
+                LongRangeMap<MemoryViewState> views = stripe.get(allocation);
+                MemoryViewState cached = views == null ? null : views.get(absolute);
+                if (cached == null || !cached.active || cached.size != viewSize
+                        || !cached.codecClassName.equals(viewCodecClassName) || cached.value == null) return null;
+                Map<Object, MemoryViewOrigin> origins = stateStripe(MEMORY_VIEW_ORIGINS, cached.value);
+                synchronized (origins) {
+                    MemoryViewOrigin origin = origins.get(cached.value);
+                    return origin != null && origin.matches(this, absolute) ? cached.value : null;
+                }
+            }
         }
     }
 
@@ -9632,6 +9725,93 @@ public final class Pointer {
         return result;
     }
 
+    private static Object directLocationSliceArray(Object root, int size) {
+        if (size <= 0) return null;
+        if (root instanceof Pointer) {
+            Pointer pointer = (Pointer) root;
+            if (pointer.rareState != null || pointer.allocationElementSize != size
+                    || pointer.allocationCodecClassName != null) return null;
+            root = pointer.allocation;
+        } else if (mayBeInIdentityFilter(MEMORY_VIEW_ORIGIN_FILTER, root)) {
+            return null;
+        }
+        return root != null && root.getClass().isArray()
+                && root.getClass().getComponentType().isPrimitive()
+                && inferredArrayElementSize(root) == size ? root : null;
+    }
+
+    /** Re-form a scalar slice directly from its decomposed storage location. */
+    public static Object locationSliceBacking(Object root, long offset, int size) {
+        if (root == null && offset == 0) return null;
+        Object array = directLocationSliceArray(root, size);
+        if (array != null) return array;
+        if (retainedSliceRoot(root, offset, size, null)) return root;
+        return fromLocation(root, offset, size).sliceBackingArray();
+    }
+
+    public static int locationSliceOffset(Object root, long offset, int size) {
+        if (root == null && offset == 0) return 0;
+        if (directLocationSliceArray(root, size) == null) {
+            if (retainedSliceRoot(root, offset, size, null)) return (int) (offset / size);
+            return fromLocation(root, offset, size).sliceElementOffset();
+        }
+        if (root instanceof Pointer) offset += ((Pointer) root).byteOffset;
+        if (offset % size != 0) {
+            throw new IllegalStateException("slice data pointer is not element-aligned");
+        }
+        return Math.toIntExact(offset / size);
+    }
+
+    private static boolean retainedSliceRoot(Object root, long offset, int size, String codec) {
+        if (!(root instanceof Pointer) || size <= 0 || offset % size != 0
+                || offset / size != (int) (offset / size)) return false;
+        Pointer pointer = (Pointer) root;
+        return pointer.viewSize == size && java.util.Objects.equals(pointer.viewCodecClassName, codec);
+    }
+
+    /** Retain the element owner. The slice start is relative to its current displacement. */
+    public static Object typedLocationSliceBacking(Object root, long offset, int size, String codec) {
+        if (retainedSliceRoot(root, offset, size, codec)) return root;
+        return fromTypedStorageLocation(root, offset, size, codec).sliceBackingArray();
+    }
+
+    public static int typedLocationSliceOffset(Object root, long offset, int size, String codec) {
+        if (retainedSliceRoot(root, offset, size, codec)) return (int) (offset / size);
+        return fromTypedStorageLocation(root, offset, size, codec).sliceElementOffset();
+    }
+
+    /** Normalize the aggregate slice root once. Keep byte offsets and slice length separate. */
+    public static Object sliceAddressRoot(Object backing, int size, String codec) {
+        if (backing == null) return withoutProvenance(0, size, codec);
+        if (backing instanceof Pointer) {
+            return ((Pointer) backing).sliceStorageView(size, codec);
+        }
+        // Preserve the backing owner of decoded arrays with a registered origin.
+        return fromSliceParts(backing, 0, 0L, size, codec);
+    }
+
+    /** Normalize unusual decoded/transparent storage once before scalar iteration. */
+    public static Object scalarSliceRoot(Object backing, int size) {
+        if (backing == null) return null;
+        if (backing.getClass().isArray()
+                && backing.getClass().getComponentType().isPrimitive()
+                && !mayBeInIdentityFilter(MEMORY_VIEW_ORIGIN_FILTER, backing)) {
+            return backing;
+        }
+        if (backing instanceof Pointer) {
+            Pointer pointer = (Pointer) backing;
+            if (pointer.allocation == null
+                    || (pointer.allocation.getClass().isArray()
+                        && pointer.allocation.getClass().getComponentType().isPrimitive())) {
+                return pointer;
+            }
+            // Root normalization must not change slice metadata.
+            return pointer.sliceStorageView(size, null);
+        }
+        return fromSliceParts(backing, 0, 0L, size, null);
+    }
+
+    /** Byte-backed places can access a known scalar offset without a field view. */
     public static boolean hasByteStorage(Object root) {
         return root instanceof byte[]
                 || (root instanceof Pointer && ((Pointer) root).allocation instanceof byte[]);
@@ -10866,6 +11046,21 @@ public final class Pointer {
                 : null;
     }
 
+    private long sliceScalarBits(int index, int size, String name) {
+        Pointer storage = sliceElementView();
+        storage.requireScalarViewSize(size, name);
+        return loadLocationBits(storage, Math.multiplyExact((long) index, size), size);
+    }
+
+    private static boolean storeSliceScalar(Object backing, int index, long bits, int size) {
+        if (!(backing instanceof Pointer)) return false;
+        Pointer storage = ((Pointer) backing).sliceElementView();
+        // Aggregate/encoded layouts retain set()'s conversion and ownership rules.
+        if (storage.viewSize != size || storage.viewCodecClassName != null) return false;
+        storeLocationBits(storage, Math.multiplyExact((long) index, size), bits, size);
+        return true;
+    }
+
     /**
      * Finds a slice carried through transparent single-field Rust wrappers,
      * such as {@code UnsafeCell<[T]>}.
@@ -10946,6 +11141,12 @@ public final class Pointer {
             String allocationCodec = storage.allocationCodecClassName != null
                     ? storage.allocationCodecClassName
                     : elementCodecClassName;
+            if (checkedElementSize > 0 && storage.allocationElementSize == checkedElementSize
+                    && storage.viewSize == checkedElementSize
+                    && java.util.Objects.equals(storage.viewCodecClassName, elementCodecClassName)
+                    && java.util.Objects.equals(storage.allocationCodecClassName, allocationCodec)) {
+                return storage;
+            }
             if (checkedElementSize == 0) {
                 return new Pointer(
                                 storage.allocation,
@@ -10995,24 +11196,31 @@ public final class Pointer {
 
     public static boolean sliceGetBoolean(Object backing, int index) {
         if (backing instanceof boolean[]) {
-            return ((boolean[]) backing)[index];
+            if (!mayBeInIdentityFilter(MEMORY_VIEW_FILTER, backing)) {
+                return ((boolean[]) backing)[index];
+            }
+            return loadLocationBits(backing, index, 1) != 0;
         }
-        Pointer pointer = slicePointer(backing, index);
-        return pointer != null
-                ? pointer.getBoolean()
+        return backing instanceof Pointer
+                ? ((Pointer) backing).sliceScalarBits(index, 1, "bool") != 0
                 : ((Boolean) arrayGet(backing, index)).booleanValue();
     }
 
     public static byte sliceGetI8(Object backing, int index) {
         if (backing instanceof byte[]) {
-            return ((byte[]) backing)[index];
+            if (!mayBeInIdentityFilter(MEMORY_VIEW_FILTER, backing)) {
+                return ((byte[]) backing)[index];
+            }
+            return (byte) loadLocationBits(backing, index, 1);
         }
         if (backing instanceof boolean[]) {
-            return (byte) (((boolean[]) backing)[index] ? 1 : 0);
+            if (!mayBeInIdentityFilter(MEMORY_VIEW_FILTER, backing)) {
+                return (byte) (((boolean[]) backing)[index] ? 1 : 0);
+            }
+            return (byte) loadLocationBits(backing, index, 1);
         }
-        Pointer pointer = slicePointer(backing, index);
-        if (pointer != null) {
-            return pointer.getI8();
+        if (backing instanceof Pointer) {
+            return (byte) ((Pointer) backing).sliceScalarBits(index, 1, "i8/u8");
         }
         Object value = arrayGet(backing, index);
         return value instanceof Boolean
@@ -11031,24 +11239,31 @@ public final class Pointer {
 
     public static short sliceGetI16(Object backing, int index) {
         if (backing instanceof short[]) {
-            return ((short[]) backing)[index];
+            if (!mayBeInIdentityFilter(MEMORY_VIEW_FILTER, backing)) {
+                return ((short[]) backing)[index];
+            }
+            return (short) loadLocationBits(backing, (long) index * 2, 2);
         }
-        Pointer pointer = slicePointer(backing, index);
-        return pointer != null
-                ? pointer.getI16()
+        return backing instanceof Pointer
+                ? (short) ((Pointer) backing).sliceScalarBits(index, 2, "i16/u16")
                 : ((Number) arrayGet(backing, index)).shortValue();
     }
 
     public static char sliceGetU16(Object backing, int index) {
         if (backing instanceof char[]) {
-            return ((char[]) backing)[index];
+            if (!mayBeInIdentityFilter(MEMORY_VIEW_FILTER, backing)) {
+                return ((char[]) backing)[index];
+            }
+            return (char) loadLocationBits(backing, (long) index * 2, 2);
         }
         if (backing instanceof short[]) {
-            return (char) (((short[]) backing)[index] & 0xffff);
+            if (!mayBeInIdentityFilter(MEMORY_VIEW_FILTER, backing)) {
+                return (char) (((short[]) backing)[index] & 0xffff);
+            }
+            return (char) loadLocationBits(backing, (long) index * 2, 2);
         }
-        Pointer pointer = slicePointer(backing, index);
-        if (pointer != null) {
-            return (char) (pointer.getI16() & 0xffff);
+        if (backing instanceof Pointer) {
+            return (char) ((Pointer) backing).sliceScalarBits(index, 2, "i16/u16");
         }
         Object value = arrayGet(backing, index);
         return value instanceof Character
@@ -11058,14 +11273,21 @@ public final class Pointer {
 
     public static int sliceGetI32(Object backing, int index) {
         if (backing instanceof int[]) {
-            return ((int[]) backing)[index];
+            if (!mayBeInIdentityFilter(MEMORY_VIEW_FILTER, backing)) {
+                return ((int[]) backing)[index];
+            }
+            return (int) loadLocationBits(backing, (long) index * 4, 4);
         }
         if (backing instanceof char[]) {
-            return ((char[]) backing)[index];
+            if (!mayBeInIdentityFilter(MEMORY_VIEW_FILTER, backing)) {
+                return ((char[]) backing)[index];
+            }
+            return (char) loadLocationBits(backing, (long) index * 2, 2);
         }
-        Pointer pointer = slicePointer(backing, index);
-        Object value =
-                pointer != null ? Integer.valueOf(pointer.getI32()) : arrayGet(backing, index);
+        if (backing instanceof Pointer) {
+            return (int) ((Pointer) backing).sliceScalarBits(index, 4, "i32/u32");
+        }
+        Object value = arrayGet(backing, index);
         return value instanceof Character
                 ? ((Character) value).charValue()
                 : ((Number) value).intValue();
@@ -11073,31 +11295,37 @@ public final class Pointer {
 
     public static long sliceGetI64(Object backing, int index) {
         if (backing instanceof long[]) {
-            return ((long[]) backing)[index];
+            if (!mayBeInIdentityFilter(MEMORY_VIEW_FILTER, backing)) {
+                return ((long[]) backing)[index];
+            }
+            return loadLocationBits(backing, (long) index * 8, 8);
         }
-        Pointer pointer = slicePointer(backing, index);
-        return pointer != null
-                ? pointer.getI64()
+        return backing instanceof Pointer
+                ? ((Pointer) backing).sliceScalarBits(index, 8, "i64/u64")
                 : ((Number) arrayGet(backing, index)).longValue();
     }
 
     public static float sliceGetF32(Object backing, int index) {
         if (backing instanceof float[]) {
-            return ((float[]) backing)[index];
+            if (!mayBeInIdentityFilter(MEMORY_VIEW_FILTER, backing)) {
+                return ((float[]) backing)[index];
+            }
+            return Float.intBitsToFloat((int) loadLocationBits(backing, (long) index * 4, 4));
         }
-        Pointer pointer = slicePointer(backing, index);
-        return pointer != null
-                ? pointer.getF32()
+        return backing instanceof Pointer
+                ? Float.intBitsToFloat((int) ((Pointer) backing).sliceScalarBits(index, 4, "f32"))
                 : ((Number) arrayGet(backing, index)).floatValue();
     }
 
     public static double sliceGetF64(Object backing, int index) {
         if (backing instanceof double[]) {
-            return ((double[]) backing)[index];
+            if (!mayBeInIdentityFilter(MEMORY_VIEW_FILTER, backing)) {
+                return ((double[]) backing)[index];
+            }
+            return Double.longBitsToDouble(loadLocationBits(backing, (long) index * 8, 8));
         }
-        Pointer pointer = slicePointer(backing, index);
-        return pointer != null
-                ? pointer.getF64()
+        return backing instanceof Pointer
+                ? Double.longBitsToDouble(((Pointer) backing).sliceScalarBits(index, 8, "f64"))
                 : ((Number) arrayGet(backing, index)).doubleValue();
     }
 
@@ -11105,61 +11333,84 @@ public final class Pointer {
         if (backing instanceof Object[]) {
             return independentRepeatedArrayElement(backing, index);
         }
-        Pointer pointer = slicePointer(backing, index);
-        return pointer != null
-                ? pointer.getObject()
-                : independentRepeatedArrayElement(backing, index);
+        if (backing instanceof Pointer) {
+            Pointer storage = ((Pointer) backing).sliceElementView();
+            long displacement = Math.multiplyExact((long) index, storage.viewSize);
+            Object decoded = storage.cachedSliceElement(displacement);
+            if (decoded != null) return decoded;
+            if (storage.rareState == null && storage.addressState == null
+                    && storage.isDirectAllocationView() && !mayHaveStructuralView(storage.allocation)) {
+                Object value = loadObjectLocation(storage, displacement, null);
+                // Array origins belong to the derived location, not this base.
+                if (value == null || !value.getClass().isArray()) return value;
+            }
+            return storage.add(index).getObject();
+        }
+        return independentRepeatedArrayElement(backing, index);
     }
 
     public static void sliceSetBoolean(Object backing, int index, boolean value) {
         if (backing instanceof boolean[]) {
-            ((boolean[]) backing)[index] = value;
+            if (hasScalarWriteTracking(backing)) storeLocationBits(backing, index, value ? 1 : 0, 1);
+            else ((boolean[]) backing)[index] = value;
             return;
         }
+        if (storeSliceScalar(backing, index, value ? 1 : 0, 1)) return;
         sliceSetObject(backing, index, Boolean.valueOf(value));
     }
 
     public static void sliceSetI8(Object backing, int index, byte value) {
         if (backing instanceof byte[]) {
-            ((byte[]) backing)[index] = value;
+            if (hasScalarWriteTracking(backing)) storeLocationBits(backing, index, value, 1);
+            else ((byte[]) backing)[index] = value;
             return;
         }
         if (backing instanceof boolean[]) {
-            ((boolean[]) backing)[index] = value != 0;
+            if (hasScalarWriteTracking(backing)) storeLocationBits(backing, index, value != 0 ? 1 : 0, 1);
+            else ((boolean[]) backing)[index] = value != 0;
             return;
         }
+        if (storeSliceScalar(backing, index, value, 1)) return;
         sliceSetObject(backing, index, Byte.valueOf(value));
     }
 
     public static void sliceSetI16(Object backing, int index, short value) {
         if (backing instanceof short[]) {
-            ((short[]) backing)[index] = value;
+            if (hasScalarWriteTracking(backing)) storeLocationBits(backing, (long) index * 2, value, 2);
+            else ((short[]) backing)[index] = value;
             return;
         }
+        if (storeSliceScalar(backing, index, value, 2)) return;
         sliceSetObject(backing, index, Short.valueOf(value));
     }
 
     public static void sliceSetU16(Object backing, int index, char value) {
         if (backing instanceof char[]) {
-            ((char[]) backing)[index] = value;
+            if (hasScalarWriteTracking(backing)) storeLocationBits(backing, (long) index * 2, value, 2);
+            else ((char[]) backing)[index] = value;
             return;
         }
         if (backing instanceof short[]) {
-            ((short[]) backing)[index] = (short) value;
+            if (hasScalarWriteTracking(backing)) storeLocationBits(backing, (long) index * 2, value, 2);
+            else ((short[]) backing)[index] = (short) value;
             return;
         }
+        if (storeSliceScalar(backing, index, value, 2)) return;
         sliceSetObject(backing, index, Character.valueOf(value));
     }
 
     public static void sliceSetI32(Object backing, int index, int value) {
         if (backing instanceof int[]) {
-            ((int[]) backing)[index] = value;
+            if (hasScalarWriteTracking(backing)) storeLocationBits(backing, (long) index * 4, value, 4);
+            else ((int[]) backing)[index] = value;
             return;
         }
         if (backing instanceof char[]) {
-            ((char[]) backing)[index] = (char) value;
+            if (hasScalarWriteTracking(backing)) storeLocationBits(backing, (long) index * 2, value, 2);
+            else ((char[]) backing)[index] = (char) value;
             return;
         }
+        if (storeSliceScalar(backing, index, value, 4)) return;
         Pointer pointer = slicePointer(backing, index);
         if (pointer != null) {
             pointer.set(Integer.valueOf(value));
@@ -11167,13 +11418,13 @@ public final class Pointer {
         }
         Class<?> component = backing.getClass().getComponentType();
         if (component == byte.class) {
-            Array.setByte(backing, index, (byte) value);
+            storeLocationBits(backing, index, value, 1);
         } else if (component == short.class) {
-            Array.setShort(backing, index, (short) value);
+            storeLocationBits(backing, (long) index * 2, value, 2);
         } else if (component == char.class) {
-            Array.setChar(backing, index, (char) value);
+            storeLocationBits(backing, (long) index * 2, value, 2);
         } else if (component == int.class) {
-            Array.setInt(backing, index, value);
+            storeLocationBits(backing, (long) index * 4, value, 4);
         } else {
             arraySet(backing, index, Integer.valueOf(value));
         }
@@ -11181,25 +11432,31 @@ public final class Pointer {
 
     public static void sliceSetI64(Object backing, int index, long value) {
         if (backing instanceof long[]) {
-            ((long[]) backing)[index] = value;
+            if (hasScalarWriteTracking(backing)) storeLocationBits(backing, (long) index * 8, value, 8);
+            else ((long[]) backing)[index] = value;
             return;
         }
+        if (storeSliceScalar(backing, index, value, 8)) return;
         sliceSetObject(backing, index, Long.valueOf(value));
     }
 
     public static void sliceSetF32(Object backing, int index, float value) {
         if (backing instanceof float[]) {
-            ((float[]) backing)[index] = value;
+            if (hasScalarWriteTracking(backing)) storeLocationBits(backing, (long) index * 4, Float.floatToRawIntBits(value), 4);
+            else ((float[]) backing)[index] = value;
             return;
         }
+        if (storeSliceScalar(backing, index, Float.floatToRawIntBits(value), 4)) return;
         sliceSetObject(backing, index, Float.valueOf(value));
     }
 
     public static void sliceSetF64(Object backing, int index, double value) {
         if (backing instanceof double[]) {
-            ((double[]) backing)[index] = value;
+            if (hasScalarWriteTracking(backing)) storeLocationBits(backing, (long) index * 8, Double.doubleToRawLongBits(value), 8);
+            else ((double[]) backing)[index] = value;
             return;
         }
+        if (storeSliceScalar(backing, index, Double.doubleToRawLongBits(value), 8)) return;
         sliceSetObject(backing, index, Double.valueOf(value));
     }
 
