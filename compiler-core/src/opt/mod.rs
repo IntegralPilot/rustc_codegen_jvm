@@ -8,6 +8,12 @@ pub use live::{Live, live, live_with_roots};
 
 mod cells;
 pub use cells::promote_cells;
+mod tagged;
+pub use tagged::decompose_tagged;
 
 #[cfg(test)]
 mod cells_tests;
+
+mod simplify;
+mod unreachable;
+pub use simplify::simplify_components;
