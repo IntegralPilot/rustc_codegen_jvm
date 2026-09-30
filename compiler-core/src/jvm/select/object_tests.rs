@@ -61,7 +61,6 @@ fn jvm_executes_constructors_fields_and_virtual_interface_calls() {
         name: "narrow".into(),
         ty: int,
         is_static: false,
-        relative_pointer: false,
     });
     let old = b
         .emit(
@@ -237,7 +236,6 @@ fn field_projection_verifies_both_ends_of_the_pointer_view() {
         name: "value".into(),
         ty: int,
         is_static: false,
-        relative_pointer: false,
     });
     let projection = b.projection(PointerProjection {
         field,

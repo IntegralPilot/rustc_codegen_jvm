@@ -1,7 +1,36 @@
 //! Array operations preserve lazy repeat copies and pointer-backed slice views.
 use super::*;
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Access {
+    Native,
+    Array,
+    View,
+}
+
 impl Selector<'_> {
-    pub(super) fn array(&mut self, inst: Inst) -> jvm::Result<bool> {
+    pub(super) fn array(&mut self, id: InstId, inst: Inst) -> jvm::Result<bool> {
+        if let Op::ArrayFill { array, value } = inst.op {
+            let element = self.body.value_type(value);
+            let native = self.native_array_accesses.get(id.index()) == Some(&Some(element));
+            self.load(array)?;
+            self.argument(value)?;
+            let mut descriptor = String::from("(");
+            representation::descriptor(self.types, self.body.value_type(array), &mut descriptor)?;
+            representation::descriptor(self.types, element, &mut descriptor)?;
+            descriptor.push_str(")V");
+            let owner = self.cp.add_class(if native {
+                "java/util/Arrays"
+            } else {
+                POINTER_CLASS
+            })?;
+            let target = self.cp.add_method_ref(
+                owner,
+                if native { "fill" } else { "fillArray" },
+                descriptor,
+            )?;
+            self.assembly.code.push(Instruction::Invokestatic(target));
+            return Ok(true);
+        }
         if let Op::ArrayLength(array) = inst.op {
             self.load(array)?;
             let op = if matches!(
@@ -16,13 +45,49 @@ impl Selector<'_> {
             self.assembly.code.push(op);
             return Ok(true);
         }
-        let (array, index, value) = match inst.op {
-            Op::ArrayGet { array, index } => (array, index, None),
+        if let Op::ViewGet(parts) | Op::ViewSet { parts, .. } = inst.op {
+            let [backing, start, index] = self.body.args[parts.range()] else {
+                return Err(error("slice access components"));
+            };
+            let value = match inst.op {
+                Op::ViewSet { value, .. } => Some(value),
+                _ => None,
+            };
+            let element = self.body.value_type(value.or(inst.result).unwrap());
+            let native = self.native_array_accesses.get(id.index()) == Some(&Some(element));
+            self.load(backing)?;
+            if native {
+                let mut descriptor = String::from("[");
+                representation::descriptor(self.types, element, &mut descriptor)?;
+                self.assembly
+                    .code
+                    .push(Instruction::Checkcast(self.cp.add_class(&descriptor)?));
+            }
+            self.load(start)?;
+            self.load(index)?;
+            self.assembly.code.push(Instruction::Iadd);
+            if let Some(value) = value {
+                self.argument(value)?;
+            }
+            self.array_access(
+                element,
+                value.is_some(),
+                if native { Access::Native } else { Access::View },
+            )?;
+            return Ok(true);
+        }
+        let (array, index, value, native) = match inst.op {
+            Op::ArrayGet {
+                array,
+                index,
+                native,
+            } => (array, index, None, native),
             Op::ArraySet {
                 array,
                 index,
                 value,
-            } => (array, index, Some(value)),
+                native,
+            } => (array, index, Some(value), native),
             _ => return Ok(false),
         };
         let representation = self.types.get(self.body.value_type(array));
@@ -72,6 +137,25 @@ impl Selector<'_> {
         if let Some(value) = value {
             self.argument(value)?;
         }
+        let native = native || self.native_array_accesses.get(id.index()) == Some(&Some(element));
+        let primitive = matches!(self.types.get(element), Some(Type::Scalar(_)));
+        // A raw pointer can expose this array to a decoded aggregate alias later.
+        // Only a whole-lifetime proof can remove coherence checks.
+        self.array_access(
+            element,
+            value.is_some(),
+            if native {
+                Access::Native
+            } else if view || primitive {
+                Access::View
+            } else {
+                Access::Array
+            },
+        )?;
+        Ok(true)
+    }
+
+    fn array_access(&mut self, element: TypeId, store: bool, access: Access) -> jvm::Result<()> {
         use ScalarType::*;
         let (suffix, descriptor, read, write) = match self.types.get(element) {
             Some(Type::Scalar(Bool)) => ("Boolean", "Z", Instruction::Baload, Instruction::Bastore),
@@ -97,24 +181,21 @@ impl Selector<'_> {
                 Instruction::Aastore,
             ),
         };
-        if view || (suffix == "Object" && value.is_none()) {
+        if access == Access::View || (access == Access::Array && suffix == "Object" && !store) {
             let owner = self.cp.add_class(POINTER_CLASS)?;
-            let name = if view {
-                format!(
-                    "slice{}{suffix}",
-                    if value.is_some() { "Set" } else { "Get" }
-                )
+            let name = if access == Access::View {
+                format!("slice{}{suffix}", if store { "Set" } else { "Get" })
             } else {
                 "arrayGetObject".into()
             };
-            let signature = if value.is_some() {
+            let signature = if store {
                 format!("(Ljava/lang/Object;I{descriptor})V")
             } else {
                 format!("(Ljava/lang/Object;I){descriptor}")
             };
             let method = self.cp.add_method_ref(owner, name, signature)?;
             self.assembly.code.push(Instruction::Invokestatic(method));
-            if suffix == "Object" && value.is_none() {
+            if suffix == "Object" && !store {
                 let mut name = String::new();
                 representation::descriptor(self.types, element, &mut name)?;
                 let name = name
@@ -126,10 +207,8 @@ impl Selector<'_> {
                     .push(Instruction::Checkcast(self.cp.add_class(name)?));
             }
         } else {
-            self.assembly
-                .code
-                .push(if value.is_some() { write } else { read });
+            self.assembly.code.push(if store { write } else { read });
         }
-        Ok(true)
+        Ok(())
     }
 }

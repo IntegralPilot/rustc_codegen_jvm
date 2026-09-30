@@ -1,41 +1,45 @@
 use super::*;
 use crate::scalar::{BinaryFold, Scalar, fold_binary};
 
-impl Builder<'_> {
-    pub(super) fn scalar_value(&self, value: ValueId) -> Option<Scalar> {
-        let value = self.body.resolve(value);
-        let ValueDef::Inst(inst) = self.body.values[value.index()].def else {
+pub(crate) enum Folded {
+    Value(ValueId),
+    Constant(Scalar),
+}
+
+impl Body {
+    pub(crate) fn scalar_value(&self, value: ValueId) -> Option<Scalar> {
+        let value = self.resolve(value);
+        let ValueDef::Inst(inst) = self.values[value.index()].def else {
             return None;
         };
-        let Op::Constant(constant) = self.body.instructions[inst.index()].op else {
+        let Op::Constant(constant) = self.instructions[inst.index()].op else {
             return None;
         };
-        let Constant::Scalar(scalar) = self.body.constants[constant.index()] else {
+        let Constant::Scalar(scalar) = self.constants[constant.index()] else {
             return None;
         };
         Some(scalar)
     }
 
-    pub(super) fn fold(&mut self, op: Op, result: TypeId) -> Option<ValueId> {
+    pub(crate) fn fold(&self, types: &Types, op: Op, result: TypeId) -> Option<Folded> {
         if let Op::Length(view) = op {
-            let view = self.body.resolve(view);
-            if let ValueDef::Inst(inst) = self.body.values[view.index()].def
-                && let Op::View { length, .. } = self.body.instructions[inst.index()].op
-                && self.body.value_type(length) == result
+            let view = self.resolve(view);
+            if let ValueDef::Inst(inst) = self.values[view.index()].def
+                && let Op::View { length, .. } = self.instructions[inst.index()].op
+                && self.value_type(length) == result
             {
-                return Some(length);
+                return Some(Folded::Value(length));
             }
         }
-        let Some(Type::Scalar(result_ty)) = self.types.get(result) else {
+        let Some(Type::Scalar(result_ty)) = types.get(result) else {
             return None;
         };
         let constant = match op {
             Op::Binary { op, left, right } => {
-                let Some(Type::Scalar(left_ty)) = self.types.get(self.body.value_type(left)) else {
+                let Some(Type::Scalar(left_ty)) = types.get(self.value_type(left)) else {
                     return None;
                 };
-                let Some(Type::Scalar(right_ty)) = self.types.get(self.body.value_type(right))
-                else {
+                let Some(Type::Scalar(right_ty)) = types.get(self.value_type(right)) else {
                     return None;
                 };
                 let result = fold_binary(
@@ -44,33 +48,57 @@ impl Builder<'_> {
                     right_ty,
                     self.scalar_value(left),
                     self.scalar_value(right),
-                    || self.body.resolve(left) == self.body.resolve(right),
+                    || self.resolve(left) == self.resolve(right),
                 )?;
                 match result {
-                    BinaryFold::Left if result_ty == left_ty => return Some(left),
-                    BinaryFold::Right if result_ty == right_ty => return Some(right),
+                    BinaryFold::Left if result_ty == left_ty => return Some(Folded::Value(left)),
+                    BinaryFold::Right if result_ty == right_ty => {
+                        return Some(Folded::Value(right));
+                    }
                     BinaryFold::Constant(value) => value,
                     _ => return None,
                 }
             }
+            Op::Reinterpret(value) => {
+                // Full JVM integer-width signedness is only an annotation.
+                // Narrow int carriers can have different extension semantics.
+                let value = self.scalar_value(value)?;
+                let (width, _) = value.ty().integer()?;
+                if !matches!(width, 32 | 64) || result_ty.integer()?.0 != width {
+                    return None;
+                }
+                value.cast(result_ty)?
+            }
             Op::Not(value) => self.scalar_value(value)?.not()?,
             Op::Bit { op, value } => self.scalar_value(value)?.bit(op)?,
             Op::Overflow { op, args } => {
-                let args = &self.body.args[args.range()];
+                let args = &self.args[args.range()];
                 let a = self.scalar_value(args[0])?;
                 let b = self.scalar_value(args[1])?;
                 Scalar::boolean(a.overflows(op, b)?)
             }
             Op::Neg(value) => self.scalar_value(value)?.neg()?,
             Op::Cast(value) => {
-                if self.body.value_type(value) == result {
-                    return Some(value);
+                if self.value_type(value) == result {
+                    return Some(Folded::Value(value));
                 }
                 self.scalar_value(value)?.cast(result_ty)?
             }
             _ => return None,
         };
-        (constant.ty() == result_ty).then(|| self.constant(result, constant))
+        (constant.ty() == result_ty).then_some(Folded::Constant(constant))
+    }
+}
+
+impl Builder<'_> {
+    pub(super) fn scalar_value(&self, value: ValueId) -> Option<Scalar> {
+        self.body.scalar_value(value)
+    }
+    pub(super) fn fold(&mut self, op: Op, result: TypeId) -> Option<ValueId> {
+        match self.body.fold(self.types, op, result)? {
+            Folded::Value(value) => Some(value),
+            Folded::Constant(value) => Some(self.constant(result, value)),
+        }
     }
 }
 

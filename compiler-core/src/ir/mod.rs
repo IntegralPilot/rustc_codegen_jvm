@@ -4,6 +4,7 @@ pub use debug::*;
 mod body;
 mod builder;
 mod fold;
+pub(crate) use fold::Folded;
 mod ids;
 mod parameters;
 mod remap;
@@ -22,3 +23,6 @@ mod tests;
 
 #[cfg(test)]
 mod storage_tests;
+
+mod shape;
+pub use shape::ComponentShape;

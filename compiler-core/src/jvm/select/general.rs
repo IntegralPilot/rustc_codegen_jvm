@@ -5,6 +5,21 @@ use jvm::attributes::{ArrayType, BootstrapMethod};
 impl Selector<'_> {
     pub(super) fn general(&mut self, inst: Inst) -> jvm::Result<bool> {
         match inst.op {
+            Op::Heap { operation, args } => {
+                let (name, descriptor) = match operation {
+                    HeapOp::Allocate => ("allocate", "(JJ)Ljava/lang/Object;"),
+                    HeapOp::Reallocate => {
+                        ("reallocate", "(Ljava/lang/Object;JJJJ)Ljava/lang/Object;")
+                    }
+                    HeapOp::Deallocate => ("deallocate", "(Ljava/lang/Object;J)V"),
+                };
+                for &value in &self.body.args[args.range()] {
+                    self.load(value)?;
+                }
+                let class = self.cp.add_class("org/rustlang/runtime/Heap")?;
+                let method = self.cp.add_method_ref(class, name, descriptor)?;
+                self.assembly.code.push(Instruction::Invokestatic(method));
+            }
             Op::Nop => {}
             Op::Exception => self.assembly.code.push(
                 Kind::Reference.load(

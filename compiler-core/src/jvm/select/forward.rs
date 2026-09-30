@@ -57,24 +57,25 @@ fn first_operand(body: &Body, op: Op) -> Option<ValueId> {
         Op::Neg(value)
         | Op::Not(value)
         | Op::Cast(value)
+        | Op::Refine(value)
         | Op::Reinterpret(value)
         | Op::Adapt(value)
         | Op::NewArray(value)
         | Op::ArrayLength(value)
         | Op::Opaque(value)
         | Op::Load(value)
+        | Op::LoadCopy(value)
         | Op::Length(value)
         | Op::SetStatic { value, .. } => Some(value),
-        Op::Project { base, .. } | Op::LoadField { base, .. } | Op::StoreField { base, .. } => {
-            Some(base)
-        }
+        Op::Project { base, .. }
+        | Op::LoadField { base, .. }
+        | Op::LoadFieldCopy { base, .. }
+        | Op::StoreField { base, .. }
+        | Op::LoadFieldPart { base, .. }
+        | Op::StoreFieldParts { base, .. } => Some(base),
         Op::Offset { pointer, .. } | Op::Store { pointer, .. } => Some(pointer),
         Op::ViewData { view, .. } => Some(view),
-        Op::GetField { object, field } | Op::SetField { object, field, .. }
-            if !body.fields[field.index()].relative_pointer =>
-        {
-            Some(object)
-        }
+        Op::GetField { object, .. } | Op::SetField { object, .. } => Some(object),
         Op::Call { kind, args, .. } if kind != CallKind::Constructor => {
             body.args[args.range()].first().copied()
         }
@@ -98,17 +99,9 @@ mod tests {
         let result = b.constant(int, Scalar::integer(ScalarType::I32, 7).unwrap());
         b.terminate(Terminator::Return(Some(result)));
         let body = b.finish().unwrap();
-        let code = compile_with_options(
-            &body,
-            &types,
-            &mut Default::default(),
-            Options {
-                relative_pointer_abi: true,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(code.max_locals, 6); // Pointer + two offsets + byte ABI slots.
+        let code = compile_with_options(&body, &types, &mut Default::default(), Options::default())
+            .unwrap();
+        assert_eq!(code.max_locals, 2); // Pointer and byte ABI slots.
         assert_eq!(
             code.instructions,
             vec![Instruction::Bipush(7), Instruction::Ireturn]

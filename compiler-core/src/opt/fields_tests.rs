@@ -23,7 +23,6 @@ fn project(
         name: "value".into(),
         ty: scalar,
         is_static: false,
-        relative_pointer: false,
     });
     let projection = b.projection(PointerProjection {
         field,

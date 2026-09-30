@@ -36,14 +36,14 @@ pub fn verify_with_debug(
     check!(
         types
             .get(body.return_type)
-            .is_some_and(|t| !matches!(t, Type::Opaque(_))),
+            .is_some_and(|t| !matches!(t, Type::Opaque(_) | Type::Layout(_))),
         "invalid return type"
     );
     for value in &body.values {
         check!(
             types
                 .get(value.ty)
-                .is_some_and(|t| !matches!(t, Type::Opaque(_))),
+                .is_some_and(|t| !matches!(t, Type::Opaque(_) | Type::Layout(_))),
             "invalid value type"
         );
     }
@@ -67,16 +67,11 @@ pub fn verify_with_debug(
             Some(Type::Class(symbol) | Type::Interface(symbol)) => {
                 check!(types.symbol_name(symbol).is_some(), "invalid storage class")
             }
-            Some(Type::Pointer(_) | Type::Slice(_) | Type::Str) => {}
+            Some(Type::Pointer(_) | Type::Slice(_) | Type::Str | Type::TaggedI64) => {}
             _ => return Err(VerifyError("unsupported storage type".into())),
         }
     }
     for field in &body.fields {
-        check!(
-            !field.relative_pointer
-                || (!field.is_static && matches!(types.get(field.ty), Some(Type::Pointer(_)))),
-            "invalid relative pointer field"
-        );
         check!(
             matches!(types.get(field.owner), Some(Type::Class(symbol) | Type::Interface(symbol)) if types.symbol_name(symbol).is_some()),
             "invalid field owner"
@@ -84,7 +79,7 @@ pub fn verify_with_debug(
         check!(
             types
                 .get(field.ty)
-                .is_some_and(|t| !matches!(t, Type::Unit | Type::Opaque(_))),
+                .is_some_and(|t| !matches!(t, Type::Unit | Type::Opaque(_) | Type::Layout(_))),
             "invalid field type"
         );
     }
@@ -191,11 +186,36 @@ pub fn verify_with_debug(
                 check!(method.index() < body.methods.len(), "invalid call target");
                 check!(args.range().end <= body.args.len(), "invalid operand list");
             }
-            Op::Overflow { args, .. } => {
+            Op::Overflow { args, .. }
+            | Op::Heap { args, .. }
+            | Op::LoadStorageField { address: args, .. }
+            | Op::LoadStorageFieldCopy { address: args, .. }
+            | Op::StoreStorageField { args, .. }
+            | Op::AddressPack(args)
+            | Op::LoadAddress(args)
+            | Op::LoadAddressCopy(args)
+            | Op::CopyStorage { parts: args, .. }
+            | Op::LoadTypedCopy { parts: args, .. }
+            | Op::LoadTyped { parts: args, .. }
+            | Op::StoreTyped { parts: args, .. }
+            | Op::TypedAddressPack { parts: args, .. }
+            | Op::LocationTag(args)
+            | Op::LocationEqual(args)
+            | Op::LocationCompare(args)
+            | Op::TaggedPack(args)
+            | Op::ViewPack(args)
+            | Op::ViewGet(args)
+            | Op::ViewSet { parts: args, .. }
+            | Op::ViewAddress { parts: args, .. }
+            | Op::StoreAddress { parts: args, .. }
+            | Op::StoreFieldParts { parts: args, .. } => {
                 check!(args.range().end <= body.args.len(), "invalid operand list")
             }
             Op::Constant(id) => check!(id.index() < body.constants.len(), "invalid constant"),
-            Op::LoadSlot(id) | Op::AddressOfSlot(id) | Op::StoreSlot { slot: id, .. } => {
+            Op::LoadSlot(id)
+            | Op::AddressOfSlot(id)
+            | Op::StoreSlot { slot: id, .. }
+            | Op::SlotRoot(id) => {
                 check!(id.index() < body.slots.len(), "invalid storage slot")
             }
             _ => {}
@@ -259,7 +279,9 @@ pub fn verify_with_debug(
         for local in &debug.locals {
             match *local {
                 DebugLocal::Value(ty) => check!(
-                    types.get(ty).is_some_and(|t| !matches!(t, Type::Opaque(_))),
+                    types
+                        .get(ty)
+                        .is_some_and(|t| !matches!(t, Type::Opaque(_) | Type::Layout(_))),
                     "invalid debug local type"
                 ),
                 DebugLocal::Storage(slot) => {
