@@ -26,6 +26,7 @@ public class Main {
         BorrowedLocals.check();
         HeapStorage.check();
         CodecAdapters.check();
+        ConstantBlocks.check();
         MetadataFilters.check();
         StructuralViews.check();
         Field field = Pointer.class.getDeclaredField("EXPOSED_ADDRESSES");
