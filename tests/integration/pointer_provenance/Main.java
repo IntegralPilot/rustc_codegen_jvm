@@ -19,8 +19,12 @@ public class Main {
         LocationQueries.check();
         SliceLocations.check();
         OwnedFields.check();
+        IoCopies.check();
+        MemoryCopies.check();
+        MemoryFills.check();
         BorrowedFields.check();
         BorrowedLocals.check();
+        HeapStorage.check();
         CodecAdapters.check();
         MetadataFilters.check();
         StructuralViews.check();

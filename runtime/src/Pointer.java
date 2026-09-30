@@ -4966,20 +4966,25 @@ public final class Pointer {
     }
 
     public static Pointer allocateBytes(long byteCount, long alignment) {
-        try {
-            int size = checkedArrayLength(byteCount);
-            int checkedAlignment = checkedAlignment(alignment);
-            byte[] bytes = new byte[size];
-            recordAlignment(bytes, checkedAlignment);
-            Pointer pointer = new Pointer(bytes, 1, 0, 1, null);
-            synchronized (ALLOCATIONS) {
-                ALLOCATOR_OWNED_ALLOCATIONS.put(bytes, Boolean.TRUE);
-            }
-            return pointer;
-        } catch (IllegalArgumentException | ArithmeticException | OutOfMemoryError failure) {
-            // GlobalAlloc reports allocation failure with a null pointer. In
-            // particular, Rust's usize range is much larger than a JVM array.
-            return null;
+        return fromLocation(Heap.allocate(byteCount, alignment), 0, 1);
+    }
+
+    static void registerHeapAllocation(Object allocation, int alignment) {
+        recordAlignment(allocation, alignment);
+        synchronized (ALLOCATIONS) {
+            ALLOCATOR_OWNED_ALLOCATIONS.put(allocation, Boolean.TRUE);
+        }
+    }
+
+    static void copyHeapAllocation(Object root, long offset, byte[] destination, int size) {
+        if (root instanceof byte[]
+                && !mayBeInIdentityFilter(MEMORY_VIEW_FILTER, root)
+                && !mayBeInIdentityFilter(MEMORY_VIEW_ORIGIN_FILTER, root)
+                && !mayBeInIdentityFilter(ENCODED_POINTER_FILTER, root)
+                && !mayBeInIdentityFilter(ENCODED_REFERENCE_FILTER, root)) {
+            System.arraycopy(root, Math.toIntExact(offset), destination, 0, size);
+        } else {
+            copy(fromLocation(root, offset, 1), array(destination, 0, 1), size);
         }
     }
 
@@ -5210,34 +5215,18 @@ public final class Pointer {
     }
 
     public static Pointer reallocateBytes(
-            Pointer source,
-            long oldByteCount,
-            long alignment,
-            long newByteCount) {
-        if (source == null) {
-            throw new NullPointerException("Rust realloc requires a non-null pointer");
-        }
-        try {
-            int oldSize = checkedArrayLength(oldByteCount);
-            int newSize = checkedArrayLength(newByteCount);
-            Pointer destination = allocateBytes(newSize, alignment);
-            if (destination == null) {
-                return null;
-            }
-            copy(source, destination, Math.min(oldSize, newSize));
-            deallocateBytes(source);
-            return destination;
-        } catch (IllegalArgumentException | ArithmeticException | OutOfMemoryError failure) {
-            return null;
-        }
+            Pointer source, long oldByteCount, long alignment, long newByteCount) {
+        return fromLocation(Heap.reallocate(source, 0, oldByteCount, alignment, newByteCount), 0, 1);
     }
 
     /** Releases a byte allocation after Rust's allocator has ended its lifetime. */
     public static void deallocateBytes(Pointer pointer) {
-        if (pointer == null || pointer.allocation == null) {
-            return;
-        }
-        Object allocation = pointer.allocation;
+        Heap.deallocate(pointer, 0);
+    }
+
+    static void releaseHeapAllocation(Object allocation) {
+        if (allocation instanceof Pointer) allocation = ((Pointer) allocation).allocation;
+        if (allocation == null) return;
         synchronized (ALLOCATIONS) {
             ALLOCATOR_OWNED_ALLOCATIONS.remove(allocation);
             AllocationInfo info = ALLOCATIONS.remove(allocation);
@@ -5280,7 +5269,7 @@ public final class Pointer {
         discardEncodedReferences(allocation);
     }
 
-    private static int checkedAlignment(long alignment) {
+    static int checkedAlignment(long alignment) {
         if (alignment <= 0
                 || alignment > Integer.MAX_VALUE
                 || (alignment & (alignment - 1L)) != 0) {
@@ -10699,6 +10688,100 @@ public final class Pointer {
         storeBytes(incomingBits(value, materializedSize), materializedSize);
     }
 
+    /** Copy exact locations without constructing their boundary wrappers. */
+    public static void copyStorage(Object source, long sourceOffset, int sourceSize, String sourceCodec,
+            Object destination, long destinationOffset, int destinationSize, String destinationCodec,
+            long byteCount, boolean nonoverlapping) {
+        int count = checkedArrayLength(byteCount);
+        if (count == 0) return;
+        Object from = plainCopyArray(source);
+        Object to = plainCopyArray(destination);
+        if (from != null && to != null && from.getClass() == to.getClass()) {
+            long fromOffset = sourceOffset + (source instanceof Pointer ? ((Pointer) source).byteOffset : 0);
+            long toOffset = destinationOffset + (destination instanceof Pointer ? ((Pointer) destination).byteOffset : 0);
+            int width = inferredArrayElementSize(from);
+            if (fromOffset >= 0 && toOffset >= 0 && fromOffset % width == 0
+                    && toOffset % width == 0 && count % width == 0) {
+                if (nonoverlapping && from == to
+                        && fromOffset < Math.addExact(toOffset, count)
+                        && toOffset < Math.addExact(fromOffset, count)) {
+                    throw new IllegalArgumentException("copy_nonoverlapping regions overlap");
+                }
+                System.arraycopy(from, Math.toIntExact(fromOffset / width),
+                        to, Math.toIntExact(toOffset / width), count / width);
+                return;
+            }
+        }
+        if (count <= 8 && tryCopyScalarLocations(source, sourceOffset,
+                destination, destinationOffset, count, nonoverlapping)) return;
+        Pointer fromPointer = fromTypedStorageLocation(source, sourceOffset, sourceSize, sourceCodec);
+        Pointer toPointer = fromTypedStorageLocation(destination, destinationOffset, destinationSize, destinationCodec);
+        if (nonoverlapping) copyNonOverlapping(fromPointer, toPointer, count);
+        else copy(fromPointer, toPointer, count);
+    }
+
+    /** Read all source bytes before writing so overlapping scalar copies preserve their input. */
+    private static boolean tryCopyScalarLocations(Object source, long sourceOffset,
+            Object destination, long destinationOffset, int count, boolean nonoverlapping) {
+        Object from = scalarCopyAllocation(source, sourceOffset, count);
+        Object to = scalarCopyAllocation(destination, destinationOffset, count);
+        if (from == null || to == null || hasEncodedCopyState(from) || hasEncodedCopyState(to)) return false;
+        long fromOffset = source instanceof Pointer
+                ? Math.addExact(((Pointer) source).byteOffset, sourceOffset) : sourceOffset;
+        long toOffset = destination instanceof Pointer
+                ? Math.addExact(((Pointer) destination).byteOffset, destinationOffset) : destinationOffset;
+        if (from == to) {
+            if (nonoverlapping && fromOffset < Math.addExact(toOffset, count)
+                    && toOffset < Math.addExact(fromOffset, count)) {
+                throw new IllegalArgumentException("copy_nonoverlapping regions overlap");
+            }
+            if (fromOffset == toOffset) return true;
+        }
+        long bits = loadLocationBits(source, sourceOffset, count);
+        // Flushing can publish encoded references. The general copy must transfer their provenance and GC roots.
+        if (hasEncodedCopyState(from) || hasEncodedCopyState(to)) return false;
+        storeLocationBits(destination, destinationOffset, bits, count);
+        return true;
+    }
+
+    private static boolean hasEncodedCopyState(Object allocation) {
+        return mayBeInIdentityFilter(ENCODED_POINTER_FILTER, allocation)
+                || mayBeInIdentityFilter(ENCODED_REFERENCE_FILTER, allocation);
+    }
+
+    private static Object scalarCopyAllocation(Object root, long offset, int count) {
+        if (root instanceof Storage) {
+            Storage storage = (Storage) root;
+            if (!directStorage(storage)) return null;
+            StorageLayout layout = storage.layout(((Cell) storage).value);
+            return layout != null && layout.at(offset, count) != null ? storage : null;
+        }
+        if (root instanceof Pointer) {
+            Pointer pointer = (Pointer) root;
+            // Projected fields can redirect arithmetic to a different owner.
+            if (pointer.addressState != null || pointer.allocationElementSize <= 0) return null;
+            root = pointer.allocation;
+        } else if (mayBeInIdentityFilter(MEMORY_VIEW_ORIGIN_FILTER, root)) {
+            return null;
+        }
+        return root != null && root.getClass().isArray()
+                && root.getClass().getComponentType().isPrimitive() ? root : null;
+    }
+
+    private static Object plainCopyArray(Object root) {
+        if (root instanceof Pointer) {
+            Pointer pointer = (Pointer) root;
+            if (pointer.allocation == null || pointer.rareState != null || pointer.addressState != null
+                    || pointer.allocationCodecClassName != null
+                    || pointer.allocationElementSize != inferredArrayElementSize(pointer.allocation)) return null;
+            root = pointer.allocation;
+        }
+        return root != null && root.getClass().isArray()
+                && root.getClass().getComponentType().isPrimitive()
+                && !hasScalarWriteTracking(root)
+                && !mayBeInIdentityFilter(MEMORY_VIEW_ORIGIN_FILTER, root) ? root : null;
+    }
+
     public static void copy(Pointer source, Pointer destination, int byteCount) {
         if (tryCopyScalarRange(
                 source,
@@ -11006,15 +11089,102 @@ public final class Pointer {
     }
 
     public static void writeBytes(Pointer destination, int value, int byteCount) {
-        byte[] bytes = new byte[byteCount];
-        for (int index = 0; index < byteCount; index++) {
-            bytes[index] = (byte) value;
-        }
-        destination.storeRange(bytes);
+        writeBytes(destination, 0L, value, (long) byteCount);
     }
 
     public static void writeBytes(Pointer destination, int value, long byteCount) {
-        writeBytes(destination, value, checkedArrayLength(byteCount));
+        writeBytes(destination, 0L, value, byteCount);
+    }
+
+    /** Fill an exact byte range without allocating an address or a byte image. */
+    public static void writeBytes(Object root, long offset, int value, long byteCount) {
+        int count = checkedArrayLength(byteCount);
+        if (count == 0) return;
+        long bits = (value & 255L) * 0x0101010101010101L;
+        if (root instanceof Storage && fillScalarStorage((Storage) root, offset, count, bits)) return;
+        root = normalizeLocationOrigin(root);
+        Pointer pointer = root instanceof Pointer ? (Pointer) root : null;
+        Object allocation = pointer == null ? root : pointer.allocation;
+        if (allocation != null && allocation.getClass().isArray()
+                && allocation.getClass().getComponentType().isPrimitive()) {
+            int width = inferredArrayElementSize(allocation);
+            if (pointer == null || pointer.allocationElementSize == width) {
+                long start = pointer == null ? offset : Math.addExact(pointer.byteOffset, offset);
+                long capacity = (long) Array.getLength(allocation) * width;
+                if (start < 0 || start > capacity - count)
+                    throw new IndexOutOfBoundsException("byte fill exceeds primitive array storage");
+                if (pointer == null && hasScalarWriteTracking(allocation))
+                    pointer = new Pointer(allocation, width, 0, width, null);
+                if (pointer != null) {
+                    pointer.prepareMemoryWrite(start, count);
+                    discardEncodedPointers(allocation, start, count);
+                }
+                fillPrimitiveArray(allocation, start, count, width, bits);
+                // Partial fills can leave other encoded references alive.
+                if (start == 0 && count == capacity) discardEncodedReferences(allocation);
+                return;
+            }
+        }
+        pointer = root instanceof Storage || root instanceof Pointer
+                ? fromStorageLocation(root, offset) : fromLocation(root, offset, 1);
+        byte[] bytes = new byte[count];
+        Arrays.fill(bytes, (byte) value);
+        pointer.storeRange(bytes);
+    }
+
+    private static boolean fillScalarStorage(Storage storage, long offset, int count, long bits) {
+        if (!directStorage(storage) || offset < 0 || offset > (long) storage.size - count) return false;
+        Object value = ((Cell) storage).value;
+        if (storage.size <= 8 && isPrimitiveScalarCarrier(value)) {
+            long mask = atomicMask(count) << (offset * 8);
+            long updated = (valueBits(value, storage.size) & ~mask) | ((bits << (offset * 8)) & mask);
+            ((Cell) storage).value = carrierFromBits(value, updated, storage.size);
+            return true;
+        }
+        StorageLayout layout = storage.layout(value);
+        if (layout == null) return false;
+        long end = offset + count;
+        // Validate all leaves first. Padding needs the general byte path without prior partial writes.
+        for (long cursor = offset; cursor < end; ) {
+            StorageLayout.Leaf leaf = layout.at(cursor, 1);
+            if (leaf == null) return false;
+            cursor += Math.min(end - cursor, leaf.size - (cursor - leaf.offset) % leaf.size);
+        }
+        for (long cursor = offset; cursor < end; ) {
+            StorageLayout.Leaf leaf = layout.at(cursor, 1);
+            int chunk = (int) Math.min(end - cursor, leaf.size - (cursor - leaf.offset) % leaf.size);
+            leaf.write(value, cursor, bits, chunk);
+            cursor += chunk;
+        }
+        return true;
+    }
+
+    private static void fillPrimitiveArray(Object array, long offset, int count, int width, long bits) {
+        long end = offset + count;
+        int first = Math.toIntExact(offset / width), within = (int) (offset % width);
+        if (within != 0) {
+            int chunk = (int) Math.min(end - offset, width - within);
+            long mask = atomicMask(chunk) << (within * 8);
+            storePrimitiveArrayBits(array, first,
+                    (primitiveArrayBits(array, first) & ~mask) | ((bits << (within * 8)) & mask));
+            offset += chunk;
+            first++;
+        }
+        int last = Math.toIntExact(end / width);
+        if (first < last) {
+            if (array instanceof byte[]) Arrays.fill((byte[]) array, first, last, (byte) bits);
+            else if (array instanceof boolean[]) Arrays.fill((boolean[]) array, first, last, bits != 0);
+            else if (array instanceof short[]) Arrays.fill((short[]) array, first, last, (short) bits);
+            else if (array instanceof char[]) Arrays.fill((char[]) array, first, last, (char) bits);
+            else if (array instanceof int[]) Arrays.fill((int[]) array, first, last, (int) bits);
+            else if (array instanceof long[]) Arrays.fill((long[]) array, first, last, bits);
+            else if (array instanceof float[]) Arrays.fill((float[]) array, first, last, Float.intBitsToFloat((int) bits));
+            else Arrays.fill((double[]) array, first, last, Double.longBitsToDouble(bits));
+        }
+        if (offset < end && end % width != 0) {
+            long mask = atomicMask((int) (end % width));
+            storePrimitiveArrayBits(array, last, (primitiveArrayBits(array, last) & ~mask) | (bits & mask));
+        }
     }
 
     public static void writeElements(Pointer destination, int value, long elementCount) {
@@ -11025,7 +11195,7 @@ public final class Pointer {
         return checkedArrayLength(Math.multiplyExact(elementCount, (long) pointer.viewSize));
     }
 
-    private static int checkedArrayLength(long length) {
+    static int checkedArrayLength(long length) {
         if (length < 0 || length > Integer.MAX_VALUE) {
             throw new IllegalArgumentException("Rust memory operation exceeds JVM array limits");
         }
