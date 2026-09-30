@@ -1,5 +1,9 @@
 //! Analyses are built on demand and owned by one body compilation.
+mod field_abi;
 mod fields;
+pub use field_abi::lower_borrowed_fields;
+#[cfg(test)]
+mod field_abi_tests;
 mod live;
 pub use fields::promote_fields;
 #[cfg(test)]
@@ -20,6 +24,20 @@ mod cells_tests;
 
 mod view_abi;
 pub use view_abi::{component_argument_slots, lower_component_arguments};
+
+mod addresses;
+pub use addresses::decompose_addresses;
+
+#[cfg(test)]
+mod addresses_tests;
+
+mod return_abi;
+pub use return_abi::lower_component_returns;
+
+#[cfg(test)]
+mod return_abi_tests;
+
+mod address_parts;
 
 mod simplify;
 mod unreachable;
