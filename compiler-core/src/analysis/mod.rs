@@ -5,3 +5,5 @@ mod users;
 pub(crate) use users::ValueUsers;
 mod arrays;
 pub(crate) use arrays::native_array_accesses;
+#[cfg(test)]
+mod arrays_tests;
