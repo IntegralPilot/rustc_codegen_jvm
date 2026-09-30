@@ -1,45 +1,10 @@
 //! Escape analysis and SSA promotion for private, explicitly initialized cells.
 use crate::ir::*;
 
-const NONE: u32 = u32::MAX;
+use crate::analysis::{NO_ORIGIN as NONE, origins};
 
 fn cell_index(index: u32) -> Option<usize> {
     (index != NONE).then_some(index as usize)
-}
-
-fn origins(body: &Body, roots: &[u32]) -> Vec<u32> {
-    let mut origins = roots.to_vec();
-    let mut known = roots.iter().map(|&index| index != NONE).collect::<Vec<_>>();
-    let mut path = Vec::new();
-    for index in 0..body.values.len() {
-        if known[index] {
-            continue;
-        }
-        let mut value = ValueId::new(index);
-        let root = loop {
-            path.push(value);
-            value = body.resolve(value);
-            if known[value.index()] {
-                break origins[value.index()];
-            }
-            // Memoize negative results too. Marking before following a use
-            // bounds the walk even for malformed reinterpretation cycles.
-            known[value.index()] = true;
-            path.push(value);
-            let ValueDef::Inst(inst) = body.values[value.index()].def else {
-                break NONE;
-            };
-            let Op::Reinterpret(input) = body.instructions[inst.index()].op else {
-                break NONE;
-            };
-            value = input;
-        };
-        for value in path.drain(..) {
-            known[value.index()] = true;
-            origins[value.index()] = root;
-        }
-    }
-    origins
 }
 
 /// Each candidate is a fresh allocation and its typed initial contents. The
@@ -60,37 +25,66 @@ pub fn promote_cells(
         roots[cell.index()] = u32::try_from(index).expect("too many private cells");
     }
     let origins = origins(&body, &roots);
+    // Field promotion can leave unused projections.
+    // They do not observe addresses and must not block SSA storage promotion.
+    let live = super::live(&body, types);
     let mut escaped = vec![false; cells.len()];
-    for inst in &body.instructions {
+    for (id, inst) in body.instructions.iter().enumerate() {
+        if !live.instructions[id] {
+            continue;
+        }
         inst.op.visit_uses(&body.args, |value| {
             let Some(index) = cell_index(origins[value.index()]) else {
                 return;
             };
             let pointee = body.value_type(cells[index].1);
             let allowed = match inst.op {
-                Op::Reinterpret(_) => true,
-                Op::Load(pointer) => {
+                Op::Reinterpret(_) | Op::Refine(_) => true,
+                Op::Load(pointer) | Op::LoadCopy(pointer) => {
                     pointer == value && inst.result.is_some_and(|v| body.value_type(v) == pointee)
                 }
                 Op::Store {
                     pointer,
                     value: stored,
                 } => pointer == value && stored != value && body.value_type(stored) == pointee,
+                Op::LoadField { base, projection } => {
+                    base == value
+                        && body.fields[body.projections[projection.index()].field.index()].owner
+                            == pointee
+                }
+                Op::StoreField {
+                    base,
+                    projection,
+                    value: stored,
+                } => {
+                    base == value
+                        && stored != value
+                        && body.fields[body.projections[projection.index()].field.index()].owner
+                            == pointee
+                }
                 _ => false,
             };
             escaped[index] |= !allowed;
         });
     }
-    // Only trivial address joins have been resolved. A nontrivial address phi
-    // may select another allocation; retain its storage rather than guessing.
+    // Equal-origin joins retain one allocation.
+    // Mixed joins must retain each allocation's addressable storage.
     let mut escape = |value: ValueId| {
         if let Some(index) = cell_index(origins[value.index()]) {
             escaped[index] = true;
         }
     };
     for edge in &body.edges {
-        for &value in &edge.args {
-            escape(value);
+        for (&value, &param) in edge
+            .args
+            .iter()
+            .zip(&body.blocks[edge.target.index()].params)
+        {
+            if live.values[body.resolve(param).index()]
+                && origins[value.index()] != origins[param.index()]
+            {
+                escape(value);
+            }
         }
     }
     for block in &body.blocks {
@@ -135,7 +129,8 @@ pub fn promote_cells(
                 continue;
             }
             let pointer = match inst.op {
-                Op::Load(pointer) | Op::Store { pointer, .. } => pointer,
+                Op::Load(pointer) | Op::LoadCopy(pointer) | Op::Store { pointer, .. } => pointer,
+                Op::LoadField { base, .. } | Op::StoreField { base, .. } => base,
                 _ => continue,
             };
             let Some(variable) = cell_index(origins[pointer.index()]).and_then(|i| variables[i])
@@ -144,10 +139,22 @@ pub fn promote_cells(
             };
             builder.body.instructions[id.index()].op = match inst.op {
                 Op::Load(_) => Op::Reinterpret(builder.read(variable)),
+                Op::LoadCopy(_) => Op::CopyValue(builder.read(variable)),
                 Op::Store { value, .. } => {
                     builder.define(variable, value);
                     Op::Nop
                 }
+                Op::LoadField { projection, .. } => Op::GetField {
+                    object: builder.read(variable),
+                    field: builder.body.projections[projection.index()].field,
+                },
+                Op::StoreField {
+                    projection, value, ..
+                } => Op::SetField {
+                    object: builder.read(variable),
+                    field: builder.body.projections[projection.index()].field,
+                    value,
+                },
                 _ => unreachable!(),
             };
         }

@@ -1,5 +1,9 @@
 //! Analyses are built on demand and owned by one body compilation.
+mod borrowed_memory;
 mod field_abi;
+pub use borrowed_memory::{borrowed_memory_method, lower_borrowed_memory};
+#[cfg(test)]
+mod borrowed_memory_tests;
 mod fields;
 pub use field_abi::lower_borrowed_fields;
 #[cfg(test)]
@@ -12,6 +16,10 @@ pub use live::{Live, live, live_with_roots};
 
 mod cells;
 pub use cells::promote_cells;
+mod storage;
+pub use storage::lower_typed_storage;
+#[cfg(test)]
+mod storage_tests;
 mod tagged;
 pub use tagged::decompose_tagged;
 mod views;
