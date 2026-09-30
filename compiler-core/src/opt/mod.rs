@@ -47,6 +47,19 @@ mod return_abi_tests;
 
 mod address_parts;
 
+mod typed_addresses;
+pub use typed_addresses::lower_typed_addresses;
+#[cfg(test)]
+mod typed_addresses_tests;
+
+mod typed_loads;
+pub use typed_loads::lower_typed_loads;
+#[cfg(test)]
+mod typed_loads_tests;
+
+#[cfg(test)]
+mod array_view_tests;
+
 mod simplify;
 mod unreachable;
 pub use simplify::simplify_components;
