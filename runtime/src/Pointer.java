@@ -148,11 +148,28 @@ public final class Pointer {
         }
         Method target = null;
         for (Method method : function.getClass().getMethods()) {
-            if (method.getName().equals("call")
-                    && method.getParameterTypes().length == arguments.length) {
-                target = method;
-                break;
+            if (!method.getName().equals("call") || Modifier.isStatic(method.getModifiers())) continue;
+            Class<?>[] params = method.getParameterTypes();
+            if (params.length == arguments.length) { target = method; break; }
+            Object[] expanded = new Object[params.length];
+            int next = 0;
+            for (Object argument : arguments) {
+                if (next >= params.length) { next = -1; break; }
+                if ((argument == null || argument instanceof Pointer)
+                        && params[next] == Object.class && next + 1 < params.length
+                        && params[next + 1] == long.class) {
+                    expanded[next++] = argument;
+                    expanded[next++] = 0L;
+                } else if ((argument == null || isSliceViewCarrierType(argument.getClass()))
+                        && params[next] == Object.class && next + 2 < params.length
+                        && params[next + 1] == int.class && params[next + 2] == long.class) {
+                    SliceView view = (SliceView) argument;
+                    expanded[next++] = view == null ? null : view.array;
+                    expanded[next++] = view == null ? 0 : view.offset;
+                    expanded[next++] = view == null ? 0L : view.rustLength;
+                } else { expanded[next++] = argument; }
             }
+            if (next == params.length) { target = method; arguments = expanded; break; }
         }
         if (target == null) {
             throw new IllegalArgumentException(
@@ -5667,10 +5684,14 @@ public final class Pointer {
             Map<Object, Pointer> cells = FUNCTION_POINTER_CELLS;
             Object identity = FunctionPointers.identity(value);
             if (value instanceof FunctionPointerAdapter) {
-                identity = canonicalFunctionPointer(
-                        ((FunctionPointerAdapter) value).functionPointerTarget());
-                cells = FUNCTION_POINTER_ADAPTER_CELLS.computeIfAbsent(
-                        value.getClass(), key -> new IdentityHashMap<>());
+                Object target = ((FunctionPointerAdapter) value).functionPointerTarget();
+                if (target instanceof MethodHandle) {
+                    identity = FunctionPointers.identity(target);
+                } else {
+                    identity = canonicalFunctionPointer(target);
+                    cells = FUNCTION_POINTER_ADAPTER_CELLS.computeIfAbsent(
+                            value.getClass(), key -> new IdentityHashMap<>());
+                }
             }
             Pointer existing = cells.get(identity);
             if (existing != null) {
