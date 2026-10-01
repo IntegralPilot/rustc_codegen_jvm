@@ -15,7 +15,7 @@ pub(super) fn allocator_shim_target_signature(
             }
             AllocatorTy::Ptr => params.push((
                 input.name.to_string(),
-                oomir::Type::Pointer(Box::new(oomir::Type::U8)),
+                oomir::Type::pointer(oomir::Type::U8),
             )),
             AllocatorTy::Usize => {
                 params.push((input.name.to_string(), oomir::Type::U64));
@@ -27,7 +27,7 @@ pub(super) fn allocator_shim_target_signature(
     }
 
     let ret = match method.output {
-        AllocatorTy::ResultPtr => oomir::Type::Pointer(Box::new(oomir::Type::U8)),
+        AllocatorTy::ResultPtr => oomir::Type::pointer(oomir::Type::U8),
         AllocatorTy::Never | AllocatorTy::Unit => oomir::Type::Void,
         AllocatorTy::Layout | AllocatorTy::Ptr | AllocatorTy::Usize => {
             panic!("invalid allocator shim output type")
@@ -215,10 +215,7 @@ pub(super) fn emit_allocator_shims<'tcx>(
             result.clone(),
         );
         if matches!(method.output, AllocatorTy::Never) {
-            instructions.push(oomir::Instruction::ThrowNewWithMessage {
-                exception_class: "java/lang/AssertionError".to_string(),
-                message: "Diverging allocator call returned unexpectedly".to_string(),
-            });
+            instructions.push(oomir::Instruction::Unreachable);
         } else {
             instructions.push(oomir::Instruction::Return {
                 operand: result.map(|name| oomir::Operand::Variable {

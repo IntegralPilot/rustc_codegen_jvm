@@ -28,7 +28,14 @@ impl Emission<'_> {
             return self.write(&dest, value);
         }
         let value = self
-            .emit(Op::ArrayGet { array, index }, Some(element))
+            .emit(
+                Op::ArrayGet {
+                    native: false,
+                    array,
+                    index,
+                },
+                Some(element),
+            )
             .unwrap();
         self.write(&dest, value)
     }
@@ -48,20 +55,12 @@ impl Emission<'_> {
             return Ok(());
         }
         if copy && self.vocabulary.types.get(element).unwrap().carrier() == 5 {
-            value = self
-                .call(
-                    oomir::POINTER_CLASS.into(),
-                    "copyManagedValue".into(),
-                    vec![self.ty(&types::object())],
-                    self.ty(&types::object()),
-                    CallKind::JvmStatic,
-                    vec![value],
-                )?
-                .unwrap();
+            value = self.copy_value(value);
         }
         let value = self.adapt(value, element)?;
         self.emit(
             Op::ArraySet {
+                native: false,
                 array,
                 index,
                 value,
@@ -78,6 +77,16 @@ impl Emission<'_> {
     ) -> Result<()> {
         let array = self.operand(array)?;
         let value = self.operand(value)?;
+        if let Some(ir::Type::Array(element)) = self
+            .vocabulary
+            .types
+            .get(self.builder.body.value_type(array))
+            && ir::StorageSlot::scalar(element, &self.vocabulary.types).is_some()
+        {
+            let value = self.adapt(value, element)?;
+            self.emit(Op::ArrayFill { array, value }, None);
+            return Ok(());
+        }
         let copy = self.constant(oomir::Constant::Boolean(copy))?;
         self.call(
             oomir::POINTER_CLASS.into(),

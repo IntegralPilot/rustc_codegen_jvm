@@ -13,6 +13,19 @@ impl Emission<'_> {
         values: Vec<ValueId>,
     ) -> Result<Option<ValueId>> {
         let initial_cell = self.initial_cell(&owner, &name, kind, returns, &values);
+        if let Some(initial) = initial_cell
+            && ir::StorageSlot::scalar(
+                self.builder.body.value_type(initial),
+                &self.vocabulary.types,
+            )
+            .is_some()
+        {
+            // Scalar storage must reach component analysis before Object ABI conversion boxes its
+            // contents.
+            let cell = self.emit(Op::ScalarCell(initial), Some(returns)).unwrap();
+            self.cells.push((cell, initial));
+            return Ok(Some(cell));
+        }
         let declared_result = returns;
         let returns = if owner == oomir::POINTER_CLASS
             && matches!(name.as_str(), "addr" | "expose_provenance" | "metadata")
@@ -100,6 +113,46 @@ impl Emission<'_> {
     pub(super) fn instruction(&mut self, instruction: oomir::Instruction) -> Result<()> {
         use oomir::Instruction::*;
         match instruction {
+            TaggedPack { dest, value, tag } => {
+                let long = self.ty(&oomir::Type::I64);
+                let value = self.operand(value)?;
+                let value = self.adapt(value, long)?;
+                let tag = self.operand(tag)?;
+                let tag = self.adapt(tag, long)?;
+                let parts = ir::List::append(&mut self.builder.body.args, [value, tag]);
+                let result = self
+                    .emit(
+                        Op::TaggedPack(parts),
+                        Some(self.ty(&oomir::Type::TaggedI64)),
+                    )
+                    .unwrap();
+                self.write(&dest, result)?;
+            }
+            TaggedPart { dest, value, index } => {
+                let value = self.operand(value)?;
+                let result = self
+                    .emit(
+                        Op::TaggedPart { value, index },
+                        Some(self.ty(&oomir::Type::I64)),
+                    )
+                    .unwrap();
+                self.write(&dest, result)?;
+            }
+            operation @ (AddressRetype { .. } | ViewAddress { .. } | AddressOffset { .. }) => {
+                self.address(operation)?;
+            }
+            Heap {
+                operation,
+                args,
+                dest,
+            } => self.heap(operation, args, dest)?,
+            operation @ (ValueCopy { .. }
+            | MemoryLoad { .. }
+            | MemoryStore { .. }
+            | MemoryCommit { .. }
+            | MemoryProject { .. }) => {
+                self.memory(operation)?;
+            }
             SourceLocation(location) => {
                 self.lines
                     .get_or_insert_with(|| jvm_compiler_core::jvm::select::SourceLines {
@@ -280,6 +333,24 @@ impl Emission<'_> {
                 args,
                 dest,
             } => {
+                if class_name == oomir::POINTER_CLASS
+                    && method_name == "nullableTag"
+                    && args.len() == 1
+                {
+                    let value = self.operand(args[0].clone())?;
+                    let tag = self
+                        .emit(Op::AddressTag(value), Some(self.ty(&oomir::Type::I64)))
+                        .unwrap();
+                    if let Some(dest) = dest {
+                        self.write(&dest, tag)?;
+                    }
+                    return Ok(());
+                }
+                if class_name == oomir::POINTER_CLASS
+                    && self.view_data(&method_name, &args, &dest)?
+                {
+                    return Ok(());
+                }
                 self.invoke(
                     class_name,
                     method_name,
@@ -396,6 +467,10 @@ impl Emission<'_> {
                 class_name,
                 args,
             } => {
+                if let Some(value) = self.construct_view(&class_name, &args)? {
+                    self.write(&dest, value)?;
+                    return Ok(());
+                }
                 let mut params = Vec::new();
                 let mut values = Vec::new();
                 let args = args
@@ -436,6 +511,7 @@ impl Emission<'_> {
                     .unwrap();
                 self.write(&dest, value)?;
             }
+            Unreachable => self.builder.terminate(Terminator::Unreachable),
             ThrowNewWithMessage {
                 exception_class,
                 message,
@@ -470,14 +546,14 @@ impl Emission<'_> {
                 field_name,
                 field_ty,
                 owner_class,
-            } => self.get_field(dest, object, owner_class, field_name, field_ty, true)?,
+            } => self.get_field(dest, object, owner_class, field_name, field_ty)?,
             GetJvmField {
                 dest,
                 object,
                 class_name,
                 field_name,
                 field_ty,
-            } => self.get_field(dest, object, class_name, field_name, field_ty, false)?,
+            } => self.get_field(dest, object, class_name, field_name, field_ty)?,
             SetField {
                 object,
                 field_name,
@@ -489,7 +565,7 @@ impl Emission<'_> {
                     name: object,
                     ty: oomir::Type::Class(owner_class.clone()),
                 })?;
-                self.set_field(object, owner_class, field_name, value, field_ty, true)?;
+                self.set_field(object, owner_class, field_name, value, field_ty)?;
             }
             SetJvmField {
                 object,
@@ -499,7 +575,7 @@ impl Emission<'_> {
                 field_ty,
             } => {
                 let object = self.operand(object)?;
-                self.set_field(object, class_name, field_name, value, field_ty, false)?;
+                self.set_field(object, class_name, field_name, value, field_ty)?;
             }
             GetStaticField {
                 dest,
@@ -508,7 +584,7 @@ impl Emission<'_> {
                 field_ty,
             } => {
                 if field_ty.has_jvm_value() {
-                    let field = self.field(class_name, field_name, &field_ty, true, false);
+                    let field = self.field(class_name, field_name, &field_ty, true);
                     let value = self
                         .emit(Op::GetStatic(field), Some(self.ty(&field_ty)))
                         .unwrap();
@@ -522,7 +598,7 @@ impl Emission<'_> {
                 field_ty,
             } => {
                 if field_ty.has_jvm_value() {
-                    let field = self.field(class_name, field_name, &field_ty, true, false);
+                    let field = self.field(class_name, field_name, &field_ty, true);
                     let value = self.operand(value)?;
                     let value = self.adapt(value, self.ty(&field_ty))?;
                     self.emit(Op::SetStatic { field, value }, None);
@@ -566,14 +642,12 @@ impl Emission<'_> {
         name: String,
         ty: &oomir::Type,
         is_static: bool,
-        relative: bool,
     ) -> ir::MemberId {
         self.builder.field(ir::FieldRef {
             owner: self.ty(&oomir::Type::Class(owner)),
             name,
             ty: self.ty(ty),
             is_static,
-            relative_pointer: relative && matches!(ty, oomir::Type::Pointer(_)),
         })
     }
     fn get_field(
@@ -583,12 +657,38 @@ impl Emission<'_> {
         owner: String,
         name: String,
         ty: oomir::Type,
-        relative: bool,
     ) -> Result<()> {
         if !ty.has_jvm_value() {
             return Ok(());
         }
         let object = self.operand(object)?;
+        if matches!(
+            owner.as_str(),
+            oomir::SLICE_VIEW_CLASS | oomir::UTF8_VIEW_CLASS
+        ) && ir::ComponentShape::view_carrier(
+            &self.vocabulary.types,
+            self.builder.body.value_type(object),
+        ) {
+            let part = match name.as_str() {
+                "array" => Some((0, types::object())),
+                "offset" => Some((1, oomir::Type::I32)),
+                "length" | "rustLength" => Some((2, oomir::Type::U64)),
+                _ => None,
+            };
+            if let Some((index, part_ty)) = part {
+                let value = self
+                    .emit(
+                        Op::ViewPart {
+                            view: object,
+                            index,
+                        },
+                        Some(self.ty(&part_ty)),
+                    )
+                    .unwrap();
+                let value = self.adapt(value, self.ty(&ty))?;
+                return self.write(&dest, value);
+            }
+        }
         if owner == oomir::SLICE_VIEW_CLASS
             && matches!(
                 self.vocabulary
@@ -608,7 +708,7 @@ impl Emission<'_> {
             return self.write(&dest, value);
         }
         let object = self.adapt(object, self.ty(&oomir::Type::Class(owner.clone())))?;
-        let field = self.field(owner, name, &ty, false, relative);
+        let field = self.field(owner, name, &ty, false);
         let value = self
             .emit(Op::GetField { object, field }, Some(self.ty(&ty)))
             .unwrap();
@@ -621,7 +721,6 @@ impl Emission<'_> {
         name: String,
         value: oomir::Operand,
         ty: oomir::Type,
-        relative: bool,
     ) -> Result<()> {
         if !ty.has_jvm_value() {
             return Ok(());
@@ -629,7 +728,7 @@ impl Emission<'_> {
         let object = self.adapt(object, self.ty(&oomir::Type::Class(owner.clone())))?;
         let value = self.operand(value)?;
         let value = self.adapt(value, self.ty(&ty))?;
-        let field = self.field(owner, name, &ty, false, relative);
+        let field = self.field(owner, name, &ty, false);
         self.emit(
             Op::SetField {
                 object,

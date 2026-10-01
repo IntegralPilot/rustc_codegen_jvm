@@ -33,6 +33,31 @@ pub(super) fn emit<'tcx>(
                 ),
             );
             }
+            let heap = if !jvm_import.interface && jvm_import.class_name == oomir::POINTER_CLASS {
+                match (jvm_import.method_name.as_str(), rust_descriptor.as_str()) {
+                    ("allocateBytes", "(JJ)Lorg/rustlang/runtime/Pointer;") => {
+                        Some(oomir::HeapOp::Allocate)
+                    }
+                    (
+                        "reallocateBytes",
+                        "(Lorg/rustlang/runtime/Pointer;JJJ)Lorg/rustlang/runtime/Pointer;",
+                    ) => Some(oomir::HeapOp::Reallocate),
+                    ("deallocateBytes", "(Lorg/rustlang/runtime/Pointer;)V") => {
+                        Some(oomir::HeapOp::Deallocate)
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            if let Some(operation) = heap {
+                instructions.push(oomir::Instruction::Heap {
+                    operation,
+                    args: oomir_operands,
+                    dest: effective_dest,
+                });
+                return;
+            }
             instructions.push(oomir::Instruction::InvokeStatic {
                 class_name: jvm_import.class_name,
                 method_name: jvm_import.method_name,

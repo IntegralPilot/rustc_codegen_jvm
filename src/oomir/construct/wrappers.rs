@@ -25,10 +25,6 @@ impl Emission<'_> {
                     name,
                     ty,
                     is_static: false,
-                    relative_pointer: matches!(
-                        self.vocabulary.types.get(ty),
-                        Some(ir::Type::Pointer(_))
-                    ),
                 });
                 value = self
                     .emit(
