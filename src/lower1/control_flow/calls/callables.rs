@@ -15,62 +15,32 @@ pub(super) fn function_item<'tcx>(
     let tuple_operand = explicit_method_args[0].clone();
     let function_ty = function_item.ty(tcx, typing_env);
     let function_sig = tcx.instantiate_bound_regions_with_erased(function_ty.fn_sig(tcx));
-    let value_input_count = function_sig
-        .inputs()
-        .iter()
-        .filter(|ty| {
-            crate::lower1::types::ty_to_oomir_type(**ty, tcx, data_types, function_item)
-                .has_jvm_value()
+    let tuple_ty = Ty::new_tup(tcx, function_sig.inputs());
+    let fields = crate::lower1::types::tuple_fields(
+        tuple_ty,
+        tuple_operand,
+        &format!("{label}_fn_def_arg"),
+        tcx,
+        data_types,
+        function_item,
+        instructions,
+    );
+    let function_args = fields
+        .into_iter()
+        .zip(function_sig.inputs())
+        .enumerate()
+        .map(|(index, (field, input_ty))| {
+            crate::lower1::value_repr::adapt_operand_to_rust_type(
+                field,
+                *input_ty,
+                &format!("{label}_fn_def_arg_{index}_adapted"),
+                tcx,
+                instance,
+                data_types,
+                instructions,
+            )
         })
-        .count();
-    let (tuple_class, tuple_fields) = if value_input_count == 0 {
-        (None, Vec::new())
-    } else {
-        let tuple_class = tuple_operand
-            .get_type()
-            .and_then(|ty| ty.get_class_name().map(str::to_string))
-            .expect("non-empty Fn argument tuple has a JVM class");
-        let fields = match data_types.get(&tuple_class) {
-            Some(oomir::DataType::Class { fields, .. }) => fields.clone(),
-            _ => panic!("Fn argument tuple class {tuple_class} was not defined"),
-        };
-        (Some(tuple_class), fields)
-    };
-    let mut function_args = Vec::new();
-    let mut tuple_fields = tuple_fields.into_iter();
-    for (index, input_ty) in function_sig.inputs().iter().enumerate() {
-        let input_oomir_ty =
-            crate::lower1::types::ty_to_oomir_type(*input_ty, tcx, data_types, function_item);
-        if !input_oomir_ty.has_jvm_value() {
-            function_args.push(oomir::Operand::Constant(oomir::Constant::Unit));
-            continue;
-        }
-        let (field_name, field_ty) = tuple_fields
-            .next()
-            .expect("Fn argument tuple has one field per JVM argument");
-        let field_dest = format!("{label}_fn_def_arg_{index}");
-        instructions.push(oomir::Instruction::GetField {
-            dest: field_dest.clone(),
-            object: tuple_operand.clone(),
-            field_name,
-            field_ty: field_ty.clone(),
-            owner_class: tuple_class
-                .clone()
-                .expect("value-bearing Fn tuple has a class"),
-        });
-        function_args.push(crate::lower1::value_repr::adapt_operand_to_rust_type(
-            oomir::Operand::Variable {
-                name: field_dest,
-                ty: field_ty,
-            },
-            *input_ty,
-            &format!("{label}_fn_def_arg_{index}_adapted"),
-            tcx,
-            instance,
-            data_types,
-            &mut instructions,
-        ));
-    }
+        .collect();
     let target = data_types.function_name(tcx, function_item);
     instructions.push(oomir::Instruction::InvokeRustStatic {
         class_name: target
@@ -164,35 +134,16 @@ pub(super) fn ordinary_call<'tcx>(
     }
     let flattened_closure_args =
         if is_closure_call && oomir_operands.len() == 2 && method_signature.params.len() > 1 {
-            oomir_operands[1]
-                .get_type()
-                .and_then(|ty| ty.get_class_name().map(str::to_string))
-                .and_then(|tuple_class| {
-                    let fields = match data_types.get(&tuple_class) {
-                        Some(oomir::DataType::Class { fields, .. })
-                            if fields.len() == method_signature.params.len() =>
-                        {
-                            fields.clone()
-                        }
-                        _ => return None,
-                    };
-                    let mut flattened = Vec::new();
-                    for (field_index, (field_name, field_ty)) in fields.into_iter().enumerate() {
-                        let dest = format!("{label}_closure_arg_{field_index}");
-                        instructions.push(oomir::Instruction::GetField {
-                            dest: dest.clone(),
-                            object: oomir_operands[1].clone(),
-                            field_name,
-                            field_ty: field_ty.clone(),
-                            owner_class: tuple_class.clone(),
-                        });
-                        flattened.push(oomir::Operand::Variable {
-                            name: dest,
-                            ty: field_ty,
-                        });
-                    }
-                    Some(flattened)
-                })
+            let tuple_ty = Ty::new_tup(tcx, &fn_inputs);
+            Some(crate::lower1::types::tuple_fields(
+                tuple_ty,
+                oomir_operands[1].clone(),
+                &format!("{label}_closure_arg"),
+                tcx,
+                data_types,
+                func_instance,
+                instructions,
+            ))
         } else {
             None
         };
