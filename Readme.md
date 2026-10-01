@@ -88,6 +88,21 @@ classes and interfaces rather than opaque native handles (see
   without JNI glue
   ([test and demo](tests/integration/jvm_link_names/src/lib.rs)).
 
+Java exposure is explicit: `pub` controls Rust visibility, while
+`#[jvm_codegen::export]` on a public function, type, or module preserves its
+Java-facing API. Marking a module includes its public descendants; marking a type
+includes its public inherent methods. Register the tool with
+`#![feature(register_tool)]` and `#![register_tool(jvm_codegen)]`.
+For a library intended entirely for Java, add `#![feature(custom_inner_attributes)]`
+and `#![jvm_codegen::export]` at the crate root, as in the examples below.
+Mark the types Java constructs or inspects as well as the functions it calls.
+Use concrete, nongeneric exports as Java entry points for generic Rust APIs.
+Ordinary Rust dependencies remain internal: the compiler can flatten their
+representations, merge their classes, and remove unused methods. Rebuild Rust
+dependencies with the same backend; generated internal classes are not a stable
+Java API. Importing existing Java classes with `jvm::class` or `jvm::interface`
+does not require an export marker.
+
 For example, one Rust API can expose an enum and accept both a JVM
 implementation of a Rust trait and a standard JVM lambda. Its result can then
 cross the Rust/Kotlin async bridge. The complete example is kept executable in
@@ -96,6 +111,10 @@ cross the Rust/Kotlin async bridge. The complete example is kept executable in
 **Rust**
 
 ```rust
+#![feature(register_tool, custom_inner_attributes)]
+#![register_tool(jvm_codegen)]
+#![jvm_codegen::export]
+
 pub trait BatchObserver {
     fn accept(&mut self, processed: u32) -> bool;
 }
@@ -247,8 +266,9 @@ Add `jvm = { package = "rcj", git = "https://github.com/IntegralPilot/rustc_code
 to `[dependencies]`.
 
 ```rust
-#![feature(extern_types, register_tool)]
+#![feature(extern_types, register_tool, custom_inner_attributes)]
 #![register_tool(jvm_codegen)]
+#![jvm_codegen::export]
 
 #[jvm::class("java.time.LocalDate", rename_all = "camelCase")]
 impl JavaLocalDate {

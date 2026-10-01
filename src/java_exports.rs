@@ -1,12 +1,66 @@
 //! Discover and materialize the Rust library surface exposed to Java.
 use super::*;
 
+/// Export attributes select the Java API. Rust visibility alone does not select it.
+pub(crate) fn is_exported(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
+    fn scope(tcx: TyCtxt<'_>, mut current: Option<DefId>) -> bool {
+        while let Some(def_id) = current {
+            #[allow(deprecated)]
+            if tcx.get_all_attrs(def_id).iter().any(|attribute| {
+                let path = attribute.path();
+                path.len() == 2 && path[0].as_str() == "jvm_codegen" && path[1].as_str() == "export"
+            }) {
+                return true;
+            }
+            current = tcx.opt_parent(def_id);
+        }
+        false
+    }
+    if scope(tcx, Some(def_id)) {
+        return true;
+    }
+    // An exported type's inherent methods are part of its Java receiver API.
+    if let Some(implementation) = tcx
+        .opt_associated_item(def_id)
+        .and_then(|i| i.impl_container(tcx))
+    {
+        let ty = tcx
+            .type_of(implementation)
+            .instantiate_identity()
+            .skip_norm_wip();
+        if let TyKind::Adt(adt, _) = ty.kind() {
+            return scope(tcx, Some(adt.did()));
+        }
+    }
+    false
+}
+
+/// KotlinFutureInterop requires these named schemas. Definition paths stay constant through
+/// reexports.
+pub(crate) fn is_runtime_type(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
+    tcx.crate_name(def_id.krate) == rustc_span::sym::core
+        && matches!(
+            lower1::jvm_names::class_for_def_id(tcx, def_id).as_str(),
+            "org/rustlang/core/task/wake/RawWaker"
+                | "org/rustlang/core/task/wake/RawWakerVTable"
+                | "org/rustlang/core/task/wake/Waker"
+                | "org/rustlang/core/task/wake/Context"
+        )
+}
+
 pub(super) fn ensure_trait_interface<'tcx>(
     tcx: TyCtxt<'tcx>,
     trait_def_id: DefId,
     data_types: &mut Definitions<'tcx>,
 ) {
     let interface_name = lower1::jvm_names::class_for_def_id(tcx, trait_def_id);
+    if !trait_def_id.is_local() && data_types.has_upstream_type(&interface_name) {
+        data_types
+            .foreign_interfaces
+            .borrow_mut()
+            .insert(interface_name);
+        return;
+    }
     let methods = trait_interface_methods(tcx, trait_def_id, &interface_name, data_types);
 
     match data_types.get_mut(&interface_name) {
@@ -63,9 +117,8 @@ pub(super) fn trait_interface_methods<'tcx>(
             continue;
         }
 
-        let mir_sig = tcx.instantiate_bound_regions_with_erased(
-            tcx.type_of(def_id).skip_binder().fn_sig(tcx),
-        );
+        let mir_sig = tcx
+            .instantiate_bound_regions_with_erased(tcx.type_of(def_id).skip_binder().fn_sig(tcx));
         let explicit_inputs = mir_sig.inputs();
         let output = mir_sig.output();
         let instance = Instance::new_raw(
@@ -122,12 +175,6 @@ pub(super) fn trait_interface_methods<'tcx>(
     methods
 }
 
-pub(super) fn crate_emits_library_artifact(tcx: TyCtxt<'_>) -> bool {
-    tcx.crate_types()
-        .iter()
-        .any(|crate_type| !matches!(crate_type, CrateType::Executable))
-}
-
 pub(super) fn is_lowerable_java_public_function(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
     if !matches!(tcx.def_kind(def_id), DefKind::Fn | DefKind::AssocFn) {
         return false;
@@ -166,7 +213,8 @@ pub(super) fn java_public_surface_def_ids(
                 JavaPublicSurface::Exported => effective_visibilities.is_exported(local_def_id),
                 JavaPublicSurface::Reachable => effective_visibilities.is_reachable(local_def_id),
             };
-            is_public_enough.then_some(local_def_id.to_def_id())
+            (is_public_enough && is_exported(tcx, local_def_id.to_def_id()))
+                .then_some(local_def_id.to_def_id())
         })
         .collect();
 
@@ -199,15 +247,11 @@ pub(super) fn materialize_java_public_data_type<'tcx>(
     }
 }
 
-pub(super) fn lower_public_library_exports<'tcx>(
+pub(super) fn lower_java_exports<'tcx>(
     tcx: TyCtxt<'tcx>,
     oomir_module: &mut lower1::context::Module<'tcx>,
     lowered_instances: &Lock<HashSet<Instance<'tcx>>>,
 ) {
-    if !crate_emits_library_artifact(tcx) {
-        return;
-    }
-
     let function_defs = java_public_surface_def_ids(tcx, JavaPublicSurface::Exported)
         .into_iter()
         .filter(|def_id| is_lowerable_java_public_function(tcx, *def_id))

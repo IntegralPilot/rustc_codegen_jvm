@@ -1,3 +1,5 @@
+#![feature(custom_inner_attributes)]
+#![jvm_codegen::export]
 #![feature(extern_types, register_tool)]
 #![register_tool(jvm_codegen)]
 
@@ -67,6 +69,13 @@ pub enum MacroRoot {
     Other(i32),
 }
 
+#[inline(never)]
+fn update_through_reborrow(state: &mut JavaState, value: i32) {
+    let borrowed = &mut *state;
+    borrowed.set_value(value);
+    assert_eq!(state.get_value(), value);
+}
+
 pub fn exercise() -> i64 {
     interfaces::exercise();
     unsafe {
@@ -77,7 +86,7 @@ pub fn exercise() -> i64 {
         assert_eq!((&*first).get_value(), 7);
         assert_eq!((&*first).get_wide(), 4_000_000_000);
 
-        (&mut *first).set_value(13);
+        update_through_reborrow(&mut *first, 13);
         assert_eq!((&*first).get_value(), 13);
 
         let second = JavaState::new(11, 9);

@@ -1,3 +1,5 @@
+#![feature(custom_inner_attributes)]
+#![jvm_codegen::export]
 #![feature(register_tool)]
 #![register_tool(jvm_codegen)]
 
