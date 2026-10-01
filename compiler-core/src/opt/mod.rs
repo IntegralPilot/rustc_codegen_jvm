@@ -39,6 +39,13 @@ pub use addresses::decompose_addresses;
 #[cfg(test)]
 mod addresses_tests;
 
+mod aggregate_joins;
+mod aggregates;
+mod value_copies;
+pub use aggregates::promote_aggregates;
+#[cfg(test)]
+mod aggregates_tests;
+
 mod return_abi;
 pub use return_abi::lower_component_returns;
 
