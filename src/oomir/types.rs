@@ -2,7 +2,6 @@
 use super::*;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[allow(dead_code)] /* Reference variant currently unused */
 pub enum Type {
     Void,
     /// Rust's inhabited, zero-sized unit value. It has no JVM stack value or local slot.
@@ -20,14 +19,42 @@ pub enum Type {
     F16,
     F32,
     F64,
-    Pointer(Box<Type>), // A sized Rust reference or raw pointer.
-    MutableReference(Box<Type>),
-    Reference(Box<Type>), // Representing references, not currently constructed but might be useful in future for more complex things.
-    Array(Box<Type>),     // Representing arrays
-    Slice(Box<Type>),     // A view over an array with an offset and length.
-    Str,                  // A borrowed UTF-8 byte view.
-    Class(String),        // For structs, enums, and potentially Objects
-    Interface(String),    // dyn TraitName
+    Pointer(Pointee), // A sized Rust reference or raw pointer.
+    Array(Box<Type>), // Representing arrays
+    Slice(Box<Type>), // A view over an array with an offset and length.
+    TaggedI64,
+    Str,               // A borrowed UTF-8 byte view.
+    Class(String),     // For structs, enums, and potentially Objects
+    Interface(String), // dyn TraitName
+}
+
+/// Source-language layout attached to an address, independent of its JVM carrier.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AddressSchema {
+    pub size: u32,
+    pub codec: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Pointee {
+    pub value: Box<Type>,
+    pub layout: Option<std::sync::Arc<AddressSchema>>,
+}
+impl AsRef<Type> for Pointee {
+    fn as_ref(&self) -> &Type {
+        &self.value
+    }
+}
+impl std::ops::Deref for Pointee {
+    type Target = Type;
+    fn deref(&self) -> &Type {
+        &self.value
+    }
+}
+impl std::ops::DerefMut for Pointee {
+    fn deref_mut(&mut self) -> &mut Type {
+        &mut self.value
+    }
 }
 
 pub fn is_non_null_class_name(class_name: &str) -> bool {
@@ -38,50 +65,91 @@ pub fn is_non_null_class_name(class_name: &str) -> bool {
 }
 
 impl Type {
-    /// A readable, descriptor-stable token for generated JVM ABI helper names.
-    pub fn jvm_abi_name_token(&self) -> String {
-        fn identifier(raw: &str) -> String {
-            let mut result = String::with_capacity(raw.len());
-            let mut separator = false;
-            for ch in raw.chars() {
-                if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$') {
-                    result.push(ch);
-                    separator = false;
-                } else if !separator && !result.is_empty() {
-                    result.push('_');
-                    separator = true;
-                }
-            }
-            while result.ends_with('_') {
-                result.pop();
-            }
-            if result.is_empty() {
-                "Object".to_string()
-            } else {
-                result
-            }
-        }
+    pub fn pointer(value: Type) -> Self {
+        Self::Pointer(Pointee {
+            value: Box::new(value),
+            layout: None,
+        })
+    }
+    pub fn with_address_layout(self, size: u32, codec: Option<String>) -> Self {
+        let Self::Pointer(mut pointee) = self else {
+            return self;
+        };
+        pointee.layout = Some(std::sync::Arc::new(AddressSchema { size, codec }));
+        Self::Pointer(pointee)
+    }
 
-        match self {
-            Type::Void | Type::Unit => "void".to_string(),
-            Type::Boolean => "boolean".to_string(),
-            Type::I8 | Type::U8 => "byte".to_string(),
-            Type::I16 => "short".to_string(),
-            Type::Char | Type::U16 => "char".to_string(),
-            Type::I32 | Type::U32 => "int".to_string(),
-            Type::I64 | Type::U64 => "long".to_string(),
-            Type::F16 => "binary16".to_string(),
-            Type::F32 => "float".to_string(),
-            Type::F64 => "double".to_string(),
-            Type::Pointer(_) => "Pointer".to_string(),
-            Type::MutableReference(inner) | Type::Array(inner) => {
-                format!("Array_{}", inner.jvm_abi_name_token())
-            }
-            Type::Reference(inner) => inner.jvm_abi_name_token(),
-            Type::Slice(_) => "SliceView".to_string(),
-            Type::Str => "Utf8View".to_string(),
-            Type::Class(name) | Type::Interface(name) => identifier(name),
+    pub fn materialize_address(
+        &self,
+        cp: &mut jvm_compiler_core::classfile::constant_pool::InternedConstantPool,
+        code: &mut Vec<jvm_compiler_core::classfile::attributes::Instruction>,
+    ) -> jvm_compiler_core::classfile::Result<()> {
+        if let Self::Pointer(pointee) = self
+            && let Some(layout) = &pointee.layout
+        {
+            jvm_compiler_core::jvm::abi::materialize_typed_address(
+                cp,
+                code,
+                layout.size,
+                layout.codec.as_deref(),
+            )
+        } else {
+            jvm_compiler_core::jvm::abi::materialize_address(cp, code, self.address_plan())
         }
+    }
+    pub fn scalar_address_size(&self) -> Option<u32> {
+        let Self::Pointer(inner) = self else {
+            return None;
+        };
+        Some(match inner.as_ref() {
+            Self::Boolean | Self::I8 | Self::U8 => 1,
+            Self::I16 | Self::U16 | Self::F16 => 2,
+            Self::I32 | Self::U32 | Self::F32 => 4,
+            Self::I64 | Self::U64 | Self::F64 => 8,
+            _ => return None,
+        })
+    }
+
+    pub fn address_plan(&self) -> u32 {
+        use jvm_compiler_core::jvm::abi;
+        match self {
+            Self::Pointer(inner) => match inner.as_ref() {
+                Self::Slice(_) | Self::Str => abi::STORED_VIEW,
+                Self::Pointer(_) => abi::STORED_ADDRESS,
+                _ => self.scalar_address_size().unwrap_or(0),
+            },
+            _ => 0,
+        }
+    }
+
+    pub fn component_shape(&self) -> Option<jvm_compiler_core::ir::ComponentShape> {
+        use jvm_compiler_core::ir::ComponentShape;
+        if matches!(self, Self::TaggedI64) {
+            Some(ComponentShape::TaggedI64)
+        } else if matches!(self, Self::Slice(_) | Self::Str) {
+            Some(ComponentShape::View)
+        } else if self.scalar_address_size().is_some() {
+            Some(ComponentShape::Address)
+        } else if matches!(self, Self::Pointer(_)) {
+            Some(ComponentShape::StorageAddress)
+        } else {
+            None
+        }
+    }
+
+    pub fn components(&self) -> Option<impl ExactSizeIterator<Item = Type> + use<>> {
+        use jvm_compiler_core::ir::ComponentShape;
+        self.component_shape().map(|shape| {
+            let object = Type::Class("java/lang/Object".into());
+            let (parts, count) = match shape {
+                ComponentShape::TaggedI64 => ([Self::I64, Self::I64, Self::Unit], 2),
+                ComponentShape::View => ([object, Self::I32, Self::U64], 3),
+                ComponentShape::Address | ComponentShape::StorageAddress => {
+                    ([object, Self::I64, Self::Unit], 2)
+                }
+            };
+            parts.into_iter().take(count)
+        })
     }
 
     /// The JVM's own immutable string class, used only for JVM ABI values.
@@ -115,8 +183,7 @@ impl Type {
         let mut arrays = 0;
         let (primitive, name) = loop {
             match ty {
-                Type::Reference(inner) => ty = inner,
-                Type::Array(inner) | Type::MutableReference(inner) if inner.has_jvm_value() => {
+                Type::Array(inner) if inner.has_jvm_value() => {
                     arrays += 1;
                     ty = inner;
                 }
@@ -124,8 +191,8 @@ impl Type {
                     arrays += 1;
                     break ('L', "java/lang/Object");
                 }
-                Type::MutableReference(_) => break ('L', "java/lang/Object"),
                 Type::Pointer(_) => break ('L', POINTER_CLASS),
+                Type::TaggedI64 => break ('L', TAGGED_LONG_CLASS),
                 Type::Str => break ('L', UTF8_VIEW_CLASS),
                 Type::Slice(_) => break ('L', SLICE_VIEW_CLASS),
                 Type::Class(name) | Type::Interface(name) => break ('L', name.as_str()),
@@ -180,13 +247,13 @@ impl Type {
     /// Returns None for primitive types.
     pub fn to_jvm_internal_name(&self) -> Option<String> {
         match self {
+            Type::TaggedI64 => Some(TAGGED_LONG_CLASS.to_string()),
             Type::Str => Some(UTF8_VIEW_CLASS.to_string()),
             Type::Class(name) | Type::Interface(name) => Some(name.replace('.', "/")),
             Type::Pointer(_) => Some(POINTER_CLASS.to_string()),
-            Type::Reference(inner) => inner.to_jvm_internal_name(), // delegate to inner type
             // For array-valued types, the descriptor is the component class name
             // expected by `anewarray`. Mutable references use one-element arrays.
-            Type::Array(_) | Type::MutableReference(_) => Some(self.to_jvm_descriptor()),
+            Type::Array(_) => Some(self.to_jvm_descriptor()),
             Type::Slice(_) => Some(SLICE_VIEW_CLASS.to_string()),
             // Primitives don't have an internal name for anewarray.
             _ => None,
@@ -223,13 +290,12 @@ impl Type {
             Type::F32 => Some(JVMInstruction::Fastore),
             Type::F64 => Some(JVMInstruction::Dastore),
             // Reference types:
-            Type::Str
+            Type::TaggedI64
+            | Type::Str
             | Type::Class(_)
             | Type::Interface(_)
             | Type::Array(_)
-            | Type::Slice(_)
-            | Type::Reference(_)
-            | Type::MutableReference(_) => Some(JVMInstruction::Aastore),
+            | Type::Slice(_) => Some(JVMInstruction::Aastore),
             Type::Pointer(_) => Some(JVMInstruction::Aastore),
             Type::Void => None,
             Type::Unit => None,
@@ -241,15 +307,16 @@ impl Type {
         match constant {
             Constant::Unit => Type::Unit,
             Constant::StaticRef { ty, .. } => ty.clone(),
-            Constant::FunctionPointer { interface_name, .. } => {
+            Constant::FunctionPointer { interface_name, .. }
+            | Constant::FunctionHandle { interface_name, .. } => {
                 Type::Interface(interface_name.clone())
             }
             Constant::FactoryCall { ty, .. } => ty.clone(),
             Constant::StaticCall { ty, .. } => ty.clone(),
-            Constant::PointerAddress { pointee, .. } => Type::Pointer(pointee.clone()),
-            Constant::RepeatedBytePointer { pointee, .. } => Type::Pointer(pointee.clone()),
-            Constant::ByteArrayPointer { pointee, .. } => Type::Pointer(pointee.clone()),
-            Constant::InternedPointer { pointee, .. } => Type::Pointer(pointee.clone()),
+            Constant::PointerAddress { pointee, .. } => Type::pointer(*pointee.clone()),
+            Constant::RepeatedBytePointer { pointee, .. } => Type::pointer(*pointee.clone()),
+            Constant::ByteArrayPointer { pointee, .. } => Type::pointer(*pointee.clone()),
+            Constant::InternedPointer { pointee, .. } => Type::pointer(*pointee.clone()),
             Constant::Null(ty) => ty.clone(),
             Constant::I8(_) => Type::I8,
             Constant::U8(_) => Type::U8,
@@ -268,11 +335,11 @@ impl Type {
             Constant::Boolean(_) => Type::Boolean,
             Constant::Char(_) => Type::Char,
             Constant::Str(_) => Type::Str,
-            Constant::String(_) => Type::java_string(),
+            Constant::String(_) | Constant::LiteralString(_) => Type::java_string(),
             Constant::Instance {
                 class_name, params, ..
             } if class_name == POINTER_CLASS => {
-                Type::Pointer(Box::new(if params.len() == 3 {
+                Type::pointer(if params.len() == 3 {
                     params
                         .first()
                         .map(Type::from_constant)
@@ -281,7 +348,10 @@ impl Type {
                     // Address-only constructors carry no JVM pointee value from
                     // which to infer a more specific OOMIR type.
                     Type::Unit
-                }))
+                })
+            }
+            Constant::Instance { class_name, .. } if class_name == TAGGED_LONG_CLASS => {
+                Type::TaggedI64
             }
             Constant::Instance { class_name, .. } => Type::Class(class_name.to_string()),
         }
@@ -311,11 +381,10 @@ impl Type {
     pub fn is_jvm_reference_type(&self) -> bool {
         matches!(
             self,
-            Type::Reference(_)
-                | Type::Pointer(_)
-                | Type::MutableReference(_)
+            Type::Pointer(_)
                 | Type::Array(_)
                 | Type::Slice(_)
+                | Type::TaggedI64
                 | Type::Str
                 | Type::Class(_)
                 | Type::Interface(_)
@@ -350,11 +419,9 @@ impl Type {
             Type::Pointer(_) => Some(POINTER_CLASS.to_string()),
             Type::Array(_) => Some(self.to_jvm_descriptor()), // Array descriptor works for checkcast/anewarray
             Type::Slice(_) => Some(SLICE_VIEW_CLASS.to_string()),
+            Type::TaggedI64 => Some(TAGGED_LONG_CLASS.to_string()),
             Type::Str => Some(UTF8_VIEW_CLASS.to_string()),
-            Type::Reference(inner) => inner.to_jvm_descriptor_or_internal_name(),
-            Type::MutableReference(inner) => {
-                Type::Array(inner.clone()).to_jvm_descriptor_or_internal_name()
-            } // MutableReference is treated as an array
+            // MutableReference is treated as an array
             _ => None,
         }
     }
@@ -370,11 +437,8 @@ impl Type {
                 false
             }
             // Handle nested types recursively
-            Type::MutableReference(inner)
-            | Type::Pointer(inner)
-            | Type::Reference(inner)
-            | Type::Array(inner)
-            | Type::Slice(inner) => inner.replace_class(old_name, new_name),
+            Type::Array(inner) | Type::Slice(inner) => inner.replace_class(old_name, new_name),
+            Type::Pointer(inner) => inner.replace_class(old_name, new_name),
             // Primitive types and Void are unaffected.
             Type::Void
             | Type::Unit
@@ -391,6 +455,7 @@ impl Type {
             | Type::F16
             | Type::F32
             | Type::F64
+            | Type::TaggedI64
             | Type::Str => {
                 // No class names to replace here
                 false
@@ -407,10 +472,9 @@ impl Type {
         );
         match self {
             Type::Class(name) | Type::Interface(name) => Some(name),
+            Type::TaggedI64 => Some(TAGGED_LONG_CLASS),
             Type::Str => Some(UTF8_VIEW_CLASS),
-            Type::Array(inner) | Type::MutableReference(inner) | Type::Reference(inner) => {
-                inner.get_class_name()
-            }
+            Type::Array(inner) => inner.get_class_name(),
             // Method dispatch through a Rust reference targets the pointee;
             // pointer-native methods are redirected explicitly during lowering.
             Type::Pointer(inner) => inner.get_class_name(),
@@ -437,15 +501,9 @@ mod tests {
             (U16, "C"),
             (Class("java.lang.É".into()), "Ljava/lang/É;"),
             (Interface("java/lang/É".into()), "Ljava/lang/É;"),
-            (Pointer(Box::new(Unit)), "Lorg/rustlang/runtime/Pointer;"),
+            (Type::pointer(Unit), "Lorg/rustlang/runtime/Pointer;"),
             (Array(Box::new(Unit)), "[Ljava/lang/Object;"),
-            (MutableReference(Box::new(Unit)), "Ljava/lang/Object;"),
-            (
-                Array(Box::new(MutableReference(Box::new(Unit)))),
-                "[Ljava/lang/Object;",
-            ),
-            (Reference(Box::new(Array(Box::new(U8)))), "[B"),
-            (MutableReference(Box::new(Array(Box::new(I8)))), "[[B"),
+            (Array(Box::new(Array(Box::new(I8)))), "[[B"),
         ];
         for (ty, expected) in &cases {
             assert_eq!(ty.to_jvm_descriptor(), *expected);
