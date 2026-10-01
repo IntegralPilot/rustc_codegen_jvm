@@ -2,10 +2,13 @@ mod aggregate_components;
 mod array_locations;
 mod borrowed_fields;
 mod component_calls;
+mod nullable_refs;
+mod optional_views;
 mod partial_init;
 mod returned_views;
 mod stored_addresses;
 mod str_patterns;
+mod transparent_enums;
 
 fn sum(values: &[i32]) -> i32 {
     let mut total = 0;
@@ -289,7 +292,10 @@ fn main() {
     borrowed_fields::run();
     array_locations::run();
     partial_init::run();
+    nullable_refs::run();
+    optional_views::run();
     returned_views::run();
+    transparent_enums::run();
     component_calls::run();
     let values = [10, 20, 30, 40, 50];
     let whole: &[i32] = &values;

@@ -41,7 +41,31 @@ pub(crate) fn ty_to_oomir_type<'tcx>(
         return cached;
     }
     crate::metrics::record_type_cache_miss();
-    let lowered = ty_to_oomir_type_resolved(resolved_ty, tcx, data_types, instance_context);
+    let mut lowered = ty_to_oomir_type_resolved(resolved_ty, tcx, data_types, instance_context);
+    // JVM array descriptors omit length. Raw addresses keep the exact Rust stride and codec.
+    let static_pointee = match resolved_ty.kind() {
+        TyKind::RawPtr(pointee, _) => Some(*pointee),
+        TyKind::Adt(def, args) if crate::lower1::is_non_null_lang_item(tcx, def.did()) => {
+            args.iter().find_map(|arg| arg.as_type())
+        }
+        _ => None,
+    };
+    if matches!(lowered, oomir::Type::Pointer(_))
+        && let Some(pointee) = static_pointee
+        && let TyKind::Array(element, _) = pointee.kind()
+        && matches!(
+            element.kind(),
+            TyKind::Bool | TyKind::Char | TyKind::Int(_) | TyKind::Uint(_) | TyKind::Float(_)
+        )
+        && let Ok(size) = layout_size_bytes(tcx, pointee)
+        && let Ok(size) = u32::try_from(size)
+        && size > 0
+    {
+        let codec = pointer_view_codec_operand(pointee, tcx, data_types, instance_context);
+        if let oomir::Operand::Constant(oomir::Constant::String(codec)) = codec {
+            lowered = lowered.with_address_layout(size, Some(codec));
+        }
+    }
     data_types
         .representations
         .insert(resolved_ty, lowered.clone());
@@ -88,21 +112,47 @@ pub(super) fn ty_to_oomir_type_resolved<'tcx>(
             FloatTy::F128 => oomir::Type::Class(crate::lower2::F128_CLASS.to_string()),
         },
         rustc_middle::ty::TyKind::Adt(adt_def, substs) => {
+            if tcx.lang_items().phantom_data() == Some(adt_def.did()) {
+                return oomir::Type::Unit;
+            }
+            if tagged_scalar(resolved_ty, tcx).is_some() {
+                return oomir::Type::TaggedI64;
+            }
+            if let Some(payload) = direct_enum_payload(resolved_ty, tcx) {
+                return ty_to_oomir_type(payload, tcx, data_types, instance_context);
+            }
+            if let Some(scalar) = value_scalar_ty(resolved_ty, tcx) {
+                return ty_to_oomir_type(scalar, tcx, data_types, instance_context);
+            }
+            if let Some(payload) = transparent_payload(resolved_ty, tcx) {
+                return ty_to_oomir_type(payload.ty, tcx, data_types, instance_context);
+            }
             if crate::lower1::is_non_null_lang_item(tcx, adt_def.did())
                 && let Some(pointee) = substs.iter().find_map(|arg| arg.as_type())
                 && is_codegen_sized(pointee, tcx)
             {
-                return oomir::Type::Pointer(Box::new(ty_to_oomir_type(
+                return oomir::Type::pointer(ty_to_oomir_type(
                     pointee,
                     tcx,
                     data_types,
                     instance_context,
-                )));
+                ));
             }
             let jvm_name_full =
                 generate_adt_jvm_class_name(&adt_def, substs, tcx, data_types, instance_context);
 
-            if !should_define_named_data_type(tcx, adt_def.did()) && substs.is_empty() {
+            if !adt_def.did().is_local()
+                && !adt_def.is_union()
+                && data_types.has_upstream_type(&jvm_name_full)
+            {
+                remember_external_fields(
+                    adt_def,
+                    substs,
+                    &jvm_name_full,
+                    tcx,
+                    data_types,
+                    instance_context,
+                );
                 return oomir::Type::Class(jvm_name_full);
             }
 
@@ -177,7 +227,7 @@ pub(super) fn ty_to_oomir_type_resolved<'tcx>(
                 // Sized references carry a stable address. Mutability remains
                 // a Rust type-system property; both reference kinds use the
                 // same JVM pointer representation so reborrows preserve identity.
-                oomir::Type::Pointer(Box::new(pointee_oomir_type))
+                oomir::Type::pointer(pointee_oomir_type)
             }
         }
         rustc_middle::ty::TyKind::RawPtr(ty, _mutability) => {
@@ -200,7 +250,7 @@ pub(super) fn ty_to_oomir_type_resolved<'tcx>(
                 if matches!(pointee_oomir_type, oomir::Type::Class(_)) {
                     pointee_oomir_type
                 } else {
-                    oomir::Type::Pointer(Box::new(pointee_oomir_type))
+                    oomir::Type::pointer(pointee_oomir_type)
                 }
             } else {
                 // Sized raw pointers and sized references intentionally share
@@ -208,9 +258,9 @@ pub(super) fn ty_to_oomir_type_resolved<'tcx>(
                 // const/mut casts and makes arithmetic independent of the JVM ABI.
                 let oomir_pointee_type = ty_to_oomir_type(*ty, tcx, data_types, instance_context);
                 if matches!(oomir_pointee_type, oomir::Type::Void) {
-                    oomir::Type::Pointer(Box::new(oomir::Type::Unit))
+                    oomir::Type::pointer(oomir::Type::Unit)
                 } else {
-                    oomir::Type::Pointer(Box::new(oomir_pointee_type))
+                    oomir::Type::pointer(oomir_pointee_type)
                 }
             }
         }
@@ -229,99 +279,58 @@ pub(super) fn ty_to_oomir_type_resolved<'tcx>(
                 instance_context,
             )))
         }
-        rustc_middle::ty::TyKind::Tuple(tuple_elements) => {
-            // Unit is an inhabited Rust value, but occupies no JVM stack or local slot.
-            if tuple_elements.is_empty() {
+        TyKind::Tuple(elements) => {
+            if let Some(word) = packed_word(resolved_ty, tcx) {
+                return word.jvm_type();
+            }
+            if elements.is_empty() {
                 return oomir::Type::Unit;
             }
-
-            // Handle non-empty tuples -> generate a class
-            let element_mir_tys: Vec<Ty<'tcx>> = tuple_elements.iter().collect(); // Collect MIR types
-
-            // Generate the JVM class name for this specific tuple type
-            let tuple_class_name =
-                generate_tuple_jvm_class_name(&element_mir_tys, tcx, data_types, instance_context);
-
-            // Check if we've already created the DataType for this tuple signature
-            if !data_types.contains_key(&tuple_class_name) {
-                breadcrumbs::log!(
-                    breadcrumbs::LogLevel::Info,
-                    "type-mapping",
-                    format!(
-                        "Info: Defining new tuple type class: {} for MIR type {:?}",
-                        tuple_class_name, resolved_ty
-                    )
-                );
-                // Create the fields ("field0", "field1", ...) and their OOMIR types
-                let oomir_fields = element_mir_tys
-                    .iter()
+            let fields = elements.iter().collect::<Vec<_>>();
+            let name = generate_tuple_jvm_class_name(&fields, tcx, data_types, instance_context);
+            if data_types.get(&name).is_none() {
+                let fields = fields
+                    .into_iter()
                     .enumerate()
-                    .map(|(i, &elem_ty)| {
-                        let field_name = format!("field{}", i);
-                        // Recursively convert element type to OOMIR type
-                        let field_oomir_type =
-                            ty_to_oomir_type(elem_ty, tcx, data_types, instance_context);
-                        (field_name, field_oomir_type)
+                    .map(|(index, ty)| {
+                        (
+                            format!("field{index}"),
+                            ty_to_oomir_type(ty, tcx, data_types, instance_context),
+                        )
                     })
                     .collect::<Vec<_>>();
-
-                let mut methods = HashMap::default();
-                methods.insert(
-                    "eq".to_string(),
-                    DataTypeMethod::AdtHelperMethod {
-                        kind: oomir::AdtHelperKind::PartialEqClass {
-                            fields: oomir_fields.clone(),
-                        },
-                    },
-                );
-
-                // Create and insert the DataType definition
-                let tuple_data_type = oomir::DataType::Class {
-                    fields: oomir_fields,
-                    is_abstract: false,
-                    methods,
-                    super_class: None,
-                    interfaces: vec![],
-                };
-                data_types.insert(tuple_class_name.clone(), tuple_data_type);
-                breadcrumbs::log!(
-                    breadcrumbs::LogLevel::Info,
-                    "type-mapping",
-                    format!("   -> Added DataType: {:?}", data_types[&tuple_class_name])
-                );
-            } else {
-                if let Some(oomir::DataType::Class {
-                    fields, methods, ..
-                }) = data_types.get_mut(&tuple_class_name)
-                {
-                    methods.entry("eq".to_string()).or_insert_with(|| {
+                let imported = data_types.has_upstream_type(&name);
+                let methods = if imported {
+                    HashMap::default()
+                } else {
+                    HashMap::from_iter([(
+                        "eq".into(),
                         DataTypeMethod::AdtHelperMethod {
                             kind: oomir::AdtHelperKind::PartialEqClass {
                                 fields: fields.clone(),
                             },
-                        }
-                    });
+                        },
+                    )])
+                };
+                let schema = oomir::DataType::Class {
+                    fields,
+                    methods,
+                    is_abstract: false,
+                    super_class: None,
+                    interfaces: Vec::new(),
+                    kind: if is_codegen_sized(resolved_ty, tcx) {
+                        oomir::ClassKind::Value
+                    } else {
+                        oomir::ClassKind::MemoryView
+                    },
+                };
+                if imported {
+                    data_types.external_schemas.insert(name.clone(), schema);
+                } else {
+                    data_types.insert(name.clone(), schema);
                 }
-                breadcrumbs::log!(
-                    breadcrumbs::LogLevel::Info,
-                    "type-mapping",
-                    format!(
-                        "Info: Reusing existing tuple type class: {}",
-                        tuple_class_name
-                    )
-                );
             }
-
-            ensure_managed_drop(
-                resolved_ty,
-                &tuple_class_name,
-                tcx,
-                data_types,
-                instance_context,
-            );
-
-            // Return the OOMIR type as a Class reference
-            oomir::Type::Class(tuple_class_name)
+            oomir::Type::Class(name)
         }
         rustc_middle::ty::TyKind::Slice(component_ty) => {
             // Special case for slices of string references
@@ -486,6 +495,11 @@ pub(super) fn ty_to_oomir_type_resolved<'tcx>(
             ty = resolved_ty,
         ),
         rustc_middle::ty::TyKind::Closure(def_id, args) => {
+            // Static closure calls already identify their body. Dynamic calls obtain that identity
+            // from the adapter.
+            if args.as_closure().upvar_tys().is_empty() {
+                return oomir::Type::Unit;
+            }
             let safe_name = data_types.closure_class_name(tcx, *def_id, args, false);
 
             // Define the closure class struct if not already present
@@ -506,6 +520,7 @@ pub(super) fn ty_to_oomir_type_resolved<'tcx>(
                     safe_name.clone(),
                     oomir::DataType::Class {
                         fields,
+                        kind: crate::oomir::ClassKind::Value,
                         is_abstract: false,
                         methods: HashMap::default(), // 'call' is handled via MIR lowering logic
                         super_class: Some("java/lang/Object".to_string()),
@@ -529,6 +544,7 @@ pub(super) fn ty_to_oomir_type_resolved<'tcx>(
                 safe_name.clone(),
                 oomir::DataType::Class {
                     fields: vec![("__state".to_string(), oomir::Type::I32)],
+                    kind: crate::oomir::ClassKind::Value,
                     is_abstract: false,
                     methods: HashMap::default(),
                     super_class: Some("java/lang/Object".to_string()),

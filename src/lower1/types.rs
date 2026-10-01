@@ -17,12 +17,23 @@ use rustc_span::{Symbol, def_id::DefId, sym};
 
 mod mapping;
 pub(crate) use mapping::{is_codegen_sized, mir_int_to_oomir_const, ty_to_oomir_type};
+mod tuples;
+pub(crate) use tuples::{tuple_fields, tuple_value};
+mod packed;
+pub(crate) use packed::{packed_word, value_scalar_ty};
+mod transparent;
+pub(crate) use transparent::transparent_payload;
+mod tagged;
+pub(crate) use tagged::{tagged_scalar, tagged_value};
+mod nullable;
+pub(crate) use nullable::{direct_enum_payload, enum_carrier};
+mod enum_scalars;
+pub(crate) use enum_scalars::{enum_scalar_ty, enum_scalar_variant};
 mod enums;
 use enums::*;
 pub(crate) use enums::{
-    adapt_simple_enum_operand, enum_scoped_method_name, enum_variant_field_name,
-    jvm_subtype_payload_ty, union_from_method_name, union_getter_method_name,
-    union_setter_method_name,
+    adapt_simple_enum_operand, enum_variant_field_name, enum_variant_name, jvm_subtype_payload_ty,
+    union_from_method_name, union_getter_method_name, union_setter_method_name,
 };
 mod abi;
 pub(crate) use abi::{
@@ -39,6 +50,7 @@ pub(crate) use layout::{
 };
 mod adt;
 use adt::*;
+pub(crate) use adt::{adt_class_kind, ensure_drop_callback, struct_field_name};
 pub(crate) use adt::{force_define_named_adt, should_define_named_data_type};
 mod drop;
 use drop::*;
@@ -48,12 +60,19 @@ mod bytes;
 use bytes::*;
 mod enum_codecs;
 use enum_codecs::*;
+mod enum_codec_dispatch;
+use enum_codec_dispatch::*;
 mod write;
 use write::*;
 mod read;
 use read::*;
 mod transmute;
 pub(crate) use transmute::ensure_exact_transmute_helper;
+mod bitcasts;
+pub(crate) use bitcasts::emit_direct_transmute;
+mod range_encoder;
+mod storage_layout;
+pub(crate) use storage_layout::scalar_storage_layout;
 mod pointer_codecs;
 use pointer_codecs::*;
 pub(crate) use pointer_codecs::{
@@ -68,8 +87,8 @@ mod names;
 use names::*;
 pub(crate) use names::{
     generate_adt_jvm_class_name, generate_tuple_jvm_class_name, get_field_name_from_index,
-    readable_rust_generic_arg_name, readable_rust_type_name, sanitize_name_token, short_hash,
-    stable_def_identity, stable_def_path, stable_instance_identity, stable_type_identity,
+    readable_rust_generic_arg_name, sanitize_name_token, stable_def_identity, stable_def_path,
+    stable_instance_identity, stable_type_identity,
 };
 
 pub const UNION_BYTES_FIELD: &str = "_bytes";
@@ -82,9 +101,6 @@ const STRUCT_TAIL_POINTER_VIEW_CODEC_PREFIX: &str = "@struct-tail-pointer\n";
 const TRAIT_POINTER_VIEW_CODEC_PREFIX: &str = "@trait-pointer\n";
 pub(super) const ENUM_UNION_DISCRIMINANT_METHOD: &str = "_unionDiscriminant";
 const ENUM_FROM_UNION_DISCRIMINANT_METHOD: &str = "_fromUnionDiscriminant";
-const ENUM_WRITE_UNION_STORAGE_METHOD: &str = "_writeUnionStorage";
-const ENUM_READ_UNION_STORAGE_METHOD: &str = "_readUnionStorage";
-const ENUM_DROP_FIELDS_METHOD: &str = "_rust_drop_fields";
 const MANAGED_DROP_METHOD: &str = "rustDrop";
 const MANAGED_DROP_INTERFACE: &str = "org/rustlang/runtime/RustDrop";
 
@@ -203,6 +219,31 @@ pub(crate) struct ExactTransmuteHelper {
 #[derive(Clone)]
 pub(crate) struct PointerMemoryCodec {
     pub class_name: String,
+}
+
+impl PointerMemoryCodec {
+    fn owner(&self) -> &str {
+        self.class_name.split('#').next().unwrap()
+    }
+
+    fn method(&self, name: &str) -> String {
+        let key = self
+            .class_name
+            .split('#')
+            .nth(1)
+            .expect("generated codec recipe");
+        let prefix = match name {
+            "encode" => "e",
+            "encodeAt" => "w",
+            "decode" => "d",
+            "decodeAt" => "a",
+            "bind" => "b",
+            "_rustArrayElementSize" => "s",
+            "_rustArrayElementCodec" => "c",
+            _ => unreachable!("unknown codec operation {name}"),
+        };
+        format!("{prefix}${key}")
+    }
 }
 
 // Keep ordinary nested generic/tuple names readable for Java callers. Hashing

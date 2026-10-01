@@ -34,13 +34,10 @@ pub(super) fn pointer_view_size_operand<'tcx>(
     tcx: TyCtxt<'tcx>,
     instance: Instance<'tcx>,
 ) -> oomir::Operand {
-    let pointee = match pointer_ty.kind() {
-        TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _) => *pointee,
-        other => panic!("expected pointer/reference type, found {other:?}"),
-    };
-    let pointee = EarlyBinder::bind(tcx, pointee)
+    let pointer_ty = EarlyBinder::bind(tcx, pointer_ty)
         .instantiate(tcx, instance.args)
         .skip_norm_wip();
+    let pointee = pointer_pointee_ty(pointer_ty, tcx);
     let size = crate::lower1::types::layout_size_bytes(tcx, pointee).unwrap_or_else(|error| {
         panic!("could not determine pointer view size for {pointee:?}: {error}")
     });
@@ -50,10 +47,22 @@ pub(super) fn pointer_view_size_operand<'tcx>(
 }
 
 pub(super) fn pointer_pointee_ty<'tcx>(
-    pointer_ty: rustc_middle::ty::Ty<'tcx>,
+    mut pointer_ty: rustc_middle::ty::Ty<'tcx>,
+    tcx: TyCtxt<'tcx>,
 ) -> rustc_middle::ty::Ty<'tcx> {
-    match pointer_ty.kind() {
-        TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _) => *pointee,
-        other => panic!("expected pointer/reference type, found {other:?}"),
+    loop {
+        match pointer_ty.kind() {
+            TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _) => return *pointee,
+            TyKind::Pat(inner, _) => pointer_ty = *inner,
+            _ => {
+                // The proven transparent field supplies the pointee. The owner can have other
+                // generic arguments.
+                pointer_ty = crate::lower1::types::transparent_payload(pointer_ty, tcx)
+                    .unwrap_or_else(|| {
+                        panic!("expected pointer/reference type, found {pointer_ty:?}")
+                    })
+                    .ty;
+            }
+        }
     }
 }

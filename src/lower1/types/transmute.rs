@@ -109,6 +109,7 @@ pub(super) fn force_define_transmute_adts<'tcx>(
     }
 
     match ty.kind() {
+        TyKind::Adt(adt_def, _) if tcx.lang_items().phantom_data() == Some(adt_def.did()) => {}
         TyKind::Adt(adt_def, substs) => {
             if !should_define_named_data_type(tcx, adt_def.did()) && substs.is_empty() {
                 force_define_named_adt(ty, tcx, data_types, instance_context);
@@ -172,7 +173,6 @@ pub(crate) fn ensure_exact_transmute_helper<'tcx>(
 
     let source_oomir_ty = ty_to_oomir_type(source_ty, tcx, data_types, instance_context);
     let target_oomir_ty = ty_to_oomir_type(target_ty, tcx, data_types, instance_context);
-    let method_name = "transmute".to_string();
     let signature = oomir::Signature {
         params: source_oomir_ty
             .has_jvm_value()
@@ -181,21 +181,6 @@ pub(crate) fn ensure_exact_transmute_helper<'tcx>(
         ret: Box::new(target_oomir_ty.clone()),
         is_static: true,
     };
-    let readable = format!(
-        "{}_to_{}",
-        sanitize_name_token(&readable_rust_type_name(
-            source_ty,
-            tcx,
-            data_types,
-            instance_context,
-        )),
-        sanitize_name_token(&readable_rust_type_name(
-            target_ty,
-            tcx,
-            data_types,
-            instance_context,
-        ))
-    );
     let identity = format!(
         "{}:{}->{}:{}",
         stable_type_identity(tcx, source_ty),
@@ -203,16 +188,13 @@ pub(crate) fn ensure_exact_transmute_helper<'tcx>(
         stable_type_identity(tcx, target_ty),
         target_oomir_ty.to_jvm_descriptor()
     );
-    // The same readable Rust types can use different JVM carriers across
-    // upstream and downstream monomorphizations. Include the descriptors in
-    // the class identity so their helper methods cannot collide at link time.
-    let local_name = crate::stable_hash::readable_disambiguated_name(
-        "ExactTransmute",
-        &readable,
-        &identity,
-        180,
+    let identity = crate::stable_hash::short_hash(&identity, 16);
+    let method_name = format!("transmute${identity}");
+    let class_name = format!(
+        "{}/mono/Mono_{}",
+        jvm_names::crate_root(tcx, instance_context.def_id().krate),
+        &identity[..2],
     );
-    let class_name = jvm_names::synthetic_class_for_instance(tcx, instance_context, local_name);
     let helper = ExactTransmuteHelper {
         class_name: class_name.clone(),
         method_name: method_name.clone(),
@@ -229,7 +211,10 @@ pub(crate) fn ensure_exact_transmute_helper<'tcx>(
         TyKind::RawPtr(pointee, _) | TyKind::Ref(_, pointee, _) => Some(*pointee),
         TyKind::Adt(adt_def, args)
             if crate::lower1::is_non_null_lang_item(tcx, adt_def.did())
-                && matches!(oomir_ty, oomir::Type::Pointer(_)) =>
+                && matches!(
+                    oomir_ty,
+                    oomir::Type::Pointer(_) | oomir::Type::Slice(_) | oomir::Type::Str
+                ) =>
         {
             args.iter().find_map(|arg| arg.as_type())
         }
@@ -283,7 +268,10 @@ pub(crate) fn ensure_exact_transmute_helper<'tcx>(
         }
         TyKind::Adt(adt_def, args)
             if crate::lower1::is_non_null_lang_item(tcx, adt_def.did())
-                && matches!(target_oomir_ty, oomir::Type::Pointer(_)) =>
+                && matches!(
+                    target_oomir_ty,
+                    oomir::Type::Pointer(_) | oomir::Type::Slice(_) | oomir::Type::Str
+                ) =>
         {
             args.iter()
                 .find_map(|arg| arg.as_type())
@@ -299,23 +287,6 @@ pub(crate) fn ensure_exact_transmute_helper<'tcx>(
                 .map(|(_, field_ty)| (field_ty.clone(), *pointee, Some(class_name.clone())))
         }),
     };
-    let target_struct_tail_view = target_pointee.and_then(|pointee| {
-        let tail = tcx.struct_tail_for_codegen(pointee, TypingEnv::fully_monomorphized());
-        let tail_view = if tail.is_str() {
-            Some(oomir::UTF8_VIEW_CLASS)
-        } else if matches!(tail.kind(), TyKind::Slice(_)) {
-            Some(oomir::SLICE_VIEW_CLASS)
-        } else {
-            None
-        }?;
-        let oomir::Type::Pointer(target) = &target_oomir_ty else {
-            return None;
-        };
-        let oomir::Type::Class(target_class) = target.as_ref() else {
-            return None;
-        };
-        Some((target_class.clone(), tail_view.to_string()))
-    });
     let mut pointer_instructions = Vec::new();
     let source_pointer = if source_pointee.is_some() && source_oomir_ty.has_jvm_value() {
         Some((
@@ -350,35 +321,54 @@ pub(crate) fn ensure_exact_transmute_helper<'tcx>(
             |((source_pointer, source_pointer_ty), (target_pointer_ty, pointee, wrapper))| {
                 let retyped = if source_pointer_pointee == Some(pointee) {
                     source_pointer
-                } else if let Some((target_class, tail_view_class)) = &target_struct_tail_view {
-                    if !matches!(source_pointer_ty, oomir::Type::Pointer(_))
-                        || !matches!(target_pointer_ty, oomir::Type::Pointer(_))
-                    {
-                        return Ok(None);
-                    }
-                    let retyped_name = "_retargeted_struct_tail_pointer".to_string();
+                } else if matches!(pointee.kind(), TyKind::Adt(def, _) if def.is_struct())
+                    && matches!(
+                        tcx.struct_tail_for_codegen(pointee, TypingEnv::fully_monomorphized())
+                            .kind(),
+                        TyKind::Dynamic(..)
+                    )
+                    && matches!(source_pointer_ty, oomir::Type::Pointer(_))
+                {
+                    // MIR can express a pointer cast as a transmute. The DST adapter belongs at the
+                    // new tail offset.
+                    let name = "_trait_tail_pointer".to_string();
                     pointer_instructions.push(oomir::Instruction::InvokeStatic {
-                        dest: Some(retyped_name.clone()),
-                        class_name: oomir::POINTER_CLASS.to_string(),
-                        method_name: "retargetStructTail".to_string(),
+                        dest: Some(name.clone()),
+                        class_name: oomir::POINTER_CLASS.into(),
+                        method_name: "retypeStructTailFromTraitPointer".into(),
                         method_ty: oomir::Signature {
                             params: vec![
-                                ("pointer".to_string(), source_pointer_ty),
-                                ("target_class".to_string(), oomir::Type::java_string()),
-                                ("tail_view_class".to_string(), oomir::Type::java_string()),
+                                ("pointer".into(), source_pointer_ty),
+                                ("prefix_size".into(), oomir::Type::U64),
+                                ("codec".into(), oomir::Type::java_string()),
                             ],
                             ret: Box::new(target_pointer_ty.clone()),
                             is_static: true,
                         },
                         args: vec![
                             source_pointer,
-                            oomir::Operand::Constant(oomir::Constant::String(target_class.clone())),
-                            oomir::Operand::Constant(oomir::Constant::String(
-                                tail_view_class.clone(),
-                            )),
+                            oomir::Operand::Constant(oomir::Constant::U64(layout_size_bytes(
+                                tcx, pointee,
+                            )?
+                                as u64)),
+                            pointer_view_codec_operand(pointee, tcx, data_types, instance_context),
                         ],
                     });
-                    operand_var(retyped_name, target_pointer_ty.clone())
+                    operand_var(name, target_pointer_ty.clone())
+                } else if matches!(source_pointer_ty, oomir::Type::Pointer(_))
+                    && let Some(retyped) =
+                        crate::lower1::control_flow::rvalue::emit_struct_tail_reborrow_view(
+                            pointee,
+                            source_pointer.clone(),
+                            &target_pointer_ty,
+                            "_retargeted_struct_tail_pointer",
+                            tcx,
+                            instance_context,
+                            data_types,
+                            &mut pointer_instructions,
+                        )
+                {
+                    retyped
                 } else if source_pointer_ty == target_pointer_ty
                     && matches!(source_pointer_ty, oomir::Type::Pointer(_))
                 {
@@ -387,27 +377,22 @@ pub(crate) fn ensure_exact_transmute_helper<'tcx>(
                     && matches!(target_pointer_ty, oomir::Type::Pointer(_))
                 {
                     let retyped_name = "_retyped_pointer".to_string();
-                    pointer_instructions.push(oomir::Instruction::InvokeVirtual {
+                    pointer_instructions.push(oomir::Instruction::AddressRetype {
                         dest: Some(retyped_name.clone()),
-                        class_name: oomir::POINTER_CLASS.to_string(),
-                        method_name: "retype".to_string(),
-                        method_ty: oomir::Signature {
-                            params: vec![
-                                ("self".to_string(), source_pointer_ty),
-                                ("view_size".to_string(), oomir::Type::U64),
-                                ("view_codec".to_string(), oomir::Type::java_string()),
-                            ],
-                            ret: Box::new(target_pointer_ty.clone()),
-                            is_static: false,
-                        },
-                        args: vec![
-                            oomir::Operand::Constant(oomir::Constant::U64(
+                        source: source_pointer,
+                        layout: Box::new(oomir::AddressLayout {
+                            pointer_type: target_pointer_ty.clone(),
+                            size: oomir::Operand::Constant(oomir::Constant::U64(
                                 u64::try_from(layout_size_bytes(tcx, pointee)?)
                                     .map_err(|_| "pointer transmute view exceeds u64")?,
                             )),
-                            pointer_view_codec_operand(pointee, tcx, data_types, instance_context),
-                        ],
-                        operand: source_pointer,
+                            codec: pointer_view_codec_operand(
+                                pointee,
+                                tcx,
+                                data_types,
+                                instance_context,
+                            ),
+                        }),
                     });
                     operand_var(retyped_name, target_pointer_ty.clone())
                 } else {
@@ -537,6 +522,7 @@ pub(crate) fn ensure_exact_transmute_helper<'tcx>(
                 class_name,
                 oomir::DataType::Class {
                     fields: Vec::new(),
+                    kind: crate::oomir::ClassKind::Static,
                     is_abstract: false,
                     methods: HashMap::from_iter([(
                         method_name,
