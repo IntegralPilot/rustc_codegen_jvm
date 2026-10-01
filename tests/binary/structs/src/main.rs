@@ -1,3 +1,6 @@
+mod primitive_fields;
+mod stored_fields;
+
 struct Inner {
     x: i32,
     y: (i32, i32),
@@ -10,6 +13,8 @@ struct Outer<'a> {
 }
 
 fn main() {
+    primitive_fields::run();
+    stored_fields::run();
     // === Nested STRUCT + TUPLE + ARRAY ===
     let mut outer = Outer {
         label: "start",

@@ -6,7 +6,7 @@ use super::{
         emit_instructions_to_get_on_own, emit_instructions_to_set_value, emit_pointer_read,
         emit_pointer_slice_parts, emit_retyped_slice_data_pointer, place_to_string,
     },
-    types::{enum_scoped_method_name, mir_int_to_oomir_const},
+    types::mir_int_to_oomir_const,
 };
 use crate::lower1::context::Definitions;
 use crate::oomir;
@@ -21,21 +21,21 @@ use rustc_middle::{
         Operand as MirOperand, Place, SourceInfo, StatementKind, TerminatorKind, UnwindAction,
         visit::Visitor,
     },
-    ty::{EarlyBinder, Instance, InstanceKind, ShimKind, Ty, TyCtxt, TyKind, TypingEnv, VtblEntry},
+    ty::{EarlyBinder, Instance, InstanceKind, ShimKind, Ty, TyCtxt, TyKind, TypingEnv},
 };
 use rustc_span::{Symbol, sym};
 
 mod calls;
+mod metadata;
+use metadata::{emit_pointer_metadata, emit_raw_pointer_from_parts, emit_trait_object_metadata};
 pub mod checked_intrinsics;
 mod checked_ops;
 mod comparisons;
 pub(super) use comparisons::*;
 mod diagnostics;
 pub(super) use diagnostics::*;
-mod borrows;
-pub(super) use borrows::*;
-mod drop_lowering;
-pub(super) use drop_lowering::*;
+mod drop_glue;
+pub(super) use drop_glue::*;
 mod atomic;
 pub(super) use atomic::*;
 
@@ -68,108 +68,8 @@ fn is_core_ptr_free_function(
             .is_some_and(|parent| tcx.opt_item_name(parent) == Some(sym::ptr))
 }
 
-fn emit_trait_object_metadata(
-    pointer: oomir::Operand,
-    output_type: &oomir::Type,
-    dest: String,
-    temp_prefix: &str,
-    data_types: &HashMap<String, oomir::DataType>,
-    instructions: &mut Vec<oomir::Instruction>,
-) {
-    let metadata_class = output_type
-        .get_class_name()
-        .expect("trait-object metadata must be represented by a JVM class")
-        .to_string();
-    let metadata_fields = match data_types.get(&metadata_class) {
-        Some(oomir::DataType::Class { fields, .. }) => fields.clone(),
-        other => panic!("trait-object metadata class is unavailable: {other:?}"),
-    };
-    let [(_, vtable_type), (_, phantom_type)] = metadata_fields.as_slice() else {
-        panic!("trait-object metadata must contain vtable and phantom fields")
-    };
-    let vtable_class = vtable_type
-        .get_class_name()
-        .expect("trait-object vtable pointer must be represented by a JVM class")
-        .to_string();
-    let vtable_fields = match data_types.get(&vtable_class) {
-        Some(oomir::DataType::Class { fields, .. }) => fields.clone(),
-        other => panic!("trait-object vtable pointer class is unavailable: {other:?}"),
-    };
-    let [(_, marker_type)] = vtable_fields.as_slice() else {
-        panic!("trait-object vtable pointer must contain exactly one pointer field")
-    };
-    let phantom_class = phantom_type
-        .get_class_name()
-        .expect("trait-object metadata phantom field must be a JVM class")
-        .to_string();
-
-    let marker_name = format!("{temp_prefix}_vtable_marker");
-    let pointer_type = pointer
-        .get_type()
-        .expect("trait-object metadata source must be typed");
-    instructions.push(oomir::Instruction::InvokeStatic {
-        dest: Some(marker_name.clone()),
-        class_name: oomir::POINTER_CLASS.to_string(),
-        method_name: "traitMetadataMarker".to_string(),
-        method_ty: oomir::Signature {
-            params: vec![
-                ("pointer".to_string(), pointer_type),
-                ("metadata_class".to_string(), oomir::Type::java_string()),
-            ],
-            ret: Box::new(marker_type.clone()),
-            is_static: true,
-        },
-        args: vec![
-            pointer,
-            oomir::Operand::Constant(oomir::Constant::String(metadata_class.clone())),
-        ],
-    });
-
-    let vtable_name = format!("{temp_prefix}_vtable");
-    instructions.push(oomir::Instruction::ConstructObject {
-        dest: vtable_name.clone(),
-        class_name: vtable_class,
-        args: vec![(
-            oomir::Operand::Variable {
-                name: marker_name,
-                ty: marker_type.clone(),
-            },
-            marker_type.clone(),
-        )],
-    });
-    let phantom_name = format!("{temp_prefix}_phantom");
-    instructions.push(oomir::Instruction::ConstructObject {
-        dest: phantom_name.clone(),
-        class_name: phantom_class,
-        args: Vec::new(),
-    });
-    instructions.push(oomir::Instruction::ConstructObject {
-        dest,
-        class_name: metadata_class,
-        args: vec![
-            (
-                oomir::Operand::Variable {
-                    name: vtable_name,
-                    ty: vtable_type.clone(),
-                },
-                vtable_type.clone(),
-            ),
-            (
-                oomir::Operand::Variable {
-                    name: phantom_name,
-                    ty: phantom_type.clone(),
-                },
-                phantom_type.clone(),
-            ),
-        ],
-    });
-}
-
 fn requires_compiled_static_dispatch(ty: &oomir::Type) -> bool {
-    if let oomir::Type::MutableReference(inner)
-    | oomir::Type::Reference(inner)
-    | oomir::Type::Pointer(inner) = ty
-    {
+    if let oomir::Type::Pointer(oomir::Pointee { value: inner, .. }) = ty {
         return requires_compiled_static_dispatch(inner);
     }
     matches!(ty, oomir::Type::Unit | oomir::Type::Void)
@@ -198,15 +98,12 @@ pub(super) fn convert_basic_block<'tcx>(
     basic_blocks: &mut HashMap<String, oomir::BasicBlock>,
     data_types: &mut Definitions<'tcx>,
     external_interfaces: &mut HashSet<String>,
-    mutable_borrow_arrays: &mut MutableBorrowMap<'tcx>,
     debug_variables: &[oomir::DebugVariable],
     debug_scope_cache: &super::DebugScopeCache,
-    initially_available_pointer_locals: HashSet<Local>,
 ) -> oomir::BasicBlock {
     // Use the basic block index as its label.
     let label = format!("bb{}", bb.index());
     let mut instructions = Vec::new();
-    let mut initialized_borrows = initially_available_pointer_locals;
     // Convert each MIR statement in the block.
     for (statement_index, stmt) in bb_data.statements.iter().enumerate() {
         let statement_location = Location {
@@ -236,137 +133,10 @@ pub(super) fn convert_basic_block<'tcx>(
                     instance,
                     data_types,
                     external_interfaces,
-                    mutable_borrow_arrays,
-                    &initialized_borrows,
                 );
 
                 // Add instructions needed to calculate the Rvalue
                 instructions.extend(rvalue_instructions);
-
-                if let rustc_middle::mir::Rvalue::Ref(_, _, borrowed_place) = rvalue {
-                    let dest_ty = place.ty(&mir.local_decls, tcx).ty;
-                    let borrowed_is_trait_object = matches!(dest_ty.kind(), TyKind::Ref(..))
-                        && matches!(source_operand.get_type(), Some(oomir::Type::Interface(_)));
-                    if borrowed_is_trait_object {
-                        // Trait objects do not use the MutableReference array wrapper
-                    } else {
-                        // Check if the destination is a simple local (most common case for &mut assignment)
-                        if place.projection.is_empty() {
-                            if let oomir::Operand::Variable {
-                                name: array_var_name,
-                                ty: array_ty,
-                            } = &source_operand
-                            {
-                                match array_ty {
-                                    oomir::Type::Pointer(element_ty) => {
-                                        breadcrumbs::log!(
-                                            breadcrumbs::LogLevel::Info,
-                                            "mir-lowering",
-                                            format!(
-                                                "Info: Tracking mutable borrow array for place {:?} stored in local {:?}. Original: {:?}, ArrayVar: {}, ElementTy: {:?}",
-                                                place,
-                                                place.local,
-                                                borrowed_place,
-                                                array_var_name,
-                                                element_ty
-                                            )
-                                        );
-                                        mutable_borrow_arrays.insert(
-                                            place.local,
-                                            PointerOrigin {
-                                                original_place: borrowed_place.clone(),
-                                                carrier_name: place_to_string(place, tcx),
-                                                pointee_type: *element_ty.clone(),
-                                                writable: matches!(
-                                                    rvalue,
-                                                    rustc_middle::mir::Rvalue::Ref(
-                                                        _,
-                                                        rustc_middle::mir::BorrowKind::Mut { .. },
-                                                        _
-                                                    )
-                                                ),
-                                            },
-                                        );
-                                        initialized_borrows.insert(place.local);
-                                    }
-                                    oomir::Type::Slice(_) | oomir::Type::Str => {
-                                        // Slice views already alias their backing array, so writes
-                                        // are visible directly and need no copy-out bookkeeping.
-                                        // Utf8View has the same canonical aliasing behaviour for
-                                        // `str` references.
-                                    }
-                                    _ => {
-                                        breadcrumbs::log!(
-                                            breadcrumbs::LogLevel::Warn,
-                                            "mir-lowering",
-                                            format!(
-                                                "Warning: Expected mutable-reference or slice representation, found {:?}",
-                                                array_ty
-                                            )
-                                        );
-                                    }
-                                }
-                            } else {
-                                breadcrumbs::log!(
-                                    breadcrumbs::LogLevel::Warn,
-                                    "mir-lowering",
-                                    format!(
-                                        "Warning: Expected variable operand for mutable borrow ref assignment result, found {:?}",
-                                        source_operand
-                                    )
-                                );
-                            }
-                        } else {
-                            breadcrumbs::log!(
-                                breadcrumbs::LogLevel::Warn,
-                                "mir-lowering",
-                                format!(
-                                    "Warning: Mutable borrow assigned to complex place {:?}, write-back might not work correctly.",
-                                    place
-                                )
-                            );
-                        }
-                    }
-                }
-
-                if let rustc_middle::mir::Rvalue::RawPtr(
-                    rustc_middle::mir::RawPtrKind::Const | rustc_middle::mir::RawPtrKind::Mut,
-                    pointed_place,
-                ) = rvalue
-                    && place.projection.is_empty()
-                    && let oomir::Operand::Variable {
-                        name: _,
-                        ty: oomir::Type::Pointer(element_ty),
-                    } = &source_operand
-                {
-                    let inherited_origin = pointed_place
-                        .projection
-                        .last()
-                        .filter(|projection| {
-                            matches!(projection, rustc_middle::mir::ProjectionElem::Deref)
-                        })
-                        .and_then(|_| mutable_borrow_arrays.get(&pointed_place.local))
-                        .map(|origin| origin.original_place.clone());
-                    mutable_borrow_arrays.insert(
-                        place.local,
-                        PointerOrigin {
-                            original_place: inherited_origin
-                                .unwrap_or_else(|| pointed_place.clone()),
-                            // The assigned local is the stable carrier across
-                            // block boundaries, not the rvalue temporary.
-                            carrier_name: place_to_string(place, tcx),
-                            pointee_type: element_ty.as_ref().clone(),
-                            writable: matches!(
-                                rvalue,
-                                rustc_middle::mir::Rvalue::RawPtr(
-                                    rustc_middle::mir::RawPtrKind::Mut,
-                                    _
-                                )
-                            ),
-                        },
-                    );
-                    initialized_borrows.insert(place.local);
-                }
 
                 // 2. Generate instructions to store the computed value into the destination place
                 let assignment_instructions = emit_instructions_to_set_value(
@@ -380,27 +150,6 @@ pub(super) fn convert_basic_block<'tcx>(
 
                 // Add the final assignment instructions (Move, SetField, ArrayStore)
                 instructions.extend(assignment_instructions);
-                instructions.extend(emit_pointer_origin_refreshes(
-                    place,
-                    &initialized_borrows,
-                    mutable_borrow_arrays,
-                    tcx,
-                    instance,
-                    mir,
-                    data_types,
-                ));
-                if place.projection.iter().any(|projection| {
-                    matches!(projection, rustc_middle::mir::ProjectionElem::Deref)
-                }) {
-                    instructions.extend(emit_selected_mutable_borrow_writebacks(
-                        [place.local],
-                        mutable_borrow_arrays,
-                        tcx,
-                        instance,
-                        mir,
-                        data_types,
-                    ));
-                }
             }
             StatementKind::StorageLive(_) | StatementKind::StorageDead(_) => {
                 // no-op, currently
@@ -441,7 +190,11 @@ pub(super) fn convert_basic_block<'tcx>(
                         data_types,
                         &mut instructions,
                     );
-                    let source_rust_ty = copy.src.ty(&mir.local_decls, tcx);
+                    // MIR can still contain generic parameters. The byte count requires the
+                    // instantiated type.
+                    let source_rust_ty = EarlyBinder::bind(tcx, copy.src.ty(&mir.local_decls, tcx))
+                        .instantiate(tcx, instance.args)
+                        .skip_norm_wip();
                     let pointee = match source_rust_ty.kind() {
                         TyKind::RawPtr(pointee, _) | TyKind::Ref(_, pointee, _) => *pointee,
                         other => panic!(
@@ -530,6 +283,12 @@ pub(super) fn convert_basic_block<'tcx>(
                     instructions.extend(emit_instructions_to_set_value(
                         place, value, tcx, instance, mir, data_types,
                     ));
+                } else if super::types::tagged_scalar(enum_ty, tcx).is_some() {
+                    assert_eq!(variant_index.as_u32(), 1);
+                } else if let Some(carrier) = super::types::enum_carrier(enum_ty, tcx) {
+                    if *variant_index != carrier.variant {
+                        instructions.push(oomir::Instruction::Unreachable);
+                    }
                 } else {
                     breadcrumbs::log!(
                         breadcrumbs::LogLevel::Warn,
@@ -679,8 +438,6 @@ pub(super) fn convert_basic_block<'tcx>(
                     func,
                     destination,
                     target,
-                    mutable_borrow_arrays,
-                    &mut initialized_borrows,
                 );
             }
             TerminatorKind::Assert {
@@ -903,16 +660,25 @@ pub(super) fn convert_basic_block<'tcx>(
                     .instantiate(tcx, instance.args)
                     .skip_norm_wip();
                 if rust_ty.needs_drop(tcx, TypingEnv::fully_monomorphized()) {
-                    let (value_name, value_instructions, value_ty) =
-                        emit_instructions_to_get_on_own(place, tcx, instance, mir, data_types);
-                    instructions.extend(value_instructions);
-                    emit_rust_drop_value(
-                        rust_ty,
-                        oomir::Operand::Variable {
-                            name: value_name,
-                            ty: value_ty,
-                        },
+                    let pointer_ty = crate::lower1::types::ty_to_oomir_type(
+                        Ty::new_ptr(tcx, rust_ty, rustc_middle::ty::Mutability::Mut),
+                        tcx,
+                        data_types,
+                        instance,
+                    );
+                    let pointer = rvalue::emit_pointer_to_place(
+                        place,
+                        &pointer_ty,
                         &format!("{label}_drop"),
+                        tcx,
+                        instance,
+                        mir,
+                        data_types,
+                        &mut instructions,
+                    );
+                    emit_drop_in_place(
+                        rust_ty,
+                        pointer,
                         tcx,
                         instance,
                         data_types,
@@ -926,10 +692,7 @@ pub(super) fn convert_basic_block<'tcx>(
                 });
             }
             TerminatorKind::Unreachable => {
-                instructions.push(oomir::Instruction::ThrowNewWithMessage {
-                    exception_class: "java/lang/RuntimeException".to_string(),
-                    message: "Unreachable code reached".to_string(),
-                });
+                instructions.push(oomir::Instruction::Unreachable);
             }
             TerminatorKind::UnwindResume => {
                 instructions.push(oomir::Instruction::Rethrow);
@@ -952,10 +715,7 @@ pub(super) fn convert_basic_block<'tcx>(
                         ty: oomir::Type::Class("java/lang/Throwable".to_string()),
                     }],
                 });
-                instructions.push(oomir::Instruction::ThrowNewWithMessage {
-                    exception_class: "java/lang/AssertionError".to_string(),
-                    message: "Rust abort unexpectedly returned".to_string(),
-                });
+                instructions.push(oomir::Instruction::Unreachable);
             }
             // Other terminator kinds will be added as needed.
             _ => {

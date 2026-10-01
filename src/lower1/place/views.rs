@@ -1,171 +1,56 @@
 //! Views operations on Rust places.
 use super::*;
 
-pub(crate) fn pointer_getter_for_type(ty: &oomir::Type) -> (&'static str, oomir::Type) {
-    match ty {
-        oomir::Type::Boolean => ("getBoolean", oomir::Type::Boolean),
-        oomir::Type::I8 | oomir::Type::U8 => ("getI8", oomir::Type::I8),
-        oomir::Type::I16 | oomir::Type::U16 => ("getI16", oomir::Type::I16),
-        oomir::Type::F16 => ("getI16", oomir::Type::F16),
-        oomir::Type::I32 | oomir::Type::U32 | oomir::Type::Char => ("getI32", oomir::Type::I32),
-        oomir::Type::I64 | oomir::Type::U64 => ("getI64", oomir::Type::I64),
-        oomir::Type::F32 => ("getF32", oomir::Type::F32),
-        oomir::Type::F64 => ("getF64", oomir::Type::F64),
-        _ => (
-            "getObject",
-            oomir::Type::Class("java/lang/Object".to_string()),
-        ),
-    }
-}
-
-/// Loads the pointee while retaining the pointer itself as a first-class JVM
-/// value. Reference-valued pointees use Object at the runtime boundary and are
-/// cast back to their precise OOMIR type immediately afterwards.
 pub(crate) fn emit_pointer_read(
     pointer: Operand,
     pointee_ty: &oomir::Type,
     dest: &str,
     instructions: &mut Vec<Instruction>,
 ) -> Operand {
-    if !pointee_ty.has_jvm_value() {
-        return Operand::Constant(oomir::Constant::Unit);
-    }
-    let pointer_ty = pointer
-        .get_type()
-        .expect("a pointer read requires a typed operand");
-    let (mut method_name, runtime_ret_ty) = pointer_getter_for_type(pointee_ty);
-    let requested_class = match pointee_ty {
-        oomir::Type::Class(class_name) => Some(class_name.clone()),
-        oomir::Type::Slice(_) => Some(oomir::SLICE_VIEW_CLASS.to_string()),
-        _ => None,
-    };
-    if requested_class.is_some() {
-        method_name = "getObjectAs";
-    }
-    let runtime_dest = if runtime_ret_ty == *pointee_ty {
-        dest.to_string()
-    } else {
-        format!("{dest}_object")
-    };
-    instructions.push(Instruction::InvokeVirtual {
-        dest: Some(runtime_dest.clone()),
-        class_name: oomir::POINTER_CLASS.to_string(),
-        method_name: method_name.to_string(),
-        method_ty: oomir::Signature {
-            params: vec![("self".to_string(), pointer_ty)]
-                .into_iter()
-                .chain(
-                    requested_class
-                        .is_some()
-                        .then_some(("target_class".to_string(), oomir::Type::java_string())),
-                )
-                .collect(),
-            ret: Box::new(runtime_ret_ty.clone()),
-            is_static: false,
-        },
-        args: requested_class
-            .map(|class_name| vec![Operand::Constant(oomir::Constant::String(class_name))])
-            .unwrap_or_default(),
-        operand: pointer,
-    });
-    if runtime_ret_ty != *pointee_ty {
-        instructions.push(Instruction::Cast {
-            op: Operand::Variable {
-                name: runtime_dest,
-                ty: runtime_ret_ty,
-            },
-            ty: pointee_ty.clone(),
-            dest: dest.to_string(),
-        });
-    }
-    Operand::Variable {
-        name: dest.to_string(),
-        ty: pointee_ty.clone(),
-    }
+    memory_read(pointer, pointee_ty, dest, false, instructions)
 }
 
-/// Implements Rust's `ptr::read` family. Unlike an ordinary dereference, these
-/// operations produce an independent bitwise copy of the pointee. JVM-backed
-/// aggregate carriers therefore need to be detached from the memory view.
+/// An owned read must not establish a mutable decoded-view binding.
 pub(crate) fn emit_pointer_read_copy(
     pointer: Operand,
     pointee_ty: &oomir::Type,
     dest: &str,
     instructions: &mut Vec<Instruction>,
 ) -> Operand {
-    if !pointee_ty.is_jvm_reference_type() {
-        return emit_pointer_read(pointer, pointee_ty, dest, instructions);
-    }
+    memory_read(pointer, pointee_ty, dest, true, instructions)
+}
 
-    let read_start = instructions.len();
-    let loaded_dest = format!("{dest}_loaded");
-    let loaded = emit_pointer_read(pointer, pointee_ty, &loaded_dest, instructions);
-    if detach_pointer_read(&mut instructions[read_start..], &loaded_dest) {
-        instructions.push(Instruction::Move {
-            dest: dest.to_string(),
-            src: loaded,
-        });
-        return Operand::Variable {
-            name: dest.to_string(),
-            ty: pointee_ty.clone(),
-        };
+fn memory_read(
+    pointer: Operand,
+    pointee_ty: &oomir::Type,
+    dest: &str,
+    owned: bool,
+    instructions: &mut Vec<Instruction>,
+) -> Operand {
+    if !pointee_ty.has_jvm_value() {
+        return Operand::Constant(oomir::Constant::Unit);
     }
-    let object_dest = format!("{dest}_copy_object");
-    let object_ty = oomir::Type::Class("java/lang/Object".to_string());
-    instructions.push(Instruction::InvokeStatic {
-        dest: Some(object_dest.clone()),
-        class_name: oomir::POINTER_CLASS.to_string(),
-        method_name: "copyManagedValue".to_string(),
-        method_ty: oomir::Signature {
-            params: vec![("value".to_string(), object_ty.clone())],
-            ret: Box::new(object_ty.clone()),
-            is_static: true,
-        },
-        args: vec![loaded],
-    });
-    instructions.push(Instruction::Cast {
-        op: Operand::Variable {
-            name: object_dest,
-            ty: object_ty,
-        },
-        ty: pointee_ty.clone(),
-        dest: dest.to_string(),
+    instructions.push(Instruction::MemoryLoad {
+        dest: dest.into(),
+        pointer,
+        pointee: pointee_ty.clone(),
+        owned,
     });
     Operand::Variable {
-        name: dest.to_string(),
+        name: dest.into(),
         ty: pointee_ty.clone(),
     }
 }
 
-/// A value copy can decode directly into its owned carrier. Only fuse the final
-/// load: earlier pointer reads may be needed as live views for field projections.
+/// Only the final read makes an owned copy. Earlier projections need the live owner for writeback.
 pub(crate) fn detach_pointer_read(instructions: &mut [Instruction], value_name: &str) -> bool {
-    let Some(
-        [
-            Instruction::InvokeVirtual {
-                dest: Some(result),
-                class_name,
-                method_name,
-                ..
-            },
-            Instruction::Cast {
-                dest,
-                op: Operand::Variable { name, .. },
-                ..
-            },
-        ],
-    ) = instructions.last_chunk_mut::<2>()
-    else {
+    let Some(Instruction::MemoryLoad { dest, owned, .. }) = instructions.last_mut() else {
         return false;
     };
-    if class_name != oomir::POINTER_CLASS
-        || method_name != "getObjectAs"
-        || result != name
-        || dest != value_name
-    {
+    if dest != value_name {
         return false;
     }
-    *method_name = "getObjectCopyAs".to_string();
+    *owned = true;
     true
 }
 
@@ -175,32 +60,13 @@ pub(crate) fn emit_pointer_write(
     value: Operand,
     instructions: &mut Vec<Instruction>,
 ) {
-    if !pointee_ty.has_jvm_value() {
-        return;
+    if pointee_ty.has_jvm_value() {
+        instructions.push(Instruction::MemoryStore {
+            pointer,
+            pointee: pointee_ty.clone(),
+            value,
+        });
     }
-    let pointer_ty = pointer
-        .get_type()
-        .expect("a pointer write requires a typed operand");
-    let value_ty = if pointee_ty.is_jvm_primitive() {
-        pointee_ty.clone()
-    } else {
-        oomir::Type::Class("java/lang/Object".to_string())
-    };
-    instructions.push(Instruction::InvokeVirtual {
-        dest: None,
-        class_name: oomir::POINTER_CLASS.to_string(),
-        method_name: "set".to_string(),
-        method_ty: oomir::Signature {
-            params: vec![
-                ("self".to_string(), pointer_ty),
-                ("value".to_string(), value_ty),
-            ],
-            ret: Box::new(oomir::Type::Void),
-            is_static: false,
-        },
-        args: vec![value],
-        operand: pointer,
-    });
 }
 
 pub(crate) fn emit_slice_view(
@@ -365,11 +231,50 @@ pub(crate) fn emit_pointer_slice_parts(
     )
 }
 
+pub(crate) fn emit_pointer_slice_view(
+    data: Operand,
+    length: Operand,
+    dest: &str,
+    instructions: &mut Vec<Instruction>,
+) -> Operand {
+    let Some(oomir::Type::Pointer(element)) = data.get_type() else {
+        panic!("slice data must be an element pointer")
+    };
+    let (backing, start) = if data.get_type().unwrap().scalar_address_size().is_some() {
+        emit_pointer_slice_parts(data, dest, instructions)
+    } else {
+        (data, Operand::Constant(oomir::Constant::I32(0)))
+    };
+    let object = oomir::Type::Class("java/lang/Object".into());
+    let carrier = oomir::Type::Class(oomir::SLICE_VIEW_CLASS.into());
+    let name = format!("{dest}_view");
+    instructions.push(Instruction::ConstructObject {
+        dest: name.clone(),
+        class_name: oomir::SLICE_VIEW_CLASS.into(),
+        args: vec![
+            (backing, object),
+            (start, oomir::Type::I32),
+            (length, oomir::Type::U64),
+        ],
+    });
+    let ty = oomir::Type::Slice(element.value);
+    instructions.push(Instruction::Cast {
+        dest: dest.into(),
+        op: Operand::Variable { name, ty: carrier },
+        ty: ty.clone(),
+    });
+    Operand::Variable {
+        name: dest.into(),
+        ty,
+    }
+}
+
 /// Gives a raw slice data pointer the element view used by `SliceView` accessors.
 /// This matters when MIR constructs a fat pointer from an erased or whole-array
 /// view: the backing `Pointer` must advance and load one Rust element at a time.
 pub(crate) fn emit_retyped_slice_data_pointer(
     data: Operand,
+    element_type: oomir::Type,
     element_size: Operand,
     element_codec: Operand,
     dest_prefix: &str,
@@ -378,24 +283,19 @@ pub(crate) fn emit_retyped_slice_data_pointer(
     let data_ty = data
         .get_type()
         .expect("slice data pointer must have an OOMIR type");
+    let result_ty = oomir::Type::pointer(element_type);
     let dest = format!("{dest_prefix}_element_pointer");
-    instructions.push(Instruction::InvokeStatic {
+    instructions.push(Instruction::AddressRetype {
         dest: Some(dest.clone()),
-        class_name: oomir::POINTER_CLASS.to_string(),
-        method_name: "retype".to_string(),
-        method_ty: oomir::Signature {
-            params: vec![
-                ("pointer".to_string(), data_ty.clone()),
-                ("view_size".to_string(), oomir::Type::U64),
-                ("view_codec".to_string(), oomir::Type::java_string()),
-            ],
-            ret: Box::new(data_ty.clone()),
-            is_static: true,
-        },
-        args: vec![data, element_size, element_codec],
+        source: data,
+        layout: Box::new(oomir::AddressLayout {
+            pointer_type: result_ty.clone(),
+            size: element_size,
+            codec: element_codec,
+        }),
     });
     Operand::Variable {
         name: dest,
-        ty: data_ty,
+        ty: result_ty,
     }
 }

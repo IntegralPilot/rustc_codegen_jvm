@@ -1,11 +1,4 @@
-//! This is the stage 1 lowering pass of the compiler.
-//! It is responsible for coverting the MIR into a lower-level IR, called OOMIR (see src/oomir.rs).
-//! It is a simple pass that converts the MIR into a more object-oriented representation.
-
-// lower1.rs
-//! This module converts Rust MIR into an object-oriented MIR (OOMIR)
-//! that sits between MIR and JVM bytecode. It supports a subset of Rust constructs
-//! (arithmetic, branching, returns) and can be extended to support more of Rust.
+//! Lower monomorphized Rust MIR into typed JVM operations for SSA construction.
 
 use crate::lower1::context::Definitions;
 use crate::oomir;
@@ -13,15 +6,14 @@ use control_flow::convert_basic_block;
 use rustc_attr_ir::lang_items::LangItem;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use rustc_middle::{
-    mir::{
-        BasicBlock, Body, Local, OUTERMOST_SOURCE_SCOPE, Place, ProjectionElem, StatementKind,
-        TerminatorKind, VarDebugInfoContents,
-    },
+    mir::{Body, Local, OUTERMOST_SOURCE_SCOPE, VarDebugInfoContents},
     ty::{EarlyBinder, Instance, InstanceKind, ShimKind, TyCtxt},
 };
 use rustc_span::def_id::DefId;
-use std::collections::VecDeque;
 use types::ty_to_oomir_type;
+
+mod initialization;
+use initialization::{MirControlFlow, class_locals_needing_initial_carriers};
 
 mod debug;
 pub(crate) use debug::source_location;
@@ -38,351 +30,6 @@ mod value_repr;
 
 pub(crate) fn is_non_null_lang_item(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
     tcx.is_lang_item(def_id, LangItem::NonNull)
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct LocalBitSet {
-    words: Vec<u64>,
-}
-
-impl LocalBitSet {
-    fn empty(local_count: usize) -> Self {
-        Self {
-            words: vec![0; local_count.div_ceil(u64::BITS as usize)],
-        }
-    }
-
-    fn all(local_count: usize) -> Self {
-        let mut result = Self {
-            words: vec![u64::MAX; local_count.div_ceil(u64::BITS as usize)],
-        };
-        if let Some(last) = result.words.last_mut()
-            && !local_count.is_multiple_of(u64::BITS as usize)
-        {
-            *last = (1u64 << (local_count % u64::BITS as usize)) - 1;
-        }
-        result
-    }
-
-    fn insert(&mut self, local: Local) {
-        let index = local.index();
-        self.words[index / u64::BITS as usize] |= 1 << (index % u64::BITS as usize);
-    }
-
-    fn remove(&mut self, local: Local) {
-        let index = local.index();
-        self.words[index / u64::BITS as usize] &= !(1 << (index % u64::BITS as usize));
-    }
-
-    fn contains(&self, local: Local) -> bool {
-        let index = local.index();
-        self.words[index / u64::BITS as usize] & (1 << (index % u64::BITS as usize)) != 0
-    }
-
-    fn assign_union(&mut self, left: &Self, right: &Self) {
-        for ((dest, left), right) in self.words.iter_mut().zip(&left.words).zip(&right.words) {
-            *dest = *left | *right;
-        }
-    }
-
-    fn intersect_with_union(&mut self, left: &Self, right: &Self) {
-        for ((dest, left), right) in self.words.iter_mut().zip(&left.words).zip(&right.words) {
-            *dest &= *left | *right;
-        }
-    }
-
-    fn assign_transfer(&mut self, input: &Self, killed: &Self, generated: &Self) {
-        for (((dest, input), killed), generated) in self
-            .words
-            .iter_mut()
-            .zip(&input.words)
-            .zip(&killed.words)
-            .zip(&generated.words)
-        {
-            *dest = (*input & !*killed) | *generated;
-        }
-    }
-
-    fn intersect_with_transfer(&mut self, input: &Self, killed: &Self, generated: &Self) {
-        for (((dest, input), killed), generated) in self
-            .words
-            .iter_mut()
-            .zip(&input.words)
-            .zip(&killed.words)
-            .zip(&generated.words)
-        {
-            *dest &= (*input & !*killed) | *generated;
-        }
-    }
-
-    fn into_locals(self) -> Vec<Local> {
-        let mut locals = Vec::new();
-        for (word_index, mut word) in self.words.into_iter().enumerate() {
-            while word != 0 {
-                let bit = word.trailing_zeros() as usize;
-                locals.push(Local::from_usize(word_index * u64::BITS as usize + bit));
-                word &= word - 1;
-            }
-        }
-        locals
-    }
-
-    fn to_hash_set(&self) -> HashSet<Local> {
-        let mut locals = HashSet::default();
-        for (word_index, word) in self.words.iter().copied().enumerate() {
-            let mut word = word;
-            while word != 0 {
-                let bit = word.trailing_zeros() as usize;
-                locals.insert(Local::from_usize(word_index * u64::BITS as usize + bit));
-                word &= word - 1;
-            }
-        }
-        locals
-    }
-}
-
-struct MirControlFlow {
-    predecessors: Vec<Vec<BasicBlock>>,
-    reachable: Vec<bool>,
-}
-
-impl MirControlFlow {
-    fn new(mir: &Body<'_>) -> Self {
-        let mut predecessors = vec![Vec::new(); mir.basic_blocks.len()];
-        for (block, data) in mir.basic_blocks.iter_enumerated() {
-            for successor in data.terminator().successors() {
-                predecessors[successor.index()].push(block);
-            }
-        }
-
-        let mut reachable = vec![false; mir.basic_blocks.len()];
-        let mut queue = VecDeque::from([BasicBlock::from_usize(0)]);
-        while let Some(block) = queue.pop_front() {
-            if std::mem::replace(&mut reachable[block.index()], true) {
-                continue;
-            }
-            queue.extend(mir.basic_blocks[block].terminator().successors());
-        }
-        Self {
-            predecessors,
-            reachable,
-        }
-    }
-}
-
-fn available_pointer_locals_at_block_entries<'tcx>(
-    mir: &Body<'tcx>,
-    pointer_origins: &control_flow::MutableBorrowMap<'tcx>,
-    control_flow: &MirControlFlow,
-) -> Vec<LocalBitSet> {
-    let local_count = mir.local_decls.len();
-    let mut all_pointer_locals = LocalBitSet::empty(local_count);
-    for local in pointer_origins.keys().copied() {
-        all_pointer_locals.insert(local);
-    }
-    let mut generated = vec![LocalBitSet::empty(local_count); mir.basic_blocks.len()];
-    for (block, data) in mir.basic_blocks.iter_enumerated() {
-        for statement in &data.statements {
-            let StatementKind::Assign(assignment) = &statement.kind else {
-                continue;
-            };
-            let (place, _) = assignment.as_ref();
-            if place.projection.is_empty() && pointer_origins.contains_key(&place.local) {
-                generated[block.index()].insert(place.local);
-            }
-        }
-    }
-
-    let entry = BasicBlock::from_usize(0);
-    let mut available = mir
-        .basic_blocks
-        .indices()
-        .map(|block| {
-            if block == entry || !control_flow.reachable[block.index()] {
-                LocalBitSet::empty(local_count)
-            } else {
-                all_pointer_locals.clone()
-            }
-        })
-        .collect::<Vec<_>>();
-    let mut incoming = LocalBitSet::empty(local_count);
-
-    loop {
-        let mut changed = false;
-        for block in mir.basic_blocks.indices().filter(|block| *block != entry) {
-            if !control_flow.reachable[block.index()] {
-                continue;
-            }
-            let mut predecessors = control_flow.predecessors[block.index()]
-                .iter()
-                .copied()
-                .filter(|predecessor| control_flow.reachable[predecessor.index()]);
-            if let Some(first) = predecessors.next() {
-                incoming.assign_union(&available[first.index()], &generated[first.index()]);
-                for predecessor in predecessors {
-                    incoming.intersect_with_union(
-                        &available[predecessor.index()],
-                        &generated[predecessor.index()],
-                    );
-                }
-            } else {
-                incoming = LocalBitSet::empty(local_count);
-            }
-            if available[block.index()] != incoming {
-                available[block.index()].clone_from(&incoming);
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-
-    available
-}
-
-fn update_class_carrier_state(
-    place: &Place<'_>,
-    initialized: &mut LocalBitSet,
-    needs_initial_carrier: Option<&mut LocalBitSet>,
-) {
-    if place.projection.is_empty() {
-        initialized.insert(place.local);
-        return;
-    }
-
-    if matches!(place.projection.first(), Some(ProjectionElem::Field(..))) {
-        if let Some(needs_initial_carrier) = needs_initial_carrier
-            && !initialized.contains(place.local)
-        {
-            needs_initial_carrier.insert(place.local);
-        }
-        initialized.insert(place.local);
-    }
-}
-
-fn record_class_carrier_transfer(
-    place: &Place<'_>,
-    generated: &mut LocalBitSet,
-    killed: &mut LocalBitSet,
-) {
-    if place.projection.is_empty()
-        || matches!(place.projection.first(), Some(ProjectionElem::Field(..)))
-    {
-        generated.insert(place.local);
-        killed.remove(place.local);
-    }
-}
-
-fn class_locals_needing_initial_carriers(
-    mir: &Body<'_>,
-    control_flow: &MirControlFlow,
-) -> Vec<Local> {
-    let entry = BasicBlock::from_usize(0);
-    let local_count = mir.local_decls.len();
-    let all_locals = LocalBitSet::all(local_count);
-    let mut argument_locals = LocalBitSet::empty(local_count);
-    for index in 1..=mir.arg_count {
-        argument_locals.insert(Local::from_usize(index));
-    }
-    let mut generated = vec![LocalBitSet::empty(local_count); mir.basic_blocks.len()];
-    let mut killed = generated.clone();
-    for (block, data) in mir.basic_blocks.iter_enumerated() {
-        let block_generated = &mut generated[block.index()];
-        let block_killed = &mut killed[block.index()];
-        for statement in &data.statements {
-            match &statement.kind {
-                StatementKind::Assign(assignment) => {
-                    let (place, _) = assignment.as_ref();
-                    record_class_carrier_transfer(place, block_generated, block_killed);
-                }
-                StatementKind::StorageLive(local) | StatementKind::StorageDead(local) => {
-                    block_generated.remove(*local);
-                    block_killed.insert(*local);
-                }
-                _ => {}
-            }
-        }
-        if let TerminatorKind::Call { destination, .. } = &data.terminator().kind {
-            record_class_carrier_transfer(destination, block_generated, block_killed);
-        }
-    }
-
-    let mut available = mir
-        .basic_blocks
-        .indices()
-        .map(|block| {
-            if block == entry {
-                argument_locals.clone()
-            } else if control_flow.reachable[block.index()] {
-                all_locals.clone()
-            } else {
-                LocalBitSet::empty(local_count)
-            }
-        })
-        .collect::<Vec<_>>();
-    let mut incoming = LocalBitSet::empty(local_count);
-
-    loop {
-        let mut changed = false;
-        for block in mir.basic_blocks.indices().filter(|block| *block != entry) {
-            if !control_flow.reachable[block.index()] {
-                continue;
-            }
-            let mut predecessors = control_flow.predecessors[block.index()]
-                .iter()
-                .copied()
-                .filter(|predecessor| control_flow.reachable[predecessor.index()]);
-            if let Some(first) = predecessors.next() {
-                incoming.assign_transfer(
-                    &available[first.index()],
-                    &killed[first.index()],
-                    &generated[first.index()],
-                );
-                for predecessor in predecessors {
-                    incoming.intersect_with_transfer(
-                        &available[predecessor.index()],
-                        &killed[predecessor.index()],
-                        &generated[predecessor.index()],
-                    );
-                }
-            } else {
-                incoming = LocalBitSet::empty(local_count);
-            }
-            if available[block.index()] != incoming {
-                available[block.index()].clone_from(&incoming);
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-
-    let mut needs_initial_carrier = LocalBitSet::empty(local_count);
-    for block in mir.basic_blocks.indices() {
-        if !control_flow.reachable[block.index()] {
-            continue;
-        }
-        let mut state = available[block.index()].clone();
-        let block_data = &mir.basic_blocks[block];
-        for statement in &block_data.statements {
-            match &statement.kind {
-                StatementKind::Assign(assignment) => {
-                    let (place, _) = assignment.as_ref();
-                    update_class_carrier_state(place, &mut state, Some(&mut needs_initial_carrier))
-                }
-                StatementKind::StorageLive(local) | StatementKind::StorageDead(local) => {
-                    state.remove(*local);
-                }
-                _ => {}
-            }
-        }
-        if let TerminatorKind::Call { destination, .. } = &block_data.terminator().kind {
-            update_class_carrier_state(destination, &mut state, Some(&mut needs_initial_carrier));
-        }
-    }
-    needs_initial_carrier.into_locals()
 }
 
 fn jvm_default_operand(ty: &oomir::Type) -> oomir::Operand {
@@ -404,10 +51,9 @@ fn jvm_default_operand(ty: &oomir::Type) -> oomir::Operand {
         Type::F32 => Constant::F32(0.0),
         Type::F64 => Constant::F64(0.0),
         Type::Pointer(_)
-        | Type::MutableReference(_)
-        | Type::Reference(_)
         | Type::Array(_)
         | Type::Slice(_)
+        | Type::TaggedI64
         | Type::Str
         | Type::Class(_)
         | Type::Interface(_) => Constant::Null(ty.clone()),
@@ -538,6 +184,14 @@ fn lower_body<'tcx>(
 
     let return_oomir_ty: oomir::Type = ty_to_oomir_type(return_ty, tcx, data_types, instance);
 
+    if instance.def_id().is_local()
+        && crate::java_exports::is_lowerable_java_public_function(tcx, instance.def_id())
+        && tcx.visibility(instance.def_id()).is_public()
+        && crate::java_exports::is_exported(tcx, instance.def_id())
+    {
+        control_flow::rvalue::ensure_exported_closure_calls(return_ty, tcx, data_types, instance);
+    }
+
     let mut signature = oomir::Signature {
         params: params_oomir,
         ret: Box::new(return_oomir_ty.clone()), // Clone here to pass to convert_basic_block
@@ -600,7 +254,7 @@ fn lower_body<'tcx>(
             let (oomir_name, debug_type) = if data_types.local_uses_stable_cell(local) {
                 (
                     place::local_cell_name(local),
-                    oomir::Type::Pointer(Box::new(value_type)),
+                    oomir::Type::pointer(value_type),
                 )
             } else {
                 (format!("_{}", local.index()), value_type)
@@ -655,10 +309,6 @@ fn lower_body<'tcx>(
     let entry_label = "bb0".to_string();
 
     let mir_control_flow = MirControlFlow::new(mir);
-    let mut mutable_borrows = control_flow::collect_pointer_origins(mir, tcx, instance, data_types);
-    let available_pointer_locals =
-        available_pointer_locals_at_block_entries(mir, &mutable_borrows, &mir_control_flow);
-
     for (bb, bb_data) in mir.basic_blocks.iter_enumerated() {
         let bb_ir = convert_basic_block(
             bb,
@@ -670,10 +320,8 @@ fn lower_body<'tcx>(
             &mut basic_blocks,
             data_types,
             external_interfaces,
-            &mut mutable_borrows,
             &debug_variables,
             &debug_scope_cache,
-            available_pointer_locals[bb.index()].to_hash_set(),
         ); // Pass return type here
         basic_blocks.insert(bb_ir.label.clone(), bb_ir);
     }
@@ -709,35 +357,39 @@ fn lower_body<'tcx>(
         let tuple_param_index = if closure_has_captures { 1 } else { 0 };
         let tuple_param_local = format!("param_{tuple_param_index}");
         if let Some((_tuple_param_name, tuple_param_ty)) = signature.params.get(tuple_param_index) {
-            // Check if it's a tuple/struct type that we need to unpack
-            if let oomir::Type::Class(class_name) = tuple_param_ty {
-                // Get the data type definition to see its fields
-                if let Some(oomir::DataType::Class { fields, .. }) = data_types.get(class_name) {
-                    // Unpack each field from the tuple into the expected local variables
-                    // Local 1 contains the tuple, we need to extract fields to locals 2, 3, 4...
-                    for (field_idx, (field_name, field_ty)) in fields.iter().enumerate() {
-                        let local_var_index = field_idx + 2; // Start from local 2 (local 1 is the tuple)
-
-                        // Get the field from the tuple object (local 1)
-                        instrs.push(oomir::Instruction::GetField {
-                            dest: format!("_{}", local_var_index),
-                            object: oomir::Operand::Variable {
-                                name: tuple_param_local.to_string(),
-                                ty: tuple_param_ty.clone(),
-                            },
-                            field_name: field_name.clone(),
-                            field_ty: field_ty.clone(),
-                            owner_class: class_name.clone(),
-                        });
-                    }
-                }
+            let values = types::tuple_fields(
+                params_ty[0],
+                oomir::Operand::Variable {
+                    name: tuple_param_local,
+                    ty: tuple_param_ty.clone(),
+                },
+                "closure_arg",
+                tcx,
+                data_types,
+                instance,
+                &mut instrs,
+            );
+            for (index, src) in values.into_iter().enumerate() {
+                instrs.push(oomir::Instruction::Move {
+                    dest: format!("_{}", index + 2),
+                    src,
+                });
             }
         }
     }
 
     let carrier_locals = class_locals_needing_initial_carriers(mir, &mir_control_flow);
+    let mut initialized_cells = HashSet::default();
     for local in carrier_locals {
-        if data_types.local_uses_stable_cell(local) {
+        let rust_ty = data_types.normalize(tcx, mir.local_decls[local].ty, instance);
+        if let Some(word) = types::packed_word(rust_ty, tcx) {
+            instrs.push(oomir::Instruction::Move {
+                dest: format!("_{}", local.index()),
+                src: word.zero(),
+            });
+            if data_types.local_uses_stable_cell(local) {
+                initialized_cells.insert(local);
+            }
             continue;
         }
         let oomir::Type::Class(class_name) = place::get_place_type(
@@ -751,6 +403,7 @@ fn lower_body<'tcx>(
         };
         let Some(oomir::DataType::Class {
             fields,
+            kind: crate::oomir::ClassKind::Value | crate::oomir::ClassKind::JavaValue,
             is_abstract: false,
             ..
         }) = data_types.get(&class_name)
@@ -767,6 +420,9 @@ fn lower_body<'tcx>(
             class_name,
             args: constructor_args,
         });
+        if data_types.local_uses_stable_cell(local) {
+            initialized_cells.insert(local);
+        }
     }
 
     for (local, _) in mir.local_decls.iter_enumerated() {
@@ -788,19 +444,23 @@ fn lower_body<'tcx>(
             data_types,
             &mut instrs,
         );
-        let initial_value =
-            if local.index() > 0 && local.index() <= mir.arg_count && value_type.has_jvm_value() {
-                oomir::Operand::Variable {
-                    name: format!("_{}", local.index()),
-                    ty: value_type.clone(),
-                }
-            } else if let Some(value) = implicit_zst {
-                value
-            } else {
-                oomir::Operand::Constant(oomir::Constant::Null(oomir::Type::Class(
-                    "java/lang/Object".to_string(),
-                )))
-            };
+        let initial_value = if ((local.index() > 0 && local.index() <= mir.arg_count)
+            || initialized_cells.contains(&local))
+            && value_type.has_jvm_value()
+        {
+            // An address does not initialize its value. Inlined clone shims can assign fields
+            // before they assign the complete aggregate.
+            oomir::Operand::Variable {
+                name: format!("_{}", local.index()),
+                ty: value_type.clone(),
+            }
+        } else if let Some(value) = implicit_zst {
+            value
+        } else {
+            oomir::Operand::Constant(oomir::Constant::Null(oomir::Type::Class(
+                "java/lang/Object".to_string(),
+            )))
+        };
         instrs.push(oomir::Instruction::InvokeStatic {
             dest: Some(place::local_cell_name(local)),
             class_name: oomir::POINTER_CLASS.to_string(),
@@ -814,8 +474,9 @@ fn lower_body<'tcx>(
                     ("size".to_string(), oomir::Type::I32),
                     ("codec".to_string(), oomir::Type::java_string()),
                     ("alignment".to_string(), oomir::Type::I32),
+                    ("layout".to_string(), oomir::Type::java_string()),
                 ],
-                ret: Box::new(oomir::Type::Pointer(Box::new(value_type))),
+                ret: Box::new(oomir::Type::pointer(value_type)),
                 is_static: true,
             },
             args: vec![
@@ -856,6 +517,7 @@ fn lower_body<'tcx>(
                     )
                     .expect("stable local alignment exceeds the JVM runtime address space"),
                 )),
+                types::scalar_storage_layout(mir.local_decls[local].ty, tcx, data_types, instance),
             ],
         });
     }

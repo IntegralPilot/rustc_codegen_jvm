@@ -1,5 +1,4 @@
 use super::{
-    jvm_names,
     operand::convert_operand,
     types::{
         adapt_simple_enum_operand, enum_variant_field_name, force_define_named_adt,
@@ -17,17 +16,19 @@ use rustc_middle::{
 };
 
 pub(crate) fn has_slice_or_str_struct_tail<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {
+    struct_tail_for_place(tcx, ty).is_some_and(|tail| tail.is_slice() || tail.is_str())
+}
+
+fn struct_tail_for_place<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Option<Ty<'tcx>> {
     if !matches!(ty.kind(), TyKind::Adt(adt_def, _) if adt_def.is_struct()) {
-        return false;
+        return None;
     }
     tcx.try_normalize_erasing_regions(
         TypingEnv::fully_monomorphized(),
         rustc_middle::ty::Unnormalized::new_wip(ty),
     )
-    .is_ok_and(|normalized| {
-        let tail = tcx.struct_tail_for_codegen(normalized, TypingEnv::fully_monomorphized());
-        tail.is_slice() || tail.is_str()
-    })
+    .ok()
+    .map(|normalized| tcx.struct_tail_for_codegen(normalized, TypingEnv::fully_monomorphized()))
 }
 
 pub fn place_to_string<'tcx>(place: &Place<'tcx>, _tcx: TyCtxt<'tcx>) -> String {
@@ -37,6 +38,38 @@ pub fn place_to_string<'tcx>(place: &Place<'tcx>, _tcx: TyCtxt<'tcx>) -> String 
 
 pub(crate) fn local_cell_name(local: Local) -> String {
     format!("_cell_{}", local.index())
+}
+
+pub(in crate::lower1) fn project_memory<'tcx>(
+    dest: String,
+    base: Operand,
+    owner: String,
+    field: String,
+    field_ty: Ty<'tcx>,
+    offset: u64,
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
+    definitions: &mut Definitions<'tcx>,
+) -> Instruction {
+    let field_ty = definitions.normalize(tcx, field_ty, instance);
+    let codec = match pointer_view_codec_operand(field_ty, tcx, definitions, instance) {
+        Operand::Constant(oomir::Constant::String(codec)) => Some(codec),
+        Operand::Constant(oomir::Constant::Null(_)) => None,
+        _ => unreachable!("field memory layout must be constant"),
+    };
+    Instruction::MemoryProject {
+        dest,
+        base,
+        projection: Box::new(oomir::MemoryProjection {
+            owner,
+            field,
+            pointee: ty_to_oomir_type(field_ty, tcx, definitions, instance),
+            offset,
+            size: super::types::layout_size_bytes(tcx, field_ty)
+                .expect("sized struct field must have a layout") as u64,
+            codec,
+        }),
+    }
 }
 
 fn union_parts_from_ty<'tcx>(ty: Ty<'tcx>) -> Option<(AdtDef<'tcx>, GenericArgsRef<'tcx>)> {
@@ -108,10 +141,6 @@ fn collect_union_writebacks<'tcx>(
         };
         let class_name = match ty_to_oomir_type(union_base_ty, tcx, data_types, instance) {
             oomir::Type::Class(name) => name,
-            oomir::Type::Reference(inner) => match inner.as_ref() {
-                oomir::Type::Class(name) => name.clone(),
-                other => panic!("Union field access through non-class reference: {other:?}"),
-            },
             other => panic!("Union field access on non-class type: {other:?}"),
         };
         let field_name = union_field_name(union_def, field_index.index(), tcx);
@@ -189,17 +218,12 @@ fn collect_memory_view_writebacks(get_instructions: &[Instruction]) -> Vec<Opera
     get_instructions
         .iter()
         .filter_map(|instruction| match instruction {
-            Instruction::InvokeVirtual {
-                class_name,
-                method_name,
-                operand,
+            Instruction::MemoryLoad {
+                pointer,
+                pointee,
+                owned: false,
                 ..
-            } if class_name == oomir::POINTER_CLASS
-                && matches!(method_name.as_str(), "getObject" | "getObjectAs")
-                && matches!(operand.get_type(), Some(oomir::Type::Pointer(_))) =>
-            {
-                Some(operand.clone())
-            }
+            } if pointee.is_jvm_reference_type() => Some(pointer.clone()),
             _ => None,
         })
         .collect()
@@ -207,20 +231,8 @@ fn collect_memory_view_writebacks(get_instructions: &[Instruction]) -> Vec<Opera
 
 fn emit_memory_view_writebacks(writebacks: &[Operand], instructions: &mut Vec<Instruction>) {
     for pointer in writebacks.iter().rev() {
-        let pointer_ty = pointer
-            .get_type()
-            .expect("a memory-view writeback requires a typed pointer");
-        instructions.push(Instruction::InvokeVirtual {
-            dest: None,
-            class_name: oomir::POINTER_CLASS.to_string(),
-            method_name: "commitMemoryView".to_string(),
-            method_ty: oomir::Signature {
-                params: vec![("self".to_string(), pointer_ty)],
-                ret: Box::new(oomir::Type::Void),
-                is_static: false,
-            },
-            args: vec![],
-            operand: pointer.clone(),
+        instructions.push(Instruction::MemoryCommit {
+            pointer: pointer.clone(),
         });
     }
 }
@@ -233,11 +245,9 @@ fn field_name_from_rust_ty<'tcx>(
     match ty.kind() {
         TyKind::Ref(_, inner_ty, _) => field_name_from_rust_ty(*inner_ty, field_index, tcx),
         TyKind::Tuple(_) => Some(format!("field{}", field_index)),
-        TyKind::Adt(adt_def, _) if adt_def.is_struct() => adt_def
-            .variant(0usize.into())
-            .fields
-            .get(rustc_abi::FieldIdx::from_usize(field_index))
-            .map(|field| field.ident(tcx).to_string()),
+        TyKind::Adt(adt_def, _) if adt_def.is_struct() => {
+            Some(super::types::struct_field_name(tcx, adt_def, field_index))
+        }
         TyKind::Adt(adt_def, _) if adt_def.is_enum() => None,
         TyKind::Coroutine(_, _) => Some(format!("arg{}", field_index)),
         _ => None,
@@ -270,7 +280,7 @@ pub(super) fn field_name_for_projection<'tcx>(
     field_index: usize,
     base_rust_ty: Ty<'tcx>,
     tcx: TyCtxt<'tcx>,
-    data_types: &HashMap<String, oomir::DataType>,
+    data_types: &crate::lower1::context::Definitions<'_>,
 ) -> Result<String, String> {
     let direct_rust_ty = match base_rust_ty.kind() {
         TyKind::Ref(_, inner_ty, _) => *inner_ty,
@@ -281,7 +291,7 @@ pub(super) fn field_name_for_projection<'tcx>(
         && let Some(variant) = adt_def.variants().iter().find(|variant| {
             owner_class_name.ends_with(&format!(
                 "${}",
-                jvm_names::member_name(&variant.name.to_string())
+                crate::lower1::types::enum_variant_name(variant, tcx)
             ))
         })
     {
@@ -328,7 +338,10 @@ pub fn get_place_type<'tcx>(
         let base_ty = EarlyBinder::bind(tcx, base_place.ty(&mir.local_decls, tcx).ty)
             .instantiate(tcx, instance.args)
             .skip_norm_wip();
-        if matches!(base_ty.kind(), TyKind::Coroutine(..)) {
+        if matches!(base_ty.kind(), TyKind::Coroutine(..))
+            || super::types::tagged_scalar(base_ty, tcx).is_some()
+            || super::types::direct_enum_payload(base_ty, tcx).is_some()
+        {
             return ty_to_oomir_type(base_ty, tcx, data_types, instance);
         }
         let (adt_def, substs) = match base_ty.kind() {
@@ -349,7 +362,7 @@ pub fn get_place_type<'tcx>(
             return oomir::Type::Class(format!(
                 "{}${}",
                 base_class,
-                jvm_names::member_name(&variant.name.to_string())
+                crate::lower1::types::enum_variant_name(variant, tcx)
             ));
         }
     }
@@ -362,10 +375,12 @@ pub fn get_place_type<'tcx>(
     ty_to_oomir_type(instantiated_ty, tcx, data_types, instance)
 }
 
+mod memory_place;
 /// Generates OOMIR instructions to "get" the value from a Place.
 /// This function now supports nested projections by calling
 /// `emit_instructions_to_get_recursive`.
 mod views;
+use memory_place::indirect_field_address;
 pub(crate) use views::*;
 
 mod read;
