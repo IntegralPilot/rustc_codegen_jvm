@@ -64,8 +64,22 @@ pub use typed_loads::lower_typed_loads;
 #[cfg(test)]
 mod typed_loads_tests;
 
+mod address_observers;
+pub use address_observers::lower_address_observers;
+#[cfg(test)]
+mod address_observers_tests;
+
+mod address_intrinsics;
+pub use address_intrinsics::lower_address_intrinsics;
+#[cfg(test)]
+mod address_intrinsics_tests;
+
+mod memory_copies;
+pub use memory_copies::lower_memory_copies;
 #[cfg(test)]
 mod array_view_tests;
+#[cfg(test)]
+mod memory_copies_tests;
 
 mod simplify;
 mod unreachable;
