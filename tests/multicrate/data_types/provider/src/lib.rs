@@ -207,3 +207,30 @@ pub fn fn_pointer_score(value: i32) -> i32 {
     let f: fn(i32) -> i32 = add_three;
     apply(value, f)
 }
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct StoredBorrows { parts: BorrowedParts }
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct BorrowedParts {
+    current: *const u32,
+    values: &'static [u32],
+    text: &'static str,
+}
+
+impl StoredBorrows {
+    pub fn parts(&self) -> (*const u32, &'static [u32], &'static str) {
+        (self.parts.current, self.parts.values, self.parts.text)
+    }
+    pub fn advance(&mut self) {
+        self.parts.current = unsafe { self.parts.current.add(1) };
+        self.parts.values = &self.parts.values[1..];
+        self.parts.text = &self.parts.text[2..];
+    }
+}
+
+pub fn stored_borrows() -> StoredBorrows {
+    static VALUES: [u32; 4] = [3, 5, 8, 13];
+    StoredBorrows { parts: BorrowedParts { current: VALUES.as_ptr(), values: &VALUES[1..], text: "été" } }
+}

@@ -1,3 +1,10 @@
+mod aggregate_components;
+mod array_locations;
+mod borrowed_fields;
+mod component_calls;
+mod partial_init;
+mod returned_views;
+mod stored_addresses;
 mod str_patterns;
 
 fn sum(values: &[i32]) -> i32 {
@@ -278,6 +285,12 @@ fn check_disjoint_mut_empty_edges() {
 }
 
 fn main() {
+    aggregate_components::check();
+    borrowed_fields::run();
+    array_locations::run();
+    partial_init::run();
+    returned_views::run();
+    component_calls::run();
     let values = [10, 20, 30, 40, 50];
     let whole: &[i32] = &values;
     check_edges(whole);

@@ -1,4 +1,5 @@
 fn main() {
+    imported_borrowed_storage();
     let point = provider::Point::new(7, 11);
     assert!(point.x == 7);
     assert!(point.y == 11);
@@ -45,4 +46,22 @@ fn main() {
     options.add("h", "help", "", "show help", false, false);
     options.add("o", "output", "FILE", "write output", true, true);
     assert!(options.check());
+}
+
+fn imported_borrowed_storage() {
+    let address = Box::into_raw(Box::new(provider::stored_borrows()));
+    unsafe {
+        let copy = std::hint::black_box(address).read();
+        let (pointer, values, text) = copy.parts();
+        assert_eq!(*pointer, 3);
+        assert_eq!(values, &[5, 8, 13]);
+        assert_eq!(text, "été");
+        (*address).advance();
+        let (pointer, values, text) = (*address).parts();
+        assert_eq!(*pointer, 5);
+        assert_eq!(values, &[8, 13]);
+        assert_eq!(text, "té");
+        assert_eq!(copy.parts().1, &[5, 8, 13]);
+        drop(Box::from_raw(address));
+    }
 }

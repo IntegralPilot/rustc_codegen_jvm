@@ -8,6 +8,19 @@ pub struct Signature {
     pub is_static: bool,
 }
 
+/// Private method namespaces share an internal ABI. Java exports and imports keep their declared
+/// descriptors.
+pub fn component_method(owner: &str, name: &str) -> bool {
+    owner.contains("/mono/Mono_")
+        || name == "_fn_ptr_call"
+        || name.starts_with("_fp$")
+        || (name == "call"
+            && (owner.starts_with("org/rustlang/runtime/FnPtr_")
+                || owner.rsplit('/').next().is_some_and(|n| {
+                    n.starts_with("FnPtrImpl_") || n.starts_with("ClosureFnPtrImpl_")
+                })))
+}
+
 impl Signature {
     /// Whether the first OOMIR parameter is represented by the JVM's implicit
     /// receiver slot rather than appearing in the method descriptor.
@@ -44,20 +57,94 @@ impl Signature {
         result
     }
 
-    pub fn fn_ptr_interface_name(&self) -> String {
-        let descriptor = self.to_jvm_descriptor_with_explicit_params();
-        let params = self
+    pub fn needs_component_abi(&self) -> bool {
+        self.ret.component_shape().is_some()
+            || self
+                .explicit_jvm_params()
+                .iter()
+                .any(|(_, ty)| ty.component_shape().is_some())
+    }
+
+    pub fn component_signature(&self) -> Signature {
+        let slots: usize = self
             .explicit_jvm_params()
             .iter()
-            .filter_map(|(_, ty)| ty.has_jvm_value().then(|| ty.jvm_abi_name_token()))
-            .collect::<Vec<_>>();
-        let params = if params.is_empty() {
-            "no_args".to_string()
+            .map(|(_, ty)| match ty {
+                Type::Slice(_) | Type::Str | Type::TaggedI64 => 4,
+                Type::Pointer(_) => 3,
+                Type::I64 | Type::U64 | Type::F64 => 2,
+                Type::Void | Type::Unit => 0,
+                _ => 1,
+            })
+            .sum();
+        if slots + usize::from(self.ret.component_shape().is_some()) > 254
+            || !self.needs_component_abi()
+        {
+            return self.clone();
+        }
+        let implicit = self.has_implicit_jvm_receiver();
+        let mut params = Vec::new();
+        for (index, (name, ty)) in self.params.iter().enumerate() {
+            if let Some(parts) = ty.components().filter(|_| !(implicit && index == 0)) {
+                for (index, part) in parts.into_iter().enumerate() {
+                    params.push((format!("{name}${index}"), part));
+                }
+            } else {
+                params.push((name.clone(), ty.clone()));
+            }
+        }
+
+        let ret = if self.ret.component_shape().is_some() {
+            params.push(("$return".into(), Type::Array(Box::new(Type::I64))));
+            Box::new(self.ret.components().unwrap().next().unwrap())
         } else {
-            params.join("_")
+            self.ret.clone()
         };
-        let readable = format!("{params}_to_{}", self.ret.jvm_abi_name_token());
-        crate::stable_hash::readable_or_hashed_name("FnPtr", &readable, &descriptor, 180)
+        Signature {
+            params,
+            ret,
+            is_static: self.is_static,
+        }
+    }
+
+    pub fn fn_ptr_interface_name(&self) -> String {
+        let descriptor = self
+            .component_signature()
+            .to_jvm_descriptor_with_explicit_params();
+        fn token(ty: &Type) -> Option<&'static str> {
+            Some(match ty {
+                Type::Void | Type::Unit => "void",
+                Type::Boolean => "boolean",
+                Type::I8 | Type::U8 => "byte",
+                Type::I16 => "short",
+                Type::U16 | Type::Char => "char",
+                Type::I32 | Type::U32 => "int",
+                Type::I64 | Type::U64 => "long",
+                Type::F16 => "binary16",
+                Type::F32 => "float",
+                Type::F64 => "double",
+                _ => return None,
+            })
+        }
+        if let Some(ret) = token(&self.ret)
+            && let Some(params) = self
+                .explicit_jvm_params()
+                .iter()
+                .filter(|(_, ty)| ty.has_jvm_value())
+                .map(|(_, ty)| token(ty))
+                .collect::<Option<Vec<_>>>()
+        {
+            let params = if params.is_empty() {
+                "no_args".into()
+            } else {
+                params.join("_")
+            };
+            let name = format!("FnPtr_{params}_to_{ret}");
+            if name.len() <= 80 {
+                return name;
+            }
+        }
+        format!("FnPtr_{}", crate::stable_hash::short_hash(&descriptor, 16))
     }
 
     pub fn fn_ptr_interface_method_signature(&self) -> Signature {
@@ -66,50 +153,6 @@ impl Signature {
             ret: self.ret.clone(),
             is_static: false,
         }
-    }
-
-    /// Internal generated methods may carry a thin pointer as its stable base
-    /// plus deferred element and byte offsets. Public/JVM-facing entry points
-    /// retain the ordinary `Pointer` descriptor and bridge into this ABI.
-    pub fn relative_pointer_abi_signature(&self) -> Signature {
-        let implicit_receiver = self.has_implicit_jvm_receiver();
-        let mut params = Vec::with_capacity(self.params.len() * 3);
-        for (index, (name, ty)) in self.params.iter().enumerate() {
-            params.push((name.clone(), ty.clone()));
-            if !(implicit_receiver && index == 0) && matches!(ty, Type::Pointer(_)) {
-                params.push((format!("{name}$element_offset"), Type::I64));
-                params.push((format!("{name}$byte_offset"), Type::I64));
-            }
-        }
-        Signature {
-            params,
-            ret: self.ret.clone(),
-            is_static: self.is_static,
-        }
-    }
-
-    pub fn supports_relative_pointer_abi(&self) -> bool {
-        let implicit_receiver = self.has_implicit_jvm_receiver();
-        let mut has_pointer = false;
-        let slots = self
-            .params
-            .iter()
-            .enumerate()
-            .filter(|(index, (_, ty))| !(implicit_receiver && *index == 0) && ty.has_jvm_value())
-            .map(|(_, (_, ty))| {
-                if matches!(ty, Type::Pointer(_)) {
-                    has_pointer = true;
-                    5u16
-                } else if matches!(ty, Type::I64 | Type::U64 | Type::F64) {
-                    2
-                } else {
-                    1
-                }
-            })
-            .sum::<u16>();
-        // JVMS 4.3.3 limits a method descriptor to 255 parameter units;
-        // instance methods also consume one unit for the receiver.
-        has_pointer && slots + u16::from(!self.is_static) <= 255
     }
 
     /// Replaces all occurrences of `Type::Class(old_name)` with `Type::Class(new_name)`
