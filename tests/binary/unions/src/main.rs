@@ -4,6 +4,7 @@
 mod borrowed_enum;
 mod helper_names;
 mod receivers;
+mod shared_storage;
 
 #[derive(Copy, Clone)]
 #[repr(C)]
@@ -198,6 +199,7 @@ union FlatOuterStorage {
 }
 
 fn main() {
+    shared_storage::run();
     helper_names::run();
     borrowed_enum::run();
     receivers::run();

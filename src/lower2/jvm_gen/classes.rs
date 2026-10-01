@@ -1,10 +1,12 @@
 //! Native JVM classes emission.
+use super::enums::object_equality;
 use super::*;
 
 /// Creates a ClassFile (as bytes) for a given OOMIR DataType that's a class
 pub(in crate::lower2) fn create_data_type_classfile_for_class(
     class_name_jvm: &str,
     fields: &[(String, Type)],
+    kind: oomir::ClassKind,
     is_abstract: bool,
     methods: HashMap<String, DataTypeMethod>,
     super_class_name_jvm: &str,
@@ -13,8 +15,9 @@ pub(in crate::lower2) fn create_data_type_classfile_for_class(
     subclasses: &[String],
     nest_host: Option<&str>,
     debug_info: DebugInfoOptions,
-    relative_static_methods: &HashSet<oomir::FunctionKey>,
     context: &oomir::construct::Context,
+    output: &mut crate::lower2::output::ClassOutput,
+    registry: &crate::lower2::EmittedClassRegistry,
 ) -> jvm::Result<Vec<u8>> {
     let source_files = methods
         .values()
@@ -42,6 +45,7 @@ pub(in crate::lower2) fn create_data_type_classfile_for_class(
     let mut cp = InternedConstantPool::default();
 
     let this_class_index = cp.add_class(class_name_jvm)?;
+    cp.set_resource_anchor(this_class_index);
 
     let super_class_index = cp.add_class(super_class_name_jvm)?;
 
@@ -55,41 +59,38 @@ pub(in crate::lower2) fn create_data_type_classfile_for_class(
         let interface_index = cp.add_class(interface_name)?;
         interface_indices.push(interface_index);
     }
-    if !is_abstract {
+    if kind != oomir::ClassKind::Static && !is_abstract {
         let rust_copy_interface = "org/rustlang/runtime/RustCopy";
         if seen_interfaces.insert(rust_copy_interface) {
             interface_indices.push(cp.add_class(rust_copy_interface)?);
         }
     }
 
+    let split_addresses = kind == oomir::ClassKind::Value && oomir::fields::split_borrows(&fields);
+    let physical_fields = if split_addresses {
+        oomir::fields::physical(&fields)
+    } else {
+        fields.clone()
+    };
     let mut jvm_fields: Vec<jvm::Field> = Vec::new();
-    for (field_name, field_ty) in &fields {
+    for (field_name, field_ty) in &physical_fields {
         let name_index = cp.add_utf8(field_name)?;
         let descriptor = field_ty.to_jvm_descriptor(); // Ensure this method exists on oomir::Type
         let descriptor_index = cp.add_utf8(&descriptor)?;
 
         let field = jvm::Field {
-            access_flags: FieldAccessFlags::PUBLIC,
+            access_flags: FieldAccessFlags::PUBLIC
+                | if field_name.starts_with("$rust$") {
+                    FieldAccessFlags::SYNTHETIC
+                } else {
+                    FieldAccessFlags::empty()
+                },
             name_index,
             descriptor_index,
             field_type: oomir_type_to_ristretto_field_type(field_ty), // Use helper
             attributes: Vec::new(),
         };
         jvm_fields.push(field);
-        if matches!(field_ty, Type::Pointer(_)) {
-            for offset_name in [
-                oomir::relative_pointer_element_offset_field(field_name),
-                oomir::relative_pointer_byte_offset_field(field_name),
-            ] {
-                jvm_fields.push(jvm::Field {
-                    access_flags: FieldAccessFlags::PUBLIC | FieldAccessFlags::SYNTHETIC,
-                    name_index: cp.add_utf8(offset_name)?,
-                    descriptor_index: cp.add_utf8("J")?,
-                    field_type: oomir_type_to_ristretto_field_type(&Type::I64),
-                    attributes: Vec::new(),
-                });
-            }
-        }
         breadcrumbs::log!(
             breadcrumbs::LogLevel::Info,
             "bytecode-gen",
@@ -97,34 +98,79 @@ pub(in crate::lower2) fn create_data_type_classfile_for_class(
         );
     }
 
+    if split_addresses {
+        jvm_fields.extend(fields::layout_metadata(&mut cp, &fields)?);
+    }
+
     // Fielded Rust structs/enums must be initialized with all fields. Only genuinely
     // fieldless classes keep a no-args constructor.
-    let constructor = if fields.is_empty() {
-        create_default_constructor(&mut cp, super_class_index)?
+    let mut jvm_methods = Vec::new();
+    if kind != oomir::ClassKind::Static {
+        jvm_methods.push(if fields.is_empty() {
+            create_default_constructor(&mut cp, super_class_index)?
+        } else {
+            create_field_constructor(
+                &mut cp,
+                this_class_index,
+                super_class_index,
+                &physical_fields,
+            )?
+        });
+        if split_addresses {
+            jvm_methods.push(fields::constructor_bridge(
+                &mut cp,
+                this_class_index,
+                &fields,
+            )?);
+        }
     } else {
-        create_field_constructor(&mut cp, this_class_index, super_class_index, &fields)?
-    };
-    let mut jvm_methods = vec![constructor];
-    if fields
-        .iter()
-        .any(|(_, field_ty)| matches!(field_ty, Type::Pointer(_)))
-    {
-        jvm_methods.push(create_relative_pointer_field_constructor(
-            &mut cp,
-            this_class_index,
-            super_class_index,
-            &fields,
-        )?);
+        assert!(
+            fields.is_empty() && implements_interfaces.is_empty(),
+            "static helper has instance storage"
+        );
     }
-    if !is_abstract {
+    if kind != oomir::ClassKind::Static && !is_abstract {
         jvm_methods.push(create_managed_copy_method(
             &mut cp,
             this_class_index,
             class_name_jvm,
             &fields,
+            split_addresses,
         )?);
     }
     let mut class_attributes = Vec::new();
+    if matches!(kind, oomir::ClassKind::Value | oomir::ClassKind::Static) {
+        class_attributes.push(Attribute::Unknown {
+            name_index: cp.add_utf8(jvm::summary::PRIVATE_ATTRIBUTE)?,
+            info: Vec::new(),
+        });
+    }
+    if let Some(info) = super::shapes::carrier_recipe(
+        kind,
+        &fields,
+        &methods,
+        implements_interfaces,
+        super_class_name_jvm,
+        is_abstract,
+        |ty| object_equality(module, ty),
+    )
+    .or_else(|| {
+        super::enum_shapes::variant(
+            class_name_jvm,
+            kind,
+            &fields,
+            &methods,
+            implements_interfaces,
+            super_class_name_jvm,
+            is_abstract,
+            module,
+        )
+    }) {
+        class_attributes.push(Attribute::Unknown {
+            name_index: cp.add_utf8(jvm::summary::CARRIER_ATTRIBUTE)?,
+            info,
+        });
+    }
     let mut bootstrap_methods: Vec<BootstrapMethod> = Vec::new();
     let mut next_factory = 0;
 
@@ -140,7 +186,6 @@ pub(in crate::lower2) fn create_data_type_classfile_for_class(
                 next_factory: &mut next_factory,
                 owner: class_name_jvm,
                 kind: body::BodyOwner::Class,
-                relative_methods: relative_static_methods,
                 debug: debug_info,
                 context,
             }
@@ -202,7 +247,6 @@ pub(in crate::lower2) fn create_data_type_classfile_for_class(
                     method_name,
                     recipe,
                     module,
-                    relative_static_methods,
                     false,
                 )?);
             }
@@ -255,6 +299,7 @@ pub(in crate::lower2) fn create_data_type_classfile_for_class(
                                 this_class_idx,
                                 field_name,
                                 field_ty,
+                                split_addresses,
                             )?;
                         }
 
@@ -293,19 +338,20 @@ pub(in crate::lower2) fn create_data_type_classfile_for_class(
                         field_ty,
                     } => {
                         let method_desc = format!("(){}", field_ty.to_jvm_descriptor());
-                        let field_ref = cp.add_field_ref(
+                        let mut code = vec![Instruction::Aload_0];
+                        fields::load(
+                            &mut cp,
+                            &mut code,
                             this_class_index,
                             field_name,
-                            &field_ty.to_jvm_descriptor(),
+                            field_ty,
+                            split_addresses,
                         )?;
+                        code.push(return_instruction_for_type(field_ty));
                         let code_attribute = code_attribute_for_descriptor(
                             &mut cp,
                             1,
-                            vec![
-                                Instruction::Aload_0,
-                                Instruction::Getfield(field_ref),
-                                return_instruction_for_type(field_ty),
-                            ],
+                            code,
                             &method_desc,
                             false,
                             Some(class_name_jvm),
@@ -394,6 +440,7 @@ pub(in crate::lower2) fn create_data_type_classfile_for_class(
         });
     }
 
+    output.resources(registry, &mut cp)?;
     let class_file = ClassFile {
         code_source_url: None,
         version: Version::Java8 { minor: 0 },

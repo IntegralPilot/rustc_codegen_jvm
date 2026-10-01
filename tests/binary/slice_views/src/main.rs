@@ -6,6 +6,7 @@ mod nullable_refs;
 mod optional_views;
 mod partial_init;
 mod returned_views;
+mod shared_carriers;
 mod stored_addresses;
 mod str_patterns;
 mod transparent_enums;
@@ -296,6 +297,7 @@ fn main() {
     optional_views::run();
     returned_views::run();
     transparent_enums::run();
+    shared_carriers::run();
     component_calls::run();
     let values = [10, 20, 30, 40, 50];
     let whole: &[i32] = &values;

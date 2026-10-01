@@ -300,6 +300,7 @@ pub(crate) fn ensure_union_data_type<'tcx>(
                 (UNION_BYTES_FIELD.to_string(), byte_array_type()),
                 (UNION_OBJECTS_FIELD.to_string(), object_array_type()),
             ],
+            kind: crate::oomir::ClassKind::Value,
             is_abstract: false,
             methods: HashMap::default(),
             super_class: Some("java/lang/Object".to_string()),
@@ -405,6 +406,7 @@ pub(crate) fn ensure_union_data_type<'tcx>(
                 union_class.clone(),
                 oomir::DataType::Class {
                     fields: union_fields,
+                    kind: crate::oomir::ClassKind::Value,
                     is_abstract: false,
                     methods,
                     super_class: Some("java/lang/Object".to_string()),

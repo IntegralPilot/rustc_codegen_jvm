@@ -2,16 +2,12 @@
 mod body;
 pub(super) use body::{BodyEmitter, BodyOwner};
 mod constructors;
+mod enum_shapes;
+mod fields;
+mod shapes;
 pub(super) use constructors::create_default_constructor;
-use constructors::{
-    create_field_constructor, create_managed_copy_method, create_relative_pointer_field_constructor,
-};
-mod slices;
-pub(super) use slices::create_slice_view_classfile;
-mod strings;
-pub(super) use strings::create_utf8_view_classfile;
+use constructors::{create_field_constructor, create_managed_copy_method};
 mod bridges;
-pub(super) use bridges::create_relative_pointer_bridge;
 use bridges::create_static_instance_bridge;
 mod enum_equality;
 use enum_equality::create_enum_equality_methods;
@@ -23,6 +19,8 @@ mod interfaces;
 pub(super) use interfaces::create_data_type_classfile_for_interface;
 
 mod forward;
+mod forward_returns;
+mod function_handles;
 
 use super::{
     DebugInfoOptions,
@@ -75,7 +73,7 @@ fn code_attribute_with_stack_maps(
     })
 }
 
-fn code_attribute_for_descriptor(
+pub(super) fn code_attribute_for_descriptor(
     cp: &mut InternedConstantPool,
     max_locals: u16,
     code: Vec<Instruction>,
@@ -105,11 +103,8 @@ pub(super) fn oomir_type_to_ristretto_field_type(type2: &oomir::Type) -> jvm::Fi
         oomir::Type::F64 => jvm::FieldType::Base(BaseType::Double),
         oomir::Type::Boolean => jvm::FieldType::Base(BaseType::Boolean),
         oomir::Type::Char => jvm::FieldType::Base(BaseType::Char),
+        oomir::Type::TaggedI64 => jvm::FieldType::Object(oomir::TAGGED_LONG_CLASS.into()),
         oomir::Type::Str => jvm::FieldType::Object(oomir::UTF8_VIEW_CLASS.into()),
-        oomir::Type::Reference(ref2) => {
-            let inner_ty = ref2.as_ref();
-            oomir_type_to_ristretto_field_type(inner_ty)
-        }
         oomir::Type::Pointer(_) => jvm::FieldType::Object(oomir::POINTER_CLASS.into()),
         oomir::Type::Array(inner_ty) => {
             let inner_field_type = if inner_ty.has_jvm_value() {
@@ -120,13 +115,6 @@ pub(super) fn oomir_type_to_ristretto_field_type(type2: &oomir::Type) -> jvm::Fi
             jvm::FieldType::Array(Box::new(inner_field_type))
         }
         oomir::Type::Slice(_) => jvm::FieldType::Object(oomir::SLICE_VIEW_CLASS.into()),
-        oomir::Type::MutableReference(inner_ty) if !inner_ty.has_jvm_value() => {
-            jvm::FieldType::Object("java/lang/Object".into())
-        }
-        oomir::Type::MutableReference(inner_ty) => {
-            let inner_field_type = oomir_type_to_ristretto_field_type(inner_ty);
-            jvm::FieldType::Array(Box::new(inner_field_type))
-        }
         oomir::Type::Class(name) | oomir::Type::Interface(name) => {
             jvm::FieldType::Object(name.clone().into())
         }

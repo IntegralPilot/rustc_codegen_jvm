@@ -23,6 +23,29 @@ fn has_generated_eq(module: &oomir::Module, class_name: &str) -> bool {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ObjectEquality {
+    Object,
+    Class,
+    Interface,
+    Enum,
+}
+
+pub(super) fn object_equality(module: &oomir::Module, ty: &Type) -> ObjectEquality {
+    let (Type::Class(name) | Type::Interface(name)) = ty else {
+        unreachable!("object equality needs a nominal object type")
+    };
+    if !has_generated_eq(module, name) {
+        return ObjectEquality::Object;
+    }
+    match module.data_type(name) {
+        Some(oomir::DataType::Interface { is_enum: true, .. }) => ObjectEquality::Enum,
+        Some(oomir::DataType::Interface { .. }) => ObjectEquality::Interface,
+        _ if matches!(ty, Type::Interface(_)) => ObjectEquality::Interface,
+        _ => ObjectEquality::Class,
+    }
+}
+
 fn append_boolean_false_check(instructions: &mut Vec<Instruction>, false_fixups: &mut Vec<usize>) {
     false_fixups.push(instructions.len());
     instructions.push(Instruction::Ifeq(0));
@@ -36,16 +59,28 @@ pub(super) fn append_field_equality_check(
     variant_class_idx: u16,
     field_name: &str,
     field_ty: &Type,
+    split_addresses: bool,
 ) -> jvm::Result<()> {
-    let field_ref =
-        cp.add_field_ref(variant_class_idx, field_name, &field_ty.to_jvm_descriptor())?;
-
     instructions.push(Instruction::Aload_0);
     instructions.push(Instruction::Checkcast(variant_class_idx));
-    instructions.push(Instruction::Getfield(field_ref));
+    fields::load(
+        cp,
+        instructions,
+        variant_class_idx,
+        field_name,
+        field_ty,
+        split_addresses,
+    )?;
     instructions.push(Instruction::Aload_1);
     instructions.push(Instruction::Checkcast(variant_class_idx));
-    instructions.push(Instruction::Getfield(field_ref));
+    fields::load(
+        cp,
+        instructions,
+        variant_class_idx,
+        field_name,
+        field_ty,
+        split_addresses,
+    )?;
 
     match field_ty {
         Type::I64 | Type::U64 => {
@@ -75,6 +110,15 @@ pub(super) fn append_field_equality_check(
             false_fixups.push(instructions.len());
             instructions.push(Instruction::If_icmpne(0));
         }
+        Type::TaggedI64 => {
+            let owner = cp.add_class(oomir::TAGGED_LONG_CLASS)?;
+            instructions.push(Instruction::Invokestatic(cp.add_method_ref(
+                owner,
+                "optionEquals",
+                "(Lorg/rustlang/runtime/TaggedLong;Lorg/rustlang/runtime/TaggedLong;)Z",
+            )?));
+            append_boolean_false_check(instructions, false_fixups);
+        }
         Type::Str => {
             let view_class = cp.add_class(oomir::UTF8_VIEW_CLASS)?;
             let descriptor = format!(
@@ -93,43 +137,31 @@ pub(super) fn append_field_equality_check(
             instructions.push(Instruction::Invokevirtual(equals_ref));
             append_boolean_false_check(instructions, false_fixups);
         }
-        Type::Class(class_name) if has_generated_eq(module, class_name) => {
-            let class_idx = cp.add_class(class_name)?;
-            if matches!(
-                module.data_type(class_name),
-                Some(oomir::DataType::Interface { is_enum: true, .. })
-            ) {
-                let eq_desc = format!("(L{class_name};L{class_name};)Z");
-                let eq_ref = cp.add_interface_method_ref(class_idx, "eq", &eq_desc)?;
-                instructions.push(Instruction::Invokestatic(eq_ref));
-            } else if matches!(
-                module.data_type(class_name),
-                Some(oomir::DataType::Interface { .. })
-            ) {
-                let eq_desc = format!("(L{class_name};)Z");
-                let eq_ref = cp.add_interface_method_ref(class_idx, "eq", &eq_desc)?;
-                instructions.push(Instruction::Invokeinterface(eq_ref, 2));
-            } else {
-                let eq_desc = format!("(L{class_name};)Z");
-                let eq_ref = cp.add_method_ref(class_idx, "eq", &eq_desc)?;
-                instructions.push(Instruction::Invokevirtual(eq_ref));
-            }
-            append_boolean_false_check(instructions, false_fixups);
-        }
-        Type::Interface(interface_name) if has_generated_eq(module, interface_name) => {
-            let interface_idx = cp.add_class(interface_name)?;
-            if matches!(
-                module.data_type(interface_name),
-                Some(oomir::DataType::Interface { is_enum: true, .. })
-            ) {
-                let eq_desc = format!("(L{interface_name};L{interface_name};)Z");
-                let eq_ref = cp.add_interface_method_ref(interface_idx, "eq", &eq_desc)?;
-                instructions.push(Instruction::Invokestatic(eq_ref));
-            } else {
-                let eq_desc = format!("(L{interface_name};)Z");
-                let eq_ref = cp.add_interface_method_ref(interface_idx, "eq", &eq_desc)?;
-                instructions.push(Instruction::Invokeinterface(eq_ref, 2));
-            }
+        Type::Class(name) | Type::Interface(name) => {
+            let owner = cp.add_class(name)?;
+            let descriptor = format!("(L{name};)Z");
+            let instruction =
+                match object_equality(module, field_ty) {
+                    ObjectEquality::Enum => Instruction::Invokestatic(
+                        cp.add_interface_method_ref(owner, "eq", format!("(L{name};L{name};)Z"))?,
+                    ),
+                    ObjectEquality::Interface => Instruction::Invokeinterface(
+                        cp.add_interface_method_ref(owner, "eq", descriptor)?,
+                        2,
+                    ),
+                    ObjectEquality::Class => {
+                        Instruction::Invokevirtual(cp.add_method_ref(owner, "eq", descriptor)?)
+                    }
+                    ObjectEquality::Object => {
+                        let object = cp.add_class("java/lang/Object")?;
+                        Instruction::Invokevirtual(cp.add_method_ref(
+                            object,
+                            "equals",
+                            "(Ljava/lang/Object;)Z",
+                        )?)
+                    }
+                };
+            instructions.push(instruction);
             append_boolean_false_check(instructions, false_fixups);
         }
         Type::Array(inner) if matches!(inner.as_ref(), Type::Pointer(_)) => {
@@ -140,13 +172,6 @@ pub(super) fn append_field_equality_check(
                 "(Ljava/lang/Object;Ljava/lang/Object;)Z",
             )?;
             instructions.push(Instruction::Invokestatic(equals_ref));
-            append_boolean_false_check(instructions, false_fixups);
-        }
-        Type::Class(_) | Type::Interface(_) => {
-            let object_class_idx = cp.add_class("java/lang/Object")?;
-            let equals_ref =
-                cp.add_method_ref(object_class_idx, "equals", "(Ljava/lang/Object;)Z")?;
-            instructions.push(Instruction::Invokevirtual(equals_ref));
             append_boolean_false_check(instructions, false_fixups);
         }
         _ => {
@@ -190,7 +215,28 @@ pub(super) fn create_enum_adt_helper_method(
             enum_class,
             variants,
             values,
+            dispatch,
         } => {
+            if let Some(dispatch) = dispatch {
+                let owner = cp.add_class(enum_class)?;
+                let method = cp.add_interface_method_ref(owner, dispatch, "()J")?;
+                return enum_helper_method(
+                    cp,
+                    owner_name,
+                    method_name,
+                    &format!("(L{enum_class};)J"),
+                    1,
+                    vec![
+                        Instruction::Aload_0,
+                        Instruction::Ifnonnull(4),
+                        Instruction::Lconst_0,
+                        Instruction::Lreturn,
+                        Instruction::Aload_0,
+                        Instruction::Invokeinterface(method, 1),
+                        Instruction::Lreturn,
+                    ],
+                );
+            }
             let mut instructions = Vec::new();
             for (variant, value) in variants.iter().zip(values) {
                 instructions.push(Instruction::Aload_0);
@@ -232,11 +278,29 @@ pub(super) fn create_enum_adt_helper_method(
         }
     };
 
+    enum_helper_method(
+        cp,
+        owner_name,
+        method_name,
+        &descriptor,
+        max_locals,
+        instructions,
+    )
+}
+
+fn enum_helper_method(
+    cp: &mut InternedConstantPool,
+    owner_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    max_locals: u16,
+    instructions: Vec<Instruction>,
+) -> jvm::Result<jvm::Method> {
     let code = code_attribute_for_descriptor(
         cp,
         max_locals,
         instructions,
-        &descriptor,
+        descriptor,
         true,
         Some(owner_name),
         method_name,
@@ -244,7 +308,7 @@ pub(super) fn create_enum_adt_helper_method(
     Ok(jvm::Method {
         access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
         name_index: cp.add_utf8(method_name)?,
-        descriptor_index: cp.add_utf8(&descriptor)?,
+        descriptor_index: cp.add_utf8(descriptor)?,
         attributes: vec![code],
     })
 }

@@ -1,4 +1,5 @@
 mod scalar_tags;
+mod shared_storage;
 mod sparse_tags;
 mod tagged_scalars;
 mod trailing_underscores;
@@ -70,6 +71,7 @@ impl Drop for CustomDropEnum {
 
 fn main() {
     tagged_scalars::check();
+    shared_storage::run();
     sparse_tags::run();
     scalar_tags::run();
     trailing_underscores::run();

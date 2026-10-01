@@ -114,6 +114,7 @@ fn equality_code(
                         runtime_type_idx,
                         field_name,
                         field_ty,
+                        matches!(module.data_type(&variant.runtime_type), Some(oomir::DataType::Class { kind: oomir::ClassKind::Value, fields, .. }) if oomir::fields::split_borrows(fields)),
                     )?;
                 }
             }
