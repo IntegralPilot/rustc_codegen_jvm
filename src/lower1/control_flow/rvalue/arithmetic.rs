@@ -32,20 +32,14 @@ impl<'tcx> RvalueContext<'_, 'tcx> {
                     BinOp::Offset
                         if matches!(oomir_op1.get_type(), Some(oomir::Type::Pointer(_))) =>
                     {
-                        instructions.push(oomir::Instruction::InvokeVirtual {
+                        instructions.push(oomir::Instruction::AddressOffset {
                             dest: Some(temp_binop_var.clone()),
-                            class_name: oomir::POINTER_CLASS.to_string(),
-                            method_name: "offset".to_string(),
-                            method_ty: oomir::Signature {
-                                params: vec![
-                                    ("self".to_string(), oomir_op1.get_type().unwrap()),
-                                    ("elements".to_string(), oomir::Type::I64),
-                                ],
-                                ret: Box::new(oomir_result_type.clone()),
-                                is_static: false,
-                            },
-                            args: vec![oomir_op2],
-                            operand: oomir_op1,
+                            source: oomir_op1,
+                            count: oomir_op2,
+                            ty: oomir_result_type.clone(),
+                            bytes: false,
+                            wrapping: false,
+                            subtract: false,
                         });
                     }
                     BinOp::Eq | BinOp::Ne
@@ -380,7 +374,6 @@ impl<'tcx> RvalueContext<'_, 'tcx> {
                     convert_operand(operand, tcx, instance, mir, data_types, &mut instructions);
                 let oomir_result_type =
                     get_place_type(original_dest_place, mir, tcx, instance, data_types);
-                let mut produced_value = false;
 
                 match operation {
                     UnOp::Not => {
@@ -388,123 +381,32 @@ impl<'tcx> RvalueContext<'_, 'tcx> {
                             dest: temp_unop_var.clone(),
                             src: oomir_src_operand,
                         });
-                        produced_value = true;
                     }
                     UnOp::Neg => {
                         instructions.push(oomir::Instruction::Neg {
                             dest: temp_unop_var.clone(),
                             src: oomir_src_operand,
                         });
-                        produced_value = true;
                     }
                     UnOp::PtrMetadata => {
-                        let operand_ty = operand.ty(&mir.local_decls, tcx);
-                        let pointee = match operand_ty.kind() {
-                            TyKind::RawPtr(pointee, _) | TyKind::Ref(_, pointee, _) => *pointee,
-                            _ => operand_ty,
-                        };
-                        if pointee.is_slice() || pointee.is_str() {
-                            match oomir_src_operand.get_type().unwrap() {
-                                oomir::Type::Slice(_) | oomir::Type::Str => {
-                                    instructions.push(oomir::Instruction::GetField {
-                                        dest: temp_unop_var.clone(),
-                                        object: oomir_src_operand,
-                                        field_name: "rustLength".into(),
-                                        field_ty: oomir::Type::U64,
-                                        owner_class: oomir::SLICE_VIEW_CLASS.into(),
-                                    });
-                                }
-                                ty @ oomir::Type::Pointer(_) => {
-                                    instructions.push(oomir::Instruction::InvokeVirtual {
-                                        dest: Some(temp_unop_var.clone()),
-                                        class_name: oomir::POINTER_CLASS.into(),
-                                        method_name: "metadata".into(),
-                                        method_ty: oomir::Signature {
-                                            params: vec![("self".into(), ty)],
-                                            ret: Box::new(oomir::Type::U64),
-                                            is_static: false,
-                                        },
-                                        args: vec![],
-                                        operand: oomir_src_operand,
-                                    });
-                                }
-                                _ => {
-                                    let length_i32 = format!("{temp_unop_var}_i32");
-                                    instructions.push(oomir::Instruction::Length {
-                                        dest: length_i32.clone(),
-                                        array: oomir_src_operand,
-                                    });
-                                    instructions.push(oomir::Instruction::Cast {
-                                        dest: temp_unop_var.clone(),
-                                        op: oomir::Operand::Variable {
-                                            name: length_i32,
-                                            ty: oomir::Type::I32,
-                                        },
-                                        ty: oomir::Type::U64,
-                                    });
-                                }
-                            }
-                            produced_value = true;
-                        } else if matches!(pointee.kind(), TyKind::Dynamic(..))
-                            && matches!(oomir_src_operand.get_type(), Some(oomir::Type::Pointer(_)))
-                        {
-                            crate::lower1::control_flow::emit_trait_object_metadata(
-                                oomir_src_operand,
-                                &oomir_result_type,
-                                temp_unop_var.clone(),
-                                &format!("{base_temp_name}_trait_metadata"),
-                                data_types,
-                                &mut instructions,
-                            );
-                            produced_value = true;
-                        } else {
-                            let tail = tcx
-                                .struct_tail_for_codegen(pointee, TypingEnv::fully_monomorphized());
-                            if (tail.is_slice() || tail.is_str())
-                                && matches!(
-                                    oomir_src_operand.get_type(),
-                                    Some(oomir::Type::Pointer(_))
-                                )
-                            {
-                                instructions.push(oomir::Instruction::InvokeVirtual {
-                                    dest: Some(temp_unop_var.clone()),
-                                    class_name: oomir::POINTER_CLASS.to_string(),
-                                    method_name: "metadata".to_string(),
-                                    method_ty: oomir::Signature {
-                                        params: vec![(
-                                            "self".to_string(),
-                                            oomir_src_operand
-                                                .get_type()
-                                                .expect("DST metadata pointer must be typed"),
-                                        )],
-                                        ret: Box::new(oomir::Type::U64),
-                                        is_static: false,
-                                    },
-                                    args: Vec::new(),
-                                    operand: oomir_src_operand,
-                                });
-                                produced_value = true;
-                            }
-                        }
+                        let value = crate::lower1::control_flow::emit_pointer_metadata(
+                            tcx,
+                            instance,
+                            data_types,
+                            operand.ty(&mir.local_decls, tcx),
+                            oomir_src_operand,
+                            oomir_result_type,
+                            temp_unop_var,
+                            &mut instructions,
+                        );
+                        return (instructions, value);
                     }
                 }
 
-                if produced_value {
-                    result_operand = oomir::Operand::Variable {
-                        name: temp_unop_var,
-                        ty: oomir_result_type,
-                    };
-                } else if !oomir_result_type.has_jvm_value() {
-                    result_operand = oomir::Operand::Constant(oomir::Constant::Unit);
-                } else {
-                    result_operand = get_placeholder_operand(
-                        original_dest_place,
-                        mir,
-                        tcx,
-                        instance,
-                        data_types,
-                    );
-                }
+                result_operand = oomir::Operand::Variable {
+                    name: temp_unop_var,
+                    ty: oomir_result_type,
+                };
             }
 
             _ => unreachable!("rvalue routed to arithmetic"),

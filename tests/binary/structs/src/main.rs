@@ -1,3 +1,4 @@
+mod packed_words;
 mod primitive_fields;
 mod stored_fields;
 mod transparent_aggregates;
@@ -15,6 +16,7 @@ struct Outer<'a> {
 
 fn main() {
     primitive_fields::run();
+    packed_words::run();
     stored_fields::run();
     transparent_aggregates::run();
     // === Nested STRUCT + TUPLE + ARRAY ===

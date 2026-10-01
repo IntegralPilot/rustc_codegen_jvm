@@ -1,3 +1,6 @@
+mod scalar_tags;
+mod sparse_tags;
+mod tagged_scalars;
 mod trailing_underscores;
 mod uninhabited;
 
@@ -66,6 +69,9 @@ impl Drop for CustomDropEnum {
 }
 
 fn main() {
+    tagged_scalars::check();
+    sparse_tags::run();
+    scalar_tags::run();
     trailing_underscores::run();
     uninhabited::run();
     drop(CustomDropEnum::First(DropTracer(1)));
