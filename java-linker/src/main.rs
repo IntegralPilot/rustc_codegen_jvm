@@ -57,6 +57,7 @@ mod reachability;
 #[cfg(test)]
 mod reachability_tests;
 mod split;
+mod split_bridges;
 #[cfg(test)]
 mod split_tests;
 #[cfg(test)]

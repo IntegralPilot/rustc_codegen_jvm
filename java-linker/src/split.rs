@@ -9,6 +9,7 @@ pub(crate) fn eligible(class: &ClassFile<'_>) -> bool {
         let name = name.to_string();
         name.contains("/mono/Mono_")
             || name.contains("/mono/MonoBucket_")
+            || jvm_compiler_core::classfile::names::codec_owner(&name)
     }) && class.fields.is_empty()
         && class.interfaces.is_empty()
         && !class.access_flags.contains(ClassAccessFlags::INTERFACE)
@@ -89,6 +90,12 @@ pub(crate) fn holders<'a>(
         }
     }
     if let Some(owner) = owner {
+        if jvm_compiler_core::classfile::names::codec_owner(&owner.to_string()) {
+            // Keep reflective codec lookup on the original owner after moving method bodies.
+            let mut root = class_file_from_data(&output[0].data)?;
+            crate::split_bridges::retain_codec_surface(&mut root, &moves)?;
+            output[0].data = serialize_class_file(&root)?;
+        }
         relocations.insert(owner, moves);
     }
     Ok(output)
