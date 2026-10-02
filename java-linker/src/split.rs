@@ -7,7 +7,8 @@ pub(crate) type Relocations = HashMap<JavaString, HashMap<(JavaString, JavaStrin
 pub(crate) fn eligible(class: &ClassFile<'_>) -> bool {
     class.class_name().is_ok_and(|name| {
         let name = name.to_string();
-        name.contains("/mono/Mono_") || name.contains("/mono/MonoBucket_")
+        name.contains("/mono/Mono_")
+            || name.contains("/mono/MonoBucket_")
     }) && class.fields.is_empty()
         && class.interfaces.is_empty()
         && !class.access_flags.contains(ClassAccessFlags::INTERFACE)
@@ -30,62 +31,7 @@ pub(crate) fn eligible(class: &ClassFile<'_>) -> bool {
         })
 }
 
-fn compact(source: &ClassFile<'static>, methods: &[usize], owner: &str) -> io::Result<ClassInfo> {
-    let mut pool = ConstantPool::default();
-    let this_class = pool
-        .add_class(owner)
-        .map_err(|e| constant_pool_error("split class name", e))?;
-    let super_class = pool
-        .add_class("java/lang/Object")
-        .map_err(|e| constant_pool_error("split superclass", e))?;
-    let mut constants = constant_pool_index(&pool);
-    let mut bootstrap = Vec::new();
-    let indexes = ConstantImporter::new(source, &mut pool, &mut constants, &mut bootstrap);
-    let methods = methods
-        .iter()
-        .map(|&i| {
-            let mut method = source.methods[i].clone();
-            method.name_index = indexes.remap(method.name_index)?;
-            method.descriptor_index = indexes.remap(method.descriptor_index)?;
-            // References from sibling pieces must still be able to call helpers.
-            method
-                .access_flags
-                .remove(MethodAccessFlags::PRIVATE | MethodAccessFlags::PROTECTED);
-            method.access_flags.insert(MethodAccessFlags::PUBLIC);
-            for attribute in &mut method.attributes {
-                remap_attribute(attribute, &indexes)?;
-            }
-            Ok(method)
-        })
-        .collect::<io::Result<Vec<_>>>()?;
-    drop(indexes);
-    let mut attributes = Vec::new();
-    if !bootstrap.is_empty() {
-        let name_index = pool
-            .add_utf8("BootstrapMethods")
-            .map_err(|e| constant_pool_error("split bootstrap name", e))?;
-        attributes.push(Attribute::BootstrapMethods {
-            name_index,
-            methods: bootstrap,
-        });
-    }
-    let class = ClassFile {
-        version: source.version.clone(),
-        constant_pool: pool,
-        access_flags: ClassAccessFlags::PUBLIC
-            | ClassAccessFlags::SUPER
-            | ClassAccessFlags::SYNTHETIC,
-        this_class,
-        super_class,
-        methods,
-        attributes,
-        ..Default::default()
-    };
-    Ok(ClassInfo {
-        jar_entry_name: format!("{owner}.class"),
-        data: serialize_class_file(&class)?,
-    })
-}
+pub(crate) use crate::compact::class as compact;
 
 pub(crate) fn holders<'a>(
     sources: impl IntoIterator<Item = &'a ClassFile<'static>>,

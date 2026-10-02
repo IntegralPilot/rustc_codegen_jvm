@@ -568,6 +568,60 @@ fn bundle_fragment(class: &[u8]) -> Vec<u8> {
     out
 }
 
+#[test]
+fn binary_resources_survive_archives_and_reject_conflicting_payloads() {
+    use jvm_compiler_core::classfile::resources::{BUNDLE_PREFIX, Resource};
+    let directory = tempdir().unwrap();
+    let resource = Resource::new(vec![0, 255, 128, 17]);
+    let name = format!("{BUNDLE_PREFIX}{}", resource.name);
+    let bundle = |payload: &[u8]| {
+        let class = bundle_fragment(&abstract_class_with_method("value"));
+        let mut out = CLASS_BUNDLE_MAGIC.to_vec();
+        out.extend((name.len() as u32).to_le_bytes());
+        out.extend((payload.len() as u64).to_le_bytes());
+        out.extend(name.as_bytes());
+        out.extend(payload);
+        out.extend_from_slice(&class[CLASS_BUNDLE_MAGIC.len()..]);
+        out
+    };
+    let mut archive = b"!<arch>\n".to_vec();
+    ar_member(&mut archive, "one.jvmbundle/", &bundle(&resource.bytes));
+    ar_member(&mut archive, "two.jvmbundle/", &bundle(&resource.bytes));
+    let path = directory.path().join("input.rlib");
+    std::fs::write(&path, archive).unwrap();
+    let output = directory.path().join("output.jar");
+    crate::pipeline::link(
+        &[],
+        &[],
+        &[path.to_str().unwrap().into()],
+        &[],
+        output.to_str().unwrap(),
+    )
+    .unwrap();
+    let previous = std::fs::read(&output).unwrap();
+    let mut jar = ZipArchive::new(File::open(&output).unwrap()).unwrap();
+    let mut bytes = Vec::new();
+    jar.by_name(&resource.name)
+        .unwrap()
+        .read_to_end(&mut bytes)
+        .unwrap();
+    assert_eq!(bytes, resource.bytes);
+    assert_eq!(jar.len(), 3);
+    drop(jar);
+    let bad = directory.path().join("bad.jvmbundle");
+    std::fs::write(&bad, bundle(&[1, 2, 3, 4])).unwrap();
+    let error = crate::pipeline::link(
+        &[],
+        &[bad.to_str().unwrap().into()],
+        &[path.to_str().unwrap().into()],
+        &[],
+        output.to_str().unwrap(),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("conflicting binary constant"));
+    assert_eq!(std::fs::read(output).unwrap(), previous);
+}
+
 fn ar_member(out: &mut Vec<u8>, name: &str, bytes: &[u8]) {
     out.extend(
         format!(

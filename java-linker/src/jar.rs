@@ -29,8 +29,10 @@ impl Batch {
         let mut bytes = 0;
         for class in classes {
             let class = class?;
-            count += 1;
-            bytes += class.data.len();
+            if class.jar_entry_name.ends_with(".class") {
+                count += 1;
+                bytes += class.data.len();
+            }
             zip.start_file(class.jar_entry_name, options())?;
             zip.write_all(&class.data)?;
         }

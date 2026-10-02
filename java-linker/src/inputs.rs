@@ -1,6 +1,5 @@
 use crate::*;
 
-use jvm_compiler_core::classfile::summary;
 use std::io::SeekFrom;
 
 #[derive(Clone, Copy, Debug)]
@@ -13,8 +12,11 @@ pub(crate) struct Fragment {
 #[derive(Debug)]
 pub(crate) struct Group {
     pub(crate) name: String,
+    pub(crate) resource: bool,
+    pub(crate) demand: u32,
     pub(crate) fragments: Vec<Fragment>,
     pub(crate) bytes: usize,
+    pub(crate) carrier: Option<Vec<u8>>,
 }
 
 /// The linker retains byte ranges, not all input archives and class bodies.
@@ -25,6 +27,16 @@ pub(crate) struct Index {
     pub(crate) mains: HashSet<String>,
     positions: HashMap<String, usize>,
     scratch: Vec<u8>,
+    demands: reachability::Graph,
+    pub(crate) dead_methods: HashMap<String, HashSet<(JavaString, JavaString)>>,
+    pub(crate) pruned_resources: usize,
+    pub(crate) packable: HashMap<String, crate::packing::Candidate>,
+    pub(crate) share_carriers: bool,
+    pub(crate) aliases: crate::aliases::Aliases,
+    pub(crate) compact_carriers: bool,
+    pub(crate) private_classes: HashSet<String>,
+    pub(crate) occupied_packages: HashSet<String>,
+    pub(crate) short_methods: HashMap<Vec<u8>, Vec<u8>>,
 }
 
 fn invalid(message: impl Into<String>) -> io::Error {
@@ -84,22 +96,47 @@ impl Index {
         name: Option<String>,
     ) -> io::Result<()> {
         let len = usize::try_from(len).map_err(|_| invalid("class exceeds host address space"))?;
-        reader.seek(SeekFrom::Start(offset))?;
-        self.scratch.resize(len, 0);
-        reader.read_exact(&mut self.scratch)?;
-        let summary = summary::read(&self.scratch)?;
-        if summary.has_main {
-            self.mains.insert(summary.name.clone());
-        }
-        let name = name.unwrap_or(summary.name) + ".class";
+        let resource = name
+            .as_deref()
+            .and_then(|n| n.strip_prefix(jvm_compiler_core::classfile::resources::BUNDLE_PREFIX));
+        let (name, resource, demand, carrier) = if let Some(resource) = resource {
+            if !jvm_compiler_core::classfile::resources::valid_name(resource) {
+                return Err(invalid("invalid binary constant resource name"));
+            }
+            (
+                resource.to_owned(),
+                true,
+                self.demands.resource(resource),
+                None,
+            )
+        } else {
+            reader.seek(SeekFrom::Start(offset))?;
+            self.scratch.resize(len, 0);
+            reader.read_exact(&mut self.scratch)?;
+            let (summary, demand) = self.demands.scan(&self.scratch, false)?;
+            if summary.has_main {
+                self.mains.insert(summary.name.clone());
+            }
+            (
+                name.unwrap_or(summary.name) + ".class",
+                false,
+                demand,
+                summary.carrier,
+            )
+        };
         let next = self.groups.len();
         let &mut position = self.positions.entry(name.clone()).or_insert(next);
         if position == next {
             self.groups.push(Group {
                 name,
+                resource,
+                demand,
                 fragments: Vec::new(),
                 bytes: 0,
+                carrier,
             });
+        } else if self.groups[position].carrier != carrier {
+            self.groups[position].carrier = None;
         }
         let group = &mut self.groups[position];
         group.bytes = group
@@ -108,6 +145,37 @@ impl Index {
             .ok_or_else(|| invalid("class group size overflow"))?;
         group.fragments.push(Fragment { file, offset, len });
         Ok(())
+    }
+
+    pub(crate) fn retain_demanded(&mut self, libraries: &[String]) -> io::Result<usize> {
+        if self.mains.is_empty() {
+            self.demands = reachability::Graph::default();
+            return Ok(0);
+        }
+        self.demands.libraries(libraries)?;
+        let live = std::mem::take(&mut self.demands).finish(true);
+        let before_classes = self.groups.iter().filter(|g| !g.resource).count();
+        let before_resources = self.groups.len() - before_classes;
+        self.groups.retain(|g| live.classes[g.demand as usize]);
+        self.dead_methods = live.dead_methods;
+        self.aliases = live.aliases;
+        self.packable = live.packable;
+        self.share_carriers = live.share_carriers;
+        self.compact_carriers = live.compact_carriers;
+        self.private_classes = live.private_classes;
+        self.occupied_packages = live.occupied_packages;
+        self.short_methods = live.short_methods;
+        for group in &mut self.groups {
+            if live
+                .pinned_classes
+                .contains(group.name.trim_end_matches(".class"))
+            {
+                group.carrier = None;
+            }
+        }
+        let after_classes = self.groups.iter().filter(|g| !g.resource).count();
+        self.pruned_resources = before_resources - (self.groups.len() - after_classes);
+        Ok(before_classes - after_classes)
     }
 
     fn bundle(
@@ -133,6 +201,7 @@ impl Index {
             let name = String::from_utf8(name).map_err(|e| invalid(e.to_string()))?;
             self.record(reader, file, data_start, byte_len, Some(name))?;
             offset = data_end;
+            reader.seek(SeekFrom::Start(offset))?;
         }
         Ok(())
     }

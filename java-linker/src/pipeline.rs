@@ -12,7 +12,7 @@ pub(crate) fn link(
     libraries: &[String],
     output: &str,
 ) -> io::Result<()> {
-    let index = Index::collect(classes, bundles, archives)?;
+    let mut index = Index::collect(classes, bundles, archives)?;
     if index.groups.is_empty() && libraries.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -29,7 +29,38 @@ pub(crate) fn link(
     }
     let mut metrics =
         LinkerMetrics::enabled().then(|| LinkerMetrics::from_index(&index, libraries));
-    let namespaces = namespaces::Namespaces::collect(index.groups.iter().map(|g| g.name.as_str()));
+    let mut namespaces =
+        namespaces::Namespaces::collect(index.groups.iter().map(|g| g.name.as_str()));
+    let pruned = index.retain_demanded(libraries)?;
+    if let Some(metrics) = &mut metrics {
+        metrics.pruned_classes = pruned;
+        metrics.forwarding_methods = index.aliases.values().map(HashMap::len).sum();
+        metrics.pruned_resources = index.pruned_resources;
+    }
+    let plan = packing::Plan::build(&mut index);
+    // Release proof recipes before loading class bodies.
+    for group in &mut index.groups {
+        group.carrier = None;
+    }
+    if let Some(metrics) = &mut metrics {
+        metrics.packed_owners = plan.units.iter().map(|u| u.groups.len() - 1).sum();
+        metrics.shared_carriers = plan.shared_carriers;
+        metrics.pruned_methods = plan
+            .units
+            .iter()
+            .flat_map(|unit| &unit.groups)
+            .filter_map(|&group| {
+                index
+                    .dead_methods
+                    .get(index.groups[group].name.trim_end_matches(".class"))
+            })
+            .map(HashSet::len)
+            .sum();
+    }
+    namespaces.pack(plan.names);
+    namespaces.aliases = std::mem::take(&mut index.aliases);
+    namespaces.short_methods = std::mem::take(&mut index.short_methods);
+    namespaces.strip_proofs = index.share_carriers;
     let output = Path::new(output);
     let parent = output
         .parent()
@@ -47,11 +78,11 @@ pub(crate) fn link(
     let readers = Readers::open(&index)?;
     let relocations = std::sync::Mutex::new(split::Relocations::default());
     let mut start = 0;
-    while start < index.groups.len() {
+    while start < plan.units.len() {
         let mut end = start;
         let mut bytes = 0usize;
-        while end < index.groups.len() && end - start < BATCH_CLASSES {
-            let next = index.groups[end].bytes;
+        while end < plan.units.len() && end - start < BATCH_CLASSES {
+            let next = plan.units[end].bytes;
             if end > start && next > BATCH_BYTES.saturating_sub(bytes) {
                 break;
             }
@@ -61,18 +92,12 @@ pub(crate) fn link(
         // A single oversized class group is indivisible. All other live input
         // bytes are bounded by BATCH_BYTES, independent of the whole program.
         let chunk = (end - start).div_ceil(rayon::current_num_threads()).max(1);
-        let merged = index.groups[start..end]
+        let merged = plan.units[start..end]
             .par_chunks(chunk)
-            .map(|groups| {
-                jar::Batch::encode(groups.iter().flat_map(|group| {
-                    let result = readers.load(&index.paths, group).and_then(|fragments| {
-                        merge_group_with_relocations(fragments, Some(&relocations))
-                    });
-                    match result {
-                        Ok(classes) => classes
-                            .into_iter()
-                            .map(|class| namespaces.class(class))
-                            .collect::<Vec<_>>(),
+            .map(|units| {
+                jar::Batch::encode(units.iter().flat_map(|unit| {
+                    match merge_unit(unit, &index, &readers, &namespaces, &relocations) {
+                        Ok(classes) => classes.into_iter().map(Ok).collect::<Vec<_>>(),
                         Err(error) => vec![Err(error)],
                     }
                 }))
@@ -103,4 +128,44 @@ pub(crate) fn link(
         }
     }
     Ok(())
+}
+
+fn merge_unit(
+    unit: &packing::Unit,
+    index: &Index,
+    readers: &Readers,
+    namespaces: &namespaces::Namespaces,
+    relocations: &std::sync::Mutex<split::Relocations>,
+) -> io::Result<Vec<ClassInfo>> {
+    let mut output = Vec::new();
+    for &position in &unit.groups {
+        let group = &index.groups[position];
+        let fragments = readers.load(&index.paths, group)?;
+        if group.resource {
+            let mut fragments = fragments.into_iter();
+            let data = fragments.next().expect("resource has a fragment");
+            if fragments.any(|fragment| fragment.data != data.data) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("conflicting binary constant {}", group.name),
+                ));
+            }
+            return Ok(vec![data]);
+        }
+        let classes = merge_group_with_demands(
+            fragments,
+            Some(relocations),
+            index
+                .dead_methods
+                .get(group.name.trim_end_matches(".class")),
+        )?;
+        for class in classes {
+            output.push(namespaces.class(class)?);
+        }
+    }
+    if unit.groups.len() > 1 {
+        merge_group_with_demands(output, Some(relocations), None)
+    } else {
+        Ok(output)
+    }
 }

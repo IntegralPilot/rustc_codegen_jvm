@@ -34,6 +34,12 @@ pub(crate) struct LinkerMetrics {
     pub(crate) duplicate_fragments: usize,
     pub(crate) top_duplicate_classes: Vec<DuplicateClassMetric>,
     pub(crate) merged_classes: usize,
+    pub(crate) pruned_classes: usize,
+    pub(crate) pruned_methods: usize,
+    pub(crate) forwarding_methods: usize,
+    pub(crate) pruned_resources: usize,
+    pub(crate) packed_owners: usize,
+    pub(crate) shared_carriers: usize,
     pub(crate) merged_class_bytes: usize,
     pub(crate) library_jars: usize,
     pub(crate) library_jar_bytes: u64,
@@ -55,6 +61,12 @@ impl LinkerMetrics {
             duplicate_fragments: 0,
             top_duplicate_classes: Vec::new(),
             merged_classes: 0,
+            pruned_classes: 0,
+            pruned_methods: 0,
+            forwarding_methods: 0,
+            pruned_resources: 0,
+            packed_owners: 0,
+            shared_carriers: 0,
             merged_class_bytes: 0,
             library_jars: input_jar_files.len(),
             library_jar_bytes: input_jar_files
@@ -88,7 +100,7 @@ impl LinkerMetrics {
     }
 
     pub(crate) fn from_index(index: &inputs::Index, libraries: &[String]) -> Self {
-        let groups = &index.groups;
+        let groups: Vec<_> = index.groups.iter().filter(|g| !g.resource).collect();
         let mut duplicates = groups
             .iter()
             .filter(|g| g.fragments.len() > 1)
@@ -108,6 +120,12 @@ impl LinkerMetrics {
             duplicate_fragments: groups.iter().map(|g| g.fragments.len() - 1).sum(),
             top_duplicate_classes: duplicates,
             merged_classes: 0,
+            pruned_classes: 0,
+            pruned_methods: 0,
+            forwarding_methods: 0,
+            pruned_resources: 0,
+            packed_owners: 0,
+            shared_carriers: 0,
             merged_class_bytes: 0,
             library_jars: libraries.len(),
             library_jar_bytes: libraries
@@ -131,7 +149,7 @@ impl LinkerMetrics {
         let path = directory.join(format!("{}-linker.json", std::process::id()));
         let mut writer = BufWriter::new(fs::File::create(&path)?);
         writeln!(writer, "{{")?;
-        writeln!(writer, "  \"schema_version\": 2,")?;
+        writeln!(writer, "  \"schema_version\": 4,")?;
         writeln!(writer, "  \"kind\": \"linker_work_metrics\",")?;
         writeln!(writer, "  \"pid\": {},", std::process::id())?;
         writeln!(writer, "  \"output_jar\": {},", json_string(output_jar))?;
@@ -157,6 +175,16 @@ impl LinkerMetrics {
             self.duplicate_fragments
         )?;
         writeln!(writer, "  \"merged_classes\": {},", self.merged_classes)?;
+        writeln!(writer, "  \"pruned_classes\": {},", self.pruned_classes)?;
+        writeln!(writer, "  \"pruned_methods\": {},", self.pruned_methods)?;
+        writeln!(
+            writer,
+            "  \"forwarding_methods\": {},",
+            self.forwarding_methods
+        )?;
+        writeln!(writer, "  \"pruned_resources\": {},", self.pruned_resources)?;
+        writeln!(writer, "  \"packed_owners\": {},", self.packed_owners)?;
+        writeln!(writer, "  \"shared_carriers\": {},", self.shared_carriers)?;
         writeln!(
             writer,
             "  \"merged_class_bytes\": {},",
