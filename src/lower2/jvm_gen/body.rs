@@ -16,13 +16,15 @@ pub(in crate::lower2) struct BodyEmitter<'a> {
     pub next_factory: &'a mut usize,
     pub owner: &'a str,
     pub kind: BodyOwner,
-    pub relative_methods: &'a HashSet<oomir::FunctionKey>,
     pub debug: DebugInfoOptions,
     pub context: &'a oomir::construct::Context,
 }
 
 impl BodyEmitter<'_> {
-    pub fn emit_owned(&mut self, function: oomir::Function) -> jvm::Result<()> {
+    pub fn emit_owned(&mut self, mut function: oomir::Function) -> jvm::Result<()> {
+        function
+            .owner_class
+            .get_or_insert_with(|| self.owner.to_owned());
         let function = oomir::construct::seal(function, self.context).map_err(|message| {
             jvm::Error::VerificationError {
                 context: "SSA construction".into(),
@@ -81,32 +83,13 @@ impl BodyEmitter<'_> {
         let outlined = !interface && name.starts_with(oomir::outline::METHOD_PREFIX);
         let is_static = module_owner || function.signature.is_static;
         let signature = &function.signature;
-        let relative_adapter = !module_owner
-            && name.ends_with(oomir::RELATIVE_POINTER_METHOD_SUFFIX)
-            && signature.supports_relative_pointer_abi();
-        let relative_static = is_static
-            && self
-                .relative_methods
-                .contains(&oomir::FunctionKey::new(self.owner, name, signature));
-        let relative = relative_adapter || relative_static;
         let body = &function.body;
-        let code =
-            crate::lower2::select::compile(body, self.cp, self.bootstrap, self.debug, relative)
-                .map_err(|error| jvm::Error::VerificationError {
-                    context: format!("Function {}::{name}", self.owner),
-                    message: format!("Failed to translate function: {error:?}"),
-                })?;
+        let code = crate::lower2::select::compile(body, self.cp, self.bootstrap, self.debug)
+            .map_err(|error| jvm::Error::VerificationError {
+                context: format!("Function {}::{name}", self.owner),
+                message: format!("Failed to translate function: {error:?}"),
+            })?;
         crate::metrics::record_selection_method(body, &code, || format!("{}::{name}", self.owner));
-        let emitted_signature = if relative {
-            Cow::Owned(signature.relative_pointer_abi_signature())
-        } else {
-            Cow::Borrowed(signature)
-        };
-        let emitted_name = if relative_static {
-            Cow::Owned(format!("{name}{}", oomir::RELATIVE_POINTER_METHOD_SUFFIX))
-        } else {
-            Cow::Borrowed(name)
-        };
         let mut attributes = vec![Attribute::Code {
             name_index: self.cp.add_utf8("Code")?,
             max_stack: code.max_stack,
@@ -115,9 +98,9 @@ impl BodyEmitter<'_> {
             exception_table: code.exceptions,
             attributes: code.attributes,
         }];
-        if !outlined && (interface || name != "<init>") {
+        if self.debug.local_variables && !outlined && (interface || name != "<init>") {
             let mut parameters = Vec::new();
-            for (name, ty) in emitted_signature.explicit_jvm_params() {
+            for (name, ty) in signature.explicit_jvm_params() {
                 if ty.has_jvm_value() {
                     parameters.push(jvm::attributes::MethodParameter {
                         name_index: self.cp.add_utf8(name)?,
@@ -130,10 +113,7 @@ impl BodyEmitter<'_> {
                 parameters,
             });
         }
-        let instance_bridge = !module_owner
-            && !signature.is_static
-            && !signature.params.is_empty()
-            && !relative_adapter;
+        let instance_bridge = !module_owner && !signature.is_static && !signature.params.is_empty();
         // Enum-interface static calls select the nominal implementation. These
         // remaining generated computational bodies still need that static entry.
         let static_code = (interface && instance_bridge).then(|| attributes[0].clone());
@@ -149,20 +129,11 @@ impl BodyEmitter<'_> {
         };
         self.methods.push(jvm::Method {
             access_flags,
-            name_index: self.cp.add_utf8(emitted_name.as_ref())?,
-            descriptor_index: self.cp.add_utf8(emitted_signature.to_string())?,
+            name_index: self.cp.add_utf8(name)?,
+            descriptor_index: self.cp.add_utf8(signature.to_string())?,
             attributes,
         });
-        if relative_static {
-            self.methods.push(create_relative_pointer_bridge(
-                self.cp,
-                self.owner,
-                name,
-                signature,
-                access_flags,
-                interface,
-            )?);
-        }
+
         if let Some(code) = static_code {
             let mut signature = signature.clone();
             signature.is_static = true;

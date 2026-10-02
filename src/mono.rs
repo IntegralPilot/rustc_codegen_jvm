@@ -88,17 +88,19 @@ pub(super) fn place_or_insert_mono_function<'tcx>(
                 };
                 receiver_self != container_ty
             });
-            // The method may be monomorphized in a downstream crate. Emit a
-            // receiver-class fragment there so the linker can attach it to the
-            // upstream class definition rather than leaving only a static copy.
-            let self_oomir_ty = lower1::types::force_define_named_adt(
-                container_ty,
-                tcx,
-                &mut oomir_module.data_types,
-                instance,
-            );
-
-            if !has_arbitrary_self_receiver && let Type::Class(class_name) = self_oomir_ty {
+            let receiver_surface = matches!(container_ty.kind(), TyKind::Coroutine(..))
+                || matches!(container_ty.kind(), TyKind::Adt(def, args)
+                    if lower1::types::adt_class_kind(tcx, def, args) == oomir::ClassKind::JavaValue);
+            if receiver_surface
+                && !has_arbitrary_self_receiver
+                && lower1::types::enum_carrier(container_ty, tcx).is_none()
+                && let Type::Class(class_name) = lower1::types::force_define_named_adt(
+                    container_ty,
+                    tcx,
+                    &mut oomir_module.data_types,
+                    instance,
+                )
+            {
                 let can_extend_compiled_core_class = lower1::jvm_names::uses_compiled_core(tcx)
                     && (instance.def_id().is_local()
                         || lower1::jvm_names::compiles_external_core_instances(tcx));

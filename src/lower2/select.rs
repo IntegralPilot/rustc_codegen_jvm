@@ -7,7 +7,6 @@ pub(crate) fn compile(
     constant_pool: &mut InternedConstantPool,
     bootstrap_methods: &mut Vec<BootstrapMethod>,
     debug_info: DebugInfoOptions,
-    relative_pointer_abi: bool,
 ) -> jvm::Result<MethodCode> {
     static VERIFY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     struct Constants<'a>(&'a [oomir::Constant]);
@@ -49,7 +48,6 @@ pub(crate) fn compile(
             } else {
                 None
             },
-            relative_pointer_abi,
             bootstrap: Some(bootstrap_methods),
             constants: Some(&Constants(&body.constants)),
             debug: if debug_info.local_variables {

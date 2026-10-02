@@ -4,9 +4,7 @@ use super::jvm_names;
 use rustc_attr_ir::lang_items::LangItem;
 use rustc_hir::def::DefKind;
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
-use rustc_middle::ty::{
-    GenericArg, Instance, InstanceKind, ShimKind, TyCtxt, TyKind, TypeVisitableExt,
-};
+use rustc_middle::ty::{GenericArg, Instance, InstanceKind, ShimKind, TyCtxt, TyKind};
 use rustc_span::{def_id::DefId, sym};
 
 const MAX_MONO_FN_NAME_LEN: usize = 128;
@@ -151,6 +149,20 @@ pub fn parse_jvm_class_link_name(link_name: &str) -> Result<String, String> {
     Ok(class_name.to_string())
 }
 
+fn internal_instance(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
+    tcx.generics_of(def_id).requires_monomorphization(tcx)
+        || tcx.opt_associated_item(def_id).is_some()
+        || (matches!(tcx.def_kind(def_id), DefKind::Fn)
+            && !(tcx.visibility(def_id).is_public()
+                && crate::java_exports::is_exported(tcx, def_id))
+            // The launcher discovers the Rust entry point by its Java name.
+            && tcx.entry_fn(()).is_none_or(|(entry, _)| entry != def_id))
+        || matches!(
+            tcx.def_kind(tcx.parent(def_id)),
+            DefKind::Fn | DefKind::AssocFn | DefKind::Closure
+        )
+}
+
 pub fn mono_owner_class<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> String {
     let def_id = instance.def_id();
     // The runtime polls an async body through a carrier companion, independently of
@@ -161,19 +173,11 @@ pub fn mono_owner_class<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> St
             jvm_names::anonymous_class_for_args(tcx, def_id, instance.args, true)
         );
     }
-    if tcx.generics_of(def_id).requires_monomorphization(tcx) {
-        // Definition-crate ownership agrees across all downstream emitters.
+    if internal_instance(tcx, def_id) {
+        // Java receiver methods forward to private Rust implementations. The private ABI does not
+        // require boxed borrows.
         let identity = super::types::stable_instance_identity(tcx, def_id, instance.args);
         generic_mono_owner(tcx, def_id, &identity)
-    } else if let Some(trait_def_id) = tcx
-        .opt_associated_item(def_id)
-        .and_then(|item| item.trait_container(tcx))
-    {
-        // A Java interface carries its dynamically dispatched method, but
-        // monomorphized Rust default bodies are static functions. Put those
-        // bodies beside the trait in its module rather than generating a
-        // second class file for the interface name.
-        jvm_names::owner_class_for_function(tcx, trait_def_id)
     } else {
         jvm_names::owner_class_for_function(tcx, def_id)
     }
@@ -645,14 +649,7 @@ pub fn mono_fn_name_from_instance<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'t
     let base = jvm_names::method_for_function(tcx, instance.def_id());
     // Internal names identify the Rust definition and its substitutions.
     // Deriving a readable name must never construct carrier/codec bodies.
-    let internal = tcx
-        .generics_of(instance.def_id())
-        .requires_monomorphization(tcx)
-        || tcx.opt_associated_item(instance.def_id()).is_some()
-        || matches!(
-            tcx.def_kind(tcx.parent(instance.def_id())),
-            DefKind::Fn | DefKind::AssocFn | DefKind::Closure
-        );
+    let internal = internal_instance(tcx, instance.def_id());
     let mut method_name = if internal {
         let identity =
             super::types::stable_instance_identity(tcx, instance.def_id(), instance.args);
