@@ -13,19 +13,14 @@ pub(super) fn arith_offset<'tcx>(
     if !matches!(pointer_ty, oomir::Type::Pointer(_)) {
         panic!("arith_offset requires a pointer operand, found {pointer_ty:?}");
     }
-    instructions.push(oomir::Instruction::InvokeStatic {
+    instructions.push(oomir::Instruction::AddressOffset {
         dest: effective_dest.clone(),
-        class_name: oomir::POINTER_CLASS.to_string(),
-        method_name: "offset".to_string(),
-        method_ty: oomir::Signature {
-            params: vec![
-                ("pointer".to_string(), pointer_ty.clone()),
-                ("count".to_string(), oomir::Type::I64),
-            ],
-            ret: Box::new(oomir_output_type.clone()),
-            is_static: true,
-        },
-        args: vec![oomir_operands[0].clone(), oomir_operands[1].clone()],
+        source: oomir_operands[0].clone(),
+        count: oomir_operands[1].clone(),
+        ty: oomir_output_type.clone(),
+        bytes: false,
+        wrapping: false,
+        subtract: false,
     });
 }
 pub(super) fn raw_eq<'tcx>(

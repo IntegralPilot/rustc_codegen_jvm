@@ -20,14 +20,44 @@ pub(super) fn concrete<'tcx>(
     resolved_receiver_mir_ty: Ty<'tcx>,
     is_pointer_null_method: bool,
     is_pointer_cast_method: bool,
-    receiver_self_requires_static_dispatch: bool,
-    uses_concrete_trait_default: bool,
     comparison_rhs_ty: Option<oomir::Type>,
     pointer_api_receiver: bool,
 ) {
     // The receiver is a concrete class - use InvokeVirtual
     let class_type =
         crate::lower1::types::ty_to_oomir_type(receiver_mir_ty, tcx, data_types, instance);
+    if pointer_api_receiver && matches!(class_type, oomir::Type::Pointer(_)) {
+        let wrapping = declared_method_name.starts_with("wrapping_");
+        let operation = declared_method_name
+            .strip_prefix("wrapping_")
+            .unwrap_or(&declared_method_name);
+        if matches!(
+            operation,
+            "add" | "sub" | "offset" | "byte_add" | "byte_sub" | "byte_offset"
+        ) {
+            instructions.push(oomir::Instruction::AddressOffset {
+                dest: effective_dest,
+                source: receiver_operand,
+                count: method_args[0].clone(),
+                ty: *method_signature.ret,
+                bytes: operation.starts_with("byte_"),
+                wrapping,
+                subtract: operation.ends_with("sub"),
+            });
+            return;
+        }
+    }
+    let receiver_value_ty = match resolved_receiver_mir_ty.kind() {
+        TyKind::Ref(_, pointee, _) => *pointee,
+        _ => resolved_receiver_mir_ty,
+    };
+    let primitive_slice_equality = match receiver_value_ty.kind() {
+        TyKind::Slice(element) | TyKind::Array(element, _) => matches!(
+            data_types.normalize(tcx, *element, instance).kind(),
+            TyKind::Bool | TyKind::Char | TyKind::Int(_) | TyKind::Uint(_)
+        ),
+        _ => false,
+    };
     let runtime_static_target = match &class_type {
         oomir::Type::Str if declared_method_name == "as_bytes" => {
             Some((oomir::UTF8_VIEW_CLASS.to_string(), "asSlice".to_string()))
@@ -64,6 +94,7 @@ pub(super) fn concrete<'tcx>(
         }
         oomir::Type::Slice(element)
             if declared_method_name == "starts_with"
+                && primitive_slice_equality
                 && matches!(element.as_ref(), oomir::Type::I8 | oomir::Type::U8) =>
         {
             Some((
@@ -73,6 +104,7 @@ pub(super) fn concrete<'tcx>(
         }
         oomir::Type::Slice(element)
             if declared_method_name == "starts_with"
+                && primitive_slice_equality
                 && matches!(
                     element.as_ref(),
                     oomir::Type::I32 | oomir::Type::U32 | oomir::Type::Char
@@ -83,10 +115,14 @@ pub(super) fn concrete<'tcx>(
                 "startsWithI32".to_string(),
             ))
         }
-        oomir::Type::Slice(_) if declared_method_name == "starts_with" => Some((
-            oomir::SLICE_VIEW_CLASS.to_string(),
-            "startsWith".to_string(),
-        )),
+        oomir::Type::Slice(_)
+            if declared_method_name == "starts_with" && primitive_slice_equality =>
+        {
+            Some((
+                oomir::SLICE_VIEW_CLASS.to_string(),
+                "startsWith".to_string(),
+            ))
+        }
         oomir::Type::Slice(_)
             if matches!(declared_method_name.as_str(), "as_ptr" | "as_mut_ptr") =>
         {
@@ -182,8 +218,7 @@ pub(super) fn concrete<'tcx>(
     let static_target = runtime_static_target
         .map(|(class_name, method_name)| (class_name, method_name, false))
         .or_else(|| {
-            (uses_concrete_trait_default
-                || receiver_self_requires_static_dispatch
+            (!matches!(func_instance.def, InstanceKind::Virtual(..))
                 || requires_compiled_static_dispatch(&class_type))
             .then(|| {
                 let target = data_types.function_name(tcx, func_instance);
@@ -278,6 +313,33 @@ pub(super) fn concrete<'tcx>(
         {
             static_signature.params.pop();
             static_args.pop();
+        }
+        if !generated_rust_target
+            && class_name == oomir::POINTER_CLASS
+            && matches!(static_method_name.as_str(), "fromSlice" | "retype")
+        {
+            let mut args = static_args.into_iter();
+            let source = args.next().expect("address source");
+            let layout = Box::new(oomir::AddressLayout {
+                pointer_type: *static_signature.ret,
+                size: args.next().expect("address size"),
+                codec: args.next().expect("address codec"),
+            });
+            assert!(args.next().is_none());
+            instructions.push(if static_method_name == "retype" {
+                oomir::Instruction::AddressRetype {
+                    dest: effective_dest,
+                    source,
+                    layout,
+                }
+            } else {
+                oomir::Instruction::ViewAddress {
+                    dest: effective_dest,
+                    source,
+                    layout,
+                }
+            });
+            return;
         }
         instructions.push(if generated_rust_target {
             oomir::Instruction::InvokeRustStatic {

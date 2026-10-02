@@ -144,15 +144,15 @@ pub(super) fn map_address<'tcx>(
             let closure_arg_oomir_ty =
                 crate::lower1::types::ty_to_oomir_type(closure_arg_ty, tcx, data_types, instance);
             let closure_tuple_dest = format!("{label}_map_addr_closure_tuple");
-            let closure_tuple_class = closure_arg_oomir_ty
-                .get_class_name()
-                .expect("FnOnce closure argument tuple is a JVM class")
-                .to_string();
-            instructions.push(oomir::Instruction::ConstructObject {
-                dest: closure_tuple_dest.clone(),
-                class_name: closure_tuple_class,
-                args: vec![(address_operand.clone(), oomir::Type::U64)],
-            });
+            crate::lower1::types::tuple_value(
+                closure_arg_ty,
+                vec![(address_operand.clone(), oomir::Type::U64)],
+                &closure_tuple_dest,
+                tcx,
+                data_types,
+                instance,
+                instructions,
+            );
 
             let captures = closure_args
                 .as_closure()

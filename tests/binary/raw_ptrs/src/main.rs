@@ -8,6 +8,8 @@ mod atomic_views;
 mod borrowed_slots;
 mod borrowed_union_gc;
 mod function_arrays;
+mod fixed_views;
+mod generic_copies;
 mod non_null_views;
 mod option_refs;
 mod ordering;
@@ -2422,6 +2424,7 @@ fn exposed_allocation_churn() {
 
 fn main() {
     ordering::check();
+    fixed_views::check();
     static_layout::run();
     option_refs::run();
     array_aliases::run();
@@ -2449,6 +2452,7 @@ fn main() {
     pointer_ordering();
     raw_pointer_binary_search();
     unaligned_volatile_and_bulk_memory();
+    generic_copies::check();
     non_null_views::check();
     aggregate_memory_layout();
     managed_reference_fields_have_memory_bits();
