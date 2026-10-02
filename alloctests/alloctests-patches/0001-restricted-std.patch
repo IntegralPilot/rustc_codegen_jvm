@@ -17,10 +17,9 @@ diff --git a/tests/lib.rs b/tests/lib.rs
  #![deny(unsafe_op_in_unsafe_fn)]
  #![feature(alloc_io)]
  #![feature(allocator_ext)]
-@@ -61,5 +62,6 @@
+@@ -61,4 +62,5 @@
  #![feature(vec_deque_retain_range)]
  #![feature(vec_peek_mut)]
- #![feature(vec_try_remove)]
 +#![feature(restricted_std)]
  #![feature(write_all_vectored)]
  // tidy-alphabetical-end

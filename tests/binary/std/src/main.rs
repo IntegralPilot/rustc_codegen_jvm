@@ -1,3 +1,5 @@
+#![feature(fs_home_dirs, fs_media_dirs)]
+
 use std::collections::{HashSet, hash_map::DefaultHasher};
 use std::env;
 use std::fs::{self, File, FileTimes, OpenOptions};
@@ -13,6 +15,7 @@ use std::time::{Duration, SystemTime};
 fn main() {
     test_arguments();
     test_environment();
+    test_user_directories();
     test_stdin();
     test_provided_trait_method_on_trait_object();
     test_read_exact_eof();
@@ -48,6 +51,19 @@ fn test_environment() {
     unsafe { env::remove_var(KEY) };
     assert!(env::var_os(KEY).is_none());
     assert!(!env::vars().any(|(key, _)| key == KEY));
+}
+
+fn test_user_directories() {
+    let path = PathBuf::from("/user/café");
+    let mut home = fs::HomeDirs::empty();
+    assert!(home.cache_home().is_none());
+    home.set_cache_home(path.clone());
+    assert_eq!(home.cache_home(), Some(path.as_path()));
+
+    let mut media = fs::MediaDirs::empty();
+    assert!(media.documents().is_none());
+    media.set_documents(path.clone());
+    assert_eq!(media.documents(), Some(path.as_path()));
 }
 
 fn test_stdin() {

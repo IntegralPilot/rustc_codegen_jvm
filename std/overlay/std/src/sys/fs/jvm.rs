@@ -9,7 +9,7 @@ use crate::sys::time::{SystemTime, UNIX_EPOCH};
 use crate::time::Duration;
 use crate::vec::Vec;
 
-pub use crate::sys::fs::common::{remove_dir_all, Dir};
+pub use crate::sys::fs::common::{remove_dir_all, Dir, ExtraHomeDirs, ExtraMediaDirs};
 
 const OPTION_READ: i32 = 1;
 const OPTION_WRITE: i32 = 1 << 1;

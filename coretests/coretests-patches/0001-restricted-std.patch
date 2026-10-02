@@ -7,7 +7,7 @@ diff --git a/lib.rs b/lib.rs
 diff --git a/tests/lib.rs b/tests/lib.rs
 --- a/tests/lib.rs
 +++ b/tests/lib.rs
-@@ -97,7 +97,8 @@
+@@ -101,7 +101,8 @@
  #![feature(pointer_is_aligned_to)]
  #![feature(portable_simd)]
  #![feature(ptr_metadata)]
@@ -16,8 +16,7 @@ diff --git a/tests/lib.rs b/tests/lib.rs
  #![feature(rustc_attrs)]
  #![feature(signed_bigint_helpers)]
  #![feature(slice_from_ptr_range)]
-@@ -128,6 +129,7 @@
- #![feature(unwrap_infallible)]
+@@ -133,5 +134,6 @@
  // tidy-alphabetical-end
  #![allow(internal_features)]
 +#![allow(unexpected_cfgs)]
