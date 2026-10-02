@@ -8,7 +8,7 @@ pub(crate) struct Writer {
 fn options() -> SimpleFileOptions {
     SimpleFileOptions::default()
         .compression_method(CompressionMethod::DEFLATE)
-        .compression_level(Some(1))
+        .compression_level(Some(9))
         .unix_permissions(0o644)
 }
 
