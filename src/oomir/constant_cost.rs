@@ -1,6 +1,7 @@
 //! Estimated constant emission work, shared by preparation and outlining.
 // A byte becomes one Latin-1 character, at most two modified UTF-8 bytes.
-pub(crate) const PACKED_BYTE_CHUNK: usize = 32767;
+pub(crate) const PACKED_BYTE_CHUNK: usize =
+    (u16::MAX as usize - jvm_compiler_core::classfile::names::LITERAL_STRING.len()) / 2;
 
 pub(crate) fn constant_byte(constant: &super::Constant) -> Option<u8> {
     match constant {
@@ -33,6 +34,7 @@ pub(crate) fn constant_instruction_cost(constant: &super::Constant) -> usize {
             cost.saturating_add(constant_instruction_cost(arg))
         }),
         C::FunctionPointer { .. } => 3,
+        C::FunctionHandle { .. } => 4,
         C::PointerAddress { .. } => 3,
         C::RepeatedBytePointer { .. } => 8,
         C::ByteArrayPointer { bytes, .. } => byte_array_cost(bytes.len()).saturating_add(8),
@@ -49,7 +51,11 @@ pub(crate) fn constant_instruction_cost(constant: &super::Constant) -> usize {
         | C::Boolean(_)
         | C::Char(_)
         | C::String(_)
+        | C::LiteralString(_)
         | C::Null(_) => 1,
+        C::Str(s) if !jvm_compiler_core::classfile::names::literal_fits(s) => {
+            byte_array_cost(s.len()).saturating_add(6)
+        }
         C::Str(_) => 2,
         C::Array(element_type, elements) | C::Slice(element_type, elements)
             if is_packed_byte_array(element_type, elements) =>

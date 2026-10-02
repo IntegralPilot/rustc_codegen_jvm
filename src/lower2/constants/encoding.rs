@@ -36,6 +36,42 @@ pub fn load_constant(
             instructions.push(JI::Dup);
             instructions.push(JI::Invokespecial(constructor));
         }
+        OC::FunctionHandle {
+            interface_name,
+            owner,
+            name,
+            descriptor,
+            interface,
+            ..
+        } => {
+            let signature = cp.add_class(interface_name)?;
+            let runtime = cp.add_class("org/rustlang/runtime/FunctionPointers")?;
+            let handles = cp.add_class("java/lang/invoke/MethodHandles")?;
+            let lookup = cp.add_method_ref(
+                handles,
+                "lookup",
+                "()Ljava/lang/invoke/MethodHandles$Lookup;",
+            )?;
+            let bind = cp.add_method_ref(
+                runtime,
+                "bind",
+                "(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/Class;Ljava/lang/invoke/MethodHandle;)Ljava/lang/Object;",
+            )?;
+            let owner = cp.add_class(owner)?;
+            let method = if *interface {
+                cp.add_interface_method_ref(owner, name, descriptor)?
+            } else {
+                cp.add_method_ref(owner, name, descriptor)?
+            };
+            let handle = cp.add_method_handle(jvm::ReferenceKind::InvokeStatic, method)?;
+            instructions.extend([
+                JI::Invokestatic(lookup),
+                JI::Ldc_w(signature),
+                JI::Ldc_w(handle),
+                JI::Invokestatic(bind),
+                JI::Checkcast(signature),
+            ]);
+        }
         OC::FactoryCall {
             owner_class,
             method_name,
@@ -254,6 +290,35 @@ pub fn load_constant(
         OC::F64(v) => instructions.push(get_double_const_instr(cp, *v)),
         OC::Boolean(v) => instructions.push(if *v { JI::Iconst_1 } else { JI::Iconst_0 }),
         OC::Char(v) => instructions.push(get_int_const_instr(cp, *v as i32)),
+        OC::Str(s) if !jvm::names::literal_fits(s) => {
+            // The JVM UTF-8 limit includes linker tags. Large Rust strings require byte resources.
+            let string = cp.add_class("java/lang/String")?;
+            instructions.extend([JI::New(string), JI::Dup]);
+            super::arrays::load_bytes(instructions, cp, s.as_bytes())?;
+            let charsets = cp.add_class("java/nio/charset/StandardCharsets")?;
+            instructions.push(JI::Getstatic(cp.add_field_ref(
+                charsets,
+                "UTF_8",
+                "Ljava/nio/charset/Charset;",
+            )?));
+            instructions.push(JI::Invokespecial(cp.add_method_ref(
+                string,
+                "<init>",
+                "([BLjava/nio/charset/Charset;)V",
+            )?));
+            // Repeated loads must share the same backing allocation as ldc strings.
+            instructions.push(JI::Invokevirtual(cp.add_method_ref(
+                string,
+                "intern",
+                "()Ljava/lang/String;",
+            )?));
+            let view = cp.add_class(oomir::UTF8_VIEW_CLASS)?;
+            instructions.push(JI::Invokestatic(cp.add_method_ref(
+                view,
+                "fromJavaString",
+                "(Ljava/lang/String;)Lorg/rustlang/runtime/Utf8View;",
+            )?));
+        }
         OC::Str(s) => {
             let index = cp.add_string(s)?;
             instructions.push(if let Ok(idx8) = u8::try_from(index) {
@@ -266,8 +331,12 @@ pub fn load_constant(
             let from_java = cp.add_method_ref(view_class, "fromJavaString", descriptor)?;
             instructions.push(JI::Invokestatic(from_java));
         }
-        OC::String(s) => {
-            let index = cp.add_name_string(s)?;
+        OC::String(s) | OC::LiteralString(s) => {
+            let index = if matches!(constant, OC::LiteralString(_)) {
+                cp.add_string(s)?
+            } else {
+                cp.add_name_string(s)?
+            };
             instructions.push(if let Ok(idx8) = u8::try_from(index) {
                 JI::Ldc(idx8)
             } else {

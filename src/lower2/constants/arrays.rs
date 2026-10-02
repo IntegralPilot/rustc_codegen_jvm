@@ -61,6 +61,10 @@ pub(super) fn load_array(
     element_type: &oomir::Type,
     elements: &[oomir::Constant],
 ) -> jvm::Result<()> {
+    if super::resources::eligible(cp, element_type, elements) {
+        append_empty_array(instructions, cp, element_type, elements.len())?;
+        return super::resources::fill(instructions, cp, element_type, elements);
+    }
     if oomir::is_packed_byte_array(element_type, elements) {
         append_empty_array(instructions, cp, element_type, elements.len())?;
         return fill_packed_bytes(instructions, cp, 0, elements.len(), |index| {
@@ -95,6 +99,9 @@ pub(super) fn load_bytes(
 ) -> jvm::Result<()> {
     if bytes.len() >= 32 {
         append_empty_array(instructions, cp, &oomir::Type::U8, bytes.len())?;
+        if super::resources::fill_bytes(instructions, cp, bytes)? {
+            return Ok(());
+        }
         return fill_packed_bytes(instructions, cp, 0, bytes.len(), |index| bytes[index]);
     }
     load_array_with(

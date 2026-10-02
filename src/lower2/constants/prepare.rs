@@ -5,7 +5,7 @@ pub(super) const MAX_INLINE_CONSTANT_INSTRUCTIONS: usize = 1_024;
 
 use crate::oomir::constant_instruction_cost;
 
-fn shared_pointer(constant: &oomir::Constant) -> bool {
+pub(super) fn shared_pointer(constant: &oomir::Constant) -> bool {
     // These already denote one stable CTFE allocation. Cache the materializer
     // too, so repeated loads do not build values which the runtime discards.
     // Tiny values need less bytecode inline than two factory methods. Include
@@ -38,7 +38,7 @@ fn shared_arrays(body: &oomir::SsaBody) -> Vec<bool> {
         let parent = match inst.op {
             Op::Reinterpret(value) | Op::Cast(value) => Some(value),
             Op::GetField { object, .. } => Some(object),
-            Op::ArrayGet { array, index } => {
+            Op::ArrayGet { array, index, .. } => {
                 pending.push(ir.resolve(index));
                 Some(array)
             }

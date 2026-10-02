@@ -23,6 +23,99 @@ pub(crate) fn read_constant_value_from_memory<'tcx>(
         .layout_of(pci)
         .map_err(|_| "Couldn't get layout.".to_string())?;
 
+    if let Some(layout) = crate::lower1::types::tagged_scalar(ty, tcx) {
+        let tag = read_constant_value_from_memory(
+            tcx,
+            allocation,
+            offset + Size::from_bytes(layout.tag_offset),
+            tcx.types.u64,
+            oomir_data_types,
+            instance,
+        )?;
+        let present = matches!(tag, oomir::Constant::U64(1));
+        let value = if present {
+            read_constant_value_from_memory(
+                tcx,
+                allocation,
+                offset + Size::from_bytes(layout.payload_offset),
+                layout.payload,
+                oomir_data_types,
+                instance,
+            )?
+        } else {
+            oomir::Constant::I64(0)
+        };
+        return Ok(oomir::Constant::Instance {
+            class_name: oomir::TAGGED_LONG_CLASS.into(),
+            params: vec![value, tag],
+            param_types: vec![oomir::Type::I64, oomir::Type::I64],
+        });
+    }
+    if let Some(scalar) = crate::lower1::types::value_scalar_ty(ty, tcx) {
+        return read_constant_value_from_memory(
+            tcx,
+            allocation,
+            offset,
+            scalar,
+            oomir_data_types,
+            instance,
+        );
+    }
+    if let Some(payload) = crate::lower1::types::transparent_payload(ty, tcx) {
+        return read_constant_value_from_memory(
+            tcx,
+            allocation,
+            offset,
+            payload.ty,
+            oomir_data_types,
+            instance,
+        );
+    }
+
+    if let Some(carrier) = crate::lower1::types::enum_carrier(ty, tcx) {
+        let payload = carrier.payload;
+        if !carrier.nullable {
+            return read_constant_value_from_memory(
+                tcx,
+                allocation,
+                offset,
+                payload,
+                oomir_data_types,
+                instance,
+            );
+        }
+        let scalar = allocation
+            .read_scalar(
+                &tcx.data_layout,
+                AllocRange {
+                    start: offset,
+                    // None initializes only the pointer word. Slice metadata can remain
+                    // uninitialized.
+                    size: tcx.data_layout.pointer_size(),
+                },
+                true,
+            )
+            .map_err(|error| format!("Failed to read nullable pointer: {error:?}"))?;
+        if let Scalar::Int(value) = scalar
+            && value.to_target_usize(tcx) == 0
+        {
+            return Ok(oomir::Constant::Null(ty_to_oomir_type(
+                payload,
+                tcx,
+                oomir_data_types,
+                instance,
+            )));
+        }
+        return read_constant_value_from_memory(
+            tcx,
+            allocation,
+            offset,
+            payload,
+            oomir_data_types,
+            instance,
+        );
+    }
+
     // A reference to a ZST can point at a zero-byte allocation, so there are
     // no bytes to decode. Reconstruct its nominal JVM value from the type.
     if layout.is_zst() {
@@ -415,7 +508,11 @@ pub(crate) fn read_constant_value_from_memory<'tcx>(
                             .then_some(value)
                             .into_iter()
                             .collect(),
-                        param_types: Vec::new(),
+                        param_types: field_oomir_ty
+                            .has_jvm_value()
+                            .then_some(field_oomir_ty)
+                            .into_iter()
+                            .collect(),
                         ty: oomir::Type::Class(class_name),
                     });
                 }

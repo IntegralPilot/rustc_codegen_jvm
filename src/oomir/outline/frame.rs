@@ -164,6 +164,7 @@ impl Frame {
         let value = b
             .emit(
                 Op::ArrayGet {
+                    native: true,
                     array: arrays[location.array],
                     index,
                 },
@@ -200,6 +201,7 @@ impl Frame {
         let index = integer(b, self.elements[0], location.index as i32);
         b.emit(
             Op::ArraySet {
+                native: true,
                 array: arrays[location.array],
                 index,
                 value,

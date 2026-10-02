@@ -12,6 +12,7 @@ fn packed_byte_constants_preserve_every_byte_and_array_ownership() {
         .collect();
     let mut cp = InternedConstantPool::default();
     let this_class = cp.add_class("PackedConstants").unwrap();
+    cp.set_resource_anchor(this_class);
     let super_class = cp.add_class("java/lang/Object").unwrap();
     let mut methods = Vec::new();
     let factory = factories::create_shared_array_factory(
@@ -19,6 +20,32 @@ fn packed_byte_constants_preserve_every_byte_and_array_ownership() {
         "PackedConstants",
         &oomir::Type::U8,
         &values,
+        &mut methods,
+        &mut 0,
+    )
+    .unwrap();
+    let nested = factories::create_constant_factory(
+        &mut cp,
+        "PackedConstants",
+        &oomir::Constant::SliceRef {
+            backing: Box::new(oomir::Constant::InternedPointer {
+                identity: "PackedConstants::nested".into(),
+                value: Box::new(oomir::Constant::Array(
+                    Box::new(oomir::Type::U8),
+                    values.clone(),
+                )),
+                array_backed: true,
+                allocation_size: length as u64,
+                offset: 0,
+                view_size: 1,
+                alignment: 1,
+                view_codec: Box::new(oomir::Constant::Null(oomir::Type::java_string())),
+                pointee: Box::new(oomir::Type::U8),
+            }),
+            element_type: Box::new(oomir::Type::U8),
+            offset: 1,
+            length: (length - 1) as u64,
+        },
         &mut methods,
         &mut 0,
     )
@@ -90,16 +117,22 @@ fn packed_byte_constants_preserve_every_byte_and_array_ownership() {
     )
     .unwrap();
     for name in [
-        "array", "signed", "bytes", "shared", "pointer", "scalar", "another",
+        "array", "signed", "bytes", "packed", "shared", "pointer", "scalar", "another", "nested",
     ] {
         let mut code = Vec::new();
         match name {
             "array" => arrays::load_array(&mut code, &mut cp, &oomir::Type::U8, &values),
             "signed" => arrays::load_array(&mut code, &mut cp, &oomir::Type::I8, &signed),
             "bytes" => arrays::load_bytes(&mut code, &mut cp, &bytes),
+            "packed" => {
+                let size = oomir::PACKED_BYTE_CHUNK * 2 + 1;
+                arrays::append_empty_array(&mut code, &mut cp, &oomir::Type::U8, size).unwrap();
+                arrays::fill_packed_bytes(&mut code, &mut cp, 0, size, |_| 255)
+            }
             "pointer" => load_constant(&mut code, &mut cp, &pointer),
             "scalar" => load_constant(&mut code, &mut cp, &scalar),
             "another" => load_constant(&mut code, &mut cp, &another),
+            "nested" => load_constant(&mut code, &mut cp, &nested),
             _ => load_constant(&mut code, &mut cp, &factory),
         }
         .unwrap();
@@ -111,6 +144,8 @@ fn packed_byte_constants_preserve_every_byte_and_array_ownership() {
             descriptor_index: cp
                 .add_utf8(if matches!(name, "pointer" | "scalar" | "another") {
                     "()Lorg/rustlang/runtime/Pointer;"
+                } else if name == "nested" {
+                    "()Lorg/rustlang/runtime/SliceView;"
                 } else {
                     "()[B"
                 })
@@ -125,6 +160,31 @@ fn packed_byte_constants_preserve_every_byte_and_array_ownership() {
             }],
         });
     }
+    for (name, value) in [
+        ("shortText", "\0😃é".repeat(100)),
+        ("longText", "\0😃é".repeat(15000)),
+    ] {
+        let mut code = Vec::new();
+        load_constant(&mut code, &mut cp, &oomir::Constant::Str(value)).unwrap();
+        code.push(Instruction::Areturn);
+        factories::add_constant_helper_method(
+            &mut cp,
+            &mut methods,
+            name,
+            "()Lorg/rustlang/runtime/Utf8View;",
+            0,
+            code,
+        )
+        .unwrap();
+        methods.last_mut().unwrap().access_flags =
+            MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC;
+    }
+    let resources = cp.take_resources();
+    assert!(!resources.is_empty());
+    assert!(
+        cp.len() < 256,
+        "binary payload leaked into the constant pool"
+    );
     let class = jvm::ClassFile {
         code_source_url: None,
         version: jvm::Version::Java8 { minor: 0 },
@@ -137,15 +197,23 @@ fn packed_byte_constants_preserve_every_byte_and_array_ownership() {
         methods,
         attributes: vec![],
     };
-    let mut encoded = Vec::new();
-    jvm::encode::class_file(&class, &mut encoded).unwrap();
     let directory = std::env::temp_dir().join(format!("rcj-packed-bytes-{}", std::process::id()));
     fs::create_dir_all(&directory).unwrap();
-    fs::write(directory.join("PackedConstants.class"), encoded).unwrap();
+    let jar = super::test_support::link(&directory, &class, resources);
     fs::write(directory.join("Run.java"), format!(r#"
 public class Run {{
     private static volatile Object sink;
     public static void main(String[] args) {{
+        String piece = "\0\uD83D\uDE03é";
+        if (!org.rustlang.runtime.Utf8View.toJavaString(PackedConstants.shortText()).equals(piece.repeat(100)))
+            throw new AssertionError("short text");
+        if (!org.rustlang.runtime.Utf8View.toJavaString(PackedConstants.longText()).equals(piece.repeat(15000)))
+            throw new AssertionError("long text");
+        if (PackedConstants.longText().array != PackedConstants.longText().array)
+            throw new AssertionError("long text identity");
+        byte[] packed = PackedConstants.packed();
+        if (packed.length != {packed_length}) throw new AssertionError("packed length");
+        for (byte b : packed) if (b != -1) throw new AssertionError("packed byte");
         byte[][] arrays = {{ PackedConstants.array(), PackedConstants.signed(), PackedConstants.bytes(), PackedConstants.shared() }};
         for (byte[] bytes : arrays) {{
             if (bytes.length != {length}) throw new AssertionError("length");
@@ -158,15 +226,26 @@ public class Run {{
         org.rustlang.runtime.Pointer pointer = PackedConstants.pointer();
         byte[] backing = (byte[]) pointer.backingArray();
         if (!java.util.Arrays.equals(backing, arrays[3])) throw new AssertionError("pointer contents");
+        org.rustlang.runtime.SliceView nested = PackedConstants.nested();
+        if (nested.offset != 1 || nested.length != {length} - 1
+                || !java.util.Arrays.equals((byte[]) ((org.rustlang.runtime.Pointer) nested.array).backingArray(), arrays[3]))
+            throw new AssertionError("nested pointer contents");
+        if (PackedConstants.nested().array != nested.array) throw new AssertionError("nested pointer identity");
         java.lang.management.ThreadMXBean bean = java.lang.management.ManagementFactory.getThreadMXBean();
         if (bean instanceof com.sun.management.ThreadMXBean) {{
             com.sun.management.ThreadMXBean allocations = (com.sun.management.ThreadMXBean) bean;
             if (allocations.isThreadAllocatedMemorySupported()) {{
                 allocations.setThreadAllocatedMemoryEnabled(true);
-                for (int i = 0; i < 32; i++) sink = PackedConstants.pointer();
+                for (int i = 0; i < 32; i++) {{
+                    sink = PackedConstants.pointer();
+                    sink = PackedConstants.nested();
+                }}
                 long thread = Thread.currentThread().getId();
                 long before = allocations.getThreadAllocatedBytes(thread);
-                for (int i = 0; i < 128; i++) sink = PackedConstants.pointer();
+                for (int i = 0; i < 128; i++) {{
+                    sink = PackedConstants.pointer();
+                    sink = PackedConstants.nested();
+                }}
                 long allocated = allocations.getThreadAllocatedBytes(thread) - before;
                 if (allocated > 1024 * 1024) throw new AssertionError("reconstructed cached pointer: " + allocated);
             }}
@@ -177,13 +256,13 @@ public class Run {{
             throw new AssertionError("colliding factory");
     }}
 }}
-"#)).unwrap();
+"#, packed_length = oomir::PACKED_BYTE_CHUNK * 2 + 1)).unwrap();
     let runtime = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("runtime/build/libs/runtime-0.1.0.jar");
     let result = Command::new("java")
         .arg("-Xverify:all")
         .arg("--class-path")
-        .arg(std::env::join_paths([&directory, &runtime]).unwrap())
+        .arg(std::env::join_paths([&jar, &directory, &runtime]).unwrap())
         .arg(directory.join("Run.java"))
         .output()
         .unwrap();
