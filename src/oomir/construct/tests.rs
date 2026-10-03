@@ -131,7 +131,11 @@ fn mutation_uses_its_typed_operand_when_a_temporary_name_is_reused() {
 }
 
 pub(super) fn empty_context() -> Context {
-    let module = oomir::Module {
+    Context::new(&empty_module())
+}
+
+pub(super) fn empty_module() -> oomir::Module {
+    oomir::Module {
         name: "test".into(),
         source_file: None,
         functions: HashMap::default(),
@@ -141,8 +145,7 @@ pub(super) fn empty_context() -> Context {
         shared_context: None,
         external_interfaces: HashSet::default(),
         statics: HashMap::default(),
-    };
-    Context::new(&module)
+    }
 }
 
 #[test]

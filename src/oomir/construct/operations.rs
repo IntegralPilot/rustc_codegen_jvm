@@ -6,8 +6,8 @@ impl Emission<'_> {
     pub(super) fn call(
         &mut self,
         owner: String,
-        name: String,
-        params: Vec<TypeId>,
+        mut name: String,
+        mut params: Vec<TypeId>,
         returns: TypeId,
         kind: CallKind,
         values: Vec<ValueId>,
@@ -53,6 +53,53 @@ impl Emission<'_> {
         }
         for (&value, &ty) in values[receiver..].iter().zip(&params) {
             args.push(self.adapt(value, ty)?);
+        }
+        if matches!(kind, CallKind::JvmStatic | CallKind::RustStatic)
+            && owner.contains("/mono/Mono_")
+            && params
+                .iter()
+                .any(|&ty| matches!(self.vocabulary.types.get(ty), Some(ir::Type::Class(_))))
+        {
+            let signature = oomir::Signature {
+                params: params
+                    .iter()
+                    .map(|&ty| (String::new(), source_type(&self.vocabulary.types, ty)))
+                    .collect(),
+                ret: Box::new(source_type(&self.vocabulary.types, returns)),
+                is_static: true,
+            };
+            if let Some(signature) = self.context.record_signature(&owner, &name, &signature) {
+                let mut expanded = Vec::new();
+                for (&value, &ty) in args.iter().zip(&params) {
+                    let source = source_type(&self.vocabulary.types, ty);
+                    if let Some(fields) = self.context.scalar_fields(&source) {
+                        for (name, member_ty) in fields {
+                            let member_ty = self.ty(member_ty);
+                            let field = self.builder.field(ir::FieldRef {
+                                owner: ty,
+                                name: name.clone(),
+                                ty: member_ty,
+                                is_static: false,
+                            });
+                            expanded.push(
+                                self.emit(
+                                    Op::GetField {
+                                        object: value,
+                                        field,
+                                    },
+                                    Some(member_ty),
+                                )
+                                .unwrap(),
+                            );
+                        }
+                    } else {
+                        expanded.push(value);
+                    }
+                }
+                args = expanded;
+                params = signature.params.iter().map(|(_, ty)| self.ty(ty)).collect();
+                name.push_str(RECORD_ENTRY);
+            }
         }
         let interface = kind == CallKind::Interface || self.context.interfaces.contains(&owner);
         let method = self.builder.method(MethodRef {

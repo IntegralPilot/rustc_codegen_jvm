@@ -25,6 +25,20 @@ impl BodyEmitter<'_> {
         function
             .owner_class
             .get_or_insert_with(|| self.owner.to_owned());
+        if let Some(signature) =
+            self.context
+                .record_signature(self.owner, &function.name, &function.signature)
+        {
+            self.methods.push(super::records::bridge(
+                self.cp,
+                self.context,
+                self.owner,
+                &function.name,
+                &function.signature,
+                &signature,
+            )?);
+            function.name.push_str(oomir::construct::RECORD_ENTRY);
+        }
         let function = oomir::construct::seal(function, self.context).map_err(|message| {
             jvm::Error::VerificationError {
                 context: "SSA construction".into(),

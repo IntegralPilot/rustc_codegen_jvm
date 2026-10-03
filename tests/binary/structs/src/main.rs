@@ -1,4 +1,5 @@
 mod packed_words;
+mod record_calls;
 mod positional_storage;
 mod primitive_fields;
 mod storage_shapes;
@@ -17,6 +18,7 @@ struct Outer<'a> {
 }
 
 fn main() {
+    record_calls::run();
     primitive_fields::run();
     packed_words::run();
     stored_fields::run();

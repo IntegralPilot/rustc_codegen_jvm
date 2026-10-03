@@ -56,7 +56,8 @@ pub mod api {
 #[jvm_codegen::export]
 pub fn upstream(mut value: export_provider::Shared) -> export_provider::Shared {
     value.add(export_provider::internal_value(export_provider::Internal {
-        value: 2,
+        value: 1,
+        extra: 1,
     }));
     value
 }

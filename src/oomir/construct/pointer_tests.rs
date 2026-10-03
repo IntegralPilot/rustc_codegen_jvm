@@ -64,6 +64,7 @@ fn semantic_field_projection_keeps_layout_and_guards_erased_owners() {
                 members: vec![("value".into(), Type::U32)],
                 direct,
                 split_borrows: false,
+                scalar_record: false,
             },
         );
         let sealed = seal(function, &context).unwrap();
@@ -173,6 +174,7 @@ fn sized_aggregate_comparisons_use_locations_but_dst_keeps_its_carrier() {
                 members: vec![("value".into(), Type::U32)],
                 direct,
                 split_borrows: false,
+                scalar_record: false,
             },
         );
         let sealed = seal(function, &context).unwrap();

@@ -19,6 +19,8 @@ mod operations;
 #[cfg(test)]
 mod pointer_tests;
 mod pointers;
+mod records;
+pub(crate) use records::RECORD_ENTRY;
 mod types;
 #[cfg(test)]
 mod view_tests;
@@ -49,8 +51,19 @@ pub(crate) fn seal(function: oomir::Function, context: &Context) -> Result<oomir
             let _ = std::fs::write(path, format!("{function:#?}"));
         }
     }
+    let record_signature = function.name.strip_suffix(RECORD_ENTRY).and_then(|name| {
+        context.record_signature(
+            function.owner_class.as_deref().unwrap_or(""),
+            name,
+            &function.signature,
+        )
+    });
+    let physical_signature = record_signature
+        .clone()
+        .unwrap_or_else(|| function.signature.clone());
     let mut vocabulary = Vocabulary::default();
     vocabulary.signature(&function.signature);
+    vocabulary.signature(&physical_signature);
     for variable in &function.debug_variables {
         vocabulary.add(&variable.ty);
     }
@@ -175,9 +188,27 @@ pub(crate) fn seal(function: oomir::Function, context: &Context) -> Result<oomir
         if !ty.has_jvm_value() {
             continue;
         }
-        let value = emission
-            .builder
-            .parameter(emission.builder.current(), vocabulary.id(ty));
+        let value = if let Some(fields) = context
+            .scalar_fields(ty)
+            .filter(|_| record_signature.is_some())
+        {
+            let oomir::Type::Class(owner) = ty else {
+                unreachable!()
+            };
+            let args = fields
+                .iter()
+                .map(|(_, ty)| {
+                    emission
+                        .builder
+                        .parameter(emission.builder.current(), vocabulary.id(ty))
+                })
+                .collect();
+            emission.construct(owner.clone(), fields, args)?
+        } else {
+            emission
+                .builder
+                .parameter(emission.builder.current(), vocabulary.id(ty))
+        };
         emission.write(&format!("param_{index}"), value)?;
         let synthetic_main = function.name == "main"
             && index == 0
@@ -286,10 +317,10 @@ pub(crate) fn seal(function: oomir::Function, context: &Context) -> Result<oomir
         .owner_class
         .as_deref()
         .is_some_and(|owner| context.component_method(owner, &function.name))
-        .then(|| function.signature.component_signature());
+        .then(|| physical_signature.component_signature());
     let component_entry = component_signature
         .as_ref()
-        .is_some_and(|s| s != &function.signature);
+        .is_some_and(|s| s != &physical_signature);
     jvm_compiler_core::opt::promote_fields(&mut ir, &vocabulary.types);
     // Cell promotion precedes component analysis. Otherwise, hidden borrows can force unnecessary
     // carriers.
@@ -398,7 +429,7 @@ pub(crate) fn seal(function: oomir::Function, context: &Context) -> Result<oomir
     Ok(oomir::Function {
         name: function.name,
         owner_class: function.owner_class,
-        signature: component_signature.unwrap_or(function.signature),
+        signature: component_signature.unwrap_or(physical_signature),
         debug_variables: Vec::new(),
         body: Arc::new(oomir::SsaBody {
             ir,

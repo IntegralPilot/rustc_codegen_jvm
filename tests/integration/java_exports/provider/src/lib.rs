@@ -16,9 +16,10 @@ impl Shared {
 
 pub struct Internal {
     pub value: i32,
+    pub extra: i32,
 }
 
 #[inline(never)]
 pub fn internal_value(value: Internal) -> i32 {
-    value.value
+    value.value + value.extra
 }

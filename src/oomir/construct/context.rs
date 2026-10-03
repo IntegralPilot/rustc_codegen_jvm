@@ -6,6 +6,7 @@ pub(super) struct FieldLayout {
     pub members: Vec<(String, oomir::Type)>,
     pub direct: bool,
     pub split_borrows: bool,
+    pub scalar_record: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -100,6 +101,17 @@ impl Context {
                                 .filter(|(_, ty)| ty.has_jvm_value())
                                 .cloned()
                                 .collect(),
+                            scalar_record: *kind == oomir::ClassKind::Value
+                                && !name.starts_with("org/rustlang/runtime/")
+                                && (2..=4).contains(
+                                    &fields.iter().filter(|(_, ty)| ty.has_jvm_value()).count(),
+                                )
+                                && fields.iter().filter(|(_, ty)| ty.has_jvm_value()).all(
+                                    |(_, ty)| {
+                                        oomir::scalar::scalar_type(ty).is_some()
+                                            && !ty.is_jvm_reference_type()
+                                    },
+                                ),
                             direct: *kind != oomir::ClassKind::MemoryView,
                             split_borrows: *kind == oomir::ClassKind::Value
                                 && oomir::fields::split_borrows(fields),

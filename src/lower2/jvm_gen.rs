@@ -1,5 +1,6 @@
 //! Class assembly and shared JVM method recipes.
 mod body;
+mod records;
 pub(super) use body::{BodyEmitter, BodyOwner};
 mod constructors;
 mod enum_shapes;

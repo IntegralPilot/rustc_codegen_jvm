@@ -59,7 +59,7 @@ impl Emission<'_> {
         }
         Ok(None)
     }
-    fn construct(
+    pub(super) fn construct(
         &mut self,
         owner: String,
         fields: &[(String, oomir::Type)],
