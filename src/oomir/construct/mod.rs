@@ -298,6 +298,7 @@ pub(crate) fn seal(function: oomir::Function, context: &Context) -> Result<oomir
             .map_err(|e| format!("{}: cell promotion: {e}", function.name))?;
     }
     if debug.locals.is_empty() {
+        jvm_compiler_core::opt::lower_owned_reads(&mut ir, &vocabulary.types);
         ir = jvm_compiler_core::opt::promote_aggregates(ir, &vocabulary.types, |method| {
             let fields = &context.fields.get(&method.owner)?.members;
             let owner = vocabulary.id(&oomir::Type::Class(method.owner.clone()));

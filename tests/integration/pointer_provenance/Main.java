@@ -8,6 +8,9 @@ public class Main {
         CellArrayViews.check();
         SliceAliases.check();
         MemoryViews.check();
+        if (pointer_provenance.pointer_provenance.owned_slice_elements() != 26) {
+            throw new AssertionError("slice element copies changed their source or each other");
+        }
         AtomicViews.check();
         AtomicLocations.check();
         RangeCodecs.check();

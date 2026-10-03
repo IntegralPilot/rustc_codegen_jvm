@@ -975,7 +975,7 @@ pub(super) fn verify_types(inst: &Inst, body: &Body, types: &Types) -> Result<()
                 check!(result == Some(member.ty), "field load type mismatch");
             }
         }
-        Op::ViewGet(parts) | Op::ViewSet { parts, .. } => {
+        Op::ViewGet(parts) | Op::ViewGetCopy(parts) | Op::ViewSet { parts, .. } => {
             let parts = &body.args[parts.range()];
             check!(
                 parts.len() == 3
@@ -986,23 +986,18 @@ pub(super) fn verify_types(inst: &Inst, body: &Body, types: &Types) -> Result<()
                 "slice access requires backing, start and index"
             );
             check!(
-                matches!(inst.op, Op::ViewGet(_)) == result.is_some(),
+                matches!(inst.op, Op::ViewGet(_) | Op::ViewGetCopy(_)) == result.is_some(),
                 "slice access result mismatch"
             );
         }
-        Op::ArrayGet {
-            array,
-            index,
-            native,
-        }
-        | Op::ArraySet {
-            array,
-            index,
-            native,
-            ..
-        } => {
+        Op::ArrayGet { array, index, .. }
+        | Op::ArrayGetCopy { array, index }
+        | Op::ArraySet { array, index, .. } => {
             check!(
-                !native || matches!(types.get(ty(array)), Some(Type::Array(_))),
+                !matches!(
+                    inst.op,
+                    Op::ArrayGet { native: true, .. } | Op::ArraySet { native: true, .. }
+                ) || matches!(types.get(ty(array)), Some(Type::Array(_))),
                 "native scratch access requires a JVM array"
             );
             check!(
@@ -1010,7 +1005,8 @@ pub(super) fn verify_types(inst: &Inst, body: &Body, types: &Types) -> Result<()
                 "array index requires JVM int"
             );
             check!(
-                matches!(inst.op, Op::ArrayGet { .. }) == result.is_some(),
+                matches!(inst.op, Op::ArrayGet { .. } | Op::ArrayGetCopy { .. })
+                    == result.is_some(),
                 "array access result mismatch"
             );
         }

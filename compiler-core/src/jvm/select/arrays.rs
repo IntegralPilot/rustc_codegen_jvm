@@ -5,6 +5,7 @@ enum Access {
     Native,
     Array,
     View,
+    Owned,
 }
 
 impl Selector<'_> {
@@ -45,7 +46,7 @@ impl Selector<'_> {
             self.assembly.code.push(op);
             return Ok(true);
         }
-        if let Op::ViewGet(parts) | Op::ViewSet { parts, .. } = inst.op {
+        if let Op::ViewGet(parts) | Op::ViewGetCopy(parts) | Op::ViewSet { parts, .. } = inst.op {
             let [backing, start, index] = self.body.args[parts.range()] else {
                 return Err(error("slice access components"));
             };
@@ -72,7 +73,13 @@ impl Selector<'_> {
             self.array_access(
                 element,
                 value.is_some(),
-                if native { Access::Native } else { Access::View },
+                if matches!(inst.op, Op::ViewGetCopy(_)) {
+                    Access::Owned
+                } else if native {
+                    Access::Native
+                } else {
+                    Access::View
+                },
             )?;
             return Ok(true);
         }
@@ -82,6 +89,7 @@ impl Selector<'_> {
                 index,
                 native,
             } => (array, index, None, native),
+            Op::ArrayGetCopy { array, index } => (array, index, None, false),
             Op::ArraySet {
                 array,
                 index,
@@ -110,6 +118,9 @@ impl Selector<'_> {
             if let Some(value) = value {
                 self.argument(value)?;
                 self.write_memory(element)?;
+            } else if matches!(inst.op, Op::ArrayGetCopy { .. }) {
+                self.assembly.code.push(Instruction::Lconst_0);
+                self.read_object_address(element, true)?;
             } else {
                 self.read_memory(element)?;
             }
@@ -144,7 +155,9 @@ impl Selector<'_> {
         self.array_access(
             element,
             value.is_some(),
-            if native {
+            if matches!(inst.op, Op::ArrayGetCopy { .. }) {
+                Access::Owned
+            } else if native {
                 Access::Native
             } else if view || primitive {
                 Access::View
@@ -157,6 +170,20 @@ impl Selector<'_> {
 
     fn array_access(&mut self, element: TypeId, store: bool, access: Access) -> jvm::Result<()> {
         use ScalarType::*;
+        if access == Access::Owned {
+            let name = self.address_target(element)?;
+            let owner = self.cp.add_class(POINTER_CLASS)?;
+            let method = self.cp.add_method_ref(
+                owner,
+                "sliceGetObjectCopy",
+                "(Ljava/lang/Object;ILjava/lang/String;)Ljava/lang/Object;",
+            )?;
+            self.assembly.code.push(Instruction::Invokestatic(method));
+            self.assembly
+                .code
+                .push(Instruction::Checkcast(self.cp.add_class(&name)?));
+            return Ok(());
+        }
         let (suffix, descriptor, read, write) = match self.types.get(element) {
             Some(Type::Scalar(Bool)) => ("Boolean", "Z", Instruction::Baload, Instruction::Bastore),
             Some(Type::Scalar(I8 | U8)) => ("I8", "B", Instruction::Baload, Instruction::Bastore),

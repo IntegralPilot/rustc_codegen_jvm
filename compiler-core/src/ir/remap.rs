@@ -215,6 +215,10 @@ impl Op {
                 array: map.value(array),
                 index: map.value(index),
             },
+            ArrayGetCopy { array, index } => ArrayGetCopy {
+                array: map.value(array),
+                index: map.value(index),
+            },
             ArraySet {
                 array,
                 index,
@@ -241,6 +245,7 @@ impl Op {
                 value: map.value(value),
             },
             ViewGet(parts) => ViewGet(map.args(parts)),
+            ViewGetCopy(parts) => ViewGetCopy(map.args(parts)),
             ViewSet { parts, value } => ViewSet {
                 parts: map.args(parts),
                 value: map.value(value),

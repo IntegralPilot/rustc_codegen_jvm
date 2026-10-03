@@ -41,7 +41,11 @@ mod addresses_tests;
 
 mod aggregate_joins;
 mod aggregates;
+mod owned_reads;
 mod value_copies;
+pub use owned_reads::lower_owned_reads;
+#[cfg(test)]
+mod owned_reads_tests;
 pub use aggregates::promote_aggregates;
 #[cfg(test)]
 mod aggregates_tests;

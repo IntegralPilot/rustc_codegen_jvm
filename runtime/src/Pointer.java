@@ -11524,6 +11524,15 @@ public final class Pointer {
                 : ((Number) arrayGet(backing, index)).doubleValue();
     }
 
+    /** Read an owned element without registering a decoded memory view. */
+    public static Object sliceGetObjectCopy(Object backing, int index, String target) {
+        if (backing instanceof Pointer) {
+            Pointer storage = ((Pointer) backing).sliceElementView();
+            return loadStorageCopy(storage, Math.multiplyExact((long) index, storage.viewSize), target);
+        }
+        return copyManagedValue(independentRepeatedArrayElement(backing, index));
+    }
+
     public static Object sliceGetObject(Object backing, int index) {
         if (backing instanceof Object[]) {
             return independentRepeatedArrayElement(backing, index);

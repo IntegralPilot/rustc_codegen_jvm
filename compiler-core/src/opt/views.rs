@@ -188,9 +188,17 @@ pub fn decompose_views(body: &mut Body, types: &mut Types, debug: Option<&mut De
                 array,
                 index,
                 native: false,
-            } if components.get(array.index()).is_some_and(Option::is_some) => {
+            }
+            | Op::ArrayGetCopy { array, index }
+                if components.get(array.index()).is_some_and(Option::is_some) =>
+            {
                 let [root, start, _] = components[array.index()].unwrap();
-                Op::ViewGet(List::append(&mut body.args, [root, start, index]))
+                let parts = List::append(&mut body.args, [root, start, index]);
+                if matches!(inst.op, Op::ArrayGetCopy { .. }) {
+                    Op::ViewGetCopy(parts)
+                } else {
+                    Op::ViewGet(parts)
+                }
             }
             Op::ArraySet {
                 array,

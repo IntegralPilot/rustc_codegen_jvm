@@ -50,6 +50,34 @@ public final class MemoryViews {
     private static final String PAIR_CODEC =
             "MemoryViews$PairCodec#pair#LMemoryViews$Pair;";
 
+    private static void checkOwnedSliceElements() {
+        byte[] bytes = new byte[24];
+        MemoryBytes.write(bytes, 12, 4, 17);
+        Pointer slice = Pointer.array(bytes, 0, 1).byte_offset(4).retype(8, PAIR_CODEC);
+        Pair snapshot = (Pair) Pointer.sliceGetObjectCopy(slice, 1, Pair.class.getName());
+        if (snapshot.first != 17 || PairCodec.decodedStorage != bytes) {
+            throw new AssertionError("owned slice read used the wrong range or copied storage");
+        }
+        snapshot.first = 23;
+        if (slice.add(1).retype(4, null).getI32() != 17) {
+            throw new AssertionError("owned slice read created a live view");
+        }
+        Pair live = (Pair) Pointer.sliceGetObject(slice, 1);
+        live.first = 29;
+        Pair next = (Pair) Pointer.sliceGetObjectCopy(slice, 1, Pair.class.getName());
+        if (next.first != 29 || snapshot.first != 23) {
+            throw new AssertionError("owned slice read lost a pending write or changed a snapshot");
+        }
+        byte[][] arrays = {new byte[] {3, 5}};
+        byte[] copied = (byte[]) Pointer.sliceGetObjectCopy(arrays, 0, "[B");
+        copied[0] = 7;
+        if (arrays[0][0] != 3) throw new AssertionError("owned array element still aliases its source");
+        try {
+            Pointer.sliceGetObjectCopy(slice, 2, Pair.class.getName());
+            throw new AssertionError("owned slice read accepted an invalid byte window");
+        } catch (IndexOutOfBoundsException expected) { }
+    }
+
     public static void main(String[] args) {
         check();
     }
@@ -85,6 +113,7 @@ public final class MemoryViews {
         checkTypedCopies();
         checkPointerTypedStores();
         checkSliceComponents();
+        checkOwnedSliceElements();
         byte[] delayedBytes = new byte[8];
         Pointer delayed = Pointer.array(delayedBytes, 0, 1).retype(8, PAIR_CODEC);
         Pointer commit = Pointer.fromStorageLocation(delayed, 0);

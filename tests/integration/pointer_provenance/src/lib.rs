@@ -24,13 +24,38 @@ pub struct Pixel {
 }
 
 pub fn pixel_storage() -> *mut Pixel {
-    Box::into_raw(Box::new(Pixel { bytes: [1, 2, 3, 4] }))
+    Box::into_raw(Box::new(Pixel {
+        bytes: [1, 2, 3, 4],
+    }))
 }
 
 pub unsafe fn free_pixel(pointer: *mut Pixel) {
-    unsafe { drop(Box::from_raw(pointer)); }
+    unsafe {
+        drop(Box::from_raw(pointer));
+    }
 }
 
 pub fn first_word(words: [u32; 2]) -> u32 {
     words[0]
+}
+
+pub fn owned_slice_elements() -> i32 {
+    let mut pixels = std::hint::black_box(vec![
+        Pixel {
+            bytes: [1, 2, 3, 4]
+        };
+        3
+    ]);
+    let sum: i32 = pixels
+        .windows(2)
+        .map(|window| {
+            let mut left = window[0];
+            let right = window[1];
+            left.bytes[0] += 10;
+            i32::from(left.bytes[0]) + i32::from(right.bytes[0])
+        })
+        .sum();
+    let snapshot = std::hint::black_box(pixels[1]);
+    pixels[1].bytes[0] = 7;
+    sum + i32::from(snapshot.bytes[0]) + i32::from(pixels[0].bytes[0])
 }

@@ -257,6 +257,11 @@ pub enum Op {
         /// Compiler-owned ABI and outline scratch, inaccessible to Rust code.
         native: bool,
     },
+    /// Read an independent value without creating a borrowed element view.
+    ArrayGetCopy {
+        array: ValueId,
+        index: ValueId,
+    },
     ArraySet {
         array: ValueId,
         index: ValueId,
@@ -266,6 +271,7 @@ pub enum Op {
     },
     /// Slice access through [backing, start, index], without a view carrier.
     ViewGet(List),
+    ViewGetCopy(List),
     ViewSet {
         parts: List,
         value: ValueId,
@@ -519,6 +525,7 @@ impl Op {
             | Self::TaggedPack(list)
             | Self::ViewPack(list)
             | Self::ViewGet(list)
+            | Self::ViewGetCopy(list)
             | Self::AddressPack(list)
             | Self::LoadAddress(list)
             | Self::LoadAddressCopy(list)
@@ -547,7 +554,7 @@ impl Op {
                 visit(object);
                 visit(value);
             }
-            Self::ArrayGet { array, index, .. } => {
+            Self::ArrayGet { array, index, .. } | Self::ArrayGetCopy { array, index } => {
                 visit(array);
                 visit(index);
             }
