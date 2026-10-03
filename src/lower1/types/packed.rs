@@ -55,7 +55,11 @@ pub(crate) fn packed_word<'tcx>(ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) -> Option<Packe
         return None;
     }
     // Pointer identity, floats, padding and interior mutation are not words.
-    for ty in fields {
+    for &field in fields {
+        let mut ty = field;
+        while let TyKind::Pat(inner, _) = ty.kind() {
+            ty = *inner;
+        }
         if !matches!(
             ty.kind(),
             TyKind::Int(IntTy::I8 | IntTy::I16 | IntTy::I32 | IntTy::I64 | IntTy::Isize)

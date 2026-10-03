@@ -1,6 +1,124 @@
 //! Exact scalar and thin-address conversions need no generated codec or method.
 use crate::oomir::{self, Instruction, Operand, Type};
 
+pub(super) fn scalar_wrapper_transmute<'tcx>(
+    source: super::Ty<'tcx>,
+    target: super::Ty<'tcx>,
+    tcx: super::TyCtxt<'tcx>,
+    definitions: &mut crate::lower1::context::Definitions<'tcx>,
+    instance: rustc_middle::ty::Instance<'tcx>,
+) -> Option<Vec<Instruction>> {
+    use super::*;
+
+    fn path<'tcx>(
+        mut ty: Ty<'tcx>,
+        tcx: TyCtxt<'tcx>,
+        definitions: &mut crate::lower1::context::Definitions<'tcx>,
+        instance: rustc_middle::ty::Instance<'tcx>,
+    ) -> Option<(Type, Vec<(String, String, Type)>)> {
+        let mut fields = Vec::new();
+        for _ in 0..16 {
+            let inner = match ty.kind() {
+                TyKind::Bool
+                | TyKind::Char
+                | TyKind::Int(_)
+                | TyKind::Uint(_)
+                | TyKind::Float(_) => {
+                    return Some((ty_to_oomir_type(ty, tcx, definitions, instance), fields));
+                }
+                TyKind::Pat(inner, _) => {
+                    ty = *inner;
+                    continue;
+                }
+                TyKind::Adt(def, args)
+                    if def.is_struct() && def.non_enum_variant().fields.len() == 1 =>
+                {
+                    normalize_union_ty(
+                        tcx,
+                        def.non_enum_variant().fields[FieldIdx::from_usize(0)]
+                            .ty(tcx, args)
+                            .skip_norm_wip(),
+                    )
+                    .ok()?
+                }
+                TyKind::Tuple(elements) if elements.len() == 1 => elements[0],
+                _ => return None,
+            };
+            let layout = tcx
+                .layout_of(TypingEnv::fully_monomorphized().as_query_input(ty))
+                .ok()?;
+            if layout.fields.offset(0).bytes() != 0
+                || layout.size.bytes_usize() != layout_size_bytes(tcx, inner).ok()?
+            {
+                return None;
+            }
+            let outer = ty_to_oomir_type(ty, tcx, definitions, instance);
+            let nested = ty_to_oomir_type(inner, tcx, definitions, instance);
+            if outer != nested {
+                let Type::Class(owner) = outer else {
+                    return None;
+                };
+                let Some(DataType::Class {
+                    fields: members,
+                    kind: oomir::ClassKind::Value,
+                    is_abstract: false,
+                    ..
+                }) = definitions.get(&owner)
+                else {
+                    return None;
+                };
+                let [(name, field)] = members.as_slice() else {
+                    return None;
+                };
+                if *field != nested {
+                    return None;
+                }
+                fields.push((owner, name.clone(), nested));
+            }
+            ty = inner;
+        }
+        None
+    }
+
+    let (source_scalar, source_fields) = path(source, tcx, definitions, instance)?;
+    let (target_scalar, target_fields) = path(target, tcx, definitions, instance)?;
+    let mut instructions = Vec::new();
+    let mut value = Operand::Variable {
+        name: "_1".into(),
+        ty: source_fields
+            .first()
+            .map_or(source_scalar, |(owner, _, _)| Type::Class(owner.clone())),
+    };
+    for (index, (owner, name, ty)) in source_fields.into_iter().enumerate() {
+        let dest = format!("_scalar_source_{index}");
+        instructions.push(Instruction::GetField {
+            dest: dest.clone(),
+            object: value,
+            field_name: name,
+            field_ty: ty.clone(),
+            owner_class: owner,
+        });
+        value = Operand::Variable { name: dest, ty };
+    }
+    value = emit_direct_transmute(value, &target_scalar, "_scalar_bits", &mut instructions)?;
+    for (index, (owner, _, ty)) in target_fields.into_iter().rev().enumerate() {
+        let dest = format!("_scalar_target_{index}");
+        instructions.push(Instruction::ConstructObject {
+            dest: dest.clone(),
+            class_name: owner.clone(),
+            args: vec![(value, ty)],
+        });
+        value = Operand::Variable {
+            name: dest,
+            ty: Type::Class(owner),
+        };
+    }
+    instructions.push(Instruction::Return {
+        operand: Some(value),
+    });
+    Some(instructions)
+}
+
 pub(crate) fn emit_direct_transmute(
     source: Operand,
     target: &Type,

@@ -435,6 +435,14 @@ pub(crate) fn ensure_exact_transmute_helper<'tcx>(
                 operand: Some(operand_var(result, target_oomir_ty.clone())),
             },
         ]
+    } else if let Some(instructions) = super::bitcasts::scalar_wrapper_transmute(
+        source_ty,
+        target_ty,
+        tcx,
+        data_types,
+        instance_context,
+    ) {
+        instructions
     } else {
         let bytes_name = "_exact_bytes".to_string();
         let objects_name = "_exact_objects".to_string();
