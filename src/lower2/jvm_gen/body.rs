@@ -84,11 +84,17 @@ impl BodyEmitter<'_> {
         let is_static = module_owner || function.signature.is_static;
         let signature = &function.signature;
         let body = &function.body;
-        let code = crate::lower2::select::compile(body, self.cp, self.bootstrap, self.debug)
-            .map_err(|error| jvm::Error::VerificationError {
-                context: format!("Function {}::{name}", self.owner),
-                message: format!("Failed to translate function: {error:?}"),
-            })?;
+        let code = crate::lower2::select::compile(
+            Some(self.context),
+            body,
+            self.cp,
+            self.bootstrap,
+            self.debug,
+        )
+        .map_err(|error| jvm::Error::VerificationError {
+            context: format!("Function {}::{name}", self.owner),
+            message: format!("Failed to translate function: {error:?}"),
+        })?;
         crate::metrics::record_selection_method(body, &code, || format!("{}::{name}", self.owner));
         let mut attributes = vec![Attribute::Code {
             name_index: self.cp.add_utf8("Code")?,

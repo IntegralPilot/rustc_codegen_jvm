@@ -17,6 +17,15 @@ pub(crate) struct Context {
     parents: HashMap<String, Vec<String>>,
 }
 impl Context {
+    pub(crate) fn direct_copy(&self, owner: &str) -> bool {
+        !owner.starts_with("org/rustlang/runtime/")
+            && self.fields.get(owner).is_some_and(|layout| layout.direct)
+            && self
+                .parents
+                .get(owner)
+                .is_none_or(|parents| parents.iter().all(|parent| parent == "java/lang/Object"))
+    }
+
     pub(super) fn component_method(&self, owner: &str, name: &str) -> bool {
         oomir::component_method(owner, name)
             || (name == "call"

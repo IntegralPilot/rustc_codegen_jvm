@@ -107,6 +107,7 @@ pub(super) fn create_managed_copy_method(
     class_name: &str,
     fields: &[(String, Type)],
     split: bool,
+    context: &oomir::construct::Context,
 ) -> jvm::Result<jvm::Method> {
     let descriptor = "()Ljava/lang/Object;";
     let physical = if split {
@@ -144,13 +145,30 @@ pub(super) fn create_managed_copy_method(
         instructions.push(Instruction::Aload_0);
         instructions.push(Instruction::Getfield(field));
         if !matches!(field_ty, Type::Pointer(_)) && field_ty.is_jvm_reference_type() {
-            instructions.push(Instruction::Invokestatic(copy_managed_value));
+            let direct = match field_ty {
+                Type::Class(owner) if context.direct_copy(owner) => Some(owner),
+                _ => None,
+            };
+            let branch = if let Some(owner) = direct {
+                let owner = cp.add_class(owner)?;
+                let copy = cp.add_method_ref(owner, "rustCopy", "()Ljava/lang/Object;")?;
+                instructions.push(Instruction::Dup);
+                let branch = instructions.len();
+                instructions.extend([Instruction::Ifnull(0), Instruction::Invokevirtual(copy)]);
+                Some(branch)
+            } else {
+                instructions.push(Instruction::Invokestatic(copy_managed_value));
+                None
+            };
             instructions.extend(get_cast_instructions(
                 "rustCopy",
                 &object_type,
                 field_ty,
                 cp,
             )?);
+            if let Some(branch) = branch {
+                instructions[branch] = Instruction::Ifnull(instructions.len() as u16);
+            }
         }
     }
     instructions.push(Instruction::Invokespecial(constructor));

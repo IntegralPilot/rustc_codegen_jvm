@@ -213,6 +213,24 @@ impl Selector<'_> {
     }
 
     pub(super) fn copy_value(&mut self, ty: TypeId) -> jvm::Result<()> {
+        if let Some(Type::Class(symbol)) = self.types.get(ty)
+            && let Some(name) = self.types.symbol_name(symbol)
+            && self.direct_copy.is_some_and(|copy| copy(name))
+        {
+            let class = self.cp.add_class(name)?;
+            let method = self
+                .cp
+                .add_method_ref(class, "rustCopy", "()Ljava/lang/Object;")?;
+            let done = self.assembly.label();
+            self.assembly.code.push(Instruction::Dup);
+            self.assembly.branch(Instruction::Ifnull(0), done);
+            self.assembly.code.extend([
+                Instruction::Invokevirtual(method),
+                Instruction::Checkcast(class),
+            ]);
+            self.assembly.bind(done);
+            return Ok(());
+        }
         let owner = self.cp.add_class(POINTER_CLASS)?;
         let method = self.cp.add_method_ref(
             owner,

@@ -92,6 +92,7 @@ pub struct Options<'a> {
     pub verify: bool,
     pub lines: Option<&'a SourceLines>,
     pub constants: Option<&'a dyn Constants>,
+    pub direct_copy: Option<&'a dyn Fn(&str) -> bool>,
     pub debug: Option<&'a DebugInfo>,
     pub bootstrap: Option<&'a mut Vec<jvm::attributes::BootstrapMethod>>,
 }
@@ -117,6 +118,7 @@ struct Selector<'a> {
     aggregate_cache: Option<(ValueId, Option<ValueId>, TypeId)>,
     aggregate_slot: Option<u16>,
     constants: Option<&'a dyn Constants>,
+    direct_copy: Option<&'a dyn Fn(&str) -> bool>,
     bootstrap: Option<&'a mut Vec<jvm::attributes::BootstrapMethod>>,
 }
 
@@ -139,6 +141,7 @@ pub fn compile_with_options(
         verify,
         lines,
         constants,
+        direct_copy,
         debug,
         bootstrap,
     } = options;
@@ -180,6 +183,7 @@ pub fn compile_with_options(
         aggregate_cache: None,
         aggregate_slot: None,
         constants,
+        direct_copy,
         bootstrap,
     };
     for _ in &body.blocks {

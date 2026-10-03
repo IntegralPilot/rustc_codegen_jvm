@@ -160,6 +160,7 @@ pub(super) fn expand_flat_copies(
     if schemas.is_empty() {
         return;
     }
+    reuse_scalar_snapshots(body, types, &schemas);
     // Join non-null facts across all incoming values.
     // Each value changes from unseen to non-null to unknown at most once.
     let count = body.values.len();
@@ -284,6 +285,72 @@ pub(super) fn expand_flat_copies(
         if let Some(Terminator::Invoke { inst, .. }) = block.terminator {
             if let Some(prefix) = prefixes.remove(&inst) {
                 block.instructions.extend(prefix);
+            }
+        }
+    }
+}
+
+// Scalar field reads can use the source while no intervening operation can change it.
+fn reuse_scalar_snapshots(
+    body: &mut Body,
+    types: &Types,
+    schemas: &FxHashMap<TypeId, (MethodId, Vec<FieldRef>)>,
+) {
+    let mut positions = vec![None; body.instructions.len()];
+    for (block, data) in body.blocks.iter().enumerate() {
+        let mut epoch = 0;
+        for &id in &data.instructions {
+            positions[id.index()] = Some((block, epoch));
+            let inst = body.instructions[id.index()];
+            let read_only = match inst.op {
+                Op::CopyValue(source) => schemas.contains_key(&body.value_type(source)),
+                Op::GetField { field, .. } => schemas
+                    .get(&body.fields[field.index()].owner)
+                    .is_some_and(|(_, fields)| fields.contains(&body.fields[field.index()])),
+                _ => !inst.op.may_throw(body, types),
+            };
+            if !read_only {
+                epoch += 1;
+            }
+        }
+    }
+    let mut candidates = vec![None; body.values.len()];
+    for (index, inst) in body.instructions.iter().enumerate() {
+        if let Op::CopyValue(source) = inst.op {
+            if schemas.contains_key(&body.value_type(source)) && positions[index].is_some() {
+                candidates[inst.result.unwrap().index()] = Some(InstId::new(index));
+            }
+        }
+    }
+    let mut valid = vec![true; body.values.len()];
+    for (index, inst) in body.instructions.iter().enumerate() {
+        inst.op.visit_uses(&body.args, |value| {
+            let value = body.resolve(value);
+            if let Some(copy) = candidates[value.index()] {
+                valid[value.index()] &= positions[index] == positions[copy.index()]
+                    && matches!(inst.op, Op::GetField { object, field } if body.resolve(object) == value
+                        && schemas.get(&body.value_type(value)).is_some_and(|(_, fields)| fields.contains(&body.fields[field.index()])));
+            }
+        });
+    }
+    for block in &body.blocks {
+        block
+            .terminator
+            .unwrap()
+            .visit_uses(|value| valid[body.resolve(value).index()] = false);
+    }
+    for edge in &body.edges {
+        for &value in &edge.args {
+            valid[body.resolve(value).index()] = false;
+        }
+    }
+    for (value, copy) in candidates.into_iter().enumerate() {
+        if valid[value] {
+            if let Some(copy) = copy {
+                let Op::CopyValue(source) = body.instructions[copy.index()].op else {
+                    unreachable!()
+                };
+                body.instructions[copy.index()].op = Op::Reinterpret(source);
             }
         }
     }

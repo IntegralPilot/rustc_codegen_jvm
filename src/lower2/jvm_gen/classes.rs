@@ -136,6 +136,7 @@ pub(in crate::lower2) fn create_data_type_classfile_for_class(
             class_name_jvm,
             &fields,
             split_addresses,
+            context,
         )?);
     }
     let mut class_attributes = Vec::new();

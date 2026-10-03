@@ -621,3 +621,80 @@ fn nullable_or_nested_owned_copies_keep_the_general_operation() {
         crate::jvm::select::compile(&body, &types, &mut Default::default()).unwrap();
     }
 }
+
+#[test]
+fn scalar_copy_reads_share_only_without_intervening_mutation_or_escape() {
+    for mode in ["plain", "store", "call", "escape", "branch"] {
+        let mut types = Types::default();
+        types.intern(Type::Unit);
+        let int = types.scalar(ScalarType::I64);
+        let name = types.symbol("Pair");
+        let pair = types.intern(Type::Class(name));
+        let fields = vec![FieldRef {
+            owner: pair,
+            name: "a".into(),
+            ty: int,
+            is_static: false,
+        }];
+        let mut b = Builder::new(&types, int);
+        let input = b.parameter(b.current(), pair);
+        let zero = b.constant(int, Scalar::integer(ScalarType::I64, 0).unwrap());
+        construct(&mut b, pair, &fields, &[zero]);
+        let copy = b.emit(Op::CopyValue(input), Some(pair)).unwrap();
+        let field = b.field(fields[0].clone());
+        if mode == "store" {
+            b.emit(
+                Op::SetField {
+                    object: input,
+                    field,
+                    value: zero,
+                },
+                None,
+            );
+        }
+        if mode == "call" || mode == "escape" {
+            let method = b.method(MethodRef {
+                owner: "Opaque".into(),
+                name: "write".into(),
+                params: vec![pair],
+                returns: int,
+                interface: false,
+            });
+            let args = b.args([if mode == "escape" { copy } else { input }]);
+            b.emit(
+                Op::Call {
+                    method,
+                    kind: CallKind::JvmStatic,
+                    args,
+                },
+                Some(int),
+            );
+        }
+        if mode == "branch" {
+            let next = b.create_block();
+            b.jump(next, vec![]);
+            b.switch_to(next);
+        }
+        let value = b
+            .emit(
+                Op::GetField {
+                    object: copy,
+                    field,
+                },
+                Some(int),
+            )
+            .unwrap();
+        b.terminate(Terminator::Return(Some(value)));
+        let body =
+            promote_aggregates(b.finish().unwrap(), &types, |_| Some(fields.clone())).unwrap();
+        verify(&body, &types).unwrap();
+        assert_eq!(
+            body.instructions
+                .iter()
+                .any(|i| matches!(i.op, Op::CopyValue(_))),
+            mode != "plain",
+            "{mode}"
+        );
+        crate::jvm::select::compile(&body, &types, &mut Default::default()).unwrap();
+    }
+}

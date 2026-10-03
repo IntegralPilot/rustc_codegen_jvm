@@ -28,6 +28,7 @@ fn unreachable_does_not_construct_an_exception_or_message() {
     let sealed = seal(function, &empty_context()).unwrap();
     assert!(sealed.body.ir.instructions.is_empty());
     let code = crate::lower2::select::compile(
+        None,
         &sealed.body,
         &mut Default::default(),
         &mut vec![],
@@ -105,6 +106,7 @@ fn mutation_uses_its_typed_operand_when_a_temporary_name_is_reused() {
     assert!(sealed.body.debug.is_none());
     assert!(sealed.body.lines.is_none());
     let code = crate::lower2::select::compile(
+        None,
         &sealed.body,
         &mut Default::default(),
         &mut vec![],
@@ -271,6 +273,7 @@ fn promoted_pointer_cells_are_decomposed_before_selection() {
     );
     ir::verify(&body.ir, &body.types).unwrap();
     crate::lower2::select::compile(
+        None,
         body,
         &mut Default::default(),
         &mut vec![],

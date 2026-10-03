@@ -168,6 +168,7 @@ fn constructed_views_and_scalar_data_extraction_keep_components() {
         }
     }
     crate::lower2::select::compile(
+        None,
         body,
         &mut Default::default(),
         &mut vec![],

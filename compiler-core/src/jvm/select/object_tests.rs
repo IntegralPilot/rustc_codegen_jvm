@@ -276,3 +276,43 @@ fn field_projection_verifies_both_ends_of_the_pointer_view() {
             .contains("address space")
     );
 }
+
+#[test]
+fn exact_managed_copies_keep_null_and_unknown_types_on_their_original_paths() {
+    let mut types = Types::default();
+    let name = types.symbol("Pair");
+    let pair = types.intern(Type::Class(name));
+    let mut b = Builder::new(&types, pair);
+    let source = b.parameter(b.current(), pair);
+    let copied = b.emit(Op::CopyValue(source), Some(pair)).unwrap();
+    b.terminate(Terminator::Return(Some(copied)));
+    let body = b.finish().unwrap();
+    for known in [false, true] {
+        let mut pool = Default::default();
+        let code = compile_with_options(
+            &body,
+            &types,
+            &mut pool,
+            Options {
+                direct_copy: Some(&|owner| known && owner == "Pair"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let owner = pool.add_class("Pair").unwrap();
+        let copy = pool
+            .add_method_ref(owner, "rustCopy", "()Ljava/lang/Object;")
+            .unwrap();
+        assert_eq!(
+            code.instructions
+                .contains(&Instruction::Invokevirtual(copy)),
+            known
+        );
+        assert_eq!(
+            code.instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::Ifnull(_))),
+            known
+        );
+    }
+}

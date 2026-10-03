@@ -79,6 +79,7 @@ fn semantic_field_projection_keeps_layout_and_guards_erased_owners() {
             !direct
         );
         crate::lower2::select::compile(
+            None,
             &sealed.body,
             &mut Default::default(),
             &mut vec![],
