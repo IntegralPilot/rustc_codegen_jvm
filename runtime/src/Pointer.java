@@ -9468,7 +9468,7 @@ public final class Pointer {
             Pointer pointer = (Pointer) root;
             if (size > 0 && pointer.viewSize == size
                     && java.util.Objects.equals(codec, pointer.viewCodecClassName)
-                    && pointer.rareState == null && pointer.addressState == null
+                    && pointer.rareState == null && (pointer.addressState == null || offset == 0)
                     && pointer.isDirectAllocationView() && !mayHaveStructuralView(pointer.allocation)) {
                 Object value = loadObjectLocation(pointer, offset, target);
                 if (target != null && !target.isEmpty() || value == null || !value.getClass().isArray()) return value;
@@ -9591,6 +9591,7 @@ public final class Pointer {
         }
         if (root instanceof byte[]) return null;
         Pointer base = (Pointer) root;
+        if (base.allocation instanceof byte[] && base.rareState == null) return null;
         if (offset == 0) {
             Object direct = base.directAggregate(type);
             if (direct != null) return direct;
@@ -9862,6 +9863,9 @@ public final class Pointer {
         }
         if (root instanceof Pointer) {
             Pointer pointer = (Pointer) root;
+            if (pointer.allocation instanceof byte[] && pointer.addressState == null) {
+                return pointer.loadUnsignedAt(Math.addExact(pointer.byteOffset, offset), size);
+            }
             if (pointer.hasDirectPrimitiveArrayStorage()) {
                 return loadLocationBits(pointer.allocation, Math.addExact(pointer.byteOffset, offset), size);
             }

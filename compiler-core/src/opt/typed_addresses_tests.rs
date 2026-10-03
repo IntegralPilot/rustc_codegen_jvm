@@ -88,6 +88,7 @@ fn aggregate_slice_addresses_cross_calls_returns_and_fields_as_components() {
         is_static: false,
     });
     let projection = b.projection(PointerProjection {
+        parent: None,
         field,
         offset: 4,
         size: 4,

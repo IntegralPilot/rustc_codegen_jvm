@@ -262,6 +262,7 @@ fn projected_borrow_follows_replacement_of_private_aggregate_storage() {
             is_static: false,
         });
         let projection = b.projection(PointerProjection {
+            parent: None,
             field,
             offset: 0,
             size: 8,

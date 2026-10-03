@@ -238,6 +238,7 @@ fn field_projection_verifies_both_ends_of_the_pointer_view() {
         is_static: false,
     });
     let projection = b.projection(PointerProjection {
+        parent: None,
         field,
         offset: 8,
         size: 4,

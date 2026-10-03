@@ -88,6 +88,7 @@ fn references_to_stored_borrows_keep_their_enclosing_owner() {
             is_static: false,
         });
         let projection = builder.projection(PointerProjection {
+            parent: None,
             field,
             offset: 8,
             size: if view { 16 } else { 8 },

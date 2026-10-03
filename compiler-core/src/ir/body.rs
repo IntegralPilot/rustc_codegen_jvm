@@ -56,6 +56,7 @@ pub struct FieldRef {
 /// A field view preserves Rust byte layout and the runtime allocation identity.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct PointerProjection {
+    pub parent: Option<ProjectionId>,
     pub field: MemberId,
     pub offset: u64,
     pub size: u64,

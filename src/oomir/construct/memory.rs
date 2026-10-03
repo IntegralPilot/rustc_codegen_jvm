@@ -99,6 +99,7 @@ impl Emission<'_> {
                         is_static: false,
                     });
                     let projection = self.builder.projection(ir::PointerProjection {
+                        parent: None,
                         field,
                         offset,
                         size,

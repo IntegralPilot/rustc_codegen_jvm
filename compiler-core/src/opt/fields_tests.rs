@@ -22,6 +22,7 @@ fn owned_field_copies_keep_exception_edges_and_eliminate_address_carriers() {
                 is_static: false,
             });
             let projection = b.projection(PointerProjection {
+                parent: None,
                 field,
                 offset: 4,
                 size: 4,
@@ -111,6 +112,7 @@ fn project(
         is_static: false,
     });
     let projection = b.projection(PointerProjection {
+        parent: None,
         field,
         offset: 0,
         size: 8,
@@ -248,6 +250,7 @@ fn retyped_borrowed_fields_promote_only_with_the_original_exact_layout() {
                 is_static: false,
             });
             let projection = b.projection(PointerProjection {
+                parent: None,
                 field,
                 offset: 8,
                 size: 8,
@@ -336,6 +339,7 @@ fn field_storage_dispatch_preserves_forwarded_roots() {
             is_static: false,
         });
         let projection = b.projection(PointerProjection {
+            parent: None,
             field,
             offset: 8,
             size: 8,
@@ -413,6 +417,7 @@ fn aggregate_field_stores_reuse_storage_components_and_keep_handlers() {
         is_static: false,
     });
     let projection = b.projection(PointerProjection {
+        parent: None,
         field,
         offset: 4,
         size: 4,
@@ -442,4 +447,178 @@ fn aggregate_field_stores_reuse_storage_components_and_keep_handlers() {
         Some(Terminator::Invoke { inst, .. }) if matches!(body.instructions[inst.index()].op, Op::StoreStorageField { .. }))));
     assert!(!super::live(&body, &types).values[address.index()]);
     crate::jvm::select::compile(&body, &types, &mut Default::default()).unwrap();
+}
+
+#[test]
+fn field_lookup_reuse_stops_at_mutations_and_calls() {
+    for barrier in ["none", "store", "call"] {
+        let mut types = Types::default();
+        let (pointer, _, scalar) = layout(&mut types);
+        let Type::Pointer(owner) = types.get(pointer).unwrap() else {
+            unreachable!()
+        };
+        let unit = types.intern(Type::Unit);
+        let mut b = Builder::new(&types, scalar);
+        let base = b.parameter(b.current(), pointer);
+        let field = b.field(FieldRef {
+            owner,
+            name: "value".into(),
+            ty: scalar,
+            is_static: false,
+        });
+        let projection = b.projection(PointerProjection {
+            parent: None,
+            field,
+            offset: 8,
+            size: 8,
+            codec: None,
+        });
+        let first = b
+            .emit(Op::LoadField { base, projection }, Some(scalar))
+            .unwrap();
+        if barrier == "store" {
+            b.emit(
+                Op::StoreField {
+                    base,
+                    projection,
+                    value: first,
+                },
+                None,
+            );
+        } else if barrier == "call" {
+            let method = b.method(MethodRef {
+                owner: "Consumer".into(),
+                name: "mutate".into(),
+                params: vec![pointer],
+                returns: unit,
+                interface: false,
+            });
+            let args = b.args([base]);
+            b.emit(
+                Op::Call {
+                    method,
+                    kind: CallKind::JvmStatic,
+                    args,
+                },
+                None,
+            );
+        }
+        let second = b
+            .emit(Op::LoadField { base, projection }, Some(scalar))
+            .unwrap();
+        b.terminate(Terminator::Return(Some(second)));
+        let body = b.finish().unwrap();
+        let mut pool = crate::classfile::constant_pool::InternedConstantPool::default();
+        let code = crate::jvm::select::compile(&body, &types, &mut pool).unwrap();
+        let owner = pool.add_class("org/rustlang/runtime/Pointer").unwrap();
+        let lookup = pool
+            .add_method_ref(
+                owner,
+                "directAggregate",
+                "(Ljava/lang/Class;)Ljava/lang/Object;",
+            )
+            .unwrap();
+        use crate::classfile::attributes::Instruction;
+        let lookups = code
+            .instructions
+            .iter()
+            .filter(|i| **i == Instruction::Invokevirtual(lookup))
+            .count();
+        assert_eq!(
+            lookups,
+            match barrier {
+                "store" => 3,
+                "call" => 2,
+                _ => 1,
+            },
+            "{barrier}"
+        );
+    }
+}
+
+#[test]
+fn nested_field_reads_keep_nullable_fallback_and_exception_handler() {
+    let mut types = Types::default();
+    let scalar = types.scalar(ScalarType::I64);
+    let outer = types.symbol("Outer");
+    let outer = types.intern(Type::Class(outer));
+    let inner = types.symbol("Inner");
+    let inner = types.intern(Type::Class(inner));
+    let outer_ptr = types.intern(Type::Pointer(outer));
+    let inner_ptr = types.intern(Type::Pointer(inner));
+    let scalar_ptr = types.intern(Type::Pointer(scalar));
+    let mut b = Builder::new(&types, scalar);
+    let root = b.parameter(b.current(), outer_ptr);
+    let field = b.field(FieldRef {
+        owner: outer,
+        name: "inner".into(),
+        ty: inner,
+        is_static: false,
+    });
+    let parent = b.projection(PointerProjection {
+        parent: None,
+        field,
+        offset: 8,
+        size: 8,
+        codec: Some("InnerCodec".into()),
+    });
+    let base = b
+        .emit(
+            Op::Project {
+                base: root,
+                projection: parent,
+            },
+            Some(inner_ptr),
+        )
+        .unwrap();
+    let field = b.field(FieldRef {
+        owner: inner,
+        name: "value".into(),
+        ty: scalar,
+        is_static: false,
+    });
+    let child = b.projection(PointerProjection {
+        parent: None,
+        field,
+        offset: 0,
+        size: 8,
+        codec: None,
+    });
+    let address = b
+        .emit(
+            Op::Project {
+                base,
+                projection: child,
+            },
+            Some(scalar_ptr),
+        )
+        .unwrap();
+    let handler = b.create_block();
+    let value = b.invoke(Op::Load(address), Some(scalar), handler).unwrap();
+    b.terminate(Terminator::Return(Some(value)));
+    b.switch_to(handler);
+    b.terminate(Terminator::Rethrow);
+    let mut body = b.finish().unwrap();
+    promote_fields(&mut body, &types);
+    super::fold_field_paths(&mut body, &types);
+    verify(&body, &types).unwrap();
+    assert!(!super::live(&body, &types).values[base.index()]);
+    let ValueDef::Inst(load) = body.values[value.index()].def else {
+        panic!()
+    };
+    assert!(body.blocks.iter().any(|block| matches!(block.terminator,
+        Some(Terminator::Invoke { inst, .. }) if inst == load)));
+    let mut pool = Default::default();
+    let code = crate::jvm::select::compile(&body, &types, &mut pool).unwrap();
+    use crate::classfile::attributes::Instruction;
+    assert_eq!(
+        code.instructions
+            .iter()
+            .filter(|i| matches!(i, Instruction::Ifnull(_)))
+            .count(),
+        2
+    );
+    let owner = pool.add_class("Outer").unwrap();
+    let field = pool.add_field_ref(owner, "inner", "LInner;").unwrap();
+    assert!(code.instructions.contains(&Instruction::Getfield(field)));
 }

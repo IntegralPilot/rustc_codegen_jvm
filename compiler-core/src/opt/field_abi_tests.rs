@@ -75,6 +75,7 @@ fn stored_views_have_no_live_view_carriers() {
             });
             let loaded = if indirect {
                 let projection = b.projection(PointerProjection {
+                    parent: None,
                     field,
                     offset: 0,
                     size: 16,
@@ -146,6 +147,7 @@ fn check_stored_borrow(indirect: bool) {
     });
     let loaded = if indirect {
         let projection = b.projection(PointerProjection {
+            parent: None,
             field,
             offset: 0,
             size: 8,
@@ -229,6 +231,7 @@ fn split_field_components_share_resolution_only_before_the_next_effect() {
             is_static: false,
         });
         let projection = b.projection(PointerProjection {
+            parent: None,
             field,
             offset: 0,
             size: 16,

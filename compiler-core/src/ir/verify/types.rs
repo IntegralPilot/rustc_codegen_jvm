@@ -534,9 +534,38 @@ pub(super) fn verify_types(inst: &Inst, body: &Body, types: &Types) -> Result<()
                 .fields
                 .get(projection.field.index())
                 .ok_or_else(|| VerifyError("invalid projection field".into()))?;
+            let mut owner = field.owner;
+            let mut parent = projection.parent;
+            let mut depth = 0;
+            while let Some(id) = parent {
+                depth += 1;
+                check!(depth <= 32, "projection path cycle");
+                let previous = body
+                    .projections
+                    .get(id.index())
+                    .ok_or_else(|| VerifyError("invalid projection parent".into()))?;
+                let member = body
+                    .fields
+                    .get(previous.field.index())
+                    .ok_or_else(|| VerifyError("invalid projection parent field".into()))?;
+                check!(
+                    !member.is_static && member.ty == owner,
+                    "projection path type mismatch"
+                );
+                owner = member.owner;
+                parent = previous.parent;
+            }
             check!(
-                !field.is_static && types.pointee(ty(base)) == Some(field.owner),
+                !field.is_static && types.pointee(ty(base)) == Some(owner),
                 "projection owner mismatch"
+            );
+            check!(
+                projection.parent.is_none()
+                    || matches!(
+                        inst.op,
+                        Op::LoadField { .. } | Op::LoadFieldCopy { .. } | Op::LoadFieldPart { .. }
+                    ),
+                "projection paths require field reads"
             );
             if !matches!(inst.op, Op::Project { .. } | Op::LoadFieldCopy { .. }) {
                 check!(

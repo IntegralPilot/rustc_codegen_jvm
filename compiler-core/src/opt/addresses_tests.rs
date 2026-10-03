@@ -19,6 +19,7 @@ fn borrowed_scalar_fields_keep_their_aggregate_root_across_calls() {
         is_static: false,
     });
     let projection = b.projection(PointerProjection {
+        parent: None,
         field,
         offset: 4,
         size: 4,
@@ -280,6 +281,7 @@ fn aggregate_addresses_keep_layout_roots_through_calls_and_field_access() {
         is_static: false,
     });
     let projection = b.projection(PointerProjection {
+        parent: None,
         field,
         offset: 0,
         size: 8,

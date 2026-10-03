@@ -241,6 +241,7 @@ impl Remap for Extract<'_> {
     }
     fn projection(&mut self, id: ProjectionId) -> ProjectionId {
         let mut projection = self.source.ir.projections[id.index()].clone();
+        projection.parent = projection.parent.map(|parent| self.projection(parent));
         projection.field = self.field(projection.field);
         self.b.projection(projection)
     }

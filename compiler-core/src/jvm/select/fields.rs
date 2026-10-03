@@ -61,6 +61,22 @@ impl Selector<'_> {
             _ => return Ok(false),
         };
         let field = &self.body.fields[self.body.projections[projection.index()].field.index()];
+        let mut path = Vec::new();
+        let mut parent = self.body.projections[projection.index()].parent;
+        while let Some(id) = parent {
+            path.push(id);
+            parent = self.body.projections[id.index()].parent;
+        }
+        path.reverse();
+        let root_owner = path.first().map_or(field.owner, |p| {
+            self.body.fields[self.body.projections[p.index()].field.index()].owner
+        });
+        let Some(Type::Class(root_symbol)) = self.types.get(root_owner) else {
+            return Err(error("field path requires a concrete root"));
+        };
+        let root_class = self
+            .cp
+            .add_class(self.types.symbol_name(root_symbol).unwrap())?;
         let Some(Type::Class(owner)) = self.types.get(field.owner) else {
             return Err(error("field memory requires a concrete owner"));
         };
@@ -120,13 +136,13 @@ impl Selector<'_> {
         let done = self.assembly.label();
         let store = value.is_some() || components.is_some();
         self.load(base)?;
-        // Adjacent field components share one resolved aggregate object.
+        // Adjacent field reads share one resolved aggregate object.
         // Mutations, opaque calls and control-flow boundaries invalidate it.
-        let cached = part.is_some();
+        let cached = !store && !owned;
         let key = (
             self.body.resolve(base),
             address.map(|a| self.body.resolve(a[1])),
-            field.owner,
+            root_owner,
         );
         if cached && self.aggregate_cache == Some(key) {
             self.assembly
@@ -136,7 +152,7 @@ impl Selector<'_> {
             self.assembly.code.push(Instruction::Dup);
             if let Some(parts) = address {
                 self.load(parts[1])?;
-                self.assembly.code.push(Instruction::Ldc_w(owner));
+                self.assembly.code.push(Instruction::Ldc_w(root_class));
                 let resolve = self.cp.add_method_ref(
                     pointer,
                     "directStorageAggregate",
@@ -145,7 +161,7 @@ impl Selector<'_> {
                 self.assembly.code.push(Instruction::Invokestatic(resolve));
             } else {
                 self.assembly.code.extend([
-                    Instruction::Ldc_w(owner),
+                    Instruction::Ldc_w(root_class),
                     Instruction::Invokevirtual(direct),
                 ]);
             }
@@ -169,6 +185,23 @@ impl Selector<'_> {
         }
         self.assembly.code.push(Instruction::Dup);
         self.assembly.branch(Instruction::Ifnull(0), slow);
+        if !path.is_empty() {
+            self.assembly.code.push(Instruction::Checkcast(root_class));
+        }
+        for &id in &path {
+            let member = &self.body.fields[self.body.projections[id.index()].field.index()];
+            let Some(Type::Class(owner)) = self.types.get(member.owner) else {
+                return Err(error("field path requires a concrete owner"));
+            };
+            let owner = self.cp.add_class(self.types.symbol_name(owner).unwrap())?;
+            let mut descriptor = String::new();
+            representation::descriptor(self.types, member.ty, &mut descriptor)?;
+            let member = self.cp.add_field_ref(owner, &member.name, &descriptor)?;
+            self.assembly
+                .code
+                .extend([Instruction::Getfield(member), Instruction::Dup]);
+            self.assembly.branch(Instruction::Ifnull(0), slow);
+        }
         if !store {
             self.assembly
                 .code
@@ -212,6 +245,9 @@ impl Selector<'_> {
         self.assembly.branch(Instruction::Goto_w(0), done);
         self.assembly.bind(slow);
         self.assembly.code.push(Instruction::Pop);
+        for &id in &path {
+            self.project_field(id)?;
+        }
         if owned {
             if let Some(parts) = address {
                 self.load(parts[1])?;

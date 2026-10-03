@@ -64,6 +64,15 @@ public final class TypedFields {
 
         Nested nested = new Nested();
         nested.pair = new MemoryViews.Pair(3, 5);
+        Pointer parent = Pointer.cell(nested, 32, null);
+        Pointer pairField = parent.projectStructField(Nested.class.getName(), "pair", 0, 8, codec);
+        if (Pointer.loadTypedStorage(pairField, 0, 8, codec, MemoryViews.Pair.class.getName()) != nested.pair) {
+            throw new AssertionError("typed field read detached its managed owner");
+        }
+        nested.pair = new MemoryViews.Pair(3, 5);
+        if (Pointer.loadTypedStorage(pairField, 0, 8, codec, MemoryViews.Pair.class.getName()) != nested.pair) {
+            throw new AssertionError("typed field read retained a replaced value");
+        }
         nested.single = Float.intBitsToFloat(0x7fc01234);
         nested.wide = -0.0;
         nested.flag = true;

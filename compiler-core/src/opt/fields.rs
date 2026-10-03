@@ -1,7 +1,11 @@
 //! Promote exact typed field projections to direct JVM field accesses.
 use crate::ir::*;
 
-fn projection(body: &Body, types: &Types, mut value: ValueId) -> Option<(ValueId, ProjectionId)> {
+fn projection_of(
+    body: &Body,
+    types: &Types,
+    mut value: ValueId,
+) -> Option<(ValueId, ProjectionId)> {
     // Annotations and exact-layout retypes preserve field storage identity.
     // Casts, offsets and nontrivial joins require the general pointer path.
     let mut layout: Option<(u32, Option<SymbolId>)> = None;
@@ -74,7 +78,7 @@ pub fn promote_fields(body: &mut Body, types: &Types) {
             Op::Store { pointer, value } => (pointer, body.value_type(value)),
             _ => continue,
         };
-        let Some((base, projection)) = projection(body, types, pointer) else {
+        let Some((base, projection)) = projection_of(body, types, pointer) else {
             continue;
         };
         let field = &body.fields[body.projections[projection.index()].field.index()];
@@ -111,6 +115,56 @@ pub fn promote_fields(body: &mut Body, types: &Types) {
                 base,
                 projection,
                 value,
+            },
+            _ => unreachable!(),
+        };
+    }
+}
+
+/// Follow managed field chains without materializing their intermediate addresses.
+pub fn fold_field_paths(body: &mut Body, types: &Types) {
+    for index in 0..body.instructions.len() {
+        let (mut base, projection) = match body.instructions[index].op {
+            Op::LoadField { base, projection }
+            | Op::LoadFieldCopy { base, projection }
+            | Op::LoadFieldPart {
+                base, projection, ..
+            } => (base, projection),
+            _ => continue,
+        };
+        let mut path = vec![projection];
+        for _ in 0..32 {
+            let Some((parent, projection)) = projection_of(body, types, base) else {
+                break;
+            };
+            let member = &body.fields[body.projections[projection.index()].field.index()];
+            let child = &body.fields[body.projections[path[path.len() - 1].index()].field.index()];
+            if member.ty != child.owner
+                || types.pointee(body.value_type(parent)) != Some(member.owner)
+            {
+                break;
+            }
+            path.push(projection);
+            base = parent;
+        }
+        if path.len() < 2 {
+            continue;
+        }
+        let mut parent = path.pop();
+        for id in path.into_iter().rev() {
+            let mut field = body.projections[id.index()].clone();
+            field.parent = parent;
+            parent = Some(ProjectionId::new(body.projections.len()));
+            body.projections.push(field);
+        }
+        let projection = parent.unwrap();
+        body.instructions[index].op = match body.instructions[index].op {
+            Op::LoadField { .. } => Op::LoadField { base, projection },
+            Op::LoadFieldCopy { .. } => Op::LoadFieldCopy { base, projection },
+            Op::LoadFieldPart { index, .. } => Op::LoadFieldPart {
+                base,
+                projection,
+                index,
             },
             _ => unreachable!(),
         };

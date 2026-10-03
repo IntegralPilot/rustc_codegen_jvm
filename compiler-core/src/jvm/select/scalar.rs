@@ -5,7 +5,7 @@ impl Selector<'_> {
         let inst = self.body.instructions[id.index()];
         if !matches!(
             inst.op,
-            Op::LoadFieldPart { .. } | Op::LoadStorageField { index: Some(_), .. }
+            Op::LoadFieldPart { .. } | Op::LoadField { .. } | Op::LoadStorageField { .. }
         ) && inst.op.may_throw(self.body, self.types)
         {
             self.aggregate_cache = None;
