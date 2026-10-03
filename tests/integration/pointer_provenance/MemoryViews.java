@@ -1,4 +1,8 @@
 import java.util.Arrays;
+import java.lang.invoke.MethodHandle;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.MethodType;
+import org.rustlang.runtime.OwnedReads;
 import org.rustlang.runtime.MemoryBytes;
 import org.rustlang.runtime.Pointer;
 
@@ -50,11 +54,48 @@ public final class MemoryViews {
     private static final String PAIR_CODEC =
             "MemoryViews$PairCodec#pair#LMemoryViews$Pair;";
 
+    private static Object ownedElement(MethodHandle read, Object backing, int index, String target) {
+        if (read == null) return Pointer.sliceGetObjectCopy(backing, index, target);
+        try {
+            return read.invoke(backing, index);
+        } catch (RuntimeException | Error error) {
+            throw error;
+        } catch (Throwable error) {
+            throw new AssertionError(error);
+        }
+    }
+
     private static void checkOwnedSliceElements() {
+        MethodHandle read = OwnedReads.bootstrap(MethodHandles.lookup(), "read",
+                MethodType.methodType(Pair.class, Object.class, int.class)).dynamicInvoker();
+        checkOwnedSliceElements(null);
+        checkOwnedSliceElements(read);
+        byte[] layouts = new byte[32];
+        MemoryBytes.write(layouts, 8, 4, 41);
+        MemoryBytes.write(layouts, 16, 4, 43);
+        Pointer narrow = Pointer.array(layouts, 0, 1).retype(8, PAIR_CODEC);
+        Pointer wide = narrow.retype(16, PAIR_CODEC);
+        if (((Pair) ownedElement(read, narrow, 1, Pair.class.getName())).first != 41
+                || ((Pair) ownedElement(read, wide, 1, Pair.class.getName())).first != 43
+                || ((Pair) ownedElement(read, narrow, 1, Pair.class.getName())).first != 41) {
+            throw new AssertionError("linked read reused a different element stride");
+        }
+        byte[][] arrays = {new byte[] {3, 5}};
+        MethodHandle arrayRead = OwnedReads.bootstrap(MethodHandles.lookup(), "read",
+                MethodType.methodType(byte[].class, Object.class, int.class)).dynamicInvoker();
+        byte[] copy = (byte[]) ownedElement(arrayRead, arrays, 0, "[B");
+        copy[0] = 7;
+        if (arrays[0][0] != 3) throw new AssertionError("linked array copy aliases its source");
+        Object empty = ownedElement(read, new Pair[] {null}, 0, Pair.class.getName());
+        if (empty != null) throw new AssertionError("linked read did not preserve a null element");
+        checkOwnedSliceElements(read);
+    }
+
+    private static void checkOwnedSliceElements(MethodHandle read) {
         byte[] bytes = new byte[24];
         MemoryBytes.write(bytes, 12, 4, 17);
         Pointer slice = Pointer.array(bytes, 0, 1).byte_offset(4).retype(8, PAIR_CODEC);
-        Pair snapshot = (Pair) Pointer.sliceGetObjectCopy(slice, 1, Pair.class.getName());
+        Pair snapshot = (Pair) ownedElement(read, slice, 1, Pair.class.getName());
         if (snapshot.first != 17 || PairCodec.decodedStorage != bytes) {
             throw new AssertionError("owned slice read used the wrong range or copied storage");
         }
@@ -64,7 +105,7 @@ public final class MemoryViews {
         }
         Pair live = (Pair) Pointer.sliceGetObject(slice, 1);
         live.first = 29;
-        Pair next = (Pair) Pointer.sliceGetObjectCopy(slice, 1, Pair.class.getName());
+        Pair next = (Pair) ownedElement(read, slice, 1, Pair.class.getName());
         if (next.first != 29 || snapshot.first != 23) {
             throw new AssertionError("owned slice read lost a pending write or changed a snapshot");
         }
@@ -73,7 +114,7 @@ public final class MemoryViews {
         copied[0] = 7;
         if (arrays[0][0] != 3) throw new AssertionError("owned array element still aliases its source");
         try {
-            Pointer.sliceGetObjectCopy(slice, 2, Pair.class.getName());
+            ownedElement(read, slice, 2, Pair.class.getName());
             throw new AssertionError("owned slice read accepted an invalid byte window");
         } catch (IndexOutOfBoundsException expected) { }
     }

@@ -97,6 +97,11 @@ final class MemoryCodec {
     CodecCalls.RangeDecoder decodeAt() { return (CodecCalls.RangeDecoder) operation(3); }
     CodecCalls.Binder bind() { return (CodecCalls.Binder) operation(4); }
 
+    MethodHandle directRangeDecoder() throws IllegalAccessException {
+        return owner == null || owner == ArrayMemoryCodec.class ? null
+                : optional("a$", MethodType.methodType(encodeParameterType, byte[].class, int.class));
+    }
+
     private Object operation(int index) {
         if ((initialized & (1 << index)) == 0) initialize(index);
         return operations[index];

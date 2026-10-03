@@ -316,3 +316,42 @@ fn exact_managed_copies_keep_null_and_unknown_types_on_their_original_paths() {
         );
     }
 }
+
+#[test]
+fn owned_array_reads_keep_separate_typed_sites() {
+    let mut types = Types::default();
+    let name = types.symbol("Pair");
+    let pair = types.intern(Type::Class(name));
+    let array_type = types.intern(Type::Array(pair));
+    let int = types.scalar(ScalarType::I32);
+    let mut b = Builder::new(&types, pair);
+    let array = b.parameter(b.current(), array_type);
+    let index = b.parameter(b.current(), int);
+    b.emit(Op::ArrayGetCopy { array, index }, Some(pair));
+    let result = b
+        .emit(Op::ArrayGetCopy { array, index }, Some(pair))
+        .unwrap();
+    b.terminate(Terminator::Return(Some(result)));
+    let body = b.finish().unwrap();
+    for dynamic in [false, true] {
+        let mut pool = Default::default();
+        let mut bootstrap = Vec::new();
+        let code = compile_with_options(
+            &body,
+            &types,
+            &mut pool,
+            Options {
+                bootstrap: dynamic.then_some(&mut bootstrap),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let sites = code
+            .instructions
+            .iter()
+            .filter(|i| matches!(i, Instruction::Invokedynamic(_)))
+            .count();
+        assert_eq!(sites, if dynamic { 2 } else { 0 });
+        assert_eq!(bootstrap.len(), if dynamic { 2 } else { 0 });
+    }
+}

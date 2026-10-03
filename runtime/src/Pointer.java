@@ -11533,6 +11533,47 @@ public final class Pointer {
         return copyManagedValue(independentRepeatedArrayElement(backing, index));
     }
 
+    static String ownedSliceRecipe(Object backing, Class<?> target) {
+        if (!(backing instanceof Pointer)) return null;
+        Pointer pointer = (Pointer) backing;
+        if (!(pointer.allocation instanceof byte[]) || pointer.rareState != null
+                || pointer.addressState != null || pointer.viewSize <= 0
+                || pointer.viewSize > Integer.MAX_VALUE
+                || !isGeneratedAggregateCodec(pointer.viewCodecClassName)
+                || pointer.sliceElementView() != pointer) return null;
+        MemoryCodec plan = codecPlan(pointer.viewCodecClassName);
+        return plan.encodeParameterType == target ? pointer.viewCodecClassName : null;
+    }
+
+    static boolean ownedSliceMatches(String codec, int size, Object backing) {
+        if (!(backing instanceof Pointer)) return false;
+        Pointer pointer = (Pointer) backing;
+        return pointer.allocation instanceof byte[] && pointer.rareState == null
+                && pointer.addressState == null && pointer.viewSize == size
+                && codec.equals(pointer.viewCodecClassName);
+    }
+
+    static byte[] ownedSliceBytes(Object backing) {
+        return (byte[]) ((Pointer) backing).allocation;
+    }
+
+    static int ownedSliceSize(Object backing) {
+        return (int) ((Pointer) backing).viewSize;
+    }
+
+    static int ownedSliceOffset(Object backing, int index) {
+        Pointer pointer = (Pointer) backing;
+        long offset = Math.addExact(pointer.byteOffset,
+                Math.multiplyExact((long) index, pointer.viewSize));
+        int start = Math.toIntExact(offset);
+        int size = (int) pointer.viewSize;
+        if (start < 0 || start > ((byte[]) pointer.allocation).length - size) {
+            throw new IndexOutOfBoundsException("aggregate read exceeds byte-addressable Rust storage");
+        }
+        pointer.flushMemoryViewsOverlapping(offset, size);
+        return start;
+    }
+
     public static Object sliceGetObject(Object backing, int index) {
         if (backing instanceof Object[]) {
             return independentRepeatedArrayElement(backing, index);
@@ -11812,7 +11853,7 @@ public final class Pointer {
         }
     }
 
-    private static MemoryCodec codecPlan(String codecClassName) {
+    static MemoryCodec codecPlan(String codecClassName) {
         if (codecClassName == null) {
             throw new IllegalStateException("pointer view has no aggregate codec");
         }

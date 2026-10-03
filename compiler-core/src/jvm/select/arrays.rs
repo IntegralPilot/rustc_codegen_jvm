@@ -171,6 +171,30 @@ impl Selector<'_> {
     fn array_access(&mut self, element: TypeId, store: bool, access: Access) -> jvm::Result<()> {
         use ScalarType::*;
         if access == Access::Owned {
+            if let Some(bootstrap) = &mut self.bootstrap {
+                let owner = self.cp.add_class("org/rustlang/runtime/OwnedReads")?;
+                let method = self.cp.add_method_ref(
+                    owner,
+                    "bootstrap",
+                    concat!(
+                        "(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;",
+                        "Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/CallSite;"
+                    ),
+                )?;
+                let bootstrap_method_ref = self
+                    .cp
+                    .add_method_handle(jvm::ReferenceKind::InvokeStatic, method)?;
+                let index = u16::try_from(bootstrap.len())?;
+                bootstrap.push(jvm::attributes::BootstrapMethod {
+                    bootstrap_method_ref,
+                    arguments: vec![],
+                });
+                let mut descriptor = String::from("(Ljava/lang/Object;I)");
+                representation::descriptor(self.types, element, &mut descriptor)?;
+                let site = self.cp.add_invoke_dynamic(index, "read", descriptor)?;
+                self.assembly.code.push(Instruction::Invokedynamic(site));
+                return Ok(());
+            }
             let name = self.address_target(element)?;
             let owner = self.cp.add_class(POINTER_CLASS)?;
             let method = self.cp.add_method_ref(
