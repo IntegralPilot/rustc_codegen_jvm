@@ -428,3 +428,161 @@ fn nonentry_allocations_remain_conservative_at_joins() {
     );
     verify(&body, &types).unwrap();
 }
+
+#[test]
+fn nested_fields_follow_replacement_and_keep_owned_reads() {
+    for mode in ["plain", "escape", "retype", "invoke"] {
+        let escapes = mode == "escape";
+        let mut types = Types::default();
+        types.intern(Type::Unit);
+        let int = types.scalar(ScalarType::I64);
+        let name = types.symbol("Inner");
+        let inner = types.intern(Type::Class(name));
+        let name = types.symbol("Outer");
+        let outer = types.intern(Type::Class(name));
+        let outer_ptr = types.intern(Type::Pointer(outer));
+        let name = types.symbol("Other");
+        let other = types.intern(Type::Class(name));
+        let other_ptr = types.intern(Type::Pointer(other));
+        let inner_ptr = types.intern(Type::Pointer(inner));
+        let int_ptr = types.intern(Type::Pointer(int));
+        let mut b = Builder::new(&types, if escapes { int_ptr } else { int });
+        let first = b.parameter(b.current(), outer);
+        let second = b.parameter(b.current(), outer);
+        let storage = cell(&mut b, outer, outer_ptr, first);
+        let base = if mode == "retype" {
+            b.emit(Op::Reinterpret(storage), Some(other_ptr)).unwrap()
+        } else {
+            storage
+        };
+        let inner_field = b.field(FieldRef {
+            owner: if mode == "retype" { other } else { outer },
+            name: "inner".into(),
+            ty: inner,
+            is_static: false,
+        });
+        let scalar_field = b.field(FieldRef {
+            owner: inner,
+            name: "scalar".into(),
+            ty: int,
+            is_static: false,
+        });
+        let inner_projection = b.projection(PointerProjection {
+            parent: None,
+            field: inner_field,
+            offset: 0,
+            size: 8,
+            codec: Some("InnerCodec".into()),
+        });
+        let scalar_projection = b.projection(PointerProjection {
+            parent: None,
+            field: scalar_field,
+            offset: 0,
+            size: 8,
+            codec: None,
+        });
+        let nested = b
+            .emit(
+                Op::Project {
+                    base,
+                    projection: inner_projection,
+                },
+                Some(inner_ptr),
+            )
+            .unwrap();
+        let borrow = b
+            .emit(
+                Op::Project {
+                    base: nested,
+                    projection: scalar_projection,
+                },
+                Some(int_ptr),
+            )
+            .unwrap();
+        let snapshot = b.emit(Op::LoadCopy(nested), Some(inner)).unwrap();
+        let snapshot_value = b
+            .emit(
+                Op::GetField {
+                    object: snapshot,
+                    field: scalar_field,
+                },
+                Some(int),
+            )
+            .unwrap();
+        b.emit(
+            Op::Store {
+                pointer: storage,
+                value: second,
+            },
+            None,
+        );
+        b.emit(
+            Op::Store {
+                pointer: borrow,
+                value: snapshot_value,
+            },
+            None,
+        );
+        let handler = b.create_block();
+        let after = if mode == "invoke" {
+            b.invoke(Op::Load(borrow), Some(int), handler).unwrap()
+        } else {
+            b.emit(Op::Load(borrow), Some(int)).unwrap()
+        };
+        b.terminate(Terminator::Return(Some(if escapes {
+            borrow
+        } else {
+            after
+        })));
+        b.switch_to(handler);
+        b.terminate(Terminator::Rethrow);
+        let mut body = b.finish().unwrap();
+        super::promote_fields(&mut body, &types);
+        let original = body.clone();
+        let body = promote_cells(body, &types, &[(storage, first)]).unwrap();
+        verify(&body, &types).unwrap();
+        if mode != "plain" {
+            assert_eq!(body, original, "{mode}");
+            continue;
+        }
+        let operation = |value: ValueId| {
+            let ValueDef::Inst(id) = body.values[value.index()].def else {
+                panic!()
+            };
+            body.instructions[id.index()].op
+        };
+        let Op::CopyValue(copied) = operation(snapshot) else {
+            panic!()
+        };
+        assert_eq!(
+            operation(copied),
+            Op::GetField {
+                object: first,
+                field: inner_field
+            }
+        );
+        let Op::GetField { object, field } = operation(after) else {
+            panic!()
+        };
+        assert_eq!(field, scalar_field);
+        assert_eq!(
+            operation(object),
+            Op::GetField {
+                object: second,
+                field: inner_field
+            }
+        );
+        assert!(body.instructions.iter().any(
+            |i| matches!(i.op, Op::SetField { object, field, value }
+            if field == scalar_field && value == snapshot_value
+                && operation(object) == Op::GetField { object: second, field: inner_field })
+        ));
+        let live = super::live(&body, &types);
+        assert!(
+            !live.values[storage.index()]
+                && !live.values[nested.index()]
+                && !live.values[borrow.index()]
+        );
+        crate::jvm::select::compile(&body, &types, &mut Default::default()).unwrap();
+    }
+}
