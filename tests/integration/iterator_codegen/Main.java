@@ -14,6 +14,7 @@ public class Main {
             check(iterator_codegen.iterator_codegen.zip_enumerate(n), zip);
             check(iterator_codegen.iterator_codegen.reverse(n), reverse);
             check(iterator_codegen.iterator_codegen.windows(n), n*(n+1)+(n+1)*(n+2)+(n+2)*(n+3));
+            check(iterator_codegen.iterator_codegen.record_windows(n), 7*(n+1)*(n+2)/2+3*(n+1));
             check(iterator_codegen.iterator_codegen.nested(n), nested);
             check(iterator_codegen.iterator_codegen.mutable(n), 4*n+12);
             check(iterator_codegen.iterator_codegen.custom(n), sum*3);

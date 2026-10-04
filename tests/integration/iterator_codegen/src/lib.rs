@@ -32,6 +32,21 @@ pub fn windows(n: i32) -> i32 {
 }
 
 #[jvm_codegen::export]
+pub fn record_windows(n: i32) -> i32 {
+    #[derive(Clone, Copy)]
+    struct Pair {
+        x: i32,
+        y: i32,
+    }
+    let values: Vec<_> = (0..n + 3).map(|x| Pair { x, y: x * 3 }).collect();
+    values[1..].windows(2).map(|w| {
+        let mut first = w[0];
+        first.x += w[1].y;
+        first.x + w[0].y
+    }).sum()
+}
+
+#[jvm_codegen::export]
 pub fn nested(n: i32) -> i32 {
     (0..n).flat_map(|x| 0..x).filter(|x| x % 2 == 0).sum()
 }

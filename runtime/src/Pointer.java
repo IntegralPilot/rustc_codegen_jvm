@@ -9838,7 +9838,10 @@ public final class Pointer {
     public static Object sliceAddressRoot(Object backing, int size, String codec) {
         if (backing == null) return withoutProvenance(0, size, codec);
         if (backing instanceof Pointer) {
-            return ((Pointer) backing).sliceStorageView(size, codec);
+            Pointer pointer = (Pointer) backing;
+            if (pointer.allocation instanceof byte[] && size > 0 && pointer.viewSize == size
+                    && java.util.Objects.equals(pointer.viewCodecClassName, codec)) return pointer;
+            return pointer.sliceStorageView(size, codec);
         }
         // Preserve the backing owner of decoded arrays with a registered origin.
         return fromSliceParts(backing, 0, 0L, size, codec);

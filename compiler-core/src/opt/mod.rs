@@ -65,6 +65,8 @@ mod address_parts;
 
 mod typed_addresses;
 pub use typed_addresses::lower_typed_addresses;
+mod view_roundtrips;
+pub use view_roundtrips::fold_view_roundtrips;
 #[cfg(test)]
 mod typed_addresses_tests;
 
