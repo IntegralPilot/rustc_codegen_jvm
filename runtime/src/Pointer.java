@@ -785,9 +785,11 @@ public final class Pointer {
         private final String codec;
         private final ExposedTarget target;
         private final boolean targetUsesOwnerAllocation;
+        private final long address;
 
         private EncodedPointerState(
-                Object owner, int size, String codec, ExposedTarget target) {
+                Object owner, int size, String codec, ExposedTarget target, long address) {
+            this.address = address;
             this.size = size;
             this.codec = codec;
             targetUsesOwnerAllocation = target.allocation == owner;
@@ -808,9 +810,11 @@ public final class Pointer {
         private final int size;
         private final String codec;
         private final ExposedTarget target;
+        private final long address;
 
         private EncodedPointerCopy(
-                long offset, int size, String codec, ExposedTarget target) {
+                long offset, int size, String codec, ExposedTarget target, long address) {
+            this.address = address;
             this.offset = offset;
             this.size = size;
             this.codec = codec;
@@ -823,21 +827,8 @@ public final class Pointer {
             long offset,
             int size,
             String codec,
-            Pointer pointer) {
-        rememberEncodedPointer(
-                owner,
-                offset,
-                size,
-                codec,
-                pointer == null ? null : pointer.exposedTarget());
-    }
-
-    private static void rememberEncodedPointer(
-            Object owner,
-            long offset,
-            int size,
-            String codec,
-            ExposedTarget target) {
+            ExposedTarget target,
+            long address) {
         if (owner == null || target == null || size <= 0 || codec == null) {
             return;
         }
@@ -852,7 +843,7 @@ public final class Pointer {
             removeOverlappingEncodedPointers(pointers, offset, size);
             pointers.put(
                     offset,
-                    new EncodedPointerState(owner, size, codec, target));
+                    new EncodedPointerState(owner, size, codec, target, address));
             markIdentityFilter(ENCODED_POINTER_FILTER, owner);
         }
         maybeRebuildIdentityFilter(ENCODED_POINTER_FILTER, ENCODED_POINTERS);
@@ -872,11 +863,10 @@ public final class Pointer {
             }
             if (state != null
                     && state.size == size
+                    && state.address == address
                     && codec.equals(state.codec)) {
-                Pointer pointer = pointerFromExposedTarget(state.target(owner));
-                if (pointer.numericAddress() == address) {
-                    return pointer;
-                }
+                return pointerFromExposedTarget(state.target,
+                        state.targetUsesOwnerAllocation ? owner : state.target.allocation);
             }
         }
         return null;
@@ -917,7 +907,7 @@ public final class Pointer {
                             entryOffset,
                             state.size,
                             state.codec,
-                            state.target(sourceOwner)));
+                            state.target(sourceOwner), state.address));
                 }
             }
             if (move) {
@@ -949,7 +939,7 @@ public final class Pointer {
                                 targetOwner,
                                 entry.size,
                                 entry.codec,
-                                entry.target));
+                                entry.target, entry.address));
             }
             markIdentityFilter(ENCODED_POINTER_FILTER, targetOwner);
         }
@@ -2063,7 +2053,7 @@ public final class Pointer {
             String metadataClass = codec.substring(TRAIT_POINTER_VIEW_CODEC_PREFIX.length());
             Pointer marker = traitMetadataMarker(pointer, metadataClass);
             dataAddress = erasedAddress(pointer);
-            rememberEncodedPointer(image, 0, wordSize, codec, pointer);
+            rememberEncodedPointer(image, 0, wordSize, codec, pointer.exposedTarget(), dataAddress);
             pointerMetadata = marker.address();
         }
 
@@ -5809,8 +5799,12 @@ public final class Pointer {
     }
 
     private static Pointer pointerFromExposedTarget(ExposedTarget target) {
+        return pointerFromExposedTarget(target, target.allocation);
+    }
+
+    private static Pointer pointerFromExposedTarget(ExposedTarget target, Object allocation) {
         Pointer pointer = new Pointer(
-                target.allocation,
+                allocation,
                 target.allocationElementSize,
                 target.byteOffset,
                 target.viewSize,
@@ -5848,8 +5842,8 @@ public final class Pointer {
             long viewSize,
             String viewCodecClassName,
             String pointerCodec) {
-        return typedPointerObjectFromAddress(address, pointerCodec)
-                .retype(viewSize, viewCodecClassName);
+        return retypeDecodedPointer(typedPointerObjectFromAddress(address, pointerCodec),
+                viewSize, viewCodecClassName);
     }
 
     /** Decodes an integer-to-pointer transmute without acquiring exposed provenance. */
@@ -7440,7 +7434,8 @@ public final class Pointer {
                     ownerOffset,
                     encodedSize,
                     pointerCodec,
-                    target);
+                    target,
+                    address);
         }
         return address;
     }
@@ -9472,6 +9467,17 @@ public final class Pointer {
         }
         if (root instanceof Pointer) {
             Pointer pointer = (Pointer) root;
+            if ((size == 4 || size == 8) && pointer.allocation instanceof byte[]
+                    && pointer.allocationElementSize == 1 && pointer.allocationCodecClassName == null
+                    && pointer.rareState == null && pointer.addressState == null
+                    && target != null && matchesBinaryClassName(target, Pointer.class.getName())
+                    && isRawPointerCodec(codec) && !isArrayReferenceCodec(codec)) {
+                long absolute = Math.addExact(pointer.byteOffset, offset);
+                long address = pointer.loadUnsignedAt(absolute, size);
+                Pointer value = encodedPointer(pointer.allocation, absolute, size, codec, address);
+                return decodedRawPointer(value == null
+                        ? typedPointerObjectFromAddress(address, codec) : value, codec);
+            }
             if (size > 0 && pointer.viewSize == size
                     && java.util.Objects.equals(codec, pointer.viewCodecClassName)
                     && pointer.rareState == null && (pointer.addressState == null || offset == 0)
@@ -12144,12 +12150,18 @@ public final class Pointer {
             return pointer;
         }
         if (isArrayReferenceCodec(codec)) {
-            return pointer.retype(
+            return retypeDecodedPointer(pointer,
                     arrayReferenceElementSize(codec), arrayReferenceElementCodec(codec));
         }
-        pointer = pointer.retype(rawPointerPointeeSize(codec), rawPointerPointeeCodec(codec));
-        String pointeeClass = rawPointerPointeeClass(codec);
-        return pointeeClass.isEmpty() ? pointer : pointer.nominalManagedPointee(pointeeClass);
+        RawPointerLayout layout = rawPointerLayout(codec);
+        pointer = retypeDecodedPointer(pointer, layout.size, layout.codec);
+        return layout.owner.isEmpty() ? pointer : pointer.nominalManagedPointee(layout.owner);
+    }
+
+    // Callers supply a new decoded carrier. No other value can observe its metadata.
+    private static Pointer retypeDecodedPointer(Pointer pointer, long size, String codec) {
+        return size > 0 && pointer.viewSize == size && java.util.Objects.equals(pointer.viewCodecClassName, codec)
+                ? pointer : pointer.retype(size, codec);
     }
 
     private static Object decodeArrayReference(long address, String codec, Class<?> targetClass) {
@@ -12163,54 +12175,48 @@ public final class Pointer {
         return SliceView.create(targetClass, data, 0, arrayReferenceLength(codec));
     }
 
-    private static long rawPointerPointeeSize(String codec) {
-        if (isArrayReferenceCodec(codec)) {
-            return Math.multiplyExact(
-                    arrayReferenceLength(codec), (long) arrayReferenceElementSize(codec));
+    private static final ConcurrentHashMap<String, RawPointerLayout> RAW_POINTER_LAYOUTS =
+            new ConcurrentHashMap<>();
+
+    private static final class RawPointerLayout {
+        final long size;
+        final String owner, codec;
+
+        RawPointerLayout(String descriptor) {
+            int start = RAW_POINTER_VIEW_CODEC.length() + 1;
+            int ownerStart = descriptor.indexOf('\n', start);
+            int codecStart = ownerStart < 0 ? -1 : descriptor.indexOf('\n', ownerStart + 1);
+            if (codecStart < 0) {
+                throw new IllegalArgumentException("invalid Rust raw-pointer codec descriptor");
+            }
+            try {
+                size = Long.parseLong(descriptor.substring(start, ownerStart));
+            } catch (NumberFormatException error) {
+                throw new IllegalArgumentException("invalid Rust raw-pointer pointee size", error);
+            }
+            if (size < 0) throw new IllegalArgumentException("negative Rust raw-pointer pointee size");
+            owner = descriptor.substring(ownerStart + 1, codecStart);
+            String element = descriptor.substring(codecStart + 1);
+            codec = element.isEmpty() ? null : element;
         }
-        int sizeStart = RAW_POINTER_VIEW_CODEC.length() + 1;
-        int codecStart = codec.indexOf('\n', sizeStart);
-        if (codecStart < 0) {
-            throw new IllegalArgumentException("invalid Rust raw-pointer codec descriptor");
-        }
-        long pointeeSize;
-        try {
-            pointeeSize = Long.parseLong(codec.substring(sizeStart, codecStart));
-        } catch (NumberFormatException error) {
-            throw new IllegalArgumentException("invalid Rust raw-pointer pointee size", error);
-        }
-        if (pointeeSize < 0) {
-            throw new IllegalArgumentException("negative Rust raw-pointer pointee size");
-        }
-        return pointeeSize;
     }
 
-    private static String rawPointerPointeeClass(String codec) {
-        if (isArrayReferenceCodec(codec)) {
-            return "";
-        }
-        int classStart = codec.indexOf('\n', RAW_POINTER_VIEW_CODEC.length() + 1);
-        if (classStart < 0) {
-            throw new IllegalArgumentException("invalid Rust raw-pointer codec descriptor");
-        }
-        int classEnd = codec.indexOf('\n', classStart + 1);
-        if (classEnd < 0) {
-            throw new IllegalArgumentException("invalid Rust raw-pointer codec descriptor");
-        }
-        return codec.substring(classStart + 1, classEnd);
+    private static RawPointerLayout rawPointerLayout(String codec) {
+        RawPointerLayout layout = RAW_POINTER_LAYOUTS.get(codec);
+        if (layout != null) return layout;
+        layout = new RawPointerLayout(codec);
+        RawPointerLayout previous = RAW_POINTER_LAYOUTS.putIfAbsent(codec, layout);
+        return previous == null ? layout : previous;
+    }
+
+    private static long rawPointerPointeeSize(String codec) {
+        return isArrayReferenceCodec(codec)
+                ? Math.multiplyExact(arrayReferenceLength(codec), (long) arrayReferenceElementSize(codec))
+                : rawPointerLayout(codec).size;
     }
 
     private static String rawPointerPointeeCodec(String codec) {
-        if (isArrayReferenceCodec(codec)) {
-            return arrayReferenceElementCodec(codec);
-        }
-        int classStart = codec.indexOf('\n', RAW_POINTER_VIEW_CODEC.length() + 1);
-        int codecStart = classStart < 0 ? -1 : codec.indexOf('\n', classStart + 1);
-        if (codecStart < 0) {
-            throw new IllegalArgumentException("invalid Rust raw-pointer codec descriptor");
-        }
-        String pointeeCodec = codec.substring(codecStart + 1);
-        return pointeeCodec.isEmpty() ? null : pointeeCodec;
+        return isArrayReferenceCodec(codec) ? arrayReferenceElementCodec(codec) : rawPointerLayout(codec).codec;
     }
 
     /**

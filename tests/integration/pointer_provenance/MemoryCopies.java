@@ -72,6 +72,39 @@ public final class MemoryCopies {
         Pointer restored = (Pointer) Pointer.array(to, 0, 1).retype(8, ADDRESS).getObject();
         restored.set(47);
         if (pointee[1] != 47) throw new AssertionError("encoded pointer provenance lost");
+        for (int displacement : new int[] {0, 3}) {
+            byte[] storage = new byte[16];
+            Pointer root = Pointer.array(storage, displacement, 1);
+            Pointer original = Pointer.array(pointee, 1, 4);
+            Pointer.fromTypedStorageLocation(root, 2, 8, ADDRESS).set(original);
+            Pointer loaded = (Pointer) Pointer.loadTypedStorage(root, 2, 8, ADDRESS, Pointer.class.getName());
+            loaded.set(53);
+            if (pointee[1] != 53 || loaded.addr() != original.addr())
+                throw new AssertionError("direct pointer read lost offset or provenance");
+            Pointer.withMetadata(loaded, 17);
+            Pointer again = (Pointer) Pointer.loadTypedStorage(root, 2, 8, ADDRESS, Pointer.class.getName());
+            try {
+                again.metadata();
+                throw new AssertionError("decoded pointer metadata leaked to storage");
+            } catch (IllegalStateException absent) { }
+            long replacement = Pointer.array(pointee, 0, 4).address();
+            org.rustlang.runtime.MemoryBytes.write(storage, displacement + 2, 8, replacement);
+            loaded = (Pointer) Pointer.loadTypedStorage(root, 2, 8, ADDRESS, Pointer.class.getName());
+            loaded.set(61);
+            if (pointee[0] != 61 || pointee[1] != 53)
+                throw new AssertionError("changed address reused stale provenance");
+        }
+        byte[] self = new byte[16];
+        Pointer selfRoot = Pointer.array(self, 0, 1);
+        Pointer.fromTypedStorageLocation(selfRoot, 0, 8, ADDRESS).set(selfRoot.byte_offset(8).retype(4));
+        Pointer.copyStorage(self, 0, 8, ADDRESS, to, 0, 8, ADDRESS, 8, true);
+        for (Pointer data : new Pointer[] {selfRoot, Pointer.array(to, 0, 1)}) {
+            Pointer value = (Pointer) Pointer.loadTypedStorage(data, 0, 8, ADDRESS, Pointer.class.getName());
+            value.set(59);
+            if (Pointer.loadLocationBits(self, 8, 4) != 59)
+                throw new AssertionError("copied self-pointer lost its allocation");
+            Pointer.storeLocationBits(self, 8, 0, 4);
+        }
     }
 
     private static void scalarLocations() throws Exception {
@@ -118,6 +151,11 @@ public final class MemoryCopies {
         String codec = "MemoryCopies$ReferenceCodec#reference#LMemoryCopies$ReferenceBox;#8";
         Pointer whole = Pointer.fromTypedStorageLocation(source, 0, 8, codec);
         ReferenceBox decoded = (ReferenceBox) whole.getObject();
+        decoded.value = Pointer.array(pointee, 0, 4);
+        Pointer direct = (Pointer) Pointer.loadTypedStorage(Pointer.array(source, 0, 1),
+                0, 8, ADDRESS, Pointer.class.getName());
+        if (direct.getI32() != 41) throw new AssertionError("direct pointer read missed pending view writes");
+        decoded = (ReferenceBox) whole.getObject();
         decoded.value = Pointer.array(pointee, 0, 4);
         // Flushing first publishes this provenance. A metadata check before the read cannot detect it.
         Pointer.copyStorage(whole, 0, 1, null, destination, 0, 1, null, 8, true);
