@@ -58,6 +58,10 @@ impl Selector<'_> {
                 self.load(right)?;
                 let left_ty = self.scalar_type(left)?;
                 if op.is_comparison() {
+                    if self.forwarded[result.index()] && self.branch_condition == Some(result) {
+                        self.pending_branch = Some(self.comparison_branch(op, left_ty)?);
+                        return Ok(());
+                    }
                     self.comparison(op, left_ty)?;
                 } else {
                     self.binary(op, left_ty, self.scalar_type(right)?)?;
@@ -218,7 +222,7 @@ impl Selector<'_> {
         ));
         Ok(())
     }
-    pub(super) fn comparison(&mut self, op: BinaryOp, ty: ScalarType) -> jvm::Result<()> {
+    fn comparison_branch(&mut self, op: BinaryOp, ty: ScalarType) -> jvm::Result<Instruction> {
         use BinaryOp::*;
         use Instruction as I;
         let direct = kind(ty)? == Kind::Int && ty != ScalarType::U32;
@@ -246,9 +250,7 @@ impl Selector<'_> {
                 });
             }
         }
-        let yes = self.assembly.label();
-        let end = self.assembly.label();
-        let branch = match (op, direct) {
+        Ok(match (op, direct) {
             (Eq, true) => I::If_icmpeq(0),
             (Ne, true) => I::If_icmpne(0),
             (Lt, true) => I::If_icmplt(0),
@@ -262,7 +264,14 @@ impl Selector<'_> {
             (Gt, false) => I::Ifgt(0),
             (Ge, false) => I::Ifge(0),
             _ => unreachable!(),
-        };
+        })
+    }
+
+    pub(super) fn comparison(&mut self, op: BinaryOp, ty: ScalarType) -> jvm::Result<()> {
+        use Instruction as I;
+        let branch = self.comparison_branch(op, ty)?;
+        let yes = self.assembly.label();
+        let end = self.assembly.label();
         self.assembly.branch(branch, yes);
         self.assembly.code.push(I::Iconst_0);
         self.assembly.branch(I::Goto_w(0), end);

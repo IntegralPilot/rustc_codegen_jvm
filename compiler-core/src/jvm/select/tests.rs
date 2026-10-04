@@ -25,6 +25,45 @@ fn binary_body(types: &Types, ty: TypeId, ret: TypeId, op: BinaryOp) -> Body {
     b.finish().unwrap()
 }
 
+fn comparison_branch(
+    types: &Types,
+    ty: TypeId,
+    boolean: TypeId,
+    op: BinaryOp,
+    switch: bool,
+) -> Body {
+    let mut b = Builder::new(types, boolean);
+    let left = b.parameter(b.current(), ty);
+    let right = b.parameter(b.current(), ty);
+    let value = b
+        .emit(Op::Binary { op, left, right }, Some(boolean))
+        .unwrap();
+    let yes = b.create_block();
+    let no = b.create_block();
+    let yes_edge = b.edge(yes, vec![]);
+    let no_edge = b.edge(no, vec![]);
+    b.body.cases.push((Scalar::boolean(false), no_edge));
+    b.terminate(if switch {
+        Terminator::Switch {
+            value,
+            cases: List { start: 0, len: 1 },
+            otherwise: yes_edge,
+        }
+    } else {
+        Terminator::Branch {
+            condition: value,
+            yes: yes_edge,
+            no: no_edge,
+        }
+    });
+    for (block, value) in [(yes, true), (no, false)] {
+        b.switch_to(block);
+        let result = b.constant(boolean, Scalar::boolean(value));
+        b.terminate(Terminator::Return(Some(result)));
+    }
+    b.finish().unwrap()
+}
+
 fn branch_arguments(types: &Types, int: TypeId, boolean: TypeId) -> Body {
     let mut b = Builder::new(types, int);
     let condition = b.parameter(b.current(), boolean);
@@ -342,6 +381,21 @@ fn jvm_verifies_and_executes_ssa_loops_parallel_copies_scalars_and_throw_points(
     let int_array = types.intern(Type::Array(int));
     use crate::scalar::BitOp;
     let methods = [
+        (
+            "branchLtFloat",
+            "(FF)Z",
+            comparison_branch(&types, float, boolean, BinaryOp::Lt, false),
+        ),
+        (
+            "switchGeFloat",
+            "(FF)Z",
+            comparison_branch(&types, float, boolean, BinaryOp::Ge, true),
+        ),
+        (
+            "branchLtUnsigned",
+            "(JJ)Z",
+            comparison_branch(&types, ulong, boolean, BinaryOp::Lt, false),
+        ),
         (
             "popByte",
             "(B)I",
@@ -677,6 +731,13 @@ public class Run {
         check(SsaFixture.divUnsigned(-1, 2)==Integer.divideUnsigned(-1,2));
         check(!SsaFixture.ltUnsigned(-1, 0)); check(SsaFixture.ltUnsigned(0,-1));
         check(!SsaFixture.ltFloat(Float.NaN, 1)); check(!SsaFixture.ltFloat(1,Float.NaN));
+        float[] floats = {Float.NaN, Float.NEGATIVE_INFINITY, -1, -0.0f, 0.0f, 1, Float.POSITIVE_INFINITY};
+        for (float a : floats) for (float b : floats) {
+            check(SsaFixture.branchLtFloat(a,b) == (a < b));
+            check(SsaFixture.switchGeFloat(a,b) == (a >= b));
+        }
+        for (long a : boundaries) for (long b : boundaries)
+            check(SsaFixture.branchLtUnsigned(a,b) == (Long.compareUnsigned(a,b) < 0));
         check(!SsaFixture.geFloat(Float.NaN, 1)); check(SsaFixture.geFloat(-0.0f,0.0f));
         check(SsaFixture.eqDouble(-0.0,0.0)); check(!SsaFixture.eqDouble(Double.NaN,Double.NaN));
         check(Double.doubleToRawLongBits(SsaFixture.divDouble(-0.0,1.0))==Long.MIN_VALUE);

@@ -38,6 +38,7 @@ pub(super) fn values(body: &Body, live: &crate::opt::Live, debug: Option<&DebugI
             match block.terminator.unwrap() {
                 Terminator::Return(value) => value,
                 Terminator::Branch { condition, .. } => Some(condition),
+                Terminator::Switch { value, cases, .. } if cases.len == 1 => Some(value),
                 Terminator::Throw {
                     value,
                     unwind: None,
