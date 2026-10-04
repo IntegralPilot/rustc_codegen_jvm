@@ -11591,14 +11591,14 @@ public final class Pointer {
         return copyManagedValue(independentRepeatedArrayElement(backing, index));
     }
 
+    // Owned byte reads use the exact codec and do not consume pointer metadata.
     static String ownedSliceRecipe(Object backing, Class<?> target) {
         if (!(backing instanceof Pointer)) return null;
         Pointer pointer = (Pointer) backing;
-        if (!(pointer.allocation instanceof byte[]) || pointer.rareState != null
-                || pointer.addressState != null || pointer.viewSize <= 0
+        if (!(pointer.allocation instanceof byte[]) || pointer.allocationElementSize != 1
+                || pointer.allocationCodecClassName != null || pointer.viewSize <= 0
                 || pointer.viewSize > Integer.MAX_VALUE
-                || !isGeneratedAggregateCodec(pointer.viewCodecClassName)
-                || pointer.sliceElementView() != pointer) return null;
+                || !isGeneratedAggregateCodec(pointer.viewCodecClassName)) return null;
         MemoryCodec plan = codecPlan(pointer.viewCodecClassName);
         return plan.encodeParameterType == target ? pointer.viewCodecClassName : null;
     }
@@ -11606,8 +11606,8 @@ public final class Pointer {
     static boolean ownedSliceMatches(String codec, int size, Object backing) {
         if (!(backing instanceof Pointer)) return false;
         Pointer pointer = (Pointer) backing;
-        return pointer.allocation instanceof byte[] && pointer.rareState == null
-                && pointer.addressState == null && pointer.viewSize == size
+        return pointer.allocation instanceof byte[] && pointer.allocationElementSize == 1
+                && pointer.allocationCodecClassName == null && pointer.viewSize == size
                 && codec.equals(pointer.viewCodecClassName);
     }
 

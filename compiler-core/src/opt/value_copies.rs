@@ -119,7 +119,7 @@ fn reuse_array_snapshots(body: &mut Body, types: &Types) {
 pub(super) fn expand_flat_copies(
     body: &mut Body,
     types: &Types,
-    layout: &mut impl FnMut(&MethodRef) -> Option<Vec<FieldRef>>,
+    layout: &mut impl FnMut(&str) -> Option<Vec<FieldRef>>,
 ) {
     if !body
         .instructions
@@ -144,7 +144,7 @@ pub(super) fn expand_flat_copies(
             continue;
         }
         let method_ref = &body.methods[method.index()];
-        let Some(fields) = layout(method_ref) else {
+        let Some(fields) = layout(&method_ref.owner) else {
             continue;
         };
         if fields.len() > 8

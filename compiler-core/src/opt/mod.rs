@@ -45,6 +45,7 @@ mod addresses_tests;
 
 mod aggregate_joins;
 mod aggregates;
+mod owned_copies;
 mod owned_reads;
 mod value_copies;
 pub use owned_reads::lower_owned_reads;

@@ -82,21 +82,31 @@ fn owned_elements_fuse_only_without_other_observers_effects_or_handlers() {
 
 #[test]
 fn transfer_a_sole_owned_snapshot_but_keep_observed_copies() {
-    for observed in [false, true] {
+    for mode in ["plain", "effect", "observed"] {
         let mut types = Types::default();
         let name = types.symbol("Pair");
         let pair = types.intern(Type::Class(name));
         let mut b = Builder::new(&types, pair);
         let input = b.parameter(b.current(), pair);
         let snapshot = b.emit(Op::CopyValue(input), Some(pair)).unwrap();
+        let field = b.field(FieldRef {
+            owner: pair,
+            name: "next".into(),
+            ty: pair,
+            is_static: false,
+        });
+        if mode == "effect" {
+            b.emit(
+                Op::SetField {
+                    object: input,
+                    field,
+                    value: input,
+                },
+                None,
+            );
+        }
         let copy = b.emit(Op::CopyValue(snapshot), Some(pair)).unwrap();
-        if observed {
-            let field = b.field(FieldRef {
-                owner: pair,
-                name: "next".into(),
-                ty: pair,
-                is_static: false,
-            });
+        if mode == "observed" {
             b.emit(
                 Op::SetField {
                     object: input,
@@ -115,11 +125,12 @@ fn transfer_a_sole_owned_snapshot_but_keep_observed_copies() {
         };
         assert_eq!(
             body.instructions[id.index()].op,
-            if observed {
+            if mode == "observed" {
                 Op::CopyValue(snapshot)
             } else {
                 Op::Reinterpret(snapshot)
-            }
+            },
+            "{mode}"
         );
     }
 }

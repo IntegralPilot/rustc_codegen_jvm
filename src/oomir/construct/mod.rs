@@ -330,19 +330,21 @@ pub(crate) fn seal(function: oomir::Function, context: &Context) -> Result<oomir
     }
     if debug.locals.is_empty() {
         jvm_compiler_core::opt::lower_owned_reads(&mut ir, &vocabulary.types);
-        ir = jvm_compiler_core::opt::promote_aggregates(ir, &vocabulary.types, |method| {
-            let fields = &context.fields.get(&method.owner)?.members;
-            let owner = vocabulary.id(&oomir::Type::Class(method.owner.clone()));
+        ir = jvm_compiler_core::opt::promote_aggregates(ir, &vocabulary.types, |name| {
+            let fields = &context.fields.get(name)?.members;
+            let owner = vocabulary.id(&oomir::Type::Class(name.into()));
             Some(
                 fields
                     .iter()
-                    .map(|(name, ty)| ir::FieldRef {
-                        owner,
-                        name: name.clone(),
-                        ty: vocabulary.id(ty),
-                        is_static: false,
+                    .map(|(name, ty)| {
+                        Some(ir::FieldRef {
+                            owner,
+                            name: name.clone(),
+                            ty: vocabulary.find(ty)?,
+                            is_static: false,
+                        })
                     })
-                    .collect(),
+                    .collect::<Option<Vec<_>>>()?,
             )
         })
         .map_err(|e| format!("{}: aggregate promotion: {e}", function.name))?;

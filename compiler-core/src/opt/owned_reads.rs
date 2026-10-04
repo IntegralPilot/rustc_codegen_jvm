@@ -1,4 +1,4 @@
-//! Fuse an element read and its sole copy without crossing effects or handlers.
+//! Fuse owned reads and transfer private snapshots without crossing handlers.
 use crate::ir::*;
 
 pub fn lower_owned_reads(body: &mut Body, types: &Types) {
@@ -88,9 +88,11 @@ pub fn lower_owned_reads(body: &mut Body, types: &Types) {
         } else {
             continue;
         };
-        if between
-            .iter()
-            .any(|id| body.instructions[id.index()].op.may_throw(body, types))
+        // A private snapshot cannot change through an intervening call.
+        if op != body.instructions[read.index()].op
+            && between
+                .iter()
+                .any(|id| body.instructions[id.index()].op.may_throw(body, types))
         {
             continue;
         }

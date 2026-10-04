@@ -109,6 +109,12 @@ public final class MemoryViews {
         if (next.first != 29 || snapshot.first != 23) {
             throw new AssertionError("owned slice read lost a pending write or changed a snapshot");
         }
+        Pointer.withMetadata(slice, 19);
+        slice.addr();
+        Pair exposed = (Pair) ownedElement(read, slice, 1, Pair.class.getName());
+        exposed.first = 31;
+        if (next.first != 29 || slice.metadata() != 19 || MemoryBytes.read(bytes, 12, 4) != 29)
+            throw new AssertionError("owned slice read changed exposed storage or metadata");
         byte[][] arrays = {new byte[] {3, 5}};
         byte[] copied = (byte[]) Pointer.sliceGetObjectCopy(arrays, 0, "[B");
         copied[0] = 7;

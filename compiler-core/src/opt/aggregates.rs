@@ -12,8 +12,9 @@ pub(super) struct Candidate {
 pub fn promote_aggregates(
     mut body: Body,
     types: &Types,
-    mut layout: impl FnMut(&MethodRef) -> Option<Vec<FieldRef>>,
+    mut layout: impl FnMut(&str) -> Option<Vec<FieldRef>>,
 ) -> Result<Body, VerifyError> {
+    super::owned_copies::reuse_readonly_copies(&mut body, types, &mut layout);
     super::value_copies::expand_flat_copies(&mut body, types, &mut layout);
     if !body.instructions.iter().any(|inst| {
         matches!(
@@ -37,7 +38,7 @@ pub fn promote_aggregates(
         else {
             continue;
         };
-        let Some(fields) = layout(&body.methods[method.index()]) else {
+        let Some(fields) = layout(&body.methods[method.index()].owner) else {
             continue;
         };
         if fields.len() != args.len as usize

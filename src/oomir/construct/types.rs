@@ -162,6 +162,9 @@ impl Vocabulary {
         }
         id
     }
+    pub fn find(&self, ty: &oomir::Type) -> Option<ir::TypeId> {
+        common_id(ty).or_else(|| self.ids.get(ty).copied())
+    }
     pub fn id(&self, ty: &oomir::Type) -> ir::TypeId {
         if let Some(id) = common_id(ty) {
             return id;
