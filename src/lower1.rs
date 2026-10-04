@@ -13,6 +13,11 @@ use rustc_span::def_id::DefId;
 use types::ty_to_oomir_type;
 
 mod initialization;
+mod inline;
+mod inline_enums;
+mod inline_niches;
+mod inline_places;
+mod inline_records;
 use initialization::{MirControlFlow, class_locals_needing_initial_carriers};
 
 mod debug;
@@ -72,6 +77,8 @@ pub fn mir_to_oomir<'tcx>(
     data_types: &mut Definitions<'tcx>,
     external_interfaces: &mut HashSet<String>,
 ) -> oomir::Function {
+    let expanded = inline::expand(tcx, instance, mir);
+    let mir = expanded.as_ref().unwrap_or(mir);
     data_types.with_body(mir, |data_types| {
         lower_body(
             tcx,

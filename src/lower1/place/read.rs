@@ -71,10 +71,11 @@ pub(crate) fn emit_instructions_to_get_recursive<'tcx>(
         match proj {
             ProjectionElem::Field(field_index, field_ty) => {
                 let base_place_for_field = projection_prefix_place(place, proj_index, tcx);
-                let base_rust_ty =
-                    EarlyBinder::bind(tcx, base_place_for_field.ty(&mir.local_decls, tcx).ty)
-                        .instantiate(tcx, instance.args)
-                        .skip_norm_wip();
+                let base_rust_ty = data_types.normalize(
+                    tcx,
+                    base_place_for_field.ty(&mir.local_decls, tcx).ty,
+                    instance,
+                );
 
                 if let Some(payload) = super::super::types::transparent_payload(base_rust_ty, tcx) {
                     if field_index.index() == payload.field {
@@ -413,7 +414,9 @@ pub(crate) fn emit_instructions_to_get_recursive<'tcx>(
                         )
                     }) {
                     Ok(name) => name,
-                    Err(e) => panic!("Error getting field name: {}", e),
+                    Err(e) => panic!(
+                        "Error getting field name: {e}, Rust type {base_rust_ty:?}, in {instance:?}"
+                    ),
                 };
                 coroutine_variant = None;
 

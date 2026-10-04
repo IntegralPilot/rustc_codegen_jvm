@@ -417,6 +417,7 @@ pub(crate) fn ensure_closure_callable_bridge<'tcx>(
 
 pub(super) fn ensure_erased_receiver_fn_pointer_bridge<'tcx>(
     data_types: &mut Definitions<'tcx>,
+    source_rust_ty: Ty<'tcx>,
     source_signature: &oomir::Signature,
     source_interface: &str,
     target_signature: &oomir::Signature,
@@ -495,14 +496,15 @@ pub(super) fn ensure_erased_receiver_fn_pointer_bridge<'tcx>(
     let source_descriptor = source_signature.to_jvm_descriptor_with_explicit_params();
     let target_descriptor = target_signature.to_jvm_descriptor_with_explicit_params();
     let identity = format!(
-        "{source_signature:?}:{source_descriptor}->{target_signature:?}:{target_descriptor}"
+        "{source_rust_ty:?}:{source_signature:?}:{source_descriptor}->{target_signature:?}:{target_descriptor}"
     );
     let local_name = crate::stable_hash::readable_or_hashed_name(
         "FnPtrErasedReceiverBridge",
         &format!(
-            "{}_to_{}",
+            "{}_to_{}_{}",
             source_signature.fn_ptr_interface_name(),
-            target_signature.fn_ptr_interface_name()
+            target_signature.fn_ptr_interface_name(),
+            crate::stable_hash::short_hash(&identity, 16)
         ),
         &identity,
         180,
@@ -548,7 +550,41 @@ pub(super) fn ensure_erased_receiver_fn_pointer_bridge<'tcx>(
     } else {
         erased_receiver
     };
-    if erased_pointer_to_slice {
+    let rust_signature = tcx.instantiate_bound_regions_with_erased(source_rust_ty.fn_sig(tcx));
+    let array_receiver = rust_signature.inputs().first().and_then(|receiver| {
+        let (TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _)) = receiver.kind() else {
+            return None;
+        };
+        let TyKind::Array(element, length) = pointee.kind() else {
+            return None;
+        };
+        Some((*element, length.try_to_target_usize(tcx)?))
+    });
+    if erased_pointer_to_slice && let Some((element, length)) = array_receiver {
+        let element_type = ty_to_oomir_type(element, tcx, data_types, instance);
+        let pointer_type = oomir::Type::pointer(element_type);
+        let pointer_name = "_array_data".to_string();
+        instructions.push(oomir::Instruction::AddressRetype {
+            dest: Some(pointer_name.clone()),
+            source: erased_payload,
+            layout: Box::new(oomir::AddressLayout {
+                pointer_type: pointer_type.clone(),
+                size: rust_layout_size_operand(element, tcx, instance),
+                codec: crate::lower1::types::pointer_view_codec_operand(
+                    element, tcx, data_types, instance,
+                ),
+            }),
+        });
+        crate::lower1::place::emit_pointer_slice_view(
+            oomir::Operand::Variable {
+                name: pointer_name,
+                ty: pointer_type,
+            },
+            oomir::Operand::Constant(oomir::Constant::U64(length)),
+            &typed_receiver_name,
+            &mut instructions,
+        );
+    } else if erased_pointer_to_slice {
         let restored_object_name = "_restored_slice_object".to_string();
         let view_class_name = match source_receiver_ty {
             oomir::Type::Slice(_) => oomir::SLICE_VIEW_CLASS,

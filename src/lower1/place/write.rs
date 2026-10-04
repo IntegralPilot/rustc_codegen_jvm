@@ -134,9 +134,8 @@ pub(crate) fn emit_instructions_to_set_value<'tcx>(
             }
         }
         if matches!(last_projection, ProjectionElem::Field(field, _) if field.index() == 0) {
-            let base_rust_ty = EarlyBinder::bind(tcx, base_place.ty(&mir.local_decls, tcx).ty)
-                .instantiate(tcx, instance.args)
-                .skip_norm_wip();
+            let base_rust_ty =
+                data_types.normalize(tcx, base_place.ty(&mir.local_decls, tcx).ty, instance);
             if super::super::types::tagged_scalar(base_rust_ty, tcx).is_some() {
                 let Some((ProjectionElem::Downcast(_, variant), prefix)) =
                     base_projection_elems.split_last()
@@ -248,10 +247,11 @@ pub(crate) fn emit_instructions_to_set_value<'tcx>(
                         && matches!(&reference_type, oomir::Type::Pointer(inner)
                             if matches!(inner.as_ref(), oomir::Type::Class(_)))
                         && {
-                            let ty =
-                                EarlyBinder::bind(tcx, base_place.ty(&mir.local_decls, tcx).ty)
-                                    .instantiate(tcx, instance.args)
-                                    .skip_norm_wip();
+                            let ty = data_types.normalize(
+                                tcx,
+                                base_place.ty(&mir.local_decls, tcx).ty,
+                                instance,
+                            );
                             matches!(ty.kind(), TyKind::Tuple(_))
                                 || matches!(ty.kind(), TyKind::Adt(def, _) if def.is_struct())
                         };
@@ -283,9 +283,8 @@ pub(crate) fn emit_instructions_to_set_value<'tcx>(
         // 3. Generate the final store instruction based on the *last* projection.
         match last_projection {
             ProjectionElem::Field(field_index, field_mir_ty) => {
-                let base_rust_ty = EarlyBinder::bind(tcx, base_place.ty(&mir.local_decls, tcx).ty)
-                    .instantiate(tcx, instance.args)
-                    .skip_norm_wip();
+                let base_rust_ty =
+                    data_types.normalize(tcx, base_place.ty(&mir.local_decls, tcx).ty, instance);
                 if matches!(&base_oomir_type, oomir::Type::Pointer(inner)
                     if matches!(inner.as_ref(), oomir::Type::Class(_)))
                     && (matches!(base_rust_ty.kind(), TyKind::Tuple(_))

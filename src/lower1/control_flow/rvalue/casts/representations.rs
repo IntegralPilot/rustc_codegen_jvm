@@ -56,6 +56,13 @@ impl<'tcx> PreparedCast<'_, 'tcx> {
             return (instructions, result);
         }
         if matches!(cast_kind, CastKind::Transmute)
+            && oomir_source_type == oomir_target_type
+            && matches!(oomir_target_type, oomir::Type::Slice(_) | oomir::Type::Str)
+            && same_view_pointee(source_mir_ty, resolved_target_mir_ty, tcx)
+        {
+            return (instructions, oomir_operand);
+        }
+        if matches!(cast_kind, CastKind::Transmute)
             && let Some(result) = crate::lower1::types::emit_direct_transmute(
                 oomir_operand.clone(),
                 &oomir_target_type,
@@ -638,4 +645,15 @@ impl<'tcx> PreparedCast<'_, 'tcx> {
         };
         (instructions, result_operand)
     }
+}
+
+fn same_view_pointee<'tcx>(source: Ty<'tcx>, target: Ty<'tcx>, tcx: TyCtxt<'tcx>) -> bool {
+    let pointee = |ty: Ty<'tcx>| match ty.kind() {
+        TyKind::Ref(_, inner, _) | TyKind::RawPtr(inner, _) => Some(*inner),
+        TyKind::Adt(def, args) if crate::lower1::is_non_null_lang_item(tcx, def.did()) => {
+            Some(args.type_at(0))
+        }
+        _ => None,
+    };
+    pointee(source).is_some_and(|source| pointee(target) == Some(source))
 }

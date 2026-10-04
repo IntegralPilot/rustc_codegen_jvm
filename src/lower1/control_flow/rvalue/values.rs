@@ -107,12 +107,28 @@ impl<'tcx> RvalueContext<'_, 'tcx> {
                 let place_mir_ty =
                     normalize_unsize_ty(place.ty(&mir.local_decls, tcx).ty, tcx, instance);
                 let carrier = crate::lower1::types::enum_carrier(place_mir_ty, tcx);
-                if let Some(carrier) = carrier.filter(|carrier| !carrier.nullable) {
+                let single_variant = carrier
+                    .filter(|carrier| !carrier.nullable)
+                    .map(|carrier| carrier.variant)
+                    .or_else(|| {
+                        let layout = tcx
+                            .layout_of(
+                                rustc_middle::ty::TypingEnv::fully_monomorphized()
+                                    .as_query_input(place_mir_ty),
+                            )
+                            .ok()?;
+                        if let rustc_abi::Variants::Single { index } = layout.variants {
+                            Some(index)
+                        } else {
+                            None
+                        }
+                    });
+                if let Some(variant) = single_variant {
                     // A single inhabited variant needs no payload read.
                     let TyKind::Adt(def, _) = place_mir_ty.kind() else {
                         unreachable!()
                     };
-                    let discriminant = def.discriminant_for_variant(tcx, carrier.variant).val;
+                    let discriminant = def.discriminant_for_variant(tcx, variant).val;
                     let result_ty =
                         get_place_type(original_dest_place, mir, tcx, instance, data_types);
                     instructions.push(oomir::Instruction::Cast {

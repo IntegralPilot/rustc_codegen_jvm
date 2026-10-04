@@ -166,6 +166,7 @@ impl<'tcx> RvalueContext<'_, 'tcx> {
 
                         if let Ok(bridge_class) = ensure_erased_receiver_fn_pointer_bridge(
                             data_types,
+                            source_mir_ty,
                             &source_signature,
                             &source_interface,
                             &target_signature,

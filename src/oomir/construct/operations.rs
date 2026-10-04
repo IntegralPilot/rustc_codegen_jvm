@@ -12,6 +12,25 @@ impl Emission<'_> {
         kind: CallKind,
         values: Vec<ValueId>,
     ) -> Result<Option<ValueId>> {
+        if kind == CallKind::JvmStatic
+            && owner == "org/rustlang/runtime/Intrinsics"
+            && name == "selectUnpredictable"
+            && values.len() == 3
+        {
+            let yes = self.adapt(values[1], returns)?;
+            let no = self.adapt(values[2], returns)?;
+            let left = self.builder.create_block();
+            let right = self.builder.create_block();
+            let done = self.builder.create_block();
+            let result = self.builder.parameter(done, returns);
+            self.builder.branch(values[0], left, right);
+            self.builder.switch_to(left);
+            self.builder.jump(done, vec![yes]);
+            self.builder.switch_to(right);
+            self.builder.jump(done, vec![no]);
+            self.builder.switch_to(done);
+            return Ok(Some(result));
+        }
         let initial_cell = self.initial_cell(&owner, &name, kind, returns, &values);
         if let Some(initial) = initial_cell
             && ir::StorageSlot::scalar(
