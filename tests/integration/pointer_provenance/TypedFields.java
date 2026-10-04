@@ -14,6 +14,7 @@ public final class TypedFields {
 
     public static void check() throws Exception {
         originViews();
+        linkedProjections();
         String codec = "MemoryViews$PairCodec#pair#LMemoryViews$Pair;";
         Object owner = Pointer.storageAligned(new MemoryViews.Pair(17, 31), 8, codec, 4,
                 "0,4,first\n4,4,second");
@@ -96,6 +97,41 @@ public final class TypedFields {
                 || nested.flag || nested.small != 50000 || boundary.get(aggregate) != null) {
             throw new AssertionError("nested scalar store materialized or detached storage");
         }
+    }
+
+    private static void linkedProjections() throws Exception {
+        try {
+            java.lang.invoke.MethodHandle project = org.rustlang.runtime.FieldProjections.bootstrap(
+                    java.lang.invoke.MethodHandles.lookup(), "field",
+                    java.lang.invoke.MethodType.methodType(Pointer.class,
+                            Object.class, String.class, long.class, String.class)).dynamicInvoker();
+            Nested owner = new Nested();
+            owner.pair = new MemoryViews.Pair(3, 5);
+            Pointer first = (Pointer) project.invokeWithArguments(owner, "pair", 8L, null);
+            if (project.invokeWithArguments(owner, "pair", 8L, null) != first) {
+                throw new AssertionError("field call site did not reuse the same borrow");
+            }
+            first.addr();
+            Pointer published = (Pointer) project.invokeWithArguments(owner, "pair", 8L, null);
+            if (published.addr() != first.addr()) {
+                throw new AssertionError("cached field lost published address identity");
+            }
+            java.lang.ref.WeakReference<Object> weak = projectedOwner(project);
+            for (int i = 0; i < 20 && weak.get() != null; i++) {
+                System.gc();
+                Thread.sleep(10);
+            }
+            if (weak.get() != null) throw new AssertionError("field call site retained its owner");
+        } catch (Throwable error) {
+            throw new AssertionError(error);
+        }
+    }
+
+    private static java.lang.ref.WeakReference<Object> projectedOwner(java.lang.invoke.MethodHandle project)
+            throws Throwable {
+        Nested owner = new Nested();
+        project.invokeWithArguments(owner, "pair", 8L, null);
+        return new java.lang.ref.WeakReference<>(owner);
     }
 
     private static void originViews() {

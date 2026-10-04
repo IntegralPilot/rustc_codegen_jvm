@@ -26,6 +26,19 @@ impl Selector<'_> {
         for &arg in &self.body.args[args.range()] {
             self.argument(arg)?;
         }
+        if matches!(kind, CallKind::RustStatic | CallKind::JvmStatic)
+            && method.owner == POINTER_CLASS
+            && method.name == "field"
+            && signature
+                == "(Ljava/lang/Object;Ljava/lang/String;JLjava/lang/String;)Lorg/rustlang/runtime/Pointer;"
+            && self.runtime_call_site(
+                "org/rustlang/runtime/FieldProjections",
+                "field",
+                &signature,
+            )?
+        {
+            return Ok(());
+        }
         self.assembly.code.push(match kind {
             CallKind::RustStatic | CallKind::JvmStatic => Instruction::Invokestatic(target),
             CallKind::Constructor => Instruction::Invokespecial(target),
@@ -41,5 +54,36 @@ impl Selector<'_> {
             _ => return Err(error("instance call selection requires reference values")),
         });
         Ok(())
+    }
+
+    fn runtime_call_site(
+        &mut self,
+        owner: &str,
+        name: &str,
+        descriptor: &str,
+    ) -> jvm::Result<bool> {
+        let Some(bootstrap) = &mut self.bootstrap else {
+            return Ok(false);
+        };
+        let owner = self.cp.add_class(owner)?;
+        let method = self.cp.add_method_ref(
+            owner,
+            "bootstrap",
+            concat!(
+                "(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;",
+                "Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/CallSite;"
+            ),
+        )?;
+        let bootstrap_method_ref = self
+            .cp
+            .add_method_handle(jvm::ReferenceKind::InvokeStatic, method)?;
+        let index = u16::try_from(bootstrap.len())?;
+        bootstrap.push(jvm::attributes::BootstrapMethod {
+            bootstrap_method_ref,
+            arguments: vec![],
+        });
+        let site = self.cp.add_invoke_dynamic(index, name, descriptor)?;
+        self.assembly.code.push(Instruction::Invokedynamic(site));
+        Ok(true)
     }
 }

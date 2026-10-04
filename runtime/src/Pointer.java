@@ -2769,6 +2769,9 @@ public final class Pointer {
                 || !mayBeInIdentityFilter(MEMORY_VIEW_FILTER, allocation)) {
             return;
         }
+        if (MEMORY_VIEW_ABSENCE.get().matches(allocation, memoryViewEpoch(allocation))) {
+            return;
+        }
         synchronized (atomicStripe(this)) {
             flushMemoryViewsOverlappingLocked(offset, size, overwrite);
         }
@@ -8140,6 +8143,8 @@ public final class Pointer {
         long currentBits = primitiveArrayBits(array, elementIndex);
         long updated = (currentBits & ~mask) | ((incoming & valueMask) << shift);
         storePrimitiveArrayBits(array, elementIndex, updated);
+        // In-place writes must reach the decoded field owner's storage.
+        if (allocation instanceof FieldCell) ((FieldCell) allocation).commitOwners();
         return true;
     }
 
@@ -8565,6 +8570,7 @@ public final class Pointer {
                                 allocation, absoluteByteOffset, byteCount);
                         storeArrayCodecBits(
                                 current, withinElement, bits, byteCount, plan);
+                        if (allocation instanceof FieldCell) ((FieldCell) allocation).commitOwners();
                         return;
                     }
                     byte[] direct = plan.directUnionBytes(current);
@@ -8695,6 +8701,7 @@ public final class Pointer {
                 prepareMemoryWrite(absoluteByteOffset, 1);
                 discardEncodedPointers(allocation, absoluteByteOffset, 1);
                 storeArrayCodecBits(current, withinElement, value & 0xffL, 1, plan);
+                if (allocation instanceof FieldCell) ((FieldCell) allocation).commitOwners();
                 return;
             }
             byte[] direct = plan.directUnionBytes(current);
@@ -9989,18 +9996,21 @@ public final class Pointer {
                 && !mayHaveStructuralView(base.allocation)) {
             int elementIndex = Math.toIntExact(
                     Math.floorDiv(absoluteByteOffset, base.allocationElementSize));
-            Object value = base.readElement(elementIndex);
             boolean trustedDirectCarrier = base.allocation instanceof Cell
                     || base.allocation instanceof ReceiverCell
                     || base.allocation instanceof FieldCell;
             if (targetClassName == null
                     || targetClassName.isEmpty()
-                    || value == null
                     || trustedDirectCarrier) {
                 base.flushMemoryViewsOverlapping(
                         absoluteByteOffset, base.allocationElementSize);
-                value = base.readElement(elementIndex);
-                return value;
+                return base.readElement(elementIndex);
+            }
+            Object value = base.readElement(elementIndex);
+            if (value == null) {
+                base.flushMemoryViewsOverlapping(
+                        absoluteByteOffset, base.allocationElementSize);
+                return base.readElement(elementIndex);
             }
             try {
                 Class<?> valueClass = value.getClass();
@@ -12514,5 +12524,14 @@ public final class Pointer {
             bits = sign | ((exponent - 15 + 127) << 23) | (mantissa << 13);
         }
         return Float.intBitsToFloat(bits);
+    }
+
+    static boolean cachedFieldMatches(Pointer pointer, Object owner, String name, long size, String codec) {
+        if (pointer == null || pointer.metadata != -1 || pointer.rareState != null
+                || pointer.addressState != null || pointer.viewSize != size
+                || !(pointer.allocation instanceof FieldCell)) return false;
+        FieldCell cell = (FieldCell) pointer.allocation;
+        return cell.fixedOwner == owner && cell.access.field.getName().equals(name)
+                && java.util.Objects.equals(pointer.viewCodecClassName, codec);
     }
 }
