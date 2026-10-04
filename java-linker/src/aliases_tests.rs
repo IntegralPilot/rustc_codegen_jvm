@@ -156,7 +156,12 @@ fn forwarders_redirect_calls_and_handles_without_an_additional_jar_pass() {
         "{}",
         String::from_utf8_lossy(&execution.stderr)
     );
-    assert_eq!(String::from_utf8_lossy(&execution.stdout), "5\n7\n");
+    assert_eq!(
+        String::from_utf8_lossy(&execution.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        ["5", "7"]
+    );
     let mut jar = ZipArchive::new(fs::File::open(output).unwrap()).unwrap();
     let mut methods = 0;
     for i in 0..jar.len() {
