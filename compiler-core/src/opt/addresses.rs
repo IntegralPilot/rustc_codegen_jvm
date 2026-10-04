@@ -112,7 +112,9 @@ fn decompose(
                             && matches!(projection.size, 8 | 16));
                 }
                 Op::Constant(constant)
-                    if address && matches!(body.constants[constant.index()], Constant::Null(_)) =>
+                    if matches!(body.constants[constant.index()], Constant::Uninit(_))
+                        || (address
+                            && matches!(body.constants[constant.index()], Constant::Null(_))) =>
                 {
                     eligible[index] = true
                 }
@@ -132,7 +134,7 @@ fn decompose(
                 {
                     eligible[index] = true
                 }
-                Op::Reinterpret(source) | Op::Adapt(source)
+                Op::Reinterpret(source) | Op::Adapt(source) | Op::Refine(source)
                     if types.address_layout(ty)
                         == types.address_layout(body.value_type(source)) =>
                 {
@@ -218,8 +220,17 @@ fn decompose(
         let mut prefix = Vec::new();
         let (root_op, offset_op) = match original.op {
             Op::Project { base, projection } => {
-                let source = parts(body, types, base, &known, object, long, &mut prefix);
                 let displacement = body.projections[projection.index()].offset;
+                let (base, projection, displacement) = if shape == ComponentShape::Address {
+                    super::fields::fold_projection(body, types, base, projection).unwrap_or((
+                        base,
+                        projection,
+                        displacement,
+                    ))
+                } else {
+                    (base, projection, displacement)
+                };
+                let source = parts(body, types, base, &known, object, long, &mut prefix);
                 let (constant, displacement) = literal(body, long, displacement as i64);
                 let (sum_inst, sum) = append(
                     body,
@@ -242,6 +253,15 @@ fn decompose(
                         offset: sum,
                     },
                 )
+            }
+            Op::Constant(constant)
+                if matches!(body.constants[constant.index()], Constant::Uninit(_)) =>
+            {
+                let root = ConstId::new(body.constants.len());
+                body.constants.push(Constant::Uninit(object));
+                let offset = ConstId::new(body.constants.len());
+                body.constants.push(Constant::Uninit(long));
+                (Op::Constant(root), Op::Constant(offset))
             }
             Op::Constant(_) => {
                 let null = ConstId::new(body.constants.len());
@@ -404,7 +424,10 @@ fn decompose(
         body.instructions[offset.index()].op = offset_op;
         prefix.extend([root, offset]);
         let values = known[original.result.unwrap().index()].unwrap();
-        body.instructions[id.index()].op = Op::AddressPack(List::append(&mut body.args, values));
+        if ComponentShape::of(types, body.value_type(original.result.unwrap())) == Some(shape) {
+            body.instructions[id.index()].op =
+                Op::AddressPack(List::append(&mut body.args, values));
+        }
         prefixes.insert(id, prefix);
     }
     for (block, incoming) in predecessors.iter().enumerate() {

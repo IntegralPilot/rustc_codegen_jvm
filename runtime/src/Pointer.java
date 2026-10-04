@@ -9686,8 +9686,7 @@ public final class Pointer {
     public static Object storageFieldRoot(Object root, long offset, String owner,
             String field, long fieldOffset, long size, String codec) {
         // Scalar components supply their own width. Byte storage needs no layout carrier.
-        if (codec == null && size > 0 && size <= 8 && hasByteStorage(root)
-                && (!(root instanceof Pointer) || ((Pointer) root).traitMetadataCarrier() == null)) {
+        if (codec == null && size > 0 && size <= 8 && hasPlainByteStorage(root)) {
             return root;
         }
         if (root instanceof Storage && size > 0 && size <= 8) {
@@ -9870,6 +9869,11 @@ public final class Pointer {
     public static boolean hasByteStorage(Object root) {
         return root instanceof byte[]
                 || (root instanceof Pointer && ((Pointer) root).allocation instanceof byte[]);
+    }
+
+    public static boolean hasPlainByteStorage(Object root) {
+        return hasByteStorage(root)
+                && (!(root instanceof Pointer) || ((Pointer) root).traitMetadataCarrier() == null);
     }
 
     /** Scalar field fallback after generated code has tried the managed carrier. */

@@ -205,7 +205,20 @@ fn check_stored_borrow(indirect: bool) {
             }
         }
     }
-    crate::jvm::select::compile(&body, &types, &mut Default::default()).unwrap();
+    let mut pool = Default::default();
+    let code = crate::jvm::select::compile(&body, &types, &mut pool).unwrap();
+    let owner = pool.add_class("org/rustlang/runtime/Pointer").unwrap();
+    let read = pool
+        .add_method_ref(owner, "getObject", "()Ljava/lang/Object;")
+        .unwrap();
+    assert_eq!(
+        code.instructions
+            .iter()
+            .filter(|i| **i == crate::classfile::attributes::Instruction::Invokevirtual(read))
+            .count(),
+        usize::from(indirect),
+        "the displacement must not repeat the pointer read"
+    );
 }
 
 #[test]

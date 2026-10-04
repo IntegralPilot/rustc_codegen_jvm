@@ -59,3 +59,38 @@ pub fn owned_slice_elements() -> i32 {
     pixels[1].bytes[0] = 7;
     sum + i32::from(snapshot.bytes[0]) + i32::from(pixels[0].bytes[0])
 }
+
+#[repr(C)]
+pub struct NestedPair {
+    pub first: u64,
+    pub second: u64,
+}
+
+#[repr(C)]
+pub struct NestedWords {
+    pub prefix: [u64; 2],
+    pub pair: NestedPair,
+}
+
+pub fn nested_words() -> NestedWords {
+    NestedWords {
+        prefix: [13, 17],
+        pair: NestedPair {
+            first: 19,
+            second: (23 << 32) | 29,
+        },
+    }
+}
+
+pub unsafe fn replace_nested_word(value: *mut NestedWords, replacement: u32) -> u32 {
+    unsafe {
+        let word = (&raw mut (*value).pair.second).cast::<u32>().add(1);
+        let previous = *word;
+        *word = replacement;
+        previous
+    }
+}
+
+pub unsafe fn read_nested_word(value: *const NestedWords) -> u64 {
+    unsafe { (*value).pair.second }
+}

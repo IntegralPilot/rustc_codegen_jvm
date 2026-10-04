@@ -4,74 +4,131 @@ use crate::scalar::{BinaryOp, Scalar, ScalarType};
 
 #[test]
 fn borrowed_scalar_fields_keep_their_aggregate_root_across_calls() {
-    let mut types = Types::default();
-    let int = types.scalar(ScalarType::I32);
-    let owner = types.symbol("Pair");
-    let owner = types.intern(Type::Class(owner));
-    let aggregate = types.intern(Type::Pointer(owner));
-    let scalar = types.intern(Type::Pointer(int));
-    let mut b = Builder::new(&types, int);
-    let root = b.parameter(b.current(), aggregate);
-    let field = b.field(FieldRef {
-        owner,
-        name: "second".into(),
-        ty: int,
-        is_static: false,
-    });
-    let projection = b.projection(PointerProjection {
-        parent: None,
-        field,
-        offset: 4,
-        size: 4,
-        codec: None,
-    });
-    let pointer = b
-        .emit(
-            Op::Project {
-                base: root,
-                projection,
-            },
-            Some(scalar),
-        )
-        .unwrap();
-    let method = b.method(MethodRef {
-        owner: "Kernel".into(),
-        name: "consume".into(),
-        params: vec![scalar],
-        returns: int,
-        interface: false,
-    });
-    let args = b.args([pointer]);
-    let result = b
-        .emit(
-            Op::Call {
-                method,
-                kind: CallKind::RustStatic,
-                args,
-            },
-            Some(int),
-        )
-        .unwrap();
-    b.terminate(Terminator::Return(Some(result)));
-    let mut body = b.finish().unwrap();
-    lower_component_arguments(&mut body, &mut types, true, |_| true, None);
-    decompose_addresses(&mut body, &mut types, None);
-    verify(&body, &types).unwrap();
-    let live = super::live(&body, &types);
-    assert!(
-        !body
-            .instructions
-            .iter()
-            .enumerate()
-            .any(|(id, inst)| live.instructions[id]
-                && matches!(inst.op, Op::AddressPack(_) | Op::Project { .. }))
-    );
-    assert!(
-        body.instructions
-            .iter()
-            .any(|i| matches!(i.op, Op::ProjectRoot { .. }))
-    );
-    crate::jvm::select::compile(&body, &types, &mut Default::default()).unwrap();
+    for nested in [false, true] {
+        let mut types = Types::default();
+        let int = types.scalar(ScalarType::I32);
+        let owner = types.symbol("Pair");
+        let owner = types.intern(Type::Class(owner));
+        let aggregate = types.intern(Type::Pointer(owner));
+        let scalar = types.intern(Type::Pointer(int));
+        let outer_name = types.symbol("Outer");
+        let outer = types.intern(Type::Class(outer_name));
+        let outer_pointer = types.intern(Type::Pointer(outer));
+        let mut b = Builder::new(&types, int);
+        let mut root = b.parameter(b.current(), if nested { outer_pointer } else { aggregate });
+        if nested {
+            let field = b.field(FieldRef {
+                owner: outer,
+                name: "pair".into(),
+                ty: owner,
+                is_static: false,
+            });
+            let projection = b.projection(PointerProjection {
+                parent: None,
+                field,
+                offset: 16,
+                size: 8,
+                codec: Some("PairCodec#pair#LPair;".into()),
+            });
+            root = b
+                .emit(
+                    Op::Project {
+                        base: root,
+                        projection,
+                    },
+                    Some(aggregate),
+                )
+                .unwrap();
+        }
+        let field = b.field(FieldRef {
+            owner,
+            name: "second".into(),
+            ty: int,
+            is_static: false,
+        });
+        let projection = b.projection(PointerProjection {
+            parent: None,
+            field,
+            offset: 4,
+            size: 4,
+            codec: None,
+        });
+        let pointer = b
+            .emit(
+                Op::Project {
+                    base: root,
+                    projection,
+                },
+                Some(scalar),
+            )
+            .unwrap();
+        let method = b.method(MethodRef {
+            owner: "Kernel".into(),
+            name: "consume".into(),
+            params: vec![scalar],
+            returns: int,
+            interface: false,
+        });
+        let args = b.args([pointer]);
+        let result = b
+            .emit(
+                Op::Call {
+                    method,
+                    kind: CallKind::RustStatic,
+                    args,
+                },
+                Some(int),
+            )
+            .unwrap();
+        b.terminate(Terminator::Return(Some(result)));
+        let mut body = b.finish().unwrap();
+        lower_component_arguments(&mut body, &mut types, true, |_| true, None);
+        decompose_addresses(&mut body, &mut types, None);
+        verify(&body, &types).unwrap();
+        let live = super::live(&body, &types);
+        assert!(
+            !body
+                .instructions
+                .iter()
+                .enumerate()
+                .any(|(id, inst)| live.instructions[id]
+                    && matches!(inst.op, Op::AddressPack(_) | Op::Project { .. }))
+        );
+        assert!(
+            body.instructions
+                .iter()
+                .any(|i| matches!(i.op, Op::ProjectRoot { .. }))
+        );
+        for inst in &body.instructions {
+            if let Op::ProjectRoot { projection, .. } = inst.op {
+                assert_eq!(
+                    body.projections[projection.index()].parent.is_some(),
+                    nested
+                );
+            }
+            if let Op::ProjectOffset { offset, .. } = inst.op {
+                let ValueDef::Inst(id) = body.values[offset.index()].def else {
+                    panic!()
+                };
+                let Op::Binary { right, .. } = body.instructions[id.index()].op else {
+                    panic!()
+                };
+                let ValueDef::Inst(id) = body.values[right.index()].def else {
+                    panic!()
+                };
+                let Op::Constant(id) = body.instructions[id.index()].op else {
+                    panic!()
+                };
+                assert_eq!(
+                    body.constants[id.index()],
+                    Constant::Scalar(
+                        Scalar::integer(ScalarType::I64, if nested { 20 } else { 4 }).unwrap()
+                    )
+                );
+            }
+        }
+        crate::jvm::select::compile(&body, &types, &mut Default::default()).unwrap();
+    }
 }
 
 #[test]
@@ -499,7 +556,7 @@ fn nullable_discriminants_do_not_materialize_borrowed_addresses() {
 }
 
 #[test]
-fn nullable_return_joins_keep_address_components() {
+fn inactive_and_nullable_return_joins_keep_address_components() {
     let mut types = Types::default();
     let int = types.scalar(ScalarType::I32);
     let boolean = types.scalar(ScalarType::Bool);
@@ -507,7 +564,10 @@ fn nullable_return_joins_keep_address_components() {
     let owner = types.intern(Type::Class(owner));
     let object = types.symbol("java/lang/Object");
     let object = types.intern(Type::Class(object));
-    for pointee in [int, owner] {
+    for (pointee, inactive) in [int, owner]
+        .into_iter()
+        .flat_map(|pointee| [(pointee, false), (pointee, true)])
+    {
         let pointer = types.intern(Type::Pointer(pointee));
         let mut b = Builder::new(&types, pointer);
         let condition = b.parameter(b.current(), boolean);
@@ -523,14 +583,20 @@ fn nullable_return_joins_keep_address_components() {
         b.jump(done, vec![]);
         b.switch_to(none);
         let constant = ConstId::new(b.body.constants.len());
-        b.body.constants.push(Constant::Null(pointer));
-        let null = b.emit(Op::Constant(constant), Some(pointer)).unwrap();
+        let ty = if inactive { object } else { pointer };
+        b.body.constants.push(if inactive {
+            Constant::Uninit(ty)
+        } else {
+            Constant::Null(ty)
+        });
+        let null = b.emit(Op::Constant(constant), Some(ty)).unwrap();
         let erased = b.emit(Op::Reinterpret(null), Some(object)).unwrap();
         b.define(result, erased);
         b.jump(done, vec![]);
         b.switch_to(done);
         let result = b.read(result);
         let result = b.emit(Op::Adapt(result), Some(pointer)).unwrap();
+        let result = b.emit(Op::Refine(result), Some(pointer)).unwrap();
         b.terminate(Terminator::Return(Some(result)));
         let mut body = b.finish().unwrap();
         lower_component_arguments(&mut body, &mut types, true, |_| false, None);

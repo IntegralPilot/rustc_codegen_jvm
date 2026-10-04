@@ -621,4 +621,9 @@ fn nested_field_reads_keep_nullable_fallback_and_exception_handler() {
     let owner = pool.add_class("Outer").unwrap();
     let field = pool.add_field_ref(owner, "inner", "LInner;").unwrap();
     assert!(code.instructions.contains(&Instruction::Getfield(field)));
+    let runtime = pool.add_class("org/rustlang/runtime/Pointer").unwrap();
+    let load = pool
+        .add_method_ref(runtime, "loadLocationBits", "(Ljava/lang/Object;JI)J")
+        .unwrap();
+    assert!(code.instructions.contains(&Instruction::Invokestatic(load)));
 }

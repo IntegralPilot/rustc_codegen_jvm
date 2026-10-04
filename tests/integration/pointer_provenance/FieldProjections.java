@@ -27,6 +27,19 @@ public final class FieldProjections {
         Derived(int first, int second) { super(first, second); }
     }
 
+    public static final class NestedCodec {
+        public static byte[] e$words(pointer_provenance.NestedWords value) {
+            return java.nio.ByteBuffer.allocate(32).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                    .putLong(value.prefix[0]).putLong(value.prefix[1])
+                    .putLong(value.pair.first).putLong(value.pair.second).array();
+        }
+        public static pointer_provenance.NestedWords d$words(byte[] image) {
+            java.nio.ByteBuffer bytes = java.nio.ByteBuffer.wrap(image).order(java.nio.ByteOrder.LITTLE_ENDIAN);
+            return new pointer_provenance.NestedWords(new long[] {bytes.getLong(), bytes.getLong()},
+                    new pointer_provenance.NestedPair(bytes.getLong(), bytes.getLong()));
+        }
+    }
+
     private static Pointer second(Pointer root) {
         try {
             return (Pointer) SECOND.invokeExact(root);
@@ -52,6 +65,21 @@ public final class FieldProjections {
     }
 
     public static void check() throws Exception {
+        Pointer words = Pointer.cell(pointer_provenance.pointer_provenance.nested_words(), 32,
+                "FieldProjections$NestedCodec#words#Lpointer_provenance/NestedWords;#32");
+        byte[] image = new byte[32];
+        java.nio.ByteBuffer.wrap(image).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                .putLong(0, 13).putLong(8, 17).putLong(16, 19).putLong(24, (23L << 32) | 29);
+        Pointer bytes = Pointer.array(image, 0, 1);
+        for (Pointer value : new Pointer[] {words, bytes}) {
+            if (pointer_provenance.pointer_provenance.replace_nested_word(value, 31) != 23
+                    || pointer_provenance.pointer_provenance.replace_nested_word(value, 37) != 31
+                    || pointer_provenance.pointer_provenance.read_nested_word(value) != ((37L << 32) | 29))
+                throw new AssertionError("nested scalar projection used the wrong offset");
+        }
+        if (java.nio.ByteBuffer.wrap(image).order(java.nio.ByteOrder.LITTLE_ENDIAN).getLong(24)
+                != ((37L << 32) | 29))
+            throw new AssertionError("nested scalar write changed adjacent bytes");
         Pair fixedOwner = new Pair(5, 7);
         Pointer fixedFirst = Pointer.field(fixedOwner, "second", 4, null);
         Pointer fixedSecond = Pointer.field(fixedOwner, "second", 4, null);

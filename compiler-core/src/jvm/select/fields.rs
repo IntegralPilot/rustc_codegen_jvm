@@ -245,6 +245,17 @@ impl Selector<'_> {
         self.assembly.branch(Instruction::Goto_w(0), done);
         self.assembly.bind(slow);
         self.assembly.code.push(Instruction::Pop);
+        if part == Some(1) && matches!(self.types.get(field.ty), Some(Type::Pointer(_))) {
+            // The fallback root contains the full address. Its displacement is zero.
+            self.assembly
+                .code
+                .extend([Instruction::Pop, Instruction::Lconst_0]);
+            self.assembly.bind(done);
+            return Ok(true);
+        }
+        if !path.is_empty() && !owned && !store {
+            self.nested_byte_field(address.map(|parts| parts[1]), projection, part, done)?;
+        }
         for &id in &path {
             self.project_field(id)?;
         }
@@ -322,11 +333,7 @@ impl Selector<'_> {
             self.read_memory(field.ty)?;
             if let Some(index) = part {
                 if matches!(self.types.get(field.ty), Some(Type::Pointer(_))) {
-                    if index == 1 {
-                        self.assembly
-                            .code
-                            .extend([Instruction::Pop, Instruction::Lconst_0]);
-                    }
+                    debug_assert_eq!(index, 0);
                 } else if matches!(self.types.get(field.ty), Some(Type::TaggedI64)) {
                     let owner = self.cp.add_class(super::super::abi::TAGGED_LONG_CLASS)?;
                     self.assembly

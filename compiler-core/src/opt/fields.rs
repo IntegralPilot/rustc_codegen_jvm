@@ -124,7 +124,7 @@ pub fn promote_fields(body: &mut Body, types: &Types) {
 /// Follow managed field chains without materializing their intermediate addresses.
 pub fn fold_field_paths(body: &mut Body, types: &Types) {
     for index in 0..body.instructions.len() {
-        let (mut base, projection) = match body.instructions[index].op {
+        let (base, projection) = match body.instructions[index].op {
             Op::LoadField { base, projection }
             | Op::LoadFieldCopy { base, projection }
             | Op::LoadFieldPart {
@@ -132,32 +132,9 @@ pub fn fold_field_paths(body: &mut Body, types: &Types) {
             } => (base, projection),
             _ => continue,
         };
-        let mut path = vec![projection];
-        for _ in 0..32 {
-            let Some((parent, projection)) = projection_of(body, types, base) else {
-                break;
-            };
-            let member = &body.fields[body.projections[projection.index()].field.index()];
-            let child = &body.fields[body.projections[path[path.len() - 1].index()].field.index()];
-            if member.ty != child.owner
-                || types.pointee(body.value_type(parent)) != Some(member.owner)
-            {
-                break;
-            }
-            path.push(projection);
-            base = parent;
-        }
-        if path.len() < 2 {
+        let Some((base, projection, _)) = fold_projection(body, types, base, projection) else {
             continue;
-        }
-        let mut parent = path.pop();
-        for id in path.into_iter().rev() {
-            let mut field = body.projections[id.index()].clone();
-            field.parent = parent;
-            parent = Some(ProjectionId::new(body.projections.len()));
-            body.projections.push(field);
-        }
-        let projection = parent.unwrap();
+        };
         body.instructions[index].op = match body.instructions[index].op {
             Op::LoadField { .. } => Op::LoadField { base, projection },
             Op::LoadFieldCopy { .. } => Op::LoadFieldCopy { base, projection },
@@ -169,4 +146,45 @@ pub fn fold_field_paths(body: &mut Body, types: &Types) {
             _ => unreachable!(),
         };
     }
+}
+
+pub(super) fn fold_projection(
+    body: &mut Body,
+    types: &Types,
+    mut base: ValueId,
+    projection: ProjectionId,
+) -> Option<(ValueId, ProjectionId, u64)> {
+    let mut path = vec![projection];
+    let mut offset = body.projections[projection.index()].offset;
+    if body.projections[projection.index()].parent.is_some() {
+        return None;
+    }
+    for _ in 0..32 {
+        let Some((parent, projection)) = projection_of(body, types, base) else {
+            break;
+        };
+        let layout = &body.projections[projection.index()];
+        let member = &body.fields[layout.field.index()];
+        let child = &body.fields[body.projections[path[path.len() - 1].index()].field.index()];
+        if layout.parent.is_some()
+            || member.ty != child.owner
+            || types.pointee(body.value_type(parent)) != Some(member.owner)
+        {
+            break;
+        }
+        offset = offset.checked_add(layout.offset)?;
+        path.push(projection);
+        base = parent;
+    }
+    if path.len() < 2 {
+        return None;
+    }
+    let mut parent = path.pop();
+    for id in path.into_iter().rev() {
+        let mut field = body.projections[id.index()].clone();
+        field.parent = parent;
+        parent = Some(ProjectionId::new(body.projections.len()));
+        body.projections.push(field);
+    }
+    Some((base, parent.unwrap(), offset))
 }

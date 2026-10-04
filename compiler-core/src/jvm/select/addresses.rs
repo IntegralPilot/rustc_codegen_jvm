@@ -168,6 +168,10 @@ impl Selector<'_> {
                 address,
                 projection,
             } => {
+                if self.body.projections[projection.index()].parent.is_some() {
+                    self.project_scalar_path(address, projection)?;
+                    return Ok(true);
+                }
                 for &part in &self.body.args[address.range()] {
                     self.load(part)?;
                 }
