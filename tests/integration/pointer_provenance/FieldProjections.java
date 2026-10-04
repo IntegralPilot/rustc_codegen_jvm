@@ -2,6 +2,17 @@ import org.rustlang.runtime.Pointer;
 
 /** Repeated field borrows retain a live place without rebuilding its wrapper. */
 public final class FieldProjections {
+    private static final java.lang.invoke.MethodHandle SECOND;
+    static {
+        try {
+            SECOND = org.rustlang.runtime.FieldProjections.project(java.lang.invoke.MethodHandles.lookup(),
+                    "project", java.lang.invoke.MethodType.methodType(Pointer.class, Pointer.class),
+                    Pair.class, "second", 4, 4, "").dynamicInvoker();
+        } catch (ReflectiveOperationException error) {
+            throw new ExceptionInInitializerError(error);
+        }
+    }
+
     public static class Pair {
         public int first, second;
         Pair(int first, int second) { this.first = first; this.second = second; }
@@ -17,7 +28,11 @@ public final class FieldProjections {
     }
 
     private static Pointer second(Pointer root) {
-        return root.projectStructField(Pair.class.getName(), "second", 4, 4, null);
+        try {
+            return (Pointer) SECOND.invokeExact(root);
+        } catch (Throwable error) {
+            throw new AssertionError(error);
+        }
     }
 
     private static boolean thin(Pointer pointer) {

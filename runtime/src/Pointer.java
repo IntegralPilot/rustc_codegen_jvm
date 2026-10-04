@@ -4696,6 +4696,11 @@ public final class Pointer {
             throw new IllegalArgumentException(
                     "unknown Rust field " + ownerClass.getName() + "." + fieldName, error);
         }
+        return rootField(owner, access, size, codecClassName, source, displacement);
+    }
+
+    private static Pointer rootField(Object owner, FieldAccess access, long size,
+            String codecClassName, Pointer source, long displacement) {
         FieldCell cell = ownedField(owner, access);
         Pointer cached = cell.cachedProjection;
         boolean reusable = source != null && source.metadata == -1 && source.rareState == null;
@@ -4766,6 +4771,30 @@ public final class Pointer {
         }
         Object value = directCellValueOrSelf();
         return value != null && value != this && BYTE_STORAGE_CARRIERS.get(value.getClass());
+    }
+
+    static MethodHandle fieldProjection(Class<?> owner, String field, long offset,
+            long size, String codec) throws ReflectiveOperationException {
+        FieldAccess access = size == 0 && optionalInstanceField(owner, field) == null
+                ? null : fieldAccess(owner, field);
+        MethodHandle target = MethodHandles.lookup().findStatic(Pointer.class, "projectResolvedField",
+                MethodType.methodType(Pointer.class, Pointer.class, Class.class, FieldAccess.class,
+                        String.class, long.class, long.class, String.class));
+        return MethodHandles.insertArguments(target, 1, owner, access, field, offset, size, codec);
+    }
+
+    private static Pointer projectResolvedField(Pointer pointer, Class<?> owner, FieldAccess access,
+            String field, long offset, long size, String codec) {
+        if (pointer.allocation instanceof byte[] && pointer.traitMetadataCarrier() == null) {
+            return pointer.byteOffsetRetype(offset, size, codec);
+        }
+        if (access != null
+                && (pointer.allocation instanceof Cell || pointer.allocation instanceof FieldCell)
+                && pointer.byteOffset == 0 && pointer.viewSize == pointer.allocationElementSize
+                && owner.isInstance(directCellCarrier(pointer.allocation))) {
+            return rootField(pointer.allocation, access, size, codec, pointer, offset);
+        }
+        return pointer.projectStructField(owner.getName(), field, offset, size, codec);
     }
 
     public Pointer projectStructField(

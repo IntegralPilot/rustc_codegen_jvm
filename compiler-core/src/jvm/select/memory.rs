@@ -253,6 +253,51 @@ impl Selector<'_> {
 
     /// Project the pointer already on the operand stack.
     pub(super) fn project_field(&mut self, projection: ProjectionId) -> jvm::Result<()> {
+        if let Some(bootstrap) = &mut self.bootstrap {
+            let projection = &self.body.projections[projection.index()];
+            let field = &self.body.fields[projection.field.index()];
+            let Some(Type::Class(symbol)) = self.types.get(field.owner) else {
+                return Err(error("projection requires class layout"));
+            };
+            let owner = self.cp.add_class("org/rustlang/runtime/FieldProjections")?;
+            let method = self.cp.add_method_ref(
+                owner,
+                "project",
+                concat!(
+                    "(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;",
+                    "Ljava/lang/invoke/MethodType;Ljava/lang/Class;Ljava/lang/String;JJ",
+                    "Ljava/lang/String;)Ljava/lang/invoke/CallSite;"
+                ),
+            )?;
+            let bootstrap_method_ref = self
+                .cp
+                .add_method_handle(jvm::ReferenceKind::InvokeStatic, method)?;
+            let arguments = [
+                self.cp.add_class(self.types.symbol_name(symbol).unwrap())?,
+                self.cp.add_string(&field.name)?,
+                self.cp.add_long(projection.offset as i64)?,
+                self.cp.add_long(projection.size as i64)?,
+                self.cp
+                    .add_name_string(projection.codec.as_deref().unwrap_or(""))?,
+            ];
+            if let Some(&site) = self.projection_sites.get(&arguments) {
+                self.assembly.code.push(Instruction::Invokedynamic(site));
+                return Ok(());
+            }
+            let index = u16::try_from(bootstrap.len())?;
+            bootstrap.push(jvm::attributes::BootstrapMethod {
+                bootstrap_method_ref,
+                arguments: arguments.to_vec(),
+            });
+            let site = self.cp.add_invoke_dynamic(
+                index,
+                "project",
+                "(Lorg/rustlang/runtime/Pointer;)Lorg/rustlang/runtime/Pointer;",
+            )?;
+            self.projection_sites.insert(arguments, site);
+            self.assembly.code.push(Instruction::Invokedynamic(site));
+            return Ok(());
+        }
         self.project_field_arguments(projection)?;
         let owner = self.cp.add_class(POINTER_CLASS)?;
         let method = self.cp.add_method_ref(owner, "projectStructField", "(Ljava/lang/String;Ljava/lang/String;JJLjava/lang/String;)Lorg/rustlang/runtime/Pointer;")?;

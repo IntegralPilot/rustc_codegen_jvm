@@ -27,6 +27,13 @@ public final class FieldProjections {
         return new ConstantCallSite(FIELD.bindTo(new FieldProjections()).asType(type));
     }
 
+    public static CallSite project(MethodHandles.Lookup lookup, String name, MethodType type,
+            Class<?> owner, String field, long offset, long size, String codec)
+            throws ReflectiveOperationException {
+        return new ConstantCallSite(Pointer.fieldProjection(owner, field, offset, size,
+                codec.isEmpty() ? null : codec).asType(type));
+    }
+
     private Pointer field(Object owner, String name, long size, String codec) {
         WeakReference<Pointer> reference = previous;
         Pointer pointer = reference == null ? null : reference.get();
