@@ -35,7 +35,7 @@ pub(super) fn emit_borrowed_array_view<'tcx>(
     // typed zero-byte cell so every logical index can materialize the value
     // while retaining Rust's rule that all ZST element addresses are equal.
     let backing = if element_type.has_jvm_value() {
-        let pointer_type = oomir::Type::Pointer(Box::new(element_type.clone()));
+        let pointer_type = oomir::Type::pointer(element_type.clone());
         let template = const_eval::read_zero_sized_constant(tcx, *element_ty, data_types, instance)
             .unwrap_or_else(|error| {
                 panic!("could not materialize borrowed ZST array element {element_ty:?}: {error}")
@@ -114,7 +114,7 @@ pub(super) fn emit_borrowed_projected_array_view<'tcx>(
         .try_to_target_usize(tcx)?;
     let array_type = ty_to_oomir_type(array_ty, tcx, data_types, instance);
     let element_type = ty_to_oomir_type(*element_ty, tcx, data_types, instance);
-    let array_pointer_type = oomir::Type::Pointer(Box::new(array_type));
+    let array_pointer_type = oomir::Type::pointer(array_type);
     let array_pointer = emit_pointer_to_place(
         source_place,
         &array_pointer_type,
@@ -125,67 +125,31 @@ pub(super) fn emit_borrowed_projected_array_view<'tcx>(
         data_types,
         instructions,
     );
-    let element_pointer_type = oomir::Type::Pointer(Box::new(element_type.clone()));
+    let element_pointer_type = oomir::Type::pointer(element_type.clone());
     let element_pointer_name = format!("{dest}_element_pointer");
-    instructions.push(oomir::Instruction::InvokeStatic {
+    instructions.push(oomir::Instruction::AddressRetype {
         dest: Some(element_pointer_name.clone()),
-        class_name: oomir::POINTER_CLASS.to_string(),
-        method_name: "retype".to_string(),
-        method_ty: oomir::Signature {
-            params: vec![
-                ("pointer".to_string(), array_pointer_type),
-                ("view_size".to_string(), oomir::Type::U64),
-                ("view_codec".to_string(), oomir::Type::java_string()),
-            ],
-            ret: Box::new(element_pointer_type.clone()),
-            is_static: true,
-        },
-        args: vec![
-            array_pointer,
-            rust_layout_size_operand(*element_ty, tcx, instance),
-            crate::lower1::types::pointer_view_codec_operand(
+        source: array_pointer,
+        layout: Box::new(oomir::AddressLayout {
+            pointer_type: element_pointer_type.clone(),
+            size: rust_layout_size_operand(*element_ty, tcx, instance),
+            codec: crate::lower1::types::pointer_view_codec_operand(
                 *element_ty,
                 tcx,
                 data_types,
                 instance,
             ),
-        ],
+        }),
     });
-    let object = format!("{dest}_object");
-    instructions.push(oomir::Instruction::ConstructObject {
-        dest: object.clone(),
-        class_name: oomir::SLICE_VIEW_CLASS.to_string(),
-        args: vec![
-            (
-                oomir::Operand::Variable {
-                    name: element_pointer_name,
-                    ty: element_pointer_type,
-                },
-                oomir::Type::Class("java/lang/Object".to_string()),
-            ),
-            (
-                oomir::Operand::Constant(oomir::Constant::I32(0)),
-                oomir::Type::I32,
-            ),
-            (
-                oomir::Operand::Constant(oomir::Constant::U64(length)),
-                oomir::Type::U64,
-            ),
-        ],
-    });
-    let slice_type = oomir::Type::Slice(Box::new(element_type));
-    instructions.push(oomir::Instruction::Cast {
-        dest: dest.to_string(),
-        op: oomir::Operand::Variable {
-            name: object,
-            ty: oomir::Type::Class(oomir::SLICE_VIEW_CLASS.to_string()),
+    Some(crate::lower1::place::emit_pointer_slice_view(
+        oomir::Operand::Variable {
+            name: element_pointer_name,
+            ty: element_pointer_type,
         },
-        ty: slice_type.clone(),
-    });
-    Some(oomir::Operand::Variable {
-        name: dest.to_string(),
-        ty: slice_type,
-    })
+        oomir::Operand::Constant(oomir::Constant::U64(length)),
+        dest,
+        instructions,
+    ))
 }
 
 pub(super) fn emit_raw_array_pointer_unsize<'tcx>(
@@ -303,44 +267,22 @@ pub(super) fn emit_raw_array_pointer_unsize<'tcx>(
         && matches!(target_oomir_ty, oomir::Type::Pointer(_))
     {
         let erased_pointer_dest = format!("{dest}_pointer");
-        instructions.push(oomir::Instruction::InvokeVirtual {
+        instructions.push(oomir::Instruction::AddressRetype {
             dest: Some(erased_pointer_dest.clone()),
-            class_name: oomir::POINTER_CLASS.to_string(),
-            method_name: "retype".to_string(),
-            method_ty: oomir::Signature {
-                params: vec![
-                    ("self".to_string(), source_oomir_ty.clone()),
-                    ("view_size".to_string(), oomir::Type::U64),
-                ],
-                ret: Box::new(target_oomir_ty.clone()),
-                is_static: false,
-            },
-            args: vec![oomir::Operand::Constant(oomir::Constant::U64(0))],
-            operand: source.clone(),
+            source: source.clone(),
+            layout: Box::new(oomir::AddressLayout {
+                pointer_type: target_oomir_ty.clone(),
+                size: oomir::Operand::Constant(oomir::Constant::U64(0)),
+                codec: oomir::Operand::Constant(oomir::Constant::Null(oomir::Type::java_string())),
+            }),
         });
         let erased_pointer = oomir::Operand::Variable {
             name: erased_pointer_dest,
             ty: target_oomir_ty.clone(),
         };
-        if callable_closure_bridge {
-            instructions.push(oomir::Instruction::InvokeStatic {
-                dest: Some(dest.to_string()),
-                class_name: oomir::POINTER_CLASS.to_string(),
-                method_name: "attachPointeeTraitObjectCarrier".to_string(),
-                method_ty: oomir::Signature {
-                    params: vec![
-                        ("pointer".to_string(), target_oomir_ty.clone()),
-                        ("pointee_size".to_string(), oomir::Type::U64),
-                        ("pointee_alignment".to_string(), oomir::Type::U64),
-                    ],
-                    ret: Box::new(target_oomir_ty.clone()),
-                    is_static: true,
-                },
-                args: std::iter::once(erased_pointer)
-                    .chain(layout_args())
-                    .collect(),
-            });
-        } else if let Some(adapter_class) = callable_fn_def_adapter {
+        // Raw callable pointers require payload layout and vtable metadata. The call interface
+        // alone does not supply them.
+        if let Some(adapter_class) = callable_fn_def_adapter {
             let carrier_dest = format!("{dest}_carrier");
             instructions.push(oomir::Instruction::ConstructObject {
                 dest: carrier_dest.clone(),
@@ -450,69 +392,34 @@ pub(super) fn emit_raw_array_pointer_unsize<'tcx>(
     }
 
     let element_oomir_ty = ty_to_oomir_type(target_element, tcx, data_types, instance);
-    let element_pointer_ty = oomir::Type::Pointer(Box::new(element_oomir_ty));
+    let element_pointer_ty = oomir::Type::pointer(element_oomir_ty);
     let element_pointer = format!("{dest}_element_pointer");
-    instructions.push(oomir::Instruction::InvokeStatic {
+    instructions.push(oomir::Instruction::AddressRetype {
         dest: Some(element_pointer.clone()),
-        class_name: oomir::POINTER_CLASS.to_string(),
-        method_name: "retype".to_string(),
-        method_ty: oomir::Signature {
-            params: vec![
-                ("pointer".to_string(), source_oomir_ty),
-                ("view_size".to_string(), oomir::Type::U64),
-                ("view_codec".to_string(), oomir::Type::java_string()),
-            ],
-            ret: Box::new(element_pointer_ty.clone()),
-            is_static: true,
-        },
-        args: vec![
-            source,
-            rust_layout_size_operand(target_element, tcx, instance),
-            crate::lower1::types::pointer_view_codec_operand(
+        source: source,
+        layout: Box::new(oomir::AddressLayout {
+            pointer_type: element_pointer_ty.clone(),
+            size: rust_layout_size_operand(target_element, tcx, instance),
+            codec: crate::lower1::types::pointer_view_codec_operand(
                 target_element,
                 tcx,
                 data_types,
                 instance,
             ),
-        ],
+        }),
     });
 
     let length = EarlyBinder::bind(tcx, *length)
         .instantiate(tcx, instance.args)
         .skip_norm_wip()
         .try_to_target_usize(tcx)?;
-    let slice_object = format!("{dest}_slice_object");
-    instructions.push(oomir::Instruction::ConstructObject {
-        dest: slice_object.clone(),
-        class_name: oomir::SLICE_VIEW_CLASS.to_string(),
-        args: vec![
-            (
-                oomir::Operand::Variable {
-                    name: element_pointer,
-                    ty: element_pointer_ty,
-                },
-                oomir::Type::Class("java/lang/Object".to_string()),
-            ),
-            (
-                oomir::Operand::Constant(oomir::Constant::I32(0)),
-                oomir::Type::I32,
-            ),
-            (
-                oomir::Operand::Constant(oomir::Constant::U64(length)),
-                oomir::Type::U64,
-            ),
-        ],
-    });
-    instructions.push(oomir::Instruction::Cast {
-        dest: dest.to_string(),
-        op: oomir::Operand::Variable {
-            name: slice_object,
-            ty: oomir::Type::Class(oomir::SLICE_VIEW_CLASS.to_string()),
+    Some(crate::lower1::place::emit_pointer_slice_view(
+        oomir::Operand::Variable {
+            name: element_pointer,
+            ty: element_pointer_ty,
         },
-        ty: target_oomir_ty.clone(),
-    });
-    Some(oomir::Operand::Variable {
-        name: dest.to_string(),
-        ty: target_oomir_ty,
-    })
+        oomir::Operand::Constant(oomir::Constant::U64(length)),
+        dest,
+        instructions,
+    ))
 }

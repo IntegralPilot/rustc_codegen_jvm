@@ -48,11 +48,6 @@ pub(super) fn emit<'tcx>(
             declared_method_name.clone(),
             &method_signature.to_string(),
         );
-        let is_provided_trait_method = item.trait_container(tcx).is_some_and(|trait_def_id| {
-            tcx.provided_trait_methods(trait_def_id).any(|provided| {
-                provided.def_id == item.def_id || item.trait_item_def_id() == Some(provided.def_id)
-            })
-        });
         let method_requires_sized_self = tcx.generics_require_sized_self(item.def_id);
         let transparent_virtual_receiver = if matches!(func_instance.def, InstanceKind::Virtual(..))
             && !method_requires_sized_self
@@ -111,34 +106,18 @@ pub(super) fn emit<'tcx>(
                     .first()
                     .cloned()
                     .expect("Fn trait calls carry an argument tuple");
-                let tuple_oomir_ty = tuple_operand
-                    .get_type()
-                    .expect("Fn trait argument tuple is typed");
-                let tuple_class = tuple_oomir_ty
-                    .get_class_name()
-                    .expect("non-unit Fn argument tuple is a JVM class")
-                    .to_string();
-                let fields = match data_types.get(&tuple_class) {
-                    Some(oomir::DataType::Class { fields, .. }) => fields.clone(),
-                    _ => panic!("Fn argument tuple class {tuple_class} was not defined"),
-                };
-                for (field_index, (field_name, field_ty)) in fields.into_iter().enumerate() {
-                    if !field_ty.has_jvm_value() {
-                        continue;
-                    }
-                    let field_dest = format!("{label}_callable_arg_{field_index}");
-                    instructions.push(oomir::Instruction::GetField {
-                        dest: field_dest.clone(),
-                        object: tuple_operand.clone(),
-                        field_name,
-                        field_ty: field_ty.clone(),
-                        owner_class: tuple_class.clone(),
-                    });
-                    flattened_args.push(oomir::Operand::Variable {
-                        name: field_dest,
-                        ty: field_ty,
-                    });
-                }
+                flattened_args = crate::lower1::types::tuple_fields(
+                    callable_abi.tuple_ty,
+                    tuple_operand,
+                    &format!("{label}_callable_arg"),
+                    tcx,
+                    data_types,
+                    instance,
+                    instructions,
+                )
+                .into_iter()
+                .filter(|value| value.get_type().is_some_and(|ty| ty.has_jvm_value()))
+                .collect();
             }
             instructions.push(oomir::Instruction::InvokeInterface {
                 class_name: callable_abi.interface_name,
@@ -179,125 +158,21 @@ pub(super) fn emit<'tcx>(
                 operand: receiver_operand,
             });
         } else {
-            // Check if this method is declared in a trait (interface)
-            let trait_container = item.trait_container(tcx);
-
-            // Check if the receiver operand is an interface type (after any casts)
-            let receiver_oomir_ty = receiver_operand.get_type();
-            let has_concrete_receiver_method = match &receiver_oomir_ty {
-                Some(oomir::Type::Class(class_name)) => matches!(
-                    data_types.get(class_name),
-                    Some(oomir::DataType::Class { methods, .. })
-                        if methods.contains_key(&method_name)
-                ),
-                _ => false,
+            let use_interface = if matches!(func_instance.def, InstanceKind::Virtual(..)) {
+                match receiver_operand.get_type() {
+                    Some(oomir::Type::Interface(name)) => Some(name),
+                    _ => item
+                        .trait_container(tcx)
+                        .map(|trait_id| data_types.class_name(tcx, trait_id)),
+                }
+            } else {
+                None
             };
-            let uses_concrete_trait_default =
-                is_provided_trait_method && !has_concrete_receiver_method;
-
-            // Use InvokeInterface if:
-            // 1. The receiver type is explicitly an Interface type, OR
-            // 2. The method is declared in a trait (which maps to an interface)
-            let use_interface =
-                if let Some(oomir::Type::Interface(interface_name)) = &receiver_oomir_ty {
-                    Some(interface_name.clone())
-                } else if let Some(trait_def_id) = trait_container
-                    && item.impl_container(tcx).is_none()
-                    && !has_concrete_receiver_method
-                {
-                    // Get the trait name and convert to interface name
-                    let interface_name = data_types.class_name(tcx, trait_def_id);
-                    matches!(
-                        data_types.get(&interface_name),
-                        Some(oomir::DataType::Interface { methods, .. })
-                            if methods.contains_key(&interface_method_name)
-                    )
-                    .then_some(interface_name)
-                } else {
-                    None
-                };
             let dispatch_receiver_ty =
                 crate::lower1::types::ty_to_oomir_type(receiver_mir_ty, tcx, data_types, instance);
             let resolved_receiver_mir_ty = EarlyBinder::bind(tcx, receiver_mir_ty)
                 .instantiate(tcx, instance.args)
                 .skip_norm_wip();
-            let receiver_self_mir_ty = match resolved_receiver_mir_ty.kind() {
-                TyKind::Ref(_, pointee, _) => *pointee,
-                _ => resolved_receiver_mir_ty,
-            };
-            let impl_container_mir_ty = item.impl_container(tcx).map(|impl_def_id| {
-                tcx.type_of(impl_def_id)
-                    .instantiate(tcx, func_instance.args)
-                    .skip_norm_wip()
-            });
-            let inherent_container_mir_ty = item
-                .impl_container(tcx)
-                .filter(|impl_def_id| tcx.impl_opt_trait_ref(*impl_def_id).is_none())
-                .and(impl_container_mir_ty);
-            let trait_impl_self_requires_static_dispatch = item
-                .impl_container(tcx)
-                .is_some_and(|impl_def_id| tcx.impl_opt_trait_ref(impl_def_id).is_some())
-                && !has_concrete_receiver_method;
-            let has_arbitrary_self_receiver = inherent_container_mir_ty
-                .is_some_and(|container_ty| container_ty != receiver_self_mir_ty);
-            let mut receiver_value_mir_ty = receiver_self_mir_ty;
-            while let TyKind::Ref(_, pointee, _) = receiver_value_mir_ty.kind() {
-                receiver_value_mir_ty = *pointee;
-            }
-            let trait_object_method_requires_static_dispatch = if let TyKind::Dynamic(predicates, _) =
-                receiver_value_mir_ty.kind()
-                && let Some(principal) = predicates.principal()
-                && item.trait_container(tcx).is_some()
-            {
-                let trait_ref = tcx.instantiate_bound_regions_with_erased(
-                    principal.with_self_ty(tcx, receiver_value_mir_ty),
-                );
-                !tcx.vtable_entries(trait_ref).iter().any(|entry| {
-                    let VtblEntry::Method(method) = entry else {
-                        return false;
-                    };
-                    method.def_id() == item.def_id
-                        || tcx
-                            .opt_associated_item(method.def_id())
-                            .and_then(|method_item| method_item.trait_item_def_id())
-                            == Some(item.def_id)
-                })
-            } else {
-                false
-            };
-            let has_enum_reference_receiver = matches!(
-                resolved_receiver_mir_ty.kind(),
-                TyKind::Ref(_, pointee, _)
-                    if matches!(pointee.kind(), TyKind::Adt(adt_def, _)
-                        if adt_def.is_enum())
-            );
-            let method_has_own_generic_params = !tcx
-                .generics_of(func_instance.def_id())
-                .own_params
-                .is_empty();
-            // The class behind a reference implements
-            // methods for its pointee, not blanket Rust
-            // impls whose `Self` is the reference itself
-            // when that pointee has no generated instance
-            // methods (notably closures and function items).
-            let receiver_self_requires_static_dispatch = inherent_container_mir_ty.is_some()
-                || has_enum_reference_receiver
-                || has_arbitrary_self_receiver
-                || trait_impl_self_requires_static_dispatch
-                || trait_object_method_requires_static_dispatch
-                || method_requires_sized_self
-                || matches!(
-                    receiver_value_mir_ty.kind(),
-                    TyKind::Closure(..) | TyKind::FnDef(..) | TyKind::FnPtr(..)
-                )
-                || matches!(
-                    receiver_self_mir_ty.kind(),
-                    TyKind::Ref(..) if method_has_own_generic_params
-                )
-                || matches!(
-                    receiver_self_mir_ty.kind(),
-                    TyKind::RawPtr(..) | TyKind::FnPtr(..)
-                );
             let pointer_api_receiver = {
                 let receiver_value_ty = match resolved_receiver_mir_ty.kind() {
                     TyKind::Ref(_, pointee, _) => *pointee,
@@ -369,19 +244,30 @@ pub(super) fn emit<'tcx>(
             );
             let direct_non_null_fat_equality = non_null_carrier
                 .is_some_and(|ty| matches!(ty, oomir::Type::Slice(_) | oomir::Type::Str));
-            let direct_equality = matches!(declared_method_name.as_str(), "eq" | "ne")
+            // Only primitive Rust receivers use numeric shortcuts. Shared storage does not change
+            // Rust method selection.
+            let mut comparison_rust_ty = resolved_receiver_mir_ty;
+            while let TyKind::Ref(_, inner, _) = comparison_rust_ty.kind() {
+                comparison_rust_ty = *inner;
+            }
+            let nominal_value_receiver =
+                crate::lower1::types::direct_enum_payload(comparison_rust_ty, tcx).is_some()
+                    || crate::lower1::types::transparent_payload(comparison_rust_ty, tcx).is_some()
+                    || crate::lower1::types::value_scalar_ty(comparison_rust_ty, tcx).is_some();
+            let direct_equality = !nominal_value_receiver
+                && matches!(declared_method_name.as_str(), "eq" | "ne")
                 && (supports_direct_equality(&comparison_value_ty)
                     || non_null_carrier.is_some_and(|ty| {
                         supports_direct_equality(ty) || direct_non_null_fat_equality
                     }))
                 && comparison_rhs_ty.as_ref() == Some(&comparison_value_ty)
                 && oomir_operands.len() == 2;
-            let direct_ordering =
-                matches!(declared_method_name.as_str(), "lt" | "le" | "gt" | "ge")
-                    && (supports_direct_ordering(&comparison_value_ty)
-                        || non_null_carrier.is_some_and(supports_direct_ordering))
-                    && comparison_rhs_ty.as_ref() == Some(&comparison_value_ty)
-                    && oomir_operands.len() == 2;
+            let direct_ordering = !nominal_value_receiver
+                && matches!(declared_method_name.as_str(), "lt" | "le" | "gt" | "ge")
+                && (supports_direct_ordering(&comparison_value_ty)
+                    || non_null_carrier.is_some_and(supports_direct_ordering))
+                && comparison_rhs_ty.as_ref() == Some(&comparison_value_ty)
+                && oomir_operands.len() == 2;
             let direct_unit_comparison = comparison_value_ty == oomir::Type::Unit
                 && comparison_rhs_ty.as_ref() == Some(&oomir::Type::Unit)
                 && oomir_operands.len() == 2
@@ -434,7 +320,17 @@ pub(super) fn emit<'tcx>(
                 && declared_method_name == "to_bits"
                 && oomir_operands.len() == 1;
 
-            if direct_f16_to_bits {
+            if nominal_value_receiver && use_interface.is_none() {
+                let target = data_types.function_name(tcx, func_instance);
+                method_signature.is_static = true;
+                instructions.push(oomir::Instruction::InvokeRustStatic {
+                    class_name: target.class_to_call_on.expect("nominal method owner"),
+                    method_name: target.method_name,
+                    method_ty: method_signature,
+                    args: oomir_operands,
+                    dest: effective_dest,
+                });
+            } else if direct_f16_to_bits {
                 if let Some(dest) = effective_dest {
                     instructions.push(oomir::Instruction::InvokeStatic {
                         dest: Some(dest),
@@ -588,9 +484,18 @@ pub(super) fn emit<'tcx>(
                 )
             {
                 if let Some(dest) = effective_dest {
+                    let reference = crate::lower1::value_repr::adapt_operand_to_rust_type(
+                        receiver_operand,
+                        fn_output,
+                        label,
+                        tcx,
+                        instance,
+                        data_types,
+                        &mut instructions,
+                    );
                     instructions.push(oomir::Instruction::Move {
                         dest,
-                        src: receiver_operand,
+                        src: reference,
                     });
                 }
             } else if matches!(&dispatch_receiver_ty, oomir::Type::Pointer(_))
@@ -611,6 +516,7 @@ pub(super) fn emit<'tcx>(
                 && declared_method_name == "to_raw_parts"
             {
                 pointer_access::to_raw_parts(
+                    tcx,
                     data_types,
                     &label,
                     &mut instructions,
@@ -749,22 +655,14 @@ pub(super) fn emit<'tcx>(
                     dispatch_receiver_ty,
                 );
             } else if let Some(interface_name) = use_interface {
-                method_dispatch::interface(
-                    tcx,
-                    data_types,
-                    &mut instructions,
-                    func_instance,
-                    oomir_operands,
-                    effective_dest,
-                    method_signature,
-                    receiver_operand,
-                    method_args,
-                    interface_method_name,
-                    dispatch_receiver_ty,
-                    receiver_self_requires_static_dispatch,
-                    uses_concrete_trait_default,
-                    interface_name,
-                );
+                instructions.push(oomir::Instruction::InvokeInterface {
+                    class_name: interface_name,
+                    method_name: interface_method_name,
+                    method_ty: method_signature,
+                    args: method_args,
+                    dest: effective_dest,
+                    operand: receiver_operand,
+                });
             } else {
                 runtime_methods::concrete(
                     tcx,
@@ -785,8 +683,6 @@ pub(super) fn emit<'tcx>(
                     resolved_receiver_mir_ty,
                     is_pointer_null_method,
                     is_pointer_cast_method,
-                    receiver_self_requires_static_dispatch,
-                    uses_concrete_trait_default,
                     comparison_rhs_ty,
                     pointer_api_receiver,
                 );
@@ -835,24 +731,6 @@ pub(super) fn emit<'tcx>(
                         args: vec![oomir_operands[0].clone()],
                     });
                 }
-                generated = true;
-            }
-
-            if !generated
-                && let Some(class_name) = class_type.get_class_name()
-                && matches!(
-                    data_types.get(class_name),
-                    Some(oomir::DataType::Class { methods, .. })
-                        if methods.contains_key(&method_name)
-                )
-            {
-                instructions.push(oomir::Instruction::InvokeRustStatic {
-                    class_name: class_name.to_string(),
-                    method_name: method_name.clone(),
-                    method_ty: method_signature.clone(),
-                    args: oomir_operands.clone(),
-                    dest: effective_dest.clone(), // use effective_dest
-                });
                 generated = true;
             }
         }

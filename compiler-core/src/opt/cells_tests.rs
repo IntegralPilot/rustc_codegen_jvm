@@ -101,6 +101,32 @@ fn keeps_storage_when_its_address_escapes() {
 }
 
 #[test]
+fn private_array_cells_disappear_but_owned_loads_still_copy() {
+    let mut types = Types::default();
+    let byte = types.scalar(ScalarType::U8);
+    let array = types.intern(Type::Array(byte));
+    let pointer = types.intern(Type::Pointer(array));
+    let mut b = Builder::new(&types, array);
+    let initial = b.parameter(b.current(), array);
+    let storage = cell(&mut b, array, pointer, initial);
+    let copied = b.emit(Op::LoadCopy(storage), Some(array)).unwrap();
+    b.terminate(Terminator::Return(Some(copied)));
+    let body = promote_cells(b.finish().unwrap(), &types, &[(storage, initial)]).unwrap();
+    verify(&body, &types).unwrap();
+    assert!(
+        body.instructions
+            .iter()
+            .any(|i| i.op == Op::CopyValue(initial))
+    );
+    assert!(
+        !body
+            .instructions
+            .iter()
+            .any(|i| matches!(i.op, Op::Call { .. } | Op::LoadCopy(_)))
+    );
+}
+
+#[test]
 fn promoted_contents_reach_the_unwind_edge_at_the_throwing_call() {
     let mut types = Types::default();
     let int = types.scalar(ScalarType::I64);
@@ -212,5 +238,351 @@ fn follows_long_alias_chains_for_both_loads_and_escapes() {
             };
             assert_eq!(body.instructions[inst.index()].op, Op::Reinterpret(initial));
         }
+    }
+}
+
+#[test]
+fn projected_borrow_follows_replacement_of_private_aggregate_storage() {
+    let mut types = Types::default();
+    types.intern(Type::Unit);
+    let int = types.scalar(ScalarType::I64);
+    let name = types.symbol("Counter");
+    let object = types.intern(Type::Class(name));
+    let pointer = types.intern(Type::Pointer(object));
+    let field_pointer = types.intern(Type::Pointer(int));
+    for escapes in [false, true] {
+        let mut b = Builder::new(&types, if escapes { field_pointer } else { int });
+        let first = b.parameter(b.current(), object);
+        let second = b.parameter(b.current(), object);
+        let storage = cell(&mut b, object, pointer, first);
+        let field = b.field(FieldRef {
+            owner: object,
+            name: "count".into(),
+            ty: int,
+            is_static: false,
+        });
+        let projection = b.projection(PointerProjection {
+            parent: None,
+            field,
+            offset: 0,
+            size: 8,
+            codec: None,
+        });
+        let borrow = b
+            .emit(
+                Op::Project {
+                    base: storage,
+                    projection,
+                },
+                Some(field_pointer),
+            )
+            .unwrap();
+        let before = b.emit(Op::Load(borrow), Some(int)).unwrap();
+        b.emit(
+            Op::Store {
+                pointer: storage,
+                value: second,
+            },
+            None,
+        );
+        b.emit(
+            Op::Store {
+                pointer: borrow,
+                value: before,
+            },
+            None,
+        );
+        let after = b.emit(Op::Load(borrow), Some(int)).unwrap();
+        b.terminate(Terminator::Return(Some(if escapes {
+            borrow
+        } else {
+            after
+        })));
+        let mut body = b.finish().unwrap();
+        super::promote_fields(&mut body, &types);
+        let original = body.clone();
+        let body = promote_cells(body, &types, &[(storage, first)]).unwrap();
+        verify(&body, &types).unwrap();
+        if escapes {
+            assert_eq!(body, original);
+            continue;
+        }
+        let read = |value: ValueId| {
+            let ValueDef::Inst(inst) = body.values[value.index()].def else {
+                panic!()
+            };
+            body.instructions[inst.index()].op
+        };
+        assert_eq!(
+            read(before),
+            Op::GetField {
+                object: first,
+                field
+            }
+        );
+        assert_eq!(
+            read(after),
+            Op::GetField {
+                object: second,
+                field
+            }
+        );
+        assert!(body.instructions.iter().any(|i| i.op
+            == Op::SetField {
+                object: second,
+                field,
+                value: before,
+            }));
+        let live = super::live(&body, &types);
+        assert!(!live.values[storage.index()] && !live.values[borrow.index()]);
+        crate::jvm::select::compile(&body, &types, &mut Default::default()).unwrap();
+    }
+}
+
+#[test]
+fn equal_allocation_origins_cross_control_flow_joins() {
+    for distinct in [false, true] {
+        let mut types = Types::default();
+        let int = types.scalar(ScalarType::I64);
+        let boolean = types.scalar(ScalarType::Bool);
+        let pointer = types.intern(Type::Pointer(int));
+        let mut b = Builder::new(&types, int);
+        let condition = b.parameter(b.current(), boolean);
+        let initial = b.constant(int, Scalar::integer(ScalarType::I64, 7).unwrap());
+        let first = cell(&mut b, int, pointer, initial);
+        let second = if distinct {
+            cell(&mut b, int, pointer, initial)
+        } else {
+            first
+        };
+        let left = b.create_block();
+        let right = b.create_block();
+        let join = b.create_block();
+        let selected = b.parameter(join, pointer);
+        b.branch(condition, left, right);
+        b.switch_to(left);
+        let alias = b.emit(Op::Reinterpret(first), Some(pointer)).unwrap();
+        b.jump(join, vec![alias]);
+        b.switch_to(right);
+        let alias = b.emit(Op::Refine(second), Some(pointer)).unwrap();
+        b.jump(join, vec![alias]);
+        b.switch_to(join);
+        let next = b.constant(int, Scalar::integer(ScalarType::I64, 11).unwrap());
+        b.emit(
+            Op::Store {
+                pointer: selected,
+                value: next,
+            },
+            None,
+        );
+        let result = b.emit(Op::Load(first), Some(int)).unwrap();
+        b.terminate(Terminator::Return(Some(result)));
+        let mut cells = vec![(first, initial)];
+        if distinct {
+            cells.push((second, initial));
+        }
+        let body = promote_cells(b.finish().unwrap(), &types, &cells).unwrap();
+        verify(&body, &types).unwrap();
+        let retains_storage = body
+            .instructions
+            .iter()
+            .any(|i| matches!(i.op, Op::Call { .. }));
+        assert_eq!(retains_storage, distinct);
+        crate::jvm::select::compile(&body, &types, &mut Default::default()).unwrap();
+    }
+}
+
+#[test]
+fn nonentry_allocations_remain_conservative_at_joins() {
+    let mut types = Types::default();
+    let int = types.scalar(ScalarType::I64);
+    let boolean = types.scalar(ScalarType::Bool);
+    let pointer = types.intern(Type::Pointer(int));
+    let mut b = Builder::new(&types, int);
+    let again = b.parameter(b.current(), boolean);
+    let initial = b.constant(int, Scalar::integer(ScalarType::I64, 7).unwrap());
+    let allocate = b.create_block();
+    let join = b.create_block();
+    let repeat = b.create_block();
+    let done = b.create_block();
+    let selected = b.parameter(join, pointer);
+    b.jump(allocate, vec![]);
+    b.switch_to(allocate);
+    let storage = cell(&mut b, int, pointer, initial);
+    b.jump(join, vec![storage]);
+    b.switch_to(join);
+    let value = b.emit(Op::Load(selected), Some(int)).unwrap();
+    b.branch(again, repeat, done);
+    b.switch_to(repeat);
+    let alias = b.emit(Op::Reinterpret(storage), Some(pointer)).unwrap();
+    b.jump(join, vec![alias]);
+    b.switch_to(done);
+    b.terminate(Terminator::Return(Some(value)));
+    let body = promote_cells(b.finish().unwrap(), &types, &[(storage, initial)]).unwrap();
+    // Only the entry region has a single-execution proof.
+    // This pass must retain allocations elsewhere, even if another proof could remove them.
+    assert!(
+        body.instructions
+            .iter()
+            .any(|i| matches!(i.op, Op::Call { .. }))
+    );
+    verify(&body, &types).unwrap();
+}
+
+#[test]
+fn nested_fields_follow_replacement_and_keep_owned_reads() {
+    for mode in ["plain", "escape", "retype", "invoke"] {
+        let escapes = mode == "escape";
+        let mut types = Types::default();
+        types.intern(Type::Unit);
+        let int = types.scalar(ScalarType::I64);
+        let name = types.symbol("Inner");
+        let inner = types.intern(Type::Class(name));
+        let name = types.symbol("Outer");
+        let outer = types.intern(Type::Class(name));
+        let outer_ptr = types.intern(Type::Pointer(outer));
+        let name = types.symbol("Other");
+        let other = types.intern(Type::Class(name));
+        let other_ptr = types.intern(Type::Pointer(other));
+        let inner_ptr = types.intern(Type::Pointer(inner));
+        let int_ptr = types.intern(Type::Pointer(int));
+        let mut b = Builder::new(&types, if escapes { int_ptr } else { int });
+        let first = b.parameter(b.current(), outer);
+        let second = b.parameter(b.current(), outer);
+        let storage = cell(&mut b, outer, outer_ptr, first);
+        let base = if mode == "retype" {
+            b.emit(Op::Reinterpret(storage), Some(other_ptr)).unwrap()
+        } else {
+            storage
+        };
+        let inner_field = b.field(FieldRef {
+            owner: if mode == "retype" { other } else { outer },
+            name: "inner".into(),
+            ty: inner,
+            is_static: false,
+        });
+        let scalar_field = b.field(FieldRef {
+            owner: inner,
+            name: "scalar".into(),
+            ty: int,
+            is_static: false,
+        });
+        let inner_projection = b.projection(PointerProjection {
+            parent: None,
+            field: inner_field,
+            offset: 0,
+            size: 8,
+            codec: Some("InnerCodec".into()),
+        });
+        let scalar_projection = b.projection(PointerProjection {
+            parent: None,
+            field: scalar_field,
+            offset: 0,
+            size: 8,
+            codec: None,
+        });
+        let nested = b
+            .emit(
+                Op::Project {
+                    base,
+                    projection: inner_projection,
+                },
+                Some(inner_ptr),
+            )
+            .unwrap();
+        let borrow = b
+            .emit(
+                Op::Project {
+                    base: nested,
+                    projection: scalar_projection,
+                },
+                Some(int_ptr),
+            )
+            .unwrap();
+        let snapshot = b.emit(Op::LoadCopy(nested), Some(inner)).unwrap();
+        let snapshot_value = b
+            .emit(
+                Op::GetField {
+                    object: snapshot,
+                    field: scalar_field,
+                },
+                Some(int),
+            )
+            .unwrap();
+        b.emit(
+            Op::Store {
+                pointer: storage,
+                value: second,
+            },
+            None,
+        );
+        b.emit(
+            Op::Store {
+                pointer: borrow,
+                value: snapshot_value,
+            },
+            None,
+        );
+        let handler = b.create_block();
+        let after = if mode == "invoke" {
+            b.invoke(Op::Load(borrow), Some(int), handler).unwrap()
+        } else {
+            b.emit(Op::Load(borrow), Some(int)).unwrap()
+        };
+        b.terminate(Terminator::Return(Some(if escapes {
+            borrow
+        } else {
+            after
+        })));
+        b.switch_to(handler);
+        b.terminate(Terminator::Rethrow);
+        let mut body = b.finish().unwrap();
+        super::promote_fields(&mut body, &types);
+        let original = body.clone();
+        let body = promote_cells(body, &types, &[(storage, first)]).unwrap();
+        verify(&body, &types).unwrap();
+        if mode != "plain" {
+            assert_eq!(body, original, "{mode}");
+            continue;
+        }
+        let operation = |value: ValueId| {
+            let ValueDef::Inst(id) = body.values[value.index()].def else {
+                panic!()
+            };
+            body.instructions[id.index()].op
+        };
+        let Op::CopyValue(copied) = operation(snapshot) else {
+            panic!()
+        };
+        assert_eq!(
+            operation(copied),
+            Op::GetField {
+                object: first,
+                field: inner_field
+            }
+        );
+        let Op::GetField { object, field } = operation(after) else {
+            panic!()
+        };
+        assert_eq!(field, scalar_field);
+        assert_eq!(
+            operation(object),
+            Op::GetField {
+                object: second,
+                field: inner_field
+            }
+        );
+        assert!(body.instructions.iter().any(
+            |i| matches!(i.op, Op::SetField { object, field, value }
+            if field == scalar_field && value == snapshot_value
+                && operation(object) == Op::GetField { object: second, field: inner_field })
+        ));
+        let live = super::live(&body, &types);
+        assert!(
+            !live.values[storage.index()]
+                && !live.values[nested.index()]
+                && !live.values[borrow.index()]
+        );
+        crate::jvm::select::compile(&body, &types, &mut Default::default()).unwrap();
     }
 }

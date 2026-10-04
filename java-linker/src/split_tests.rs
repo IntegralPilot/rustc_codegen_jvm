@@ -1,3 +1,4 @@
+use crate::test_support::run_jar;
 use crate::*;
 use ristretto_classfile::{Method, MethodAccessFlags, ReferenceKind, Version};
 
@@ -104,16 +105,7 @@ fn oversized_holder_is_split_and_calls_and_handles_follow() {
     paths.push(path.to_string_lossy().into_owned());
     let output = temp.path().join("output.jar");
     pipeline::link(&paths, &[], &[], &[], output.to_str().unwrap()).unwrap();
-    let result = std::process::Command::new("java")
-        .args(["-Xverify:all", "-jar"])
-        .arg(&output)
-        .output()
-        .expect("Java is required for classfile verification");
-    assert!(
-        result.status.success(),
-        "{}",
-        String::from_utf8_lossy(&result.stderr)
-    );
+    run_jar(&output);
     let mut jar = ZipArchive::new(fs::File::open(output).unwrap()).unwrap();
     let mut names = HashSet::default();
     let mut target = None;
@@ -168,4 +160,81 @@ fn overflow_does_not_move_public_or_stateful_classes() {
     let mut class = class_file_from_data(&fragment("test/mono/Mono_example_00", 0).data).unwrap();
     class.methods[0].name_index = class.constant_pool.add_utf8("<clinit>").unwrap();
     assert!(!split::eligible(&class));
+}
+
+#[test]
+fn split_codecs_keep_reflective_lookup_and_all_argument_widths() {
+    let owner = "test/Codecs_overflow";
+    let mut first = class_file_from_data(&fragment(owner, 0).data).unwrap();
+    first.methods.push(Method {
+        access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
+        name_index: first.constant_pool.add_utf8("mixed").unwrap(),
+        descriptor_index: first
+            .constant_pool
+            .add_utf8("(IJFDLjava/lang/Object;[I)D")
+            .unwrap(),
+        attributes: vec![Attribute::Code {
+            name_index: first.constant_pool.add_utf8("Code").unwrap(),
+            max_stack: 2,
+            max_locals: 8,
+            code: vec![Instruction::Dload(4), Instruction::Dreturn],
+            exception_table: Vec::new(),
+            attributes: Vec::new(),
+        }],
+    });
+    let temp = tempfile::tempdir().unwrap();
+    let fragments = [
+        serialize_class_file(&first).unwrap(),
+        fragment(owner, 100).data,
+    ];
+    let paths = fragments
+        .iter()
+        .enumerate()
+        .map(|(i, bytes)| {
+            let path = temp.path().join(format!("{i}.class"));
+            fs::write(&path, bytes).unwrap();
+            path.to_string_lossy().into_owned()
+        })
+        .collect::<Vec<_>>();
+    let output = temp.path().join("codecs.jar");
+    pipeline::link(&paths, &[], &[], &[], output.to_str().unwrap()).unwrap();
+    let check = temp.path().join("Check.java");
+    fs::write(
+        &check,
+        r#"
+public class Check {
+    public static void main(String[] args) throws Exception {
+        Class<?> codec = Class.forName("test.Codecs_overflow");
+        codec.getMethod("f0").invoke(null);
+        codec.getMethod("f150").invoke(null);
+        Object result = codec.getMethod("mixed", int.class, long.class, float.class,
+                double.class, Object.class, int[].class)
+            .invoke(null, 1, 2L, 3.0f, 7.25, new Object(), new int[1]);
+        if (!result.equals(7.25)) throw new AssertionError(result);
+    }
+}
+"#,
+    )
+    .unwrap();
+    let compile = std::process::Command::new("javac")
+        .arg(&check)
+        .output()
+        .unwrap();
+    assert!(
+        compile.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let classpath = std::env::join_paths([temp.path(), output.as_path()]).unwrap();
+    let execution = std::process::Command::new("java")
+        .args(["-Xverify:all", "-cp"])
+        .arg(classpath)
+        .arg("Check")
+        .output()
+        .unwrap();
+    assert!(
+        execution.status.success(),
+        "{}",
+        String::from_utf8_lossy(&execution.stderr)
+    );
 }

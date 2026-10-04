@@ -348,9 +348,12 @@ pub(super) fn integer_min<'tcx>(
     );
 }
 pub(super) fn carrying_mul_add<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    data_types: &mut Definitions<'tcx>,
+    instance: Instance<'tcx>,
+    output: Ty<'tcx>,
     label: &str,
     instructions: &mut Vec<oomir::Instruction>,
-    oomir_output_type: oomir::Type,
     oomir_operands: Vec<oomir::Operand>,
     dest: String,
 ) {
@@ -397,13 +400,9 @@ pub(super) fn carrying_mul_add<'tcx>(
             dest: Some(result_dest),
         });
     }
-    instructions.push(oomir::Instruction::ConstructObject {
-        dest,
-        class_name: oomir_output_type
-            .get_class_name()
-            .expect("carrying_mul_add returns a tuple class")
-            .to_string(),
-        args: vec![
+    crate::lower1::types::tuple_value(
+        output,
+        vec![
             (
                 oomir::Operand::Variable {
                     name: low_dest,
@@ -419,7 +418,12 @@ pub(super) fn carrying_mul_add<'tcx>(
                 input_ty,
             ),
         ],
-    });
+        &dest,
+        tcx,
+        data_types,
+        instance,
+        instructions,
+    );
 }
 pub(super) fn ctpop<'tcx>(
     instructions: &mut Vec<oomir::Instruction>,

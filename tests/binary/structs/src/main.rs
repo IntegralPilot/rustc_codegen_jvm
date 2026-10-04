@@ -1,3 +1,11 @@
+mod packed_words;
+mod record_calls;
+mod positional_storage;
+mod primitive_fields;
+mod storage_shapes;
+mod stored_fields;
+mod transparent_aggregates;
+
 struct Inner {
     x: i32,
     y: (i32, i32),
@@ -10,6 +18,13 @@ struct Outer<'a> {
 }
 
 fn main() {
+    record_calls::run();
+    primitive_fields::run();
+    packed_words::run();
+    stored_fields::run();
+    storage_shapes::run();
+    positional_storage::run();
+    transparent_aggregates::run();
     // === Nested STRUCT + TUPLE + ARRAY ===
     let mut outer = Outer {
         label: "start",

@@ -242,6 +242,9 @@ pub(super) fn union_aggregate_layout<'tcx>(
     instance_context: rustc_middle::ty::Instance<'tcx>,
 ) -> Result<Option<UnionAggregateLayout<'tcx>>, String> {
     let ty = resolve_union_ty(tcx, ty, instance_context)?;
+    if value_scalar_ty(ty, tcx).is_some() || transparent_payload(ty, tcx).is_some() {
+        return Ok(None);
+    }
     let layout = tcx
         .layout_of(TypingEnv::fully_monomorphized().as_query_input(ty))
         .map_err(|err| format!("could not get layout for {:?}: {:?}", ty, err))?;
@@ -282,7 +285,7 @@ pub(super) fn union_aggregate_layout<'tcx>(
                             field.ty(tcx, substs).skip_norm_wip(),
                             instance_context,
                         )?,
-                        field.ident(tcx).to_string(),
+                        struct_field_name(tcx, adt_def, index),
                         layout
                             .fields
                             .offset(FieldIdx::from_usize(index).into())
@@ -538,7 +541,7 @@ pub(super) fn union_enum_variant_layout<'tcx>(
     let variant_class = format!(
         "{}${}",
         enum_class,
-        jvm_names::member_name(&variant.name.to_string())
+        crate::lower1::types::enum_variant_name(variant, tcx)
     );
     let mut fields = Vec::new();
     for (field_index, field) in variant.fields.iter().enumerate() {
@@ -580,7 +583,7 @@ pub(super) fn enum_union_write_signature(receiver_class: &str) -> oomir::Signatu
             ("offset".to_string(), oomir::Type::I32),
         ],
         ret: Box::new(oomir::Type::Void),
-        is_static: false,
+        is_static: true,
     }
 }
 

@@ -23,6 +23,9 @@ mod remap;
 use remap::*;
 mod merge;
 use merge::*;
+mod method_names;
+#[cfg(test)]
+mod method_names_tests;
 mod metrics;
 use metrics::*;
 mod args;
@@ -30,14 +33,35 @@ use args::*;
 mod jar;
 #[cfg(test)]
 use jar::*;
+mod aliases;
+#[cfg(test)]
+mod aliases_tests;
+mod carriers;
+#[cfg(test)]
+mod carriers_tests;
+mod compact;
+#[cfg(test)]
+mod enum_carriers_tests;
 mod inputs;
-mod pipeline;
+#[cfg(test)]
+mod literal_tests;
 mod namespaces;
 #[cfg(test)]
 mod namespaces_tests;
+mod packing;
+mod pipeline;
+mod private_names;
+#[cfg(test)]
+mod private_names_tests;
+mod reachability;
+#[cfg(test)]
+mod reachability_tests;
 mod split;
+mod split_bridges;
 #[cfg(test)]
 mod split_tests;
+#[cfg(test)]
+mod test_support;
 #[cfg(test)]
 mod tests;
 

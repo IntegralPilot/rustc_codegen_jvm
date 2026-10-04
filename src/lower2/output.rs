@@ -25,6 +25,20 @@ fn io_error(context: &str, error: std::io::Error) -> jvm::Error {
 }
 
 impl ClassOutput {
+    pub fn resources(
+        &mut self,
+        registry: &ClassRegistry,
+        cp: &mut super::constant_pool::InternedConstantPool,
+    ) -> jvm::Result<()> {
+        for resource in cp.take_resources() {
+            let name = format!("{}{}", jvm::resources::BUNDLE_PREFIX, resource.name);
+            registry
+                .emit(&mut self.writer, &name, &resource.bytes)
+                .map_err(|e| io_error(&name, e))?;
+        }
+        Ok(())
+    }
+
     pub fn create(module: &str) -> jvm::Result<Self> {
         let ordinal = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
         let directory = std::env::temp_dir().join(format!(

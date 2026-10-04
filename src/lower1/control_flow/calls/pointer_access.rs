@@ -10,6 +10,14 @@ pub(super) fn as_ref<'tcx>(
     dispatch_receiver_ty: oomir::Type,
 ) {
     if let Some(dest) = effective_dest {
+        if matches!(oomir_output_type, oomir::Type::Pointer(_)) {
+            instructions.push(oomir::Instruction::Cast {
+                dest,
+                op: receiver_operand,
+                ty: oomir_output_type,
+            });
+            return;
+        }
         let option_class = oomir_output_type
             .get_class_name()
             .expect("pointer as_ref/as_mut returns Option")
@@ -21,14 +29,16 @@ pub(super) fn as_ref<'tcx>(
             method_ty: oomir::Signature {
                 params: vec![
                     ("pointer".to_string(), dispatch_receiver_ty.clone()),
-                    ("option_class".to_string(), oomir::Type::java_string()),
+                    ("some_class".to_string(), oomir::Type::java_string()),
+                    ("none_class".to_string(), oomir::Type::java_string()),
                 ],
                 ret: Box::new(oomir::Type::Class("java/lang/Object".to_string())),
                 is_static: true,
             },
             args: vec![
                 receiver_operand,
-                oomir::Operand::Constant(oomir::Constant::String(option_class)),
+                oomir::Operand::Constant(oomir::Constant::String(format!("{option_class}$Some"))),
+                oomir::Operand::Constant(oomir::Constant::String(format!("{option_class}$None"))),
             ],
             dest: Some(option_object.clone()),
         });
@@ -58,7 +68,10 @@ pub(super) fn non_null_ref<'tcx>(
     // raw-pointer methods with the same names which return Option.
     if let Some(dest) = effective_dest {
         if let oomir::Type::Pointer(non_null_ty) = &dispatch_receiver_ty
-            && matches!(non_null_ty.as_ref(), oomir::Type::Pointer(_))
+            && matches!(
+                non_null_ty.as_ref(),
+                oomir::Type::Pointer(_) | oomir::Type::Slice(_) | oomir::Type::Str
+            )
         {
             let pointer = crate::lower1::place::emit_pointer_read(
                 receiver_operand,
@@ -129,9 +142,18 @@ pub(super) fn non_null_ref<'tcx>(
                 instructions.push(oomir::Instruction::Move { dest, src: adapted });
             }
         } else {
+            let reference = crate::lower1::value_repr::adapt_operand_to_rust_type(
+                receiver_operand,
+                fn_output,
+                label,
+                tcx,
+                instance,
+                data_types,
+                &mut instructions,
+            );
             instructions.push(oomir::Instruction::Move {
                 dest,
-                src: receiver_operand,
+                src: reference,
             });
         }
     }
@@ -175,6 +197,7 @@ pub(super) fn is_aligned<'tcx>(
     });
 }
 pub(super) fn to_raw_parts<'tcx>(
+    tcx: TyCtxt<'tcx>,
     data_types: &mut Definitions<'tcx>,
     label: &str,
     mut instructions: &mut Vec<oomir::Instruction>,
@@ -203,28 +226,38 @@ pub(super) fn to_raw_parts<'tcx>(
                 if matches!(pointee.kind(), TyKind::Dynamic(..))
         );
         let data_pointer_name = format!("{label}_raw_parts_data");
-        instructions.push(oomir::Instruction::InvokeStatic {
-            class_name: oomir::POINTER_CLASS.to_string(),
-            method_name: if source_is_trait_object {
-                "traitObjectDataPointer".to_string()
-            } else {
-                "retype".to_string()
-            },
-            method_ty: oomir::Signature {
-                params: vec![
-                    ("pointer".to_string(), dispatch_receiver_ty.clone()),
-                    ("view_size".to_string(), oomir::Type::U64),
-                    ("view_codec".to_string(), oomir::Type::java_string()),
+        instructions.push(if !source_is_trait_object {
+            oomir::Instruction::AddressRetype {
+                dest: Some(data_pointer_name.clone()),
+                source: receiver_operand.clone(),
+                layout: Box::new(oomir::AddressLayout {
+                    pointer_type: data_pointer_ty.clone(),
+                    size: oomir::Operand::Constant(oomir::Constant::U64(0)),
+                    codec: oomir::Operand::Constant(oomir::Constant::Null(
+                        oomir::Type::java_string(),
+                    )),
+                }),
+            }
+        } else {
+            oomir::Instruction::InvokeStatic {
+                class_name: oomir::POINTER_CLASS.to_string(),
+                method_name: "traitObjectDataPointer".to_string(),
+                method_ty: oomir::Signature {
+                    params: vec![
+                        ("pointer".to_string(), dispatch_receiver_ty.clone()),
+                        ("view_size".to_string(), oomir::Type::U64),
+                        ("view_codec".to_string(), oomir::Type::java_string()),
+                    ],
+                    ret: Box::new(data_pointer_ty.clone()),
+                    is_static: true,
+                },
+                args: vec![
+                    receiver_operand.clone(),
+                    oomir::Operand::Constant(oomir::Constant::U64(0)),
+                    oomir::Operand::Constant(oomir::Constant::Null(oomir::Type::java_string())),
                 ],
-                ret: Box::new(data_pointer_ty.clone()),
-                is_static: true,
-            },
-            args: vec![
-                receiver_operand.clone(),
-                oomir::Operand::Constant(oomir::Constant::U64(0)),
-                oomir::Operand::Constant(oomir::Constant::Null(oomir::Type::java_string())),
-            ],
-            dest: Some(data_pointer_name.clone()),
+                dest: Some(data_pointer_name.clone()),
+            }
         });
         let mut tuple_args = vec![(
             oomir::Operand::Variable {
@@ -238,6 +271,13 @@ pub(super) fn to_raw_parts<'tcx>(
                 let metadata_name = format!("{label}_raw_parts_metadata");
                 emit_trait_object_metadata(
                     receiver_operand.clone(),
+                    crate::lower1::types::stable_type_identity(
+                        tcx,
+                        match resolved_receiver_mir_ty.kind() {
+                            TyKind::RawPtr(pointee, _) | TyKind::Ref(_, pointee, _) => *pointee,
+                            _ => unreachable!("trait metadata source is a pointer"),
+                        },
+                    ),
                     &metadata_ty,
                     metadata_name.clone(),
                     &metadata_name,

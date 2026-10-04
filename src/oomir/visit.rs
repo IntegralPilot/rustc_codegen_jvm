@@ -6,8 +6,19 @@ macro_rules! operand_visitor {
         pub fn $name<'a>(&'a $($mutable)? self, mut visit: impl FnMut(&'a $($mutable)? Operand)) {
             use Instruction::*;
             match self {
+                TaggedPack { value, tag, .. } => { visit(value); visit(tag); }
+                TaggedPart { value, .. } => visit(value),
                 Binary { op1, op2, .. } => { visit(op1); visit(op2); }
                 Not { src, .. } | Neg { src, .. } | Move { src, .. } => visit(src),
+                ValueCopy { source, .. } => visit(source),
+                MemoryLoad { pointer, .. } | MemoryCommit { pointer } => visit(pointer),
+                Heap { args, .. } => args.iter().for_each(&mut visit),
+                MemoryProject { base, .. } => visit(base),
+                AddressRetype { source, layout, .. } | ViewAddress { source, layout, .. } => {
+                    visit(source); visit(&layout.size); visit(&layout.codec);
+                }
+                AddressOffset { source, count, .. } => { visit(source); visit(count); }
+                MemoryStore { pointer, value, .. } => { visit(pointer); visit(value); }
                 Branch { condition, .. } => visit(condition),
                 Return { operand } => { if let Some(operand) = operand { visit(operand); } }
                 InvokeStatic { args, .. } | InvokeRustStatic { args, .. } => {
@@ -31,7 +42,7 @@ macro_rules! operand_visitor {
                 SetJvmField { object, value, .. } => { visit(object); visit(value); }
                 GetField { object, .. } | GetJvmField { object, .. } | Cast { op: object, .. } => visit(object),
                 SourceLocation(_) | LocalVariableScope(_) | UnwindStart { .. } | UnwindEnd
-                | Rethrow | CreateFunctionPointer { .. } | GetStaticField { .. } | Jump { .. }
+                | Rethrow | Unreachable | CreateFunctionPointer { .. } | GetStaticField { .. } | Jump { .. }
                 | ThrowNewWithMessage { .. } | Label { .. } => {}
             }
         }

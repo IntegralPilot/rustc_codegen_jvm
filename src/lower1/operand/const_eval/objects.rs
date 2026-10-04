@@ -390,7 +390,7 @@ pub(crate) fn handle_constant_enum<'tcx>(
     let variant_class_name = format!(
         "{}${}", // Using '$' as inner class separator is common in JVM
         base_enum_name,
-        jvm_names::member_name(&variant_def.ident(tcx).to_string())
+        crate::lower1::types::enum_variant_name(variant_def, tcx)
     );
 
     Ok(oomir::Constant::Instance {

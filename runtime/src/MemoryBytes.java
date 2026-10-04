@@ -11,6 +11,10 @@ public final class MemoryBytes {
         }
     }
 
+    public static void clear(byte[] bytes, int offset, int size) {
+        java.util.Arrays.fill(bytes, offset, offset + size, (byte) 0);
+    }
+
     public static void write(byte[] bytes, int offset, int size, long value) {
         for (int index = 0; index < size; index++) {
             bytes[offset + index] = (byte) (value >>> (index * 8));

@@ -103,41 +103,133 @@ impl<'tcx> RvalueContext<'_, 'tcx> {
                 }
             }
             Rvalue::Discriminant(place) => {
-                // 1. Generate instructions to get the actual value from the place
+                let temp_discriminant_var = generate_temp_var_name(data_types, &base_temp_name);
+                let place_mir_ty =
+                    normalize_unsize_ty(place.ty(&mir.local_decls, tcx).ty, tcx, instance);
+                let carrier = crate::lower1::types::enum_carrier(place_mir_ty, tcx);
+                if let Some(carrier) = carrier.filter(|carrier| !carrier.nullable) {
+                    // A single inhabited variant needs no payload read.
+                    let TyKind::Adt(def, _) = place_mir_ty.kind() else {
+                        unreachable!()
+                    };
+                    let discriminant = def.discriminant_for_variant(tcx, carrier.variant).val;
+                    let result_ty =
+                        get_place_type(original_dest_place, mir, tcx, instance, data_types);
+                    instructions.push(oomir::Instruction::Cast {
+                        dest: temp_discriminant_var.clone(),
+                        ty: result_ty.clone(),
+                        op: oomir::Operand::Constant(oomir::Constant::I64(discriminant as i64)),
+                    });
+                    return (
+                        instructions,
+                        oomir::Operand::Variable {
+                            name: temp_discriminant_var,
+                            ty: result_ty,
+                        },
+                    );
+                }
                 let (actual_value_var_name, get_instructions, actual_value_oomir_type) =
                     emit_instructions_to_get_on_own(place, tcx, instance, mir, data_types);
-
-                // Add the instructions needed to get the value (e.g., ArrayGet)
                 instructions.extend(get_instructions);
-
-                // 2. Now operate on the variable holding the actual value
-                let temp_discriminant_var = generate_temp_var_name(data_types, &base_temp_name);
+                if crate::lower1::types::enum_scalar_ty(place_mir_ty, tcx).is_some() {
+                    let result_ty =
+                        get_place_type(original_dest_place, mir, tcx, instance, data_types);
+                    instructions.push(oomir::Instruction::Cast {
+                        dest: temp_discriminant_var.clone(),
+                        ty: result_ty.clone(),
+                        op: oomir::Operand::Variable {
+                            name: actual_value_var_name,
+                            ty: actual_value_oomir_type,
+                        },
+                    });
+                    return (
+                        instructions,
+                        oomir::Operand::Variable {
+                            name: temp_discriminant_var,
+                            ty: result_ty,
+                        },
+                    );
+                }
+                if matches!(actual_value_oomir_type, oomir::Type::TaggedI64) {
+                    let result_ty =
+                        get_place_type(original_dest_place, mir, tcx, instance, data_types);
+                    let part = format!("{temp_discriminant_var}_tag");
+                    instructions.push(oomir::Instruction::TaggedPart {
+                        dest: part.clone(),
+                        value: oomir::Operand::Variable {
+                            name: actual_value_var_name,
+                            ty: actual_value_oomir_type,
+                        },
+                        index: 1,
+                    });
+                    instructions.push(oomir::Instruction::Cast {
+                        dest: temp_discriminant_var.clone(),
+                        ty: result_ty.clone(),
+                        op: oomir::Operand::Variable {
+                            name: part,
+                            ty: oomir::Type::I64,
+                        },
+                    });
+                    return (
+                        instructions,
+                        oomir::Operand::Variable {
+                            name: temp_discriminant_var,
+                            ty: result_ty,
+                        },
+                    );
+                }
+                if carrier.is_some() {
+                    let result_ty =
+                        get_place_type(original_dest_place, mir, tcx, instance, data_types);
+                    instructions.push(oomir::Instruction::InvokeStatic {
+                        dest: Some(temp_discriminant_var.clone()),
+                        class_name: oomir::POINTER_CLASS.to_string(),
+                        method_name: if matches!(
+                            actual_value_oomir_type,
+                            oomir::Type::Slice(_) | oomir::Type::Str
+                        ) {
+                            "nullableViewTag"
+                        } else {
+                            "nullableTag"
+                        }
+                        .to_string(),
+                        method_ty: oomir::Signature {
+                            params: vec![("value".to_string(), actual_value_oomir_type.clone())],
+                            ret: Box::new(oomir::Type::I64),
+                            is_static: true,
+                        },
+                        args: vec![oomir::Operand::Variable {
+                            name: actual_value_var_name,
+                            ty: actual_value_oomir_type,
+                        }],
+                    });
+                    let cast = format!("{temp_discriminant_var}_cast");
+                    instructions.push(oomir::Instruction::Cast {
+                        dest: cast.clone(),
+                        ty: result_ty.clone(),
+                        op: oomir::Operand::Variable {
+                            name: temp_discriminant_var,
+                            ty: oomir::Type::I64,
+                        },
+                    });
+                    return (
+                        instructions,
+                        oomir::Operand::Variable {
+                            name: cast,
+                            ty: result_ty,
+                        },
+                    );
+                }
 
                 let place_class_name = match actual_value_oomir_type.clone() {
                     oomir::Type::Class(name) => name.clone(),
                     // Handle potential references if get_on_own returns Ref(Class)
-                    oomir::Type::Reference(inner) => {
-                        if let oomir::Type::Class(name) = inner.as_ref() {
-                            name.clone()
-                        } else {
-                            panic!("Discriminant on Ref to non-class type: {:?}", inner)
-                        }
-                    }
-                    oomir::Type::MutableReference(inner) => {
-                        if let oomir::Type::Class(name) = inner.as_ref() {
-                            name.clone()
-                        } else {
-                            panic!("Discriminant on MutableRef to non-class type: {:?}", inner)
-                        }
-                    }
                     _ => panic!(
                         "Discriminant on non-class type: {:?}",
                         actual_value_oomir_type
                     ),
                 };
 
-                let place_mir_ty =
-                    normalize_unsize_ty(place.ty(&mir.local_decls, tcx).ty, tcx, instance);
                 if matches!(place_mir_ty.kind(), TyKind::Coroutine(..)) {
                     instructions.push(oomir::Instruction::GetField {
                         dest: temp_discriminant_var.clone(),
@@ -175,7 +267,7 @@ impl<'tcx> RvalueContext<'_, 'tcx> {
                 }
                 let (enum_class_name, use_numeric_discriminant) = match place_mir_ty.kind() {
                     TyKind::Adt(adt_def, substs) if adt_def.is_enum() => {
-                        force_define_named_adt(place_mir_ty, tcx, data_types, instance);
+                        ty_to_oomir_type(place_mir_ty, tcx, data_types, instance);
                         (
                             generate_adt_jvm_class_name(adt_def, substs, tcx, data_types, instance),
                             enum_union_discriminant_supported(adt_def, tcx),

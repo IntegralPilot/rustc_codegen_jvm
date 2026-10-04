@@ -1,3 +1,5 @@
+mod array_promotions;
+mod binary_data;
 mod cyclic;
 mod nested_constants;
 mod scoped_statics;
@@ -69,6 +71,8 @@ mod nested {
 }
 
 fn main() {
+    array_promotions::run();
+    binary_data::run();
     cyclic::run();
     nested_constants::run();
     scoped_statics::run();

@@ -11,6 +11,8 @@ use jvm::{
 mod encoding;
 pub(super) use encoding::*;
 mod arrays;
+mod resources;
+mod structured;
 use arrays::append_empty_array;
 mod factories;
 use factories::{create_constant_factory, create_shared_array_factory};
@@ -21,5 +23,7 @@ pub(super) use prepare::{function_needs_constant_preparation, prepare_function_c
 mod statics;
 pub(super) use statics::create_static_initializer_method;
 
+#[cfg(test)]
+mod test_support;
 #[cfg(test)]
 mod tests;

@@ -89,3 +89,47 @@ fn definite_assignment_accepts_a_store_on_every_path() {
     let loads = locals_loaded_before_definite_store(&instructions, &[], 2, "test", &[]).unwrap();
     assert!(loads.is_empty());
 }
+
+#[test]
+fn duplicate_two_words_under_one_preserves_categories() {
+    use FrameValue::*;
+    for (input, expected) in [
+        (vec![Null, Long], vec![Long, Null, Long]),
+        (
+            vec![Null, Integer, Float],
+            vec![Integer, Float, Null, Integer, Float],
+        ),
+    ] {
+        let mut state = FrameState::new(Vec::new(), 0);
+        for value in input {
+            state.push(value);
+        }
+        super::transfer::transfer_instruction(
+            0,
+            &Instruction::Dup2_x1,
+            &mut state,
+            &[],
+            &ConstantPool::default(),
+            "dup2_x1",
+            &mut SignatureCache::default(),
+        )
+        .unwrap();
+        assert_eq!(state.stack, expected);
+        assert_eq!(state.stack_words, 5);
+    }
+    let mut state = FrameState::new(Vec::new(), 0);
+    state.push(Long);
+    state.push(Long);
+    assert!(
+        super::transfer::transfer_instruction(
+            0,
+            &Instruction::Dup2_x1,
+            &mut state,
+            &[],
+            &ConstantPool::default(),
+            "dup2_x1",
+            &mut SignatureCache::default()
+        )
+        .is_err()
+    );
+}

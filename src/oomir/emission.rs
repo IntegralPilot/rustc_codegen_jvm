@@ -24,8 +24,37 @@ pub struct BasicBlock {
 
 pub use jvm_compiler_core::scalar::BinaryOp;
 
+/// Field locations keep the Rust layout independently of the generated carrier.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MemoryProjection {
+    pub owner: String,
+    pub field: String,
+    pub pointee: Type,
+    pub offset: u64,
+    pub size: u64,
+    pub codec: Option<String>,
+}
+
+/// Address layouts stay explicit until instruction selection.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AddressLayout {
+    pub pointer_type: Type,
+    pub size: Operand,
+    pub codec: Operand,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Instruction {
+    TaggedPack {
+        dest: String,
+        value: Operand,
+        tag: Operand,
+    },
+    TaggedPart {
+        dest: String,
+        value: Operand,
+        index: u8,
+    },
     SourceLocation(SourceLocation), // metadata. does not emit JVM bytecode.
     LocalVariableScope(Vec<usize>), // same
     UnwindStart {
@@ -33,6 +62,7 @@ pub enum Instruction {
     }, // metadata for a protected JVM region.
     UnwindEnd,                      // ends the current protected region.
     Rethrow,                        // resumes the current Rust unwind.
+    Unreachable,                    // reaching this terminator is undefined behavior.
     Binary {
         op: BinaryOp,
         dest: String,
@@ -87,6 +117,55 @@ pub enum Instruction {
     Move {
         dest: String,
         src: Operand, // Source operand (could be Variable or Constant, though in this context, it's likely Variable)
+    },
+    /// Owned reads make independent copies. Live reads can require MemoryCommit after field
+    /// mutation.
+    MemoryLoad {
+        dest: String,
+        pointer: Operand,
+        pointee: Type,
+        owned: bool,
+    },
+    MemoryStore {
+        pointer: Operand,
+        pointee: Type,
+        value: Operand,
+    },
+    ValueCopy {
+        dest: String,
+        source: Operand,
+    },
+    MemoryCommit {
+        pointer: Operand,
+    },
+    Heap {
+        operation: HeapOp,
+        args: Vec<Operand>,
+        dest: Option<String>,
+    },
+    MemoryProject {
+        dest: String,
+        base: Operand,
+        projection: Box<MemoryProjection>,
+    },
+    AddressRetype {
+        dest: Option<String>,
+        source: Operand,
+        layout: Box<AddressLayout>,
+    },
+    ViewAddress {
+        dest: Option<String>,
+        source: Operand,
+        layout: Box<AddressLayout>,
+    },
+    AddressOffset {
+        dest: Option<String>,
+        source: Operand,
+        count: Operand,
+        ty: Type,
+        bytes: bool,
+        wrapping: bool,
+        subtract: bool,
     },
     ThrowNewWithMessage {
         exception_class: String, // e.g., "java/lang/RuntimeException"

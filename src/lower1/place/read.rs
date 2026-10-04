@@ -1,6 +1,12 @@
 //! Read operations on Rust places.
 use super::*;
 
+fn is_struct_tail_place<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {
+    struct_tail_for_place(tcx, ty).is_some_and(|tail| {
+        tail.is_slice() || tail.is_str() || matches!(tail.kind(), TyKind::Dynamic(..))
+    })
+}
+
 pub(crate) fn emit_instructions_to_get_recursive<'tcx>(
     place: &Place<'tcx>,
     tcx: TyCtxt<'tcx>,
@@ -8,6 +14,14 @@ pub(crate) fn emit_instructions_to_get_recursive<'tcx>(
     mir: &Body<'tcx>,
     data_types: &mut Definitions<'tcx>,
 ) -> (String, Vec<Instruction>, oomir::Type) {
+    let mut instructions = Vec::new();
+    if let Some((pointer, ty)) =
+        indirect_field_address(place, tcx, instance, mir, data_types, &mut instructions)
+    {
+        let dest = format!("{}_field_value", place_to_string(place, tcx));
+        emit_pointer_read(pointer, &ty, &dest, &mut instructions);
+        return (dest, instructions, ty);
+    }
     // Start with the base local.
     let current_place = Place {
         local: place.local,
@@ -15,7 +29,6 @@ pub(crate) fn emit_instructions_to_get_recursive<'tcx>(
     };
     let mut current_var = place_to_string(&current_place, tcx);
     let mut current_type = get_place_type(&current_place, mir, tcx, instance, data_types);
-    let mut instructions = vec![];
     let mut coroutine_variant = None;
     if data_types.local_uses_stable_cell(place.local) {
         let pointee_type = current_type.clone();
@@ -23,7 +36,7 @@ pub(crate) fn emit_instructions_to_get_recursive<'tcx>(
         let value = emit_pointer_read(
             Operand::Variable {
                 name: local_cell_name(place.local),
-                ty: oomir::Type::Pointer(Box::new(pointee_type.clone())),
+                ty: oomir::Type::pointer(pointee_type.clone()),
             },
             &pointee_type,
             &value_name,
@@ -63,6 +76,64 @@ pub(crate) fn emit_instructions_to_get_recursive<'tcx>(
                         .instantiate(tcx, instance.args)
                         .skip_norm_wip();
 
+                if let Some(payload) = super::super::types::transparent_payload(base_rust_ty, tcx) {
+                    if field_index.index() == payload.field {
+                        current_type = ty_to_oomir_type(field_ty, tcx, data_types, instance);
+                    } else {
+                        let ty = data_types.normalize(tcx, field_ty, instance);
+                        let dest = format!("{current_var}_marker_{}", field_index.index());
+                        current_type = ty_to_oomir_type(ty, tcx, data_types, instance);
+                        let field = if current_type.has_jvm_value() {
+                            super::super::value_repr::materialize_implicit_zst(
+                                ty,
+                                &dest,
+                                tcx,
+                                instance,
+                                data_types,
+                                &mut instructions,
+                            )
+                            .expect("owner marker is a zero-sized value")
+                        } else {
+                            oomir::Operand::Constant(oomir::Constant::Unit)
+                        };
+                        instructions.push(Instruction::Move {
+                            dest: dest.clone(),
+                            src: field,
+                        });
+                        current_var = dest;
+                    }
+                    continue;
+                }
+
+                if let Some(word) = super::super::types::packed_word(base_rust_ty, tcx) {
+                    let field_type = ty_to_oomir_type(field_ty, tcx, data_types, instance);
+                    let dest = format!("{current_var}_packed_{}", field_index.index());
+                    let source = Operand::Variable {
+                        name: current_var,
+                        ty: current_type.clone(),
+                    };
+                    let value = if matches!(current_type, oomir::Type::Pointer(_)) {
+                        let address = word.field_address(
+                            source,
+                            field_index.index(),
+                            &field_type,
+                            &dest,
+                            &mut instructions,
+                        );
+                        emit_pointer_read(address, &field_type, &dest, &mut instructions)
+                    } else {
+                        word.extract(
+                            source,
+                            field_index.index(),
+                            &field_type,
+                            &dest,
+                            &mut instructions,
+                        )
+                    };
+                    current_var = value.get_name().unwrap().to_string();
+                    current_type = field_type;
+                    continue;
+                }
                 if field_index.index() == 0
                     && proj_index > 0
                     && let ProjectionElem::Downcast(_, variant_idx) =
@@ -74,6 +145,27 @@ pub(crate) fn emit_instructions_to_get_recursive<'tcx>(
                     // A transparent subtype case has no wrapper field: after
                     // the downcast, projecting its sole Rust payload is an
                     // identity at the JVM level.
+                    current_type = ty_to_oomir_type(field_ty, tcx, data_types, instance);
+                    continue;
+                }
+
+                if field_index.index() == 0 && matches!(current_type, oomir::Type::TaggedI64) {
+                    let dest = format!("{current_var}_payload");
+                    instructions.push(Instruction::TaggedPart {
+                        dest: dest.clone(),
+                        value: Operand::Variable {
+                            name: current_var,
+                            ty: current_type,
+                        },
+                        index: 0,
+                    });
+                    current_var = dest;
+                    current_type = ty_to_oomir_type(field_ty, tcx, data_types, instance);
+                    continue;
+                }
+                if field_index.index() == 0
+                    && super::super::types::direct_enum_payload(base_rust_ty, tcx).is_some()
+                {
                     current_type = ty_to_oomir_type(field_ty, tcx, data_types, instance);
                     continue;
                 }
@@ -107,9 +199,7 @@ pub(crate) fn emit_instructions_to_get_recursive<'tcx>(
                             )
                         });
                     let field_offset = layout.fields.offset(field_index.index()).bytes_usize();
-                    let field_rust_ty = EarlyBinder::bind(tcx, field_ty)
-                        .instantiate(tcx, instance.args)
-                        .skip_norm_wip();
+                    let field_rust_ty = data_types.normalize(tcx, field_ty, instance);
                     let base_pointer_name = current_var.clone();
                     let base_pointer_ty = current_type.clone();
                     let oomir::Type::Pointer(base_pointee_ty) = &base_pointer_ty else {
@@ -127,6 +217,7 @@ pub(crate) fn emit_instructions_to_get_recursive<'tcx>(
                         data_types,
                     )
                     .unwrap_or_else(|error| panic!("Error getting struct field name: {error}"));
+                    let memory_offset = field_offset as u64;
                     let field_offset = Operand::Constant(oomir::Constant::U64(
                         u64::try_from(field_offset).expect("Rust struct field offset exceeds u64"),
                     ));
@@ -150,7 +241,7 @@ pub(crate) fn emit_instructions_to_get_recursive<'tcx>(
                             },
                             args: vec![
                                 Operand::Constant(oomir::Constant::String(owner_class)),
-                                Operand::Constant(oomir::Constant::String(field_name)),
+                                Operand::Constant(oomir::Constant::LiteralString(field_name)),
                                 field_offset,
                             ],
                             operand: Operand::Variable {
@@ -191,7 +282,7 @@ pub(crate) fn emit_instructions_to_get_recursive<'tcx>(
                             },
                             args: vec![
                                 Operand::Constant(oomir::Constant::String(owner_class)),
-                                Operand::Constant(oomir::Constant::String(field_name)),
+                                Operand::Constant(oomir::Constant::LiteralString(field_name)),
                                 field_offset,
                                 Operand::Constant(oomir::Constant::U64(
                                     u64::try_from(
@@ -227,47 +318,29 @@ pub(crate) fn emit_instructions_to_get_recursive<'tcx>(
                         current_var = next_var;
                     } else {
                         current_type = ty_to_oomir_type(field_rust_ty, tcx, data_types, instance);
-                        let field_pointer_ty = oomir::Type::Pointer(Box::new(current_type.clone()));
+                        let field_pointer_ty = oomir::Type::pointer(current_type.clone());
                         let typed_pointer_name = format!("{current_var}_typed_field_pointer");
-                        instructions.push(Instruction::InvokeVirtual {
-                            dest: Some(typed_pointer_name.clone()),
-                            class_name: oomir::POINTER_CLASS.to_string(),
-                            method_name: "projectStructField".to_string(),
-                            method_ty: oomir::Signature {
-                                params: vec![
-                                    ("self".to_string(), base_pointer_ty.clone()),
-                                    ("owner_class".to_string(), oomir::Type::java_string()),
-                                    ("field_name".to_string(), oomir::Type::java_string()),
-                                    ("field_offset".to_string(), oomir::Type::U64),
-                                    ("field_size".to_string(), oomir::Type::U64),
-                                    ("field_codec".to_string(), oomir::Type::java_string()),
-                                ],
-                                ret: Box::new(field_pointer_ty.clone()),
-                                is_static: false,
-                            },
-                            args: vec![
-                                Operand::Constant(oomir::Constant::String(owner_class)),
-                                Operand::Constant(oomir::Constant::String(field_name)),
-                                field_offset,
-                                Operand::Constant(oomir::Constant::U64(
-                                    u64::try_from(
-                                        super::super::types::layout_size_bytes(tcx, field_rust_ty)
-                                            .expect("sized struct field must have a layout"),
-                                    )
-                                    .expect("Rust struct field layout exceeds u64"),
-                                )),
-                                pointer_view_codec_operand(
-                                    field_rust_ty,
-                                    tcx,
-                                    data_types,
-                                    instance,
-                                ),
-                            ],
-                            operand: Operand::Variable {
+                        instructions.push(super::project_memory(
+                            typed_pointer_name.clone(),
+                            Operand::Variable {
                                 name: base_pointer_name,
                                 ty: base_pointer_ty,
                             },
-                        });
+                            owner_class,
+                            field_name,
+                            field_rust_ty,
+                            memory_offset,
+                            tcx,
+                            instance,
+                            data_types,
+                        ));
+                        if is_struct_tail_place(tcx, field_rust_ty) {
+                            // Nested DST fields require the address and length. Their static prefix
+                            // does not describe the complete value.
+                            current_var = typed_pointer_name;
+                            current_type = field_pointer_ty;
+                            continue;
+                        }
                         let next_var = format!("{current_var}_{}", field_index.index());
                         let value = emit_pointer_read(
                             Operand::Variable {
@@ -286,15 +359,6 @@ pub(crate) fn emit_instructions_to_get_recursive<'tcx>(
                     let owner_class_name =
                         match ty_to_oomir_type(base_rust_ty, tcx, data_types, instance) {
                             oomir::Type::Class(name) => name,
-                            oomir::Type::Reference(inner)
-                                if matches!(inner.as_ref(), oomir::Type::Class(_)) =>
-                            {
-                                if let oomir::Type::Class(name) = inner.as_ref() {
-                                    name.clone()
-                                } else {
-                                    unreachable!()
-                                }
-                            }
                             other => {
                                 panic!("Union field access on non-class OOMIR type: {:?}", other)
                             }
@@ -329,18 +393,8 @@ pub(crate) fn emit_instructions_to_get_recursive<'tcx>(
                 // Get the owner class name and field name.
                 let owner_class_name = match &current_type {
                     oomir::Type::Class(name) => name.clone(),
-                    oomir::Type::Reference(inner)
-                        if matches!(inner.as_ref(), oomir::Type::Class(_)) =>
-                    {
-                        if let oomir::Type::Class(name) = inner.as_ref() {
-                            name.clone()
-                        } else {
-                            unreachable!()
-                        }
-                    }
                     _ => panic!(
-                        "Field access on non-class type: current var '{}' has type: {:?}",
-                        current_var, current_type
+                        "Field access on non-class type: current var '{current_var}' has type {current_type:?}, Rust type {base_rust_ty:?}, in {instance:?}"
                     ),
                 };
 
@@ -407,15 +461,6 @@ pub(crate) fn emit_instructions_to_get_recursive<'tcx>(
                 // Determine element type from the current type (which should be an array or reference-to-array).
                 current_type = match &current_type {
                     oomir::Type::Array(inner) | oomir::Type::Slice(inner) => inner.as_ref().clone(),
-                    oomir::Type::Reference(inner)
-                        if matches!(inner.as_ref(), oomir::Type::Array(_)) =>
-                    {
-                        if let oomir::Type::Array(element_type) = inner.as_ref() {
-                            element_type.as_ref().clone()
-                        } else {
-                            unreachable!()
-                        }
-                    }
                     _ => panic!(
                         "Index access on non-array type: current var '{}' has type: {:?}",
                         current_var, current_type
@@ -441,15 +486,6 @@ pub(crate) fn emit_instructions_to_get_recursive<'tcx>(
                 // Determine element type based on current_type being an array or reference-to-array.
                 current_type = match &current_type {
                     oomir::Type::Array(inner) | oomir::Type::Slice(inner) => inner.as_ref().clone(),
-                    oomir::Type::Reference(inner)
-                        if matches!(inner.as_ref(), oomir::Type::Array(_)) =>
-                    {
-                        if let oomir::Type::Array(element_type) = inner.as_ref() {
-                            element_type.as_ref().clone()
-                        } else {
-                            unreachable!()
-                        }
-                    }
                     _ => panic!(
                         "Constant index access on non-array type: current var '{}' has type: {:?}",
                         current_var, current_type
@@ -526,8 +562,8 @@ pub(crate) fn emit_instructions_to_get_recursive<'tcx>(
                     TyKind::RawPtr(pointee, _) | TyKind::Ref(_, pointee, _) => Some(*pointee),
                     _ => None,
                 };
-                let preserve_slice_tailed_pointer = pointer_pointee
-                    .is_some_and(|pointee| has_slice_or_str_struct_tail(tcx, pointee));
+                let preserve_unsized_pointer =
+                    pointer_pointee.is_some_and(|pointee| is_struct_tail_place(tcx, pointee));
                 let projects_field = matches!(base_rust_ty.kind(), TyKind::RawPtr(..))
                     && matches!(
                         place.projection.get(proj_index + 1),
@@ -548,7 +584,12 @@ pub(crate) fn emit_instructions_to_get_recursive<'tcx>(
                 // A raw field projection must not read neighboring, possibly
                 // uninitialized fields. References already guarantee a valid
                 // enclosing value, so retain their direct object access.
-                if preserve_slice_tailed_pointer || projects_field {
+                let projects_packed_field = matches!(
+                    place.projection.get(proj_index + 1),
+                    Some(ProjectionElem::Field(..))
+                ) && pointer_pointee
+                    .is_some_and(|ty| super::super::types::packed_word(ty, tcx).is_some());
+                if preserve_unsized_pointer || projects_field || projects_packed_field {
                     continue;
                 }
                 if matches!(type_before_proj, oomir::Type::Slice(_))
@@ -588,51 +629,6 @@ pub(crate) fn emit_instructions_to_get_recursive<'tcx>(
                         current_var = result.get_name().unwrap_or(&next_var).to_string();
                         current_type = element_type.as_ref().clone();
                     }
-                    oomir::Type::MutableReference(_) => {
-                        let type_before_deref = current_type.clone();
-
-                        match type_before_deref.clone() {
-                            oomir::Type::MutableReference(element_type) => {
-                                // Create a temporary variable name for the dereferenced value
-                                let next_var = format!("{}_deref", current_var);
-
-                                breadcrumbs::log!(
-                                    breadcrumbs::LogLevel::Info,
-                                    "place-lowering",
-                                    format!(
-                                        "Info: Handling Deref: Var '{}' ({:?}) -> Temp Var '{}' (Type: {:?})",
-                                        current_var,
-                                        type_before_deref,
-                                        next_var,
-                                        element_type.as_ref()
-                                    )
-                                );
-
-                                instructions.push(oomir::Instruction::ArrayGet {
-                                    dest: next_var.clone(),
-                                    array: Operand::Variable {
-                                        name: current_var.clone(),
-                                        ty: type_before_deref, // The type is Array(T)
-                                    },
-                                    // Index is always 0 for our reference representation
-                                    index: Operand::Constant(oomir::Constant::I32(0)),
-                                });
-
-                                // Update current_var and current_type for subsequent projections
-                                current_var = next_var;
-                                current_type = element_type.as_ref().clone(); // Type becomes T
-                            }
-                            _ => {
-                                panic!(
-                                    "Attempted to Deref a non-reference (non-array) type: \
-                             Variable '{}' has type {:?}. Place: {:?}",
-                                    current_var,
-                                    current_type, // Use the original current_type for the error
-                                    place
-                                );
-                            }
-                        }
-                    }
                     _ => {
                         // no op
                     }
@@ -652,6 +648,12 @@ pub(crate) fn emit_instructions_to_get_recursive<'tcx>(
                 let base_rust_ty = EarlyBinder::bind(tcx, base_rust_ty)
                     .instantiate(tcx, instance.args)
                     .skip_norm_wip();
+
+                if super::super::types::tagged_scalar(base_rust_ty, tcx).is_some()
+                    || super::super::types::direct_enum_payload(base_rust_ty, tcx).is_some()
+                {
+                    continue;
+                }
 
                 let coroutine_ty = match base_rust_ty.kind() {
                     TyKind::Coroutine(..) => Some(base_rust_ty),
@@ -711,7 +713,7 @@ pub(crate) fn emit_instructions_to_get_recursive<'tcx>(
                 let variant_class_name = format!(
                     "{}${}",
                     base_enum_oomir_name, // Use OOMIR name already derived
-                    jvm_names::member_name(&variant_def.name.to_string())
+                    crate::lower1::types::enum_variant_name(variant_def, tcx)
                 );
                 let transparent_payload =
                     jvm_subtype_payload_ty(&adt_def, variant_def, substs, tcx);

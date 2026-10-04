@@ -136,7 +136,7 @@ pub(crate) fn slice_tailed_pointer_constant<'tcx>(
         };
     let java_object = oomir::Type::Class("java/lang/Object".to_string());
     let java_string = oomir::Type::java_string();
-    let data_pointer_type = oomir::Type::Pointer(Box::new(element_type));
+    let data_pointer_type = oomir::Type::pointer(element_type);
     let data_pointer = oomir::Constant::StaticCall {
         owner_class: oomir::POINTER_CLASS.to_string(),
         method_name: "fromSlice".to_string(),
@@ -169,7 +169,7 @@ pub(crate) fn slice_tailed_pointer_constant<'tcx>(
             java_string,
             oomir::Type::U64,
         ],
-        ty: oomir::Type::Pointer(Box::new(pointee_type)),
+        ty: oomir::Type::pointer(pointee_type),
     })
 }
 
@@ -442,7 +442,7 @@ pub(crate) fn slice_ref_constant<'tcx>(
                 element_codec,
             ],
             param_types: Vec::new(),
-            ty: oomir::Type::Pointer(Box::new(element_type.clone())),
+            ty: oomir::Type::pointer(element_type.clone()),
         }
     } else {
         backing

@@ -259,11 +259,38 @@ pub(crate) fn merge_group(fragments: Vec<ClassInfo>) -> io::Result<ClassInfo> {
         .unwrap())
 }
 
+#[cfg(test)]
 pub(crate) fn merge_group_with_relocations(
     fragments: Vec<ClassInfo>,
     relocations: Option<&std::sync::Mutex<split::Relocations>>,
 ) -> io::Result<Vec<ClassInfo>> {
-    if fragments.len() == 1 {
+    merge_group_with_demands(fragments, relocations, None)
+}
+
+fn prune_methods(
+    class: &mut ClassFile<'static>,
+    dead: &HashSet<(JavaString, JavaString)>,
+) -> io::Result<bool> {
+    let keep = (0..class.methods.len())
+        .map(|i| Ok(!dead.contains(&method_identity(class, i)?)))
+        .collect::<io::Result<Vec<_>>>()?;
+    let changed = keep.iter().any(|&keep| !keep);
+    if changed {
+        class.methods = std::mem::take(&mut class.methods)
+            .into_iter()
+            .zip(keep)
+            .filter_map(|(method, keep)| keep.then_some(method))
+            .collect();
+    }
+    Ok(changed)
+}
+
+pub(crate) fn merge_group_with_demands(
+    fragments: Vec<ClassInfo>,
+    relocations: Option<&std::sync::Mutex<split::Relocations>>,
+    dead: Option<&HashSet<(JavaString, JavaString)>>,
+) -> io::Result<Vec<ClassInfo>> {
+    if fragments.len() == 1 && dead.is_none() {
         return Ok(fragments);
     }
 
@@ -288,17 +315,18 @@ pub(crate) fn merge_group_with_relocations(
         unique_fragments.push(fragment);
         content_hashes.entry(hash).or_default().push(index);
     }
-    if unique_fragments.len() == 1 {
+    if unique_fragments.len() == 1 && dead.is_none() {
         return Ok(unique_fragments);
     }
 
     // Parse every surviving fragment once. Previously the reorder
     // check parsed all fragments and the merge loop parsed them all a
     // second time.
+    let mut pruned = false;
     let mut parsed = unique_fragments
         .into_iter()
         .map(|fragment| {
-            let class_file = class_file_from_data(&fragment.data).map_err(|error| {
+            let mut class_file = class_file_from_data(&fragment.data).map_err(|error| {
                 io::Error::new(
                     error.kind(),
                     format!(
@@ -307,6 +335,9 @@ pub(crate) fn merge_group_with_relocations(
                     ),
                 )
             })?;
+            if let Some(dead) = dead {
+                pruned |= prune_methods(&mut class_file, dead)?;
+            }
             Ok((fragment, class_file))
         })
         .collect::<io::Result<Vec<_>>>()?;
@@ -329,7 +360,10 @@ pub(crate) fn merge_group_with_relocations(
                     && split::eligible(&base)
                     && parsed.iter().all(|(_, c)| split::eligible(c))
                 {
-                    let original = class_file_from_data(&merged.data)?;
+                    let mut original = class_file_from_data(&merged.data)?;
+                    if let Some(dead) = dead {
+                        prune_methods(&mut original, dead)?;
+                    }
                     return split::holders(
                         std::iter::once(&original).chain(parsed.iter().map(|(_, c)| c)),
                         &mut relocations.lock().unwrap(),
@@ -344,6 +378,17 @@ pub(crate) fn merge_group_with_relocations(
                 ));
             }
         }
+    }
+    if pruned {
+        let owner = base
+            .class_name()
+            .map_err(|e| constant_pool_error("pruned owner", e))?
+            .to_string();
+        return Ok(vec![split::compact(
+            &base,
+            &(0..base.methods.len()).collect::<Vec<_>>(),
+            &owner,
+        )?]);
     }
     if changed {
         merged.data = serialize_class_file(&base).map_err(|error| {

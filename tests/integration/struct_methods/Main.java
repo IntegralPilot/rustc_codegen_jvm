@@ -11,8 +11,19 @@ public class Main {
         assertRustFinalizeIsNotJavaFinalizer();
         assertFieldlessNoArgsConstructorRemains();
         assertConstantStructUsesDeclarationOrder();
+        assertPrivateCarrierHasNoReceiverBridges();
+        assertOptionalViewBridges();
 
         System.out.println("Struct method mapping test passed!");
+    }
+
+    private static void assertOptionalViewBridges() {
+        struct_methods.OptionalViewBridge bridge = new struct_methods.OptionalViewBridge();
+        org.rustlang.runtime.Utf8View empty = org.rustlang.runtime.Utf8View.fromJavaString("");
+        if (bridge.has_value(null) || bridge.has_value(bridge.round_trip(null))
+                || !bridge.has_value(empty) || !bridge.has_value(bridge.round_trip(empty))) {
+            throw new AssertionError("optional view bridges must distinguish None from empty borrows");
+        }
     }
 
     private static void assertNoFieldedNoArgsConstructor() {
@@ -117,6 +128,24 @@ public class Main {
         struct_methods.OrderedConstant profile = struct_methods.struct_methods.default_profile();
         if (profile.z_value != 36L || !profile.a_flag) {
             throw new AssertionError("constant structs should use declaration-order constructor arguments");
+        }
+    }
+
+    private static void assertPrivateCarrierHasNoReceiverBridges() throws Exception {
+        if (struct_methods.struct_methods.private_counter() != 12) {
+            throw new AssertionError("private Rust calls and destruction must still run");
+        }
+        Class<?> carrier;
+        try {
+            carrier = Class.forName("struct_methods.PrivateCounter");
+        } catch (ClassNotFoundException eliminatedCarrier) {
+            return;
+        }
+        for (Method method : carrier.getDeclaredMethods()) {
+            if (method.getName().equals("advance") || method.getName().equals("drop")
+                    || method.getName().equals("rustDrop")) {
+                throw new AssertionError("private carrier should not have an unused receiver bridge: " + method);
+            }
         }
     }
 }

@@ -30,11 +30,10 @@ pub fn local_kind(ty: &Type) -> Option<jvm_compiler_core::jvm::locals::LocalKind
         Type::I64 | Type::U64 => K::Long,
         Type::F32 => K::Float,
         Type::F64 => K::Double,
-        Type::Reference(_)
-        | Type::Pointer(_)
-        | Type::MutableReference(_)
+        Type::Pointer(_)
         | Type::Array(_)
         | Type::Slice(_)
+        | Type::TaggedI64
         | Type::Str
         | Type::Class(_)
         | Type::Interface(_) => K::Reference,
@@ -180,18 +179,6 @@ pub fn get_cast_instructions(
             };
             let method = cp.add_method_ref(owner, method_name, &format!("()L{dest_class};"))?;
             return Ok(vec![JI::Invokevirtual(method)]);
-        }
-
-        if let Type::MutableReference(inner) = src {
-            let inner = inner.as_ref();
-            let mut instrs = vec![JI::Iconst_0, JI::Aaload];
-            if dest != inner {
-                if let Some(dest_name) = dest.to_jvm_descriptor_or_internal_name() {
-                    let dest_idx = cp.add_class(&dest_name)?;
-                    instrs.push(JI::Checkcast(dest_idx));
-                }
-            }
-            return Ok(instrs);
         }
 
         // Generic checkcast for all other reference-to-reference
@@ -411,13 +398,12 @@ pub(super) fn return_instruction_for_type(ty: &oomir::Type) -> Instruction {
         oomir::Type::I64 | oomir::Type::U64 => Instruction::Lreturn,
         oomir::Type::F32 => Instruction::Freturn,
         oomir::Type::F64 => Instruction::Dreturn,
-        oomir::Type::Str
+        oomir::Type::TaggedI64
+        | oomir::Type::Str
         | oomir::Type::Class(_)
         | oomir::Type::Array(_)
         | oomir::Type::Slice(_)
-        | oomir::Type::Reference(_)
         | oomir::Type::Pointer(_)
-        | oomir::Type::MutableReference(_)
         | oomir::Type::Interface(_) => Instruction::Areturn,
         oomir::Type::Void | oomir::Type::Unit => Instruction::Return,
     }

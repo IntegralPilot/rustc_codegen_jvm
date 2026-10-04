@@ -220,27 +220,10 @@ pub fn convert_operand<'tcx>(
             }
 
             let copy_id = data_types.next_temporary();
-            let object_ty = oomir::Type::Class("java/lang/Object".to_string());
-            let object_dest = format!("{final_var_name}_copy_object_{copy_id}");
             let copy_dest = format!("{final_var_name}_copy_{copy_id}");
-            instructions.push(oomir::Instruction::InvokeStatic {
-                dest: Some(object_dest.clone()),
-                class_name: oomir::POINTER_CLASS.to_string(),
-                method_name: "copyManagedValue".to_string(),
-                method_ty: oomir::Signature {
-                    params: vec![("value".to_string(), object_ty.clone())],
-                    ret: Box::new(object_ty.clone()),
-                    is_static: true,
-                },
-                args: vec![loaded],
-            });
-            instructions.push(oomir::Instruction::Cast {
-                op: oomir::Operand::Variable {
-                    name: object_dest,
-                    ty: object_ty,
-                },
-                ty: final_type.clone(),
+            instructions.push(oomir::Instruction::ValueCopy {
                 dest: copy_dest.clone(),
+                source: loaded,
             });
             oomir::Operand::Variable {
                 name: copy_dest,

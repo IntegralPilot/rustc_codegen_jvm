@@ -8,22 +8,42 @@ use super::*;
 pub(super) struct CanonicalDataTypeRegistry {
     variants: HashMap<String, Vec<oomir::DataType>>,
     external_interfaces: HashSet<String>,
+    external_schemas: HashMap<String, oomir::DataType>,
 }
 
 impl CanonicalDataTypeRegistry {
+    pub(super) fn provided_names(&self) -> Vec<String> {
+        let mut names = self
+            .variants
+            .iter()
+            .filter(|(_, variants)| variants.len() == 1)
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        names
+    }
+
     pub(super) fn collect(&mut self, module: &mut oomir::Module) {
+        if let Some(schemas) = &module.shared_data_types {
+            for (name, schema) in schemas.iter() {
+                self.external_schemas
+                    .entry(name.clone())
+                    .or_insert_with(|| Self::schema_for(schema));
+            }
+        }
         self.external_interfaces
             .extend(module.external_interfaces.iter().cloned());
-        let relative_static_methods = Arc::make_mut(&mut module.relative_static_methods);
         for (name, data_type) in &mut module.data_types {
             let contribution = match data_type {
                 oomir::DataType::Class {
+                    kind,
                     is_abstract,
                     super_class,
                     fields,
                     methods,
                     interfaces,
                 } => oomir::DataType::Class {
+                    kind: *kind,
                     is_abstract: *is_abstract,
                     super_class: super_class.clone(),
                     fields: fields.clone(),
@@ -40,7 +60,6 @@ impl CanonicalDataTypeRegistry {
                     is_enum: *is_enum,
                 },
             };
-            Self::record_relative_static_methods(name, &contribution, relative_static_methods);
             module.suppressed_data_types.insert(name.clone());
 
             let variants = self.variants.entry(name.clone()).or_default();
@@ -57,30 +76,6 @@ impl CanonicalDataTypeRegistry {
         }
     }
 
-    pub(super) fn record_relative_static_methods(
-        class_name: &str,
-        data_type: &oomir::DataType,
-        relative_static_methods: &mut HashSet<oomir::FunctionKey>,
-    ) {
-        let methods = match data_type {
-            oomir::DataType::Class { methods, .. } | oomir::DataType::Interface { methods, .. } => {
-                methods
-            }
-        };
-        for (method_name, method) in methods {
-            let Some(signature) = method.function_signature() else {
-                continue;
-            };
-            if signature.is_static && signature.supports_relative_pointer_abi() {
-                relative_static_methods.insert(oomir::FunctionKey::new(
-                    class_name,
-                    method_name,
-                    signature,
-                ));
-            }
-        }
-    }
-
     /// Validate before moving anything: a rejected contribution is tried against
     /// the next variant, while an accepted body is never cloned.
     pub(super) fn try_merge(
@@ -90,6 +85,7 @@ impl CanonicalDataTypeRegistry {
         match (existing, incoming) {
             (
                 oomir::DataType::Class {
+                    kind: existing_kind,
                     is_abstract: existing_abstract,
                     super_class: existing_super,
                     fields: existing_fields,
@@ -97,6 +93,7 @@ impl CanonicalDataTypeRegistry {
                     interfaces: existing_interfaces,
                 },
                 oomir::DataType::Class {
+                    kind: incoming_kind,
                     is_abstract: incoming_abstract,
                     super_class: incoming_super,
                     fields: incoming_fields,
@@ -104,7 +101,8 @@ impl CanonicalDataTypeRegistry {
                     interfaces: incoming_interfaces,
                 },
             ) => {
-                if existing_abstract != incoming_abstract
+                if existing_kind != incoming_kind
+                    || existing_abstract != incoming_abstract
                     || existing_super != incoming_super
                     || incoming_fields.iter().any(|(name, ty)| {
                         existing_fields
@@ -181,9 +179,14 @@ impl CanonicalDataTypeRegistry {
         let Self {
             variants,
             external_interfaces,
+            external_schemas,
         } = self;
         let shared_context = Arc::new(std::sync::OnceLock::new());
-        let shared_data_types = Arc::new(Self::shared_schemas(&variants));
+        let mut shared_data_types = Self::shared_schemas(&variants);
+        for (name, schema) in external_schemas {
+            shared_data_types.entry(name).or_insert(schema);
+        }
+        let shared_data_types = Arc::new(shared_data_types);
         let mut buckets = Vec::<HashMap<String, oomir::DataType>>::new();
         let mut names = variants.into_iter().collect::<Vec<_>>();
         names.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
@@ -219,7 +222,6 @@ impl CanonicalDataTypeRegistry {
                     suppressed_data_types: HashSet::default(),
                     shared_data_types: Some(Arc::clone(&shared_data_types)),
                     shared_context: context,
-                    relative_static_methods: Arc::new(HashSet::default()),
                     external_interfaces: external_interfaces.clone(),
                     statics: HashMap::default(),
                 }
@@ -235,6 +237,7 @@ impl CanonicalDataTypeRegistry {
             (
                 Class {
                     fields: a,
+                    kind: ka,
                     is_abstract: aa,
                     super_class: sa,
                     interfaces: ia,
@@ -242,12 +245,13 @@ impl CanonicalDataTypeRegistry {
                 },
                 Class {
                     fields: b,
+                    kind: kb,
                     is_abstract: ab,
                     super_class: sb,
                     interfaces: ib,
                     ..
                 },
-            ) => (a, aa, sa, ia) == (b, ab, sb, ib),
+            ) => (a, ka, aa, sa, ia) == (b, kb, ab, sb, ib),
             (
                 Interface {
                     interfaces: a,
@@ -295,12 +299,14 @@ impl CanonicalDataTypeRegistry {
     pub(super) fn schema_for(data_type: &oomir::DataType) -> oomir::DataType {
         match data_type {
             oomir::DataType::Class {
+                kind,
                 is_abstract,
                 super_class,
                 fields,
                 methods,
                 interfaces,
             } => oomir::DataType::Class {
+                kind: *kind,
                 is_abstract: *is_abstract,
                 super_class: super_class.clone(),
                 fields: fields.clone(),
@@ -352,6 +358,7 @@ mod canonical_data_type_registry_tests {
             "example/Mixed".to_string(),
             vec![
                 oomir::DataType::Class {
+                    kind: crate::oomir::ClassKind::Value,
                     is_abstract: false,
                     super_class: None,
                     fields: Vec::new(),

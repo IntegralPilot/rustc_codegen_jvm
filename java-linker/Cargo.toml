@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+flate2 = { version = "1.1.9", features = ["zlib-rs"] }
 jvm-compiler-core = { path = "../compiler-core" }
 rayon = "1.10.0"
 ristretto_classfile = "0.31.0"

@@ -23,14 +23,15 @@ pub(crate) type CheckedIntrinsic = (String, String, String);
 /// No completed function bodies or serialized output are retained here.
 #[derive(Default)]
 pub(crate) struct CrateContext<'tcx> {
-    pub(crate) upstream_symbols: HashSet<u64>,
+    upstream: crate::symbols::Upstream,
+    provided_codecs: Lock<HashSet<String>>,
     provided_symbols: Lock<HashSet<u64>>,
     normalized: Lock<HashMap<(Ty<'tcx>, GenericArgsRef<'tcx>), Ty<'tcx>>>,
-    tuple_abis: Lock<HashMap<String, Vec<oomir::Type>>>,
     allocations: Lock<HashMap<AllocId, String>>,
     checked_intrinsics: Lock<HashSet<CheckedIntrinsic>>,
     union_bodies: Lock<HashSet<Ty<'tcx>>>,
     storage_objects: Lock<HashMap<Ty<'tcx>, bool>>,
+    storage_layouts: Lock<HashMap<Ty<'tcx>, Option<String>>>,
     byte_support: Lock<HashMap<Ty<'tcx>, Result<(), String>>>,
     completed_codecs: Lock<HashMap<Ty<'tcx>, super::types::PointerMemoryCodec>>,
     caller_locations: Lock<HashMap<rustc_span::Span, oomir::Constant>>,
@@ -41,12 +42,11 @@ pub(crate) struct CrateContext<'tcx> {
 impl<'tcx> CrateContext<'tcx> {
     pub(crate) fn with_upstream_symbols(tcx: TyCtxt<'tcx>) -> Self {
         Self {
-            upstream_symbols: crate::symbols::upstream(tcx)
-                .expect("could not read JVM symbol indexes"),
+            upstream: crate::symbols::upstream(tcx).expect("could not read JVM symbol indexes"),
             ..Self::default()
         }
     }
-    pub(crate) fn provided_symbols(&self) -> Vec<u64> {
+    pub(crate) fn provided_symbols(&self) -> crate::symbols::Provided {
         let mut symbols = self
             .provided_symbols
             .borrow()
@@ -54,7 +54,18 @@ impl<'tcx> CrateContext<'tcx> {
             .copied()
             .collect::<Vec<_>>();
         symbols.sort_unstable();
-        symbols
+        let mut codecs = self
+            .provided_codecs
+            .borrow()
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        codecs.sort_unstable();
+        crate::symbols::Provided {
+            bodies: symbols,
+            codecs,
+            types: Vec::new(),
+        }
     }
 
     pub(crate) fn take_references(&self) -> Vec<Instance<'tcx>> {
@@ -65,11 +76,14 @@ impl<'tcx> CrateContext<'tcx> {
 #[derive(Default)]
 pub(crate) struct Definitions<'tcx> {
     values: HashMap<String, oomir::DataType>,
+    /// Imported storage schemas inform the ABI without requesting class emission.
+    pub(crate) external_schemas: HashMap<String, oomir::DataType>,
     // Owner metadata for imports and generated function-pointer adapters;
     // foreign interfaces must never acquire generated classfile definitions.
     pub(crate) foreign_interfaces: Lock<HashSet<String>>,
     pub(super) representations: HashMap<Ty<'tcx>, oomir::Type>,
     pub(super) defined_enums: HashSet<String>,
+    pub(super) building_codecs: HashMap<Ty<'tcx>, super::types::PointerMemoryCodec>,
     shared: Shared<'tcx>,
     checked_intrinsics: Vec<CheckedIntrinsic>,
     next_temporary: usize,
@@ -77,13 +91,29 @@ pub(crate) struct Definitions<'tcx> {
 }
 
 impl<'tcx> Definitions<'tcx> {
+    /// Read-only schema queries are independent of physical ownership.
+    pub(crate) fn get(&self, name: &str) -> Option<&oomir::DataType> {
+        self.values
+            .get(name)
+            .or_else(|| self.external_schemas.get(name))
+    }
+
+    pub(crate) fn storage_layout(&self, ty: Ty<'tcx>) -> Option<Option<String>> {
+        self.shared.storage_layouts.borrow().get(&ty).cloned()
+    }
+
+    pub(crate) fn remember_storage_layout(&self, ty: Ty<'tcx>, layout: Option<String>) {
+        self.shared.storage_layouts.borrow_mut().insert(ty, layout);
+    }
     pub(crate) fn new(shared: Shared<'tcx>) -> Self {
         Self {
             shared,
             values: HashMap::default(),
+            external_schemas: HashMap::default(),
             foreign_interfaces: Lock::default(),
             representations: HashMap::default(),
             defined_enums: HashSet::default(),
+            building_codecs: HashMap::default(),
             checked_intrinsics: Vec::new(),
             next_temporary: 0,
             body: BodyFacts::default(),
@@ -126,17 +156,6 @@ impl<'tcx> Definitions<'tcx> {
         resolved
     }
 
-    pub(crate) fn tuple_name_conflicts(&self, name: &str, fields: &[oomir::Type]) -> bool {
-        let mut abis = self.shared.tuple_abis.borrow_mut();
-        match abis.get(name) {
-            Some(previous) => previous != fields,
-            None => {
-                abis.insert(name.to_owned(), fields.to_vec());
-                false
-            }
-        }
-    }
-
     pub(crate) fn allocation_identity(&self, id: AllocId, candidate: String) -> String {
         self.shared
             .allocations
@@ -147,7 +166,13 @@ impl<'tcx> Definitions<'tcx> {
     }
 
     pub(crate) fn has_upstream_body(&self, key: u64) -> bool {
-        self.shared.upstream_symbols.contains(&key)
+        self.shared.upstream.bodies.contains(&key)
+    }
+    pub(crate) fn has_upstream_type(&self, name: &str) -> bool {
+        self.shared.upstream.types.contains(name)
+    }
+    pub(crate) fn has_upstream_codec(&self, recipe: &str) -> bool {
+        self.shared.upstream.codecs.contains(recipe)
     }
     pub(crate) fn record_provided_body(&self, key: u64) {
         self.shared.provided_symbols.borrow_mut().insert(key);
@@ -175,6 +200,15 @@ impl<'tcx> Definitions<'tcx> {
     }
 
     pub(super) fn complete_codec(&self, ty: Ty<'tcx>, codec: super::types::PointerMemoryCodec) {
+        if !self.has_upstream_codec(&codec.class_name)
+            && codec.class_name.contains('#')
+            && !codec.class_name.starts_with("org/rustlang/runtime/")
+        {
+            self.shared
+                .provided_codecs
+                .borrow_mut()
+                .insert(codec.class_name.clone());
+        }
         self.shared.completed_codecs.borrow_mut().insert(ty, codec);
     }
 
@@ -245,15 +279,8 @@ impl BodyFacts {
                 }
             }
         }
-        for index in 1..=body.arg_count {
-            if matches!(
-                body.local_decls[mir::Local::from_usize(index)].ty.kind(),
-                rustc_middle::ty::TyKind::Ref(..) | rustc_middle::ty::TyKind::RawPtr(..)
-            ) {
-                // Incoming pointers already are stable addresses.
-                stable_cells[index] = false;
-            }
-        }
+        // A borrow of the parameter needs local storage. A borrow through the parameter uses the
+        // incoming allocation.
         Self { stable_cells }
     }
 }
@@ -287,10 +314,6 @@ mod tests {
         assert_eq!(first.checked_intrinsics.len(), 1);
         assert!(second.checked_intrinsics.is_empty());
         assert_eq!(separate.checked_intrinsics.len(), 1);
-        assert!(!first.tuple_name_conflicts("Tuple", &[oomir::Type::I32]));
-        assert!(!second.tuple_name_conflicts("Tuple", &[oomir::Type::I32]));
-        assert!(second.tuple_name_conflicts("Tuple", &[oomir::Type::I64]));
-        assert!(!separate.tuple_name_conflicts("Tuple", &[oomir::Type::I64]));
         assert_eq!(
             (
                 first.next_temporary(),

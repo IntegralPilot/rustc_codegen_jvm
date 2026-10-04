@@ -47,7 +47,17 @@ fn executes_full_width_view_metadata_and_typed_data_extraction() {
         let mut invalid = body.clone();
         invalid.instructions[1].op = Op::Length(data);
         assert!(verify(&invalid, &types).is_err());
+        let mut body = body;
+        crate::opt::decompose_views(&mut body, &mut types, None);
+        verify(&body, &types).unwrap();
         let code = compile(&body, &types, &mut cp).unwrap();
+        assert!(
+            !code
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::New(_))),
+            "local view allocated a carrier"
+        );
         methods.push(Method {
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
             name_index: cp.add_utf8(name).unwrap(),
@@ -131,11 +141,18 @@ public class Utf8View extends SliceView {
 package org.rustlang.runtime;
 public class Pointer {
     public static Pointer extracted;
+    public static long extractedLength;
     public static Pointer fromSlice(Object value, int size, String codec) {
         SliceView view = (SliceView)value;
         if (view.offset != 0 || codec != null || size != (view instanceof Utf8View ? 1 : 8))
             throw new AssertionError("wrong extraction arguments");
-        return extracted = (Pointer)view.array;
+        return fromSliceParts(view.array, view.offset, view.rustLength, size, codec);
+    }
+    public static Pointer fromSliceParts(Object data, int start, long length, int size, String codec) {
+        if (start != 0 || codec != null || (size != 1 && size != 8))
+            throw new AssertionError("wrong component arguments");
+        extractedLength = length;
+        return extracted = (Pointer)data;
     }
 }"#,
     )
@@ -146,9 +163,9 @@ public class ViewRun {
     public static void main(String[] args) {
         Pointer pointer = new Pointer();
         for (long length : new long[] { 0, 1, Integer.MAX_VALUE, (1L << 40) + 23, Long.MAX_VALUE }) {
-            if (ViewSsa.slice(pointer, length) != length || Pointer.extracted != pointer)
+            if (ViewSsa.slice(pointer, length) != length || Pointer.extracted != pointer || Pointer.extractedLength != length)
                 throw new AssertionError("slice " + length);
-            if (ViewSsa.string(pointer, length) != length || Pointer.extracted != pointer)
+            if (ViewSsa.string(pointer, length) != length || Pointer.extracted != pointer || Pointer.extractedLength != length)
                 throw new AssertionError("string " + length);
             if (ViewSsa.read_slice(new SliceView(pointer, 3, length)) != length
                 || ViewSsa.read_string(new Utf8View(pointer, 2, length)) != length)

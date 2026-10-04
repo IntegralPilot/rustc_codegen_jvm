@@ -9,35 +9,6 @@ fn scalar(types: &Types, ty: TypeId) -> jvm::Result<ScalarType> {
 }
 
 impl Selector<'_> {
-    pub(super) fn materialize_parameters(&mut self) -> jvm::Result<()> {
-        for &param in &self.body.blocks[self.body.entry.index()].params {
-            // The ABI root reserves the slot; only additional uses need an
-            // actual pointer value. Unused arguments require no materialization.
-            if self.live.uses[param.index()] == 1
-                || !matches!(
-                    self.types.get(self.body.value_type(param)),
-                    Some(Type::Pointer(_))
-                )
-            {
-                continue;
-            }
-            let slot = self.slot(param);
-            let owner = self.cp.add_class(POINTER_CLASS)?;
-            let method = self.cp.add_method_ref(
-                owner,
-                "materializeRelative",
-                "(Lorg/rustlang/runtime/Pointer;JJ)Lorg/rustlang/runtime/Pointer;",
-            )?;
-            self.assembly.code.extend([
-                Kind::Reference.load(slot),
-                Kind::Long.load(slot + 1),
-                Kind::Long.load(slot + 3),
-                Instruction::Invokestatic(method),
-                Kind::Reference.store(slot),
-            ]);
-        }
-        Ok(())
-    }
     pub(super) fn initialize_storage(&mut self) -> jvm::Result<()> {
         for storage in &self.body.slots {
             let owner = self.cp.add_class(POINTER_CLASS)?;
@@ -46,7 +17,7 @@ impl Selector<'_> {
                 let code = match scalar {
                     Bool => 4,
                     I8 | U8 => 8,
-                    I16 => 9,
+                    I16 | F16 => 9,
                     U16 => 5,
                     I32 | U32 => 10,
                     I64 | U64 => 11,
@@ -56,17 +27,10 @@ impl Selector<'_> {
                 };
                 let array =
                     jvm::attributes::ArrayType::from_bytes(&mut jvm::ByteReader::new(&[code]))?;
-                self.assembly.code.extend([
-                    Instruction::Iconst_1,
-                    Instruction::Newarray(array),
-                    Instruction::Iconst_0,
-                    get_int_const_instr(self.cp, storage.size as i32),
-                ]);
-                self.cp.add_method_ref(
-                    owner,
-                    "array",
-                    "(Ljava/lang/Object;II)Lorg/rustlang/runtime/Pointer;",
-                )?
+                self.assembly
+                    .code
+                    .extend([Instruction::Iconst_1, Instruction::Newarray(array)]);
+                None
             } else {
                 self.assembly.code.push(Instruction::Aconst_null);
                 self.assembly
@@ -83,11 +47,11 @@ impl Selector<'_> {
                 self.assembly
                     .code
                     .push(get_int_const_instr(self.cp, storage.alignment as i32));
-                self.cp.add_method_ref(
+                Some(self.cp.add_method_ref(
                     owner,
                     "cellAligned",
                     "(Ljava/lang/Object;ILjava/lang/String;I)Lorg/rustlang/runtime/Pointer;",
-                )?
+                )?)
             };
             let slot = self.next_slot;
             self.next_slot = self
@@ -95,10 +59,10 @@ impl Selector<'_> {
                 .checked_add(1)
                 .ok_or_else(|| error("JVM storage slot limit"))?;
             self.storage.push(slot);
-            self.assembly.code.extend([
-                Instruction::Invokestatic(target),
-                Kind::Reference.store(slot),
-            ]);
+            if let Some(target) = target {
+                self.assembly.code.push(Instruction::Invokestatic(target));
+            }
+            self.assembly.code.push(Kind::Reference.store(slot));
         }
         Ok(())
     }
@@ -108,6 +72,10 @@ impl Selector<'_> {
             return Ok(true);
         }
         match inst.op {
+            Op::CopyValue(value) => {
+                self.load(value)?;
+                self.copy_value(self.body.value_type(value))?;
+            }
             Op::Opaque(value) => self.load(value)?,
             Op::Project { base, projection } => {
                 self.load(base)?;
@@ -140,20 +108,37 @@ impl Selector<'_> {
                 )?;
                 self.assembly.code.push(Instruction::Invokestatic(method));
             }
-            Op::AddressOfSlot(slot) => self
-                .assembly
-                .code
-                .push(Kind::Reference.load(self.storage[slot.index()])),
+            Op::AddressOfSlot(slot) => {
+                self.assembly
+                    .code
+                    .push(Kind::Reference.load(self.storage[slot.index()]));
+                let ty = self.body.slots[slot.index()].ty;
+                if StorageSlot::scalar(ty, self.types).is_some() {
+                    self.assembly.code.push(Instruction::Lconst_0);
+                    self.materialize_address(ty)?;
+                }
+            }
             Op::LoadSlot(slot) => {
                 self.assembly
                     .code
                     .push(Kind::Reference.load(self.storage[slot.index()]));
-                self.read_memory(self.body.slots[slot.index()].ty)?;
+                let ty = self.body.slots[slot.index()].ty;
+                if StorageSlot::scalar(ty, self.types).is_some() {
+                    self.assembly.code.push(Instruction::Lconst_0);
+                    self.read_address(ty)?;
+                } else {
+                    self.read_memory(ty)?;
+                }
             }
             Op::StoreSlot { slot, value } => {
                 self.assembly
                     .code
                     .push(Kind::Reference.load(self.storage[slot.index()]));
+                let storage = &self.body.slots[slot.index()];
+                let scalar = StorageSlot::scalar(storage.ty, self.types).is_some();
+                if scalar {
+                    self.assembly.code.push(Instruction::Lconst_0);
+                }
                 self.argument(value)?;
                 let storage = &self.body.slots[slot.index()];
                 if storage.size == 0 {
@@ -164,9 +149,22 @@ impl Selector<'_> {
                         "(Ljava/lang/Object;)V",
                     )?;
                     self.assembly.code.push(Instruction::Invokevirtual(init));
+                } else if scalar {
+                    self.write_address(storage.ty)?;
                 } else {
                     self.write_memory(storage.ty)?;
                 }
+            }
+            Op::Commit(pointer) => {
+                self.load(pointer)?;
+                let owner = self.cp.add_class(POINTER_CLASS)?;
+                let method = self.cp.add_method_ref(owner, "commitMemoryView", "()V")?;
+                self.assembly.code.push(Instruction::Invokevirtual(method));
+            }
+            Op::LoadCopy(pointer) => {
+                self.load(pointer)?;
+                self.assembly.code.push(Instruction::Lconst_0);
+                self.read_object_address(self.body.value_type(inst.result.unwrap()), true)?;
             }
             Op::Load(pointer) => {
                 self.load(pointer)?;
@@ -193,13 +191,9 @@ impl Selector<'_> {
                 else {
                     return Err(error("unsupported reference cast"));
                 };
-                let to = scalar(self.types, pointee)?;
-                let bytes = match to {
-                    ScalarType::Bool => 1,
-                    ScalarType::F32 => 4,
-                    ScalarType::F64 => 8,
-                    _ => to.integer().ok_or_else(|| error("pointer view type"))?.0 / 8,
-                };
+                let bytes = StorageSlot::scalar(pointee, self.types)
+                    .ok_or_else(|| error("pointer view type"))?
+                    .size;
                 self.load(value)?;
                 self.assembly.code.extend([
                     get_int_const_instr(self.cp, bytes as i32),
@@ -218,8 +212,55 @@ impl Selector<'_> {
         Ok(true)
     }
 
+    pub(super) fn copy_value(&mut self, ty: TypeId) -> jvm::Result<()> {
+        if let Some(Type::Class(symbol)) = self.types.get(ty)
+            && let Some(name) = self.types.symbol_name(symbol)
+            && self.direct_copy.is_some_and(|copy| copy(name))
+        {
+            let class = self.cp.add_class(name)?;
+            let method = self
+                .cp
+                .add_method_ref(class, "rustCopy", "()Ljava/lang/Object;")?;
+            let done = self.assembly.label();
+            self.assembly.code.push(Instruction::Dup);
+            self.assembly.branch(Instruction::Ifnull(0), done);
+            self.assembly.code.extend([
+                Instruction::Invokevirtual(method),
+                Instruction::Checkcast(class),
+            ]);
+            self.assembly.bind(done);
+            return Ok(());
+        }
+        let owner = self.cp.add_class(POINTER_CLASS)?;
+        let method = self.cp.add_method_ref(
+            owner,
+            "copyManagedValue",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+        )?;
+        let mut name = String::new();
+        descriptor(self.types, ty, &mut name)?;
+        let name = name
+            .strip_prefix('L')
+            .and_then(|s| s.strip_suffix(';'))
+            .unwrap_or(&name);
+        let class = self.cp.add_class(name)?;
+        self.assembly.code.extend([
+            Instruction::Invokestatic(method),
+            Instruction::Checkcast(class),
+        ]);
+        Ok(())
+    }
+
     /// Project the pointer already on the operand stack.
     pub(super) fn project_field(&mut self, projection: ProjectionId) -> jvm::Result<()> {
+        self.project_field_arguments(projection)?;
+        let owner = self.cp.add_class(POINTER_CLASS)?;
+        let method = self.cp.add_method_ref(owner, "projectStructField", "(Ljava/lang/String;Ljava/lang/String;JJLjava/lang/String;)Lorg/rustlang/runtime/Pointer;")?;
+        self.assembly.code.push(Instruction::Invokevirtual(method));
+        Ok(())
+    }
+
+    pub(super) fn project_field_arguments(&mut self, projection: ProjectionId) -> jvm::Result<()> {
         let projection = &self.body.projections[projection.index()];
         let field = &self.body.fields[projection.field.index()];
         let Some(Type::Class(symbol)) = self.types.get(field.owner) else {
@@ -230,7 +271,7 @@ impl Selector<'_> {
                 self.cp
                     .add_name_string(self.types.symbol_name(symbol).unwrap())?,
             ),
-            Instruction::Ldc_w(self.cp.add_name_string(&field.name)?),
+            Instruction::Ldc_w(self.cp.add_string(&field.name)?),
             get_long_const_instr(self.cp, projection.offset as i64),
             get_long_const_instr(self.cp, projection.size as i64),
             match &projection.codec {
@@ -238,12 +279,23 @@ impl Selector<'_> {
                 None => Instruction::Aconst_null,
             },
         ]);
-        let owner = self.cp.add_class(POINTER_CLASS)?;
-        let method = self.cp.add_method_ref(owner, "projectStructField", "(Ljava/lang/String;Ljava/lang/String;JJLjava/lang/String;)Lorg/rustlang/runtime/Pointer;")?;
-        self.assembly.code.push(Instruction::Invokevirtual(method));
         Ok(())
     }
     pub(super) fn read_memory(&mut self, ty: TypeId) -> jvm::Result<()> {
+        if matches!(self.types.get(ty), Some(Type::Array(_))) {
+            let mut descriptor = String::new();
+            representation::descriptor(self.types, ty, &mut descriptor)?;
+            let owner = self.cp.add_class(POINTER_CLASS)?;
+            let method = self
+                .cp
+                .add_method_ref(owner, "getObject", "()Ljava/lang/Object;")?;
+            let class = self.cp.add_class(descriptor)?;
+            self.assembly.code.extend([
+                Instruction::Invokevirtual(method),
+                Instruction::Checkcast(class),
+            ]);
+            return Ok(());
+        }
         let class = match self.types.get(ty) {
             Some(Type::Class(symbol) | Type::Interface(symbol)) => {
                 Some(self.types.symbol_name(symbol).unwrap())
@@ -251,13 +303,20 @@ impl Selector<'_> {
             Some(Type::Pointer(_)) => Some(POINTER_CLASS),
             Some(Type::Slice(_)) => Some(representation::SLICE_VIEW_CLASS),
             Some(Type::Str) => Some(representation::UTF8_VIEW_CLASS),
+            Some(Type::TaggedI64) => Some(super::super::abi::TAGGED_LONG_CLASS),
             _ => None,
         };
         if let Some(class) = class {
             let owner = self.cp.add_class(POINTER_CLASS)?;
             let target = if matches!(
                 self.types.get(ty),
-                Some(Type::Class(_) | Type::Interface(_) | Type::Slice(_) | Type::Str)
+                Some(
+                    Type::Class(_)
+                        | Type::Interface(_)
+                        | Type::Slice(_)
+                        | Type::Str
+                        | Type::TaggedI64
+                )
             ) {
                 self.assembly
                     .code
@@ -282,7 +341,7 @@ impl Selector<'_> {
         let (name, result) = match scalar(self.types, ty)? {
             Bool => ("getBoolean", "Z"),
             I8 | U8 => ("getI8", "B"),
-            I16 | U16 => ("getI16", "S"),
+            I16 | U16 | F16 => ("getI16", "S"),
             I32 | U32 => ("getI32", "I"),
             I64 | U64 => ("getI64", "J"),
             F32 => ("getF32", "F"),
@@ -301,7 +360,13 @@ impl Selector<'_> {
         if matches!(
             self.types.get(ty),
             Some(
-                Type::Class(_) | Type::Interface(_) | Type::Pointer(_) | Type::Slice(_) | Type::Str
+                Type::Class(_)
+                    | Type::Interface(_)
+                    | Type::Pointer(_)
+                    | Type::Slice(_)
+                    | Type::Str
+                    | Type::TaggedI64
+                    | Type::Array(_)
             )
         ) {
             signature.push_str("Ljava/lang/Object;");

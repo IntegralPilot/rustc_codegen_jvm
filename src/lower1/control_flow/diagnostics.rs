@@ -123,8 +123,5 @@ pub(in crate::lower1) fn emit_panic_lang_item<'tcx>(
         },
         args,
     });
-    instructions.push(oomir::Instruction::ThrowNewWithMessage {
-        exception_class: "java/lang/AssertionError".to_string(),
-        message: "Diverging Rust panic call returned unexpectedly".to_string(),
-    });
+    instructions.push(oomir::Instruction::Unreachable);
 }

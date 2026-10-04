@@ -1,3 +1,7 @@
+#![feature(custom_inner_attributes)]
+#![feature(register_tool)]
+#![register_tool(jvm_codegen)]
+#![jvm_codegen::export]
 pub mod bound_lifetimes;
 
 /// A Java class can implement this generated interface and Rust will dispatch

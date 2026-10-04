@@ -7,19 +7,14 @@ pub(super) fn pointer_codec_class_name<'tcx>(
     ty: Ty<'tcx>,
     tcx: TyCtxt<'tcx>,
     local_name: &str,
-    value_ty: &oomir::Type,
 ) -> String {
     let root = match ty.kind() {
-        // Structural tuple/array types are language-level types. Give them the
-        // same stable owner regardless of the crate which instantiates them.
         TyKind::Tuple(_) | TyKind::Array(_, _) => "org/rustlang/core".to_string(),
-        _ => match value_ty {
-            oomir::Type::Class(class_name) => class_name
-                .rsplit_once('/')
-                .map(|(package, _)| package.to_string())
-                .unwrap_or_else(|| jvm_names::crate_root(tcx, rustc_span::def_id::LOCAL_CRATE)),
-            _ => jvm_names::crate_root(tcx, rustc_span::def_id::LOCAL_CRATE),
-        },
+        TyKind::Adt(def, _) => jvm_names::crate_root(tcx, def.did().krate),
+        TyKind::Closure(def, _) | TyKind::Coroutine(def, _) => {
+            jvm_names::crate_root(tcx, def.krate)
+        }
+        _ => unreachable!("codec owner requires an aggregate"),
     };
     format!("{root}/{}", jvm_names::path_segment(local_name))
 }
@@ -55,30 +50,54 @@ pub(crate) fn ensure_pointer_memory_codec<'tcx>(
     instance_context: rustc_middle::ty::Instance<'tcx>,
 ) -> Result<Option<PointerMemoryCodec>, String> {
     let ty = resolve_union_ty(tcx, ty, instance_context)?;
-    let cached = data_types.completed_codec(ty);
-    if let Some(cached) = cached
-        && (!data_types.contains_key(&cached.class_name)
-            || codec_is_complete(data_types, &cached.class_name))
-    {
-        // The first requesting shard owns the codec body. Other shards still
-        // register the value carrier's declarations, but do not rebuild the
-        // encoder/decoder merely to discard them during canonical merging.
+    if value_scalar_ty(ty, tcx).is_some() || transparent_payload(ty, tcx).is_some() {
+        return Ok(None);
+    }
+    if let Some(cached) = data_types.completed_codec(ty) {
+        // The first requesting shard owns the body. Other shards require only its declarations.
         ty_to_oomir_type(ty, tcx, data_types, instance_context);
         return Ok(Some(cached));
     }
-    let result = build_pointer_memory_codec(ty, tcx, data_types, instance_context)?;
-    if let Some(codec) = &result
-        && (codec.class_name.starts_with(ZERO_SIZED_CODEC_PREFIX)
-            || codec_is_complete(data_types, &codec.class_name))
-    {
+    if let Some(codec) = data_types.building_codecs.get(&ty) {
+        return Ok(Some(codec.clone()));
+    }
+    let result = build_pointer_memory_codec(ty, tcx, data_types, instance_context);
+    data_types.building_codecs.remove(&ty);
+    if let Ok(Some(codec)) = &result {
         data_types.complete_codec(ty, codec.clone());
     }
-    Ok(result)
+    result
 }
 
-fn codec_is_complete(data_types: &HashMap<String, oomir::DataType>, class: &str) -> bool {
-    matches!(data_types.get(class), Some(oomir::DataType::Class { methods, .. })
-        if methods.contains_key("encode") && methods.contains_key("decode"))
+/// Codec recipes share holders. Method enumeration would also resolve unrelated codec types.
+fn register_codec(
+    data_types: &mut Definitions<'_>,
+    codec: &PointerMemoryCodec,
+    methods: HashMap<String, DataTypeMethod>,
+) {
+    let entry = data_types
+        .entry(codec.owner().to_owned())
+        .or_insert_with(|| oomir::DataType::Class {
+            fields: Vec::new(),
+            kind: oomir::ClassKind::Static,
+            is_abstract: false,
+            methods: HashMap::default(),
+            super_class: Some("java/lang/Object".to_owned()),
+            interfaces: Vec::new(),
+        });
+    let oomir::DataType::Class {
+        methods: existing, ..
+    } = entry
+    else {
+        unreachable!("codec holder cannot be an interface");
+    };
+    for (name, method) in methods {
+        let DataTypeMethod::Function(mut function) = method else {
+            unreachable!("codec operation must have a body");
+        };
+        function.name = codec.method(&name);
+        existing.insert(function.name.clone(), DataTypeMethod::Function(function));
+    }
 }
 
 fn build_pointer_memory_codec<'tcx>(
@@ -102,6 +121,20 @@ fn build_pointer_memory_codec<'tcx>(
     if !value_ty.has_jvm_value() {
         return Ok(None);
     }
+    // Primitive array codecs share runtime methods. Each recipe supplies its length and element
+    // type.
+    if let TyKind::Array(element, _) = ty.kind()
+        && let oomir::Type::Array(value) = &value_ty
+        && let Some(width) = oomir::Type::pointer((**value).clone()).scalar_address_size()
+        && layout_size_bytes(tcx, *element)? == width as usize
+    {
+        return Ok(Some(PointerMemoryCodec {
+            class_name: format!(
+                "org/rustlang/runtime/ArrayMemoryCodec#array#{}#{size}",
+                value_ty.to_jvm_descriptor()
+            ),
+        }));
+    }
     // These carriers have a public no-argument constructor and no state to
     // encode or bind. Retain the concrete class identity in the codec recipe;
     // no generated codec class or computational helper bodies are needed.
@@ -118,17 +151,6 @@ fn build_pointer_memory_codec<'tcx>(
             class_name: format!("{ZERO_SIZED_CODEC_PREFIX}{class_name}"),
         }));
     }
-    exact_bytes_supported(ty, tcx, instance_context, data_types)?;
-    let readable = format!(
-        "{}_{}bytes",
-        sanitize_name_token(&readable_pointer_codec_type_name(
-            ty,
-            tcx,
-            data_types,
-            instance_context,
-        )),
-        size
-    );
     // A pretty-printed `Ty` can use a different crate alias in an upstream
     // crate and a downstream monomorphization (for example `alloc::borrow`
     // versus `std::borrow`). Pointer views of the same Rust allocation must
@@ -141,40 +163,16 @@ fn build_pointer_memory_codec<'tcx>(
         stable_type_identity(tcx, ty),
         value_ty.to_jvm_descriptor()
     );
-    let local_name =
-        crate::stable_hash::readable_disambiguated_name("PointerCodec", &readable, &identity, 180);
-    let class_name = pointer_codec_class_name(ty, tcx, &local_name, &value_ty);
-    if codec_is_complete(data_types, &class_name) {
-        return Ok(Some(PointerMemoryCodec { class_name }));
+    let key = crate::stable_hash::short_hash(&identity, 16);
+    let owner = pointer_codec_class_name(ty, tcx, &format!("Codecs_{}", &key[..2]));
+    let codec = PointerMemoryCodec {
+        class_name: format!("{owner}#{key}#{}#{size}", value_ty.to_jvm_descriptor()),
+    };
+    if data_types.has_upstream_codec(&codec.class_name) {
+        return Ok(Some(codec));
     }
-
-    if matches!(
-        data_types.get(&class_name),
-        Some(oomir::DataType::Class { methods, .. }) if methods.is_empty()
-    ) {
-        // Recursive pointees may refer back to this codec while its encode and
-        // decode bodies are still being constructed. The final class will own
-        // both methods once the outer generation completes.
-        return Ok(Some(PointerMemoryCodec { class_name }));
-    }
-    if matches!(
-        data_types.get(&class_name),
-        Some(oomir::DataType::Interface { .. })
-    ) {
-        return Err(format!(
-            "pointer codec helper name {class_name} is already an interface"
-        ));
-    }
-    data_types.insert(
-        class_name.clone(),
-        oomir::DataType::Class {
-            fields: Vec::new(),
-            is_abstract: false,
-            methods: HashMap::default(),
-            super_class: Some("java/lang/Object".to_string()),
-            interfaces: Vec::new(),
-        },
-    );
+    exact_bytes_supported(ty, tcx, instance_context, data_types)?;
+    data_types.building_codecs.insert(ty, codec.clone());
 
     if matches!(ty.kind(), TyKind::Coroutine(_, _)) {
         let generated = coroutine_pointer_codec_methods(
@@ -184,67 +182,91 @@ fn build_pointer_memory_codec<'tcx>(
             data_types,
             instance_context,
         );
-        let methods = match generated {
-            Ok(methods) => methods,
-            Err(error) => {
-                data_types.remove(&class_name);
-                return Err(error);
-            }
-        };
-        match data_types.get_mut(&class_name) {
-            Some(oomir::DataType::Class {
-                methods: existing, ..
-            }) => existing.extend(methods),
-            _ => unreachable!("coroutine pointer codec placeholder disappeared"),
-        }
-        return Ok(Some(PointerMemoryCodec { class_name }));
+        register_codec(data_types, &codec, generated?);
+        return Ok(Some(codec));
     }
 
     let bytes_ty = byte_array_type();
     let object_storage_size =
         union_object_storage_size(ty, size, tcx, instance_context, data_types);
 
-    let mut encode_instructions = vec![
-        oomir::Instruction::NewArray {
-            dest: "_bytes".to_string(),
-            element_type: oomir::Type::I8,
-            size: oomir::Operand::Constant(oomir::Constant::I32(size as i32)),
-        },
-        allocate_union_object_storage("_objects", object_storage_size),
-    ];
-    let encode_storage = JvmUnionStorage::at_start("_bytes", "_objects");
+    let encode_at_offset = size > 0 && object_storage_size == 0 && range_encoder::supports(ty, tcx);
+    let mut encode_instructions = vec![allocate_union_object_storage(
+        "_objects",
+        object_storage_size,
+    )];
+    if !encode_at_offset {
+        encode_instructions.insert(
+            0,
+            oomir::Instruction::NewArray {
+                dest: "_bytes".to_string(),
+                element_type: oomir::Type::I8,
+                size: oomir::Operand::Constant(oomir::Constant::I32(size as i32)),
+            },
+        );
+    }
+    let encode_storage = if encode_at_offset {
+        JvmUnionStorage::at_offset("_2", "_objects", operand_var("_3", oomir::Type::I32))
+    } else {
+        JvmUnionStorage::at_start("_bytes", "_objects")
+    };
     let mut encode_counter = 0;
-    if let Err(error) = emit_ty_to_union_bytes(
-        ty,
-        if value_ty.has_jvm_value() {
-            operand_var("_1", value_ty.clone())
-        } else {
-            oomir::Operand::Constant(oomir::Constant::Unit)
-        },
-        &encode_storage,
-        0,
-        tcx,
-        data_types,
-        instance_context,
-        &mut encode_instructions,
-        &mut encode_counter,
-    ) {
-        data_types.remove(&class_name);
-        return Err(error);
+    let source = if value_ty.has_jvm_value() {
+        operand_var("_1", value_ty.clone())
+    } else {
+        oomir::Operand::Constant(oomir::Constant::Unit)
+    };
+    if encode_at_offset {
+        range_encoder::emit(
+            ty,
+            source,
+            &encode_storage,
+            tcx,
+            data_types,
+            instance_context,
+            &mut encode_instructions,
+            &mut encode_counter,
+        )?;
+    } else {
+        emit_ty_to_union_bytes(
+            ty,
+            source,
+            &encode_storage,
+            0,
+            tcx,
+            data_types,
+            instance_context,
+            &mut encode_instructions,
+            &mut encode_counter,
+        )?;
     }
     encode_instructions.push(oomir::Instruction::Return {
-        operand: Some(operand_var("_bytes", bytes_ty.clone())),
+        operand: (!encode_at_offset).then(|| operand_var("_bytes", bytes_ty.clone())),
     });
     let encode = oomir::Function {
-        name: "encode".to_string(),
+        name: if encode_at_offset {
+            "encodeAt"
+        } else {
+            "encode"
+        }
+        .to_string(),
         owner_class: None,
         debug_variables: Vec::new(),
         signature: oomir::Signature {
-            params: value_ty
-                .has_jvm_value()
-                .then(|| vec![("value".to_string(), value_ty.clone())])
-                .unwrap_or_default(),
-            ret: Box::new(bytes_ty.clone()),
+            params: if encode_at_offset {
+                vec![
+                    ("value".to_string(), value_ty.clone()),
+                    ("bytes".to_string(), bytes_ty.clone()),
+                    ("offset".to_string(), oomir::Type::I32),
+                ]
+            } else {
+                vec![("value".to_string(), value_ty.clone())]
+            },
+            ret: Box::new(if encode_at_offset {
+                oomir::Type::Void
+            } else {
+                bytes_ty.clone()
+            }),
             is_static: true,
         },
         body: simple_body(encode_instructions).into(),
@@ -276,7 +298,6 @@ fn build_pointer_memory_codec<'tcx>(
     ) {
         Ok(decoded) => decoded,
         Err(error) => {
-            data_types.remove(&class_name);
             return Err(error);
         }
     };
@@ -307,7 +328,7 @@ fn build_pointer_memory_codec<'tcx>(
         body: simple_body(decode_instructions).into(),
     };
 
-    let pointer_ty = oomir::Type::Pointer(Box::new(value_ty.clone()));
+    let pointer_ty = oomir::Type::pointer(value_ty.clone());
     let mut bind_instructions = Vec::new();
     let mut bind_counter = 0;
     if let Err(error) = emit_memory_view_bindings(
@@ -320,52 +341,13 @@ fn build_pointer_memory_codec<'tcx>(
         &mut bind_instructions,
         &mut bind_counter,
     ) {
-        data_types.remove(&class_name);
         return Err(error);
     }
     let mut methods = HashMap::from_iter([
-        ("encode".to_string(), DataTypeMethod::Function(encode)),
+        (encode.name.clone(), DataTypeMethod::Function(encode)),
         (decode.name.clone(), DataTypeMethod::Function(decode)),
     ]);
-    if decode_at_offset {
-        let decoded = operand_var("_decoded", value_ty.clone());
-        let decode = oomir::Function {
-            name: "decode".to_string(),
-            owner_class: None,
-            debug_variables: Vec::new(),
-            signature: oomir::Signature {
-                params: vec![("bytes".to_string(), bytes_ty.clone())],
-                ret: Box::new(value_ty.clone()),
-                is_static: true,
-            },
-            body: simple_body(vec![
-                oomir::Instruction::InvokeStatic {
-                    dest: Some("_decoded".to_string()),
-                    class_name: class_name.clone(),
-                    method_name: "decodeAt".to_string(),
-                    method_ty: oomir::Signature {
-                        params: vec![
-                            ("bytes".to_string(), bytes_ty.clone()),
-                            ("offset".to_string(), oomir::Type::I32),
-                        ],
-                        ret: Box::new(value_ty.clone()),
-                        is_static: true,
-                    },
-                    args: vec![
-                        operand_var("_1", bytes_ty),
-                        oomir::Operand::Constant(oomir::Constant::I32(0)),
-                    ],
-                },
-                oomir::Instruction::Return {
-                    operand: Some(decoded),
-                },
-            ])
-            .into(),
-        };
-        methods.insert("decode".to_string(), DataTypeMethod::Function(decode));
-    }
-    // The runtime treats a missing binder as a no-op. Do not compile a method
-    // whose only instruction would be `return`.
+    // The runtime supplies whole-buffer adapters and treats absent binders as no-ops.
     if !bind_instructions.is_empty() {
         bind_instructions.push(oomir::Instruction::Return { operand: None });
         let bind = oomir::Function {
@@ -426,18 +408,8 @@ fn build_pointer_memory_codec<'tcx>(
             }),
         );
     }
-    match data_types.get_mut(&class_name) {
-        Some(oomir::DataType::Class {
-            methods: existing, ..
-        }) => existing.extend(methods),
-        Some(oomir::DataType::Interface { .. }) => {
-            return Err(format!(
-                "pointer codec helper name {class_name} is already an interface"
-            ));
-        }
-        None => unreachable!("pointer codec placeholder disappeared during generation"),
-    }
-    Ok(Some(PointerMemoryCodec { class_name }))
+    register_codec(data_types, &codec, methods);
+    Ok(Some(codec))
 }
 
 pub(crate) fn pointer_memory_codec_operand<'tcx>(
@@ -446,6 +418,13 @@ pub(crate) fn pointer_memory_codec_operand<'tcx>(
     data_types: &mut Definitions<'tcx>,
     instance_context: rustc_middle::ty::Instance<'tcx>,
 ) -> oomir::Operand {
+    let ty = data_types.normalize(tcx, ty, instance_context);
+    if let TyKind::Pat(inner, _) = ty.kind() {
+        return pointer_memory_codec_operand(*inner, tcx, data_types, instance_context);
+    }
+    if let Some(payload) = transparent_payload(ty, tcx) {
+        return pointer_memory_codec_operand(payload.ty, tcx, data_types, instance_context);
+    }
     if let Some(codec) = fat_pointer_codec_operand(ty, tcx, data_types, instance_context) {
         return codec;
     }
@@ -476,6 +455,13 @@ pub(crate) fn pointer_view_codec_operand<'tcx>(
     data_types: &mut Definitions<'tcx>,
     instance_context: rustc_middle::ty::Instance<'tcx>,
 ) -> oomir::Operand {
+    let ty = data_types.normalize(tcx, ty, instance_context);
+    if let TyKind::Pat(inner, _) = ty.kind() {
+        return pointer_view_codec_operand(*inner, tcx, data_types, instance_context);
+    }
+    if let Some(payload) = transparent_payload(ty, tcx) {
+        return pointer_view_codec_operand(payload.ty, tcx, data_types, instance_context);
+    }
     if let Some(codec) = fat_pointer_codec_operand(ty, tcx, data_types, instance_context) {
         return codec;
     }

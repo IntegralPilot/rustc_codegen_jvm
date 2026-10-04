@@ -299,6 +299,7 @@ pub fn emit_all_needed_intrinsics(needed_intrinsics: &[(String, String, String)]
         intrinsic_methods.insert(function.name.clone(), DataTypeMethod::Function(function));
     }
     DataType::Class {
+        kind: crate::oomir::ClassKind::Static,
         is_abstract: false,
         super_class: Some("java/lang/Object".to_string()),
         fields: vec![],

@@ -5,6 +5,176 @@ pub(super) fn verify_types(inst: &Inst, body: &Body, types: &Types) -> Result<()
     let result = inst.result.map(|v| body.value_type(v));
     let ty = |v| body.value_type(v);
     match inst.op {
+        Op::CopyStorage { parts, layouts, .. } => {
+            let parts = body
+                .args
+                .get(parts.range())
+                .ok_or_else(|| VerifyError("invalid copy components".into()))?;
+            check!(
+                parts.len() == 5 && result.is_none(),
+                "invalid memory copy operands"
+            );
+            for (i, layout) in layouts.into_iter().enumerate() {
+                let Some(Type::Layout(layout)) = types.get(layout) else {
+                    return Err(VerifyError("copy needs an exact storage layout".into()));
+                };
+                let AddressLayout { size, codec, .. } = types.get_layout(layout);
+                check!(
+                    types
+                        .get(ty(parts[i * 2]))
+                        .is_some_and(|t| t.carrier() == 5)
+                        && types.get(ty(parts[i * 2 + 1])) == Some(Type::Scalar(ScalarType::I64)),
+                    "invalid copy location"
+                );
+                check!(
+                    size <= i32::MAX as u32 && codec.is_none_or(|s| types.symbol_name(s).is_some()),
+                    "invalid copy layout"
+                );
+            }
+            check!(
+                matches!(
+                    types.get(ty(parts[4])),
+                    Some(Type::Scalar(
+                        ScalarType::I32 | ScalarType::U32 | ScalarType::I64 | ScalarType::U64
+                    ))
+                ),
+                "copy length needs an integer"
+            );
+        }
+        Op::ViewRoot {
+            backing,
+            size,
+            codec,
+        } => check!(
+            types.get(ty(backing)).is_some_and(|t| t.carrier() == 5)
+                && result.is_some_and(|t| matches!(types.get(t), Some(Type::Class(s))
+                    if types.symbol_name(s) == Some("java/lang/Object")))
+                && (1..=i32::MAX as u32).contains(&size)
+                && codec.is_none_or(|s| types.symbol_name(s).is_some()),
+            "invalid slice storage root"
+        ),
+        Op::Heap { operation, args } => {
+            let args = &body.args[args.range()];
+            let (count, root, returns) = match operation {
+                HeapOp::Allocate => (2, false, true),
+                HeapOp::Reallocate => (5, true, true),
+                HeapOp::Deallocate => (2, true, false),
+            };
+            check!(args.len() == count, "invalid heap operation arity");
+            check!(
+                !root || types.get(ty(args[0])).is_some_and(|t| t.carrier() == 5),
+                "heap operation requires a storage root"
+            );
+            check!(
+                args[usize::from(root)..]
+                    .iter()
+                    .all(|&arg| types.get(ty(arg)) == Some(Type::Scalar(ScalarType::I64))),
+                "heap sizes, alignments and offsets must be i64"
+            );
+            check!(
+                if returns {
+                    result.is_some_and(|ty| {
+                        matches!(types.get(ty), Some(Type::Class(name))
+                    if types.symbol_name(name) == Some("java/lang/Object"))
+                    })
+                } else {
+                    result.is_none()
+                },
+                "invalid heap operation result"
+            );
+        }
+        Op::CopyValue(value) => check!(
+            result == Some(ty(value)) && types.get(ty(value)).is_some_and(|t| t.carrier() == 5),
+            "copy requires the same reference value type"
+        ),
+        Op::TaggedPack(parts) => {
+            let parts = &body.args[parts.range()];
+            check!(
+                parts.len() == 2
+                    && parts
+                        .iter()
+                        .all(|&v| types.get(ty(v)) == Some(Type::Scalar(ScalarType::I64)))
+                    && result.is_some_and(|t| types.get(t) == Some(Type::TaggedI64)),
+                "invalid tagged scalar components"
+            );
+        }
+        Op::TaggedPart { value, index } => {
+            check!(
+                index < 2
+                    && types.get(ty(value)) == Some(Type::TaggedI64)
+                    && result.is_some_and(|t| types.get(t) == Some(Type::Scalar(ScalarType::I64))),
+                "invalid tagged scalar projection"
+            );
+        }
+        Op::LoadStorageField {
+            address,
+            projection,
+            ..
+        }
+        | Op::LoadStorageFieldCopy {
+            address,
+            projection,
+        }
+        | Op::StoreStorageField {
+            args: address,
+            projection,
+            ..
+        } => {
+            let parts = body
+                .args
+                .get(address.range())
+                .ok_or_else(|| VerifyError("invalid storage address".into()))?;
+            check!(
+                parts.len() >= 2
+                    && types.get(ty(parts[0])).is_some_and(|t| t.carrier() == 5)
+                    && types.get(ty(parts[1])) == Some(Type::Scalar(ScalarType::I64)),
+                "invalid storage address components"
+            );
+            let projection = body
+                .projections
+                .get(projection.index())
+                .ok_or_else(|| VerifyError("invalid storage projection".into()))?;
+            let field = body
+                .fields
+                .get(projection.field.index())
+                .ok_or_else(|| VerifyError("invalid storage field".into()))?;
+            check!(
+                !field.is_static && matches!(types.get(field.owner), Some(Type::Class(_))),
+                "storage projection needs a concrete owner"
+            );
+            match inst.op {
+                Op::LoadStorageFieldCopy { .. } => check!(
+                    parts.len() == 2
+                        && result == Some(field.ty)
+                        && types.get(field.ty).is_some_and(|t| t.carrier() == 5),
+                    "invalid owned storage field result"
+                ),
+                Op::LoadStorageField { index, .. } => check!(
+                    parts.len() == 2
+                        && result.is_some_and(|result| match index {
+                            Some(index) =>
+                                borrowed_part_matches(types, field.ty, index as usize, result),
+                            None => result == field.ty,
+                        }),
+                    "invalid storage field result"
+                ),
+                Op::StoreStorageField { split, .. } => check!(
+                    result.is_none()
+                        && if split {
+                            ComponentShape::of(types, field.ty)
+                                .is_some_and(|s| s.len() == parts.len() - 2)
+                                && parts[2..]
+                                    .iter()
+                                    .enumerate()
+                                    .all(|(i, &p)| borrowed_part_matches(types, field.ty, i, ty(p)))
+                        } else {
+                            parts.len() == 3 && ty(parts[2]) == field.ty
+                        },
+                    "invalid storage field values"
+                ),
+                _ => unreachable!(),
+            }
+        }
         Op::Nop => check!(result.is_none(), "nop produces a value"),
         Op::ArrayLength(value) => check!(
             result.and_then(|t| types.get(t)) == Some(Type::Scalar(ScalarType::I32))
@@ -14,6 +184,13 @@ pub(super) fn verify_types(inst: &Inst, body: &Body, types: &Types) -> Result<()
                 ),
             "array length requires an array or view and int result"
         ),
+        Op::Refine(value) => {
+            check!(
+                result.and_then(|r| types.get(r)).map(Type::carrier) == Some(5)
+                    && types.get(ty(value)).map(Type::carrier) == Some(5),
+                "reference refinement requires reference operands"
+            );
+        }
         Op::Reinterpret(value) => {
             check!(
                 result.and_then(|r| types.get(r)).map(Type::carrier)
@@ -31,6 +208,38 @@ pub(super) fn verify_types(inst: &Inst, body: &Body, types: &Types) -> Result<()
                 "invalid ABI adaptation"
             );
         }
+        Op::ScalarCell(value) => {
+            check!(
+                StorageSlot::scalar(ty(value), types).is_some()
+                    && result.and_then(|r| types.get(r)) == Some(Type::Pointer(ty(value))),
+                "scalar storage requires an exact scalar pointee"
+            );
+        }
+        Op::ProjectRoot {
+            address,
+            projection,
+        } => {
+            let values = &body.args[address.range()];
+            check!(
+                values.len() == 2
+                    && types.get(ty(values[0])).is_some_and(|t| t.carrier() == 5)
+                    && types.get(ty(values[1])) == Some(Type::Scalar(ScalarType::I64))
+                    && projection.index() < body.projections.len()
+                    && result
+                        .and_then(|r| types.get(r))
+                        .is_some_and(|t| t.carrier() == 5),
+                "invalid typed field location"
+            );
+        }
+        Op::ProjectOffset { root, base, offset } => {
+            check!(
+                types.get(ty(root)).is_some_and(|t| t.carrier() == 5)
+                    && types.get(ty(base)).is_some_and(|t| t.carrier() == 5)
+                    && types.get(ty(offset)) == Some(Type::Scalar(ScalarType::I64))
+                    && result == Some(ty(offset)),
+                "invalid typed field displacement"
+            );
+        }
         Op::NewArray(size) => {
             check!(
                 types.get(ty(size)) == Some(Type::Scalar(ScalarType::I32)),
@@ -39,6 +248,14 @@ pub(super) fn verify_types(inst: &Inst, body: &Body, types: &Types) -> Result<()
             check!(
                 matches!(result.and_then(|r| types.get(r)), Some(Type::Array(_))),
                 "array allocation requires array result"
+            );
+        }
+        Op::ArrayFill { array, value } => {
+            check!(
+                result.is_none()
+                    && types.get(ty(array)) == Some(Type::Array(ty(value)))
+                    && StorageSlot::scalar(ty(value), types).is_some(),
+                "primitive array fill type mismatch"
             );
         }
         Op::FunctionPointer { signature, target } => {
@@ -251,8 +468,61 @@ pub(super) fn verify_types(inst: &Inst, body: &Body, types: &Types) -> Result<()
             }
         }
         Op::Opaque(value) => check!(result == Some(ty(value)), "opaque value type mismatch"),
+        Op::AddressTag(value) => {
+            check!(
+                matches!(types.get(ty(value)), Some(Type::Pointer(_)))
+                    && result.and_then(|ty| types.get(ty)) == Some(Type::Scalar(ScalarType::I64)),
+                "nullable tag needs pointer operand and i64 result"
+            );
+        }
+        Op::AddressEqual { left, right } | Op::AddressCompare { left, right } => {
+            let output = if matches!(inst.op, Op::AddressCompare { .. }) {
+                ScalarType::I32
+            } else {
+                ScalarType::Bool
+            };
+            check!(
+                matches!(types.get(ty(left)), Some(Type::Pointer(_)))
+                    && matches!(types.get(ty(right)), Some(Type::Pointer(_)))
+                    && result.and_then(|ty| types.get(ty)) == Some(Type::Scalar(output)),
+                "invalid address comparison"
+            );
+        }
+        Op::LocationEqual(parts) | Op::LocationCompare(parts) => {
+            let output = if matches!(inst.op, Op::LocationCompare(_)) {
+                ScalarType::I32
+            } else {
+                ScalarType::Bool
+            };
+            let values = body
+                .args
+                .get(parts.range())
+                .ok_or_else(|| VerifyError("invalid location operands".into()))?;
+            check!(
+                values.len() == 4
+                    && result.and_then(|ty| types.get(ty)) == Some(Type::Scalar(output)),
+                "invalid location comparison"
+            );
+            for (index, &value) in values.iter().enumerate() {
+                check!(
+                    if index % 2 == 0 {
+                        matches!(types.get(ty(value)), Some(Type::Class(s)) if types.symbol_name(s) == Some("java/lang/Object"))
+                    } else {
+                        types.get(ty(value)) == Some(Type::Scalar(ScalarType::I64))
+                    },
+                    "location component mismatch"
+                );
+            }
+        }
         Op::Project { base, projection }
         | Op::LoadField { base, projection }
+        | Op::LoadFieldCopy { base, projection }
+        | Op::LoadFieldPart {
+            base, projection, ..
+        }
+        | Op::StoreFieldParts {
+            base, projection, ..
+        }
         | Op::StoreField {
             base, projection, ..
         } => {
@@ -264,19 +534,56 @@ pub(super) fn verify_types(inst: &Inst, body: &Body, types: &Types) -> Result<()
                 .fields
                 .get(projection.field.index())
                 .ok_or_else(|| VerifyError("invalid projection field".into()))?;
+            let mut owner = field.owner;
+            let mut parent = projection.parent;
+            let mut depth = 0;
+            while let Some(id) = parent {
+                depth += 1;
+                check!(depth <= 32, "projection path cycle");
+                let previous = body
+                    .projections
+                    .get(id.index())
+                    .ok_or_else(|| VerifyError("invalid projection parent".into()))?;
+                let member = body
+                    .fields
+                    .get(previous.field.index())
+                    .ok_or_else(|| VerifyError("invalid projection parent field".into()))?;
+                check!(
+                    !member.is_static && member.ty == owner,
+                    "projection path type mismatch"
+                );
+                owner = member.owner;
+                parent = previous.parent;
+            }
             check!(
-                !field.is_static && types.get(ty(base)) == Some(Type::Pointer(field.owner)),
+                !field.is_static && types.pointee(ty(base)) == Some(owner),
                 "projection owner mismatch"
             );
-            if !matches!(inst.op, Op::Project { .. }) {
+            check!(
+                projection.parent.is_none()
+                    || matches!(
+                        inst.op,
+                        Op::LoadField { .. } | Op::LoadFieldCopy { .. } | Op::LoadFieldPart { .. }
+                    ),
+                "projection paths require field reads"
+            );
+            if !matches!(inst.op, Op::Project { .. } | Op::LoadFieldCopy { .. }) {
                 check!(
-                    matches!(types.get(field.ty), Some(Type::Scalar(_))),
-                    "promoted field access requires a scalar field"
+                    matches!(
+                        types.get(field.ty),
+                        Some(Type::Scalar(_) | Type::Pointer(_) | Type::Slice(_) | Type::Str)
+                    ),
+                    "promoted field access requires a scalar or pointer field"
                 );
             }
             match inst.op {
+                Op::LoadFieldCopy { .. } => check!(
+                    result == Some(field.ty)
+                        && types.get(field.ty).is_some_and(|t| t.carrier() == 5),
+                    "owned field load type mismatch"
+                ),
                 Op::Project { .. } => check!(
-                    result.and_then(|id| types.get(id)) == Some(Type::Pointer(field.ty)),
+                    result.and_then(|id| types.pointee(id)) == Some(field.ty),
                     "projection result mismatch"
                 ),
                 Op::LoadField { .. } => {
@@ -286,6 +593,41 @@ pub(super) fn verify_types(inst: &Inst, body: &Body, types: &Types) -> Result<()
                     result.is_none() && ty(value) == field.ty,
                     "field store type mismatch"
                 ),
+                Op::LoadFieldPart { index, .. } => {
+                    check!(
+                        result.is_some_and(|part| borrowed_part_matches(
+                            types,
+                            field.ty,
+                            index as usize,
+                            part
+                        )),
+                        "invalid split field load"
+                    );
+                }
+                Op::StoreFieldParts { parts, .. } => {
+                    let values = body
+                        .args
+                        .get(parts.range())
+                        .ok_or_else(|| VerifyError("invalid split field operands".into()))?;
+                    check!(
+                        result.is_none()
+                            && ComponentShape::of(types, field.ty)
+                                .is_some_and(|shape| shape.len() == values.len()),
+                        "invalid split field store"
+                    );
+                    check!(
+                        values
+                            .iter()
+                            .enumerate()
+                            .all(|(index, &value)| borrowed_part_matches(
+                                types,
+                                field.ty,
+                                index,
+                                ty(value)
+                            )),
+                        "invalid split field components"
+                    );
+                }
                 _ => unreachable!(),
             }
             check!(
@@ -327,6 +669,193 @@ pub(super) fn verify_types(inst: &Inst, body: &Body, types: &Types) -> Result<()
                 "view length needs usize"
             );
         }
+        Op::RetypeAddress {
+            pointer,
+            size,
+            codec,
+        } => {
+            check!(
+                matches!(types.get(ty(pointer)), Some(Type::Pointer(_)))
+                    && matches!(result.and_then(|t| types.get(t)), Some(Type::Pointer(_))),
+                "retyped address needs pointer operands"
+            );
+            check!(
+                size <= i32::MAX as u32 && codec.is_none_or(|id| types.symbol_name(id).is_some()),
+                "invalid address layout"
+            );
+        }
+        Op::LocationTag(parts)
+        | Op::AddressPack(parts)
+        | Op::LoadAddress(parts)
+        | Op::LoadAddressCopy(parts)
+        | Op::LoadTypedCopy { parts, .. }
+        | Op::LoadTyped { parts, .. }
+        | Op::StoreTyped { parts, .. }
+        | Op::TypedAddressPack { parts, .. }
+        | Op::StoreAddress { parts, .. } => {
+            let parts = body
+                .args
+                .get(parts.range())
+                .ok_or_else(|| VerifyError("invalid address components".into()))?;
+            check!(
+                match inst.op {
+                    Op::LoadTyped { .. } => matches!(parts.len(), 2 | 3),
+                    Op::StoreTyped { .. } => parts.len() == 3,
+                    _ => parts.len() == 2,
+                },
+                "address component count"
+            );
+            check!(
+                types.get(ty(parts[0])).is_some_and(|t| t.carrier() == 5),
+                "address root needs a reference"
+            );
+            check!(
+                types.get(ty(parts[1])) == Some(Type::Scalar(ScalarType::I64)),
+                "address offset needs signed long"
+            );
+            if let Op::LoadTypedCopy { size, codec, .. }
+            | Op::LoadTyped { size, codec, .. }
+            | Op::TypedAddressPack { size, codec, .. }
+            | Op::StoreTyped { size, codec, .. } = inst.op
+            {
+                check!(
+                    size > 0
+                        && size <= i32::MAX as u32
+                        && codec.is_none_or(|id| types.symbol_name(id).is_some()),
+                    "invalid typed address layout"
+                );
+            }
+            match inst.op {
+                Op::LocationTag(_) => check!(
+                    result.and_then(|ty| types.get(ty)) == Some(Type::Scalar(ScalarType::I64)),
+                    "nullable tag needs i64 result"
+                ),
+                Op::AddressPack(_) | Op::TypedAddressPack { .. } => check!(
+                    result
+                        .and_then(|t| ComponentShape::of(types, t))
+                        .is_some_and(ComponentShape::is_address),
+                    "address pack needs pointer type"
+                ),
+                Op::LoadAddressCopy(_) | Op::LoadTypedCopy { .. } => check!(
+                    result.is_some_and(|t| types.get(t).is_some_and(|t| t.carrier() == 5)),
+                    "owned address load needs a reference carrier"
+                ),
+                Op::LoadTyped { .. } => {
+                    check!(
+                        result.is_some_and(|t| types.get(t).is_some_and(|t| t.carrier() == 5)),
+                        "typed borrowed load needs a reference carrier"
+                    );
+                    if let Some(&target) = parts.get(2) {
+                        check!(
+                            matches!(types.get(ty(target)), Some(Type::Class(name))
+                            if types.symbol_name(name) == Some("java/lang/String")),
+                            "typed borrowed load needs a class name"
+                        );
+                    }
+                }
+                Op::LoadAddress(_) => check!(
+                    result.is_some_and(|t| StorageSlot::scalar(t, types).is_some()
+                        || types.get(t).is_some_and(|t| t.carrier() == 5)),
+                    "address load needs a stored value"
+                ),
+                Op::StoreTyped { .. } => check!(
+                    result.is_none() && types.get(ty(parts[2])).is_some_and(|t| t.carrier() == 5),
+                    "typed store needs an aggregate value"
+                ),
+                Op::StoreAddress { value, .. } => check!(
+                    result.is_none()
+                        && (StorageSlot::scalar(ty(value), types).is_some()
+                            || types.get(ty(value)).is_some_and(|t| t.carrier() == 5)),
+                    "address store needs a stored value"
+                ),
+                _ => unreachable!(),
+            }
+        }
+        Op::AddressPart { address, index } => {
+            check!(
+                ComponentShape::of(types, ty(address)).is_some_and(ComponentShape::is_address),
+                "address part needs pointer type"
+            );
+            check!(
+                match index {
+                    0 => result
+                        .and_then(|t| types.get(t))
+                        .is_some_and(|t| t.carrier() == 5),
+                    1 => result.and_then(|t| types.get(t)) == Some(Type::Scalar(ScalarType::I64)),
+                    _ => false,
+                },
+                "invalid address component"
+            );
+        }
+        Op::SlotRoot(slot) => {
+            check!(
+                body.slots
+                    .get(slot.index())
+                    .and_then(|s| StorageSlot::scalar(s.ty, types))
+                    .is_some(),
+                "slot root needs primitive storage"
+            );
+            check!(
+                result
+                    .and_then(|t| types.get(t))
+                    .is_some_and(|t| t.carrier() == 5),
+                "slot root needs reference result"
+            );
+        }
+        Op::ViewPack(parts) | Op::ViewAddress { parts, .. } => {
+            let parts = body
+                .args
+                .get(parts.range())
+                .ok_or_else(|| VerifyError("invalid view components".into()))?;
+            check!(parts.len() == 3, "view needs backing, start, and length");
+            check!(
+                types.get(ty(parts[0])).is_some_and(|ty| ty.carrier() == 5),
+                "view backing needs a reference"
+            );
+            check!(
+                types.get(ty(parts[1])) == Some(Type::Scalar(ScalarType::I32)),
+                "view start needs an int"
+            );
+            check!(
+                types.get(ty(parts[2])) == Some(Type::Scalar(ScalarType::U64)),
+                "view length needs usize"
+            );
+            if let Op::ViewPack(_) = inst.op {
+                check!(
+                    result.is_some_and(|t| ComponentShape::view_carrier(types, t)),
+                    "view pack result"
+                );
+                return Ok(());
+            }
+            let Op::ViewAddress { size, codec, .. } = inst.op else {
+                unreachable!()
+            };
+            check!(
+                matches!(result.and_then(|ty| types.get(ty)), Some(Type::Pointer(_))),
+                "view address needs a pointer"
+            );
+            check!(
+                size <= i32::MAX as u32 && codec.is_none_or(|id| types.symbol_name(id).is_some()),
+                "invalid view address layout"
+            );
+        }
+        Op::ViewPart { view, index } => {
+            check!(
+                ComponentShape::view_carrier(types, ty(view)),
+                "view part source"
+            );
+            check!(
+                match index {
+                    0 => result
+                        .and_then(|t| types.get(t))
+                        .is_some_and(|t| t.carrier() == 5),
+                    1 => result.and_then(|t| types.get(t)) == Some(Type::Scalar(ScalarType::I32)),
+                    2 => result.and_then(|t| types.get(t)) == Some(Type::Scalar(ScalarType::U64)),
+                    _ => false,
+                },
+                "view part result"
+            );
+        }
         Op::ViewData { view, size, codec } => {
             let element = view_element(types.get(ty(view)), types);
             check!(
@@ -337,6 +866,44 @@ pub(super) fn verify_types(inst: &Inst, body: &Body, types: &Types) -> Result<()
             check!(
                 size <= i32::MAX as u32 && codec.is_none_or(|id| types.symbol_name(id).is_some()),
                 "invalid view element layout"
+            );
+        }
+        Op::AddressViewPart { address, index } => {
+            check!(
+                ComponentShape::of(types, ty(address)).is_some_and(ComponentShape::is_address),
+                "view part needs an address"
+            );
+            check!(
+                match (index, result.and_then(|t| types.get(t))) {
+                    (0, Some(Type::Class(s))) => types.symbol_name(s) == Some("java/lang/Object"),
+                    (1, Some(Type::Scalar(ScalarType::I32))) => true,
+                    _ => false,
+                },
+                "invalid address view component"
+            );
+        }
+        Op::TypedAddressViewPart {
+            parts,
+            size,
+            codec,
+            index,
+        } => {
+            let parts = &body.args[parts.range()];
+            check!(parts.len() == 2, "invalid typed slice location arity");
+            check!(
+                types.get(ty(parts[0])).is_some_and(|t| t.carrier() == 5)
+                    && types.get(ty(parts[1])) == Some(Type::Scalar(ScalarType::I64))
+                    && (1..=i32::MAX as u32).contains(&size)
+                    && codec.is_none_or(|s| types.symbol_name(s).is_some()),
+                "invalid typed slice location"
+            );
+            check!(
+                match (index, result.and_then(|t| types.get(t))) {
+                    (0, Some(Type::Class(s))) => types.symbol_name(s) == Some("java/lang/Object"),
+                    (1, Some(Type::Scalar(ScalarType::I32))) => true,
+                    _ => false,
+                },
+                "invalid typed slice component"
             );
         }
         Op::Cast(value) => {
@@ -356,12 +923,25 @@ pub(super) fn verify_types(inst: &Inst, body: &Body, types: &Types) -> Result<()
             result.and_then(|ty| types.get(ty)) == Some(Type::Pointer(body.slots[slot.index()].ty)),
             "slot address type mismatch"
         ),
+        Op::Commit(pointer) => check!(
+            result.is_none() && matches!(types.get(ty(pointer)), Some(Type::Pointer(_))),
+            "view commit needs its address owner"
+        ),
+        Op::LoadCopy(pointer) => check!(
+            result.is_some_and(|t| types.get(t).is_some_and(|t| t.carrier() == 5))
+                && types.pointee(ty(pointer)) == result,
+            "owned pointer load type mismatch"
+        ),
         Op::Load(pointer) => check!(
-            result.is_some() && types.get(ty(pointer)) == result.map(Type::Pointer),
-            "pointer load type mismatch"
+            result.is_some() && types.pointee(ty(pointer)) == result,
+            "pointer load type mismatch: address {:?} ({:?}), result {:?} ({:?})",
+            pointer,
+            types.get(ty(pointer)),
+            result,
+            result.and_then(|ty| types.get(ty))
         ),
         Op::Store { pointer, value } => check!(
-            result.is_none() && types.get(ty(pointer)) == Some(Type::Pointer(ty(value))),
+            result.is_none() && types.pointee(ty(pointer)) == Some(ty(value)),
             "pointer store type mismatch"
         ),
         Op::StoreSlot { slot, value } => {
@@ -395,8 +975,41 @@ pub(super) fn verify_types(inst: &Inst, body: &Body, types: &Types) -> Result<()
                 check!(result == Some(member.ty), "field load type mismatch");
             }
         }
-        Op::ArraySet { .. } => check!(result.is_none(), "store produces value"),
-        _ => {}
+        Op::ViewGet(parts) | Op::ViewGetCopy(parts) | Op::ViewSet { parts, .. } => {
+            let parts = &body.args[parts.range()];
+            check!(
+                parts.len() == 3
+                    && types.get(ty(parts[0])).is_some_and(|t| t.carrier() == 5)
+                    && parts[1..]
+                        .iter()
+                        .all(|&p| types.get(ty(p)) == Some(Type::Scalar(ScalarType::I32))),
+                "slice access requires backing, start and index"
+            );
+            check!(
+                matches!(inst.op, Op::ViewGet(_) | Op::ViewGetCopy(_)) == result.is_some(),
+                "slice access result mismatch"
+            );
+        }
+        Op::ArrayGet { array, index, .. }
+        | Op::ArrayGetCopy { array, index }
+        | Op::ArraySet { array, index, .. } => {
+            check!(
+                !matches!(
+                    inst.op,
+                    Op::ArrayGet { native: true, .. } | Op::ArraySet { native: true, .. }
+                ) || matches!(types.get(ty(array)), Some(Type::Array(_))),
+                "native scratch access requires a JVM array"
+            );
+            check!(
+                types.get(ty(index)) == Some(Type::Scalar(ScalarType::I32)),
+                "array index requires JVM int"
+            );
+            check!(
+                matches!(inst.op, Op::ArrayGet { .. } | Op::ArrayGetCopy { .. })
+                    == result.is_some(),
+                "array access result mismatch"
+            );
+        }
     }
     Ok(())
 }
@@ -406,5 +1019,20 @@ fn view_element(ty: Option<Type>, types: &Types) -> Option<TypeId> {
         Some(Type::Slice(element)) => Some(element),
         Some(Type::Str) => types.find(Type::Scalar(ScalarType::U8)),
         _ => None,
+    }
+}
+
+fn borrowed_part_matches(types: &Types, logical: TypeId, index: usize, part: TypeId) -> bool {
+    match (ComponentShape::of(types, logical), index, types.get(part)) {
+        (Some(ComponentShape::TaggedI64), 0..=1, Some(Type::Scalar(ScalarType::I64))) => true,
+        (Some(_), 0, Some(Type::Class(s))) => types.symbol_name(s) == Some("java/lang/Object"),
+        (
+            Some(ComponentShape::Address | ComponentShape::StorageAddress),
+            1,
+            Some(Type::Scalar(ScalarType::I64)),
+        )
+        | (Some(ComponentShape::View), 1, Some(Type::Scalar(ScalarType::I32)))
+        | (Some(ComponentShape::View), 2, Some(Type::Scalar(ScalarType::U64))) => true,
+        _ => false,
     }
 }

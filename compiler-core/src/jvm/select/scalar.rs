@@ -3,6 +3,13 @@ use super::*;
 impl Selector<'_> {
     pub(super) fn instruction(&mut self, id: InstId) -> jvm::Result<()> {
         let inst = self.body.instructions[id.index()];
+        if !matches!(
+            inst.op,
+            Op::LoadFieldPart { .. } | Op::LoadField { .. } | Op::LoadStorageField { .. }
+        ) && inst.op.may_throw(self.body, self.types)
+        {
+            self.aggregate_cache = None;
+        }
         if inst.result.is_some_and(|v| literal(self.body, v).is_some()) {
             return Ok(());
         }
@@ -25,7 +32,8 @@ impl Selector<'_> {
             return Ok(());
         }
         if self.general(inst)?
-            || self.array(inst)?
+            || self.array(id, inst)?
+            || self.address(inst)?
             || self.memory(inst)?
             || self.object(inst)?
             || self.view(inst)?
@@ -149,9 +157,13 @@ impl Selector<'_> {
                 self.assembly.code.push(I::L2i);
             }
             let (width, signed) = ty.integer().ok_or_else(|| error("non-integer shift"))?;
-            self.assembly
-                .code
-                .extend([get_int_const_instr(self.cp, (width - 1) as i32), I::Iand]);
+            // JVM int/long shifts already mask to 5/6 bits. Only narrower
+            // Rust integer widths require a stricter mask.
+            if width < 32 {
+                self.assembly
+                    .code
+                    .extend([get_int_const_instr(self.cp, (width - 1) as i32), I::Iand]);
+            }
             self.assembly.code.push(match (op, kind, signed) {
                 (Shl, Kind::Int, _) => I::Ishl,
                 (Shl, Kind::Long, _) => I::Lshl,

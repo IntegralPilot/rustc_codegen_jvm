@@ -4,8 +4,7 @@ use crate::oomir::{self, DataType};
 use jvm_compiler_core::jvm::MethodCode;
 use jvm_gen::{
     create_data_type_classfile_for_class, create_data_type_classfile_for_interface,
-    create_default_constructor, create_slice_view_classfile, create_utf8_view_classfile,
-    oomir_type_to_ristretto_field_type,
+    create_default_constructor, oomir_type_to_ristretto_field_type,
 };
 #[derive(Clone, Copy)]
 pub(crate) struct DebugInfoOptions {
@@ -24,7 +23,6 @@ use rustc_middle::ty::TyCtxt;
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::PathBuf,
-    sync::Arc,
 };
 
 use jvm::constant_pool;
@@ -49,7 +47,6 @@ pub const U128_CLASS: &str = "org/rustlang/runtime/U128";
 pub fn oomir_to_jvm_bytecode(
     mut module: oomir::Module,
     debug_info: DebugInfoOptions,
-    emit_runtime_views: bool,
     registry: &EmittedClassRegistry,
 ) -> jvm::Result<Vec<(String, PathBuf)>> {
     let context = if let Some(shared) = &module.shared_context {
@@ -58,61 +55,7 @@ pub fn oomir_to_jvm_bytecode(
         std::borrow::Cow::Owned(oomir::construct::Context::new(&module))
     };
 
-    let function_relative_methods = module
-        .functions
-        .values()
-        .filter_map(|function| {
-            (function.signature.is_static
-                && function.name != "<init>"
-                && function.signature.supports_relative_pointer_abi())
-            .then(|| {
-                oomir::FunctionKey::new(
-                    module.owner_class_for_function(function),
-                    &function.name,
-                    &function.signature,
-                )
-            })
-        })
-        .collect::<Vec<_>>();
-    for method in function_relative_methods {
-        if !module.relative_static_methods.contains(&method) {
-            Arc::make_mut(&mut module.relative_static_methods).insert(method);
-        }
-    }
-    for (class_name, data_type) in &module.data_types {
-        let oomir::DataType::Class { methods, .. } = data_type else {
-            continue;
-        };
-        for (method_name, method) in methods {
-            let Some(signature) = method.function_signature() else {
-                continue;
-            };
-            if signature.is_static
-                && method_name != "<init>"
-                && signature.supports_relative_pointer_abi()
-            {
-                let method = oomir::FunctionKey::new(class_name, method_name, signature);
-                if !module.relative_static_methods.contains(&method) {
-                    Arc::make_mut(&mut module.relative_static_methods).insert(method);
-                }
-            }
-        }
-    }
     let mut output = output::ClassOutput::create(&module.name)?;
-    if emit_runtime_views {
-        output.emit(
-            registry,
-            oomir::SLICE_VIEW_CLASS.to_string(),
-            create_slice_view_classfile()?,
-            crate::metrics::ClassOrigin::Runtime,
-        )?;
-        output.emit(
-            registry,
-            oomir::UTF8_VIEW_CLASS.to_string(),
-            create_utf8_view_classfile()?,
-            crate::metrics::ClassOrigin::Runtime,
-        )?;
-    }
 
     // Consume functions class-by-class so their OOMIR is released as soon as
     // the corresponding classfile has been serialized.
@@ -172,12 +115,16 @@ pub fn oomir_to_jvm_bytecode(
             .flatten()
             .or_else(|| source_files.first().map(|file| (*file).to_string()));
         let mut class_statics = statics_by_class.remove(&class_name_jvm).unwrap_or_default();
+        let private_statics = !class_statics.is_empty()
+            && functions.is_empty()
+            && class_statics.iter().all(|value| value.is_private);
         class_statics.sort_by(|left, right| left.field_name.cmp(&right.field_name));
         let mut main_cp = InternedConstantPool::default();
         let super_class_name_jvm = "java/lang/Object"; // Standard superclass
 
         let super_class_index = main_cp.add_class(super_class_name_jvm)?;
         let this_class_index = main_cp.add_class(&class_name_jvm)?;
+        main_cp.set_resource_anchor(this_class_index);
 
         let mut methods: Vec<jvm::Method> = Vec::new();
         let mut bootstrap_methods: Vec<BootstrapMethod> = Vec::new();
@@ -219,7 +166,6 @@ pub fn oomir_to_jvm_bytecode(
                 next_factory: &mut next_factory,
                 owner: &class_name_jvm,
                 kind: jvm_gen::BodyOwner::Module,
-                relative_methods: &module.relative_static_methods,
                 debug: debug_info,
                 context: &context,
             }
@@ -227,7 +173,7 @@ pub fn oomir_to_jvm_bytecode(
         }
 
         // Add a default constructor if none was provided in OOMIR
-        if !has_constructor {
+        if !has_constructor && !class_name_jvm.contains("/mono/Mono_") {
             methods.push(create_default_constructor(&mut main_cp, super_class_index)?);
         }
 
@@ -240,6 +186,12 @@ pub fn oomir_to_jvm_bytecode(
         } else {
             Vec::new()
         };
+        if (class_name_jvm.contains("/mono/Mono_") && class_statics.is_empty()) || private_statics {
+            attributes.push(Attribute::Unknown {
+                name_index: main_cp.add_utf8(jvm::summary::PRIVATE_ATTRIBUTE)?,
+                info: Vec::new(),
+            });
+        }
         if !bootstrap_methods.is_empty() {
             attributes.push(Attribute::BootstrapMethods {
                 name_index: main_cp.add_utf8("BootstrapMethods")?,
@@ -247,6 +199,7 @@ pub fn oomir_to_jvm_bytecode(
             });
         }
 
+        output.resources(registry, &mut main_cp)?;
         let class_file = ClassFile {
             code_source_url: None,
             version: Version::Java8 { minor: 0 },
@@ -339,6 +292,7 @@ pub fn oomir_to_jvm_bytecode(
 
         match data_type {
             DataType::Class {
+                kind,
                 is_abstract,
                 super_class,
                 fields,
@@ -351,6 +305,7 @@ pub fn oomir_to_jvm_bytecode(
                 let dt_bytecode = create_data_type_classfile_for_class(
                     dt_name_oomir,
                     fields,
+                    *kind,
                     *is_abstract,
                     methods,
                     super_class.as_deref().unwrap_or("java/lang/Object"),
@@ -359,8 +314,9 @@ pub fn oomir_to_jvm_bytecode(
                     &subclasses,
                     nest_host.as_deref(),
                     debug_info,
-                    &module.relative_static_methods,
                     &context,
+                    &mut output,
+                    registry,
                 )?;
                 output.emit(
                     registry,
@@ -385,8 +341,9 @@ pub fn oomir_to_jvm_bytecode(
                     subclasses,
                     nest_host,
                     debug_info,
-                    &module.relative_static_methods,
                     &context,
+                    &mut output,
+                    registry,
                 )?;
                 output.emit(
                     registry,

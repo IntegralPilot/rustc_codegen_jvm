@@ -3,11 +3,20 @@
 
 use core::mem::MaybeUninit;
 
+mod array_aliases;
 mod atomic_views;
+mod borrowed_slots;
 mod borrowed_union_gc;
 mod function_arrays;
+mod fixed_views;
+mod generic_copies;
+mod non_null_views;
+mod option_refs;
+mod ordering;
 mod reconstructed_traits;
 mod scalar_constants;
+mod scalar_storage;
+mod static_layout;
 mod swapped_references;
 
 fn generic_uninit_slice_data<T>(values: &mut [MaybeUninit<T>]) -> *mut T {
@@ -468,6 +477,12 @@ fn same_width_pointer_reinterpretation() {
 
 fn f16_pointer_storage() {
     let mut value = 1.5_f16;
+    let shared = core::ptr::from_ref(&value);
+    let non_null = core::ptr::NonNull::from_ref(&value).as_ptr();
+    assert_eq!(shared, non_null);
+    assert_eq!(unsafe { shared.read().to_bits() }, 0x3e00);
+    let uninit = core::mem::MaybeUninit::new(value);
+    assert_eq!(unsafe { uninit.as_ptr().read().to_bits() }, 0x3e00);
     let pointer = &mut value as *mut f16;
     unsafe {
         assert!(*pointer == 1.5_f16);
@@ -2408,6 +2423,12 @@ fn exposed_allocation_churn() {
 }
 
 fn main() {
+    ordering::check();
+    fixed_views::check();
+    static_layout::run();
+    option_refs::run();
+    array_aliases::run();
+    scalar_storage::run();
     reconstructed_traits::run();
     atomic_views::run();
     borrowed_union_gc::run();
@@ -2431,6 +2452,8 @@ fn main() {
     pointer_ordering();
     raw_pointer_binary_search();
     unaligned_volatile_and_bulk_memory();
+    generic_copies::check();
+    non_null_views::check();
     aggregate_memory_layout();
     managed_reference_fields_have_memory_bits();
     projected_field_addresses_share_allocations();

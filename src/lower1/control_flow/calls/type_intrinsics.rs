@@ -199,36 +199,46 @@ pub(super) fn type_id_eq<'tcx>(
     let type_id_ty = oomir_operands[0]
         .get_type()
         .expect("TypeId equality operands are typed");
-    let oomir::Type::Class(type_id_class) = &type_id_ty else {
-        panic!("type_id_eq received non-class operand {type_id_ty:?}");
-    };
-    let data_ty = match data_types.get(type_id_class) {
-        Some(oomir::DataType::Class { fields, .. }) => fields
-            .iter()
-            .find(|(name, _)| name == "data")
-            .map(|(_, ty)| ty.clone())
-            .expect("TypeId class has a data field"),
-        _ => panic!("TypeId class {type_id_class} is not defined"),
+    let (left_data, right_data, data_ty) = match &type_id_ty {
+        oomir::Type::Array(_) => (
+            oomir_operands[0].clone(),
+            oomir_operands[1].clone(),
+            type_id_ty.clone(),
+        ),
+        oomir::Type::Class(type_id_class) => {
+            let (data_name, data_ty) = match data_types.get(type_id_class) {
+                Some(oomir::DataType::Class { fields, .. }) => fields
+                    .first()
+                    .cloned()
+                    .expect("TypeId class has a data field"),
+                _ => panic!("TypeId class {type_id_class} is not defined"),
+            };
+            let mut data =
+                oomir_operands
+                    .into_iter()
+                    .take(2)
+                    .enumerate()
+                    .map(|(index, operand)| {
+                        let name = format!("{label}_type_id_data_{index}");
+                        instructions.push(oomir::Instruction::GetField {
+                            dest: name.clone(),
+                            object: operand,
+                            field_name: data_name.clone(),
+                            field_ty: data_ty.clone(),
+                            owner_class: type_id_class.clone(),
+                        });
+                        oomir::Operand::Variable {
+                            name,
+                            ty: data_ty.clone(),
+                        }
+                    });
+            (data.next().unwrap(), data.next().unwrap(), data_ty)
+        }
+        _ => panic!("type_id_eq received unsupported operand {type_id_ty:?}"),
     };
     let oomir::Type::Array(pointer_ty) = &data_ty else {
-        panic!("TypeId data field is not an array: {data_ty:?}");
+        panic!("TypeId data is not an array: {data_ty:?}");
     };
-    let left_data = format!("{label}_type_id_left_data");
-    let right_data = format!("{label}_type_id_right_data");
-    instructions.push(oomir::Instruction::GetField {
-        dest: left_data.clone(),
-        object: oomir_operands[0].clone(),
-        field_name: "data".to_string(),
-        field_ty: data_ty.clone(),
-        owner_class: type_id_class.clone(),
-    });
-    instructions.push(oomir::Instruction::GetField {
-        dest: right_data.clone(),
-        object: oomir_operands[1].clone(),
-        field_name: "data".to_string(),
-        field_ty: data_ty.clone(),
-        owner_class: type_id_class.clone(),
-    });
 
     let limb_count = 16usize
         / usize::try_from(tcx.data_layout.pointer_size().bytes()).expect("pointer size fits usize");
@@ -240,18 +250,12 @@ pub(super) fn type_id_eq<'tcx>(
         let index = oomir::Operand::Constant(oomir::Constant::I32(limb as i32));
         instructions.push(oomir::Instruction::ArrayGet {
             dest: left_limb.clone(),
-            array: oomir::Operand::Variable {
-                name: left_data.clone(),
-                ty: data_ty.clone(),
-            },
+            array: left_data.clone(),
             index: index.clone(),
         });
         instructions.push(oomir::Instruction::ArrayGet {
             dest: right_limb.clone(),
-            array: oomir::Operand::Variable {
-                name: right_data.clone(),
-                ty: data_ty.clone(),
-            },
+            array: right_data.clone(),
             index,
         });
         instructions.push(oomir::Instruction::InvokeVirtual {

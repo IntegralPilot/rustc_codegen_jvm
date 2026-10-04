@@ -37,7 +37,23 @@ pub(super) fn emit_unsize_value<'tcx>(
     let source_oomir_ty = ty_to_oomir_type(source_ty, tcx, data_types, instance);
     let target_oomir_ty = ty_to_oomir_type(target_ty, tcx, data_types, instance);
 
-    let result = if source_oomir_ty == target_oomir_ty {
+    let result = if let (TyKind::Adt(source_def, _), TyKind::Adt(target_def, _)) =
+        (source_ty.kind(), target_ty.kind())
+        && source_def.did() == target_def.did()
+        && let Some(source_payload) = crate::lower1::types::transparent_payload(source_ty, tcx)
+        && let Some(target_payload) = crate::lower1::types::transparent_payload(target_ty, tcx)
+    {
+        emit_unsize_value(
+            source_payload.ty,
+            target_payload.ty,
+            source,
+            dest,
+            tcx,
+            instance,
+            data_types,
+            instructions,
+        )
+    } else if source_oomir_ty == target_oomir_ty {
         instructions.push(oomir::Instruction::Move {
             dest: dest.to_string(),
             src: source,
@@ -51,7 +67,10 @@ pub(super) fn emit_unsize_value<'tcx>(
         && source_def.did() == target_def.did()
         && crate::lower1::is_non_null_lang_item(tcx, source_def.did())
         && matches!(source_oomir_ty, oomir::Type::Pointer(_))
-        && let oomir::Type::Class(target_class) = &target_oomir_ty
+        && matches!(
+            target_oomir_ty,
+            oomir::Type::Class(_) | oomir::Type::Slice(_) | oomir::Type::Str
+        )
     {
         let field = source_def
             .variant(0usize.into())
@@ -74,6 +93,9 @@ pub(super) fn emit_unsize_value<'tcx>(
             instructions,
         )
         .map(|pointer| {
+            let oomir::Type::Class(target_class) = &target_oomir_ty else {
+                return pointer;
+            };
             let pointer_ty = pointer
                 .get_type()
                 .expect("unsized NonNull pointer has a JVM value");
@@ -130,7 +152,11 @@ pub(super) fn emit_unsize_value<'tcx>(
                     instructions.push(oomir::Instruction::GetField {
                         dest: source_field_name.clone(),
                         object: source.clone(),
-                        field_name: field.ident(tcx).to_string(),
+                        field_name: crate::lower1::types::struct_field_name(
+                            tcx,
+                            source_def,
+                            field_index,
+                        ),
                         field_ty: source_field_oomir_ty.clone(),
                         owner_class: source_class.clone(),
                     });
@@ -190,7 +216,7 @@ pub(super) fn emit_unsize_value<'tcx>(
         tcx,
         instance,
     ) {
-        let source_pointee = normalize_unsize_ty(pointer_pointee_ty(source_ty), tcx, instance);
+        let source_pointee = normalize_unsize_ty(pointer_pointee_ty(source_ty, tcx), tcx, instance);
         let TyKind::Array(element_ty, length) = tcx
             .struct_tail_for_codegen(source_pointee, TypingEnv::fully_monomorphized())
             .kind()
@@ -198,7 +224,7 @@ pub(super) fn emit_unsize_value<'tcx>(
             unreachable!("struct-tail unsizing source was validated")
         };
         let length = length.try_to_target_usize(tcx)?;
-        let target_pointee = normalize_unsize_ty(pointer_pointee_ty(target_ty), tcx, instance);
+        let target_pointee = normalize_unsize_ty(pointer_pointee_ty(target_ty, tcx), tcx, instance);
         let target_tail =
             tcx.struct_tail_for_codegen(target_pointee, TypingEnv::fully_monomorphized());
         let tail_view_class = if target_tail.is_str() {

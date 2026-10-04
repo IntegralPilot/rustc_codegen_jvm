@@ -1,13 +1,12 @@
 use super::*;
 
-pub(crate) fn ensure_closure_fn_pointer_adapter_class<'tcx>(
+pub(crate) fn ensure_closure_fn_pointer_bridge<'tcx>(
     data_types: &mut Definitions<'tcx>,
     closure_instance: Instance<'tcx>,
     signature: &oomir::Signature,
-    interface_name: &str,
     tcx: TyCtxt<'tcx>,
     instance_context: Instance<'tcx>,
-) -> String {
+) -> (String, String) {
     let typing_env = TypingEnv::fully_monomorphized();
     let closure_ty = closure_instance.ty(tcx, typing_env);
     let TyKind::Closure(_, closure_args) = closure_ty.kind() else {
@@ -31,21 +30,15 @@ pub(crate) fn ensure_closure_fn_pointer_adapter_class<'tcx>(
     let target_owner = target.class_to_call_on.expect("closure has a JVM owner");
     let target_method = target.method_name;
     let descriptor = signature.to_jvm_descriptor_with_explicit_params();
-    let target_name = format!("{target_owner}::{target_method}");
-    let identity = format!("{target_name}:{descriptor}");
-    let base_name = jvm_names::path_segment(&target_method);
-    let interface_token = interface_name.rsplit('/').next().unwrap_or(interface_name);
-    let local_name = crate::stable_hash::readable_or_hashed_name(
-        "ClosureFnPtrImpl",
-        &format!("{base_name}_{interface_token}"),
-        &identity,
-        180,
+    let method_name = format!(
+        "_fp${}",
+        crate::stable_hash::short_hash(&format!("{target_method}:{descriptor}"), 16)
     );
-    let class_name = jvm_names::synthetic_class_for_instance(tcx, instance_context, local_name);
-
-    let mut method_params = Vec::with_capacity(signature.params.len() + 1);
-    method_params.push(("self".to_string(), oomir::Type::Class(class_name.clone())));
-    method_params.extend(signature.params.iter().cloned());
+    if matches!(data_types.get(&target_owner), Some(oomir::DataType::Class { methods, .. } | oomir::DataType::Interface { methods, .. }) if methods.contains_key(&method_name))
+    {
+        return (target_owner, method_name);
+    }
+    let method_params = signature.params.clone();
 
     let tuple_dest = "_closure_args".to_string();
     let tuple_args = signature
@@ -56,7 +49,7 @@ pub(crate) fn ensure_closure_fn_pointer_adapter_class<'tcx>(
         .map(|(index, (_, ty))| {
             (
                 oomir::Operand::Variable {
-                    name: format!("_{}", index + 2),
+                    name: format!("_{}", index + 1),
                     ty: ty.clone(),
                 },
                 ty.clone(),
@@ -65,15 +58,15 @@ pub(crate) fn ensure_closure_fn_pointer_adapter_class<'tcx>(
         .collect::<Vec<_>>();
     let mut instructions = Vec::new();
     let closure_call_args = if tuple_oomir_ty.has_jvm_value() {
-        let tuple_class = tuple_oomir_ty
-            .get_class_name()
-            .expect("non-unit closure argument tuple is represented by a JVM class")
-            .to_string();
-        instructions.push(oomir::Instruction::ConstructObject {
-            dest: tuple_dest.clone(),
-            class_name: tuple_class,
-            args: tuple_args,
-        });
+        crate::lower1::types::tuple_value(
+            tuple_ty,
+            tuple_args,
+            &tuple_dest,
+            tcx,
+            data_types,
+            instance_context,
+            &mut instructions,
+        );
         vec![oomir::Operand::Variable {
             name: tuple_dest,
             ty: tuple_oomir_ty.clone(),
@@ -90,7 +83,7 @@ pub(crate) fn ensure_closure_fn_pointer_adapter_class<'tcx>(
     let call_dest = signature.ret.has_jvm_value().then(|| "_ret".to_string());
     instructions.push(oomir::Instruction::InvokeRustStatic {
         dest: call_dest.clone(),
-        class_name: target_owner,
+        class_name: target_owner.clone(),
         method_name: target_method,
         method_ty: oomir::Signature {
             params: closure_method_params,
@@ -107,13 +100,13 @@ pub(crate) fn ensure_closure_fn_pointer_adapter_class<'tcx>(
     });
 
     let call_method = oomir::DataTypeMethod::Function(oomir::Function {
-        name: "call".to_string(),
+        name: method_name.clone(),
         owner_class: None,
         debug_variables: Vec::new(),
         signature: oomir::Signature {
             params: method_params,
             ret: signature.ret.clone(),
-            is_static: false,
+            is_static: true,
         },
         body: oomir::CodeBlock {
             entry: "bb0".to_string(),
@@ -127,53 +120,21 @@ pub(crate) fn ensure_closure_fn_pointer_adapter_class<'tcx>(
         }
         .into(),
     });
-    let relative_method_name = format!("call{}", oomir::RELATIVE_POINTER_METHOD_SUFFIX);
-    let relative_call_method = signature.supports_relative_pointer_abi().then(|| {
-        let oomir::DataTypeMethod::Function(mut function) = call_method.clone() else {
-            unreachable!("closure function-pointer adapters are OOMIR functions");
-        };
-        function.name = relative_method_name.clone();
-        oomir::DataTypeMethod::Function(function)
-    });
 
-    match data_types.get_mut(&class_name) {
-        Some(oomir::DataType::Class {
-            methods,
-            interfaces,
-            ..
-        }) => {
-            methods.entry("call".to_string()).or_insert(call_method);
-            if let Some(relative_call_method) = relative_call_method {
-                methods
-                    .entry(relative_method_name)
-                    .or_insert(relative_call_method);
-            }
-            if !interfaces.iter().any(|name| name == interface_name) {
-                interfaces.push(interface_name.to_string());
-            }
-        }
-        Some(oomir::DataType::Interface { .. }) => {
-            panic!("closure function-pointer adapter name collided with an interface")
-        }
-        None => {
-            let mut methods = HashMap::from_iter([("call".to_string(), call_method)]);
-            if let Some(relative_call_method) = relative_call_method {
-                methods.insert(relative_method_name, relative_call_method);
-            }
-            data_types.insert(
-                class_name.clone(),
-                oomir::DataType::Class {
-                    fields: Vec::new(),
-                    is_abstract: false,
-                    methods,
-                    super_class: Some("java/lang/Object".to_string()),
-                    interfaces: vec![interface_name.to_string()],
-                },
-            );
-        }
-    }
-
-    class_name
+    let entry = data_types
+        .entry(target_owner.clone())
+        .or_insert_with(|| oomir::DataType::Class {
+            fields: Vec::new(),
+            kind: oomir::ClassKind::Static,
+            is_abstract: false,
+            methods: HashMap::default(),
+            super_class: None,
+            interfaces: Vec::new(),
+        });
+    let (oomir::DataType::Class { methods, .. } | oomir::DataType::Interface { methods, .. }) =
+        entry;
+    methods.entry(method_name.clone()).or_insert(call_method);
+    (target_owner, method_name)
 }
 
 pub(super) fn ensure_non_capturing_closure_fn_pointer_bridge<'tcx>(
@@ -192,142 +153,56 @@ pub(super) fn ensure_non_capturing_closure_fn_pointer_bridge<'tcx>(
         closure_args.as_closure().upvar_tys().is_empty(),
         "only non-capturing closures can become function pointers"
     );
-    let oomir::Type::Class(closure_class) =
-        ty_to_oomir_type(closure_ty, tcx, data_types, instance_context)
-    else {
-        panic!("closure type did not lower to a JVM class");
+    let target = data_types.function_name(tcx, closure_instance);
+    let owner = target
+        .class_to_call_on
+        .clone()
+        .expect("closure has a JVM owner");
+    let method_name = target.method_name.clone();
+    let entry = data_types
+        .entry(owner.clone())
+        .or_insert_with(|| oomir::DataType::Class {
+            fields: Vec::new(),
+            kind: oomir::ClassKind::Static,
+            is_abstract: false,
+            methods: HashMap::default(),
+            super_class: Some("java/lang/Object".to_string()),
+            interfaces: Vec::new(),
+        });
+    let oomir::DataType::Class { methods, .. } = entry else {
+        panic!("closure implementation holder must be a class");
     };
-    let method_name = "_fn_ptr_call".to_string();
-    let already_defined = matches!(
-        data_types.get(&closure_class),
-        Some(oomir::DataType::Class { methods, .. }) if methods.contains_key(&method_name)
-    );
-    if already_defined {
-        return (closure_class, method_name);
-    }
-
-    // Optimised MIR can remove the standalone closure mono item when its only
-    // use is this coercion. Keep the implementation alongside the bridge in
-    // the closure's existing class so the LambdaMetafactory target never
-    // depends on that separate reachability decision.
-    let implementation_method_name = "_fn_ptr_impl".to_string();
-    let implementation_already_defined = matches!(
-        data_types.get(&closure_class),
-        Some(oomir::DataType::Class { methods, .. })
-            if methods.contains_key(&implementation_method_name)
-    );
-    if !implementation_already_defined {
-        let closure_mir = tcx.instance_mir(closure_instance.def);
+    // MIR can omit a closure mono item used only by coercion. The adapter still requires its
+    // canonical static body.
+    if !methods.contains_key(&method_name) {
         let implementation = crate::lower1::mir_to_oomir(
             tcx,
             closure_instance,
-            closure_mir,
-            Some(crate::lower1::naming::FnNameData {
-                class_to_call_on: Some(closure_class.clone()),
-                method_name: implementation_method_name.clone(),
-            }),
+            tcx.instance_mir(closure_instance.def),
+            Some(target),
             true,
             data_types,
             external_interfaces,
         );
-        let Some(oomir::DataType::Class { methods, .. }) = data_types.get_mut(&closure_class)
-        else {
-            panic!("closure class disappeared while adding its function-pointer implementation");
+        let Some(oomir::DataType::Class { methods, .. }) = data_types.get_mut(&owner) else {
+            unreachable!("closure implementation holder disappeared");
         };
-        methods.insert(
-            implementation_method_name.clone(),
-            DataTypeMethod::Function(implementation),
-        );
+        methods.insert(method_name, DataTypeMethod::Function(implementation));
     }
-
-    let closure_sig = tcx.instantiate_bound_regions_with_erased(closure_args.as_closure().sig());
-    let tuple_ty = *closure_sig
-        .inputs()
-        .first()
-        .expect("closure call ABI always has a tuple argument");
-    let tuple_oomir_ty = ty_to_oomir_type(tuple_ty, tcx, data_types, instance_context);
-    let mut instructions = Vec::new();
-    let closure_args = if tuple_oomir_ty.has_jvm_value() {
-        let tuple_dest = "_closure_args".to_string();
-        instructions.push(oomir::Instruction::ConstructObject {
-            dest: tuple_dest.clone(),
-            class_name: tuple_oomir_ty
-                .get_class_name()
-                .expect("non-unit closure tuple is represented by a JVM class")
-                .to_string(),
-            args: signature
-                .params
-                .iter()
-                .enumerate()
-                .map(|(index, (_, ty))| {
-                    (
-                        oomir::Operand::Variable {
-                            name: format!("_{}", index + 1),
-                            ty: ty.clone(),
-                        },
-                        ty.clone(),
-                    )
-                })
-                .collect(),
-        });
-        vec![oomir::Operand::Variable {
-            name: tuple_dest,
-            ty: tuple_oomir_ty.clone(),
-        }]
-    } else {
-        Vec::new()
-    };
-    let call_dest = signature.ret.has_jvm_value().then(|| "_ret".to_string());
-    instructions.push(oomir::Instruction::InvokeStatic {
-        dest: call_dest.clone(),
-        class_name: closure_class.clone(),
-        method_name: implementation_method_name,
-        method_ty: oomir::Signature {
-            params: tuple_oomir_ty
-                .has_jvm_value()
-                .then(|| ("args".to_string(), tuple_oomir_ty))
-                .into_iter()
-                .collect(),
-            ret: signature.ret.clone(),
-            is_static: true,
-        },
-        args: closure_args,
-    });
-    instructions.push(oomir::Instruction::Return {
-        operand: call_dest.map(|name| oomir::Operand::Variable {
-            name,
-            ty: signature.ret.as_ref().clone(),
-        }),
-    });
-    let bridge = DataTypeMethod::Function(oomir::Function {
-        name: method_name.clone(),
-        owner_class: None,
-        signature: signature.clone(),
-        debug_variables: Vec::new(),
-        body: oomir::CodeBlock {
-            entry: "bb0".to_string(),
-            basic_blocks: HashMap::from_iter([(
-                "bb0".to_string(),
-                oomir::BasicBlock {
-                    label: "bb0".to_string(),
-                    instructions,
-                },
-            )]),
-        }
-        .into(),
-    });
-    let Some(oomir::DataType::Class { methods, .. }) = data_types.get_mut(&closure_class) else {
-        panic!("closure class disappeared while adding its function-pointer bridge");
-    };
-    methods.insert(method_name.clone(), bridge);
-    (closure_class, method_name)
+    ensure_closure_fn_pointer_bridge(
+        data_types,
+        closure_instance,
+        signature,
+        tcx,
+        instance_context,
+    )
 }
 
 /// Makes a concrete Rust closure directly implement the primitive-specialized
 /// JVM SAM used by `dyn Fn*`.  The bridge rebuilds Rust's tuple call argument
 /// and, for a capturing closure, supplies the address-like environment carrier
 /// expected by the lowered closure body.
-pub(super) fn ensure_closure_callable_bridge<'tcx>(
+pub(crate) fn ensure_closure_callable_bridge<'tcx>(
     closure_ty: rustc_middle::ty::Ty<'tcx>,
     callable_abi: &crate::lower1::types::CallableTraitObjectAbi<'tcx>,
     data_types: &mut Definitions<'tcx>,
@@ -361,10 +236,6 @@ pub(super) fn ensure_closure_callable_bridge<'tcx>(
     let mut instructions = Vec::new();
     let tuple_dest = "_closure_args".to_string();
     let tuple_call_arg = if tuple_oomir_ty.has_jvm_value() {
-        let tuple_class = tuple_oomir_ty
-            .get_class_name()
-            .expect("non-unit closure argument tuple is represented by a JVM class")
-            .to_string();
         let tuple_args = callable_abi
             .signature
             .params
@@ -380,11 +251,15 @@ pub(super) fn ensure_closure_callable_bridge<'tcx>(
                 )
             })
             .collect();
-        instructions.push(oomir::Instruction::ConstructObject {
-            dest: tuple_dest.clone(),
-            class_name: tuple_class,
-            args: tuple_args,
-        });
+        crate::lower1::types::tuple_value(
+            callable_abi.tuple_ty,
+            tuple_args,
+            &tuple_dest,
+            tcx,
+            data_types,
+            instance_context,
+            &mut instructions,
+        );
         Some(oomir::Operand::Variable {
             name: tuple_dest,
             ty: tuple_oomir_ty.clone(),
@@ -530,44 +405,14 @@ pub(super) fn ensure_closure_callable_bridge<'tcx>(
     {
         interfaces.push(callable_abi.interface_name.clone());
     }
+    crate::lower1::types::ensure_drop_callback(
+        closure_ty,
+        &closure_class,
+        tcx,
+        data_types,
+        instance_context,
+    );
     true
-}
-
-pub(super) fn closure_callable_abi<'tcx>(
-    closure_ty: Ty<'tcx>,
-    tcx: TyCtxt<'tcx>,
-    data_types: &mut Definitions<'tcx>,
-    instance: Instance<'tcx>,
-) -> Option<crate::lower1::types::CallableTraitObjectAbi<'tcx>> {
-    let closure_ty = normalize_unsize_ty(closure_ty, tcx, instance);
-    let TyKind::Closure(_, closure_args) = closure_ty.kind() else {
-        return None;
-    };
-    let closure_signature = tcx.instantiate_bound_regions_with_erased(closure_args.as_closure().sig());
-    let tuple_ty = *closure_signature.inputs().first()?;
-    let TyKind::Tuple(tuple_elements) = tuple_ty.kind() else {
-        return None;
-    };
-    let params = tuple_elements
-        .iter()
-        .enumerate()
-        .filter_map(|(index, element_ty)| {
-            let ty = ty_to_oomir_type(element_ty, tcx, data_types, instance);
-            ty.has_jvm_value().then(|| (format!("arg{index}"), ty))
-        })
-        .collect();
-    let output_ty = closure_signature.output();
-    let signature = oomir::Signature {
-        params,
-        ret: Box::new(ty_to_oomir_type(output_ty, tcx, data_types, instance)),
-        is_static: true,
-    };
-    let interface_name = ensure_fn_ptr_interface(&signature, data_types, tcx, instance);
-    Some(crate::lower1::types::CallableTraitObjectAbi {
-        tuple_ty,
-        signature,
-        interface_name,
-    })
 }
 
 pub(super) fn ensure_erased_receiver_fn_pointer_bridge<'tcx>(
@@ -862,6 +707,7 @@ pub(super) fn ensure_erased_receiver_fn_pointer_bridge<'tcx>(
                 "function".into(),
                 oomir::Type::Interface(source_interface.into()),
             )],
+            kind: crate::oomir::ClassKind::Value,
             is_abstract: false,
             methods: HashMap::from_iter([
                 ("call".into(), call_method),

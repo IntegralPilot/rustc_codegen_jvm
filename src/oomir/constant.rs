@@ -13,6 +13,13 @@ pub enum Constant {
         adapter_class: String,
         interface_name: String,
     },
+    FunctionHandle {
+        interface_name: String,
+        owner: String,
+        name: String,
+        descriptor: String,
+        interface: bool,
+    },
     /// A lower2-generated call to a private factory method. Large static object
     /// graphs use these to stay within the JVM's per-method bytecode limit.
     FactoryCall {
@@ -94,7 +101,10 @@ pub enum Constant {
     Boolean(bool),
     Char(char),
     Str(String),
+    /// Compiler-controlled class, method or descriptor used by reflection.
     String(String),
+    /// Java text with no method/class naming semantics (including field names).
+    LiteralString(String),
     // 0 = the type of elements, 1 = the elements as a vec of constants
     Array(Box<Type>, Vec<Constant>),
     Slice(Box<Type>, Vec<Constant>),
@@ -140,6 +150,15 @@ impl std::hash::Hash for Constant {
             } => {
                 adapter_class.hash(state);
                 interface_name.hash(state);
+            }
+            Constant::FunctionHandle {
+                interface_name,
+                owner,
+                name,
+                descriptor,
+                interface,
+            } => {
+                (interface_name, owner, name, descriptor, interface).hash(state);
             }
             Constant::FactoryCall {
                 owner_class,
@@ -248,7 +267,7 @@ impl std::hash::Hash for Constant {
             Constant::Boolean(b) => b.hash(state),
             Constant::Char(c) => c.hash(state),
             Constant::Str(s) => s.hash(state),
-            Constant::String(s) => s.hash(state),
+            Constant::String(s) | Constant::LiteralString(s) => s.hash(state),
             Constant::Array(ty, elements) => {
                 ty.hash(state);
                 elements.hash(state);

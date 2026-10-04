@@ -212,11 +212,15 @@ impl Remap for Extract<'_> {
             return id;
         }
         let mut constant = self.source.ir.constants[id.index()];
-        if let Constant::External { index, ty } = constant {
+        if let Constant::External { index, ty, pure } = constant {
             let next = self.constants.len() as u32;
             self.constants
                 .push(self.source.constants[index as usize].clone());
-            constant = Constant::External { index: next, ty };
+            constant = Constant::External {
+                index: next,
+                ty,
+                pure,
+            };
         }
         let next = ConstId::new(self.b.body.constants.len());
         self.b.body.constants.push(constant);
@@ -237,6 +241,7 @@ impl Remap for Extract<'_> {
     }
     fn projection(&mut self, id: ProjectionId) -> ProjectionId {
         let mut projection = self.source.ir.projections[id.index()].clone();
+        projection.parent = projection.parent.map(|parent| self.projection(parent));
         projection.field = self.field(projection.field);
         self.b.projection(projection)
     }

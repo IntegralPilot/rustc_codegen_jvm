@@ -186,7 +186,7 @@ pub(crate) fn fn_pointer_target<'tcx>(
     }
     let (_, receiver_ty) = signature.params.first()?;
     let (receiver_ty, indirect_receiver) = match receiver_ty {
-        oomir::Type::Pointer(inner) | oomir::Type::Reference(inner) => (inner.as_ref(), true),
+        oomir::Type::Pointer(oomir::Pointee { value: inner, .. }) => (inner.as_ref(), true),
         other => (other, false),
     };
     let mut method_signature = signature.clone();
@@ -464,14 +464,7 @@ pub(crate) fn ensure_fn_pointer_adapter_class<'tcx>(
         }
         .into(),
     });
-    let relative_method_name = format!("call{}", oomir::RELATIVE_POINTER_METHOD_SUFFIX);
-    let relative_call_method = signature.supports_relative_pointer_abi().then(|| {
-        let oomir::DataTypeMethod::Function(mut function) = call_method.clone() else {
-            unreachable!("function-pointer adapters are OOMIR functions");
-        };
-        function.name = relative_method_name.clone();
-        oomir::DataTypeMethod::Function(function)
-    });
+
     let code_identity = match target_function {
         Some(FnPointerTarget::Static(_) | FnPointerTarget::ImportedStatic(_)) => identity,
         _ => format!("{class_name}::call:{descriptor}"),
@@ -513,11 +506,7 @@ pub(crate) fn ensure_fn_pointer_adapter_class<'tcx>(
                 interfaces.push(identity_interface);
             }
             methods.entry("call".to_string()).or_insert(call_method);
-            if let Some(relative_call_method) = relative_call_method {
-                methods
-                    .entry(relative_method_name)
-                    .or_insert(relative_call_method);
-            }
+
             if !interfaces
                 .iter()
                 .any(|interface| interface == interface_name)
@@ -536,17 +525,16 @@ pub(crate) fn ensure_fn_pointer_adapter_class<'tcx>(
             );
         }
         None => {
-            let mut methods = HashMap::from_iter([
+            let methods = HashMap::from_iter([
                 ("call".to_string(), call_method),
                 ("functionPointerIdentity".into(), identity_method),
             ]);
-            if let Some(relative_call_method) = relative_call_method {
-                methods.insert(relative_method_name, relative_call_method);
-            }
+
             data_types.insert(
                 class_name.clone(),
                 oomir::DataType::Class {
                     fields: vec![],
+                    kind: crate::oomir::ClassKind::Value,
                     is_abstract: false,
                     methods,
                     super_class: Some("java/lang/Object".to_string()),

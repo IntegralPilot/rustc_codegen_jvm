@@ -15,7 +15,8 @@ use rustc_span::def_id::LOCAL_CRATE;
 
 use super::super::{
     control_flow::rvalue::{
-        ensure_closure_fn_pointer_adapter_class, ensure_fn_pointer_adapter_class, fn_pointer_target,
+        FnPointerTarget, callable_handle, ensure_closure_fn_pointer_bridge,
+        ensure_fn_pointer_adapter_class, fn_pointer_target,
     },
     control_flow::trait_objects::ensure_trait_object_adapter_class_for_pointees,
     jvm_names, ty_to_oomir_type,
@@ -138,40 +139,49 @@ pub fn read_pointer_constant<'tcx>(
                 )
             }
         }
-        _ => {
-            let layout = tcx
-                .layout_of(TypingEnv::fully_monomorphized().as_query_input(ty))
-                .map_err(|error| format!("Could not determine scalar constant layout: {error:?}"))?;
-            if !matches!(layout.backend_repr, BackendRepr::Scalar(_))
-                || layout.size != tcx.data_layout.pointer_size()
-            {
-                return Err(format!("Unexpected pointer scalar for constant type {ty:?}"));
-            }
-            // This pointer is the aggregate's contents, not its address. Put
-            // the scalar in temporary storage so the normal decoder preserves
-            // enum niches, field types, and function-pointer provenance.
-            let mut allocation =
-                ConstAllocation::new(layout.size, layout.align.abi, AllocInit::Uninit, ());
-            allocation
-                .write_scalar(
-                    &tcx.data_layout,
-                    AllocRange {
-                        start: Size::ZERO,
-                        size: layout.size,
-                    },
-                    Scalar::from_pointer(pointer, &tcx.data_layout),
-                )
-                .map_err(|error| format!("Could not store pointer scalar: {error:?}"))?;
-            read_constant_value_from_memory(
-                tcx,
-                &allocation,
-                Size::ZERO,
-                ty,
-                oomir_data_types,
-                instance,
-            )
-        }
+        _ => read_scalar_aggregate_constant(
+            tcx,
+            Scalar::from_pointer(pointer, &tcx.data_layout),
+            ty,
+            oomir_data_types,
+            instance,
+        ),
     }
+}
+
+fn read_scalar_aggregate_constant<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    scalar: Scalar,
+    ty: Ty<'tcx>,
+    data_types: &mut Definitions<'tcx>,
+    instance: Instance<'tcx>,
+) -> Result<oomir::Constant, String> {
+    let layout = tcx
+        .layout_of(TypingEnv::fully_monomorphized().as_query_input(ty))
+        .map_err(|error| format!("Could not determine scalar constant layout: {error:?}"))?;
+    let size = match scalar {
+        Scalar::Int(value) => value.size(),
+        Scalar::Ptr(..) => tcx.data_layout.pointer_size(),
+    };
+    if !matches!(layout.backend_repr, BackendRepr::Scalar(_)) || layout.size != size {
+        return Err(format!(
+            "Unexpected {size:?} scalar for constant type {ty:?}"
+        ));
+    }
+    // The scalar contains aggregate data. The decoder requires storage to recover fields, enum
+    // niches, and pointer provenance.
+    let mut allocation = ConstAllocation::new(layout.size, layout.align.abi, AllocInit::Uninit, ());
+    allocation
+        .write_scalar(
+            &tcx.data_layout,
+            AllocRange {
+                start: Size::ZERO,
+                size,
+            },
+            scalar,
+        )
+        .map_err(|error| format!("Could not store aggregate scalar: {error:?}"))?;
+    read_constant_value_from_memory(tcx, &allocation, Size::ZERO, ty, data_types, instance)
 }
 
 fn pointer_references_static(tcx: TyCtxt<'_>, pointer: Pointer<CtfeProvenance>) -> bool {
@@ -525,27 +535,47 @@ fn read_function_pointer_constant<'tcx>(
         _ => None,
     };
 
-    let adapter_class = if let Some(closure_instance) = closure_instance {
-        ensure_closure_fn_pointer_adapter_class(
+    if let Some(closure_instance) = closure_instance {
+        let (owner, name) = ensure_closure_fn_pointer_bridge(
             oomir_data_types,
             closure_instance,
             &signature,
-            &interface_name,
             tcx,
             instance,
-        )
-    } else {
-        let callable_target =
-            fn_pointer_target(tcx, oomir_data_types, function_instance, &signature);
-        ensure_fn_pointer_adapter_class(
-            oomir_data_types,
-            callable_target.as_ref(),
+        );
+        return Ok(callable_handle(
             &signature,
             &interface_name,
-            tcx,
-            instance,
-        )
-    };
+            owner,
+            name,
+            false,
+        ));
+    }
+    let target = fn_pointer_target(tcx, oomir_data_types, function_instance, &signature);
+    if let Some(FnPointerTarget::Static(target) | FnPointerTarget::ImportedStatic(target)) = &target
+    {
+        if let Some(owner) = &target.class_to_call_on
+            && (!signature.needs_component_abi()
+                || oomir::component_method(owner, &target.method_name))
+        {
+            let is_interface = oomir_data_types.foreign_interfaces.borrow().contains(owner);
+            return Ok(callable_handle(
+                &signature,
+                &interface_name,
+                owner.clone(),
+                target.method_name.clone(),
+                is_interface,
+            ));
+        }
+    }
+    let adapter_class = ensure_fn_pointer_adapter_class(
+        oomir_data_types,
+        target.as_ref(),
+        &signature,
+        &interface_name,
+        tcx,
+        instance,
+    );
 
     Ok(oomir::Constant::FunctionPointer {
         adapter_class,
@@ -713,7 +743,7 @@ fn read_pointee_constant<'tcx>(
                 .layout_of(TypingEnv::fully_monomorphized().as_query_input(concrete_ty))
                 .map_err(|error| format!("Could not determine vtable layout: {error:?}"))?;
             let concrete_oomir_ty = ty_to_oomir_type(concrete_ty, tcx, oomir_data_types, instance);
-            let pointer_oomir_ty = oomir::Type::Pointer(Box::new(concrete_oomir_ty));
+            let pointer_oomir_ty = oomir::Type::pointer(concrete_oomir_ty);
             let oomir::Type::Interface(interface_name) =
                 ty_to_oomir_type(dyn_ty, tcx, oomir_data_types, instance)
             else {
@@ -750,12 +780,12 @@ fn read_pointee_constant<'tcx>(
                     pointee_codec,
                 ],
                 param_types: Vec::new(),
-                ty: oomir::Type::Pointer(Box::new(ty_to_oomir_type(
+                ty: oomir::Type::pointer(ty_to_oomir_type(
                     pointee_ty,
                     tcx,
                     oomir_data_types,
                     instance,
-                ))),
+                )),
             })
         }
         GlobalAlloc::TypeId { ty } => Err(format!("Unsupported constant pointer to TypeId {ty:?}")),

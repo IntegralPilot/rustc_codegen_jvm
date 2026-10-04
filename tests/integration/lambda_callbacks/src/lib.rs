@@ -1,3 +1,7 @@
+#![feature(custom_inner_attributes)]
+#![feature(register_tool)]
+#![register_tool(jvm_codegen)]
+#![jvm_codegen::export]
 pub fn apply_i32(callback: &dyn Fn(i32) -> i32, value: i32) -> i32 {
     callback(value)
 }
@@ -46,6 +50,10 @@ pub fn call_unit(callback: &dyn Fn(()) -> ()) {
 pub fn rust_closure_test(value: i32) -> i32 {
     let offset = 2;
     apply_i32(&|input| input * 4 + offset, value)
+}
+
+pub fn rust_capturing_closure(offset: i32) -> impl Fn(i32) -> i32 {
+    move |value| value + offset
 }
 
 pub fn rust_fn_mut_test(value: i32) -> i32 {

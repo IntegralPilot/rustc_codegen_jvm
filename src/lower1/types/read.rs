@@ -12,6 +12,61 @@ pub(super) fn emit_ty_from_union_bytes<'tcx>(
     temp_counter: &mut usize,
 ) -> Result<oomir::Operand, String> {
     let ty = resolve_union_ty(tcx, ty, instance_context)?;
+    if let Some(layout) = tagged_scalar(ty, tcx) {
+        let tag = emit_ty_from_union_bytes(
+            tcx.types.u64,
+            storage,
+            base_offset + layout.tag_offset,
+            tcx,
+            data_types,
+            instance_context,
+            instructions,
+            temp_counter,
+        )?;
+        let value = emit_ty_from_union_bytes(
+            layout.payload,
+            storage,
+            base_offset + layout.payload_offset,
+            tcx,
+            data_types,
+            instance_context,
+            instructions,
+            temp_counter,
+        )?;
+        let dest = next_union_temp("tagged", temp_counter);
+        instructions.push(oomir::Instruction::TaggedPack {
+            dest: dest.clone(),
+            value,
+            tag,
+        });
+        return Ok(operand_var(dest, oomir::Type::TaggedI64));
+    }
+    if let Some(scalar) = value_scalar_ty(ty, tcx) {
+        return emit_ty_from_union_bytes(
+            scalar,
+            storage,
+            base_offset,
+            tcx,
+            data_types,
+            instance_context,
+            instructions,
+            temp_counter,
+        );
+    }
+    if let Some(payload) =
+        direct_enum_payload(ty, tcx).or_else(|| transparent_payload(ty, tcx).map(|p| p.ty))
+    {
+        return emit_ty_from_union_bytes(
+            payload,
+            storage,
+            base_offset,
+            tcx,
+            data_types,
+            instance_context,
+            instructions,
+            temp_counter,
+        );
+    }
     if layout_size_bytes(tcx, ty)? == 0 {
         let jvm_ty = ty_to_oomir_type(ty, tcx, data_types, instance_context);
         if !jvm_ty.has_jvm_value() {
@@ -139,8 +194,8 @@ pub(super) fn emit_ty_from_union_bytes<'tcx>(
         let decoded = next_union_temp("nested_coroutine_value", temp_counter);
         instructions.push(oomir::Instruction::InvokeStatic {
             dest: Some(decoded.clone()),
-            class_name: codec.class_name,
-            method_name: "decode".to_string(),
+            class_name: codec.owner().to_owned(),
+            method_name: codec.method("decode"),
             method_ty: oomir::Signature {
                 params: vec![("bytes".to_string(), byte_array_type())],
                 ret: Box::new(value_ty.clone()),
@@ -174,7 +229,7 @@ pub(super) fn emit_ty_from_union_bytes<'tcx>(
                 .ok_or_else(|| format!("array length is not concrete for {inner:?}"))?;
             let element_oomir_ty = ty_to_oomir_type(*element, tcx, data_types, instance_context);
             let slice_ty = oomir::Type::Slice(Box::new(element_oomir_ty.clone()));
-            let pointer_ty = oomir::Type::Pointer(Box::new(element_oomir_ty));
+            let pointer_ty = oomir::Type::pointer(element_oomir_ty);
             let address = emit_bits_from_union_bytes(
                 oomir::Type::U64,
                 layout_size_bytes(tcx, ty)?,
@@ -393,7 +448,7 @@ pub(super) fn emit_ty_from_union_bytes<'tcx>(
             let oomir::Type::Class(enum_class) = &enum_oomir_ty else {
                 return Err(format!("enum {ty:?} did not map to a JVM class"));
             };
-            ensure_enum_union_codec(
+            let codec = ensure_enum_union_codec(
                 adt_def,
                 substs,
                 ty,
@@ -406,8 +461,8 @@ pub(super) fn emit_ty_from_union_bytes<'tcx>(
             let offset = storage.byte_index(base_offset, instructions, temp_counter);
             instructions.push(oomir::Instruction::InvokeStatic {
                 dest: Some(enum_dest.clone()),
-                class_name: enum_class.clone(),
-                method_name: ENUM_READ_UNION_STORAGE_METHOD.to_string(),
+                class_name: codec.owner,
+                method_name: codec.reader,
                 method_ty: enum_union_read_signature(enum_class),
                 args: vec![
                     operand_var(storage.bytes_var.clone(), byte_array_type()),

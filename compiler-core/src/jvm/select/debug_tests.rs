@@ -46,6 +46,15 @@ fn debug_mirrors_keep_dead_values_and_hide_uninitialized_join_bindings() {
             value: seven,
         },
     );
+    // Keep executable work after initializing the conditional binding.
+    // An empty edge has no bytecode range for its debug information.
+    debug.push(
+        &b,
+        DebugChange::Set {
+            local: 1,
+            value: parameter,
+        },
+    );
     b.jump(join, vec![]);
     b.switch_to(join);
     debug.push(&b, DebugChange::Scope(0));

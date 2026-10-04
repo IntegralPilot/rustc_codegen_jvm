@@ -106,6 +106,7 @@ pub(crate) fn readable_oomir_type_name(t: &oomir::Type) -> String {
         Type::F32 => "f32".to_string(),
         Type::F64 => "f64".to_string(),
         Type::Str => "Str".to_string(),
+        Type::TaggedI64 => "TaggedI64".to_string(),
         Type::Void => "Void".to_string(),
         Type::Unit => "Unit".to_string(),
         Type::Class(name) => {
@@ -115,8 +116,6 @@ pub(crate) fn readable_oomir_type_name(t: &oomir::Type) -> String {
         Type::Array(inner) => format!("{}Array", readable_oomir_type_name(inner)),
         Type::Slice(inner) => format!("{}Slice", readable_oomir_type_name(inner)),
         Type::Pointer(inner) => format!("Ptr{}", readable_oomir_type_name(inner)),
-        Type::Reference(inner) => format!("Ref{}", readable_oomir_type_name(inner)),
-        Type::MutableReference(inner) => format!("Ref{}", readable_oomir_type_name(inner)),
         Type::Interface(name) => {
             // prefix interfaces with I to avoid conflicts with classes
             let seg = name.rsplit('/').next().unwrap_or(name);
@@ -133,9 +132,6 @@ pub(super) fn readable_tuple_abi_type_name(t: &oomir::Type) -> String {
         Type::Array(inner) => format!("{}Array", readable_tuple_abi_type_name(inner)),
         Type::Slice(inner) => format!("{}Slice", readable_tuple_abi_type_name(inner)),
         Type::Pointer(inner) => format!("Ptr{}", readable_tuple_abi_type_name(inner)),
-        Type::Reference(inner) | Type::MutableReference(inner) => {
-            format!("Ref{}", readable_tuple_abi_type_name(inner))
-        }
         _ => readable_oomir_type_name(t),
     }
 }
@@ -305,121 +301,6 @@ pub(crate) fn readable_rust_type_name<'tcx>(
     }
 }
 
-pub(super) fn readable_pointer_codec_type_name<'tcx>(
-    ty: Ty<'tcx>,
-    tcx: TyCtxt<'tcx>,
-    data_types: &mut Definitions<'tcx>,
-    instance_context: rustc_middle::ty::Instance<'tcx>,
-) -> String {
-    if let Some(name) = primitive_rust_type_name(ty) {
-        return name.to_owned();
-    }
-    let instantiated = EarlyBinder::bind(tcx, ty).instantiate(tcx, instance_context.args);
-    let ty = tcx
-        .try_normalize_erasing_regions(TypingEnv::fully_monomorphized(), instantiated)
-        .unwrap_or_else(|_| instantiated.skip_norm_wip());
-    match ty.kind() {
-        TyKind::Ref(_, inner, mutability) => format!(
-            "{}_to_{}",
-            if mutability.is_mut() { "MutRef" } else { "Ref" },
-            readable_pointer_codec_type_name(*inner, tcx, data_types, instance_context)
-        ),
-        TyKind::RawPtr(inner, mutability) => format!(
-            "{}_to_{}",
-            if mutability.is_mut() {
-                "MutPtr"
-            } else {
-                "ConstPtr"
-            },
-            readable_pointer_codec_type_name(*inner, tcx, data_types, instance_context)
-        ),
-        TyKind::Array(inner, length) => {
-            let length = length
-                .try_to_target_usize(tcx)
-                .map(|length| length.to_string())
-                .unwrap_or_else(|| "Unknown".to_string());
-            format!(
-                "Array{}_of_{}",
-                length,
-                readable_pointer_codec_type_name(*inner, tcx, data_types, instance_context)
-            )
-        }
-        TyKind::Slice(inner) => format!(
-            "Slice_of_{}",
-            readable_pointer_codec_type_name(*inner, tcx, data_types, instance_context)
-        ),
-        TyKind::Tuple(elements) if elements.is_empty() => "Unit".to_string(),
-        TyKind::Tuple(elements) => format!(
-            "Tuple_of_{}",
-            elements
-                .iter()
-                .map(|element| readable_pointer_codec_type_name(
-                    element,
-                    tcx,
-                    data_types,
-                    instance_context,
-                ))
-                .collect::<Vec<_>>()
-                .join("_and_")
-        ),
-        TyKind::Dynamic(predicates, _) => {
-            let base = readable_tuple_abi_type_name(&ty_to_oomir_type(
-                ty,
-                tcx,
-                data_types,
-                instance_context,
-            ));
-            let auto_traits = predicates
-                .iter()
-                .filter_map(|predicate| match predicate.skip_binder() {
-                    ExistentialPredicate::AutoTrait(def_id) => {
-                        Some(data_types.readable_class_name(tcx, def_id))
-                    }
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            if auto_traits.is_empty() {
-                base
-            } else {
-                format!("{}_and_{}", base, auto_traits.join("_and_"))
-            }
-        }
-        TyKind::Adt(adt_def, substs) => {
-            let base = data_types.readable_class_name(tcx, adt_def.did());
-            let args = substs
-                .iter()
-                .filter_map(|arg| {
-                    if let Some(arg_ty) = arg.as_type() {
-                        Some(readable_pointer_codec_type_name(
-                            arg_ty,
-                            tcx,
-                            data_types,
-                            instance_context,
-                        ))
-                    } else {
-                        arg.as_const().map(|constant| {
-                            format!(
-                                "Const_{}",
-                                readable_rust_const_name(constant, tcx, instance_context)
-                            )
-                        })
-                    }
-                })
-                .collect::<Vec<_>>();
-            if args.is_empty() {
-                base
-            } else {
-                format!("{}_of_{}", base, args.join("_and_"))
-            }
-        }
-        TyKind::FnDef(def_id, _) => readable_qualified_function_item_path(tcx, *def_id),
-        TyKind::Char => "char".to_string(),
-        TyKind::Int(IntTy::Isize) => "isize".to_string(),
-        TyKind::Uint(UintTy::Usize) => "usize".to_string(),
-        _ => readable_oomir_type_name(&ty_to_oomir_type(ty, tcx, data_types, instance_context)),
-    }
-}
-
 pub(super) fn readable_rust_const_name<'tcx>(
     constant: rustc_middle::ty::Const<'tcx>,
     tcx: TyCtxt<'tcx>,
@@ -478,8 +359,7 @@ pub(crate) fn sanitize_name_token(s: &str) -> String {
     }
 }
 
-/// Generate a JVM-safe ADT name, retaining raw tokens for the long-name hash.
-/// A token may recursively name a large generic type; calculate it only once.
+/// ADT names use stable Rust type identity.
 pub(crate) fn generate_adt_jvm_class_name<'tcx>(
     adt_def: &AdtDef<'tcx>,
     substs: GenericArgsRef<'tcx>,
@@ -488,87 +368,110 @@ pub(crate) fn generate_adt_jvm_class_name<'tcx>(
     instance_context: rustc_middle::ty::Instance<'tcx>,
 ) -> String {
     let base = data_types.class_name(tcx, adt_def.did());
-    let tokens = substs
+    if !substs
         .iter()
-        .filter_map(|arg| readable_rust_generic_arg_name(arg, tcx, data_types, instance_context))
-        .collect::<Vec<_>>();
-    let mut name = base.clone();
-    for token in &tokens {
-        name.push('_');
-        name.push_str(&sanitize_name_token(token));
+        .any(|arg| arg.as_type().is_some() || arg.as_const().is_some())
+    {
+        return base;
     }
-    if name.len() <= MAX_TUPLE_NAME_LEN {
-        return name;
-    }
-    let mut identity = base.clone();
-    identity.push('_');
-    for token in tokens {
-        identity.push_str(&token);
-        identity.push('_');
-    }
-    format!("{base}_{}", short_hash(&identity, 10))
+    let concrete = data_types.normalize(tcx, Ty::new_adt(tcx, *adt_def, substs), instance_context);
+    let identity = stable_type_identity(tcx, concrete);
+    format!("{base}_{identity}")
 }
 
-/// Generates a readable JVM class name for a tuple type. Rust types that share
-/// the same JVM field carriers (such as `usize` and `u64`) deliberately reuse a
-/// tuple class. A qualified stable hash is added only when the readable name is
-/// already occupied by an ABI-incompatible tuple, such as two unrelated enums
-/// both named `Ordering`.
+/// Tuple names use the complete field representation. Pointer<Array<U8>> and Array<Pointer<U8>>
+/// have the same readable token.
+fn tuple_carrier_name(fields: &[oomir::Type], unsized_tail: bool) -> String {
+    let prefix = if unsized_tail { "TupleDst" } else { "Tuple" };
+    let hash = crate::stable_hash::short_hash_value(&fields, 16);
+    let tokens = fields
+        .iter()
+        .map(|ty| sanitize_name_token(&readable_tuple_abi_type_name(ty)))
+        .collect::<Vec<_>>()
+        .join("_");
+    let readable = format!("org/rustlang/core/{prefix}_{tokens}_{hash}");
+    if readable.len() <= MAX_TUPLE_NAME_LEN {
+        readable
+    } else {
+        format!("org/rustlang/core/{prefix}_{hash}")
+    }
+}
+
+#[cfg(test)]
+mod tuple_names_tests {
+    use super::{MAX_TUPLE_NAME_LEN, readable_tuple_abi_type_name, tuple_carrier_name};
+    use crate::oomir::Type;
+
+    #[test]
+    fn nested_carriers_cannot_claim_each_others_upstream_tuple() {
+        let address = Type::pointer(Type::Array(Box::new(Type::U8)));
+        let array = Type::Array(Box::new(Type::pointer(Type::U8)));
+        assert_eq!(
+            readable_tuple_abi_type_name(&address),
+            readable_tuple_abi_type_name(&array)
+        );
+        let address_name = tuple_carrier_name(std::slice::from_ref(&address), false);
+        let array_name = tuple_carrier_name(&[array], false);
+        assert_ne!(address_name, array_name);
+    }
+
+    #[test]
+    fn tuple_identity_preserves_field_paths_and_address_layouts() {
+        let left = Type::Class("example/A_B".into());
+        let right = Type::Class("example_A/B".into());
+        assert_eq!(
+            readable_tuple_abi_type_name(&left),
+            readable_tuple_abi_type_name(&right)
+        );
+        assert_ne!(
+            tuple_carrier_name(&[left], false),
+            tuple_carrier_name(&[right], false)
+        );
+        let pointer = Type::pointer(Type::Array(Box::new(Type::U8)));
+        let four = pointer
+            .clone()
+            .with_address_layout(4, Some("array4".into()));
+        let eight = pointer.with_address_layout(8, Some("array8".into()));
+        assert_ne!(
+            tuple_carrier_name(&[four], false),
+            tuple_carrier_name(&[eight], false)
+        );
+    }
+
+    #[test]
+    fn identical_representations_share_bounded_names() {
+        let fields = [Type::U64, Type::Class("example/LongName".repeat(30))];
+        let name = tuple_carrier_name(&fields, false);
+        assert!(name.len() <= MAX_TUPLE_NAME_LEN);
+        assert_ne!(name, tuple_carrier_name(&fields, true));
+        assert_ne!(name, tuple_carrier_name(&fields[..1], false));
+    }
+}
+
+/// Equal OOMIR fields share a tuple class. Address layout remains part of the identity for field
+/// accessors.
 pub(crate) fn generate_tuple_jvm_class_name<'tcx>(
     element_tys: &[Ty<'tcx>],
     tcx: TyCtxt<'tcx>,
-    data_types: &mut Definitions<'tcx>, // Needed for recursive calls
+    data_types: &mut Definitions<'tcx>,
     instance_context: rustc_middle::ty::Instance<'tcx>,
 ) -> String {
-    // First attempt: build a human-readable name like `Tuple_i32_String`.
-    let mut tokens: Vec<String> = Vec::new();
-    let mut oomir_element_types = Vec::new();
-    for ty in element_tys {
-        let oomir_ty = ty_to_oomir_type(*ty, tcx, data_types, instance_context);
-        // Downstream monomorphizations have a fresh collision registry, so keep
-        // carrier paths in tuple names to prevent incompatible linker fragments.
-        let token = readable_tuple_abi_type_name(&oomir_ty);
-        tokens.push(sanitize_name_token(&token));
-        oomir_element_types.push(oomir_ty);
-    }
-
-    let readable_name = format!("org/rustlang/core/Tuple_{}", tokens.join("_"));
-    let local_incompatible_collision = match data_types.get(&readable_name) {
-        Some(oomir::DataType::Class { fields, .. }) => fields
-            .iter()
-            .map(|(_, field_ty)| field_ty)
-            .ne(oomir_element_types.iter()),
-        Some(_) => true,
-        None => false,
-    };
-
-    if readable_name.len() <= MAX_TUPLE_NAME_LEN {
-        let crate_incompatible_collision =
-            data_types.tuple_name_conflicts(&readable_name, &oomir_element_types);
-        if !local_incompatible_collision && !crate_incompatible_collision {
-            return readable_name;
-        }
-    }
-
-    let identity = element_tys
+    let fields = element_tys
         .iter()
-        .map(|ty| readable_rust_type_name(*ty, tcx, data_types, instance_context))
-        .collect::<Vec<_>>()
-        .join("_");
-    let hash = short_hash(&identity, 10);
-    let disambiguated = format!("{readable_name}_{hash}");
-    if disambiguated.len() <= MAX_TUPLE_NAME_LEN {
-        disambiguated
-    } else {
-        format!("org/rustlang/core/Tuple_{hash}")
-    }
+        .map(|ty| ty_to_oomir_type(*ty, tcx, data_types, instance_context))
+        .collect::<Vec<_>>();
+    let unsized_tail = element_tys.last().is_some_and(|ty| {
+        let ty = data_types.normalize(tcx, *ty, instance_context);
+        !is_codegen_sized(ty, tcx)
+    });
+    tuple_carrier_name(&fields, unsized_tail)
 }
 
 // Helper to get field name from index using DataType info
 pub(crate) fn get_field_name_from_index(
     owner_class_name: &str,
     index: usize,
-    data_types: &HashMap<String, oomir::DataType>,
+    data_types: &crate::lower1::context::Definitions<'_>,
 ) -> Result<String, String> {
     // Return Result for error handling
     data_types

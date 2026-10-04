@@ -1,4 +1,5 @@
 //! Rustc-independent IR and JVM compiler machinery.
+pub mod analysis;
 pub mod ir;
 pub mod scalar;
 

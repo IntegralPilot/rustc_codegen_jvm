@@ -5,6 +5,7 @@ pub mod encode;
 pub mod key;
 pub mod names;
 pub mod registry;
+pub mod resources;
 pub mod summary;
 pub use ristretto_classfile::byte_reader::ByteReader;
 pub use ristretto_classfile::*;

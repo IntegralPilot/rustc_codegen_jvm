@@ -20,6 +20,10 @@ mod tests {
         let array = Constant::Array(Box::new(super::super::Type::F64), vec![nan]);
         assert_eq!(array, array.clone());
         assert!(HashSet::from([array.clone()]).contains(&array));
+        let literal = Constant::LiteralString("eq".into());
+        assert_eq!(literal, literal.clone());
+        assert_ne!(literal, Constant::String("eq".into()));
+        assert!(HashSet::from([literal.clone()]).contains(&literal));
     }
 }
 
@@ -49,6 +53,22 @@ impl PartialEq for Constant {
                     interface_name: b1,
                 },
             ) => a0 == b0 && a1 == b1,
+            (
+                Self::FunctionHandle {
+                    interface_name: a1,
+                    owner: a2,
+                    name: a3,
+                    descriptor: a4,
+                    interface: a5,
+                },
+                Self::FunctionHandle {
+                    interface_name: b1,
+                    owner: b2,
+                    name: b3,
+                    descriptor: b4,
+                    interface: b5,
+                },
+            ) => (a1, a2, a3, a4, a5) == (b1, b2, b3, b4, b5),
             (
                 Self::FactoryCall {
                     owner_class: a0,
@@ -189,7 +209,8 @@ impl PartialEq for Constant {
             (Self::Boolean(a0), Self::Boolean(b0)) => a0 == b0,
             (Self::Char(a0), Self::Char(b0)) => a0 == b0,
             (Self::Str(a0), Self::Str(b0)) => a0 == b0,
-            (Self::String(a0), Self::String(b0)) => a0 == b0,
+            (Self::String(a0), Self::String(b0))
+            | (Self::LiteralString(a0), Self::LiteralString(b0)) => a0 == b0,
             (Self::Array(a0, a1), Self::Array(b0, b1)) => a0 == b0 && a1 == b1,
             (Self::Slice(a0, a1), Self::Slice(b0, b1)) => a0 == b0 && a1 == b1,
             (

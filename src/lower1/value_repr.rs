@@ -5,12 +5,9 @@ use rustc_middle::ty::{EarlyBinder, Instance, Ty, TyCtxt, TyKind, TypingEnv};
 
 use crate::oomir;
 
-use super::{
-    jvm_names,
-    types::{
-        adapt_simple_enum_operand, ensure_exact_transmute_helper, ensure_union_data_type,
-        generate_adt_jvm_class_name, generate_tuple_jvm_class_name, ty_to_oomir_type,
-    },
+use super::types::{
+    adapt_simple_enum_operand, ensure_exact_transmute_helper, ensure_union_data_type,
+    generate_adt_jvm_class_name, generate_tuple_jvm_class_name, ty_to_oomir_type,
 };
 
 enum RustValueRepresentation {
@@ -54,7 +51,11 @@ fn representation<'tcx>(
     let TyKind::Adt(adt_def, substs) = rust_ty.kind() else {
         return RustValueRepresentation::Direct;
     };
-    if !adt_def.is_enum() {
+    if matches!(jvm_ty, oomir::Type::TaggedI64)
+        || !adt_def.is_enum()
+        || super::types::direct_enum_payload(rust_ty, tcx).is_some()
+        || super::types::enum_scalar_ty(rust_ty, tcx).is_some()
+    {
         return RustValueRepresentation::Direct;
     }
 
@@ -185,6 +186,27 @@ pub(super) fn construct_fieldless_enum_variant<'tcx>(
         return None;
     }
     let variant_def = adt_def.variant(variant);
+    if let Some(value) = super::types::enum_scalar_variant(enum_ty, variant, tcx) {
+        return Some(oomir::Operand::Constant(value));
+    }
+    if super::types::tagged_scalar(enum_ty, tcx).is_some() {
+        return (variant.as_u32() == 0).then(|| {
+            let dest = format!("{temp_prefix}_none");
+            instructions.push(super::types::tagged_value(
+                dest.clone(),
+                oomir::Operand::Constant(oomir::Constant::I64(0)),
+                0,
+            ));
+            operand_var(dest, oomir::Type::TaggedI64)
+        });
+    }
+    if let Some(carrier) = super::types::enum_carrier(enum_ty, tcx) {
+        return (carrier.nullable && variant.as_u32() == 0).then(|| {
+            oomir::Operand::Constant(oomir::Constant::Null(ty_to_oomir_type(
+                enum_ty, tcx, data_types, instance,
+            )))
+        });
+    }
     if variant_def.fields.iter().any(|field| {
         let field_ty = resolved_ty(field.ty(tcx, substs).skip_norm_wip(), tcx, instance);
         ty_to_oomir_type(field_ty, tcx, data_types, instance).has_jvm_value()
@@ -196,7 +218,7 @@ pub(super) fn construct_fieldless_enum_variant<'tcx>(
     let variant_class = format!(
         "{}${}",
         base_class,
-        jvm_names::member_name(&variant_def.name.to_string())
+        crate::lower1::types::enum_variant_name(variant_def, tcx)
     );
     let dest = format!("{temp_prefix}_enum_value");
     instructions.push(oomir::Instruction::ConstructObject {
@@ -222,6 +244,19 @@ pub(super) fn materialize_implicit_zst<'tcx>(
     if layout.size.bytes() != 0 {
         return None;
     }
+    if !ty_to_oomir_type(rust_ty, tcx, data_types, instance).has_jvm_value() {
+        return None;
+    }
+    if let Some(payload) = super::types::direct_enum_payload(rust_ty, tcx) {
+        return materialize_implicit_zst(
+            payload,
+            temp_prefix,
+            tcx,
+            instance,
+            data_types,
+            instructions,
+        );
+    }
 
     match rust_ty.kind() {
         TyKind::Adt(adt_def, substs) if adt_def.is_enum() => {
@@ -234,7 +269,7 @@ pub(super) fn materialize_implicit_zst<'tcx>(
             let variant_class = format!(
                 "{}${}",
                 base_class,
-                jvm_names::member_name(&variant.name.to_string())
+                crate::lower1::types::enum_variant_name(variant, tcx)
             );
             let mut args = Vec::new();
             for (field_index, field) in variant.fields.iter().enumerate() {
@@ -494,6 +529,15 @@ fn adapt_physical_scalar<'tcx>(
     if !target_jvm_ty.is_jvm_reference_type() {
         return None;
     }
+    let dest = format!("{temp_prefix}_layout_value");
+    if let Some(value) = crate::lower1::types::emit_direct_transmute(
+        source.clone(),
+        &target_jvm_ty,
+        &dest,
+        instructions,
+    ) {
+        return Some(value);
+    }
     let target_layout = tcx
         .layout_of(TypingEnv::fully_monomorphized().as_query_input(target_rust_ty))
         .ok()?;
@@ -502,7 +546,6 @@ fn adapt_physical_scalar<'tcx>(
     let helper =
         ensure_exact_transmute_helper(source_rust_ty, target_rust_ty, tcx, data_types, instance)
             .ok()?;
-    let dest = format!("{temp_prefix}_layout_value");
     instructions.push(oomir::Instruction::InvokeStatic {
         dest: Some(dest.clone()),
         class_name: helper.class_name,
@@ -606,7 +649,7 @@ pub(super) fn adapt_operand_to_rust_type<'tcx>(
 ) -> oomir::Operand {
     let target_rust_ty = resolved_ty(target_rust_ty, tcx, instance);
     let target_jvm_ty = ty_to_oomir_type(target_rust_ty, tcx, data_types, instance);
-    let source = adapt_mutable_reference_carrier(
+    let source = adapt_reference_carrier(
         source,
         target_rust_ty,
         &target_jvm_ty,
@@ -744,7 +787,7 @@ pub(super) fn adapt_operand_to_rust_type<'tcx>(
                     let variant_class = format!(
                         "{}${}",
                         base_class,
-                        jvm_names::member_name(&variant_def.name.to_string())
+                        crate::lower1::types::enum_variant_name(variant_def, tcx)
                     );
                     let dest = format!("{temp_prefix}_enum_value");
                     instructions.push(oomir::Instruction::ConstructObject {

@@ -13,6 +13,56 @@ pub(super) fn emit_ty_to_union_bytes<'tcx>(
     temp_counter: &mut usize,
 ) -> Result<(), String> {
     let ty = resolve_union_ty(tcx, ty, instance_context)?;
+    if let Some(layout) = tagged_scalar(ty, tcx) {
+        for (index, offset) in [(0, layout.payload_offset), (1, layout.tag_offset)] {
+            let dest = next_union_temp("tagged_part", temp_counter);
+            instructions.push(oomir::Instruction::TaggedPart {
+                dest: dest.clone(),
+                value: source.clone(),
+                index,
+            });
+            emit_ty_to_union_bytes(
+                tcx.types.i64,
+                operand_var(dest, oomir::Type::I64),
+                storage,
+                base_offset + offset,
+                tcx,
+                data_types,
+                instance_context,
+                instructions,
+                temp_counter,
+            )?;
+        }
+        return Ok(());
+    }
+    if let Some(scalar) = value_scalar_ty(ty, tcx) {
+        return emit_ty_to_union_bytes(
+            scalar,
+            source,
+            storage,
+            base_offset,
+            tcx,
+            data_types,
+            instance_context,
+            instructions,
+            temp_counter,
+        );
+    }
+    if let Some(payload) =
+        direct_enum_payload(ty, tcx).or_else(|| transparent_payload(ty, tcx).map(|p| p.ty))
+    {
+        return emit_ty_to_union_bytes(
+            payload,
+            source,
+            storage,
+            base_offset,
+            tcx,
+            data_types,
+            instance_context,
+            instructions,
+            temp_counter,
+        );
+    }
     if layout_size_bytes(tcx, ty)? == 0 {
         return Ok(());
     }
@@ -95,8 +145,8 @@ pub(super) fn emit_ty_to_union_bytes<'tcx>(
         let value_ty = ty_to_oomir_type(ty, tcx, data_types, instance_context);
         instructions.push(oomir::Instruction::InvokeStatic {
             dest: Some(encoded.clone()),
-            class_name: codec.class_name,
-            method_name: "encode".to_string(),
+            class_name: codec.owner().to_owned(),
+            method_name: codec.method("encode"),
             method_ty: oomir::Signature {
                 params: vec![("value".to_string(), value_ty)],
                 ret: Box::new(byte_array_type()),
@@ -141,37 +191,24 @@ pub(super) fn emit_ty_to_union_bytes<'tcx>(
             // SliceView. Transmutes (notably fmt::Arguments::new) must encode the
             // data address, not the managed identity of the SliceView wrapper.
             let element_size = layout_size_bytes(tcx, *element)?;
-            let pointer_ty = oomir::Type::Pointer(Box::new(ty_to_oomir_type(
+            let pointer_ty = oomir::Type::pointer(ty_to_oomir_type(
                 *element,
                 tcx,
                 data_types,
                 instance_context,
-            )));
+            ));
             let pointer_dest = next_union_temp("union_array_reference_pointer", temp_counter);
-            instructions.push(oomir::Instruction::InvokeStatic {
+            instructions.push(oomir::Instruction::ViewAddress {
                 dest: Some(pointer_dest.clone()),
-                class_name: oomir::POINTER_CLASS.to_string(),
-                method_name: "fromSlice".to_string(),
-                method_ty: oomir::Signature {
-                    params: vec![
-                        (
-                            "slice".to_string(),
-                            oomir::Type::Class("java/lang/Object".to_string()),
-                        ),
-                        ("element_size".to_string(), oomir::Type::U64),
-                        ("codec".to_string(), oomir::Type::java_string()),
-                    ],
-                    ret: Box::new(pointer_ty.clone()),
-                    is_static: true,
-                },
-                args: vec![
-                    source,
-                    oomir::Operand::Constant(oomir::Constant::U64(
+                source: source,
+                layout: Box::new(oomir::AddressLayout {
+                    pointer_type: pointer_ty.clone(),
+                    size: oomir::Operand::Constant(oomir::Constant::U64(
                         u64::try_from(element_size)
                             .map_err(|_| "Rust array element layout exceeds u64")?,
                     )),
-                    pointer_view_codec_operand(*element, tcx, data_types, instance_context),
-                ],
+                    codec: pointer_view_codec_operand(*element, tcx, data_types, instance_context),
+                }),
             });
             let address_dest = next_union_temp("union_array_reference_address", temp_counter);
             let pointer_codec =
@@ -200,12 +237,12 @@ pub(super) fn emit_ty_to_union_bytes<'tcx>(
                 args: vec![
                     operand_var(
                         pointer_dest,
-                        oomir::Type::Pointer(Box::new(ty_to_oomir_type(
+                        oomir::Type::pointer(ty_to_oomir_type(
                             *element,
                             tcx,
                             data_types,
                             instance_context,
-                        ))),
+                        )),
                     ),
                     operand_var(storage.bytes_var.clone(), byte_array_type()),
                     storage_offset,
@@ -366,7 +403,7 @@ pub(super) fn emit_ty_to_union_bytes<'tcx>(
             let oomir::Type::Class(enum_class) = &enum_oomir_ty else {
                 return Err(format!("enum {ty:?} did not map to a JVM class"));
             };
-            ensure_enum_union_codec(
+            let codec = ensure_enum_union_codec(
                 adt_def,
                 substs,
                 ty,
@@ -376,17 +413,17 @@ pub(super) fn emit_ty_to_union_bytes<'tcx>(
                 instance_context,
             )?;
             let offset = storage.byte_index(base_offset, instructions, temp_counter);
-            instructions.push(oomir::Instruction::InvokeVirtual {
+            instructions.push(oomir::Instruction::InvokeStatic {
                 dest: None,
-                class_name: enum_class.clone(),
-                method_name: enum_scoped_method_name(enum_class, ENUM_WRITE_UNION_STORAGE_METHOD),
+                class_name: codec.owner,
+                method_name: codec.writer,
                 method_ty: enum_union_write_signature(enum_class),
                 args: vec![
+                    source,
                     operand_var(storage.bytes_var.clone(), byte_array_type()),
                     operand_var(storage.objects_var.clone(), object_array_type()),
                     offset,
                 ],
-                operand: source,
             });
             Ok(())
         }

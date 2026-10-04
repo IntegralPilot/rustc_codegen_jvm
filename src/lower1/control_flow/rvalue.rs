@@ -38,17 +38,25 @@ use rustc_middle::{
 mod pointer_layout;
 use pointer_layout::*;
 mod struct_tails;
+pub(crate) use struct_tails::emit_struct_tail_reborrow_view;
 use struct_tails::*;
 mod unsize;
 use unsize::*;
+mod array_places;
+use array_places::*;
 mod array_views;
 use array_views::*;
 mod addressing;
+pub(crate) use addressing::emit_pointer_to_place;
 use addressing::*;
 mod aggregates;
 use aggregates::*;
+mod callable_handles;
 mod function_pointers;
+pub(crate) use callable_handles::callable_handle;
 pub(crate) use function_pointers::*;
+mod exported_closures;
+pub(crate) use exported_closures::ensure_exported_closure_calls;
 mod closures;
 pub(crate) use closures::*;
 mod arithmetic;
@@ -63,8 +71,6 @@ struct RvalueContext<'b, 'tcx> {
     instance: Instance<'tcx>,
     data_types: &'b mut Definitions<'tcx>,
     external_interfaces: &'b mut HashSet<String>,
-    pointer_origins: &'b crate::lower1::control_flow::MutableBorrowMap<'tcx>,
-    available_pointer_locals: &'b HashSet<rustc_middle::mir::Local>,
 }
 
 fn generate_temp_var_name(data_types: &mut Definitions<'_>, base_name: &str) -> String {
@@ -116,8 +122,6 @@ pub(super) fn convert_rvalue_to_operand<'a>(
     instance: Instance<'a>,
     data_types: &mut Definitions<'a>,
     external_interfaces: &mut HashSet<String>,
-    pointer_origins: &super::MutableBorrowMap<'a>,
-    available_pointer_locals: &HashSet<rustc_middle::mir::Local>,
 ) -> (Vec<oomir::Instruction>, oomir::Operand) {
     breadcrumbs::log!(
         breadcrumbs::LogLevel::Info,
@@ -131,8 +135,6 @@ pub(super) fn convert_rvalue_to_operand<'a>(
         instance,
         data_types,
         external_interfaces,
-        pointer_origins,
-        available_pointer_locals,
     };
     match rvalue {
         Rvalue::Use(..) => context.lower_values(rvalue),

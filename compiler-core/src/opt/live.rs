@@ -85,7 +85,10 @@ pub fn live_with_roots(
 
 fn has_effects(op: Op, body: &Body, types: &Types) -> bool {
     // An unused fat-pointer carrier has no observable identity.
-    !matches!(op, Op::View { .. }) && op.may_throw(body, types)
+    !matches!(
+        op,
+        Op::View { .. } | Op::ViewPack(_) | Op::AddressPack(_) | Op::SlotRoot(_)
+    ) && op.may_throw(body, types)
 }
 
 #[cfg(test)]

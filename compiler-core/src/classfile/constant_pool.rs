@@ -9,6 +9,8 @@ pub struct InternedConstantPool {
     pool: ConstantPool<'static>,
     constants: HashMap<ConstantKey, u16>,
     strings: HashMap<jvm::JavaString, u16>,
+    resource_anchor: Option<u16>,
+    resources: Vec<super::resources::Resource>,
 }
 
 impl Default for InternedConstantPool {
@@ -17,6 +19,8 @@ impl Default for InternedConstantPool {
             pool: ConstantPool::default(),
             constants: HashMap::default(),
             strings: HashMap::default(),
+            resource_anchor: None,
+            resources: Vec::new(),
         }
     }
 }
@@ -30,7 +34,30 @@ impl Deref for InternedConstantPool {
 }
 
 impl InternedConstantPool {
+    pub fn set_resource_anchor(&mut self, owner: u16) {
+        self.resource_anchor = Some(owner);
+    }
+
+    pub fn resource_anchor(&self) -> Option<u16> {
+        self.resource_anchor
+    }
+
+    pub fn add_resource(&mut self, bytes: Vec<u8>) -> jvm::Result<u16> {
+        let resource = super::resources::Resource::new(bytes);
+        let name = self.add_name_string(&resource.name)?;
+        self.resources.push(resource);
+        Ok(name)
+    }
+
+    pub fn take_resources(&mut self) -> Vec<super::resources::Resource> {
+        std::mem::take(&mut self.resources)
+    }
+
     pub fn into_inner(self) -> ConstantPool<'static> {
+        assert!(
+            self.resources.is_empty(),
+            "binary constants were not emitted"
+        );
         self.pool
     }
 
@@ -84,20 +111,15 @@ impl InternedConstantPool {
 
     pub fn add_string<S: AsRef<str>>(&mut self, value: S) -> jvm::Result<u16> {
         let value = value.as_ref();
-        let string_index = if value.starts_with(super::names::STRING_TAG) {
-            self.add_utf8(format!("{}{value}", super::names::LITERAL_STRING))?
-        } else {
-            self.add_utf8(value)?
-        };
+        // Literal text must never become a reflection or class-liveness root.
+        // The final linker removes this tag without interpreting its payload.
+        let string_index = self.add_utf8(format!("{}{value}", super::names::LITERAL_STRING))?;
         self.add(Constant::String(string_index))
     }
 
     /// Compiler-generated reflection names/descriptors need the same namespace
     /// relocation as class references. Rust string literals use `add_string`.
     pub fn add_name_string(&mut self, value: &str) -> jvm::Result<u16> {
-        if !value.contains(super::names::CRATE_MARKER) {
-            return self.add_string(value);
-        }
         let index = self.add_utf8(format!("{}{value}", super::names::NAME_STRING))?;
         self.add(Constant::String(index))
     }

@@ -1,7 +1,6 @@
 package org.rustlang.runtime;
 
 import java.lang.reflect.Constructor;
-import java.lang.reflect.Field;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
@@ -77,7 +76,6 @@ public final class KotlinFutureInterop {
         private final Constructor<?> rawWakerConstructor;
         private final Constructor<?> wakerConstructor;
         private final Constructor<?> contextConstructor;
-        private final Constructor<?> pinConstructor;
         private final Method resume;
         private final Pointer vtablePointer;
         private final int futureSize;
@@ -102,10 +100,7 @@ public final class KotlinFutureInterop {
                         "org.rustlang.core.task.wake.Waker", true, loader);
                 Class<?> contextClass = Class.forName(
                         "org.rustlang.core.task.wake.Context", true, loader);
-                Class<?> pinClass = Class.forName(
-                        "org.rustlang.core.pin.Pin_MutRef" + futureClass.getSimpleName(),
-                        true,
-                        loader);
+                resume = findResumeMethod(futureClass);
 
                 rawWakerConstructor = rawWakerClass.getConstructor(Pointer.class, Pointer.class);
                 Constructor<?> vtableConstructor = constructorWithArity(rawWakerVTableClass, 4);
@@ -163,8 +158,6 @@ public final class KotlinFutureInterop {
 
                 wakerConstructor = wakerClass.getConstructor(rawWakerClass);
                 contextConstructor = rustConstructor(contextClass);
-                pinConstructor = pinClass.getConstructor(Pointer.class);
-                resume = findResumeMethod(futureClass, pinClass);
                 this.futureSize = futureSize;
                 this.futureCodec = futureCodec;
                 this.futureAlignment = futureAlignment;
@@ -190,14 +183,13 @@ public final class KotlinFutureInterop {
                 Object context = contextConstructor.newInstance(contextArguments);
                 Pointer futurePointer = Pointer.receiverCellAligned(
                         future, futureSize, futureCodec, futureAlignment);
-                Object pin = pinConstructor.newInstance(futurePointer);
-                Object result = resume.invoke(null, pin, Pointer.cell(context));
+                Object result = resume.invoke(null, futurePointer, Pointer.cell(context));
 
-                if (result.getClass().getName().endsWith("$Pending")) {
+                if (result.getClass().getSimpleName().equals("Pending")) {
                     return PENDING;
                 }
                 try {
-                    Field output = result.getClass().getField("value");
+                    RustField output = RustField.find(result.getClass(), "value");
                     return output.get(result);
                 } catch (NoSuchFieldException noOutput) {
                     return UNIT;
@@ -235,8 +227,7 @@ public final class KotlinFutureInterop {
 
         private static Object defaultRustValue(Class<?> type) throws ReflectiveOperationException {
             if (type.isInterface()) {
-                Class<?> none = Class.forName(
-                        type.getName() + "$None", true, type.getClassLoader());
+                Class<?> none = RustClasses.nested(type, "None");
                 return none.getConstructor().newInstance();
             }
             try {
@@ -247,17 +238,18 @@ public final class KotlinFutureInterop {
             }
         }
 
-        private static Method findResumeMethod(Class<?> futureClass, Class<?> pinClass)
+        private static Method findResumeMethod(Class<?> futureClass)
                 throws ReflectiveOperationException {
+            // Body is an executable namespace, never a shared storage carrier.
             Class<?> bodyClass = Class.forName(
                     futureClass.getName() + "$Body", true, futureClass.getClassLoader());
             for (Method method : bodyClass.getMethods()) {
                 Class<?>[] parameters = method.getParameterTypes();
                 if (Modifier.isStatic(method.getModifiers())
                         && parameters.length == 2
-                        && parameters[0] == pinClass
+                        && parameters[0] == Pointer.class
                         && parameters[1] == Pointer.class
-                        && method.getReturnType().getName().contains(".task.poll.Poll_")) {
+                        && RustClasses.hasNested(method.getReturnType(), "Ready", "Pending")) {
                     return method;
                 }
             }

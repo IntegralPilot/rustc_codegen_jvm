@@ -2,7 +2,13 @@
 use super::*;
 use std::borrow::Cow;
 
-fn add_constant_helper_method(
+/// The owner distinguishes equal constants when the linker combines private method holders.
+pub(super) fn helper_name(kind: char, owner: &str, identity: &str, next: usize) -> String {
+    let identity = crate::stable_hash::short_hash_value(&(owner, identity), 16);
+    format!("$c{kind}{identity}_{next:x}")
+}
+
+pub(super) fn add_constant_helper_method(
     cp: &mut InternedConstantPool,
     methods: &mut Vec<jvm::Method>,
     method_name: &str,
@@ -10,27 +16,15 @@ fn add_constant_helper_method(
     max_locals: u16,
     instructions: Vec<Instruction>,
 ) -> jvm::Result<()> {
-    let initial = jvm_compiler_core::jvm::frames::initial_locals_for_descriptor(
-        descriptor, true, None, false,
-    )?;
-    let max_stack = jvm_compiler_core::jvm::frames::analyze(
-        &instructions,
-        &initial,
-        &[],
-        usize::from(max_locals),
+    let code = super::super::jvm_gen::code_attribute_for_descriptor(
         cp,
-        method_name,
-        &[],
-    )?
-    .max_stack;
-    let code = Attribute::Code {
-        name_index: cp.add_utf8("Code")?,
-        max_stack,
         max_locals,
-        code: instructions,
-        exception_table: Vec::new(),
-        attributes: Vec::new(),
-    };
+        instructions,
+        descriptor,
+        true,
+        None,
+        method_name,
+    )?;
     methods.push(jvm::Method {
         access_flags: MethodAccessFlags::PRIVATE
             | MethodAccessFlags::STATIC
@@ -51,6 +45,60 @@ pub(super) fn create_chunked_array_factory(
     next_factory: &mut usize,
     storage_field: Option<u16>,
 ) -> jvm::Result<oomir::Constant> {
+    if super::resources::eligible(cp, element_type, elements) {
+        let array_type = oomir::Type::Array(Box::new(element_type.clone()));
+        let mut code = Vec::new();
+        if let Some(field) = storage_field {
+            code.push(Instruction::Getstatic(field));
+        } else {
+            append_empty_array(&mut code, cp, element_type, elements.len())?;
+        }
+        super::resources::fill(&mut code, cp, element_type, elements)?;
+        code.push(Instruction::Areturn);
+        let storage_name = storage_field.map(|field| {
+            let jvm::Constant::FieldRef {
+                name_and_type_index,
+                ..
+            } = cp.try_get(field).unwrap()
+            else {
+                unreachable!("static storage field")
+            };
+            let jvm::Constant::NameAndType { name_index, .. } =
+                cp.try_get(*name_and_type_index).unwrap()
+            else {
+                unreachable!("static storage name")
+            };
+            cp.try_get_utf8(*name_index).unwrap().to_string()
+        });
+        let identity =
+            crate::stable_hash::short_hash_value(&(element_type, elements, storage_name), 16);
+        let name = helper_name('d', owner_class, &identity, *next_factory);
+        *next_factory += 1;
+        add_constant_helper_method(
+            cp,
+            methods,
+            &name,
+            &format!("(){}", array_type.to_jvm_descriptor()),
+            0,
+            code,
+        )?;
+        return Ok(oomir::Constant::FactoryCall {
+            owner_class: owner_class.into(),
+            method_name: name,
+            ty: array_type,
+        });
+    }
+    if let Some(factory) = super::structured::factory(
+        cp,
+        owner_class,
+        element_type,
+        elements,
+        methods,
+        next_factory,
+        storage_field,
+    )? {
+        return Ok(factory);
+    }
     if oomir::is_packed_byte_array(element_type, elements) {
         return create_byte_array_factory(
             cp,
@@ -94,7 +142,7 @@ pub(super) fn create_chunked_array_factory(
                 end += 1;
             }
 
-            let method_name = format!("_constant_fill_{identity}_{}", *next_factory);
+            let method_name = helper_name('x', owner_class, &identity, *next_factory);
             *next_factory += 1;
             let mut instructions = Vec::new();
             for (index, element) in prepared[start..end].iter().enumerate() {
@@ -136,7 +184,7 @@ pub(super) fn create_chunked_array_factory(
         }
     }
 
-    let method_name = format!("_constant_factory_{identity}_{}", *next_factory);
+    let method_name = helper_name('f', owner_class, &identity, *next_factory);
     *next_factory += 1;
     let descriptor = format!("(){array_descriptor}");
     let mut instructions = Vec::new();
@@ -182,7 +230,7 @@ fn create_byte_array_factory(
     }
     let chunk_size = (MAX_INLINE_CONSTANT_INSTRUCTIONS / 4).max(1) * oomir::PACKED_BYTE_CHUNK;
     for (chunk_index, chunk) in elements.chunks(chunk_size).enumerate() {
-        let name = format!("_constant_fill_{identity}_{}", *next_factory);
+        let name = helper_name('x', owner_class, &identity, *next_factory);
         *next_factory += 1;
         let mut fill = vec![Instruction::Aload_0];
         super::arrays::fill_packed_bytes(
@@ -200,7 +248,7 @@ fn create_byte_array_factory(
         ));
     }
     instructions.push(Instruction::Areturn);
-    let name = format!("_constant_factory_{identity}_{}", *next_factory);
+    let name = helper_name('f', owner_class, &identity, *next_factory);
     *next_factory += 1;
     add_constant_helper_method(cp, methods, &name, "()[B", 0, instructions)?;
     Ok(oomir::Constant::FactoryCall {
@@ -238,7 +286,8 @@ pub(super) fn create_shared_pointer_factory(
     methods: &mut Vec<jvm::Method>,
     next_factory: &mut usize,
 ) -> jvm::Result<oomir::Constant> {
-    let builder = create_constant_factory(cp, owner_class, constant, methods, next_factory)?;
+    let builder =
+        create_unshared_constant_factory(cp, owner_class, constant, methods, next_factory)?;
     let identity = crate::stable_hash::short_hash_value(constant, 16);
     share_factory(cp, owner_class, &identity, builder, methods, next_factory)
 }
@@ -260,7 +309,7 @@ fn share_factory(
         unreachable!("shared constant construction requires a factory call");
     };
 
-    let method_name = format!("_constant_shared_{constant_identity}_{}", *next_factory);
+    let method_name = helper_name('s', owner_class, constant_identity, *next_factory);
     *next_factory += 1;
     let descriptor = format!("(){}", ty.to_jvm_descriptor());
     let identity = format!("{owner_class}#{constant_identity}");
@@ -296,6 +345,22 @@ fn share_factory(
 }
 
 pub(super) fn create_constant_factory(
+    cp: &mut InternedConstantPool,
+    owner_class: &str,
+    constant: &oomir::Constant,
+    methods: &mut Vec<jvm::Method>,
+    next_factory: &mut usize,
+) -> jvm::Result<oomir::Constant> {
+    // Nested references also identify stable CTFE allocations. Without caching, each use
+    // reconstructs the same table.
+    if super::prepare::shared_pointer(constant) {
+        create_shared_pointer_factory(cp, owner_class, constant, methods, next_factory)
+    } else {
+        create_unshared_constant_factory(cp, owner_class, constant, methods, next_factory)
+    }
+}
+
+fn create_unshared_constant_factory(
     cp: &mut InternedConstantPool,
     owner_class: &str,
     constant: &oomir::Constant,
@@ -451,7 +516,7 @@ pub(super) fn create_constant_factory(
 
     let return_type = oomir::Type::from_constant(&prepared);
     let identity = crate::stable_hash::short_hash_value(constant, 16);
-    let method_name = format!("_constant_factory_{identity}_{}", *next_factory);
+    let method_name = helper_name('f', owner_class, &identity, *next_factory);
     *next_factory += 1;
     let descriptor = format!("(){}", return_type.to_jvm_descriptor());
     let mut instructions = Vec::new();
