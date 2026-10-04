@@ -24,5 +24,5 @@ pub fn unsupported_err() -> io::Error {
 }
 
 pub fn abort_internal() -> ! {
-    core::intrinsics::abort()
+    core::intrinsics::abort_immediate()
 }

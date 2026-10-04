@@ -69,7 +69,7 @@ pub(super) fn emit<'tcx>(
                 src: oomir::Operand::Constant(oomir::Constant::Boolean(needs_drop)),
             });
         }
-    } else if is_compiler_intrinsic && intrinsic_name == "abort" {
+    } else if is_compiler_intrinsic && intrinsic_name == "abort_immediate" {
         instructions.push(oomir::Instruction::InvokeStatic {
             dest: None,
             class_name: "org/rustlang/runtime/PanicSupport".to_string(),
