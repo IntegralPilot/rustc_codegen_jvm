@@ -5,6 +5,7 @@ import org.rustlang.runtime.Pointer;
 /** Shared codecs preserve exact lengths, offsets and scalar bit patterns. */
 public final class PrimitiveArrayCodecs {
     public static void check() {
+        byteWidths();
         roundTrip(new boolean[] {true, false, true}, 1);
         roundTrip(new byte[] {-128, -1, 0, 127}, 1);
         roundTrip(new short[] {Short.MIN_VALUE, -1, 0, Short.MAX_VALUE}, 2);
@@ -20,6 +21,28 @@ public final class PrimitiveArrayCodecs {
         Pointer.encodeArrayMemory(overlap, overlap, 0, 1, null);
         if (!Arrays.equals(overlap, new byte[] {3, 5, 7, 11, 13}))
             throw new AssertionError("in-place byte encoding changed data");
+    }
+
+    private static void byteWidths() {
+        for (long bits : new long[] {0, -1, Long.MIN_VALUE, 0x81726354a5b6c7d8L}) {
+            byte[] encoded = java.nio.ByteBuffer.allocate(8)
+                    .order(java.nio.ByteOrder.LITTLE_ENDIAN).putLong(bits).array();
+            for (int width = 0; width <= 8; width++) {
+                for (int offset = 0; offset <= 8; offset++) {
+                    byte[] expected = new byte[16], actual = new byte[16];
+                    Arrays.fill(expected, (byte) 37);
+                    Arrays.fill(actual, (byte) 37);
+                    System.arraycopy(encoded, 0, expected, offset, width);
+                    org.rustlang.runtime.MemoryBytes.write(actual, offset, width, bits);
+                    byte[] scalar = Arrays.copyOf(Arrays.copyOf(encoded, width), 8);
+                    long value = java.nio.ByteBuffer.wrap(scalar)
+                            .order(java.nio.ByteOrder.LITTLE_ENDIAN).getLong();
+                    if (!Arrays.equals(actual, expected)
+                            || org.rustlang.runtime.MemoryBytes.read(actual, offset, width) != value)
+                        throw new AssertionError("scalar byte width or alignment changed");
+                }
+            }
+        }
     }
 
     private static void roundTrip(Object source, int width) {

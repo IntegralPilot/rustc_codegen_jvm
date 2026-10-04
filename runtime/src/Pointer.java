@@ -8200,12 +8200,8 @@ public final class Pointer {
                 throw new IndexOutOfBoundsException(
                         "scalar load exceeds byte-addressable Rust storage");
             }
-            flushMemoryViewsOverlapping(absoluteByteOffset, byteCount);
-            long result = 0;
-            for (int index = 0; index < byteCount; index++) {
-                result |= ((long) bytes[offset + index] & 0xffL) << (index * 8);
-            }
-            return result;
+            flushFilteredMemoryViews(absoluteByteOffset, byteCount, false);
+            return MemoryBytes.read(bytes, offset, byteCount);
         }
         return loadUnsignedAtSlow(absoluteByteOffset, byteCount);
     }
@@ -8535,9 +8531,7 @@ public final class Pointer {
             }
             prepareMemoryWrite(absoluteByteOffset, byteCount);
             discardEncodedPointers(allocation, absoluteByteOffset, byteCount);
-            for (int index = 0; index < byteCount; index++) {
-                bytes[offset + index] = (byte) (bits >>> (index * 8));
-            }
+            MemoryBytes.write(bytes, offset, byteCount, bits);
             return;
         }
         if (storeEmbeddedArrayBits(absoluteByteOffset, bits, byteCount)) {
@@ -9622,9 +9616,10 @@ public final class Pointer {
         return type.isInstance(value) ? value : null;
     }
 
-    /** Borrow an aggregate element directly from a Cell that owns a fixed array. */
+    /** Borrow an aggregate element from a cell or field that owns a fixed array. */
     private Object directCellArrayElement(long offset, Class<?> type) {
-        if (!(allocation instanceof Cell) || addressState != null
+        if (!(allocation instanceof Cell || allocation instanceof FieldCell)
+                || addressState != null && !(allocation instanceof FieldCell)
                 || traitObjectCarrier() != null || traitMetadataCarrier() != null
                 || zeroSizedSourceViewSize() >= 0 || mayHaveStructuralView(allocation)
                 || !isGeneratedAggregateCodec(allocationCodecClassName)
@@ -9635,16 +9630,18 @@ public final class Pointer {
                 || !java.util.Objects.equals(viewCodecClassName, plan.arrayElementCodec)) return null;
         long absolute = Math.addExact(byteOffset, offset);
         if (absolute < 0 || absolute % stride != 0) return null;
-        Object value = ((Cell) allocation).value;
+        Object value = readElement(0);
         if (!(value instanceof Object[]) || !plan.encodeParameterType.isInstance(value)
                 || (long) ((Object[]) value).length * stride != allocationElementSize
                 || absolute / stride >= ((Object[]) value).length) return null;
-        flushMemoryViewsOverlapping(absolute, stride);
-        // Read the current carrier again. A byte alias or whole-array assignment can replace it.
-        value = ((Cell) allocation).value;
-        if (!(value instanceof Object[]) || !plan.encodeParameterType.isInstance(value)
-                || (long) ((Object[]) value).length * stride != allocationElementSize
-                || absolute / stride >= ((Object[]) value).length) return null;
+        if (!directCellHasNoMemoryViews(allocation)) {
+            flushMemoryViewsOverlapping(absolute, stride);
+            // Flushing a byte alias can replace the array carrier.
+            value = readElement(0);
+            if (!(value instanceof Object[]) || !plan.encodeParameterType.isInstance(value)
+                    || (long) ((Object[]) value).length * stride != allocationElementSize
+                    || absolute / stride >= ((Object[]) value).length) return null;
+        }
         Object element = independentRepeatedArrayElement(value, (int) (absolute / stride));
         // Nested array values require their separate origin-registration rules.
         return element != null && !element.getClass().isArray() && type.isInstance(element) ? element : null;
@@ -9863,6 +9860,16 @@ public final class Pointer {
     }
 
     public static long loadLocationBits(Object root, long offset, int size) {
+        if (root instanceof Pointer) {
+            Pointer pointer = (Pointer) root;
+            if (pointer.allocation instanceof byte[] && pointer.addressState == null) {
+                return pointer.loadUnsignedAt(Math.addExact(pointer.byteOffset, offset), size);
+            }
+        }
+        return loadLocationBitsSlow(root, offset, size);
+    }
+
+    private static long loadLocationBitsSlow(Object root, long offset, int size) {
         if (root instanceof Storage) {
             Storage storage = (Storage) root;
             Object value = ((Cell) storage).value;
@@ -9871,13 +9878,10 @@ public final class Pointer {
                 StorageLayout.Leaf leaf = layout == null ? null : layout.at(offset, size);
                 if (leaf != null) return leaf.read(value, offset, size);
             }
-            root = storage.boundary();
+            return loadLocationBits(storage.boundary(), offset, size);
         }
         if (root instanceof Pointer) {
             Pointer pointer = (Pointer) root;
-            if (pointer.allocation instanceof byte[] && pointer.addressState == null) {
-                return pointer.loadUnsignedAt(Math.addExact(pointer.byteOffset, offset), size);
-            }
             if (pointer.hasDirectPrimitiveArrayStorage()) {
                 return loadLocationBits(pointer.allocation, Math.addExact(pointer.byteOffset, offset), size);
             }
@@ -11743,7 +11747,9 @@ public final class Pointer {
                         && allocationElementSize == inferredArrayElementSize(allocation)
                 ? allocationElementSize
                 : 0;
-        if (directPrimitiveElementSize > 0) {
+        if (allocation instanceof byte[] && directPrimitiveElementSize == 1) {
+            System.arraycopy(source, 0, allocation, Math.toIntExact(byteOffset), source.length);
+        } else if (directPrimitiveElementSize > 0) {
             for (int index = 0; index < source.length; index++) {
                 storePrimitiveArrayByte(
                         allocation,

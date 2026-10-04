@@ -19,9 +19,35 @@ public final class CellArrayViews {
         }
     }
 
+    public static final class Holder {
+        public MemoryViews.Pair[] pairs;
+        public Holder(MemoryViews.Pair[] pairs) { this.pairs = pairs; }
+    }
+
+    public static final class HolderCodec {
+        public static byte[] e$holder(Holder value) { return Codec.e$pairs(value.pairs); }
+        public static Holder d$holder(byte[] bytes) { return new Holder(Codec.d$pairs(bytes)); }
+    }
+
     public static void check() {
+        check(false);
+        check(true);
+        String codec = "CellArrayViews$HolderCodec#holder#LCellArrayViews$Holder;#16";
+        Pointer bytes = Pointer.array(new byte[16], 0, 1);
+        Holder decoded = (Holder) bytes.retype(16, codec).getObject();
+        Pointer field = Pointer.field(decoded, "pairs", 16, ARRAY).retype(8, ELEMENT);
+        direct(field, 8).second = 41;
+        Pointer.commitStorageLocation(field, 8);
+        if (bytes.byte_offset(12).retype(4, null).getI32() != 41)
+            throw new AssertionError("field array write did not reach its decoded owner");
+    }
+
+    private static void check(boolean field) {
         MemoryViews.Pair[] values = {new MemoryViews.Pair(3, 5), new MemoryViews.Pair(7, 11)};
-        Pointer whole = Pointer.cell(values, 16, ARRAY);
+        Pointer parent = Pointer.cell(new Holder(values), 16, null);
+        Pointer whole = field
+                ? parent.projectStructField(Holder.class.getName(), "pairs", 0, 16, ARRAY)
+                : Pointer.cell(values, 16, ARRAY);
         Pointer elements = whole.retype(8, ELEMENT);
         if (direct(elements, 0) != values[0] || direct(elements, 8) != values[1])
             throw new AssertionError("cell array element decoded instead of borrowing its carrier");
@@ -30,7 +56,8 @@ public final class CellArrayViews {
         if (whole.byte_offset(12).retype(4, null).getI32() != 13)
             throw new AssertionError("direct element field write was not visible through bytes");
         MemoryViews.Pair[] replacement = {new MemoryViews.Pair(17, 19), new MemoryViews.Pair(23, 29)};
-        whole.set(replacement);
+        if (field) parent.set(new Holder(replacement));
+        else whole.set(replacement);
         if (direct(elements, 0) != replacement[0] || direct(elements, 8) != replacement[1])
             throw new AssertionError("element lookup retained a replaced whole array");
         Pointer decoded = whole.byte_offset(8).retype(8, ELEMENT);
