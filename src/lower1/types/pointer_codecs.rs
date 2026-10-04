@@ -418,8 +418,11 @@ pub(crate) fn pointer_memory_codec_operand<'tcx>(
     data_types: &mut Definitions<'tcx>,
     instance_context: rustc_middle::ty::Instance<'tcx>,
 ) -> oomir::Operand {
-    if let Some(payload) = transparent_payload(data_types.normalize(tcx, ty, instance_context), tcx)
-    {
+    let ty = data_types.normalize(tcx, ty, instance_context);
+    if let TyKind::Pat(inner, _) = ty.kind() {
+        return pointer_memory_codec_operand(*inner, tcx, data_types, instance_context);
+    }
+    if let Some(payload) = transparent_payload(ty, tcx) {
         return pointer_memory_codec_operand(payload.ty, tcx, data_types, instance_context);
     }
     if let Some(codec) = fat_pointer_codec_operand(ty, tcx, data_types, instance_context) {
@@ -452,8 +455,11 @@ pub(crate) fn pointer_view_codec_operand<'tcx>(
     data_types: &mut Definitions<'tcx>,
     instance_context: rustc_middle::ty::Instance<'tcx>,
 ) -> oomir::Operand {
-    if let Some(payload) = transparent_payload(data_types.normalize(tcx, ty, instance_context), tcx)
-    {
+    let ty = data_types.normalize(tcx, ty, instance_context);
+    if let TyKind::Pat(inner, _) = ty.kind() {
+        return pointer_view_codec_operand(*inner, tcx, data_types, instance_context);
+    }
+    if let Some(payload) = transparent_payload(ty, tcx) {
         return pointer_view_codec_operand(payload.ty, tcx, data_types, instance_context);
     }
     if let Some(codec) = fat_pointer_codec_operand(ty, tcx, data_types, instance_context) {

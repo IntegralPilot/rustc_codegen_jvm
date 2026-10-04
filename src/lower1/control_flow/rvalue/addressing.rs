@@ -355,6 +355,22 @@ pub(crate) fn emit_pointer_to_place<'tcx>(
                 let base_rust_ty = EarlyBinder::bind(tcx, base_place.ty(&mir.local_decls, tcx).ty)
                     .instantiate(tcx, instance.args)
                     .skip_norm_wip();
+                if field_index.index() == 0
+                    && matches!(base_rust_ty.kind(), TyKind::Adt(def, args)
+                        if crate::lower1::is_non_null_lang_item(tcx, def.did())
+                            && crate::lower1::types::is_codegen_sized(args.type_at(0), tcx))
+                {
+                    return emit_pointer_to_place(
+                        &base_place,
+                        pointer_ty,
+                        temp_prefix,
+                        tcx,
+                        instance,
+                        mir,
+                        data_types,
+                        instructions,
+                    );
+                }
                 if let Some(payload) = crate::lower1::types::transparent_payload(base_rust_ty, tcx)
                 {
                     if field_index.index() == payload.field {
