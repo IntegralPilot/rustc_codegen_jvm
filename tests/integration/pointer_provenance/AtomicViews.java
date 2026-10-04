@@ -46,15 +46,18 @@ public final class AtomicViews {
     public static void check() throws Exception {
         check(false);
         check(true);
-        absenceEpoch();
+        absenceEpoch(false);
+        absenceEpoch(true);
     }
 
-    private static void absenceEpoch() throws InterruptedException {
+    private static void absenceEpoch(boolean initialView) throws InterruptedException {
         byte[] storage = new byte[8];
         Pointer bytes = Pointer.array(storage, 0, 1).retype(4, null);
         Pointer whole = bytes.retype(8, "AtomicViews$Codec#pair#LAtomicViews$Pair;#8");
-        ((Pair) whole.getObject()).payload = 1;
-        if (bytes.getI32() != 1 || bytes.getI32() != 1) throw new AssertionError("initial view was not flushed");
+        if (initialView) ((Pair) whole.getObject()).payload = 1;
+        int expected = initialView ? 1 : 0;
+        if (bytes.getI32() != expected || bytes.getI32() != expected)
+            throw new AssertionError("initial view was not flushed");
         Thread writer = new Thread(() -> ((Pair) whole.getObject()).payload = 73);
         writer.start();
         writer.join();

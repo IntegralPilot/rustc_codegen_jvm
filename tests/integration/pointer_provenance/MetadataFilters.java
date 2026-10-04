@@ -23,6 +23,7 @@ final class MetadataFilters {
     @SuppressWarnings("unchecked")
     static void check() throws Exception {
         locationOriginFalsePositive();
+        committedViewRebuild();
         Object source = new byte[16], target = new byte[16], copied = new byte[16];
         Map<Object, Object>[] stripes = (Map<Object, Object>[]) field(Pointer.class, "ENCODED_REFERENCES");
         Method stripeIndex = method("stateStripeIndex", Object.class);
@@ -57,6 +58,46 @@ final class MetadataFilters {
         }
         method("discardEncodedReferences", Object.class).invoke(null, source);
         method("discardEncodedReferences", Object.class).invoke(null, copied);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void committedViewRebuild() throws Exception {
+        byte[] storage = new byte[8];
+        Pointer bytes = Pointer.array(storage, 0, 1).retype(4);
+        Pointer whole = bytes.retype(8, "MemoryViews$PairCodec#pair#LMemoryViews$Pair;");
+        MemoryViews.Pair view = (MemoryViews.Pair) whole.getObject();
+        view.first = 7;
+        Object pointers = field(Pointer.class, "ENCODED_POINTER_FILTER");
+        method("markIdentityFilter", pointers.getClass(), Object.class).invoke(null, pointers, storage);
+        int index = (int) method("stateStripeIndex", Object.class).invoke(null, storage);
+        Map<Object, Object>[] encoded = (Map<Object, Object>[]) field(Pointer.class, "ENCODED_POINTERS");
+        Map<Object, Object>[] views = (Map<Object, Object>[]) field(Pointer.class, "MEMORY_VIEWS");
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        Thread writer = new Thread(() -> {
+            try { whole.commitMemoryView(); }
+            catch (Throwable error) { failure.set(error); }
+        });
+        synchronized (encoded[index]) {
+            writer.start();
+            long deadline = System.nanoTime() + 5_000_000_000L;
+            while (writer.getState() != Thread.State.BLOCKED) {
+                if (failure.get() != null || !writer.isAlive() || System.nanoTime() >= deadline)
+                    throw new AssertionError("commit did not reach pointer invalidation", failure.get());
+                Thread.yield();
+            }
+            synchronized (views[index]) {
+                if (views[index].containsKey(storage))
+                    throw new AssertionError("commit did not remove its old view");
+            }
+            Object filter = field(Pointer.class, "MEMORY_VIEW_FILTER");
+            ((AtomicLong) field(filter, "marks")).set(Long.MAX_VALUE);
+            method("maybeRebuildIdentityFilter", filter.getClass(), Map[].class).invoke(null, filter, views);
+        }
+        writer.join(5000);
+        if (writer.isAlive() || failure.get() != null)
+            throw new AssertionError("view commit failed", failure.get());
+        view.first = 73;
+        if (bytes.getI32() != 73) throw new AssertionError("filter rebuild hid a committed view");
     }
 
     private static void locationOriginFalsePositive() throws Exception {

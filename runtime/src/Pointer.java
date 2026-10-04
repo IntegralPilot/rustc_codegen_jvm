@@ -347,7 +347,8 @@ public final class Pointer {
     private static final Map<String, Pointer> TRAIT_METADATA_MARKERS = new HashMap<>();
     private static final ConcurrentHashMap<Long, TraitMetadataInfo> TRAIT_METADATA_INFO =
             new ConcurrentHashMap<>();
-    private static final int STATE_STRIPE_COUNT = 256;
+    private static final int STATE_STRIPE_BITS = 8;
+    private static final int STATE_STRIPE_COUNT = 1 << STATE_STRIPE_BITS;
     private static final int LAZY_ARRAY_REPEAT_THRESHOLD = 2;
     private static final int REPEATED_ARRAY_FILTER_WORDS = 1 << 16;
     private static final long IDENTITY_FILTER_REBUILD_MARKS = 1L << 18;
@@ -355,8 +356,7 @@ public final class Pointer {
     private static final class RebuildableIdentityFilter {
         private final int wordCount;
         private final long rebuildMarks;
-        private volatile AtomicLongArray primary;
-        private volatile AtomicLongArray secondary;
+        private volatile IdentityFilterState state;
         private final AtomicLong marks = new AtomicLong();
         private final AtomicInteger rebuilding = new AtomicInteger();
 
@@ -367,7 +367,18 @@ public final class Pointer {
         private RebuildableIdentityFilter(int wordCount, long rebuildMarks) {
             this.wordCount = wordCount;
             this.rebuildMarks = rebuildMarks;
-            primary = new AtomicLongArray(wordCount);
+        }
+
+        private synchronized IdentityFilterState initialize() {
+            if (state == null) state = new IdentityFilterState(new AtomicLongArray(wordCount), null);
+            return state;
+        }
+    }
+    private static final class IdentityFilterState {
+        private final AtomicLongArray primary, secondary;
+        private IdentityFilterState(AtomicLongArray primary, AtomicLongArray secondary) {
+            this.primary = primary;
+            this.secondary = secondary;
         }
     }
     private static final AtomicLongArray REPEATED_ARRAY_FILTER =
@@ -386,8 +397,8 @@ public final class Pointer {
             new RebuildableIdentityFilter(1 << 20, 1L << 22);
     private static final AtomicLongArray FIELD_CELL_FILTER =
             new AtomicLongArray(REPEATED_ARRAY_FILTER_WORDS);
-    private static final AtomicLongArray SHARED_CONSTANT_ARRAY_FILTER =
-            new AtomicLongArray(REPEATED_ARRAY_FILTER_WORDS);
+    private static final RebuildableIdentityFilter SHARED_CONSTANT_ARRAY_FILTER =
+            new RebuildableIdentityFilter();
     private static final Map<Object, Map<Long, StructuralViewState>>[] STRUCTURAL_VIEWS =
             createWeakMapStripes();
     private static final Map<Object, LongRangeMap<MemoryViewState>>[] MEMORY_VIEWS =
@@ -1708,9 +1719,7 @@ public final class Pointer {
     }
 
     private static void markRepeatedArray(Object array) {
-        int hash = System.identityHashCode(array);
-        markFilterHash(REPEATED_ARRAY_FILTER, mixRepeatedArrayHash(hash));
-        markFilterHash(REPEATED_ARRAY_FILTER, mixRepeatedArrayHash(hash ^ 0x9e37_79b9));
+        markIdentityFilter(REPEATED_ARRAY_FILTER, array);
     }
 
     private static boolean mayBeRepeatedArray(Object array) {
@@ -1722,26 +1731,6 @@ public final class Pointer {
         hash *= 0x7feb_352d;
         hash ^= hash >>> 15;
         return hash;
-    }
-
-    private static boolean markFilterHash(AtomicLongArray filter, int hash) {
-        int bitIndex = hash & (filter.length() * Long.SIZE - 1);
-        int wordIndex = bitIndex >>> 6;
-        long bit = 1L << bitIndex;
-        while (true) {
-            long previous = filter.get(wordIndex);
-            if ((previous & bit) != 0) {
-                return false;
-            }
-            if (filter.compareAndSet(wordIndex, previous, previous | bit)) {
-                return true;
-            }
-        }
-    }
-
-    private static boolean hasFilterHash(AtomicLongArray filter, int hash) {
-        int bitIndex = hash & (filter.length() * Long.SIZE - 1);
-        return (filter.get(bitIndex >>> 6) & (1L << bitIndex)) != 0;
     }
 
     /** Reads one reference-array element while preserving Rust array value semantics. */
@@ -2646,47 +2635,47 @@ public final class Pointer {
         return mayBeInIdentityFilter(STRUCTURAL_VIEW_FILTER, allocation);
     }
 
+    // Both bits share one word so a lookup needs one atomic read.
+    private static long identityFilterBits(int hash) {
+        int first = hash >>> 20;
+        return (1L << first) | (1L << (first + 1 + ((hash >>> 26) & 31)));
+    }
+
     private static boolean markIdentityFilter(AtomicLongArray filter, Object value) {
-        int hash = System.identityHashCode(value);
-        boolean first = markFilterHash(filter, mixRepeatedArrayHash(hash));
-        boolean second =
-                markFilterHash(filter, mixRepeatedArrayHash(hash ^ 0x9e37_79b9));
-        return first || second;
+        int hash = mixRepeatedArrayHash(System.identityHashCode(value));
+        int index = hash & (filter.length() - 1);
+        long bits = identityFilterBits(hash);
+        while (true) {
+            long previous = filter.get(index);
+            if ((previous & bits) == bits) return false;
+            if (filter.compareAndSet(index, previous, previous | bits)) return true;
+        }
     }
 
     private static boolean mayBeInIdentityFilter(AtomicLongArray filter, Object value) {
-        int hash = System.identityHashCode(value);
-        return hasFilterHash(filter, mixRepeatedArrayHash(hash))
-                && hasFilterHash(filter, mixRepeatedArrayHash(hash ^ 0x9e37_79b9));
+        int hash = mixRepeatedArrayHash(System.identityHashCode(value));
+        long bits = identityFilterBits(hash);
+        return (filter.get(hash & (filter.length() - 1)) & bits) == bits;
     }
 
     private static void markIdentityFilter(RebuildableIdentityFilter filter, Object value) {
-        // The caller holds the owning stripe during publication.
-        // Also mark the replacement filter if a rebuild has passed that stripe.
-        // Recheck primary because the rebuild can publish it and clear secondary between reads.
+        // Mark both generations and retry if a rebuild publishes a new state.
         boolean added = false;
-        AtomicLongArray primary;
+        IdentityFilterState state;
         do {
-            primary = filter.primary;
-            added |= markIdentityFilter(primary, value);
-            AtomicLongArray secondary = filter.secondary;
-            if (secondary != null && secondary != primary) markIdentityFilter(secondary, value);
-        } while (primary != filter.primary);
-        if (added) {
-            filter.marks.incrementAndGet();
-        }
+            state = filter.state;
+            if (state == null) state = filter.initialize();
+            added |= markIdentityFilter(state.primary, value);
+            if (state.secondary != null) added |= markIdentityFilter(state.secondary, value);
+        } while (state != filter.state);
+        if (added) filter.marks.incrementAndGet();
     }
 
     private static boolean mayBeInIdentityFilter(
             RebuildableIdentityFilter filter, Object value) {
-        AtomicLongArray primary = filter.primary;
-        if (mayBeInIdentityFilter(primary, value)) {
-            return true;
-        }
-        AtomicLongArray secondary = filter.secondary;
-        return secondary != null
-                && secondary != primary
-                && mayBeInIdentityFilter(secondary, value);
+        IdentityFilterState state = filter.state;
+        return state != null && (mayBeInIdentityFilter(state.primary, value)
+                || (state.secondary != null && mayBeInIdentityFilter(state.secondary, value)));
     }
 
     private static void maybeRebuildIdentityFilter(
@@ -2695,14 +2684,13 @@ public final class Pointer {
                 || !filter.rebuilding.compareAndSet(0, 1)) return;
         try {
             AtomicLongArray rebuilt = new AtomicLongArray(filter.wordCount);
-            filter.secondary = rebuilt;
+            filter.state = new IdentityFilterState(filter.state.primary, rebuilt);
             for (Map<Object, ?> stripe : stripes) {
                 synchronized (stripe) {
                     ((WeakIdentityMap<?>) stripe).forEachLiveKey(key -> markIdentityFilter(rebuilt, key));
                 }
             }
-            filter.primary = rebuilt;
-            filter.secondary = null;
+            filter.state = new IdentityFilterState(rebuilt, null);
             filter.marks.set(0);
         } finally {
             filter.rebuilding.set(0);
@@ -2765,10 +2753,24 @@ public final class Pointer {
     }
 
     private void flushMemoryViewsOverlapping(long offset, int size, boolean overwrite) {
-        if (directCellHasNoMemoryViews(allocation)
-                || !mayBeInIdentityFilter(MEMORY_VIEW_FILTER, allocation)) {
-            return;
+        if (!directCellHasNoMemoryViews(allocation)) {
+            flushFilteredMemoryViews(offset, size, overwrite);
         }
+    }
+
+    private void flushFilteredMemoryViews(long offset, int size, boolean overwrite) {
+        int cached = absentViewState;
+        int stripe = cached == 0 ? stateStripeIndex(allocation) : cached & (STATE_STRIPE_COUNT - 1);
+        long epoch = MEMORY_VIEW_EPOCHS.get(stripe);
+        if (epoch + 1 == (cached >>> STATE_STRIPE_BITS)) return;
+        if (mayBeInIdentityFilter(MEMORY_VIEW_FILTER, allocation)) {
+            flushTrackedMemoryViews(offset, size, overwrite);
+        } else if (epoch >= 0 && epoch < (-1 >>> STATE_STRIPE_BITS)) {
+            absentViewState = ((int) (epoch + 1) << STATE_STRIPE_BITS) | stripe;
+        }
+    }
+
+    private void flushTrackedMemoryViews(long offset, int size, boolean overwrite) {
         if (MEMORY_VIEW_ABSENCE.get().matches(allocation, memoryViewEpoch(allocation))) {
             return;
         }
@@ -3296,6 +3298,7 @@ public final class Pointer {
             }
             state.active = true;
             setDirectCellHasMemoryView(allocation, true);
+            markIdentityFilter(MEMORY_VIEW_FILTER, allocation);
         }
         advanceMemoryViewEpoch(allocation);
         registerMemoryViewOrigin(state.value);
@@ -4116,6 +4119,8 @@ public final class Pointer {
         }
     }
 
+    // Pack the stripe and its absent-view epoch plus one. Zero means no cache.
+    private int absentViewState;
     private final Object allocation;
     private final int allocationElementSize;
     private final long byteOffset;
@@ -11580,7 +11585,7 @@ public final class Pointer {
         if (start < 0 || start > ((byte[]) pointer.allocation).length - size) {
             throw new IndexOutOfBoundsException("aggregate read exceeds byte-addressable Rust storage");
         }
-        pointer.flushMemoryViewsOverlapping(offset, size);
+        pointer.flushFilteredMemoryViews(offset, size, false);
         return start;
     }
 
