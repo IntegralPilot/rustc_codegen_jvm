@@ -26,10 +26,15 @@ pub fn decompose_views(body: &mut Body, types: &mut Types, debug: Option<&mut De
         match body.values[index].def {
             ValueDef::Inst(id) => match body.instructions[id.index()].op {
                 Op::View { .. } | Op::ViewPack(_) => eligible[index] = true,
-                Op::Constant(id) if matches!(body.constants[id.index()], Constant::Null(_)) => {
+                Op::Constant(id)
+                    if matches!(
+                        body.constants[id.index()],
+                        Constant::Null(_) | Constant::Uninit(_)
+                    ) =>
+                {
                     eligible[index] = true;
                 }
-                Op::Reinterpret(source) | Op::Adapt(source) => {
+                Op::Reinterpret(source) | Op::Adapt(source) | Op::Refine(source) => {
                     eligible[index] = true;
                     users.connect(source, index);
                 }
@@ -89,7 +94,8 @@ pub fn decompose_views(body: &mut Body, types: &mut Types, debug: Option<&mut De
             ValueDef::Inst(id) => {
                 // Partially initialized aggregates use null borrowed fields.
                 // Read their default component slots without dereferencing a view carrier.
-                if matches!(body.instructions[id.index()].op, Op::Constant(_)) {
+                if let Op::Constant(constant) = body.instructions[id.index()].op {
+                    let uninit = matches!(body.constants[constant.index()], Constant::Uninit(_));
                     let mut parts = [ValueId::new(0); 3];
                     let mut prefix = Vec::new();
                     for (index, (ty, constant)) in [
@@ -107,7 +113,11 @@ pub fn decompose_views(body: &mut Body, types: &mut Types, debug: Option<&mut De
                     .enumerate()
                     {
                         let constant_id = ConstId::new(body.constants.len());
-                        body.constants.push(constant);
+                        body.constants.push(if uninit {
+                            Constant::Uninit(ty)
+                        } else {
+                            constant
+                        });
                         let (instruction, value) = append(body, Op::Constant(constant_id), ty);
                         prefix.push(instruction);
                         parts[index] = value;

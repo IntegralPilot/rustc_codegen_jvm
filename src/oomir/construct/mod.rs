@@ -400,6 +400,11 @@ pub(crate) fn seal(function: oomir::Function, context: &Context) -> Result<oomir
     if ir.instructions.len() != representation_start {
         jvm_compiler_core::opt::simplify_components(&mut ir, &vocabulary.types);
     }
+    if debug.locals.is_empty()
+        && jvm_compiler_core::opt::lower_array_locations(&mut ir, &mut vocabulary.types)
+    {
+        jvm_compiler_core::opt::simplify_components(&mut ir, &vocabulary.types);
+    }
     jvm_compiler_core::opt::fold_field_paths(&mut ir, &vocabulary.types);
     if let Some(Some(names)) = DUMP.get() {
         let qualified = format!(

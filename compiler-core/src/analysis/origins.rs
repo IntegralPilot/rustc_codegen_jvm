@@ -8,6 +8,23 @@ const UNKNOWN: u32 = u32::MAX - 1;
 /// Only roots in an entry block without incoming edges can cross joins.
 /// Conflicting inputs make joins unknown. Each value changes at most twice.
 pub(crate) fn origins(body: &Body, roots: &[u32]) -> Vec<u32> {
+    origins_with(
+        body,
+        roots,
+        |op| match op {
+            Op::Reinterpret(source) | Op::Refine(source) => Some(source),
+            _ => None,
+        },
+        false,
+    )
+}
+
+pub(crate) fn origins_with(
+    body: &Body,
+    roots: &[u32],
+    source_of: impl Fn(Op) -> Option<ValueId>,
+    ignore_uninit: bool,
+) -> Vec<u32> {
     let count = body.values.len();
     let mut stable = vec![
         false;
@@ -34,6 +51,7 @@ pub(crate) fn origins(body: &Body, roots: &[u32]) -> Vec<u32> {
     }
     let mut state = roots.to_vec();
     let mut joins = vec![false; count];
+    let mut undefined = vec![false; count];
     let mut users = super::ValueUsers::new(count);
     for (index, value) in body.values.iter().enumerate() {
         if roots[index] != NO_ORIGIN {
@@ -41,10 +59,17 @@ pub(crate) fn origins(body: &Body, roots: &[u32]) -> Vec<u32> {
         }
         let source = match value.def {
             ValueDef::Alias(source) => Some(source),
-            ValueDef::Inst(inst) => match body.instructions[inst.index()].op {
-                Op::Reinterpret(source) | Op::Refine(source) => Some(source),
-                _ => None,
-            },
+            ValueDef::Inst(inst) => {
+                let op = body.instructions[inst.index()].op;
+                // An inactive enum payload can use any allocation. A real null cannot.
+                if ignore_uninit
+                    && matches!(op, Op::Constant(id) if matches!(body.constants[id.index()], Constant::Uninit(_)))
+                {
+                    undefined[index] = true;
+                    state[index] = UNKNOWN;
+                }
+                source_of(op)
+            }
             ValueDef::Param(block) if block != body.entry => {
                 joins[index] = true;
                 state[index] = UNKNOWN;
@@ -94,11 +119,16 @@ pub(crate) fn origins(body: &Body, roots: &[u32]) -> Vec<u32> {
             // A cycle without a defining root cannot prove allocation identity,
             // even if another incoming edge has a known root.
             for (index, value) in state.iter_mut().enumerate() {
-                if *value == UNKNOWN {
+                if *value == UNKNOWN && !undefined[index] {
                     *value = NO_ORIGIN;
                     pending.push(index);
                 }
             }
+        }
+    }
+    for origin in &mut state {
+        if *origin == UNKNOWN {
+            *origin = NO_ORIGIN;
         }
     }
     state

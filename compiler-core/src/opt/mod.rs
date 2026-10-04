@@ -22,6 +22,10 @@ pub use storage::lower_typed_storage;
 mod storage_tests;
 mod tagged;
 pub use tagged::decompose_tagged;
+mod array_locations;
+#[cfg(test)]
+mod array_locations_tests;
+pub use array_locations::lower_array_locations;
 mod views;
 pub use views::decompose_views;
 #[cfg(test)]
