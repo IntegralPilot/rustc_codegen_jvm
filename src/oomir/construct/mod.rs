@@ -401,11 +401,16 @@ pub(crate) fn seal(function: oomir::Function, context: &Context) -> Result<oomir
     jvm_compiler_core::opt::lower_typed_loads(&mut ir, &vocabulary.types);
     if ir.instructions.len() != representation_start {
         jvm_compiler_core::opt::simplify_components(&mut ir, &vocabulary.types);
+    } else {
+        jvm_compiler_core::opt::simplify_control_flow(&mut ir);
     }
     if debug.locals.is_empty()
         && jvm_compiler_core::opt::lower_array_locations(&mut ir, &mut vocabulary.types)
     {
         jvm_compiler_core::opt::simplify_components(&mut ir, &vocabulary.types);
+    }
+    if debug.locals.is_empty() {
+        jvm_compiler_core::opt::remove_rethrows(&mut ir, &vocabulary.types);
     }
     jvm_compiler_core::opt::fold_field_paths(&mut ir, &vocabulary.types);
     if let Some(Some(names)) = DUMP.get() {

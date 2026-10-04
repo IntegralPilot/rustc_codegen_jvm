@@ -59,10 +59,13 @@ fn jvm_preserves_throwable_identity_through_catch_and_rethrow() {
         } else {
             Terminator::Return(Some(caught))
         });
-        let body = b.finish().unwrap();
+        let mut body = b.finish().unwrap();
+        crate::opt::remove_rethrows(&mut body, &types);
         let code = compile(&body, &types, &mut cp).unwrap();
-        assert_eq!(code.exceptions.len(), 1);
-        assert!(code.exceptions[0].range_pc.start < code.exceptions[0].range_pc.end);
+        assert_eq!(code.exceptions.len(), usize::from(!rethrow));
+        for entry in &code.exceptions {
+            assert!(entry.range_pc.start < entry.range_pc.end);
+        }
         methods.push(Method {
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
             name_index: cp

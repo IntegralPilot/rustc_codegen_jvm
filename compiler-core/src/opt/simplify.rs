@@ -78,6 +78,11 @@ pub fn simplify_components(body: &mut Body, types: &Types) {
             }
         }
     }
+    simplify_control_flow(body);
+}
+
+/// Builder joins can expose constants without adding representation instructions.
+pub fn simplify_control_flow(body: &mut Body) {
     // Remove exact identities only after the constant worklist has settled.
     for index in 0..body.instructions.len() {
         let inst = body.instructions[index];

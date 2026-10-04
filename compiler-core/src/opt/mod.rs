@@ -90,9 +90,11 @@ mod array_view_tests;
 #[cfg(test)]
 mod memory_copies_tests;
 
+mod rethrows;
+pub use rethrows::remove_rethrows;
 mod simplify;
 mod unreachable;
-pub use simplify::simplify_components;
+pub use simplify::{simplify_components, simplify_control_flow};
 
 fn append_value(
     body: &mut crate::ir::Body,
