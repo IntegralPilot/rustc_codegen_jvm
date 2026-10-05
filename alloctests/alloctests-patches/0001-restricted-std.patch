@@ -9,17 +9,7 @@ diff --git a/lib.rs b/lib.rs
 diff --git a/tests/lib.rs b/tests/lib.rs
 --- a/tests/lib.rs
 +++ b/tests/lib.rs
-@@ -1,6 +1,7 @@
- // tidy-alphabetical-start
- #![allow(internal_features)]
-+#![allow(unexpected_cfgs)]
- #![deny(implicit_provenance_casts)]
- #![deny(unsafe_op_in_unsafe_fn)]
- #![feature(alloc_io)]
- #![feature(allocator_ext)]
-@@ -61,4 +62,5 @@
- #![feature(vec_deque_retain_range)]
- #![feature(vec_peek_mut)]
+@@ -1 +1,3 @@
 +#![feature(restricted_std)]
- #![feature(write_all_vectored)]
- // tidy-alphabetical-end
++#![allow(unexpected_cfgs)]
+ // tidy-alphabetical-start
