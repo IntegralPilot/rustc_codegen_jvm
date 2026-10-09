@@ -1,3 +1,7 @@
+#![feature(custom_inner_attributes)]
+#![feature(register_tool)]
+#![register_tool(jvm_codegen)]
+#![jvm_codegen::export]
 pub struct Ciallo {
     pub count: i32,
     pub desc: &'static str,

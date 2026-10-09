@@ -79,8 +79,11 @@ impl Assembly {
                 _ => unreachable!(),
             }
         }
+        let mut candidates = Vec::new();
         for (index, label) in self.fixups {
             let target = self.labels[label.0].ok_or_else(|| error("unbound JVM label"))?;
+            let short = target == index + 2
+                && matches!(self.code.get(index + 1), Some(Instruction::Goto_w(_)));
             let target = u16::try_from(target)?;
             match &mut self.code[index] {
                 Instruction::Goto_w(t) => *t = i32::from(target),
@@ -88,9 +91,73 @@ impl Assembly {
                     *instruction =
                         crate::jvm::flow::set_conditional_branch_target(instruction, target)
                             .ok_or_else(|| error("invalid symbolic branch"))?;
+                    if short {
+                        candidates.push(index);
+                    }
                 }
             }
         }
+        if candidates.is_empty() {
+            return Ok(self.code);
+        }
+        let offsets = crate::jvm::encoding::instruction_byte_offsets(&self.code)?;
+        let mut targeted = vec![false; self.code.len()];
+        for position in self.labels.into_iter().flatten() {
+            if position < targeted.len() {
+                targeted[position] = true;
+            }
+        }
+        for index in candidates {
+            if targeted[index + 1] {
+                continue;
+            }
+            let Instruction::Goto_w(target) = self.code[index + 1] else {
+                continue;
+            };
+            let target = u16::try_from(target)?;
+            if i16::try_from(offsets[usize::from(target)] as i64 - offsets[index] as i64).is_ok() {
+                self.code[index] =
+                    crate::jvm::flow::invert_conditional_branch(&self.code[index], target).unwrap();
+                // Retain instruction indices and switch alignment for metadata.
+                self.code[index + 1] = Instruction::Nop;
+            }
+        }
         Ok(self.code)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shorten_only_unshared_conditional_trampolines_within_range() {
+        for (distance, shared, short) in
+            [(12, false, true), (40000, false, false), (12, true, false)]
+        {
+            let mut a = Assembly::default();
+            let skip = a.label();
+            let target = a.label();
+            a.branch(Instruction::Ifeq(0), skip);
+            if shared {
+                let shared = a.label();
+                a.bind(shared);
+            }
+            a.branch(Instruction::Goto_w(0), target);
+            a.bind(skip);
+            a.code.resize(distance, Instruction::Nop);
+            a.bind(target);
+            a.code.push(Instruction::Return);
+            let code = a.finish().unwrap();
+            assert_eq!(
+                code[0],
+                if short {
+                    Instruction::Ifne(distance as u16)
+                } else {
+                    Instruction::Ifeq(2)
+                }
+            );
+            assert_eq!(matches!(code[1], Instruction::Nop), short);
+        }
     }
 }

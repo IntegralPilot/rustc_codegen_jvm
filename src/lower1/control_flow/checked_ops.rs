@@ -12,8 +12,6 @@ pub fn emit_checked_arithmetic_oomir_instructions(
     unique_id_offset: usize, // Used to ensure unique labels/temps
     result_tuple_class: &str,
 ) -> (Vec<Instruction>, String, String, String) {
-    // Instead of inlining, emit a call to a reusable checked arithmetic intrinsic function.
-    // The intrinsic function should be emitted once per type/operation elsewhere (e.g., at module init).
     let mut generated_instructions = Vec::new();
     let unique_id = unique_id_offset;
     let tmp_pair = format!("{}_{}_chk_pair_{}", dest_base_name, operation, unique_id);
@@ -38,6 +36,50 @@ pub fn emit_checked_arithmetic_oomir_instructions(
     };
     let fn_name =
         checked_intrinsics::get_intrinsic_function_name(operation, ty_suffix, result_tuple_class);
+
+    if matches!(operation, "add" | "sub") && !matches!(op_ty, Type::Class(_)) {
+        let body = checked_intrinsics::emit_checked_arithmetic_intrinsic(
+            operation,
+            op_ty,
+            ty_suffix,
+            result_tuple_class,
+        );
+        let rename = |name: &str| {
+            if name == "tmp_struct" {
+                tmp_pair.clone()
+            } else {
+                format!("{tmp_pair}${name}")
+            }
+        };
+        let operand = |value: &mut Operand| {
+            if let Operand::Variable { name, .. } = value {
+                match name.as_str() {
+                    "_1" => *value = op1.clone(),
+                    "_2" => *value = op2.clone(),
+                    _ => *name = rename(name),
+                }
+            }
+        };
+        for mut instruction in body.body.basic_blocks["entry"].instructions.clone() {
+            match &mut instruction {
+                Instruction::Binary { dest, op1, op2, .. } => {
+                    *dest = rename(dest);
+                    operand(op1);
+                    operand(op2);
+                }
+                Instruction::ConstructObject { dest, args, .. } => {
+                    *dest = rename(dest);
+                    for (arg, _) in args {
+                        operand(arg);
+                    }
+                }
+                Instruction::Return { .. } => continue,
+                _ => unreachable!(),
+            }
+            generated_instructions.push(instruction);
+        }
+        return (generated_instructions, tmp_pair, tmp_result, tmp_overflow);
+    }
 
     // Register that this intrinsic is needed
     data_types.request_checked_intrinsic(operation, ty_suffix, result_tuple_class);

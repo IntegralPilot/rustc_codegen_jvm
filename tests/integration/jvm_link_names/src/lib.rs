@@ -1,3 +1,7 @@
+#![feature(custom_inner_attributes)]
+#![feature(register_tool)]
+#![register_tool(jvm_codegen)]
+#![jvm_codegen::export]
 #![feature(extern_types)]
 
 unsafe extern "C" {

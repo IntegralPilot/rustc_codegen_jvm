@@ -90,7 +90,7 @@ pub(super) fn struct_tail_pointer_target_class<'tcx>(
 /// Restores the nominal view of a slice-tailed DST when reborrowing through a
 /// pointer wrapper. Allocator-backed pointers can retain the correct data word
 /// and metadata while carrying only the allocation's element view.
-pub(super) fn emit_struct_tail_reborrow_view<'tcx>(
+pub(crate) fn emit_struct_tail_reborrow_view<'tcx>(
     pointee_ty: Ty<'tcx>,
     source: oomir::Operand,
     pointer_ty: &oomir::Type,
@@ -101,6 +101,9 @@ pub(super) fn emit_struct_tail_reborrow_view<'tcx>(
     instructions: &mut Vec<oomir::Instruction>,
 ) -> Option<oomir::Operand> {
     let pointee_ty = normalize_unsize_ty(pointee_ty, tcx, instance);
+    if !matches!(pointee_ty.kind(), TyKind::Adt(def, _) if def.is_struct()) {
+        return None;
+    }
     let tail = tcx.struct_tail_for_codegen(pointee_ty, TypingEnv::fully_monomorphized());
     if tail == pointee_ty {
         return None;
@@ -176,8 +179,10 @@ pub(super) fn emit_struct_tail_pointer_cast<'tcx>(
     data_types: &mut Definitions<'tcx>,
     instructions: &mut Vec<oomir::Instruction>,
 ) -> Option<oomir::Operand> {
-    let source_pointee = normalize_unsize_ty(pointer_pointee_ty(source_pointer_ty), tcx, instance);
-    let target_pointee = normalize_unsize_ty(pointer_pointee_ty(target_pointer_ty), tcx, instance);
+    let source_pointee =
+        normalize_unsize_ty(pointer_pointee_ty(source_pointer_ty, tcx), tcx, instance);
+    let target_pointee =
+        normalize_unsize_ty(pointer_pointee_ty(target_pointer_ty, tcx), tcx, instance);
     let TyKind::Adt(source_def, _) = source_pointee.kind() else {
         return None;
     };
@@ -217,7 +222,8 @@ pub(super) fn emit_slice_pointer_carrier<'tcx>(
     data_types: &mut Definitions<'tcx>,
     instructions: &mut Vec<oomir::Instruction>,
 ) -> Option<oomir::Operand> {
-    let target_pointee = normalize_unsize_ty(pointer_pointee_ty(target_pointer_ty), tcx, instance);
+    let target_pointee =
+        normalize_unsize_ty(pointer_pointee_ty(target_pointer_ty, tcx), tcx, instance);
     let source_ty = source.get_type()?;
     let oomir::Type::Pointer(_) = &source_ty else {
         return None;
@@ -233,7 +239,7 @@ pub(super) fn emit_slice_pointer_carrier<'tcx>(
         target_pointee.sequence_element_type(tcx)
     };
     let element_type = ty_to_oomir_type(element_ty, tcx, data_types, instance);
-    let element_pointer_type = oomir::Type::Pointer(Box::new(element_type));
+    let element_pointer_type = oomir::Type::pointer(element_type);
     let metadata = format!("{dest}_metadata");
     instructions.push(oomir::Instruction::InvokeVirtual {
         dest: Some(metadata.clone()),
@@ -248,24 +254,16 @@ pub(super) fn emit_slice_pointer_carrier<'tcx>(
         operand: source.clone(),
     });
     let retyped = format!("{dest}_data");
-    instructions.push(oomir::Instruction::InvokeVirtual {
+    instructions.push(oomir::Instruction::AddressRetype {
         dest: Some(retyped.clone()),
-        class_name: oomir::POINTER_CLASS.to_string(),
-        method_name: "retype".to_string(),
-        method_ty: oomir::Signature {
-            params: vec![
-                ("self".to_string(), source_ty),
-                ("view_size".to_string(), oomir::Type::U64),
-                ("view_codec".to_string(), oomir::Type::java_string()),
-            ],
-            ret: Box::new(element_pointer_type.clone()),
-            is_static: false,
-        },
-        args: vec![
-            rust_layout_size_operand(element_ty, tcx, instance),
-            crate::lower1::types::pointer_view_codec_operand(element_ty, tcx, data_types, instance),
-        ],
-        operand: source,
+        source: source,
+        layout: Box::new(oomir::AddressLayout {
+            pointer_type: element_pointer_type.clone(),
+            size: rust_layout_size_operand(element_ty, tcx, instance),
+            codec: crate::lower1::types::pointer_view_codec_operand(
+                element_ty, tcx, data_types, instance,
+            ),
+        }),
     });
     let view_class = if target_pointee.is_str() {
         oomir::UTF8_VIEW_CLASS
@@ -321,11 +319,13 @@ pub(super) fn emit_trait_object_to_struct_tail_cast<'tcx>(
     data_types: &mut Definitions<'tcx>,
     instructions: &mut Vec<oomir::Instruction>,
 ) -> Option<oomir::Operand> {
-    let source_pointee = normalize_unsize_ty(pointer_pointee_ty(source_pointer_ty), tcx, instance);
+    let source_pointee =
+        normalize_unsize_ty(pointer_pointee_ty(source_pointer_ty, tcx), tcx, instance);
     if !matches!(source_pointee.kind(), TyKind::Dynamic(..)) {
         return None;
     }
-    let target_pointee = normalize_unsize_ty(pointer_pointee_ty(target_pointer_ty), tcx, instance);
+    let target_pointee =
+        normalize_unsize_ty(pointer_pointee_ty(target_pointer_ty, tcx), tcx, instance);
     let TyKind::Adt(target_def, _) = target_pointee.kind() else {
         return None;
     };
@@ -467,50 +467,32 @@ pub(super) fn emit_struct_trait_tail_pointer_unsize<'tcx>(
         let source_tail_oomir_ty =
             ty_to_oomir_type(source_tail_pointer_ty, tcx, data_types, instance);
         let offset_pointer = format!("{dest}_tail_offset");
-        instructions.push(oomir::Instruction::InvokeVirtual {
+        instructions.push(oomir::Instruction::AddressOffset {
             dest: Some(offset_pointer.clone()),
-            class_name: oomir::POINTER_CLASS.to_string(),
-            method_name: "byte_offset".to_string(),
-            method_ty: oomir::Signature {
-                params: vec![
-                    ("self".to_string(), source_oomir_ty.clone()),
-                    ("byte_count".to_string(), oomir::Type::U64),
-                ],
-                ret: Box::new(source_oomir_ty.clone()),
-                is_static: false,
-            },
-            args: vec![oomir::Operand::Constant(oomir::Constant::U64(
-                info.source_tail_offset,
-            ))],
-            operand: source.clone(),
+            source: source.clone(),
+            count: oomir::Operand::Constant(oomir::Constant::U64(info.source_tail_offset)),
+            ty: source_oomir_ty.clone(),
+            bytes: true,
+            wrapping: false,
+            subtract: false,
         });
         let source_tail_pointer = format!("{dest}_tail_source");
-        instructions.push(oomir::Instruction::InvokeVirtual {
+        instructions.push(oomir::Instruction::AddressRetype {
             dest: Some(source_tail_pointer.clone()),
-            class_name: oomir::POINTER_CLASS.to_string(),
-            method_name: "retype".to_string(),
-            method_ty: oomir::Signature {
-                params: vec![
-                    ("self".to_string(), source_oomir_ty.clone()),
-                    ("view_size".to_string(), oomir::Type::U64),
-                    ("view_codec".to_string(), oomir::Type::java_string()),
-                ],
-                ret: Box::new(source_tail_oomir_ty.clone()),
-                is_static: false,
+            source: oomir::Operand::Variable {
+                name: offset_pointer,
+                ty: source_oomir_ty.clone(),
             },
-            args: vec![
-                rust_layout_size_operand(info.source_tail, tcx, instance),
-                crate::lower1::types::pointer_view_codec_operand(
+            layout: Box::new(oomir::AddressLayout {
+                pointer_type: source_tail_oomir_ty.clone(),
+                size: rust_layout_size_operand(info.source_tail, tcx, instance),
+                codec: crate::lower1::types::pointer_view_codec_operand(
                     info.source_tail,
                     tcx,
                     data_types,
                     instance,
                 ),
-            ],
-            operand: oomir::Operand::Variable {
-                name: offset_pointer,
-                ty: source_oomir_ty.clone(),
-            },
+            }),
         });
         let tail_trait_dest = format!("{dest}_tail_trait");
         let tail_trait = emit_unsize_value(

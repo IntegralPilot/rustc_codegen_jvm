@@ -1,3 +1,7 @@
+#![feature(register_tool)]
+#![register_tool(jvm_codegen)]
+
+#[jvm_codegen::export]
 pub fn triple(value: u32) -> u32 {
     value * 3
 }

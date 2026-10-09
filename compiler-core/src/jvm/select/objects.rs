@@ -1,11 +1,8 @@
-use super::super::abi::{
-    relative_pointer_byte_offset_field, relative_pointer_element_offset_field,
-};
 use super::*;
 
 impl Selector<'_> {
     pub(super) fn object(&mut self, inst: Inst) -> jvm::Result<bool> {
-        if let Op::Cast(value) = inst.op {
+        if let Op::Cast(value) | Op::Refine(value) = inst.op {
             if self.value_kind(value)? == Kind::Reference
                 && self.value_kind(inst.result.unwrap())? == Kind::Reference
             {
@@ -63,38 +60,6 @@ impl Selector<'_> {
             _ => unreachable!(),
         };
         self.assembly.code.push(op);
-        if field.relative_pointer {
-            let (object, store) = match inst.op {
-                Op::GetField { object, .. } => (object, false),
-                Op::SetField { object, .. } => (object, true),
-                _ => return Err(error("relative pointer fields require an instance")),
-            };
-            for name in [
-                relative_pointer_element_offset_field(&field.name),
-                relative_pointer_byte_offset_field(&field.name),
-            ] {
-                let offset = self.cp.add_field_ref(class, name, "J")?;
-                self.load(object)?;
-                if store {
-                    self.assembly
-                        .code
-                        .extend([Instruction::Lconst_0, Instruction::Putfield(offset)]);
-                } else {
-                    self.assembly.code.push(Instruction::Getfield(offset));
-                }
-            }
-            if !store {
-                let owner = self.cp.add_class(POINTER_CLASS)?;
-                let materialize = self.cp.add_method_ref(
-                    owner,
-                    "materializeRelative",
-                    "(Lorg/rustlang/runtime/Pointer;JJ)Lorg/rustlang/runtime/Pointer;",
-                )?;
-                self.assembly
-                    .code
-                    .push(Instruction::Invokestatic(materialize));
-            }
-        }
         Ok(true)
     }
 }

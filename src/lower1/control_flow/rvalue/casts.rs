@@ -94,6 +94,8 @@ impl<'tcx> RvalueContext<'_, 'tcx> {
                         }
                         if let Some(FnPointerTarget::Static(target)) = &callable_target
                             && let Some(target_class_name) = &target.class_to_call_on
+                            && (!signature.needs_component_abi()
+                                || oomir::component_method(target_class_name, &target.method_name))
                         {
                             instructions.push(oomir::Instruction::CreateFunctionPointer {
                                 dest: temp_cast_var.clone(),
@@ -164,6 +166,7 @@ impl<'tcx> RvalueContext<'_, 'tcx> {
 
                         if let Ok(bridge_class) = ensure_erased_receiver_fn_pointer_bridge(
                             data_types,
+                            source_mir_ty,
                             &source_signature,
                             &source_interface,
                             &target_signature,
@@ -228,7 +231,7 @@ impl<'tcx> RvalueContext<'_, 'tcx> {
                         );
                         if matches!(source_mir_ty.kind(), TyKind::RawPtr(..) | TyKind::Ref(..))
                             && matches!(
-                                pointer_pointee_ty(source_mir_ty).kind(),
+                                pointer_pointee_ty(source_mir_ty, tcx).kind(),
                                 TyKind::Dynamic(..)
                             )
                             && matches!(
@@ -236,11 +239,11 @@ impl<'tcx> RvalueContext<'_, 'tcx> {
                                 TyKind::RawPtr(..) | TyKind::Ref(..)
                             )
                             && !matches!(
-                                pointer_pointee_ty(resolved_target_mir_ty).kind(),
+                                pointer_pointee_ty(resolved_target_mir_ty, tcx).kind(),
                                 TyKind::Dynamic(..)
                             )
                             && crate::lower1::types::is_codegen_sized(
-                                pointer_pointee_ty(resolved_target_mir_ty),
+                                pointer_pointee_ty(resolved_target_mir_ty, tcx),
                                 tcx,
                             )
                             && matches!(oomir_target_type, oomir::Type::Pointer(_))
@@ -262,7 +265,7 @@ impl<'tcx> RvalueContext<'_, 'tcx> {
                                     raw_oomir_operand,
                                     pointer_view_size_operand(*target_mir_ty, tcx, instance),
                                     crate::lower1::types::pointer_view_codec_operand(
-                                        pointer_pointee_ty(*target_mir_ty),
+                                        pointer_pointee_ty(resolved_target_mir_ty, tcx),
                                         tcx,
                                         data_types,
                                         instance,
@@ -422,7 +425,7 @@ impl<'tcx> RvalueContext<'_, 'tcx> {
                                     oomir_operand,
                                     pointer_view_size_operand(*target_mir_ty, tcx, instance),
                                     crate::lower1::types::pointer_view_codec_operand(
-                                        pointer_pointee_ty(*target_mir_ty),
+                                        pointer_pointee_ty(resolved_target_mir_ty, tcx),
                                         tcx,
                                         data_types,
                                         instance,
@@ -588,7 +591,7 @@ impl<'tcx> RvalueContext<'_, 'tcx> {
                                     address,
                                     pointer_view_size_operand(*target_mir_ty, tcx, instance),
                                     crate::lower1::types::pointer_view_codec_operand(
-                                        pointer_pointee_ty(*target_mir_ty),
+                                        pointer_pointee_ty(resolved_target_mir_ty, tcx),
                                         tcx,
                                         data_types,
                                         instance,

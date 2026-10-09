@@ -8,9 +8,7 @@ use rustc_middle::ty::{
 
 use super::super::{
     jvm_names,
-    types::{
-        pointer_view_codec_operand, readable_rust_type_name, sanitize_name_token, ty_to_oomir_type,
-    },
+    types::{pointer_view_codec_operand, stable_type_identity, ty_to_oomir_type},
 };
 use crate::oomir;
 
@@ -23,7 +21,7 @@ const RUNTIME_TRAIT_OBJECT_ALIGNMENT_METHOD: &str = "rustTraitObjectAlignment";
 pub(super) fn carrier_needs_trait_object_adapter(
     carrier_ty: &oomir::Type,
     interface_name: &str,
-    data_types: &HashMap<String, oomir::DataType>,
+    data_types: &crate::lower1::context::Definitions<'_>,
 ) -> bool {
     match carrier_ty {
         oomir::Type::Class(class_name) => !matches!(
@@ -107,21 +105,16 @@ pub(crate) fn ensure_trait_object_adapter_class_for_pointees<'tcx>(
     );
 
     let identity = format!(
-        "{dynamic_ty:?}:{trait_ref:?}:{}",
+        "{}:{}:{}",
+        stable_type_identity(tcx, concrete_ty),
+        stable_type_identity(tcx, dynamic_ty),
         carrier_ty.to_jvm_descriptor()
     );
-    let concrete_token = sanitize_name_token(&readable_rust_type_name(
-        concrete_ty,
-        tcx,
-        data_types,
-        instance_context,
-    ));
-    let interface_token = interface_name.rsplit('/').next().unwrap_or(interface_name);
-    let local_name = crate::stable_hash::readable_or_hashed_name(
-        "TraitObjectCarrier",
-        &format!("{concrete_token}_as_{interface_token}"),
-        &identity,
-        180,
+    // Different Rust callables can share one physical carrier. Dispatch requires their Rust
+    // identity.
+    let local_name = format!(
+        "TraitObjectCarrier_{}",
+        crate::stable_hash::short_hash(&identity, 16)
     );
     let class_name = jvm_names::synthetic_class_for_instance(tcx, instance_context, local_name);
     if data_types.contains_key(&class_name) {
@@ -130,13 +123,35 @@ pub(crate) fn ensure_trait_object_adapter_class_for_pointees<'tcx>(
 
     let mut adapter_methods = HashMap::default();
     let mut interface_methods = HashMap::default();
-    let callable_fn_pointer = callable_abi
+    let callable_value = callable_abi
         .as_ref()
-        .filter(|_| matches!(concrete_ty.kind(), TyKind::FnPtr(..)));
-    if let Some(callable) = callable_fn_pointer {
-        // Fn/FnMut/FnOnce share one flattened JVM call method. Forward through
-        // the stored function pointer instead of adding Rust's tuple-taking
-        // vtable shims as extra abstract methods on the functional interface.
+        .filter(|_| matches!(concrete_ty.kind(), TyKind::FnPtr(..) | TyKind::Closure(..)));
+    if let Some(callable) = callable_value {
+        let erased_closure = match concrete_ty.kind() {
+            TyKind::Closure(def, args) if args.as_closure().upvar_tys().is_empty() => {
+                Some(Instance::new_raw(*def, args))
+            }
+            _ => None,
+        };
+        let value_ty =
+            if erased_closure.is_none() && matches!(concrete_ty.kind(), TyKind::Closure(..)) {
+                if !super::rvalue::ensure_closure_callable_bridge(
+                    concrete_ty,
+                    callable,
+                    data_types,
+                    tcx,
+                    instance_context,
+                ) {
+                    return Err(format!(
+                        "could not generate callable closure bridge for {concrete_ty:?}"
+                    ));
+                }
+                ty_to_oomir_type(concrete_ty, tcx, data_types, instance_context)
+            } else {
+                oomir::Type::Interface(callable.interface_name.clone())
+            };
+        // Fn, FnMut, and FnOnce share one JVM call method. Extra tuple shims would break the
+        // functional interface.
         let payload = oomir::Operand::Variable {
             name: "_callable".to_string(),
             ty: carrier_ty.clone(),
@@ -151,36 +166,86 @@ pub(crate) fn ensure_trait_object_adapter_class_for_pointees<'tcx>(
             field_ty: carrier_ty.clone(),
             owner_class: class_name.clone(),
         }];
-        let function = if matches!(carrier_ty, oomir::Type::Pointer(_)) {
-            crate::lower1::place::emit_pointer_read(
-                payload,
-                &oomir::Type::Interface(callable.interface_name.clone()),
-                "_function",
-                &mut instructions,
-            )
-        } else {
-            payload
-        };
         let result = callable
             .signature
             .ret
             .has_jvm_value()
             .then(|| "_ret".to_string());
-        instructions.push(oomir::Instruction::CallIndirect {
-            dest: result.clone(),
-            function_ptr: Box::new(function),
-            args: callable
-                .signature
-                .params
-                .iter()
-                .enumerate()
-                .map(|(index, (_, ty))| oomir::Operand::Variable {
-                    name: format!("_{}", index + 2),
-                    ty: ty.clone(),
-                })
-                .collect(),
-            signature: callable.signature.clone(),
-        });
+        let arguments = callable
+            .signature
+            .params
+            .iter()
+            .enumerate()
+            .map(|(index, (_, ty))| oomir::Operand::Variable {
+                name: format!("_{}", index + 2),
+                ty: ty.clone(),
+            })
+            .collect::<Vec<_>>();
+        if let Some(closure) = erased_closure {
+            instructions.clear();
+            let tuple_ty = ty_to_oomir_type(callable.tuple_ty, tcx, data_types, instance_context);
+            let mut params = Vec::new();
+            let mut args = Vec::new();
+            if tuple_ty.has_jvm_value() {
+                let argument = crate::lower1::types::tuple_value(
+                    callable.tuple_ty,
+                    arguments
+                        .into_iter()
+                        .zip(callable.signature.params.iter().map(|(_, ty)| ty.clone()))
+                        .collect(),
+                    "_arguments",
+                    tcx,
+                    data_types,
+                    instance_context,
+                    &mut instructions,
+                );
+                params.push(("args".into(), tuple_ty.clone()));
+                args.push(argument);
+            }
+            let target = data_types.function_name(tcx, closure);
+            instructions.push(oomir::Instruction::InvokeStatic {
+                dest: result.clone(),
+                class_name: target.class_to_call_on.expect("closure owner"),
+                method_name: target.method_name,
+                method_ty: oomir::Signature {
+                    params,
+                    ret: callable.signature.ret.clone(),
+                    is_static: true,
+                },
+                args,
+            });
+        } else {
+            let function = if matches!(carrier_ty, oomir::Type::Pointer(_)) {
+                crate::lower1::place::emit_pointer_read(
+                    payload,
+                    &value_ty,
+                    "_function",
+                    &mut instructions,
+                )
+            } else {
+                payload
+            };
+            let interface_ty = oomir::Type::Interface(callable.interface_name.clone());
+            let function = if function.get_type().as_ref() != Some(&interface_ty) {
+                instructions.push(oomir::Instruction::Cast {
+                    op: function,
+                    ty: interface_ty.clone(),
+                    dest: "_function_interface".into(),
+                });
+                oomir::Operand::Variable {
+                    name: "_function_interface".into(),
+                    ty: interface_ty,
+                }
+            } else {
+                function
+            };
+            instructions.push(oomir::Instruction::CallIndirect {
+                dest: result.clone(),
+                function_ptr: Box::new(function),
+                args: arguments,
+                signature: callable.signature.clone(),
+            });
+        }
         instructions.push(oomir::Instruction::Return {
             operand: result.map(|name| oomir::Operand::Variable {
                 name,
@@ -216,7 +281,7 @@ pub(crate) fn ensure_trait_object_adapter_class_for_pointees<'tcx>(
     }
     for entry in trait_ref
         .into_iter()
-        .filter(|_| callable_fn_pointer.is_none())
+        .filter(|_| callable_value.is_none())
         .flat_map(|trait_ref| tcx.vtable_entries(trait_ref).iter())
     {
         let VtblEntry::Method(target_instance) = entry else {
@@ -227,144 +292,6 @@ pub(crate) fn ensure_trait_object_adapter_class_for_pointees<'tcx>(
             .type_of(target_instance.def_id())
             .instantiate(tcx, target_instance.args)
             .skip_norm_wip();
-        if let TyKind::Closure(_, closure_args) = target_instance_ty.kind() {
-            let Some(callable_abi) = &callable_abi else {
-                return Err(format!(
-                    "closure vtable entry does not target a callable trait: {target_instance:?}"
-                ));
-            };
-            let closure_signature =
-                tcx.instantiate_bound_regions_with_erased(closure_args.as_closure().sig());
-            let tuple_ty = *closure_signature
-                .inputs()
-                .first()
-                .ok_or_else(|| {
-                    format!("closure call signature has no argument tuple: {target_instance:?}")
-                })?;
-            let tuple_oomir_ty = ty_to_oomir_type(tuple_ty, tcx, data_types, *target_instance);
-            let return_ty = callable_abi.signature.ret.as_ref().clone();
-            let payload_name = "_trait_object_payload".to_string();
-            let mut instructions = vec![oomir::Instruction::GetField {
-                dest: payload_name.clone(),
-                object: oomir::Operand::Variable {
-                    name: "_1".to_string(),
-                    ty: oomir::Type::Class(class_name.clone()),
-                },
-                field_name: "value".to_string(),
-                field_ty: carrier_ty.clone(),
-                owner_class: class_name.clone(),
-            }];
-            let mut target_params = Vec::new();
-            let mut target_args = Vec::new();
-            if !closure_args.as_closure().upvar_tys().is_empty() {
-                target_params.push(("closure_env".to_string(), carrier_ty.clone()));
-                target_args.push(oomir::Operand::Variable {
-                    name: payload_name,
-                    ty: carrier_ty.clone(),
-                });
-            }
-            if tuple_oomir_ty.has_jvm_value() {
-                let tuple_name = "_trait_object_call_args".to_string();
-                instructions.push(oomir::Instruction::ConstructObject {
-                    dest: tuple_name.clone(),
-                    class_name: tuple_oomir_ty
-                        .get_class_name()
-                        .ok_or_else(|| {
-                            format!("closure argument tuple has no JVM class: {tuple_oomir_ty:?}")
-                        })?
-                        .to_string(),
-                    args: callable_abi
-                        .signature
-                        .params
-                        .iter()
-                        .enumerate()
-                        .map(|(index, (_, ty))| {
-                            (
-                                oomir::Operand::Variable {
-                                    name: format!("_{}", index + 2),
-                                    ty: ty.clone(),
-                                },
-                                ty.clone(),
-                            )
-                        })
-                        .collect(),
-                });
-                target_params.push(("args".to_string(), tuple_oomir_ty.clone()));
-                target_args.push(oomir::Operand::Variable {
-                    name: tuple_name,
-                    ty: tuple_oomir_ty,
-                });
-            }
-            let call_dest = return_ty.has_jvm_value().then(|| "_ret".to_string());
-            let target = data_types.function_name(tcx, *target_instance);
-            instructions.extend([
-                oomir::Instruction::InvokeStatic {
-                    dest: call_dest.clone(),
-                    class_name: target.class_to_call_on.expect("closure has a JVM owner"),
-                    method_name: target.method_name,
-                    method_ty: oomir::Signature {
-                        params: target_params,
-                        ret: Box::new(return_ty.clone()),
-                        is_static: true,
-                    },
-                    args: target_args,
-                },
-                oomir::Instruction::Return {
-                    operand: call_dest.map(|name| oomir::Operand::Variable {
-                        name,
-                        ty: return_ty.clone(),
-                    }),
-                },
-            ]);
-
-            let interface_params = callable_abi.signature.params.clone();
-            let method_name = "call".to_string();
-            interface_methods.insert(
-                method_name.clone(),
-                oomir::Signature {
-                    params: interface_params.clone(),
-                    ret: Box::new(return_ty.clone()),
-                    is_static: false,
-                },
-            );
-            adapter_methods.insert(
-                method_name.clone(),
-                oomir::DataTypeMethod::Function(oomir::Function {
-                    name: method_name,
-                    owner_class: None,
-                    debug_variables: Vec::new(),
-                    signature: oomir::Signature {
-                        params: std::iter::once((
-                            "self".to_string(),
-                            oomir::Type::Class(class_name.clone()),
-                        ))
-                        .chain(interface_params)
-                        .collect(),
-                        ret: Box::new(return_ty),
-                        is_static: false,
-                    },
-                    body: oomir::CodeBlock {
-                        entry: "bb0".to_string(),
-                        basic_blocks: HashMap::from_iter([(
-                            "bb0".to_string(),
-                            oomir::BasicBlock {
-                                label: "bb0".to_string(),
-                                instructions,
-                            },
-                        )]),
-                    }
-                    .into(),
-                }),
-            );
-            continue;
-        }
-        if callable_abi.is_some() && matches!(concrete_ty.kind(), TyKind::Closure(..)) {
-            // The JVM callable interface deliberately exposes one flattened
-            // `call` method. The remaining Rust vtable entries are Fn/FnMut/
-            // FnOnce shims for the same closure body, not additional methods
-            // that belong on that functional interface.
-            continue;
-        }
         let is_coroutine = matches!(target_instance_ty.kind(), TyKind::Coroutine(..));
         let (target_inputs, target_output) = if is_coroutine
             || matches!(target_instance.def, InstanceKind::Shim(ShimKind::VTable(_)))
@@ -426,28 +353,13 @@ pub(crate) fn ensure_trait_object_adapter_class_for_pointees<'tcx>(
             })?;
             let element_ty = *element_ty;
             let element_oomir_ty = ty_to_oomir_type(element_ty, tcx, data_types, instance_context);
-            let element_pointer_ty = oomir::Type::Pointer(Box::new(element_oomir_ty));
+            let element_pointer_ty = oomir::Type::pointer(element_oomir_ty);
             let element_pointer_name = "_trait_object_array_data".to_string();
             let receiver_object_name = "_trait_object_receiver_object".to_string();
             let receiver_name = "_trait_object_receiver".to_string();
             (
                 vec![
-                    oomir::Instruction::InvokeStatic {
-                        dest: Some(element_pointer_name.clone()),
-                        class_name: oomir::POINTER_CLASS.to_string(),
-                        method_name: "retype".to_string(),
-                        method_ty: oomir::Signature {
-                            params: vec![
-                                ("pointer".to_string(), carrier_ty.clone()),
-                                ("view_size".to_string(), oomir::Type::U64),
-                                ("view_codec".to_string(), oomir::Type::java_string()),
-                            ],
-                            ret: Box::new(element_pointer_ty.clone()),
-                            is_static: true,
-                        },
-                        args: vec![
-                            payload_operand,
-                            oomir::Operand::Constant(oomir::Constant::U64(
+                    oomir::Instruction::AddressRetype { dest: Some(element_pointer_name.clone()), source: payload_operand, layout: Box::new(oomir::AddressLayout { pointer_type: element_pointer_ty.clone(), size: oomir::Operand::Constant(oomir::Constant::U64(
                                 super::super::types::layout_size_bytes(tcx, element_ty)?
                                     .try_into()
                                     .map_err(|_| {
@@ -455,15 +367,12 @@ pub(crate) fn ensure_trait_object_adapter_class_for_pointees<'tcx>(
                                             "trait-object array element is too large: {element_ty:?}"
                                         )
                                     })?,
-                            )),
-                            pointer_view_codec_operand(
+                            )), codec: pointer_view_codec_operand(
                                 element_ty,
                                 tcx,
                                 data_types,
                                 instance_context,
-                            ),
-                        ],
-                    },
+                            ) }) },
                     oomir::Instruction::ConstructObject {
                         dest: receiver_object_name.clone(),
                         class_name: oomir::SLICE_VIEW_CLASS.to_string(),
@@ -580,19 +489,21 @@ pub(crate) fn ensure_trait_object_adapter_class_for_pointees<'tcx>(
             field_ty: carrier_ty.clone(),
             owner_class: class_name.clone(),
         };
-        let receiver_has_interface = match &target_receiver_ty {
-            oomir::Type::Pointer(inner) | oomir::Type::Reference(inner) => match inner.as_ref() {
-                oomir::Type::Class(receiver_class) => matches!(
-                    data_types.get(receiver_class),
-                    Some(oomir::DataType::Class { interfaces, .. })
-                        if interfaces.iter().any(|interface| interface == interface_name)
-                ),
+        let receiver_has_interface = super::super::types::tagged_scalar(concrete_ty, tcx).is_none()
+            && super::super::types::enum_carrier(concrete_ty, tcx).is_none()
+            && match &target_receiver_ty {
+                oomir::Type::Pointer(oomir::Pointee { value: inner, .. }) => match inner.as_ref() {
+                    oomir::Type::Class(receiver_class) => matches!(
+                        data_types.get(receiver_class),
+                        Some(oomir::DataType::Class { interfaces, .. })
+                            if interfaces.iter().any(|interface| interface == interface_name)
+                    ),
+                    _ => false,
+                },
                 _ => false,
-            },
-            _ => false,
-        };
+            };
         let call = match &target_receiver_ty {
-            oomir::Type::Pointer(inner) | oomir::Type::Reference(inner)
+            oomir::Type::Pointer(oomir::Pointee { value: inner, .. })
                 if matches!(inner.as_ref(), oomir::Type::Class(_)) && receiver_has_interface =>
             {
                 let oomir::Type::Class(receiver_class) = inner.as_ref() else {
@@ -743,12 +654,44 @@ pub(crate) fn ensure_trait_object_adapter_class_for_pointees<'tcx>(
             .into(),
         }),
     );
-    let adapter_drops_payload = concrete_ty.needs_drop(tcx, TypingEnv::fully_monomorphized())
-        && matches!(carrier_ty, oomir::Type::Pointer(_));
+    let adapter_drops_payload = concrete_ty.needs_drop(tcx, TypingEnv::fully_monomorphized());
     if adapter_drops_payload {
-        let drop_instance = Instance::resolve_drop_glue(tcx, concrete_ty);
-        let target = data_types.function_name(tcx, drop_instance);
         let payload_name = "_trait_object_drop_payload".to_string();
+        let payload = oomir::Operand::Variable {
+            name: payload_name.clone(),
+            ty: carrier_ty.clone(),
+        };
+        let mut instructions = vec![oomir::Instruction::GetField {
+            dest: payload_name,
+            object: oomir::Operand::Variable {
+                name: "_1".to_string(),
+                ty: oomir::Type::Class(class_name.clone()),
+            },
+            field_name: "value".to_string(),
+            field_ty: carrier_ty.clone(),
+            owner_class: class_name.clone(),
+        }];
+        if matches!(carrier_ty, oomir::Type::Pointer(_)) {
+            super::emit_drop_in_place(
+                concrete_ty,
+                payload,
+                tcx,
+                instance_context,
+                data_types,
+                &mut instructions,
+            );
+        } else {
+            super::emit_owned_drop(
+                concrete_ty,
+                payload,
+                "_trait_drop",
+                tcx,
+                instance_context,
+                data_types,
+                &mut instructions,
+            );
+        }
+        instructions.push(oomir::Instruction::Return { operand: None });
         adapter_methods.insert(
             "rustDrop".to_string(),
             oomir::DataTypeMethod::Function(oomir::Function {
@@ -766,35 +709,7 @@ pub(crate) fn ensure_trait_object_adapter_class_for_pointees<'tcx>(
                         "bb0".to_string(),
                         oomir::BasicBlock {
                             label: "bb0".to_string(),
-                            instructions: vec![
-                                oomir::Instruction::GetField {
-                                    dest: payload_name.clone(),
-                                    object: oomir::Operand::Variable {
-                                        name: "_1".to_string(),
-                                        ty: oomir::Type::Class(class_name.clone()),
-                                    },
-                                    field_name: "value".to_string(),
-                                    field_ty: carrier_ty.clone(),
-                                    owner_class: class_name.clone(),
-                                },
-                                oomir::Instruction::InvokeStatic {
-                                    dest: None,
-                                    class_name: target
-                                        .class_to_call_on
-                                        .expect("trait-object payload drop glue has a JVM owner"),
-                                    method_name: target.method_name,
-                                    method_ty: oomir::Signature {
-                                        params: vec![("pointee".to_string(), carrier_ty.clone())],
-                                        ret: Box::new(oomir::Type::Void),
-                                        is_static: true,
-                                    },
-                                    args: vec![oomir::Operand::Variable {
-                                        name: payload_name,
-                                        ty: carrier_ty.clone(),
-                                    }],
-                                },
-                                oomir::Instruction::Return { operand: None },
-                            ],
+                            instructions,
                         },
                     )]),
                 }
@@ -875,6 +790,7 @@ pub(crate) fn ensure_trait_object_adapter_class_for_pointees<'tcx>(
         class_name.clone(),
         oomir::DataType::Class {
             fields: vec![("value".to_string(), carrier_ty.clone())],
+            kind: crate::oomir::ClassKind::Value,
             is_abstract: false,
             methods: adapter_methods,
             super_class: Some("java/lang/Object".to_string()),

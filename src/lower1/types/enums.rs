@@ -1,10 +1,21 @@
 use super::*;
 use crate::lower1::context::Definitions;
 
-/// Returns the public JVM field name for a Rust enum variant payload.
-///
-/// Struct-like variants retain their source field names. Tuple-like variants
-/// use `value` when there is exactly one payload and `_0`, `_1`, ... otherwise.
+/// Private variants use positional names. Java exports and Option/Poll adapters keep their required
+/// names.
+pub(crate) fn enum_variant_name(variant: &rustc_middle::ty::VariantDef, tcx: TyCtxt<'_>) -> String {
+    let adt = tcx.adt_def(tcx.parent(variant.def_id));
+    if super::adt::has_java_adt_identity(tcx, &adt)
+        || matches!(variant.name.as_str(), "None" | "Some" | "Ready" | "Pending")
+    {
+        jvm_names::member_name(&variant.name.to_string())
+    } else {
+        format!("V{}", adt.variant_index_with_id(variant.def_id).as_usize())
+    }
+}
+
+/// Private payload fields use positional names. Exported struct variants keep their declared field
+/// names.
 pub(crate) fn enum_variant_field_name(
     variant: &rustc_middle::ty::VariantDef,
     field_index: usize,
@@ -20,7 +31,8 @@ pub(crate) fn enum_variant_field_name(
             )
         });
     let source_name = field.ident(tcx).to_string();
-    if source_name.parse::<usize>().is_ok() {
+    let adt = tcx.adt_def(tcx.parent(variant.def_id));
+    if !super::adt::has_java_adt_identity(tcx, &adt) || source_name.parse::<usize>().is_ok() {
         if variant.fields.len() == 1 {
             "value".to_string()
         } else {
@@ -29,15 +41,6 @@ pub(crate) fn enum_variant_field_name(
     } else {
         jvm_names::member_name(&source_name)
     }
-}
-
-pub(crate) fn enum_scoped_method_name(enum_class: &str, method: &str) -> String {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for byte in enum_class.bytes() {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    format!("{method}${hash:016x}")
 }
 
 pub(crate) fn union_from_method_name(field_name: &str) -> String {
@@ -170,7 +173,7 @@ pub(super) fn enum_from_union_discriminant_function<'tcx>(
         let variant_class_name = format!(
             "{}${}",
             base_enum_name,
-            jvm_names::member_name(&variant.name.to_string())
+            crate::lower1::types::enum_variant_name(variant, tcx)
         );
         let block_name = format!("variant_{}", variant_idx.as_u32());
         let result_name = format!("_variant_{}", variant_idx.as_u32());
@@ -286,13 +289,14 @@ pub(super) fn ensure_enum_data_types<'tcx>(
         let variant_class_name = format!(
             "{}${}",
             base_enum_name,
-            jvm_names::member_name(&variant.name.to_string())
+            crate::lower1::types::enum_variant_name(variant, tcx)
         );
         if !data_types.contains_key(&variant_class_name) {
             data_types.insert(
                 variant_class_name.clone(),
                 oomir::DataType::Class {
                     fields: vec![],
+                    kind: adt_class_kind(tcx, adt_def, substs),
                     is_abstract: false,
                     methods: HashMap::default(),
                     super_class: None,
@@ -311,6 +315,11 @@ pub(super) fn ensure_enum_data_types<'tcx>(
         .variants()
         .iter()
         .any(|variant| is_jvm_subtype_variant(tcx, variant));
+    let private = adt_class_kind(tcx, adt_def, substs) == oomir::ClassKind::Value;
+    // Concrete variants have one enum parent. Transparent parents use instanceof to select the
+    // correct tag.
+    let discriminant_dispatch = (private && has_numeric_discriminant && !has_transparent_variant)
+        .then(|| oomir::ENUM_TAG_METHOD.to_owned());
     let union_factory = (!has_transparent_variant)
         .then_some(union_size)
         .flatten()
@@ -319,7 +328,7 @@ pub(super) fn ensure_enum_data_types<'tcx>(
         .variants()
         .iter()
         .map(|variant| {
-            let variant_name = jvm_names::member_name(&variant.name.to_string());
+            let variant_name = crate::lower1::types::enum_variant_name(variant, tcx);
             let fields = variant
                 .fields
                 .iter()
@@ -382,17 +391,13 @@ pub(super) fn ensure_enum_data_types<'tcx>(
             variants_info.clone(),
             tcx.is_lang_item(adt_def.did(), rustc_attr_ir::lang_items::LangItem::Option),
         );
-        methods
-            .entry(enum_scoped_method_name(
-                base_enum_name,
-                ENUM_DROP_FIELDS_METHOD,
-            ))
-            .or_insert(DataTypeMethod::Abstract(oomir::Signature {
-                params: vec![],
-                ret: Box::new(oomir::Type::Void),
-                is_static: false,
-            }));
         if has_numeric_discriminant {
+            if let Some(name) = &discriminant_dispatch {
+                methods.insert(
+                    name.clone(),
+                    DataTypeMethod::SimpleConstantReturn(oomir::Type::I64, None),
+                );
+            }
             methods
                 .entry(ENUM_UNION_DISCRIMINANT_METHOD.to_string())
                 .or_insert(DataTypeMethod::AdtHelperMethod {
@@ -403,6 +408,7 @@ pub(super) fn ensure_enum_data_types<'tcx>(
                             .discriminants(tcx)
                             .map(|(_, discriminant)| discriminant.val as i64)
                             .collect(),
+                        dispatch: discriminant_dispatch.clone(),
                     },
                 });
         }
@@ -413,37 +419,15 @@ pub(super) fn ensure_enum_data_types<'tcx>(
         }
     }
 
-    for (_variant_idx, variant) in adt_def.variants().iter().enumerate() {
-        if let Some(payload_ty) = jvm_subtype_payload_ty(adt_def, variant, substs, tcx) {
-            let receiver_class = ty_to_oomir_type(payload_ty, tcx, data_types, instance_context)
-                .get_class_name()
-                .expect("transparent enum payload is an enum interface")
-                .to_string();
-            let drop_function = enum_transparent_variant_drop_glue_function(
-                payload_ty,
-                base_enum_name,
-                &receiver_class,
-                tcx,
-                data_types,
-                instance_context,
-            );
-            let Some(oomir::DataType::Interface { methods, .. }) =
-                data_types.get_mut(&receiver_class)
-            else {
-                tcx.dcx().fatal(format!(
-                    "transparent enum payload {receiver_class} is not an interface"
-                ));
-            };
-            methods.insert(
-                enum_scoped_method_name(base_enum_name, ENUM_DROP_FIELDS_METHOD),
-                DataTypeMethod::Function(drop_function),
-            );
+    for (variant_idx, discriminant) in adt_def.discriminants(tcx) {
+        let variant = adt_def.variant(variant_idx);
+        if jvm_subtype_payload_ty(adt_def, variant, substs, tcx).is_some() {
             continue;
         }
         let variant_class_name = format!(
             "{}${}",
             base_enum_name,
-            jvm_names::member_name(&variant.name.to_string())
+            crate::lower1::types::enum_variant_name(variant, tcx)
         );
         if !created_placeholders.contains(&variant_class_name) {
             if let Some(oomir::DataType::Class { .. }) = data_types.get_mut(&variant_class_name) {
@@ -468,19 +452,18 @@ pub(super) fn ensure_enum_data_types<'tcx>(
             })
             .collect();
         let mut methods = HashMap::default();
-        methods.insert(
-            enum_scoped_method_name(base_enum_name, ENUM_DROP_FIELDS_METHOD),
-            DataTypeMethod::Function(enum_variant_drop_glue_function(
-                variant,
-                substs,
-                base_enum_name,
-                &variant_class_name,
-                tcx,
-                data_types,
-                instance_context,
-            )),
-        );
-        for (component_index, (field_name, field_ty)) in fields.iter().enumerate() {
+        if let Some(name) = &discriminant_dispatch {
+            methods.insert(
+                name.clone(),
+                DataTypeMethod::SimpleConstantReturn(
+                    oomir::Type::I64,
+                    Some(oomir::Constant::I64(discriminant.val as i64)),
+                ),
+            );
+        }
+        for (component_index, (field_name, field_ty)) in
+            fields.iter().enumerate().filter(|_| !private)
+        {
             methods.insert(
                 format!("component{}", component_index + 1),
                 DataTypeMethod::AdtHelperMethod {
@@ -525,7 +508,7 @@ pub(crate) fn adapt_simple_enum_operand(
     source: oomir::Operand,
     target_ty: &oomir::Type,
     temp_prefix: &str,
-    data_types: &HashMap<String, oomir::DataType>,
+    data_types: &crate::lower1::context::Definitions<'_>,
     instructions: &mut Vec<oomir::Instruction>,
 ) -> oomir::Operand {
     let oomir::Type::Class(enum_class) = target_ty else {

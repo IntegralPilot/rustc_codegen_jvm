@@ -11,6 +11,25 @@ pub(crate) fn read_scalar_int_constant<'tcx>(
     let ty = EarlyBinder::bind(tcx, ty)
         .instantiate(tcx, instance.args)
         .skip_norm_wip();
+    if let Some(payload) = crate::lower1::types::transparent_payload(ty, tcx) {
+        return read_scalar_int_constant(tcx, scalar_int, payload.ty, oomir_data_types, instance);
+    }
+    if let Some(scalar) = crate::lower1::types::value_scalar_ty(ty, tcx) {
+        return scalar_int_to_oomir_constant(tcx, scalar_int, scalar);
+    }
+    if let Some(carrier) = crate::lower1::types::enum_carrier(ty, tcx) {
+        let payload = carrier.payload;
+        return if carrier.nullable && scalar_int.to_target_usize(tcx) == 0 {
+            Ok(oomir::Constant::Null(ty_to_oomir_type(
+                payload,
+                tcx,
+                oomir_data_types,
+                instance,
+            )))
+        } else {
+            read_scalar_int_constant(tcx, scalar_int, payload, oomir_data_types, instance)
+        };
+    }
     if let TyKind::Pat(base_ty, _) = ty.kind() {
         return read_scalar_int_constant(tcx, scalar_int, *base_ty, oomir_data_types, instance);
     }
@@ -38,52 +57,16 @@ pub(crate) fn read_scalar_int_constant<'tcx>(
         });
     }
 
-    if let TyKind::Closure(_, closure_args) = ty.kind() {
-        let class_name = match ty_to_oomir_type(ty, tcx, oomir_data_types, instance) {
-            oomir::Type::Class(class_name) => class_name,
-            other => {
-                return Err(format!(
-                    "Scalar closure {ty:?} did not map to a JVM class: {other:?}"
-                ));
-            }
-        };
-        let mut params = Vec::new();
-        let mut param_types = Vec::new();
-        let mut non_zst_captures = 0usize;
-        for capture_ty in closure_args.as_closure().upvar_tys().iter() {
-            let capture_ty = EarlyBinder::bind(tcx, capture_ty)
-                .instantiate(tcx, instance.args)
-                .skip_norm_wip();
-            let capture_layout = tcx
-                .layout_of(TypingEnv::fully_monomorphized().as_query_input(capture_ty))
-                .map_err(|error| {
-                    format!(
-                        "Could not determine closure capture layout for {capture_ty:?}: {error:?}"
-                    )
-                })?;
-            let capture_jvm_ty = ty_to_oomir_type(capture_ty, tcx, oomir_data_types, instance);
-            if !capture_jvm_ty.has_jvm_value() {
-                continue;
-            }
-            let capture = if capture_layout.is_zst() {
-                read_zero_sized_constant(tcx, capture_ty, oomir_data_types, instance)?
-            } else {
-                non_zst_captures += 1;
-                read_scalar_int_constant(tcx, scalar_int, capture_ty, oomir_data_types, instance)?
-            };
-            params.push(capture);
-            param_types.push(capture_jvm_ty);
-        }
-        if non_zst_captures != 1 {
-            return Err(format!(
-                "Scalar closure {ty:?} has {non_zst_captures} non-ZST captures, expected exactly one"
-            ));
-        }
-        return Ok(oomir::Constant::Instance {
-            class_name,
-            params,
-            param_types,
-        });
+    if matches!(ty.kind(), TyKind::Closure(..)) {
+        // A scalar closure environment can contain nested fields. The decoder must preserve their
+        // layout and enum niches.
+        return read_scalar_aggregate_constant(
+            tcx,
+            Scalar::Int(scalar_int),
+            ty,
+            oomir_data_types,
+            instance,
+        );
     }
 
     let scalar_carrier_ty = || match scalar_int.size().bytes() {
@@ -186,7 +169,7 @@ pub(crate) fn scalar_struct_field_ty<'tcx>(
 pub(crate) fn instance_constant_with_declared_fields(
     class_name: String,
     named_values: Vec<(String, oomir::Constant)>,
-    oomir_data_types: &HashMap<String, oomir::DataType>,
+    oomir_data_types: &crate::lower1::context::Definitions<'_>,
 ) -> oomir::Constant {
     let declared_fields: &[(String, oomir::Type)] = match oomir_data_types.get(&class_name) {
         Some(oomir::DataType::Class { fields, .. }) => fields.as_slice(),
@@ -226,6 +209,9 @@ pub(crate) fn read_zero_sized_constant<'tcx>(
         .map_err(|error| format!("Could not determine ZST layout for {ty:?}: {error:?}"))?;
     if !layout.is_zst() {
         return Err(format!("Type {ty:?} is not zero-sized"));
+    }
+    if let Some(payload) = crate::lower1::types::direct_enum_payload(ty, tcx) {
+        return read_zero_sized_constant(tcx, payload, oomir_data_types, instance);
     }
 
     let oomir_ty = ty_to_oomir_type(ty, tcx, oomir_data_types, instance);
@@ -288,14 +274,19 @@ pub(crate) fn read_zero_sized_constant<'tcx>(
                 return Err(format!("ZST struct {ty:?} did not map to a class"));
             };
             let mut values = Vec::new();
-            for field in &adt_def.variant(VariantIdx::from_usize(0)).fields {
+            for (index, field) in adt_def
+                .variant(VariantIdx::from_usize(0))
+                .fields
+                .iter()
+                .enumerate()
+            {
                 let field_ty = EarlyBinder::bind(tcx, field.ty(tcx, substs).skip_norm_wip())
                     .instantiate(tcx, instance.args)
                     .skip_norm_wip();
                 let field_jvm_ty = ty_to_oomir_type(field_ty, tcx, oomir_data_types, instance);
                 if field_jvm_ty.has_jvm_value() {
                     values.push((
-                        field.ident(tcx).to_string(),
+                        crate::lower1::types::struct_field_name(tcx, adt_def, index),
                         read_zero_sized_constant(tcx, field_ty, oomir_data_types, instance)?,
                     ));
                 }
@@ -335,7 +326,7 @@ pub(crate) fn read_zero_sized_constant<'tcx>(
             let class_name = format!(
                 "{}${}",
                 base_class,
-                jvm_names::member_name(&variant.name.to_string())
+                crate::lower1::types::enum_variant_name(variant, tcx)
             );
             let mut values = Vec::new();
             for (field_index, field) in variant.fields.iter().enumerate() {

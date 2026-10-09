@@ -105,6 +105,10 @@ impl Vocabulary {
         use ir::Type as I;
         use oomir::Type as T;
         let repr = match ty {
+            T::TaggedI64 => {
+                self.add(&T::I64);
+                I::TaggedI64
+            }
             T::Void | T::Unit => I::Unit,
             T::Boolean => I::Scalar(ScalarType::Bool),
             T::Char | T::U16 => I::Scalar(ScalarType::U16),
@@ -120,20 +124,31 @@ impl Vocabulary {
             T::F64 => I::Scalar(ScalarType::F64),
             T::Class(name) => I::Class(self.types.symbol(name)),
             T::Interface(name) => I::Interface(self.types.symbol(name)),
-            T::Pointer(inner) => I::Pointer(self.add(inner)),
+            T::Pointer(inner) => {
+                let mut value = self.add(inner);
+                if let Some(layout) = &inner.layout {
+                    let codec = layout.codec.as_ref().map(|name| self.types.symbol(name));
+                    let layout_type = ir::AddressLayout {
+                        value,
+                        size: layout.size,
+                        codec,
+                    };
+                    let id = self.types.layout(layout_type);
+                    if id.index() == COMMON_DESCRIPTORS.len() + self.descriptors.len() {
+                        self.descriptors.push(String::new());
+                    }
+                    value = id;
+                }
+                I::Pointer(value)
+            }
             T::Slice(inner) => I::Slice(self.add(inner)),
-            T::Array(inner) | T::MutableReference(inner) => {
+            T::Array(inner) => {
                 let inner = if inner.has_jvm_value() {
                     self.add(inner)
                 } else {
                     self.add(&object())
                 };
                 I::Array(inner)
-            }
-            T::Reference(inner) => {
-                let id = self.add(inner);
-                self.ids.insert(ty.clone(), id);
-                return id;
             }
             T::Str => I::Str,
         };
@@ -146,6 +161,9 @@ impl Vocabulary {
             self.ids.entry(T::Class(name.clone())).or_insert(id);
         }
         id
+    }
+    pub fn find(&self, ty: &oomir::Type) -> Option<ir::TypeId> {
+        common_id(ty).or_else(|| self.ids.get(ty).copied())
     }
     pub fn id(&self, ty: &oomir::Type) -> ir::TypeId {
         if let Some(id) = common_id(ty) {
@@ -227,6 +245,38 @@ impl Vocabulary {
             self.add(&oomir::Type::Class(class_name.clone()));
         }
         match instruction {
+            Heap { .. } => {
+                self.add(&oomir::Type::pointer(oomir::Type::U8));
+            }
+            TaggedPack { .. } => {
+                self.add(&oomir::Type::TaggedI64);
+                self.add(&oomir::Type::I64);
+            }
+            TaggedPart { .. } => {
+                self.add(&oomir::Type::I64);
+            }
+            AddressRetype { layout, .. } | ViewAddress { layout, .. } => {
+                self.add(&layout.pointer_type);
+                if let oomir::Operand::Constant(oomir::Constant::String(codec)) = &layout.codec {
+                    self.types.symbol(codec);
+                }
+            }
+            AddressOffset { ty, .. } => {
+                self.add(ty);
+            }
+            MemoryProject { projection, .. } => {
+                self.add(&oomir::Type::Class(projection.owner.clone()));
+                self.add(&oomir::Type::pointer(oomir::Type::Class(
+                    projection.owner.clone(),
+                )));
+                self.add(&projection.pointee);
+                self.add(&oomir::Type::pointer(projection.pointee.clone()));
+                self.add(&oomir::Type::java_string());
+            }
+            MemoryLoad { pointee, .. } | MemoryStore { pointee, .. } => {
+                self.add(pointee);
+                self.add(&oomir::Type::pointer(pointee.clone()));
+            }
             InvokeStatic { method_ty, .. }
             | InvokeRustStatic { method_ty, .. }
             | InvokeVirtual { method_ty, .. }
@@ -329,10 +379,19 @@ pub(crate) fn source_type(types: &ir::Types, id: ir::TypeId) -> oomir::Type {
         },
         I::Class(id) => T::Class(types.symbol_name(id).unwrap().into()),
         I::Interface(id) => T::Interface(types.symbol_name(id).unwrap().into()),
-        I::Pointer(inner) => T::Pointer(Box::new(source_type(types, inner))),
+        I::Pointer(inner) => match types.get(inner).unwrap() {
+            I::Layout(id) => {
+                let ir::AddressLayout { value, size, codec } = types.get_layout(id);
+                T::pointer(source_type(types, value))
+                    .with_address_layout(size, codec.map(|s| types.symbol_name(s).unwrap().into()))
+            }
+            _ => T::pointer(source_type(types, inner)),
+        },
+        I::Layout(_) => panic!("a pointee layout is not a JVM value"),
         I::Array(inner) => T::Array(Box::new(source_type(types, inner))),
         I::Slice(inner) => T::Slice(Box::new(source_type(types, inner))),
         I::Str => T::Str,
+        I::TaggedI64 => T::TaggedI64,
     }
 }
 
@@ -364,11 +423,10 @@ mod tests {
             Class("java/lang/Throwable".into()),
             Class("A".into()),
             Interface("I".into()),
-            Pointer(Box::new(I32)),
-            Pointer(Box::new(I64)),
+            oomir::Type::pointer(I32),
+            oomir::Type::pointer(I64),
             Array(Box::new(F16)),
             Array(Box::new(I16)),
-            Reference(Box::new(U8)),
         ];
         let mut vocabulary = Vocabulary::default();
         for ty in &types {

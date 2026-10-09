@@ -2,6 +2,7 @@ use super::*;
 use crate::lower1::context::Definitions;
 
 pub(super) fn enum_variant_union_writer<'tcx>(
+    name: String,
     adt_def: &AdtDef<'tcx>,
     substs: GenericArgsRef<'tcx>,
     enum_class: &str,
@@ -142,7 +143,7 @@ pub(super) fn enum_variant_union_writer<'tcx>(
     Ok((
         receiver_class.clone(),
         oomir::Function {
-            name: enum_scoped_method_name(enum_class, ENUM_WRITE_UNION_STORAGE_METHOD),
+            name,
             owner_class: None,
             debug_variables: Vec::new(),
             signature: enum_union_write_signature(&receiver_class),
@@ -152,6 +153,7 @@ pub(super) fn enum_variant_union_writer<'tcx>(
 }
 
 pub(super) fn enum_union_reader<'tcx>(
+    name: String,
     adt_def: &AdtDef<'tcx>,
     substs: GenericArgsRef<'tcx>,
     enum_class: &str,
@@ -383,7 +385,7 @@ pub(super) fn enum_union_reader<'tcx>(
     };
 
     Ok(oomir::Function {
-        name: ENUM_READ_UNION_STORAGE_METHOD.to_string(),
+        name,
         owner_class: None,
         debug_variables: Vec::new(),
         signature: enum_union_read_signature(enum_class),
@@ -393,111 +395,4 @@ pub(super) fn enum_union_reader<'tcx>(
         }
         .into(),
     })
-}
-
-pub(super) fn ensure_enum_union_codec<'tcx>(
-    adt_def: &AdtDef<'tcx>,
-    substs: GenericArgsRef<'tcx>,
-    enum_ty: Ty<'tcx>,
-    enum_class: &str,
-    tcx: TyCtxt<'tcx>,
-    data_types: &mut Definitions<'tcx>,
-    instance_context: rustc_middle::ty::Instance<'tcx>,
-) -> Result<(), String> {
-    let writer_method = enum_scoped_method_name(enum_class, ENUM_WRITE_UNION_STORAGE_METHOD);
-    if !data_types.contains_key(enum_class) {
-        ensure_enum_data_types(
-            adt_def,
-            substs,
-            enum_class,
-            tcx,
-            data_types,
-            instance_context,
-        );
-    }
-    if let Some(DataType::Interface { methods, .. }) = data_types.get(enum_class) {
-        if methods.contains_key(ENUM_READ_UNION_STORAGE_METHOD) {
-            return Ok(());
-        }
-        if methods.contains_key(&writer_method) {
-            // The writer is installed before recursively constructing variant
-            // codecs. Encountering it without the reader means this enum is
-            // already being generated through a recursive field.
-            return Ok(());
-        }
-    }
-
-    if let Some(DataType::Interface { methods, .. }) = data_types.get_mut(enum_class) {
-        let mut abstract_writer_signature = enum_union_write_signature(enum_class);
-        abstract_writer_signature.params.remove(0);
-        methods.insert(
-            writer_method.clone(),
-            DataTypeMethod::Abstract(abstract_writer_signature),
-        );
-    } else {
-        return Err(format!("enum JVM interface {enum_class} was not defined"));
-    }
-
-    let generated = (|| {
-        let layout = tcx
-            .layout_of(TypingEnv::fully_monomorphized().as_query_input(enum_ty))
-            .map_err(|err| format!("could not get layout for {enum_ty:?}: {err:?}"))?;
-        let tag = union_enum_tag(&layout, tcx)?;
-        let mut writers = Vec::new();
-        for variant_index in 0..adt_def.variants().len() {
-            let variant_idx = VariantIdx::from_usize(variant_index);
-            writers.push(enum_variant_union_writer(
-                adt_def,
-                substs,
-                enum_class,
-                &layout,
-                &tag,
-                variant_idx,
-                tcx,
-                data_types,
-                instance_context,
-            )?);
-        }
-        let reader = enum_union_reader(
-            adt_def,
-            substs,
-            enum_class,
-            &layout,
-            &tag,
-            tcx,
-            data_types,
-            instance_context,
-        )?;
-        Ok::<_, String>((writers, reader))
-    })();
-    let (writers, reader) = match generated {
-        Ok(generated) => generated,
-        Err(error) => {
-            if let Some(DataType::Interface { methods, .. }) = data_types.get_mut(enum_class) {
-                methods.remove(&writer_method);
-            }
-            return Err(error);
-        }
-    };
-
-    for (variant_class, writer) in writers {
-        match data_types.get_mut(&variant_class) {
-            Some(DataType::Class { methods, .. }) | Some(DataType::Interface { methods, .. }) => {
-                methods.insert(writer_method.clone(), DataTypeMethod::Function(writer));
-            }
-            None => {
-                return Err(format!(
-                    "enum variant JVM type {variant_class} was not defined"
-                ));
-            }
-        }
-    }
-    let Some(DataType::Interface { methods, .. }) = data_types.get_mut(enum_class) else {
-        return Err(format!("enum JVM interface {enum_class} was not defined"));
-    };
-    methods.insert(
-        ENUM_READ_UNION_STORAGE_METHOD.to_string(),
-        DataTypeMethod::Function(reader),
-    );
-    Ok(())
 }

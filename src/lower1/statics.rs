@@ -32,12 +32,12 @@ pub fn static_ref_constant<'tcx>(
     data_types: &mut Definitions<'tcx>,
     instance: Instance<'tcx>,
 ) -> oomir::Constant {
-    let rust_ty = tcx.type_of(def_id).skip_binder();
+    let rust_ty = data_types.normalize(tcx, tcx.type_of(def_id).skip_binder(), instance);
     let value_type = ty_to_oomir_type(rust_ty, tcx, data_types, instance);
-    let ty = if matches!(value_type, oomir::Type::Array(_)) {
+    let ty = if rust_ty.is_array() {
         value_type
     } else {
-        oomir::Type::Pointer(Box::new(value_type))
+        oomir::Type::pointer(value_type)
     };
     let (owner_class, field_name) = identity(tcx, def_id);
     oomir::Constant::StaticRef {
@@ -57,13 +57,16 @@ pub fn lower_static<'tcx>(
     if is_nested(tcx, def_id) {
         return Ok(());
     }
-    let rust_ty = tcx.type_of(def_id).skip_binder();
     let instance = Instance::mono(tcx, def_id);
+    let rust_ty = module
+        .data_types
+        .normalize(tcx, tcx.type_of(def_id).skip_binder(), instance);
     let value_type = ty_to_oomir_type(rust_ty, tcx, &mut module.data_types, instance);
-    let storage_type = if matches!(value_type, oomir::Type::Array(_)) {
+    // Only Rust arrays use direct array static storage. Struct wrappers keep the struct borrow ABI.
+    let storage_type = if rust_ty.is_array() {
         value_type.clone()
     } else {
-        oomir::Type::Pointer(Box::new(value_type.clone()))
+        oomir::Type::pointer(value_type.clone())
     };
     let allocation = tcx
         .eval_static_initializer(def_id)
@@ -85,6 +88,8 @@ pub fn lower_static<'tcx>(
             _ => None,
         });
     let (owner_class, field_name) = identity(tcx, def_id);
+    let attrs = tcx.codegen_fn_attrs(def_id);
+    use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
     let static_value = oomir::Static {
         owner_class,
         field_name,
@@ -94,6 +99,11 @@ pub fn lower_static<'tcx>(
         allocation_alignment,
         allocation_codec_class_name,
         is_thread_local: tcx.is_thread_local_static(def_id),
+        is_private: !crate::java_exports::is_exported(tcx, def_id)
+            && !attrs.contains_extern_indicator()
+            && !attrs
+                .flags
+                .intersects(CodegenFnAttrFlags::USED_COMPILER | CodegenFnAttrFlags::USED_LINKER),
     };
     module.statics.insert(static_value.key(), static_value);
     Ok(())

@@ -13,6 +13,28 @@ fn jvm_preserves_throwable_identity_through_catch_and_rethrow() {
     let this_class = cp.add_class("UnwindSsa").unwrap();
     let super_class = cp.add_class("java/lang/Object").unwrap();
     let mut methods = Vec::new();
+    // The JVM requires a terminal instruction on Rust-UB paths,
+    // including methods that return a value.
+    let mut b = Builder::new(&types, int);
+    b.terminate(Terminator::Unreachable);
+    let code = compile(&b.finish().unwrap(), &types, &mut cp).unwrap();
+    assert_eq!(
+        code.instructions,
+        vec![Instruction::Aconst_null, Instruction::Athrow]
+    );
+    methods.push(Method {
+        access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
+        name_index: cp.add_utf8("unreachable").unwrap(),
+        descriptor_index: cp.add_utf8("()I").unwrap(),
+        attributes: vec![Attribute::Code {
+            name_index: cp.add_utf8("Code").unwrap(),
+            max_stack: code.max_stack,
+            max_locals: code.max_locals,
+            code: code.instructions,
+            exception_table: code.exceptions,
+            attributes: code.attributes,
+        }],
+    });
     for rethrow in [false, true] {
         let mut b = Builder::new(&types, throwable);
         let original = b.parameter(b.current(), throwable);
@@ -37,10 +59,13 @@ fn jvm_preserves_throwable_identity_through_catch_and_rethrow() {
         } else {
             Terminator::Return(Some(caught))
         });
-        let body = b.finish().unwrap();
+        let mut body = b.finish().unwrap();
+        crate::opt::remove_rethrows(&mut body, &types);
         let code = compile(&body, &types, &mut cp).unwrap();
-        assert_eq!(code.exceptions.len(), 1);
-        assert!(code.exceptions[0].range_pc.start < code.exceptions[0].range_pc.end);
+        assert_eq!(code.exceptions.len(), usize::from(!rethrow));
+        for entry in &code.exceptions {
+            assert!(entry.range_pc.start < entry.range_pc.end);
+        }
         methods.push(Method {
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
             name_index: cp
@@ -81,6 +106,8 @@ fn jvm_preserves_throwable_identity_through_catch_and_rethrow() {
         r#"
 public class UnwindRun {
     public static void main(String[] args) throws Throwable {
+        try { UnwindSsa.unreachable(); throw new AssertionError("returned"); }
+        catch (NullPointerException expected) { }
         Throwable original = new IllegalArgumentException("identity");
         if (UnwindSsa.capture(original) != original) throw new AssertionError("catch");
         try { UnwindSsa.rethrow(original); throw new AssertionError("returned"); }

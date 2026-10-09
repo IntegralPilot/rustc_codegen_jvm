@@ -18,7 +18,6 @@ pub(super) fn allocate(
     types: &Types,
     live: &crate::opt::Live,
     forwarded: &[bool],
-    relative_pointer_abi: bool,
     debug: Option<&DebugInfo>,
     order: &[BlockId],
 ) -> jvm::Result<Allocation> {
@@ -35,14 +34,7 @@ pub(super) fn allocate(
             .count
             .checked_add(value_kind(body, types, param)?.width())
             .ok_or_else(|| error("JVM local limit"))?;
-        if relative_pointer_abi
-            && matches!(types.get(body.value_type(param)), Some(Type::Pointer(_)))
-        {
-            result.count = result
-                .count
-                .checked_add(4)
-                .ok_or_else(|| error("JVM parameter limit"))?;
-        }
+
         active.push(Reverse((intervals[param.index()].1, param)));
     }
     let mut order = (0..body.values.len())
@@ -270,7 +262,6 @@ mod tests {
             &types,
             &crate::opt::live(&body, &types),
             &vec![false; body.values.len()],
-            false,
             None,
             &body.layout(),
         )

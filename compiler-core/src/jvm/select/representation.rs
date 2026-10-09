@@ -1,6 +1,6 @@
 use super::*;
 
-pub use super::super::abi::{POINTER_CLASS, SLICE_VIEW_CLASS, UTF8_VIEW_CLASS};
+pub use super::super::abi::{POINTER_CLASS, SLICE_VIEW_CLASS, TAGGED_LONG_CLASS, UTF8_VIEW_CLASS};
 
 pub(super) fn value_kind(types: &Types, ty: TypeId) -> jvm::Result<Kind> {
     match types.get(ty) {
@@ -11,7 +11,8 @@ pub(super) fn value_kind(types: &Types, ty: TypeId) -> jvm::Result<Kind> {
             | Type::Interface(_)
             | Type::Array(_)
             | Type::Slice(_)
-            | Type::Str,
+            | Type::Str
+            | Type::TaggedI64,
         ) => Ok(Kind::Reference),
         _ => Err(error("unsupported JVM value representation")),
     }
@@ -20,11 +21,12 @@ pub(super) fn value_kind(types: &Types, ty: TypeId) -> jvm::Result<Kind> {
 pub(super) fn descriptor(types: &Types, ty: TypeId, output: &mut String) -> jvm::Result<()> {
     use ScalarType::*;
     match types.get(ty) {
-        Some(t @ (Type::Pointer(_) | Type::Slice(_) | Type::Str)) => {
+        Some(t @ (Type::Pointer(_) | Type::Slice(_) | Type::Str | Type::TaggedI64)) => {
             output.push('L');
             output.push_str(match t {
                 Type::Slice(_) => SLICE_VIEW_CLASS,
                 Type::Str => UTF8_VIEW_CLASS,
+                Type::TaggedI64 => TAGGED_LONG_CLASS,
                 _ => POINTER_CLASS,
             });
             output.push(';');

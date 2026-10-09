@@ -23,6 +23,7 @@ ids!(
     EdgeId,
     VariableId,
     TypeId,
+    LayoutId,
     SymbolId,
     ConstId,
     SlotId,

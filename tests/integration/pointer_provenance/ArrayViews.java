@@ -53,6 +53,62 @@ public final class ArrayViews {
             throw new AssertionError("array window lost pointer provenance");
         }
         boundedAllocation();
+        scalarComponents();
+        promotedArrayElement();
+    }
+
+    private static void promotedArrayElement() {
+        String codec = "org/rustlang/runtime/ArrayMemoryCodec#array#[I#8";
+        for (boolean arrayFirst : new boolean[] {false, true}) {
+            String identity = "promoted-array-element-" + arrayFirst;
+            int[] value = {17, 29};
+            Pointer element;
+            Pointer array;
+            if (arrayFirst) {
+                array = Pointer.constantArray(identity, new int[][] {value}, 8, codec, 4);
+                element = Pointer.constantCell(identity, value.clone(), 8, codec, 4);
+            } else {
+                element = Pointer.constantCell(identity, value, 8, codec, 4);
+                array = Pointer.constantArray(identity, new int[][] {value.clone()}, 8, codec, 4);
+            }
+            if (!Arrays.equals((int[]) Pointer.sliceGetObject(array, 0), value)
+                    || !Arrays.equals((int[]) element.getObjectAs("[I"), value)
+                    || !array.sameAddress(element)
+                    || array.retype(4, null).getI32() != 17
+                    || element.byte_offset(4).retype(4, null).getI32() != 29) {
+                throw new AssertionError("promoted array and its element have inconsistent views");
+            }
+        }
+    }
+
+    private static void scalarComponents() {
+        long[] words = {0x1122334455667788L, 0x99aabbccddeeff00L};
+        if (Pointer.loadLocationBits(words, 6, 4) != 0xff001122L) {
+            throw new AssertionError("unaligned read lost the next primitive element");
+        }
+        Pointer.storeLocationBits(words, 7, 0x3ff0, 2);
+        if (words[0] != 0xf022334455667788L || words[1] != 0x99aabbccddeeff3fL) {
+            throw new AssertionError("partial write lost neighboring primitive bytes");
+        }
+        float[] singles = {Float.intBitsToFloat(0x7fc01234), -0.0f};
+        if (Pointer.loadLocationBits(singles, 0, 4) != 0x7fc01234L
+                || Pointer.loadLocationBits(singles, 4, 4) != 0x80000000L) {
+            throw new AssertionError("primitive reads canonicalized float bits");
+        }
+        Pointer.storeLocationBits(singles, 1, 0x9876, 2);
+        if (Float.floatToRawIntBits(singles[0]) != 0x7f987634) {
+            throw new AssertionError("partial float write converted its payload");
+        }
+        double[] doubles = {Double.longBitsToDouble(0x7ff8000000001234L)};
+        Pointer.storeLocationBits(doubles, 1, 0xabcd, 2);
+        if (Double.doubleToRawLongBits(doubles[0]) != 0x7ff8000000abcd34L) {
+            throw new AssertionError("partial double write converted its payload");
+        }
+        char[] chars = {'\uffff', '\u8123'};
+        Pointer.storeLocationBits(chars, 1, 0xabcd, 2);
+        if (chars[0] != '\ucdff' || chars[1] != '\u81ab') {
+            throw new AssertionError("partial char write lost unsigned bits");
+        }
     }
 
     private static void equal(byte[] expected, Object actual) {

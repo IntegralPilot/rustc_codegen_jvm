@@ -14,8 +14,6 @@ pub(super) fn emit<'tcx>(
     func: &MirOperand<'tcx>,
     destination: &Place<'tcx>,
     target: &Option<BasicBlock>,
-    mutable_borrow_arrays: &mut MutableBorrowMap<'tcx>,
-    initialized_borrows: &mut HashSet<Local>,
 ) {
     let mut pre_call_instructions = Vec::new();
     let mut oomir_operands: Vec<oomir::Operand> = args
@@ -47,10 +45,6 @@ pub(super) fn emit<'tcx>(
 
     let destination_oomir_type =
         crate::lower1::place::get_place_type(destination, mir, tcx, instance, data_types);
-    let destination_pointer_pointee = match &destination_oomir_type {
-        oomir::Type::Pointer(pointee) => Some(pointee.as_ref().clone()),
-        _ => None,
-    };
     let deferred_destination_store =
         !destination.projection.is_empty() || data_types.local_uses_stable_cell(destination.local);
     let dest_var_name = destination_oomir_type.has_jvm_value().then(|| {
@@ -125,35 +119,22 @@ pub(super) fn emit<'tcx>(
         }
         if fn_inputs.len() > oomir_operands.len()
             && let Some(tuple_operand) = oomir_operands.last().cloned()
-            && let Some(tuple_class) = tuple_operand
-                .get_type()
-                .and_then(|ty| ty.get_class_name().map(str::to_string))
+            && let Some(arg) = args.last()
         {
-            let prefix_len = oomir_operands.len() - 1;
-            let tuple_fields = match data_types.get(&tuple_class) {
-                Some(oomir::DataType::Class { fields, .. })
-                    if fields.len() == fn_inputs.len() - prefix_len =>
-                {
-                    Some(fields.clone())
-                }
-                _ => None,
-            };
-            if let Some(tuple_fields) = tuple_fields {
+            let tuple_ty = data_types.normalize(tcx, arg.node.ty(mir, tcx), instance);
+            let prefix = oomir_operands.len() - 1;
+            if matches!(tuple_ty.kind(), TyKind::Tuple(fields) if fields.len() == fn_inputs.len() - prefix)
+            {
                 oomir_operands.pop();
-                for (field_index, (field_name, field_ty)) in tuple_fields.into_iter().enumerate() {
-                    let dest = format!("{label}_call_tuple_arg_{field_index}");
-                    instructions.push(oomir::Instruction::GetField {
-                        dest: dest.clone(),
-                        object: tuple_operand.clone(),
-                        field_name,
-                        field_ty: field_ty.clone(),
-                        owner_class: tuple_class.clone(),
-                    });
-                    oomir_operands.push(oomir::Operand::Variable {
-                        name: dest,
-                        ty: field_ty,
-                    });
-                }
+                oomir_operands.extend(crate::lower1::types::tuple_fields(
+                    tuple_ty,
+                    tuple_operand,
+                    &format!("{label}_call_tuple_arg"),
+                    tcx,
+                    data_types,
+                    instance,
+                    instructions,
+                ));
             }
         }
 
@@ -219,35 +200,10 @@ pub(super) fn emit<'tcx>(
                 jvm_import,
             );
         } else if let InstanceKind::Shim(ShimKind::DropGlue(_, drop_ty)) = func_instance.def {
-            if let Some(drop_ty) = drop_ty
-                && drop_ty.needs_drop(tcx, TypingEnv::fully_monomorphized())
-            {
-                let drop_oomir_ty =
-                    crate::lower1::types::ty_to_oomir_type(drop_ty, tcx, data_types, instance);
-                let pointer = oomir_operands[0].clone();
-                let value = if matches!(drop_ty.kind(), TyKind::Slice(_)) {
-                    match pointer {
-                        oomir::Operand::Variable { name, .. } => oomir::Operand::Variable {
-                            name,
-                            ty: drop_oomir_ty.clone(),
-                        },
-                        other => other,
-                    }
-                } else if matches!(pointer.get_type(), Some(oomir::Type::Pointer(_))) {
-                    let value_name = format!("{label}_drop_glue_value");
-                    crate::lower1::place::emit_pointer_read(
-                        pointer,
-                        &drop_oomir_ty,
-                        &value_name,
-                        &mut instructions,
-                    )
-                } else {
-                    pointer
-                };
-                emit_rust_drop_value(
+            if let Some(drop_ty) = drop_ty {
+                emit_drop_in_place(
                     drop_ty,
-                    value,
-                    &format!("{label}_drop_glue"),
+                    oomir_operands[0].clone(),
                     tcx,
                     instance,
                     data_types,
@@ -258,7 +214,52 @@ pub(super) fn emit<'tcx>(
             let TyKind::Adt(adt_def, _) = fn_output.kind() else {
                 panic!("constructor returned non-ADT type {fn_output:?}")
             };
-            if let Some(dest) = effective_dest {
+            if let Some(payload) = crate::lower1::types::transparent_payload(fn_output, tcx) {
+                if let Some(dest) = effective_dest {
+                    instructions.push(oomir::Instruction::Move {
+                        dest,
+                        src: oomir_operands[payload.field].clone(),
+                    });
+                }
+            } else if let Some(word) = crate::lower1::types::packed_word(fn_output, tcx) {
+                if let Some(dest) = effective_dest {
+                    let mut value = word.zero();
+                    for (index, field) in oomir_operands.into_iter().enumerate() {
+                        value = word.insert(
+                            value,
+                            index,
+                            field,
+                            &format!("{dest}_field_{index}"),
+                            &mut instructions,
+                        );
+                    }
+                    instructions.push(oomir::Instruction::Move { dest, src: value });
+                }
+            } else if matches!(oomir_output_type, oomir::Type::TaggedI64) {
+                if let Some(dest) = effective_dest {
+                    instructions.push(crate::lower1::types::tagged_value(
+                        dest,
+                        oomir_operands
+                            .into_iter()
+                            .next()
+                            .expect("Some has one payload"),
+                        1,
+                    ));
+                }
+            } else if let Some(carrier) = crate::lower1::types::enum_carrier(fn_output, tcx) {
+                let variant = tcx.parent(func_instance.def_id());
+                if adt_def.variant(carrier.variant).def_id != variant {
+                    instructions.push(oomir::Instruction::Unreachable);
+                } else if let Some(dest) = effective_dest {
+                    instructions.push(oomir::Instruction::Move {
+                        dest,
+                        src: oomir_operands
+                            .into_iter()
+                            .next()
+                            .expect("direct enum has one field"),
+                    });
+                }
+            } else if let Some(dest) = effective_dest {
                 let base_class = oomir_output_type
                     .get_class_name()
                     .expect("constructor result has a JVM class");
@@ -267,7 +268,10 @@ pub(super) fn emit<'tcx>(
                     format!(
                         "{}${}",
                         base_class,
-                        jvm_names::member_name(tcx.item_name(variant_def_id).as_str())
+                        crate::lower1::types::enum_variant_name(
+                            adt_def.variant(adt_def.variant_index_with_id(variant_def_id)),
+                            tcx,
+                        )
                     )
                 } else {
                     base_class.to_string()
@@ -375,75 +379,13 @@ pub(super) fn emit<'tcx>(
         ));
     }
 
-    let destination_ty = destination.ty(&mir.local_decls, tcx).ty;
-    if destination.projection.is_empty()
-        && matches!(
-            destination_ty.kind(),
-            TyKind::Ref(_, _, mutability) if mutability.is_mut()
-        )
-    {
-        let aliases = args
-            .iter()
-            .filter_map(|arg| match &arg.node {
-                MirOperand::Move(place) | MirOperand::Copy(place)
-                    if place.projection.is_empty() =>
-                {
-                    mutable_borrow_arrays.get(&place.local).cloned()
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        // A returned `&mut U` is only a plain reborrow of an input
-        // `&mut T` when U and T are the same representation. Methods
-        // such as `ManuallyDrop::deref_mut` return a pointer derived
-        // from a field of `T`; that Pointer already carries the field
-        // address and must not be copied back as though it were T.
-        if let [alias] = aliases.as_slice()
-            && destination_pointer_pointee.as_ref() == Some(&alias.pointee_type)
-        {
-            mutable_borrow_arrays.insert(
-                destination.local,
-                PointerOrigin {
-                    original_place: alias.original_place.clone(),
-                    carrier_name: crate::lower1::place::place_to_string(destination, tcx),
-                    pointee_type: alias.pointee_type.clone(),
-                    writable: alias.writable,
-                },
-            );
-            initialized_borrows.insert(destination.local);
-        }
-    }
-
-    let mut writeback_locals = HashSet::default();
-    for arg in args {
-        if let MirOperand::Move(place) | MirOperand::Copy(place) = &arg.node
-            && place.projection.is_empty()
-            && mutable_borrow_arrays.contains_key(&place.local)
-        {
-            writeback_locals.insert(place.local);
-        }
-    }
-    let mut writeback_locals = writeback_locals.into_iter().collect::<Vec<_>>();
-    writeback_locals.sort_by_key(|local| local.index());
-    instructions.extend(emit_selected_mutable_borrow_writebacks(
-        writeback_locals,
-        mutable_borrow_arrays,
-        tcx,
-        instance,
-        mir,
-        data_types,
-    ));
-
     if let Some(target_bb) = target {
         let target_label = format!("bb{}", target_bb.index());
         instructions.push(oomir::Instruction::Jump {
             target: target_label,
         });
     } else {
-        instructions.push(oomir::Instruction::ThrowNewWithMessage {
-            exception_class: "java/lang/AssertionError".to_string(),
-            message: "Diverging Rust call returned unexpectedly".to_string(),
-        });
+        instructions.push(oomir::Instruction::Unreachable);
     }
 }
 
@@ -451,7 +393,6 @@ mod callables;
 mod imports;
 mod intrinsics;
 mod memory_intrinsics;
-mod method_dispatch;
 mod methods;
 mod numeric_intrinsics;
 mod numeric_methods;

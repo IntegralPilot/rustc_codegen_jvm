@@ -3,6 +3,13 @@ use super::*;
 impl Selector<'_> {
     pub(super) fn instruction(&mut self, id: InstId) -> jvm::Result<()> {
         let inst = self.body.instructions[id.index()];
+        if !matches!(
+            inst.op,
+            Op::LoadFieldPart { .. } | Op::LoadField { .. } | Op::LoadStorageField { .. }
+        ) && inst.op.may_throw(self.body, self.types)
+        {
+            self.aggregate_cache = None;
+        }
         if inst.result.is_some_and(|v| literal(self.body, v).is_some()) {
             return Ok(());
         }
@@ -25,7 +32,8 @@ impl Selector<'_> {
             return Ok(());
         }
         if self.general(inst)?
-            || self.array(inst)?
+            || self.array(id, inst)?
+            || self.address(inst)?
             || self.memory(inst)?
             || self.object(inst)?
             || self.view(inst)?
@@ -50,6 +58,10 @@ impl Selector<'_> {
                 self.load(right)?;
                 let left_ty = self.scalar_type(left)?;
                 if op.is_comparison() {
+                    if self.forwarded[result.index()] && self.branch_condition == Some(result) {
+                        self.pending_branch = Some(self.comparison_branch(op, left_ty)?);
+                        return Ok(());
+                    }
                     self.comparison(op, left_ty)?;
                 } else {
                     self.binary(op, left_ty, self.scalar_type(right)?)?;
@@ -149,9 +161,13 @@ impl Selector<'_> {
                 self.assembly.code.push(I::L2i);
             }
             let (width, signed) = ty.integer().ok_or_else(|| error("non-integer shift"))?;
-            self.assembly
-                .code
-                .extend([get_int_const_instr(self.cp, (width - 1) as i32), I::Iand]);
+            // JVM int/long shifts already mask to 5/6 bits. Only narrower
+            // Rust integer widths require a stricter mask.
+            if width < 32 {
+                self.assembly
+                    .code
+                    .extend([get_int_const_instr(self.cp, (width - 1) as i32), I::Iand]);
+            }
             self.assembly.code.push(match (op, kind, signed) {
                 (Shl, Kind::Int, _) => I::Ishl,
                 (Shl, Kind::Long, _) => I::Lshl,
@@ -206,7 +222,7 @@ impl Selector<'_> {
         ));
         Ok(())
     }
-    pub(super) fn comparison(&mut self, op: BinaryOp, ty: ScalarType) -> jvm::Result<()> {
+    fn comparison_branch(&mut self, op: BinaryOp, ty: ScalarType) -> jvm::Result<Instruction> {
         use BinaryOp::*;
         use Instruction as I;
         let direct = kind(ty)? == Kind::Int && ty != ScalarType::U32;
@@ -234,9 +250,7 @@ impl Selector<'_> {
                 });
             }
         }
-        let yes = self.assembly.label();
-        let end = self.assembly.label();
-        let branch = match (op, direct) {
+        Ok(match (op, direct) {
             (Eq, true) => I::If_icmpeq(0),
             (Ne, true) => I::If_icmpne(0),
             (Lt, true) => I::If_icmplt(0),
@@ -250,7 +264,14 @@ impl Selector<'_> {
             (Gt, false) => I::Ifgt(0),
             (Ge, false) => I::Ifge(0),
             _ => unreachable!(),
-        };
+        })
+    }
+
+    pub(super) fn comparison(&mut self, op: BinaryOp, ty: ScalarType) -> jvm::Result<()> {
+        use Instruction as I;
+        let branch = self.comparison_branch(op, ty)?;
+        let yes = self.assembly.label();
+        let end = self.assembly.label();
         self.assembly.branch(branch, yes);
         self.assembly.code.push(I::Iconst_0);
         self.assembly.branch(I::Goto_w(0), end);

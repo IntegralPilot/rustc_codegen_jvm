@@ -484,9 +484,12 @@ pub(super) fn emit<'tcx>(
         && let Some(dest) = effective_dest.clone()
     {
         numeric_intrinsics::carrying_mul_add(
+            tcx,
+            data_types,
+            instance,
+            fn_output,
             &label,
             &mut instructions,
-            oomir_output_type,
             oomir_operands,
             dest,
         );
@@ -744,42 +747,19 @@ pub(super) fn emit<'tcx>(
             oomir_operands,
             effective_dest,
         );
-    } else if is_ptr_metadata
-        && is_core_ptr
-        && (matches!(
-            oomir_operands[0].get_type(),
-            Some(oomir::Type::Slice(_) | oomir::Type::Str)
-        ) || fn_inputs.first().is_some_and(|input| {
-            matches!(
-                input.kind(),
-                TyKind::RawPtr(pointee, _)
-                    if pointee.is_slice() || pointee.is_str()
-            )
-        }))
-    {
-        if let Some(dest) = effective_dest.clone() {
-            instructions.push(oomir::Instruction::GetField {
+    } else if is_ptr_metadata {
+        if let Some(dest) = effective_dest {
+            emit_pointer_metadata(
+                tcx,
+                instance,
+                data_types,
+                fn_inputs[0],
+                oomir_operands[0].clone(),
+                oomir_output_type,
                 dest,
-                object: oomir_operands[0].clone(),
-                field_name: "rustLength".to_string(),
-                field_ty: oomir::Type::U64,
-                owner_class: oomir::SLICE_VIEW_CLASS.to_string(),
-            });
+                &mut instructions,
+            );
         }
-    } else if is_ptr_metadata
-        && is_core_ptr
-        && matches!(oomir_operands[0].get_type(), Some(oomir::Type::Pointer(_)))
-    {
-        pointer_intrinsics::metadata(
-            tcx,
-            data_types,
-            &label,
-            &mut instructions,
-            fn_inputs,
-            oomir_output_type,
-            oomir_operands,
-            effective_dest,
-        );
     } else if matches!(
         intrinsic_name.as_str(),
         "from_raw_parts" | "from_raw_parts_mut"

@@ -231,9 +231,7 @@ public final class RuntimeSupport {
         if (read < 0) {
             return 0;
         }
-        for (int index = 0; index < read; index++) {
-            destination.add(index).set(Byte.valueOf(copy[index]));
-        }
+        copyBytes(copy, read, destination);
         return read;
     }
 
@@ -256,6 +254,10 @@ public final class RuntimeSupport {
     static byte[] copyFromPointer(Pointer source, long length) {
         int checkedLength = Math.toIntExact(length);
         byte[] copy = new byte[checkedLength];
+        if (checkedLength != 0 && Pointer.locationStride(source) == 1) {
+            Pointer.copy(source, Pointer.array(copy, 0, 1), checkedLength);
+            return copy;
+        }
         for (int index = 0; index < checkedLength; index++) {
             copy[index] = source.add(index).getI8();
         }
@@ -269,6 +271,10 @@ public final class RuntimeSupport {
     static void copyBytes(byte[] source, int length, Pointer destination) {
         if (length < 0 || length > source.length) {
             throw new IndexOutOfBoundsException("invalid byte copy length " + length);
+        }
+        if (length != 0 && Pointer.locationStride(destination) == 1) {
+            Pointer.copy(Pointer.array(source, 0, 1), destination, length);
+            return;
         }
         for (int index = 0; index < length; index++) {
             destination.add(index).set(Byte.valueOf(source[index]));

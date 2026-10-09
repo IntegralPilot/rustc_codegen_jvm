@@ -29,34 +29,23 @@ pub(in crate::lower1) fn emit_raw_eq_pointer<'tcx>(
     );
     let element_oomir_ty =
         crate::lower1::types::ty_to_oomir_type(element_ty, tcx, data_types, instance);
-    let pointer_ty = oomir::Type::Pointer(Box::new(element_oomir_ty));
-    instructions.push(oomir::Instruction::InvokeStatic {
+    let pointer_ty = oomir::Type::pointer(element_oomir_ty);
+    instructions.push(oomir::Instruction::ViewAddress {
         dest: Some(temp_name.to_string()),
-        class_name: oomir::POINTER_CLASS.to_string(),
-        method_name: "fromSlice".to_string(),
-        method_ty: oomir::Signature {
-            params: vec![
-                (
-                    "slice".to_string(),
-                    oomir::Type::Class("java/lang/Object".to_string()),
-                ),
-                ("element_size".to_string(), oomir::Type::U64),
-                ("codec".to_string(), oomir::Type::java_string()),
-            ],
-            ret: Box::new(pointer_ty.clone()),
-            is_static: true,
-        },
-        args: vec![
-            operand,
-            oomir::Operand::Constant(oomir::Constant::U64(
+        source: operand,
+        layout: Box::new(oomir::AddressLayout {
+            pointer_type: pointer_ty.clone(),
+            size: oomir::Operand::Constant(oomir::Constant::U64(
                 u64::try_from(
                     crate::lower1::types::layout_size_bytes(tcx, element_ty)
                         .expect("raw_eq element has a concrete layout"),
                 )
                 .expect("Rust raw_eq element layout exceeds u64"),
             )),
-            crate::lower1::types::pointer_view_codec_operand(element_ty, tcx, data_types, instance),
-        ],
+            codec: crate::lower1::types::pointer_view_codec_operand(
+                element_ty, tcx, data_types, instance,
+            ),
+        }),
     });
     oomir::Operand::Variable {
         name: temp_name.to_string(),
@@ -72,7 +61,7 @@ pub(in crate::lower1) fn comparison_value_type<'tcx>(
         let oomir::Type::Pointer(inner) = ty else {
             break;
         };
-        ty = *inner;
+        ty = *inner.value;
         mir_ty = *pointee;
     }
     ty
@@ -83,7 +72,7 @@ pub(in crate::lower1) fn emit_comparison_value<'tcx>(
     mut mir_ty: Ty<'tcx>,
     dest_prefix: &str,
     tcx: TyCtxt<'tcx>,
-    data_types: &HashMap<String, oomir::DataType>,
+    data_types: &crate::lower1::context::Definitions<'_>,
     instructions: &mut Vec<oomir::Instruction>,
 ) -> oomir::Operand {
     let mut depth = 0;

@@ -1,4 +1,7 @@
+#![feature(register_tool)]
+#![register_tool(jvm_codegen)]
 #![feature(
+    allocator_api,
     iter_advance_by,
     iter_next_chunk,
     ptr_metadata,
@@ -7,6 +10,8 @@
     try_with_capacity,
     type_info
 )]
+
+mod owners;
 
 use core::cell::{Ref, RefCell, RefMut};
 use core::any::TypeId;
@@ -152,6 +157,7 @@ unsafe extern "C" {
     );
 }
 
+#[jvm_codegen::export]
 #[inline(never)]
 pub extern "C" fn arc_concurrent_worker(context: *const ArcWorkerContext) {
     let context = unsafe { &*context };
@@ -176,6 +182,7 @@ pub extern "C" fn arc_concurrent_worker(context: *const ArcWorkerContext) {
 }
 
 fn main() {
+    owners::run();
     test_vec_basic();
     test_vec_in_place_collect_relinquishes_source();
     test_zst_allocations();
@@ -1519,7 +1526,7 @@ fn test_arc_concurrent_clone_drop() {
     let owner = b"alloc_test.alloc_test";
     let method = b"arc_concurrent_worker";
 
-    arc_concurrent_worker(&context);
+    // Java reflection requires an exported worker.
     unsafe {
         run_static_pointer_workers(
             owner.as_ptr(),
@@ -1531,8 +1538,8 @@ fn test_arc_concurrent_clone_drop() {
         );
     }
 
-    assert!(context.relaxed_counter.load(Ordering::Acquire) == (WORKERS + 1) * ITERATIONS);
-    assert!(context.sequential_counter.load(Ordering::SeqCst) == (WORKERS + 1) * ITERATIONS * 2);
+    assert!(context.relaxed_counter.load(Ordering::Acquire) == WORKERS * ITERATIONS);
+    assert!(context.sequential_counter.load(Ordering::SeqCst) == WORKERS * ITERATIONS * 2);
     assert!(Arc::strong_count(&context.relaxed_counter) == 1);
     assert!(Arc::strong_count(&context.sequential_counter) == 1);
     assert!(Arc::weak_count(&context.relaxed_counter) == 0);

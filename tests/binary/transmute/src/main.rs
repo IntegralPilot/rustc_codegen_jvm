@@ -1,5 +1,6 @@
 use core::mem::{size_of, transmute};
 
+mod scalar_wrappers;
 mod u16_arrays;
 
 #[repr(u8)]
@@ -79,6 +80,7 @@ impl OuterByteSlice {
 }
 
 fn test_scalar_bits() {
+    scalar_wrappers::run();
     let truth: bool = unsafe { transmute(1u8) };
     assert!(truth);
     let truth_bits: u8 = unsafe { transmute(truth) };

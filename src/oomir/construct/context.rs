@@ -5,6 +5,8 @@ use super::*;
 pub(super) struct FieldLayout {
     pub members: Vec<(String, oomir::Type)>,
     pub direct: bool,
+    pub split_borrows: bool,
+    pub scalar_record: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -16,6 +18,24 @@ pub(crate) struct Context {
     parents: HashMap<String, Vec<String>>,
 }
 impl Context {
+    pub(crate) fn direct_copy(&self, owner: &str) -> bool {
+        !owner.starts_with("org/rustlang/runtime/")
+            && self.fields.get(owner).is_some_and(|layout| layout.direct)
+            && self
+                .parents
+                .get(owner)
+                .is_none_or(|parents| parents.iter().all(|parent| parent == "java/lang/Object"))
+    }
+
+    pub(super) fn component_method(&self, owner: &str, name: &str) -> bool {
+        oomir::component_method(owner, name)
+            || (name == "call"
+                && self.parents.get(owner).is_some_and(|parents| {
+                    parents
+                        .iter()
+                        .any(|p| p.starts_with("org/rustlang/runtime/FnPtr_"))
+                }))
+    }
     pub(crate) fn new(module: &oomir::Module) -> Self {
         fn zero(
             ty: &oomir::Type,
@@ -69,9 +89,10 @@ impl Context {
                 }
                 oomir::DataType::Class {
                     fields,
+                    kind,
                     is_abstract: false,
                     ..
-                } => {
+                } if *kind != oomir::ClassKind::Static => {
                     context.fields.insert(
                         name.clone(),
                         FieldLayout {
@@ -80,7 +101,20 @@ impl Context {
                                 .filter(|(_, ty)| ty.has_jvm_value())
                                 .cloned()
                                 .collect(),
-                            direct: false,
+                            scalar_record: *kind == oomir::ClassKind::Value
+                                && !name.starts_with("org/rustlang/runtime/")
+                                && (2..=4).contains(
+                                    &fields.iter().filter(|(_, ty)| ty.has_jvm_value()).count(),
+                                )
+                                && fields.iter().filter(|(_, ty)| ty.has_jvm_value()).all(
+                                    |(_, ty)| {
+                                        oomir::scalar::scalar_type(ty).is_some()
+                                            && !ty.is_jvm_reference_type()
+                                    },
+                                ),
+                            direct: *kind != oomir::ClassKind::MemoryView,
+                            split_borrows: *kind == oomir::ClassKind::Value
+                                && oomir::fields::split_borrows(fields),
                         },
                     );
                     let count = fields
@@ -97,46 +131,8 @@ impl Context {
                 _ => {}
             }
         }
-        // Slice/str tails need byte projection: their enclosing JVM carrier
-        // may not exist (for example a raw cast from a tuple to a Rust DST).
-        // Arrays are conservatively retained on the general path too, since
-        // this representation vocabulary does not distinguish sized tails.
-        fn direct_tail(
-            name: &str,
-            fields: &HashMap<String, FieldLayout>,
-            seen: &mut HashMap<String, bool>,
-        ) -> bool {
-            if let Some(&direct) = seen.get(name) {
-                return direct;
-            }
-            seen.insert(name.into(), false);
-            let direct = fields
-                .get(name)
-                .is_some_and(|layout| match layout.members.last() {
-                    None => true,
-                    Some((_, oomir::Type::Class(tail))) => direct_tail(tail, fields, seen),
-                    Some((
-                        _,
-                        oomir::Type::Slice(_)
-                        | oomir::Type::Str
-                        | oomir::Type::Array(_)
-                        | oomir::Type::MutableReference(_)
-                        | oomir::Type::Interface(_),
-                    )) => false,
-                    _ => true,
-                });
-            *seen.get_mut(name).unwrap() = direct;
-            direct
-        }
-        let mut direct = HashMap::default();
-        for name in context.fields.keys() {
-            direct_tail(name, &context.fields, &mut direct);
-        }
-        for (name, direct) in direct {
-            if let Some(layout) = context.fields.get_mut(&name) {
-                layout.direct = direct;
-            }
-        }
+        // Stored borrows have fixed size even with unsized pointees. The Rust schema distinguishes
+        // them from DST tails.
         context
     }
     pub(super) fn is_zero(&self, ty: &oomir::Type) -> bool {

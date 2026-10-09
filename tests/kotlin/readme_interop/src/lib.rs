@@ -1,3 +1,7 @@
+#![feature(custom_inner_attributes)]
+#![feature(register_tool)]
+#![register_tool(jvm_codegen)]
+#![jvm_codegen::export]
 pub trait BatchObserver {
     fn accept(&mut self, processed: u32) -> bool;
 }

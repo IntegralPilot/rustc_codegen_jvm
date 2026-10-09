@@ -6,6 +6,8 @@ mod bound_lifetimes;
 mod boxed_supertrait;
 mod recursive_callback;
 mod scoped_types;
+mod erased_markers;
+mod shared_dyn;
 
 trait Calculator {
     // Performs a primary calculation
@@ -310,6 +312,8 @@ fn second_tuple_value(value: (&dyn second_tuple_trait::SameName,)) -> i32 {
 }
 
 fn main() {
+    shared_dyn::run();
+    erased_markers::run();
     boxed_supertrait::run();
     associated_drop::run();
     bound_lifetimes::run();

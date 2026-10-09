@@ -9,6 +9,10 @@ use ristretto_classfile::byte_reader::ByteReader;
 #[derive(Default)]
 pub(crate) struct Namespaces {
     removable: HashSet<Vec<u8>>,
+    packed: HashMap<String, String>,
+    pub(crate) strip_proofs: bool,
+    pub(crate) aliases: crate::aliases::Aliases,
+    pub(crate) short_methods: HashMap<Vec<u8>, Vec<u8>>,
 }
 
 impl Namespaces {
@@ -23,6 +27,10 @@ impl Namespaces {
             roots.entry(plain).or_default().insert(marker);
         }
         Self {
+            packed: HashMap::default(),
+            strip_proofs: false,
+            aliases: crate::aliases::Aliases::default(),
+            short_methods: HashMap::default(),
             removable: roots
                 .into_values()
                 .filter(|identities| identities.len() == 1)
@@ -33,7 +41,67 @@ impl Namespaces {
         }
     }
 
-    fn rewrite(&self, bytes: &[u8]) -> Option<Vec<u8>> {
+    pub(crate) fn pack(&mut self, names: HashMap<String, String>) {
+        self.packed = names;
+    }
+
+    fn packed(&self, bytes: &[u8]) -> Option<Vec<u8>> {
+        if self.packed.is_empty() {
+            return None;
+        }
+        let mut output = Vec::new();
+        let mut copied = 0;
+        let mut start = 0;
+        for end in 0..=bytes.len() {
+            if end < bytes.len()
+                && !matches!(bytes[end], b'(' | b')' | b';' | b'[' | b'#' | b':' | b'\n')
+            {
+                continue;
+            }
+            let token = &bytes[start..end];
+            let text = std::str::from_utf8(token).ok();
+            if let Some(text) = text {
+                let binary = text.contains('.');
+                let normalized = if binary {
+                    text.replace('.', "/")
+                } else {
+                    text.into()
+                };
+                let mut prefix = 0;
+                let mut target = self.packed.get(&normalized);
+                if target.is_none() {
+                    let descriptor = normalized
+                        .trim_start_matches(['B', 'C', 'D', 'F', 'I', 'J', 'S', 'Z', 'V']);
+                    if let Some(name) = descriptor.strip_prefix('L') {
+                        prefix = normalized.len() - name.len();
+                        target = self.packed.get(name);
+                    }
+                }
+                if let Some(target) = target {
+                    output.extend_from_slice(&bytes[copied..start + prefix]);
+                    if binary {
+                        output.extend_from_slice(target.replace('/', ".").as_bytes());
+                    } else {
+                        output.extend_from_slice(target.as_bytes());
+                    }
+                    copied = end;
+                }
+            }
+            start = end + 1;
+        }
+        if copied == 0 {
+            return None;
+        }
+        output.extend_from_slice(&bytes[copied..]);
+        Some(output)
+    }
+
+    fn rewrite(&self, original: &[u8]) -> Option<Vec<u8>> {
+        if let Some(short) = self.short_methods.get(original) {
+            return Some(short.clone());
+        }
+        let packed = self.packed(original);
+        let bytes = packed.as_deref().unwrap_or(original);
         let mut result = Vec::new();
         let mut copied = 0;
         let mut scanned = 0;
@@ -55,7 +123,7 @@ impl Namespaces {
             }
         }
         if copied == 0 {
-            return None;
+            return packed;
         }
         result.extend_from_slice(&bytes[copied..]);
         Some(result)
@@ -73,7 +141,13 @@ impl Namespaces {
         reader.set_position(8); // magic and classfile version
         let mut pool = ConstantPool::from_bytes(&mut reader).map_err(error)?;
         let end = reader.position();
-        let names = name_constants(&pool, &mut reader).map_err(error)?;
+        let mut changed = crate::aliases::redirect(&mut pool, &self.aliases)?;
+        let (names, class_attributes) = name_constants(&pool, &mut reader).map_err(error)?;
+        let tail = if self.strip_proofs {
+            strip_proofs(&pool, &class.data[class_attributes..]).map_err(error)?
+        } else {
+            None
+        };
         let count = pool.len() as u16;
         let mut literals = HashMap::default();
         for index in 1..=count {
@@ -81,7 +155,6 @@ impl Namespaces {
                 literals.entry(*value).or_insert_with(Vec::new).push(index);
             }
         }
-        let mut changed = false;
         for index in 1..=count {
             let Some(Constant::Utf8(value)) = pool.get(index) else {
                 continue;
@@ -95,6 +168,15 @@ impl Namespaces {
                             .as_bytes()
                             .strip_prefix(LITERAL_STRING.as_bytes())
                             .map(<[u8]>::to_vec)
+                            .or_else(|| {
+                                // Older static-owner recipes were untagged.
+                                value
+                                    .as_bytes()
+                                    .windows(6)
+                                    .any(|s| s == b"/mono/" || s == b".mono.")
+                                    .then(|| self.packed(value.as_bytes()))
+                                    .flatten()
+                            })
                     };
                 if let Some(bytes) = relocated {
                     let value = JavaString::from_mutf8(bytes).map_err(error)?;
@@ -124,15 +206,17 @@ impl Namespaces {
                 .map_err(error)?;
             changed = true;
         }
-        if changed {
+        if changed || tail.is_some() {
             // Method bodies, stack maps and their constant indexes stay intact;
             // there is no second instruction decode/encode or whole-JAR pass.
             let mut bytes = Vec::with_capacity(class.data.len());
             bytes.extend_from_slice(&class.data[..8]);
             pool.to_bytes(&mut bytes).map_err(error)?;
-            bytes.extend_from_slice(&class.data[end..]);
+            bytes.extend_from_slice(&class.data[end..class_attributes]);
+            bytes.extend_from_slice(tail.as_deref().unwrap_or(&class.data[class_attributes..]));
             class.data = bytes;
-            class.jar_entry_name = self.name(&class.jar_entry_name);
+            let name = class.jar_entry_name.trim_end_matches(".class");
+            class.jar_entry_name = format!("{}.class", self.name(name));
         }
         Ok(class)
     }
@@ -164,7 +248,7 @@ impl Namespaces {
 fn name_constants(
     pool: &ConstantPool<'_>,
     reader: &mut ByteReader<'_>,
-) -> ristretto_classfile::Result<HashSet<u16>> {
+) -> ristretto_classfile::Result<(HashSet<u16>, usize)> {
     let mut names = HashSet::default();
     for constant in pool.iter() {
         match constant {
@@ -193,8 +277,41 @@ fn name_constants(
             name_attributes(pool, reader, &mut names)?;
         }
     }
+    let attributes = reader.position();
     name_attributes(pool, reader, &mut names)?;
-    Ok(names)
+    Ok((names, attributes))
+}
+
+/// Keep proof attributes for later library linking. Remove them from the final executable.
+fn strip_proofs(
+    pool: &ConstantPool<'_>,
+    bytes: &[u8],
+) -> ristretto_classfile::Result<Option<Vec<u8>>> {
+    let mut reader = ByteReader::new(bytes);
+    let count = reader.read_u16()?;
+    let mut retained = count;
+    let mut output = Vec::new();
+    let mut copied = 2;
+    for _ in 0..count {
+        let start = reader.position();
+        let name = pool.try_get_utf8(reader.read_u16()?)?;
+        let length = reader.read_u32()? as usize;
+        reader.skip(length)?;
+        if matches!(name.as_bytes(), b"RustJvmPrivate" | b"RustJvmCarrier") {
+            if output.is_empty() {
+                output.extend_from_slice(&[0, 0]);
+            }
+            output.extend_from_slice(&bytes[copied..start]);
+            copied = reader.position();
+            retained -= 1;
+        }
+    }
+    if retained == count {
+        return Ok(None);
+    }
+    output.extend_from_slice(&bytes[copied..]);
+    output[..2].copy_from_slice(&retained.to_be_bytes());
+    Ok(Some(output))
 }
 
 fn name_attributes(

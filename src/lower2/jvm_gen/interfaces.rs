@@ -10,8 +10,9 @@ pub(in crate::lower2) fn create_data_type_classfile_for_interface(
     subclasses: Vec<String>,
     nest_host: Option<String>,
     debug_info: DebugInfoOptions,
-    relative_static_methods: &HashSet<oomir::FunctionKey>,
     context: &oomir::construct::Context,
+    output: &mut crate::lower2::output::ClassOutput,
+    registry: &crate::lower2::EmittedClassRegistry,
 ) -> jvm::Result<Vec<u8>> {
     let source_files = methods
         .values()
@@ -25,14 +26,48 @@ pub(in crate::lower2) fn create_data_type_classfile_for_interface(
     let mut cp = InternedConstantPool::default();
 
     let this_class_index = cp.add_class(interface_name_jvm)?;
+    cp.set_resource_anchor(this_class_index);
 
     // Interfaces always implicitly extend Object, and must specify it in the classfile
     let super_class_index = cp.add_class("java/lang/Object")?;
 
     let mut jvm_methods: Vec<jvm::Method> = Vec::new();
     let mut class_attributes = Vec::new();
+    // Public Java enum classes remain linker roots. Private carriers follow their users.
+    let private = interface_name_jvm.starts_with("org/rustlang/runtime/FnPtr_")
+        || (matches!(
+            module.data_type(interface_name_jvm),
+            Some(oomir::DataType::Interface { is_enum: true, .. })
+        ) && !subclasses.is_empty()
+            && subclasses.iter().all(|name| {
+                matches!(
+                    module.data_type(name),
+                    Some(oomir::DataType::Class {
+                        kind: oomir::ClassKind::Value,
+                        ..
+                    })
+                )
+            }));
+    if private {
+        class_attributes.push(Attribute::Unknown {
+            name_index: cp.add_utf8(jvm::summary::PRIVATE_ATTRIBUTE)?,
+            info: Vec::new(),
+        });
+        if let Some(info) =
+            super::enum_shapes::interface(&methods, super_interfaces, module, &subclasses)
+        {
+            class_attributes.push(Attribute::Unknown {
+                name_index: cp.add_utf8(jvm::summary::CARRIER_ATTRIBUTE)?,
+                info,
+            });
+        }
+    }
     let mut bootstrap_methods: Vec<BootstrapMethod> = Vec::new();
     let mut next_factory = 0;
+    let share_function = methods.len() == 1
+        && super_interfaces.is_empty()
+        && subclasses.is_empty()
+        && nest_host.is_none();
     for (method_name, method) in methods {
         let method_name = method_name.as_str();
         if let DataTypeMethod::Function(mut function) = method {
@@ -44,7 +79,6 @@ pub(in crate::lower2) fn create_data_type_classfile_for_interface(
                 next_factory: &mut next_factory,
                 owner: interface_name_jvm,
                 kind: body::BodyOwner::Interface,
-                relative_methods: relative_static_methods,
                 debug: debug_info,
                 context,
             }
@@ -64,6 +98,12 @@ pub(in crate::lower2) fn create_data_type_classfile_for_interface(
                 // Abstract interface signatures contain only their explicit
                 // JVM parameters. There is no OOMIR function body here, so no
                 // synthetic receiver local needs to be stripped.
+                let mut signature = signature.clone();
+                if oomir::component_method(interface_name_jvm, method_name) {
+                    // Abstract signatures contain no implicit receiver.
+                    signature.is_static = true;
+                    signature = signature.component_signature();
+                }
                 let descriptor = signature.to_jvm_descriptor_with_explicit_params();
                 jvm_methods.push(jvm::Method {
                     access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::ABSTRACT,
@@ -71,85 +111,18 @@ pub(in crate::lower2) fn create_data_type_classfile_for_interface(
                     descriptor_index: cp.add_utf8(&descriptor)?,
                     attributes: Vec::new(),
                 });
-
                 if method_name == "call"
                     && interface_name_jvm.starts_with("org/rustlang/runtime/FnPtr_")
                 {
-                    let mut explicit_signature = signature.clone();
-                    explicit_signature.is_static = true;
-                    if explicit_signature.supports_relative_pointer_abi() {
-                        let relative_signature =
-                            explicit_signature.relative_pointer_abi_signature();
-                        let relative_descriptor =
-                            relative_signature.to_jvm_descriptor_with_explicit_params();
-                        let call_descriptor =
-                            explicit_signature.to_jvm_descriptor_with_explicit_params();
-                        let pointer_class = cp.add_class(oomir::POINTER_CLASS)?;
-                        let materialize = cp.add_method_ref(
-                            pointer_class,
-                            "materializeRelative",
-                            &format!("(L{};JJ)L{};", oomir::POINTER_CLASS, oomir::POINTER_CLASS),
-                        )?;
-                        let call_ref = cp.add_interface_method_ref(
-                            this_class_index,
-                            "call",
-                            &call_descriptor,
-                        )?;
-
-                        let mut instructions = vec![Instruction::Aload_0];
-                        let mut local = 1u16;
-
-                        let mut call_slots = 1u16;
-                        for (_, ty) in &explicit_signature.params {
-                            if !ty.has_jvm_value() {
-                                continue;
-                            }
-                            if matches!(ty, Type::Pointer(_)) {
-                                instructions.push(get_load_instruction(ty, local)?);
-                                instructions.push(get_load_instruction(&Type::I64, local + 1)?);
-                                instructions.push(get_load_instruction(&Type::I64, local + 3)?);
-
-                                instructions.push(Instruction::Invokestatic(materialize));
-                                local += 5;
-
-                                call_slots += 1;
-                            } else {
-                                let size = get_type_size(ty);
-                                instructions.push(get_load_instruction(ty, local)?);
-                                local += size;
-
-                                call_slots += size;
-                            }
-                        }
-                        instructions.push(Instruction::Invokeinterface(
-                            call_ref,
-                            call_slots
-                                .try_into()
-                                .map_err(|_| jvm::Error::VerificationError {
-                                    context: format!(
-                                        "Relative function-pointer bridge {interface_name_jvm}"
-                                    ),
-                                    message: "interface call exceeds 255 JVM parameter slots"
-                                        .to_string(),
-                                })?,
-                        ));
-                        instructions.push(return_instruction_for_type(&explicit_signature.ret));
-                        jvm_methods.push(jvm::Method {
-                            access_flags: MethodAccessFlags::PUBLIC,
-                            name_index: cp.add_utf8(&format!(
-                                "call{}",
-                                oomir::RELATIVE_POINTER_METHOD_SUFFIX
-                            ))?,
-                            descriptor_index: cp.add_utf8(&relative_descriptor)?,
-                            attributes: vec![code_attribute_for_descriptor(
-                                &mut cp,
-                                local,
-                                instructions,
-                                &relative_descriptor,
-                                false,
-                                Some(interface_name_jvm),
-                                "call$relative",
-                            )?],
+                    jvm_methods.push(super::function_handles::bridge(
+                        &mut cp,
+                        &signature,
+                        &mut bootstrap_methods,
+                    )?);
+                    if share_function {
+                        class_attributes.push(Attribute::Unknown {
+                            name_index: cp.add_utf8(jvm::summary::CARRIER_ATTRIBUTE)?,
+                            info: super::function_handles::carrier_recipe(&signature),
                         });
                     }
                 }
@@ -184,7 +157,6 @@ pub(in crate::lower2) fn create_data_type_classfile_for_interface(
                     method_name,
                     recipe,
                     module,
-                    relative_static_methods,
                     true,
                 )?);
             }
@@ -271,6 +243,7 @@ pub(in crate::lower2) fn create_data_type_classfile_for_interface(
         });
     }
 
+    output.resources(registry, &mut cp)?;
     let class_file = ClassFile {
         code_source_url: None,
         version: Version::Java8 { minor: 0 },

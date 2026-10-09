@@ -3,11 +3,11 @@ use super::*;
 use jvm::attributes::Instruction;
 
 pub(crate) fn compile(
+    context: Option<&oomir::construct::Context>,
     body: &oomir::SsaBody,
     constant_pool: &mut InternedConstantPool,
     bootstrap_methods: &mut Vec<BootstrapMethod>,
     debug_info: DebugInfoOptions,
-    relative_pointer_abi: bool,
 ) -> jvm::Result<MethodCode> {
     static VERIFY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     struct Constants<'a>(&'a [oomir::Constant]);
@@ -43,13 +43,13 @@ pub(crate) fn compile(
         &body.types,
         constant_pool,
         jvm_compiler_core::jvm::select::Options {
+            direct_copy: Some(&|owner| context.is_some_and(|context| context.direct_copy(owner))),
             verify: *VERIFY.get_or_init(|| std::env::var_os("RCGJ_VERIFY_SSA").is_some()),
             lines: if debug_info.line_numbers {
                 body.lines.as_ref()
             } else {
                 None
             },
-            relative_pointer_abi,
             bootstrap: Some(bootstrap_methods),
             constants: Some(&Constants(&body.constants)),
             debug: if debug_info.local_variables {

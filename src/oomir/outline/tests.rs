@@ -152,6 +152,7 @@ fn outlined_loops_exceptions_and_zero_sized_storage_execute() {
         assert!(parts.len() >= 3);
         for function in parts {
             let code = crate::lower2::select::compile(
+                None,
                 &function.body,
                 &mut cp,
                 &mut vec![],
@@ -159,7 +160,6 @@ fn outlined_loops_exceptions_and_zero_sized_storage_execute() {
                     line_numbers: true,
                     local_variables: true,
                 },
-                false,
             )
             .unwrap();
             methods.push(Method {

@@ -13,6 +13,7 @@ extern crate rustc_abi;
 extern crate rustc_ast;
 extern crate rustc_attr_ir;
 extern crate rustc_codegen_ssa;
+extern crate rustc_const_eval;
 extern crate rustc_data_structures;
 extern crate rustc_driver;
 extern crate rustc_hashes;
@@ -78,7 +79,6 @@ use rustc_middle::{
 };
 use rustc_session::{IncrCompSession, Session, config::OutputFilenames};
 use rustc_span::def_id::{DefId, LOCAL_CRATE};
-use rustc_structures::CrateType;
 use std::{
     any::Any,
     io::{BufReader, BufWriter, Write},
@@ -281,13 +281,17 @@ fn empty_oomir_module<'tcx>(
         suppressed_data_types: HashSet::default(),
         shared_data_types: None,
         shared_context: None,
-        relative_static_methods: Arc::new(HashSet::default()),
         external_interfaces: HashSet::default(),
         statics: HashMap::default(),
     }
 }
 
 fn prepare_oomir_shard(mut module: lower1::context::Module<'_>) -> oomir::Module {
+    if !module.data_types.external_schemas.is_empty() {
+        module.shared_data_types = Some(Arc::new(std::mem::take(
+            &mut module.data_types.external_schemas,
+        )));
+    }
     module.external_interfaces.extend(std::mem::take(
         &mut *module.data_types.foreign_interfaces.borrow_mut(),
     ));
@@ -302,7 +306,6 @@ fn prepare_oomir_shard(mut module: lower1::context::Module<'_>) -> oomir::Module
 fn emit_oomir_shard(
     shard_name: &str,
     oomir_module: oomir::Module,
-    emit_runtime_views: bool,
     debug_info: lower2::DebugInfoOptions,
     emitted_class_registry: &lower2::EmittedClassRegistry,
 ) -> Vec<(String, PathBuf)> {
@@ -318,16 +321,9 @@ fn emit_oomir_shard(
         )
     );
 
-    let generated_classes = lower2::oomir_to_jvm_bytecode(
-        oomir_module,
-        debug_info,
-        emit_runtime_views,
-        emitted_class_registry,
+    lower2::oomir_to_jvm_bytecode(oomir_module, debug_info, emitted_class_registry).unwrap_or_else(
+        |error| panic!("failed to lower OOMIR shard {shard_name} to JVM bytecode: {error}"),
     )
-    .unwrap_or_else(|error| {
-        panic!("failed to lower OOMIR shard {shard_name} to JVM bytecode: {error}")
-    });
-    generated_classes
 }
 
 impl CodegenBackend for MyBackend {
@@ -371,18 +367,12 @@ impl CodegenBackend for MyBackend {
                     scope,
                     worker_count,
                     OOMIR_SHARD_QUEUE_DEPTH,
-                    |(ordinal, shard_name, module, emit_runtime_views): (
-                        usize,
-                        String,
-                        oomir::Module,
-                        bool,
-                    )| {
+                    |(ordinal, shard_name, module): (usize, String, oomir::Module)| {
                         (
                             ordinal,
                             emit_oomir_shard(
                                 &shard_name,
                                 module,
-                                emit_runtime_views,
                                 debug_info,
                                 &emitted_class_registry,
                             ),
@@ -399,11 +389,11 @@ impl CodegenBackend for MyBackend {
                 // stream as their own job while ordinary owners are lowered.
                 let mut export_module =
                     empty_oomir_module(tcx, &crate_module_class, Arc::clone(&shared_lowering));
-                lower_public_library_exports(tcx, &mut export_module, &lowered_instances);
+                lower_java_exports(tcx, &mut export_module, &lowered_instances);
                 emit_allocator_shims(tcx, &mut export_module);
                 let mut export_module = prepare_oomir_shard(export_module);
                 canonical_data_types.collect(&mut export_module);
-                workers.submit((submitted, "java-exports".to_string(), export_module, true));
+                workers.submit((submitted, "java-exports".to_string(), export_module));
                 submitted += 1;
 
                 // Keep each JVM owner intact, and batch small owners so their
@@ -470,7 +460,7 @@ impl CodegenBackend for MyBackend {
                                     );
                                     let mut module = prepare_oomir_shard(module);
                                     canonical_data_types.borrow_mut().collect(&mut module);
-                                    producer.submit((ordinal, shard_name, module, false));
+                                    producer.submit((ordinal, shard_name, module));
                                 }
                             });
                         });
@@ -510,7 +500,8 @@ impl CodegenBackend for MyBackend {
                 drop(producer);
                 let canonical_data_types = canonical_data_types.into_inner();
 
-                let provided_symbols = shared_lowering.provided_symbols();
+                let mut provided_symbols = shared_lowering.provided_symbols();
+                provided_symbols.types = canonical_data_types.provided_names();
                 drop(shared_lowering);
 
                 let canonical_timer = tcx.sess.timer("jvm_canonical_types");
@@ -524,7 +515,7 @@ impl CodegenBackend for MyBackend {
                     .enumerate()
                 {
                     let shard_name = format!("canonical-types-{index}");
-                    workers.submit((submitted, shard_name, module, false));
+                    workers.submit((submitted, shard_name, module));
                     submitted += 1;
                 }
                 let mut results = tcx.sess.time("jvm_finish_emission", || workers.finish());
@@ -557,7 +548,7 @@ impl CodegenBackend for MyBackend {
     ) -> (CompiledModules, UnordMap<WorkProductId, WorkProduct>) {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let (generated_classes, provided_symbols) = *ongoing_codegen
-                .downcast::<(Vec<(String, PathBuf)>, Vec<u64>)>()
+                .downcast::<(Vec<(String, PathBuf)>, symbols::Provided)>()
                 .expect("in join_codegen: ongoing_codegen is not a generated-class list");
 
             let temporary_directories: HashSet<_> = generated_classes

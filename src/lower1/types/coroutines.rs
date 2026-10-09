@@ -353,7 +353,7 @@ pub(super) fn coroutine_pointer_codec_methods<'tcx>(
         decode_variants,
     );
 
-    let pointer_ty = oomir::Type::Pointer(Box::new(value_ty.clone()));
+    let pointer_ty = oomir::Type::pointer(value_ty.clone());
     let mut bind_entry = Vec::new();
     emit_aggregate_memory_bindings(
         &UnionAggregateLayout {

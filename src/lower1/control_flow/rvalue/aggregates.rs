@@ -107,6 +107,7 @@ pub(super) fn adapt_value_for_field<'tcx>(
             data_types.get(class_name),
             Some(oomir::DataType::Class {
                 fields,
+                kind: crate::oomir::ClassKind::Value,
                 is_abstract: false,
                 ..
             }) if fields.is_empty()
@@ -155,24 +156,24 @@ impl<'tcx> RvalueContext<'_, 'tcx> {
                 let aggregate_has_jvm_value = aggregate_oomir_type.has_jvm_value();
 
                 match kind {
-                    rustc_middle::mir::AggregateKind::Tuple if !aggregate_has_jvm_value => {
+                    rustc_middle::mir::AggregateKind::Tuple
+                    | rustc_middle::mir::AggregateKind::Adt(..)
+                    | rustc_middle::mir::AggregateKind::Closure(..)
+                        if !aggregate_has_jvm_value =>
+                    {
                         // Coroutine MIR represents unit yields and returns as empty
                         // tuple aggregates, which have no JVM value or constructor.
-                        debug_assert!(operands.is_empty());
+                        debug_assert!(operands.iter().all(|operand| {
+                            !ty_to_oomir_type(
+                                operand.ty(&mir.local_decls, tcx),
+                                tcx,
+                                data_types,
+                                instance,
+                            )
+                            .has_jvm_value()
+                        }));
                     }
                     rustc_middle::mir::AggregateKind::Tuple => {
-                        let tuple_class_name = match &aggregate_oomir_type {
-                            oomir::Type::Class(name) => name.clone(),
-                            _ => panic!("Tuple aggregate type error"),
-                        };
-                        breadcrumbs::log!(
-                            breadcrumbs::LogLevel::Info,
-                            "mir-lowering",
-                            format!(
-                                "Info: Handling Tuple Aggregate -> Temp Var '{}'",
-                                temp_aggregate_var
-                            )
-                        );
                         let place_ty = original_dest_place.ty(&mir.local_decls, tcx).ty;
                         let mut constructor_args = Vec::new();
                         for (i, mir_op) in operands.iter().enumerate() {
@@ -203,11 +204,15 @@ impl<'tcx> RvalueContext<'_, 'tcx> {
                             );
                             constructor_args.push((value_operand, element_oomir_type));
                         }
-                        instructions.push(oomir::Instruction::ConstructObject {
-                            dest: temp_aggregate_var.clone(),
-                            class_name: tuple_class_name.clone(),
-                            args: constructor_args,
-                        });
+                        crate::lower1::types::tuple_value(
+                            place_ty,
+                            constructor_args,
+                            &temp_aggregate_var,
+                            tcx,
+                            data_types,
+                            instance,
+                            &mut instructions,
+                        );
                     }
                     rustc_middle::mir::AggregateKind::Array(mir_element_ty) => {
                         breadcrumbs::log!(
@@ -262,18 +267,8 @@ impl<'tcx> RvalueContext<'_, 'tcx> {
                         }
                     }
                     rustc_middle::mir::AggregateKind::Closure(_, _) => {
-                        let closure_ty = original_dest_place.ty(&mir.local_decls, tcx).ty;
-                        if let Some(callable_abi) =
-                            closure_callable_abi(closure_ty, tcx, data_types, instance)
-                        {
-                            ensure_closure_callable_bridge(
-                                closure_ty,
-                                &callable_abi,
-                                data_types,
-                                tcx,
-                                instance,
-                            );
-                        }
+                        // Only dyn Fn coercions require callable interfaces. Static calls already
+                        // identify the closure body.
                         let closure_class_name = match &aggregate_oomir_type {
                             oomir::Type::Class(name) => name.clone(),
                             _ => panic!("Closure aggregate type error"),
@@ -395,7 +390,106 @@ impl<'tcx> RvalueContext<'_, 'tcx> {
                                 instance,
                             );
                         }
-                        if crate::lower1::is_non_null_lang_item(tcx, adt_def.did())
+                        if let Some(payload) = crate::lower1::types::transparent_payload(
+                            data_types.normalize(tcx, Ty::new_adt(tcx, adt_def, substs), instance),
+                            tcx,
+                        ) {
+                            let value = convert_operand(
+                                &operands[FieldIdx::from_usize(payload.field)],
+                                tcx,
+                                instance,
+                                mir,
+                                data_types,
+                                &mut instructions,
+                            );
+                            instructions.push(oomir::Instruction::Move {
+                                dest: temp_aggregate_var.clone(),
+                                src: value,
+                            });
+                        } else if let Some(word) = crate::lower1::types::packed_word(
+                            data_types.normalize(tcx, Ty::new_adt(tcx, adt_def, substs), instance),
+                            tcx,
+                        ) {
+                            let mut value = word.zero();
+                            for (index, operand) in operands.iter().enumerate() {
+                                let field = convert_operand(
+                                    operand,
+                                    tcx,
+                                    instance,
+                                    mir,
+                                    data_types,
+                                    &mut instructions,
+                                );
+                                value = word.insert(
+                                    value,
+                                    index,
+                                    field,
+                                    &format!("{temp_aggregate_var}_packed_{index}"),
+                                    &mut instructions,
+                                );
+                            }
+                            instructions.push(oomir::Instruction::Move {
+                                dest: temp_aggregate_var.clone(),
+                                src: value,
+                            });
+                        } else if let Some(value) = crate::lower1::types::enum_scalar_variant(
+                            data_types.normalize(tcx, Ty::new_adt(tcx, adt_def, substs), instance),
+                            *variant_idx,
+                            tcx,
+                        ) {
+                            instructions.push(oomir::Instruction::Move {
+                                dest: temp_aggregate_var.clone(),
+                                src: oomir::Operand::Constant(value),
+                            });
+                        } else if matches!(aggregate_oomir_type, oomir::Type::TaggedI64) {
+                            let value = operands
+                                .iter()
+                                .next()
+                                .map(|operand| {
+                                    convert_operand(
+                                        operand,
+                                        tcx,
+                                        instance,
+                                        mir,
+                                        data_types,
+                                        &mut instructions,
+                                    )
+                                })
+                                .unwrap_or(oomir::Operand::Constant(oomir::Constant::I64(0)));
+                            instructions.push(crate::lower1::types::tagged_value(
+                                temp_aggregate_var.clone(),
+                                value,
+                                variant_idx.as_u32() as u64,
+                            ));
+                        } else if let Some(carrier) = crate::lower1::types::enum_carrier(
+                            data_types.normalize(tcx, Ty::new_adt(tcx, adt_def, substs), instance),
+                            tcx,
+                        ) {
+                            if !carrier.nullable && *variant_idx != carrier.variant {
+                                // Specialized MIR can construct an uninhabited variant. That
+                                // variant has no payload for the remaining live representation.
+                                instructions.push(oomir::Instruction::Unreachable);
+                                return (instructions, jvm_default_value(&aggregate_oomir_type));
+                            }
+                            let value = if carrier.nullable && variant_idx.as_u32() == 0 {
+                                oomir::Operand::Constant(oomir::Constant::Null(
+                                    aggregate_oomir_type.clone(),
+                                ))
+                            } else {
+                                convert_operand(
+                                    operands.iter().next().expect("direct enum has one field"),
+                                    tcx,
+                                    instance,
+                                    mir,
+                                    data_types,
+                                    &mut instructions,
+                                )
+                            };
+                            instructions.push(oomir::Instruction::Move {
+                                dest: temp_aggregate_var.clone(),
+                                src: value,
+                            });
+                        } else if crate::lower1::is_non_null_lang_item(tcx, adt_def.did())
                             && matches!(aggregate_oomir_type, oomir::Type::Pointer(_))
                         {
                             let operand = operands
@@ -430,16 +524,22 @@ impl<'tcx> RvalueContext<'_, 'tcx> {
                             let oomir_fields: Vec<(String, oomir::Type)> = variant
                                 .fields
                                 .iter()
-                                .filter_map(|f| {
+                                .enumerate()
+                                .filter_map(|(index, f)| {
                                     let field_ty = ty_to_oomir_type(
                                         f.ty(tcx, substs).skip_norm_wip(),
                                         tcx,
                                         data_types,
                                         instance,
                                     );
-                                    field_ty
-                                        .has_jvm_value()
-                                        .then(|| (f.ident(tcx).to_string(), field_ty))
+                                    field_ty.has_jvm_value().then(|| {
+                                        (
+                                            crate::lower1::types::struct_field_name(
+                                                tcx, &adt_def, index,
+                                            ),
+                                            field_ty,
+                                        )
+                                    })
                                 })
                                 .collect();
                             if should_define_data_type && !data_types.contains_key(&jvm_class_name)
@@ -457,6 +557,9 @@ impl<'tcx> RvalueContext<'_, 'tcx> {
                                     jvm_class_name.clone(),
                                     oomir::DataType::Class {
                                         fields: oomir_fields.clone(),
+                                        kind: crate::lower1::types::adt_class_kind(
+                                            tcx, &adt_def, substs,
+                                        ),
                                         is_abstract: false,
                                         methods,
                                         super_class: None,
@@ -526,7 +629,7 @@ impl<'tcx> RvalueContext<'_, 'tcx> {
                             let variant_class_name = format!(
                                 "{}${}",
                                 base_enum_name,
-                                jvm_names::member_name(&variant_def.name.to_string())
+                                crate::lower1::types::enum_variant_name(variant_def, tcx)
                             );
                             let transparent_payload =
                                 jvm_subtype_payload_ty(&adt_def, variant_def, substs, tcx);
@@ -653,9 +756,7 @@ impl<'tcx> RvalueContext<'_, 'tcx> {
                         }
                     }
                     rustc_middle::mir::AggregateKind::RawPtr(pointee_ty, _) => {
-                        let pointee_ty = EarlyBinder::bind(tcx, *pointee_ty)
-                            .instantiate(tcx, instance.args)
-                            .skip_norm_wip();
+                        let pointee_ty = data_types.normalize(tcx, *pointee_ty, instance);
                         let destination_ty = normalize_unsize_ty(
                             original_dest_place.ty(&mir.local_decls, tcx).ty,
                             tcx,
@@ -703,6 +804,9 @@ impl<'tcx> RvalueContext<'_, 'tcx> {
                             };
                             let data = emit_retyped_slice_data_pointer(
                                 data,
+                                crate::lower1::types::ty_to_oomir_type(
+                                    element_ty, tcx, data_types, instance,
+                                ),
                                 rust_layout_size_operand(element_ty, tcx, instance),
                                 crate::lower1::types::pointer_view_codec_operand(
                                     element_ty, tcx, data_types, instance,
@@ -726,26 +830,10 @@ impl<'tcx> RvalueContext<'_, 'tcx> {
                                 args: vec![
                                     (backing, oomir::Type::Class("java/lang/Object".to_string())),
                                     (offset, oomir::Type::I32),
-                                    (
-                                        metadata,
-                                        if is_str {
-                                            oomir::Type::I32
-                                        } else {
-                                            oomir::Type::U64
-                                        },
-                                    ),
+                                    (metadata, oomir::Type::U64),
                                 ],
                             });
-                        } else if {
-                            let tail = tcx.struct_tail_for_codegen(
-                                pointee_ty,
-                                TypingEnv::fully_monomorphized(),
-                            );
-                            tail.is_slice() || tail.is_str()
-                        } {
-                            let data_ty = data
-                                .get_type()
-                                .expect("slice-tailed raw pointer data pointer is typed");
+                        } else {
                             let metadata = convert_operand(
                                 &operands[FieldIdx::from_usize(1)],
                                 tcx,
@@ -754,97 +842,17 @@ impl<'tcx> RvalueContext<'_, 'tcx> {
                                 data_types,
                                 &mut instructions,
                             );
-                            let pointee_size =
-                                crate::lower1::types::layout_size_bytes(tcx, pointee_ty)
-                                    .expect("slice-tailed raw pointer has a static prefix layout");
-                            instructions.push(oomir::Instruction::InvokeStatic {
-                                dest: Some(temp_aggregate_var.clone()),
-                                class_name: oomir::POINTER_CLASS.to_string(),
-                                method_name: "retypeWithMetadata".to_string(),
-                                method_ty: oomir::Signature {
-                                    params: vec![
-                                        ("pointer".to_string(), data_ty),
-                                        ("view_size".to_string(), oomir::Type::U64),
-                                        ("view_codec".to_string(), oomir::Type::java_string()),
-                                        ("metadata".to_string(), oomir::Type::U64),
-                                    ],
-                                    ret: Box::new(aggregate_oomir_type.clone()),
-                                    is_static: true,
-                                },
-                                args: vec![
-                                    data,
-                                    oomir::Operand::Constant(oomir::Constant::U64(
-                                        u64::try_from(pointee_size)
-                                            .expect("Rust raw DST prefix layout exceeds u64"),
-                                    )),
-                                    crate::lower1::types::pointer_view_codec_operand(
-                                        pointee_ty, tcx, data_types, instance,
-                                    ),
-                                    metadata,
-                                ],
-                            });
-                        } else if matches!(pointee_ty.kind(), TyKind::Dynamic(_, _)) {
-                            let data_ty = data
-                                .get_type()
-                                .expect("raw trait-object aggregate data pointer is typed");
-                            instructions.push(oomir::Instruction::InvokeStatic {
-                                dest: Some(temp_aggregate_var.clone()),
-                                class_name: oomir::POINTER_CLASS.to_string(),
-                                method_name: "restoreErasedView".to_string(),
-                                method_ty: oomir::Signature {
-                                    params: vec![("pointer".to_string(), data_ty)],
-                                    ret: Box::new(aggregate_oomir_type.clone()),
-                                    is_static: true,
-                                },
-                                args: vec![data],
-                            });
-                        } else {
-                            let data_ty = data
-                                .get_type()
-                                .expect("thin raw pointer aggregate data pointer is typed");
-                            if let Ok(pointee_size) =
-                                crate::lower1::types::layout_size_bytes(tcx, pointee_ty)
-                            {
-                                instructions.push(oomir::Instruction::InvokeStatic {
-                                    dest: Some(temp_aggregate_var.clone()),
-                                    class_name: oomir::POINTER_CLASS.to_string(),
-                                    method_name: "retype".to_string(),
-                                    method_ty: oomir::Signature {
-                                        params: vec![
-                                            ("pointer".to_string(), data_ty),
-                                            ("view_size".to_string(), oomir::Type::U64),
-                                            ("view_codec".to_string(), oomir::Type::java_string()),
-                                        ],
-                                        ret: Box::new(aggregate_oomir_type.clone()),
-                                        is_static: true,
-                                    },
-                                    args: vec![
-                                        data,
-                                        oomir::Operand::Constant(oomir::Constant::U64(
-                                            u64::try_from(pointee_size)
-                                                .expect("Rust raw pointer layout exceeds u64"),
-                                        )),
-                                        crate::lower1::types::pointer_view_codec_operand(
-                                            pointee_ty, tcx, data_types, instance,
-                                        ),
-                                    ],
-                                });
-                            } else {
-                                // A generic thin pointer has no metadata operand carrying T's
-                                // layout. Its data pointer came through an erased (`*const ()`)
-                                // view, which records the prior concrete view in Pointer.
-                                instructions.push(oomir::Instruction::InvokeStatic {
-                                    dest: Some(temp_aggregate_var.clone()),
-                                    class_name: oomir::POINTER_CLASS.to_string(),
-                                    method_name: "restoreErasedView".to_string(),
-                                    method_ty: oomir::Signature {
-                                        params: vec![("pointer".to_string(), data_ty)],
-                                        ret: Box::new(aggregate_oomir_type.clone()),
-                                        is_static: true,
-                                    },
-                                    args: vec![data],
-                                });
-                            }
+                            crate::lower1::control_flow::emit_raw_pointer_from_parts(
+                                tcx,
+                                instance,
+                                data_types,
+                                pointee_ty,
+                                aggregate_oomir_type.clone(),
+                                data,
+                                metadata,
+                                Some(temp_aggregate_var.clone()),
+                                &mut instructions,
+                            );
                         }
                     }
                     _ => {

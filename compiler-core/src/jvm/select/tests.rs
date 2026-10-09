@@ -25,6 +25,117 @@ fn binary_body(types: &Types, ty: TypeId, ret: TypeId, op: BinaryOp) -> Body {
     b.finish().unwrap()
 }
 
+fn comparison_branch(
+    types: &Types,
+    ty: TypeId,
+    boolean: TypeId,
+    op: BinaryOp,
+    switch: bool,
+) -> Body {
+    let mut b = Builder::new(types, boolean);
+    let left = b.parameter(b.current(), ty);
+    let right = b.parameter(b.current(), ty);
+    let value = b
+        .emit(Op::Binary { op, left, right }, Some(boolean))
+        .unwrap();
+    let yes = b.create_block();
+    let no = b.create_block();
+    let yes_edge = b.edge(yes, vec![]);
+    let no_edge = b.edge(no, vec![]);
+    b.body.cases.push((Scalar::boolean(false), no_edge));
+    b.terminate(if switch {
+        Terminator::Switch {
+            value,
+            cases: List { start: 0, len: 1 },
+            otherwise: yes_edge,
+        }
+    } else {
+        Terminator::Branch {
+            condition: value,
+            yes: yes_edge,
+            no: no_edge,
+        }
+    });
+    for (block, value) in [(yes, true), (no, false)] {
+        b.switch_to(block);
+        let result = b.constant(boolean, Scalar::boolean(value));
+        b.terminate(Terminator::Return(Some(result)));
+    }
+    b.finish().unwrap()
+}
+
+fn branch_arguments(types: &Types, int: TypeId, boolean: TypeId) -> Body {
+    let mut b = Builder::new(types, int);
+    let condition = b.parameter(b.current(), boolean);
+    let left = b.parameter(b.current(), int);
+    let right = b.parameter(b.current(), int);
+    let join = b.create_block();
+    let value = b.parameter(join, int);
+    let yes = b.edge(join, vec![left]);
+    let no = b.edge(join, vec![right]);
+    b.terminate(Terminator::Branch { condition, yes, no });
+    b.switch_to(join);
+    b.terminate(Terminator::Return(Some(value)));
+    b.finish().unwrap()
+}
+
+fn entry_loop(types: &Types, int: TypeId, boolean: TypeId, array: TypeId) -> Body {
+    let mut b = Builder::new(types, int);
+    let count = b.parameter(b.current(), array);
+    let header = b.create_block();
+    let update = b.create_block();
+    let exit = b.create_block();
+    b.jump(header, vec![]);
+    b.switch_to(header);
+    let zero = integer(&mut b, int, ScalarType::I32, 0);
+    let n = b
+        .emit(
+            Op::ArrayGet {
+                array: count,
+                index: zero,
+                native: true,
+            },
+            Some(int),
+        )
+        .unwrap();
+    let condition = b
+        .emit(
+            Op::Binary {
+                op: BinaryOp::Gt,
+                left: n,
+                right: zero,
+            },
+            Some(boolean),
+        )
+        .unwrap();
+    b.branch(condition, update, exit);
+    b.switch_to(update);
+    let one = integer(&mut b, int, ScalarType::I32, 1);
+    let next = b
+        .emit(
+            Op::Binary {
+                op: BinaryOp::Sub,
+                left: n,
+                right: one,
+            },
+            Some(int),
+        )
+        .unwrap();
+    b.emit(
+        Op::ArraySet {
+            array: count,
+            index: zero,
+            value: next,
+            native: true,
+        },
+        None,
+    );
+    b.jump(header, vec![]);
+    b.switch_to(exit);
+    b.terminate(Terminator::Return(Some(n)));
+    b.finish().unwrap()
+}
+
 fn swap_loop(
     types: &Types,
     ty: TypeId,
@@ -267,8 +378,24 @@ fn jvm_verifies_and_executes_ssa_loops_parallel_copies_scalars_and_throw_points(
     let byte = types.scalar(ScalarType::U8);
     let short = types.scalar(ScalarType::I16);
     let signed_byte = types.scalar(ScalarType::I8);
+    let int_array = types.intern(Type::Array(int));
     use crate::scalar::BitOp;
     let methods = [
+        (
+            "branchLtFloat",
+            "(FF)Z",
+            comparison_branch(&types, float, boolean, BinaryOp::Lt, false),
+        ),
+        (
+            "switchGeFloat",
+            "(FF)Z",
+            comparison_branch(&types, float, boolean, BinaryOp::Ge, true),
+        ),
+        (
+            "branchLtUnsigned",
+            "(JJ)Z",
+            comparison_branch(&types, ulong, boolean, BinaryOp::Lt, false),
+        ),
         (
             "popByte",
             "(B)I",
@@ -357,6 +484,16 @@ fn jvm_verifies_and_executes_ssa_loops_parallel_copies_scalars_and_throw_points(
         ),
         ("callHandler", "(II)I", call_with_handler(&types, int)),
         (
+            "entryLoop",
+            "([I)I",
+            entry_loop(&types, int, boolean, int_array),
+        ),
+        (
+            "branchArguments",
+            "(ZII)I",
+            branch_arguments(&types, int, boolean),
+        ),
+        (
             "tableSwitch",
             "(I)I",
             switch_body(&types, int, ScalarType::I32, &[-2, -1, 0, 1, 2]),
@@ -401,6 +538,21 @@ fn jvm_verifies_and_executes_ssa_loops_parallel_copies_scalars_and_throw_points(
             "shiftShort",
             "(SS)S",
             binary_body(&types, short, short, BinaryOp::Shr),
+        ),
+        (
+            "shiftInt",
+            "(II)I",
+            binary_body(&types, int, int, BinaryOp::Shl),
+        ),
+        (
+            "shiftLong",
+            "(JJ)J",
+            binary_body(&types, long, long, BinaryOp::Shr),
+        ),
+        (
+            "shiftUnsignedLong",
+            "(JJ)J",
+            binary_body(&types, ulong, ulong, BinaryOp::Shr),
         ),
         (
             "addByte",
@@ -455,6 +607,21 @@ fn jvm_verifies_and_executes_ssa_loops_parallel_copies_scalars_and_throw_points(
         .into_iter()
         .map(|(name, descriptor, body)| {
             let code = compile(&body, &types, &mut cp).unwrap();
+            if name == "entryLoop" {
+                assert!(
+                    code.instructions
+                        .iter()
+                        .any(|inst| matches!(inst, Instruction::Goto_w(1)))
+                );
+            }
+            if matches!(name, "swap" | "swapWide" | "branchArguments") {
+                assert!(!code.instructions.iter().enumerate().any(|(i, inst)| {
+                    matches!(inst, Instruction::Goto_w(target) if *target as usize == i + 1)
+                }));
+            }
+            if matches!(name, "shiftInt" | "shiftLong" | "shiftUnsignedLong") {
+                assert!(!code.instructions.contains(&Instruction::Iand));
+            }
             Method {
                 access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
                 name_index: cp.add_utf8(name).unwrap(),
@@ -520,6 +687,9 @@ public class Run {
         }
         long[] boundaries = {Long.MIN_VALUE, Long.MIN_VALUE+1, -3037000500L, -1, 0, 1, 3037000500L, Long.MAX_VALUE-1, Long.MAX_VALUE};
         for (long a : boundaries) for (long b : boundaries) {
+            check(SsaFixture.shiftInt((int)a, (int)b) == ((int)a << (int)b));
+            check(SsaFixture.shiftLong(a, b) == (a >> b));
+            check(SsaFixture.shiftUnsignedLong(a, b) == (a >>> b));
             boolean add=false, sub=false, mul=false;
             try { Math.addExact(a,b); } catch (ArithmeticException ex) { add=true; }
             try { Math.subtractExact(a,b); } catch (ArithmeticException ex) { sub=true; }
@@ -537,6 +707,11 @@ public class Run {
         }
         check(SsaFixture.callHandler(-7, 2)==-4);
         check(SsaFixture.callHandler(123, 0)==123);
+        check(SsaFixture.branchArguments(true, 11, 29)==11);
+        check(SsaFixture.branchArguments(false, 11, 29)==29);
+        check(SsaFixture.entryLoop(new int[]{100})==0);
+        check(SsaFixture.entryLoop(new int[]{0})==0);
+        check(SsaFixture.entryLoop(new int[]{-1})==-1);
         for (int n=-100; n<100; n++) check(SsaFixture.tableSwitch(n)==(n>=-2 && n<=2 ? n+3 : -1));
         check(SsaFixture.lookupSwitch(Integer.MIN_VALUE)==1);
         check(SsaFixture.lookupSwitch(0)==2); check(SsaFixture.lookupSwitch(Integer.MAX_VALUE)==3);
@@ -556,6 +731,13 @@ public class Run {
         check(SsaFixture.divUnsigned(-1, 2)==Integer.divideUnsigned(-1,2));
         check(!SsaFixture.ltUnsigned(-1, 0)); check(SsaFixture.ltUnsigned(0,-1));
         check(!SsaFixture.ltFloat(Float.NaN, 1)); check(!SsaFixture.ltFloat(1,Float.NaN));
+        float[] floats = {Float.NaN, Float.NEGATIVE_INFINITY, -1, -0.0f, 0.0f, 1, Float.POSITIVE_INFINITY};
+        for (float a : floats) for (float b : floats) {
+            check(SsaFixture.branchLtFloat(a,b) == (a < b));
+            check(SsaFixture.switchGeFloat(a,b) == (a >= b));
+        }
+        for (long a : boundaries) for (long b : boundaries)
+            check(SsaFixture.branchLtUnsigned(a,b) == (Long.compareUnsigned(a,b) < 0));
         check(!SsaFixture.geFloat(Float.NaN, 1)); check(SsaFixture.geFloat(-0.0f,0.0f));
         check(SsaFixture.eqDouble(-0.0,0.0)); check(!SsaFixture.eqDouble(Double.NaN,Double.NaN));
         check(Double.doubleToRawLongBits(SsaFixture.divDouble(-0.0,1.0))==Long.MIN_VALUE);
@@ -580,6 +762,29 @@ public class Run {
         directory.display()
     );
     fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn empty_blocks_fall_through_without_emitting_branches() {
+    let mut types = Types::default();
+    let int = types.scalar(ScalarType::I32);
+    let mut b = Builder::new(&types, int);
+    let value = integer(&mut b, int, ScalarType::I32, 7);
+    for _ in 0..4 {
+        let block = b.create_block();
+        b.jump(block, vec![]);
+        b.switch_to(block);
+    }
+    b.terminate(Terminator::Return(Some(value)));
+    let code = compile(&b.finish().unwrap(), &types, &mut Default::default()).unwrap();
+    assert_eq!(
+        code.instructions,
+        vec![
+            Instruction::Nop,
+            Instruction::Bipush(7),
+            Instruction::Ireturn
+        ]
+    );
 }
 
 #[test]
@@ -697,9 +902,11 @@ fn representation_constants_and_opaque_values_retain_ordered_effects() {
     let int = types.scalar(ScalarType::I32);
     let unit = types.intern(Type::Unit);
     let mut b = Builder::new(&types, unit);
-    b.body
-        .constants
-        .push(Constant::External { index: 7, ty: int });
+    b.body.constants.push(Constant::External {
+        index: 7,
+        ty: int,
+        pure: false,
+    });
     let value = b.emit(Op::Constant(ConstId::new(0)), Some(int)).unwrap();
     b.emit(Op::Opaque(value), Some(int));
     b.terminate(Terminator::Return(None));

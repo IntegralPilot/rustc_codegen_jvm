@@ -25,6 +25,7 @@ pub(super) fn with_metadata<'tcx>(
         };
         let data = emit_retyped_slice_data_pointer(
             data,
+            crate::lower1::types::ty_to_oomir_type(element_ty, tcx, data_types, instance),
             oomir::Operand::Constant(oomir::Constant::U64(
                 u64::try_from(
                     crate::lower1::types::layout_size_bytes(tcx, element_ty)
@@ -96,67 +97,44 @@ pub(super) fn cast<'tcx>(
     let source_element_size = crate::lower1::types::layout_size_bytes(tcx, source_pointee)
         .expect("fat pointer element has a concrete layout");
     let data_pointer = format!("{label}_fat_cast_data");
-    instructions.push(oomir::Instruction::InvokeStatic {
+    instructions.push(oomir::Instruction::ViewAddress {
         dest: Some(data_pointer.clone()),
-        class_name: oomir::POINTER_CLASS.to_string(),
-        method_name: "fromSlice".to_string(),
-        method_ty: oomir::Signature {
-            params: vec![
-                (
-                    "slice".to_string(),
-                    oomir::Type::Class("java/lang/Object".to_string()),
-                ),
-                ("element_size".to_string(), oomir::Type::U64),
-                ("codec".to_string(), oomir::Type::java_string()),
-            ],
-            ret: Box::new(oomir_output_type.clone()),
-            is_static: true,
-        },
-        args: vec![
-            receiver_operand,
-            oomir::Operand::Constant(oomir::Constant::U64(
+        source: receiver_operand,
+        layout: Box::new(oomir::AddressLayout {
+            pointer_type: oomir_output_type.clone(),
+            size: oomir::Operand::Constant(oomir::Constant::U64(
                 u64::try_from(source_element_size).expect("Rust slice element layout exceeds u64"),
             )),
-            crate::lower1::types::pointer_view_codec_operand(
+            codec: crate::lower1::types::pointer_view_codec_operand(
                 source_pointee,
                 tcx,
                 data_types,
                 instance,
             ),
-        ],
+        }),
     });
-    instructions.push(oomir::Instruction::InvokeVirtual {
+    instructions.push(oomir::Instruction::AddressRetype {
         dest: effective_dest,
-        class_name: oomir::POINTER_CLASS.to_string(),
-        method_name: "retype".to_string(),
-        method_ty: oomir::Signature {
-            params: vec![
-                ("self".to_string(), oomir_output_type.clone()),
-                ("view_size".to_string(), oomir::Type::U64),
-                ("view_codec".to_string(), oomir::Type::java_string()),
-            ],
-            ret: Box::new(oomir_output_type.clone()),
-            is_static: false,
+        source: oomir::Operand::Variable {
+            name: data_pointer,
+            ty: oomir_output_type.clone(),
         },
-        args: vec![
-            oomir::Operand::Constant(oomir::Constant::U64(
+        layout: Box::new(oomir::AddressLayout {
+            pointer_type: oomir_output_type.clone(),
+            size: oomir::Operand::Constant(oomir::Constant::U64(
                 u64::try_from(
                     crate::lower1::types::layout_size_bytes(tcx, target_pointee)
                         .expect("fat pointer cast target has a concrete layout"),
                 )
                 .expect("Rust pointer target layout exceeds u64"),
             )),
-            crate::lower1::types::pointer_view_codec_operand(
+            codec: crate::lower1::types::pointer_view_codec_operand(
                 target_pointee,
                 tcx,
                 data_types,
                 instance,
             ),
-        ],
-        operand: oomir::Operand::Variable {
-            name: data_pointer,
-            ty: oomir_output_type.clone(),
-        },
+        }),
     });
 }
 
@@ -176,73 +154,15 @@ pub(super) fn from_raw_parts<'tcx>(
             panic!("from_raw_parts returned non-pointer type {other:?}")
         }
     };
-    let source_ty = oomir_operands[0]
-        .get_type()
-        .expect("from_raw_parts data pointer is typed");
-    if matches!(pointee.kind(), TyKind::Dynamic(_, _)) {
-        instructions.push(oomir::Instruction::InvokeStatic {
-            dest: effective_dest.clone(),
-            class_name: oomir::POINTER_CLASS.to_string(),
-            method_name: "fromRawTraitParts".to_string(),
-            method_ty: oomir::Signature {
-                params: vec![
-                    ("pointer".to_string(), source_ty),
-                    (
-                        "metadata".to_string(),
-                        oomir::Type::Class("java/lang/Object".to_string()),
-                    ),
-                ],
-                ret: method_signature.ret.clone(),
-                is_static: true,
-            },
-            args: vec![oomir_operands[0].clone(), oomir_operands[1].clone()],
-        });
-    } else {
-        let tail = tcx.struct_tail_for_codegen(pointee, TypingEnv::fully_monomorphized());
-        let carries_slice_metadata = tail.is_slice() || tail.is_str();
-        let pointee_size =
-            crate::lower1::types::layout_size_bytes(tcx, pointee).unwrap_or_else(|error| {
-                panic!("could not determine from_raw_parts pointee size: {error}")
-            });
-        instructions.push(oomir::Instruction::InvokeStatic {
-            dest: effective_dest.clone(),
-            class_name: oomir::POINTER_CLASS.to_string(),
-            method_name: if carries_slice_metadata {
-                "retypeWithMetadata".to_string()
-            } else {
-                "retype".to_string()
-            },
-            method_ty: oomir::Signature {
-                params: {
-                    let mut params = vec![
-                        ("pointer".to_string(), source_ty),
-                        ("view_size".to_string(), oomir::Type::U64),
-                        ("view_codec".to_string(), oomir::Type::java_string()),
-                    ];
-                    if carries_slice_metadata {
-                        params.push(("metadata".to_string(), oomir::Type::U64));
-                    }
-                    params
-                },
-                ret: method_signature.ret.clone(),
-                is_static: true,
-            },
-            args: {
-                let mut args = vec![
-                    oomir_operands[0].clone(),
-                    oomir::Operand::Constant(oomir::Constant::U64(
-                        u64::try_from(pointee_size)
-                            .expect("Rust pointer target layout exceeds u64"),
-                    )),
-                    crate::lower1::types::pointer_view_codec_operand(
-                        pointee, tcx, data_types, instance,
-                    ),
-                ];
-                if carries_slice_metadata {
-                    args.push(oomir_operands[1].clone());
-                }
-                args
-            },
-        });
-    }
+    emit_raw_pointer_from_parts(
+        tcx,
+        instance,
+        data_types,
+        pointee,
+        *method_signature.ret,
+        oomir_operands[0].clone(),
+        oomir_operands[1].clone(),
+        effective_dest,
+        instructions,
+    );
 }

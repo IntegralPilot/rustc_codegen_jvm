@@ -24,7 +24,9 @@ pub(in crate::lower2) fn create_static_initializer_method(
             });
         }
 
-        if let oomir::Constant::Array(element_type, elements) = &static_value.initializer {
+        if let oomir::Constant::Array(element_type, elements) = &static_value.initializer
+            && matches!(static_value.storage_type, oomir::Type::Array(_))
+        {
             append_empty_array(&mut instructions, cp, element_type, elements.len())?;
         } else {
             instructions.push(Instruction::Aconst_null);
@@ -92,29 +94,29 @@ pub(in crate::lower2) fn create_static_initializer_method(
             &static_value.field_name,
             &static_value.storage_type.to_jvm_descriptor(),
         )?;
-        let initializer =
-            if let oomir::Constant::Array(element_type, elements) = &static_value.initializer {
-                // Fill the published array in place, including large chunked
-                // constants, without allocating and copying a second array.
-                factories::create_chunked_array_factory(
-                    cp,
-                    owner_class,
-                    element_type,
-                    elements,
-                    methods,
-                    next_factory,
-                    Some(field_ref),
-                )?
-            } else {
-                instructions.push(Instruction::Getstatic(field_ref));
-                create_constant_factory(
-                    cp,
-                    owner_class,
-                    &static_value.initializer,
-                    methods,
-                    next_factory,
-                )?
-            };
+        let initializer = if let oomir::Constant::Array(element_type, elements) =
+            &static_value.initializer
+            && matches!(static_value.storage_type, oomir::Type::Array(_))
+        {
+            factories::create_chunked_array_factory(
+                cp,
+                owner_class,
+                element_type,
+                elements,
+                methods,
+                next_factory,
+                Some(field_ref),
+            )?
+        } else {
+            instructions.push(Instruction::Getstatic(field_ref));
+            create_constant_factory(
+                cp,
+                owner_class,
+                &static_value.initializer,
+                methods,
+                next_factory,
+            )?
+        };
         load_constant(&mut instructions, cp, &initializer)?;
         if matches!(static_value.storage_type, oomir::Type::Pointer(_)) {
             let initializer_type = oomir::Type::from_constant(&initializer);

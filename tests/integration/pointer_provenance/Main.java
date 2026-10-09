@@ -5,7 +5,32 @@ import org.rustlang.runtime.Pointer;
 public class Main {
     public static void main(String[] args) throws Exception {
         ArrayViews.check();
+        CellArrayViews.check();
+        SliceAliases.check();
         MemoryViews.check();
+        if (pointer_provenance.pointer_provenance.owned_slice_elements() != 26) {
+            throw new AssertionError("slice element copies changed their source or each other");
+        }
+        AtomicViews.check();
+        AtomicLocations.check();
+        RangeCodecs.check();
+        PrimitiveArrayCodecs.check();
+        TypedFields.check();
+        FieldProjections.check();
+        CyclicFieldViews.check();
+        AddressOrder.check();
+        LocationQueries.check();
+        SliceLocations.check();
+        OwnedFields.check();
+        IoCopies.check();
+        MemoryCopies.check();
+        MemoryFills.check();
+        BorrowedFields.check();
+        BorrowedLocals.check();
+        HeapStorage.check();
+        CodecAdapters.check();
+        ConstantBlocks.check();
+        MetadataFilters.check();
         StructuralViews.check();
         Field field = Pointer.class.getDeclaredField("EXPOSED_ADDRESSES");
         field.setAccessible(true);

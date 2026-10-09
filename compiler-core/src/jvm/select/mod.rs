@@ -1,4 +1,5 @@
 //! Direct selection from compact SSA with interval-based JVM local reuse.
+mod addresses;
 mod allocate;
 mod arrays;
 mod assemble;
@@ -90,8 +91,8 @@ pub struct Options<'a> {
     /// verify; production selection otherwise consumes trusted internal IR.
     pub verify: bool,
     pub lines: Option<&'a SourceLines>,
-    pub relative_pointer_abi: bool,
     pub constants: Option<&'a dyn Constants>,
+    pub direct_copy: Option<&'a dyn Fn(&str) -> bool>,
     pub debug: Option<&'a DebugInfo>,
     pub bootstrap: Option<&'a mut Vec<jvm::attributes::BootstrapMethod>>,
 }
@@ -105,6 +106,8 @@ struct Selector<'a> {
     slots: Vec<Option<u16>>,
     forwarded: Vec<bool>,
     stack_value: Option<ValueId>,
+    branch_condition: Option<ValueId>,
+    pending_branch: Option<Instruction>,
     next_slot: u16,
     scratch_used: bool,
     exception_slot: Option<u16>,
@@ -112,8 +115,13 @@ struct Selector<'a> {
     handlers: Vec<(Label, BlockId)>,
     copies: Vec<(u16, u16, Kind)>,
     live: crate::opt::Live,
+    native_array_accesses: Vec<Option<TypeId>>,
     storage: Vec<u16>,
+    aggregate_cache: Option<(ValueId, Option<ValueId>, TypeId)>,
+    aggregate_slot: Option<u16>,
+    projection_sites: rustc_hash::FxHashMap<[u16; 5], u16>,
     constants: Option<&'a dyn Constants>,
+    direct_copy: Option<&'a dyn Fn(&str) -> bool>,
     bootstrap: Option<&'a mut Vec<jvm::attributes::BootstrapMethod>>,
 }
 
@@ -135,8 +143,8 @@ pub fn compile_with_options(
     let Options {
         verify,
         lines,
-        relative_pointer_abi,
         constants,
+        direct_copy,
         debug,
         bootstrap,
     } = options;
@@ -154,15 +162,8 @@ pub fn compile_with_options(
         crate::opt::live_with_roots(body, types, debug.into_iter().flat_map(|d| d.roots(body)));
     let order = body.layout();
     let forwarded = forward::values(body, &live, debug);
-    let allocation = allocate::allocate(
-        body,
-        types,
-        &live,
-        &forwarded,
-        relative_pointer_abi,
-        debug,
-        &order,
-    )?;
+    let allocation = allocate::allocate(body, types, &live, &forwarded, debug, &order)?;
+    let native_array_accesses = crate::analysis::native_array_accesses(body, types, &live);
     let mut debug = debug.map(|d| debug::Debug::new(d, body));
     let mut s = Selector {
         body,
@@ -173,6 +174,8 @@ pub fn compile_with_options(
         slots: allocation.slots,
         forwarded,
         stack_value: None,
+        branch_condition: None,
+        pending_branch: None,
         next_slot: allocation.count,
         scratch_used: false,
         exception_slot: None,
@@ -180,8 +183,13 @@ pub fn compile_with_options(
         handlers: Vec::new(),
         copies: Vec::new(),
         live,
+        native_array_accesses,
         storage: Vec::new(),
+        aggregate_cache: None,
+        aggregate_slot: None,
+        projection_sites: Default::default(),
         constants,
+        direct_copy,
         bootstrap,
     };
     for _ in &body.blocks {
@@ -207,12 +215,6 @@ pub fn compile_with_options(
     for &param in &body.blocks[body.entry.index()].params {
         let value = s.initial_value(param)?;
         frames::push_local_value(&mut initial, value);
-        if relative_pointer_abi
-            && matches!(types.get(body.value_type(param)), Some(Type::Pointer(_)))
-        {
-            frames::push_local_value(&mut initial, frames::FrameValue::Long);
-            frames::push_local_value(&mut initial, frames::FrameValue::Long);
-        }
     }
     if body.blocks.iter().any(|b| {
         matches!(
@@ -233,16 +235,32 @@ pub fn compile_with_options(
             .checked_add(1)
             .ok_or_else(|| error("JVM local limit"))?;
     }
-    for block in order {
+    for (position, &block) in order.iter().enumerate() {
+        s.aggregate_cache = None;
+        s.branch_condition = match body.blocks[block.index()].terminator.unwrap() {
+            Terminator::Branch { condition, .. } => Some(body.resolve(condition)),
+            Terminator::Switch { value, cases, .. }
+                if cases.len == 1
+                    && types.get(body.value_type(value))
+                        == Some(Type::Scalar(ScalarType::Bool)) =>
+            {
+                Some(body.resolve(value))
+            }
+            _ => None,
+        };
+        // Keep loop headers after method entry. Frame-offset conversion reserves
+        // offset zero for the implicit entry frame. Removing an entry jump must
+        // not create a branch target at zero.
+        if s.assembly.code.is_empty() && body.edges.iter().any(|edge| edge.target == block) {
+            s.assembly.code.push(Instruction::Nop);
+        }
         s.assembly.bind(s.blocks[block.index()]);
         if block == body.entry {
             s.initialize_storage()?;
             if let Some(debug) = &mut debug {
                 debug.allocate(&mut s)?;
             }
-            if relative_pointer_abi {
-                s.materialize_parameters()?;
-            }
+
             // JVM byte/short parameters are sign-extended by Java callers.
             for &param in &body.blocks[block.index()].params {
                 if s.live.uses[param.index()] > 1
@@ -272,6 +290,7 @@ pub fn compile_with_options(
                 .is_some_and(|event| event.position as usize == position)
             {
                 let event = events.next().unwrap();
+                s.aggregate_cache = None;
                 let start = s.assembly.code.len();
                 debug.as_mut().unwrap().apply(&mut s, event.change)?;
                 if lines.is_some() {
@@ -295,8 +314,12 @@ pub fn compile_with_options(
             }
         }
         let start = s.assembly.code.len();
-        s.terminator(body.blocks[block.index()].terminator.unwrap())?;
+        s.terminator(
+            body.blocks[block.index()].terminator.unwrap(),
+            order.get(position + 1).copied(),
+        )?;
         debug_assert!(s.stack_value.is_none());
+        debug_assert!(s.pending_branch.is_none());
         if let Some(debug) = &mut debug {
             debug.mark(start, s.assembly.code.len());
         }
@@ -434,29 +457,28 @@ impl Selector<'_> {
         Ok(())
     }
     fn jump(&mut self, edge: EdgeId) -> jvm::Result<()> {
+        self.jump_to(edge, None)
+    }
+    fn jump_to(&mut self, edge: EdgeId, fallthrough: Option<BlockId>) -> jvm::Result<()> {
         self.copies(edge)?;
-        self.assembly.branch(
-            Instruction::Goto_w(0),
-            self.blocks[self.body.edges[edge.index()].target.index()],
-        );
+        let target = self.body.edges[edge.index()].target;
+        if Some(target) != fallthrough {
+            self.assembly
+                .branch(Instruction::Goto_w(0), self.blocks[target.index()]);
+        }
         Ok(())
     }
-    fn terminator(&mut self, term: Terminator) -> jvm::Result<()> {
+    fn terminator(&mut self, term: Terminator, fallthrough: Option<BlockId>) -> jvm::Result<()> {
         match term {
-            Terminator::Jump(edge) => self.jump(edge)?,
+            Terminator::Jump(edge) => self.jump_to(edge, fallthrough)?,
             Terminator::Branch { condition, yes, no } => {
-                let yes_label = self.assembly.label();
-                self.load(condition)?;
-                self.assembly.branch(Instruction::Ifne(0), yes_label);
-                self.jump(no)?;
-                self.assembly.bind(yes_label);
-                self.jump(yes)?;
+                self.branch(condition, yes, no, fallthrough)?;
             }
             Terminator::Switch {
                 value,
                 cases,
                 otherwise,
-            } => self.switch(value, cases, otherwise)?,
+            } => self.switch(value, cases, otherwise, fallthrough)?,
             Terminator::Return(Some(value)) => {
                 self.argument(value)?;
                 self.assembly.code.push(self.value_kind(value)?.return_op());
@@ -474,7 +496,7 @@ impl Selector<'_> {
                 self.instruction(inst)?;
                 let end = u16::try_from(self.assembly.code.len())?;
                 self.protect(start, end, unwind);
-                self.jump(normal)?;
+                self.jump_to(normal, fallthrough)?;
             }
             Terminator::Rethrow => {
                 self.assembly.code.extend([

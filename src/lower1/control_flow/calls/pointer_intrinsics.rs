@@ -35,8 +35,8 @@ pub(super) fn ptr_drop_in_place<'tcx>(
     tcx: TyCtxt<'tcx>,
     instance: Instance<'tcx>,
     data_types: &mut Definitions<'tcx>,
-    label: &str,
-    mut instructions: &mut Vec<oomir::Instruction>,
+    _label: &str,
+    instructions: &mut Vec<oomir::Instruction>,
     func_instance: Instance<'tcx>,
     oomir_operands: Vec<oomir::Operand>,
 ) {
@@ -45,41 +45,14 @@ pub(super) fn ptr_drop_in_place<'tcx>(
         .types()
         .next()
         .expect("drop_in_place has a pointee type argument");
-    if pointee_ty.needs_drop(tcx, TypingEnv::fully_monomorphized()) {
-        let pointee_oomir_ty =
-            crate::lower1::types::ty_to_oomir_type(pointee_ty, tcx, data_types, instance);
-        let pointer = oomir_operands[0].clone();
-        let value = if !matches!(pointee_ty.kind(), TyKind::Slice(_))
-            && matches!(pointer.get_type(), Some(oomir::Type::Pointer(_)))
-        {
-            let value_name = format!("{label}_drop_in_place_value");
-            crate::lower1::place::emit_pointer_read(
-                pointer,
-                &pointee_oomir_ty,
-                &value_name,
-                &mut instructions,
-            )
-        } else {
-            // Fat slice references are already carried
-            // as SliceView values rather than Pointer.
-            match pointer {
-                oomir::Operand::Variable { name, .. } => oomir::Operand::Variable {
-                    name,
-                    ty: pointee_oomir_ty.clone(),
-                },
-                other => other,
-            }
-        };
-        emit_rust_drop_value(
-            pointee_ty,
-            value,
-            &format!("{label}_drop_in_place"),
-            tcx,
-            instance,
-            data_types,
-            &mut instructions,
-        );
-    }
+    emit_drop_in_place(
+        pointee_ty,
+        oomir_operands[0].clone(),
+        tcx,
+        instance,
+        data_types,
+        instructions,
+    );
 }
 pub(super) fn ptr_eq<'tcx>(
     instructions: &mut Vec<oomir::Instruction>,
@@ -179,7 +152,7 @@ pub(super) fn ptr_slice_from_raw_parts<'tcx>(
     instance: Instance<'tcx>,
     data_types: &mut Definitions<'tcx>,
     label: &str,
-    mut instructions: &mut Vec<oomir::Instruction>,
+    instructions: &mut Vec<oomir::Instruction>,
     fn_output: Ty<'tcx>,
     oomir_output_type: oomir::Type,
     oomir_operands: Vec<oomir::Operand>,
@@ -203,12 +176,13 @@ pub(super) fn ptr_slice_from_raw_parts<'tcx>(
             });
         let data = crate::lower1::place::emit_retyped_slice_data_pointer(
             data,
+            crate::lower1::types::ty_to_oomir_type(element_ty, tcx, data_types, instance),
             oomir::Operand::Constant(oomir::Constant::U64(
                 u64::try_from(element_size).expect("Rust slice element layout exceeds u64"),
             )),
             crate::lower1::types::pointer_view_codec_operand(element_ty, tcx, data_types, instance),
             &format!("{label}_raw_slice"),
-            &mut instructions,
+            instructions,
         );
         let view_class = if is_str {
             oomir::UTF8_VIEW_CLASS
@@ -218,7 +192,7 @@ pub(super) fn ptr_slice_from_raw_parts<'tcx>(
         let (backing, offset) = crate::lower1::place::emit_pointer_slice_parts(
             data,
             &format!("{label}_raw_slice"),
-            &mut instructions,
+            instructions,
         );
         let slice_object = format!("{label}_raw_slice_object");
         instructions.push(oomir::Instruction::ConstructObject {
@@ -227,14 +201,7 @@ pub(super) fn ptr_slice_from_raw_parts<'tcx>(
             args: vec![
                 (backing, oomir::Type::Class("java/lang/Object".to_string())),
                 (offset, oomir::Type::I32),
-                (
-                    oomir_operands[1].clone(),
-                    if is_str {
-                        oomir::Type::I32
-                    } else {
-                        oomir::Type::U64
-                    },
-                ),
+                (oomir_operands[1].clone(), oomir::Type::U64),
             ],
         });
         instructions.push(oomir::Instruction::Cast {
@@ -245,66 +212,6 @@ pub(super) fn ptr_slice_from_raw_parts<'tcx>(
             ty: oomir_output_type.clone(),
             dest,
         });
-    }
-}
-pub(super) fn metadata<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    data_types: &mut Definitions<'tcx>,
-    label: &str,
-    mut instructions: &mut Vec<oomir::Instruction>,
-    fn_inputs: Vec<Ty<'tcx>>,
-    oomir_output_type: oomir::Type,
-    oomir_operands: Vec<oomir::Operand>,
-    effective_dest: Option<String>,
-) {
-    if let Some(dest) = effective_dest.clone() {
-        let pointee = fn_inputs.first().and_then(|input| {
-            let (TyKind::RawPtr(pointee, _) | TyKind::Ref(_, pointee, _)) = input.kind() else {
-                return None;
-            };
-            Some(*pointee)
-        });
-        let slice_tailed_pointee = pointee.and_then(|pointee| {
-            let tail = tcx.struct_tail_for_codegen(pointee, TypingEnv::fully_monomorphized());
-            (tail.is_slice() || tail.is_str()).then_some(pointee)
-        });
-        let trait_tailed_pointee = pointee.is_some_and(|pointee| {
-            let tail = tcx.struct_tail_for_codegen(pointee, TypingEnv::fully_monomorphized());
-            matches!(tail.kind(), TyKind::Dynamic(..))
-        });
-        if slice_tailed_pointee.is_some() {
-            let pointer_ty = oomir_operands[0]
-                .get_type()
-                .expect("DST metadata operand must be typed");
-            instructions.push(oomir::Instruction::InvokeVirtual {
-                dest: Some(dest),
-                class_name: oomir::POINTER_CLASS.to_string(),
-                method_name: "metadata".to_string(),
-                method_ty: oomir::Signature {
-                    params: vec![("self".to_string(), pointer_ty)],
-                    ret: Box::new(oomir_output_type.clone()),
-                    is_static: false,
-                },
-                args: Vec::new(),
-                operand: oomir_operands[0].clone(),
-            });
-        } else if pointee.is_some_and(|pointee| matches!(pointee.kind(), TyKind::Dynamic(..)))
-            || trait_tailed_pointee
-        {
-            emit_trait_object_metadata(
-                oomir_operands[0].clone(),
-                &oomir_output_type,
-                dest,
-                &format!("{label}_trait_metadata"),
-                data_types,
-                &mut instructions,
-            );
-        } else {
-            instructions.push(oomir::Instruction::Move {
-                dest,
-                src: oomir::Operand::Constant(oomir::Constant::Null(oomir_output_type.clone())),
-            });
-        }
     }
 }
 pub(super) fn ptr_without_provenance<'tcx>(
@@ -352,7 +259,7 @@ pub(super) fn ptr_without_provenance<'tcx>(
     });
 }
 pub(super) fn ptr_read<'tcx>(
-    mut instructions: &mut Vec<oomir::Instruction>,
+    instructions: &mut Vec<oomir::Instruction>,
     oomir_operands: Vec<oomir::Operand>,
     effective_dest: Option<String>,
     intrinsic_name: String,
@@ -385,12 +292,12 @@ pub(super) fn ptr_read<'tcx>(
             oomir_operands[0].clone(),
             pointee.as_ref(),
             &dest,
-            &mut instructions,
+            instructions,
         );
     }
 }
 pub(super) fn ptr_write<'tcx>(
-    mut instructions: &mut Vec<oomir::Instruction>,
+    instructions: &mut Vec<oomir::Instruction>,
     oomir_operands: Vec<oomir::Operand>,
     intrinsic_name: String,
     is_compiler_intrinsic: bool,
@@ -401,7 +308,7 @@ pub(super) fn ptr_write<'tcx>(
             oomir_operands[0].clone(),
             pointee.as_ref(),
             oomir_operands[1].clone(),
-            &mut instructions,
+            instructions,
         );
     }
     if is_diagnostic_item(sym::ptr_write_volatile)

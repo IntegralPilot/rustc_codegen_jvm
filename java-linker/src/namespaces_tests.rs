@@ -32,7 +32,7 @@ fn names_and_reflection_strings_relocate_without_changing_literals_or_code() {
     let mut pool = InternedConstantPool::default();
     let this_class = pool.add_class(&owner).unwrap();
     let super_class = pool.add_class("java/lang/Object").unwrap();
-    let literal = pool.add_string(&owner).unwrap(); // shares UTF8 with CONSTANT_Class
+    let literal = pool.add_string(&owner).unwrap();
     let reflection = pool.add_name_string(&owner).unwrap();
     let escaped_value = format!("{NAME_STRING}{owner}");
     let escaped = pool.add_string(&escaped_value).unwrap();
@@ -123,4 +123,45 @@ fn crate_markers_are_not_nesting_separators() {
     let separators = nesting_separators(&name).collect::<Vec<_>>();
     assert_eq!(separators, [name.len() - "$Inner".len()]);
     assert_eq!(inner_name(&name), "Inner");
+}
+
+#[test]
+fn executable_proofs_are_removed_without_touching_other_metadata_or_library_proofs() {
+    let mut class = ClassFile::default();
+    class.this_class = class.constant_pool.add_class("test/Storage").unwrap();
+    class.super_class = class.constant_pool.add_class("java/lang/Object").unwrap();
+    for (name, info) in [
+        ("RustJvmPrivate", vec![]),
+        ("Unrelated", vec![4, 5]),
+        ("RustJvmCarrier", vec![1, 2, 3]),
+    ] {
+        class.attributes.push(Attribute::Unknown {
+            name_index: class.constant_pool.add_utf8(name).unwrap(),
+            info,
+        });
+    }
+    let source = Attribute::SourceFile {
+        name_index: class.constant_pool.add_utf8("SourceFile").unwrap(),
+        source_file_index: class.constant_pool.add_utf8("storage.rs").unwrap(),
+    };
+    class.attributes.push(source.clone());
+    for strip_proofs in [false, true] {
+        let mut names = Namespaces::default();
+        names.strip_proofs = strip_proofs;
+        let result = names
+            .class(ClassInfo {
+                jar_entry_name: "test/Storage.class".into(),
+                data: serialize_class_file(&class).unwrap(),
+            })
+            .unwrap();
+        let result = class_file_from_data(&result.data).unwrap();
+        assert_eq!(
+            result.attributes,
+            if strip_proofs {
+                vec![class.attributes[1].clone(), source.clone()]
+            } else {
+                class.attributes.clone()
+            }
+        );
+    }
 }

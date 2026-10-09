@@ -25,10 +25,6 @@ impl Emission<'_> {
                     name,
                     ty,
                     is_static: false,
-                    relative_pointer: matches!(
-                        self.vocabulary.types.get(ty),
-                        Some(ir::Type::Pointer(_))
-                    ),
                 });
                 value = self
                     .emit(
@@ -63,7 +59,7 @@ impl Emission<'_> {
         }
         Ok(None)
     }
-    fn construct(
+    pub(super) fn construct(
         &mut self,
         owner: String,
         fields: &[(String, oomir::Type)],

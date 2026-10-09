@@ -3,6 +3,7 @@ mod forward;
 pub use forward::{MethodForwarder, ReceiverPointer};
 mod body;
 pub(crate) mod construct;
+pub mod fields;
 pub(crate) mod outline;
 pub use body::SsaBody;
 pub type SsaFunction = Function<Arc<SsaBody>>;
@@ -23,12 +24,13 @@ pub mod scalar;
 mod visit;
 
 pub use jvm_compiler_core::jvm::abi::{
-    POINTER_CLASS, RELATIVE_POINTER_METHOD_SUFFIX, SLICE_VIEW_CLASS, UTF8_VIEW_CLASS,
-    relative_pointer_byte_offset_field, relative_pointer_element_offset_field,
+    POINTER_CLASS, SLICE_VIEW_CLASS, TAGGED_LONG_CLASS, UTF8_VIEW_CLASS,
 };
 pub const JAVA_STRING_CLASS: &str = "java/lang/String";
 pub const CALLER_LOCATION_PARAM_NAME: &str = "__caller_location";
+pub const ENUM_TAG_METHOD: &str = "$rust$tag";
 pub use jvm_compiler_core::debug::SourceLocation;
+pub use jvm_compiler_core::ir::HeapOp;
 
 /// A source-level Rust variable that can be represented by a JVM local slot.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -53,9 +55,6 @@ pub struct Module<D = HashMap<String, DataType>> {
     pub shared_data_types: Option<Arc<HashMap<String, DataType>>>,
     /// Canonical emission shards use the same immutable representation tables.
     pub shared_context: Option<Arc<std::sync::OnceLock<construct::Context>>>,
-    /// Static methods removed into the canonical data-type contribution table
-    /// that still use the component-carrying internal pointer ABI.
-    pub relative_static_methods: Arc<HashSet<FunctionKey>>,
     /// JVM interfaces referenced by this shard but defined in another crate.
     pub external_interfaces: HashSet<String>,
     pub statics: HashMap<String, Static>,
@@ -73,7 +72,6 @@ impl<D> Module<D> {
             suppressed_data_types: self.suppressed_data_types,
             shared_data_types: self.shared_data_types,
             shared_context: self.shared_context,
-            relative_static_methods: self.relative_static_methods,
             external_interfaces: self.external_interfaces,
             statics: self.statics,
         }
@@ -94,6 +92,17 @@ impl<D> Module<D> {
 }
 
 impl Module {
+    pub fn component_method(&self, owner: &str, name: &str) -> bool {
+        component_method(owner, name)
+            || (name == "call"
+                && self.data_type(owner).is_some_and(|data| {
+                    let (DataType::Class { interfaces, .. }
+                    | DataType::Interface { interfaces, .. }) = data;
+                    interfaces
+                        .iter()
+                        .any(|p| p.starts_with("org/rustlang/runtime/FnPtr_"))
+                }))
+    }
     pub fn data_type(&self, name: &str) -> Option<&DataType> {
         self.data_types.get(name).or_else(|| {
             self.shared_data_types
@@ -167,6 +176,7 @@ pub struct Static {
     pub allocation_alignment: usize,
     pub allocation_codec_class_name: Option<String>,
     pub is_thread_local: bool,
+    pub is_private: bool,
 }
 
 impl Static {
@@ -215,6 +225,8 @@ pub enum AdtHelperKind {
         enum_class: String,
         variants: Vec<EnumVariantShape>,
         values: Vec<i64>,
+        /// Private variants answer directly without naming every sibling class.
+        dispatch: Option<String>,
     },
     EnumIsVariant {
         enum_class: String,
@@ -233,9 +245,21 @@ pub enum AdtHelperKind {
     },
 }
 
+/// Static method namespaces require no Rust storage, constructors, or copy helpers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ClassKind {
+    Value,
+    /// A named public Java value keeps its declared field contract.
+    JavaValue,
+    /// DST fields describe decoded views. They do not supply authoritative inline storage.
+    MemoryView,
+    Static,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DataType {
     Class {
+        kind: ClassKind,
         is_abstract: bool,
         super_class: Option<String>,
         fields: Vec<(String, Type)>,
@@ -254,12 +278,14 @@ impl Hash for DataType {
         std::mem::discriminant(self).hash(state);
         match self {
             Self::Class {
+                kind,
                 is_abstract,
                 super_class,
                 fields,
                 methods,
                 interfaces,
             } => {
+                kind.hash(state);
                 is_abstract.hash(state);
                 super_class.hash(state);
                 fields.hash(state);
@@ -288,6 +314,7 @@ impl DataType {
     pub fn clean_duplicates(&mut self) {
         match self {
             DataType::Class {
+                kind: _,
                 is_abstract: _,
                 super_class: _,
                 fields,

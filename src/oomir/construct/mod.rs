@@ -9,12 +9,22 @@ use jvm_compiler_core::{
 };
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::sync::Arc;
+mod addresses;
 mod arithmetic;
 mod arrays;
 mod context;
+mod heap;
+mod memory;
 mod operations;
+#[cfg(test)]
+mod pointer_tests;
 mod pointers;
+mod records;
+pub(crate) use records::RECORD_ENTRY;
 mod types;
+#[cfg(test)]
+mod view_tests;
+mod views;
 mod wrappers;
 pub(crate) use context::Context;
 use types::Vocabulary;
@@ -41,8 +51,19 @@ pub(crate) fn seal(function: oomir::Function, context: &Context) -> Result<oomir
             let _ = std::fs::write(path, format!("{function:#?}"));
         }
     }
+    let record_signature = function.name.strip_suffix(RECORD_ENTRY).and_then(|name| {
+        context.record_signature(
+            function.owner_class.as_deref().unwrap_or(""),
+            name,
+            &function.signature,
+        )
+    });
+    let physical_signature = record_signature
+        .clone()
+        .unwrap_or_else(|| function.signature.clone());
     let mut vocabulary = Vocabulary::default();
     vocabulary.signature(&function.signature);
+    vocabulary.signature(&physical_signature);
     for variable in &function.debug_variables {
         vocabulary.add(&variable.ty);
     }
@@ -167,9 +188,27 @@ pub(crate) fn seal(function: oomir::Function, context: &Context) -> Result<oomir
         if !ty.has_jvm_value() {
             continue;
         }
-        let value = emission
-            .builder
-            .parameter(emission.builder.current(), vocabulary.id(ty));
+        let value = if let Some(fields) = context
+            .scalar_fields(ty)
+            .filter(|_| record_signature.is_some())
+        {
+            let oomir::Type::Class(owner) = ty else {
+                unreachable!()
+            };
+            let args = fields
+                .iter()
+                .map(|(_, ty)| {
+                    emission
+                        .builder
+                        .parameter(emission.builder.current(), vocabulary.id(ty))
+                })
+                .collect();
+            emission.construct(owner.clone(), fields, args)?
+        } else {
+            emission
+                .builder
+                .parameter(emission.builder.current(), vocabulary.id(ty))
+        };
         emission.write(&format!("param_{index}"), value)?;
         let synthetic_main = function.name == "main"
             && index == 0
@@ -255,7 +294,7 @@ pub(crate) fn seal(function: oomir::Function, context: &Context) -> Result<oomir
         lines,
         source_file,
         constants,
-        debug,
+        mut debug,
         variables,
         cells,
         ..
@@ -273,10 +312,131 @@ pub(crate) fn seal(function: oomir::Function, context: &Context) -> Result<oomir
         variables.sort_by_key(|(id, _)| id.index());
         format!("{}: {e}; bindings: {variables:?}", function.name)
     })?;
+    let representation_start = ir.instructions.len();
+    let component_signature = function
+        .owner_class
+        .as_deref()
+        .is_some_and(|owner| context.component_method(owner, &function.name))
+        .then(|| physical_signature.component_signature());
+    let component_entry = component_signature
+        .as_ref()
+        .is_some_and(|s| s != &physical_signature);
     jvm_compiler_core::opt::promote_fields(&mut ir, &vocabulary.types);
+    // Cell promotion precedes component analysis. Otherwise, hidden borrows can force unnecessary
+    // carriers.
     if debug.locals.is_empty() && !cells.is_empty() {
         ir = jvm_compiler_core::opt::promote_cells(ir, &vocabulary.types, &cells)
             .map_err(|e| format!("{}: cell promotion: {e}", function.name))?;
+    }
+    if debug.locals.is_empty() {
+        jvm_compiler_core::opt::lower_owned_reads(&mut ir, &vocabulary.types);
+        ir = jvm_compiler_core::opt::promote_aggregates(ir, &vocabulary.types, |name| {
+            let fields = &context.fields.get(name)?.members;
+            let owner = vocabulary.id(&oomir::Type::Class(name.into()));
+            Some(
+                fields
+                    .iter()
+                    .map(|(name, ty)| {
+                        Some(ir::FieldRef {
+                            owner,
+                            name: name.clone(),
+                            ty: vocabulary.find(ty)?,
+                            is_static: false,
+                        })
+                    })
+                    .collect::<Option<Vec<_>>>()?,
+            )
+        })
+        .map_err(|e| format!("{}: aggregate promotion: {e}", function.name))?;
+    }
+    jvm_compiler_core::opt::lower_borrowed_fields(
+        &mut ir,
+        &mut vocabulary.types,
+        |owner| {
+            context
+                .fields
+                .get(owner)
+                .is_some_and(|layout| layout.split_borrows)
+        },
+        Some(&mut debug),
+    );
+    jvm_compiler_core::opt::lower_typed_storage(
+        &mut ir,
+        &mut vocabulary.types,
+        &cells,
+        Some(&mut debug),
+    );
+    jvm_compiler_core::opt::lower_borrowed_memory(&mut ir, &mut vocabulary.types, Some(&mut debug));
+    jvm_compiler_core::opt::lower_component_arguments(
+        &mut ir,
+        &mut vocabulary.types,
+        component_entry,
+        |method| {
+            context.component_method(&method.owner, &method.name)
+                || jvm_compiler_core::opt::borrowed_memory_method(method)
+        },
+        Some(&mut debug),
+    );
+    jvm_compiler_core::opt::lower_component_returns(
+        &mut ir,
+        &mut vocabulary.types,
+        component_entry,
+        |method| {
+            context.component_method(&method.owner, &method.name)
+                || jvm_compiler_core::opt::borrowed_memory_method(method)
+        },
+        Some(&mut debug),
+    );
+    jvm_compiler_core::opt::decompose_tagged(&mut ir, &vocabulary.types, Some(&mut debug));
+    jvm_compiler_core::opt::decompose_views(&mut ir, &mut vocabulary.types, Some(&mut debug));
+    jvm_compiler_core::opt::lower_typed_addresses(&mut ir, &mut vocabulary.types, Some(&mut debug));
+    jvm_compiler_core::opt::decompose_addresses(&mut ir, &mut vocabulary.types, Some(&mut debug));
+    jvm_compiler_core::opt::lower_memory_copies(&mut ir, &mut vocabulary.types);
+    jvm_compiler_core::opt::lower_address_observers(
+        &mut ir,
+        &mut vocabulary.types,
+        Some(&mut debug),
+    );
+    jvm_compiler_core::opt::lower_address_intrinsics(&mut ir, &mut vocabulary.types);
+    jvm_compiler_core::opt::lower_typed_loads(&mut ir, &vocabulary.types);
+    if ir.instructions.len() != representation_start {
+        jvm_compiler_core::opt::simplify_components(&mut ir, &vocabulary.types);
+    } else {
+        jvm_compiler_core::opt::simplify_control_flow(&mut ir);
+    }
+    if debug.locals.is_empty()
+        && jvm_compiler_core::opt::fold_view_roundtrips(&mut ir, &vocabulary.types)
+    {
+        jvm_compiler_core::opt::simplify_components(&mut ir, &vocabulary.types);
+    }
+    if debug.locals.is_empty()
+        && jvm_compiler_core::opt::lower_array_locations(&mut ir, &mut vocabulary.types)
+    {
+        jvm_compiler_core::opt::simplify_components(&mut ir, &vocabulary.types);
+    }
+    if debug.locals.is_empty() {
+        jvm_compiler_core::opt::remove_rethrows(&mut ir, &vocabulary.types);
+    }
+    jvm_compiler_core::opt::fold_field_paths(&mut ir, &vocabulary.types);
+    if let Some(Some(names)) = DUMP.get() {
+        let qualified = format!(
+            "{}::{}",
+            function.owner_class.as_deref().unwrap_or(""),
+            function.name
+        );
+        if names.split(',').any(|name| qualified.contains(name)) {
+            let path = format!(
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/.generated/oomir-redesign/ssa-body-{:016x}.txt"
+                ),
+                crate::stable_hash::hash_value(&qualified)
+            );
+            let _ = std::fs::write(
+                path,
+                format!("{qualified}\n{:?}\n{ir:#?}", vocabulary.types),
+            );
+        }
     }
     let lines = lines.map(|mut lines| {
         lines.instructions.resize(ir.instructions.len(), None);
@@ -286,7 +446,7 @@ pub(crate) fn seal(function: oomir::Function, context: &Context) -> Result<oomir
     Ok(oomir::Function {
         name: function.name,
         owner_class: function.owner_class,
-        signature: function.signature,
+        signature: component_signature.unwrap_or(physical_signature),
         debug_variables: Vec::new(),
         body: Arc::new(oomir::SsaBody {
             ir,
@@ -403,13 +563,34 @@ impl Emission<'_> {
                 Scalar::from_bits(target, scalar.bits()).expect("scalar representation"),
             ));
         }
+        if self.vocabulary.types.get(ty) == Some(ir::Type::TaggedI64) {
+            let parts = match value {
+                oomir::Constant::Instance { params, .. } => params,
+                oomir::Constant::Null(_) => vec![oomir::Constant::I64(0); 2],
+                _ => Vec::new(),
+            };
+            if !parts.is_empty() {
+                let mut values = Vec::new();
+                for part in parts {
+                    let value = self.constant(part)?;
+                    values.push(self.adapt(value, self.ty(&oomir::Type::I64))?);
+                }
+                let parts = ir::List::append(&mut self.builder.body.args, values);
+                return Ok(self.emit(ir::Op::TaggedPack(parts), Some(ty)).unwrap());
+            }
+            return Err("unsupported tagged constant".into());
+        }
         let constant = match value {
             oomir::Constant::Unit => ir::Constant::Unit,
             oomir::Constant::Null(_) => ir::Constant::Null(ty),
             value => {
                 let index = self.constants.len() as u32;
+                let pure = matches!(
+                    value,
+                    oomir::Constant::String(_) | oomir::Constant::LiteralString(_)
+                );
                 self.constants.push(value);
-                ir::Constant::External { index, ty }
+                ir::Constant::External { index, ty, pure }
             }
         };
         let id = ir::ConstId::new(self.builder.body.constants.len());
@@ -442,7 +623,12 @@ impl Emission<'_> {
                 .vocabulary
                 .same_carrier(self.builder.body.value_type(value), ty)
         {
-            let value = self.emit(ir::Op::Load(value), Some(inner)).unwrap();
+            let pointee = self
+                .vocabulary
+                .types
+                .pointee(self.builder.body.value_type(value))
+                .unwrap();
+            let value = self.emit(ir::Op::Load(value), Some(pointee)).unwrap();
             return self.adapt(value, ty);
         }
         if !self

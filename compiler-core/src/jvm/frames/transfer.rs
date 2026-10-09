@@ -233,7 +233,24 @@ pub(super) fn transfer_instruction(
                 state.push(value1);
             }
         }
-        I::Dup_x2 | I::Dup2_x1 | I::Dup2_x2 => {
+        I::Dup2_x1 => {
+            let first = state.pop(context, instruction_index)?;
+            if first.is_category2() {
+                let below = state.pop_category1(context, instruction_index)?;
+                state.push(first.clone());
+                state.push(below);
+                state.push(first);
+            } else {
+                let second = state.pop_category1(context, instruction_index)?;
+                let below = state.pop_category1(context, instruction_index)?;
+                state.push(second.clone());
+                state.push(first.clone());
+                state.push(below);
+                state.push(second);
+                state.push(first);
+            }
+        }
+        I::Dup_x2 | I::Dup2_x2 => {
             return Err(jvm::Error::VerificationError {
                 context: context.to_string(),
                 message: format!(
