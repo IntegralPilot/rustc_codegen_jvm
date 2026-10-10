@@ -88,6 +88,7 @@ pub(super) fn ensure_adt_data_type<'tcx>(
     }
 
     let rust_ty = Ty::new_adt(tcx, *adt_def, substs);
+    crate::foreign_interfaces::register_implementations(tcx, rust_ty, jvm_name, data_types);
     let needs_custom_drop_fields = adt_def.is_struct()
         && !adt_def.is_box()
         && adt_def.destructor(tcx).is_some()

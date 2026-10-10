@@ -235,12 +235,9 @@ pub(crate) fn ensure_trait_object_adapter_class_for_pointees<'tcx>(
             };
             let closure_signature =
                 tcx.instantiate_bound_regions_with_erased(closure_args.as_closure().sig());
-            let tuple_ty = *closure_signature
-                .inputs()
-                .first()
-                .ok_or_else(|| {
-                    format!("closure call signature has no argument tuple: {target_instance:?}")
-                })?;
+            let tuple_ty = *closure_signature.inputs().first().ok_or_else(|| {
+                format!("closure call signature has no argument tuple: {target_instance:?}")
+            })?;
             let tuple_oomir_ty = ty_to_oomir_type(tuple_ty, tcx, data_types, *target_instance);
             let return_ty = callable_abi.signature.ret.as_ref().clone();
             let payload_name = "_trait_object_payload".to_string();
@@ -553,10 +550,13 @@ pub(crate) fn ensure_trait_object_adapter_class_for_pointees<'tcx>(
         };
         let mut method_signature = target_signature.clone();
         method_signature.is_static = false;
-        let method_name = super::super::naming::avoid_object_method_collision(
-            jvm_names::method_for_function(tcx, method_def_id),
-            &method_signature.to_string(),
-        );
+        let method_name = crate::foreign_interfaces::method_name(tcx, method_def_id)
+            .unwrap_or_else(|| {
+                super::super::naming::avoid_object_method_collision(
+                    jvm_names::method_for_function(tcx, method_def_id),
+                    &method_signature.to_string(),
+                )
+            });
 
         let mut call_args = vec![receiver_operand.clone()];
         call_args.extend(
@@ -839,29 +839,37 @@ pub(crate) fn ensure_trait_object_adapter_class_for_pointees<'tcx>(
         );
     }
 
-    match data_types.get_mut(interface_name) {
-        Some(oomir::DataType::Interface { methods, .. }) => methods.extend(
-            interface_methods
-                .into_iter()
-                .map(|(name, signature)| (name, oomir::DataTypeMethod::Abstract(signature))),
-        ),
-        Some(oomir::DataType::Class { .. }) => {
-            return Err(format!(
-                "trait interface name is already a class: {interface_name}"
-            ));
-        }
-        None => {
-            data_types.insert(
-                interface_name.to_string(),
-                oomir::DataType::Interface {
-                    methods: interface_methods
-                        .into_iter()
-                        .map(|(name, signature)| (name, oomir::DataTypeMethod::Abstract(signature)))
-                        .collect(),
-                    interfaces: vec![],
-                    is_enum: false,
-                },
-            );
+    if !data_types
+        .foreign_interfaces
+        .borrow()
+        .contains(interface_name)
+    {
+        match data_types.get_mut(interface_name) {
+            Some(oomir::DataType::Interface { methods, .. }) => methods.extend(
+                interface_methods
+                    .into_iter()
+                    .map(|(name, signature)| (name, oomir::DataTypeMethod::Abstract(signature))),
+            ),
+            Some(oomir::DataType::Class { .. }) => {
+                return Err(format!(
+                    "trait interface name is already a class: {interface_name}"
+                ));
+            }
+            None => {
+                data_types.insert(
+                    interface_name.to_string(),
+                    oomir::DataType::Interface {
+                        methods: interface_methods
+                            .into_iter()
+                            .map(|(name, signature)| {
+                                (name, oomir::DataTypeMethod::Abstract(signature))
+                            })
+                            .collect(),
+                        interfaces: vec![],
+                        is_enum: false,
+                    },
+                );
+            }
         }
     }
     let mut interfaces = vec![

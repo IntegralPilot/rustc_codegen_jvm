@@ -7,6 +7,13 @@ pub(super) fn ensure_trait_interface<'tcx>(
     data_types: &mut Definitions<'tcx>,
 ) {
     let interface_name = lower1::jvm_names::class_for_def_id(tcx, trait_def_id);
+    if crate::foreign_interfaces::interface_name(tcx, trait_def_id).is_some() {
+        data_types
+            .foreign_interfaces
+            .borrow_mut()
+            .insert(interface_name);
+        return;
+    }
     let methods = trait_interface_methods(tcx, trait_def_id, &interface_name, data_types);
 
     match data_types.get_mut(&interface_name) {
@@ -63,9 +70,8 @@ pub(super) fn trait_interface_methods<'tcx>(
             continue;
         }
 
-        let mir_sig = tcx.instantiate_bound_regions_with_erased(
-            tcx.type_of(def_id).skip_binder().fn_sig(tcx),
-        );
+        let mir_sig = tcx
+            .instantiate_bound_regions_with_erased(tcx.type_of(def_id).skip_binder().fn_sig(tcx));
         let explicit_inputs = mir_sig.inputs();
         let output = mir_sig.output();
         let instance = Instance::new_raw(

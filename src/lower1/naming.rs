@@ -513,6 +513,13 @@ pub fn associated_method_name_from_instance<'tcx>(
     instance: Instance<'tcx>,
     signature: &crate::oomir::Signature,
 ) -> String {
+    if let Some(name) = crate::foreign_interfaces::method_name(tcx, instance.def_id()) {
+        if avoid_object_method_collision(name.clone(), &signature.to_string()) != name {
+            tcx.dcx().span_fatal(tcx.def_span(instance.def_id()),
+                format!("JVM interface method `{name}` conflicts with a reserved java.lang.Object method"));
+        }
+        return name;
+    }
     let method_name = associated_method_base_name_from_instance(tcx, instance);
     avoid_object_method_collision(method_name, &signature.to_string())
 }

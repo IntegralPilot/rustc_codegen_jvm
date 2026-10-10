@@ -111,6 +111,21 @@ pub(super) fn place_or_insert_mono_function<'tcx>(
                         tcx, instance, &signature,
                     );
 
+                    if let Some(expected) = oomir_module
+                        .data_types
+                        .foreign_methods
+                        .get(&container_ty)
+                        .and_then(|methods| methods.get(&method_name))
+                        && *expected != instance
+                    {
+                        tcx.dcx().span_fatal(
+                            tcx.def_span(instance.def_id()),
+                            format!(
+                                "Rust method conflicts with JVM interface method `{method_name}`"
+                            ),
+                        );
+                    }
+
                     let implemented_trait_def_id = assoc_item
                         .impl_container(tcx)
                         .and_then(|impl_def_id| tcx.impl_opt_trait_ref(impl_def_id))

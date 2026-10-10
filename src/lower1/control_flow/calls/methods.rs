@@ -44,10 +44,13 @@ pub(super) fn emit<'tcx>(
             &method_signature,
         );
         let declared_method_name = item.name().as_str().to_string();
-        let interface_method_name = crate::lower1::naming::avoid_object_method_collision(
-            declared_method_name.clone(),
-            &method_signature.to_string(),
-        );
+        let interface_method_name = crate::foreign_interfaces::method_name(tcx, item.def_id)
+            .unwrap_or_else(|| {
+                crate::lower1::naming::avoid_object_method_collision(
+                    declared_method_name.clone(),
+                    &method_signature.to_string(),
+                )
+            });
         let is_provided_trait_method = item.trait_container(tcx).is_some_and(|trait_def_id| {
             tcx.provided_trait_methods(trait_def_id).any(|provided| {
                 provided.def_id == item.def_id || item.trait_item_def_id() == Some(provided.def_id)

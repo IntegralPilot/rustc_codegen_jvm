@@ -62,6 +62,11 @@ pub fn crate_module_class<'tcx>(tcx: TyCtxt<'tcx>, krate: CrateNum) -> String {
 }
 
 pub fn class_for_def_id<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> String {
+    if matches!(tcx.def_kind(def_id), DefKind::Trait)
+        && let Some(name) = crate::foreign_interfaces::interface_name(tcx, def_id)
+    {
+        return name;
+    }
     let root = crate_root(tcx, def_id.krate);
     let mut segments = def_path_segments(tcx, def_id);
     if segments.is_empty() {

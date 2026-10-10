@@ -262,6 +262,7 @@ fn lower_codegen_unit_items<'tcx>(
     }
 }
 
+mod foreign_interfaces;
 mod java_exports;
 use java_exports::*;
 
@@ -399,6 +400,7 @@ impl CodegenBackend for MyBackend {
                 // stream as their own job while ordinary owners are lowered.
                 let mut export_module =
                     empty_oomir_module(tcx, &crate_module_class, Arc::clone(&shared_lowering));
+                foreign_interfaces::lower_implementations(tcx, &mut export_module);
                 lower_public_library_exports(tcx, &mut export_module, &lowered_instances);
                 emit_allocator_shims(tcx, &mut export_module);
                 let mut export_module = prepare_oomir_shard(export_module);

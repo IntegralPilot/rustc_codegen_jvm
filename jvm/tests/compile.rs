@@ -1,4 +1,5 @@
-#![feature(extern_types)]
+#![feature(extern_types, register_tool)]
+#![register_tool(jvm_codegen)]
 #![allow(dead_code)]
 
 use jvm::{constructor, method};
@@ -101,3 +102,27 @@ impl DirectlyImportedAttributes {
 
 #[test]
 fn macros_expand() {}
+
+mod implementation {
+    use rcj as jvm;
+
+    #[jvm::interface("java.lang.Runnable")]
+    trait Runnable {
+        fn run(&mut self);
+    }
+
+    struct Counter(i32);
+    impl Runnable for Counter {
+        fn run(&mut self) {
+            self.0 += 1;
+        }
+    }
+
+    #[test]
+    fn remains_an_ordinary_rust_trait() {
+        let mut counter = Counter(0);
+        let task: &mut dyn Runnable = &mut counter;
+        task.run();
+        assert_eq!(counter.0, 1);
+    }
+}

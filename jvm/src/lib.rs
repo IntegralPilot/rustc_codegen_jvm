@@ -958,6 +958,12 @@ fn declare_type(args: TokenStream, item: TokenStream, interface: bool) -> TokenS
         }
     };
     let tokens = TokenStream2::from(item);
+    if interface && let Ok(trait_item) = syn::parse2::<syn::ItemTrait>(tokens.clone()) {
+        return match trait_bindings::expand(&args, trait_item) {
+            Ok(item) => quote!(#item).into(),
+            Err(error) => error.to_compile_error().into(),
+        };
+    }
 
     if let Ok(impl_block) = syn::parse2::<syn::ItemImpl>(tokens.clone()) {
         let (class, rename) = match class_config(&args, true) {
@@ -1131,6 +1137,8 @@ pub fn static_field(args: TokenStream, item: TokenStream) -> TokenStream {
 
 #[cfg(test)]
 mod interface_tests;
+
+mod trait_bindings;
 
 #[cfg(test)]
 mod tests {

@@ -24,6 +24,7 @@ pub(crate) type CheckedIntrinsic = (String, String, String);
 #[derive(Default)]
 pub(crate) struct CrateContext<'tcx> {
     pub(crate) upstream_symbols: HashSet<u64>,
+    foreign_interface_impls: crate::foreign_interfaces::Index,
     provided_symbols: Lock<HashSet<u64>>,
     normalized: Lock<HashMap<(Ty<'tcx>, GenericArgsRef<'tcx>), Ty<'tcx>>>,
     tuple_abis: Lock<HashMap<String, Vec<oomir::Type>>>,
@@ -41,6 +42,7 @@ pub(crate) struct CrateContext<'tcx> {
 impl<'tcx> CrateContext<'tcx> {
     pub(crate) fn with_upstream_symbols(tcx: TyCtxt<'tcx>) -> Self {
         Self {
+            foreign_interface_impls: crate::foreign_interfaces::Index::new(tcx),
             upstream_symbols: crate::symbols::upstream(tcx)
                 .expect("could not read JVM symbol indexes"),
             ..Self::default()
@@ -68,6 +70,7 @@ pub(crate) struct Definitions<'tcx> {
     // Owner metadata for imports and generated function-pointer adapters;
     // foreign interfaces must never acquire generated classfile definitions.
     pub(crate) foreign_interfaces: Lock<HashSet<String>>,
+    pub(crate) foreign_methods: HashMap<Ty<'tcx>, HashMap<String, Instance<'tcx>>>,
     pub(super) representations: HashMap<Ty<'tcx>, oomir::Type>,
     pub(super) defined_enums: HashSet<String>,
     shared: Shared<'tcx>,
@@ -82,12 +85,20 @@ impl<'tcx> Definitions<'tcx> {
             shared,
             values: HashMap::default(),
             foreign_interfaces: Lock::default(),
+            foreign_methods: HashMap::default(),
             representations: HashMap::default(),
             defined_enums: HashSet::default(),
             checked_intrinsics: Vec::new(),
             next_temporary: 0,
             body: BodyFacts::default(),
         }
+    }
+
+    pub(crate) fn foreign_interface_candidates(
+        &self,
+        def_id: rustc_span::def_id::DefId,
+    ) -> &[rustc_span::def_id::DefId] {
+        self.shared.foreign_interface_impls.candidates(def_id)
     }
 
     /// Nested closure lowering temporarily owns its own function facts. The

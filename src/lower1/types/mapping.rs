@@ -443,7 +443,14 @@ pub(super) fn ty_to_oomir_type_resolved<'tcx>(
                         } else {
                             base_name
                         };
-                        if should_define_named_data_type(tcx, trait_ref.def_id) {
+                        if crate::foreign_interfaces::interface_name(tcx, trait_ref.def_id)
+                            .is_some()
+                        {
+                            data_types
+                                .foreign_interfaces
+                                .borrow_mut()
+                                .insert(safe_name.clone());
+                        } else if should_define_named_data_type(tcx, trait_ref.def_id) {
                             data_types.entry(safe_name.clone()).or_insert_with(|| {
                                 oomir::DataType::Interface {
                                     methods: HashMap::default(),
