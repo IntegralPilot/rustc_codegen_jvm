@@ -626,7 +626,7 @@ pub(super) fn convert_basic_block<'tcx>(
                     });
                 }
             }
-            TerminatorKind::Goto { target } => {
+            TerminatorKind::Goto { target, .. } => {
                 let target_label = format!("bb{}", target.index());
                 instructions.push(oomir::Instruction::Jump {
                     target: target_label,
