@@ -1,5 +1,5 @@
 #![allow(internal_features, dead_code)]
-#![feature(core_intrinsics, f16, f128, ptr_internals, ptr_metadata, set_ptr_value, layout_for_ptr)]
+#![feature(core_intrinsics, f16, f128, ptr_metadata, set_ptr_value, layout_for_ptr)]
 
 use core::mem::MaybeUninit;
 
@@ -1718,7 +1718,7 @@ fn sized_to_unsized_coercion() {
 }
 
 fn pointer_wrapper_unsized_coercions() {
-    use core::ptr::{NonNull, Unique};
+    use core::ptr::NonNull;
 
     let mut data = [10_u8, 20, 30, 40];
     let non_null_array = unsafe { NonNull::new_unchecked(&mut data as *mut [u8; 4]) };
@@ -1731,9 +1731,9 @@ fn pointer_wrapper_unsized_coercions() {
     assert!(non_null_slice != NonNull::from(&mut other[..]));
 
     let mut empty = [];
-    let unique_array = unsafe { Unique::new_unchecked(&mut empty as *mut [u8; 0]) };
-    let unique_slice: Unique<[u8]> = unique_array;
-    assert!(core::ptr::metadata(unique_slice.as_ptr()) == 0);
+    let empty_array = NonNull::from(&mut empty);
+    let empty_slice: NonNull<[u8]> = empty_array;
+    assert!(core::ptr::metadata(empty_slice.as_ptr()) == 0);
 }
 
 #[repr(C)]

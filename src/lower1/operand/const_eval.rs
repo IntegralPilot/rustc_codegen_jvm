@@ -5,7 +5,6 @@ use rustc_middle::mir::interpret::{
     AllocId, AllocInit, AllocRange, Allocation, CtfeProvenance, GlobalAlloc, Pointer, Provenance,
     Scalar,
 };
-use rustc_middle::ty::consts::ConstExt;
 use rustc_middle::ty::layout::TyAndLayout;
 use rustc_middle::ty::{
     AdtDef, EarlyBinder, FloatTy, GenericArgsRef, Instance, InstanceKind, IntTy,

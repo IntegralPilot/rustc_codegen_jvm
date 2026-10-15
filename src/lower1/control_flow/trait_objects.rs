@@ -1,7 +1,6 @@
 use crate::lower1::context::Definitions;
 use rustc_hash::FxHashMap as HashMap;
 
-use rustc_middle::ty::consts::ConstExt;
 use rustc_middle::ty::{
     Instance, InstanceKind, ShimKind, Ty, TyCtxt, TyKind, TypingEnv, VtblEntry,
 };

@@ -774,6 +774,12 @@ pub fn rename(old: &Path, new: &Path) -> io::Result<()> {
     two_path_code(old, new, jvm_rename)
 }
 
+pub fn rename_noreplace(old: &Path, new: &Path) -> io::Result<()> {
+    // Create the link first to reject an existing destination without a race.
+    link(old, new)?;
+    unlink(old)
+}
+
 pub fn set_perm(path: &Path, permissions: FilePermissions) -> io::Result<()> {
     let bytes = path.as_os_str().as_encoded_bytes();
     result_code(unsafe {

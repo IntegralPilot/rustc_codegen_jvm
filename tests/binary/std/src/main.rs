@@ -1,4 +1,4 @@
-#![feature(fs_home_dirs, fs_media_dirs)]
+#![feature(fs_home_dirs, fs_media_dirs, rename_noreplace)]
 
 use std::collections::{HashSet, hash_map::DefaultHasher};
 use std::env;
@@ -404,6 +404,19 @@ fn test_directories_and_paths(root: &Path) {
     fs::rename(&copied, &renamed).unwrap();
     assert!(!copied.exists());
     assert!(renamed.exists());
+
+    fs::write(&copied, b"keep me").unwrap();
+    assert_eq!(
+        fs::rename_noreplace(&renamed, &copied).unwrap_err().kind(),
+        io::ErrorKind::AlreadyExists
+    );
+    assert_eq!(fs::read(&copied).unwrap(), b"keep me");
+    assert_eq!(fs::read(&renamed).unwrap(), b"copy me");
+    fs::remove_file(&copied).unwrap();
+    fs::rename_noreplace(&renamed, &copied).unwrap();
+    assert!(!renamed.exists());
+    assert_eq!(fs::read(&copied).unwrap(), b"copy me");
+    fs::rename(&copied, &renamed).unwrap();
 
     let canonical = fs::canonicalize(&renamed).unwrap();
     assert!(canonical.is_absolute(), "canonical path: {canonical:?}");
