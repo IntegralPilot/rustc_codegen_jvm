@@ -339,6 +339,7 @@ pub fn oomir_to_jvm_bytecode(
 
         match data_type {
             DataType::Class {
+                annotations,
                 is_abstract,
                 super_class,
                 fields,
@@ -350,6 +351,7 @@ pub fn oomir_to_jvm_bytecode(
                 // Create and serialize the class file for this data type
                 let dt_bytecode = create_data_type_classfile_for_class(
                     dt_name_oomir,
+                    annotations.as_deref().map_or(&[], Vec::as_slice),
                     fields,
                     *is_abstract,
                     methods,

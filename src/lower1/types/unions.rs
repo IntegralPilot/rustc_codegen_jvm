@@ -296,6 +296,7 @@ pub(crate) fn ensure_union_data_type<'tcx>(
     data_types.insert(
         union_class.clone(),
         oomir::DataType::Class {
+            annotations: None,
             fields: vec![
                 (UNION_BYTES_FIELD.to_string(), byte_array_type()),
                 (UNION_OBJECTS_FIELD.to_string(), object_array_type()),
@@ -404,6 +405,7 @@ pub(crate) fn ensure_union_data_type<'tcx>(
             data_types.insert(
                 union_class.clone(),
                 oomir::DataType::Class {
+                    annotations: None,
                     fields: union_fields,
                     is_abstract: false,
                     methods,

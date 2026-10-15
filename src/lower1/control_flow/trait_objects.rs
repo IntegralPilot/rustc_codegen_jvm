@@ -881,6 +881,7 @@ pub(crate) fn ensure_trait_object_adapter_class_for_pointees<'tcx>(
     data_types.insert(
         class_name.clone(),
         oomir::DataType::Class {
+            annotations: None,
             fields: vec![("value".to_string(), carrier_ty.clone())],
             is_abstract: false,
             methods: adapter_methods,

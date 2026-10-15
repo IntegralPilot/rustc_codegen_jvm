@@ -4,6 +4,7 @@ use super::*;
 /// Creates a ClassFile (as bytes) for a given OOMIR DataType that's a class
 pub(in crate::lower2) fn create_data_type_classfile_for_class(
     class_name_jvm: &str,
+    annotations: &[crate::annotations::ClassAnnotation],
     fields: &[(String, Type)],
     is_abstract: bool,
     methods: HashMap<String, DataTypeMethod>,
@@ -124,7 +125,7 @@ pub(in crate::lower2) fn create_data_type_classfile_for_class(
             &fields,
         )?);
     }
-    let mut class_attributes = Vec::new();
+    let mut class_attributes = crate::annotations::attributes(annotations, &mut cp)?;
     let mut bootstrap_methods: Vec<BootstrapMethod> = Vec::new();
     let mut next_factory = 0;
 

@@ -236,6 +236,7 @@ pub enum AdtHelperKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DataType {
     Class {
+        annotations: crate::annotations::ClassAnnotations,
         is_abstract: bool,
         super_class: Option<String>,
         fields: Vec<(String, Type)>,
@@ -254,12 +255,14 @@ impl Hash for DataType {
         std::mem::discriminant(self).hash(state);
         match self {
             Self::Class {
+                annotations,
                 is_abstract,
                 super_class,
                 fields,
                 methods,
                 interfaces,
             } => {
+                annotations.hash(state);
                 is_abstract.hash(state);
                 super_class.hash(state);
                 fields.hash(state);
@@ -288,6 +291,7 @@ impl DataType {
     pub fn clean_duplicates(&mut self) {
         match self {
             DataType::Class {
+                annotations: _,
                 is_abstract: _,
                 super_class: _,
                 fields,

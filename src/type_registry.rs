@@ -18,12 +18,14 @@ impl CanonicalDataTypeRegistry {
         for (name, data_type) in &mut module.data_types {
             let contribution = match data_type {
                 oomir::DataType::Class {
+                    annotations,
                     is_abstract,
                     super_class,
                     fields,
                     methods,
                     interfaces,
                 } => oomir::DataType::Class {
+                    annotations: annotations.clone(),
                     is_abstract: *is_abstract,
                     super_class: super_class.clone(),
                     fields: fields.clone(),
@@ -90,6 +92,7 @@ impl CanonicalDataTypeRegistry {
         match (existing, incoming) {
             (
                 oomir::DataType::Class {
+                    annotations: existing_annotations,
                     is_abstract: existing_abstract,
                     super_class: existing_super,
                     fields: existing_fields,
@@ -97,6 +100,7 @@ impl CanonicalDataTypeRegistry {
                     interfaces: existing_interfaces,
                 },
                 oomir::DataType::Class {
+                    annotations: incoming_annotations,
                     is_abstract: incoming_abstract,
                     super_class: incoming_super,
                     fields: incoming_fields,
@@ -104,7 +108,11 @@ impl CanonicalDataTypeRegistry {
                     interfaces: incoming_interfaces,
                 },
             ) => {
-                if existing_abstract != incoming_abstract
+                if existing_annotations
+                    .as_ref()
+                    .zip(incoming_annotations.as_ref())
+                    .is_some_and(|(a, b)| a != b)
+                    || existing_abstract != incoming_abstract
                     || existing_super != incoming_super
                     || incoming_fields.iter().any(|(name, ty)| {
                         existing_fields
@@ -119,6 +127,9 @@ impl CanonicalDataTypeRegistry {
                     })
                 {
                     return false;
+                }
+                if existing_annotations.is_none() {
+                    *existing_annotations = incoming_annotations.take();
                 }
                 for (name, ty) in incoming_fields.drain(..) {
                     if !existing_fields
@@ -295,12 +306,14 @@ impl CanonicalDataTypeRegistry {
     pub(super) fn schema_for(data_type: &oomir::DataType) -> oomir::DataType {
         match data_type {
             oomir::DataType::Class {
+                annotations,
                 is_abstract,
                 super_class,
                 fields,
                 methods,
                 interfaces,
             } => oomir::DataType::Class {
+                annotations: annotations.clone(),
                 is_abstract: *is_abstract,
                 super_class: super_class.clone(),
                 fields: fields.clone(),
@@ -352,6 +365,7 @@ mod canonical_data_type_registry_tests {
             "example/Mixed".to_string(),
             vec![
                 oomir::DataType::Class {
+                    annotations: None,
                     is_abstract: false,
                     super_class: None,
                     fields: Vec::new(),

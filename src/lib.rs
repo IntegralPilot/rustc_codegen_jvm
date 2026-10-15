@@ -263,6 +263,7 @@ fn lower_codegen_unit_items<'tcx>(
 }
 
 mod foreign_interfaces;
+mod annotations;
 mod java_exports;
 use java_exports::*;
 

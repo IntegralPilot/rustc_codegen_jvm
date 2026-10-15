@@ -163,6 +163,7 @@ pub(crate) fn ensure_closure_fn_pointer_adapter_class<'tcx>(
             data_types.insert(
                 class_name.clone(),
                 oomir::DataType::Class {
+                    annotations: None,
                     fields: Vec::new(),
                     is_abstract: false,
                     methods,
@@ -858,6 +859,7 @@ pub(super) fn ensure_erased_receiver_fn_pointer_bridge<'tcx>(
     data_types.insert(
         class_name.clone(),
         oomir::DataType::Class {
+            annotations: None,
             fields: vec![(
                 "function".into(),
                 oomir::Type::Interface(source_interface.into()),

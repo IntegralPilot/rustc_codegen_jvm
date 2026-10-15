@@ -20,6 +20,7 @@ pub(super) fn ensure_adt_data_type<'tcx>(
             data_types.insert(
                 jvm_name.to_string(),
                 oomir::DataType::Class {
+                    annotations: crate::annotations::from_def(tcx, adt_def.did()),
                     fields: vec![],
                     is_abstract: false,
                     methods: HashMap::default(),

@@ -292,6 +292,7 @@ pub(super) fn ensure_enum_data_types<'tcx>(
             data_types.insert(
                 variant_class_name.clone(),
                 oomir::DataType::Class {
+                    annotations: None,
                     fields: vec![],
                     is_abstract: false,
                     methods: HashMap::default(),

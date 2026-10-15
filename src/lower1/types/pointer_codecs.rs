@@ -168,6 +168,7 @@ fn build_pointer_memory_codec<'tcx>(
     data_types.insert(
         class_name.clone(),
         oomir::DataType::Class {
+            annotations: None,
             fields: Vec::new(),
             is_abstract: false,
             methods: HashMap::default(),

@@ -536,6 +536,7 @@ pub(crate) fn ensure_exact_transmute_helper<'tcx>(
             data_types.insert(
                 class_name,
                 oomir::DataType::Class {
+                    annotations: None,
                     fields: Vec::new(),
                     is_abstract: false,
                     methods: HashMap::from_iter([(

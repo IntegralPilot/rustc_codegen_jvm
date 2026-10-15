@@ -277,6 +277,7 @@ pub(super) fn ty_to_oomir_type_resolved<'tcx>(
 
                 // Create and insert the DataType definition
                 let tuple_data_type = oomir::DataType::Class {
+                    annotations: None,
                     fields: oomir_fields,
                     is_abstract: false,
                     methods,
@@ -512,6 +513,7 @@ pub(super) fn ty_to_oomir_type_resolved<'tcx>(
                 data_types.insert(
                     safe_name.clone(),
                     oomir::DataType::Class {
+                        annotations: None,
                         fields,
                         is_abstract: false,
                         methods: HashMap::default(), // 'call' is handled via MIR lowering logic
@@ -535,6 +537,7 @@ pub(super) fn ty_to_oomir_type_resolved<'tcx>(
             data_types.insert(
                 safe_name.clone(),
                 oomir::DataType::Class {
+                    annotations: None,
                     fields: vec![("__state".to_string(), oomir::Type::I32)],
                     is_abstract: false,
                     methods: HashMap::default(),

@@ -546,6 +546,7 @@ pub(crate) fn ensure_fn_pointer_adapter_class<'tcx>(
             data_types.insert(
                 class_name.clone(),
                 oomir::DataType::Class {
+                    annotations: None,
                     fields: vec![],
                     is_abstract: false,
                     methods,

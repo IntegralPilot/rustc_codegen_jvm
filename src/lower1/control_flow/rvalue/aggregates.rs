@@ -456,6 +456,7 @@ impl<'tcx> RvalueContext<'_, 'tcx> {
                                 data_types.insert(
                                     jvm_class_name.clone(),
                                     oomir::DataType::Class {
+                                        annotations: crate::annotations::from_def(tcx, adt_def.did()),
                                         fields: oomir_fields.clone(),
                                         is_abstract: false,
                                         methods,

@@ -1138,7 +1138,17 @@ pub fn static_field(args: TokenStream, item: TokenStream) -> TokenStream {
 #[cfg(test)]
 mod interface_tests;
 
+mod annotations;
 mod trait_bindings;
+
+/// Adds a Java annotation to a Rust struct. Retention defaults to `runtime`.
+/// Use `class` or `source` to match the Java annotation's retention policy.
+#[proc_macro_attribute]
+pub fn annotation(args: TokenStream, item: TokenStream) -> TokenStream {
+    annotations::expand(args.into(), item.into())
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
 
 #[cfg(test)]
 mod tests {

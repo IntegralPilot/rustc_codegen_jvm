@@ -100,8 +100,15 @@ impl DirectlyImportedAttributes {
     fn length(&self) -> i32 {}
 }
 
+#[jvm::annotation("example.Tag", value = "native")]
+struct Annotated {
+    value: i32,
+}
+
 #[test]
-fn macros_expand() {}
+fn macros_expand() {
+    assert_eq!(Annotated { value: 7 }.value, 7);
+}
 
 mod implementation {
     use rcj as jvm;
