@@ -126,7 +126,13 @@ fn merge_class_files(
         }
     }
 
-    if missing_method_indexes.is_empty() && missing_interface_indexes.is_empty() {
+    if missing_method_indexes.is_empty()
+        && missing_interface_indexes.is_empty()
+        && !incoming
+            .attributes
+            .iter()
+            .any(|a| annotations::entries(a).is_some())
+    {
         return Ok(base_changed);
     }
 
@@ -144,6 +150,12 @@ fn merge_class_files(
         &mut index.constants,
         &mut bootstrap_methods,
     );
+    base_changed |= annotations::merge(
+        &mut base.attributes,
+        &incoming.attributes,
+        &constant_indexes,
+    )?;
+    base_changed |= !missing_method_indexes.is_empty() || !missing_interface_indexes.is_empty();
     for index in missing_interface_indexes {
         base.interfaces.push(remapped_constant_index(
             incoming.interfaces[index],
@@ -189,7 +201,7 @@ fn merge_class_files(
             });
         }
     }
-    Ok(true)
+    Ok(base_changed)
 }
 
 pub(crate) fn serialize_class_file(class_file: &ClassFile<'static>) -> io::Result<Vec<u8>> {

@@ -73,7 +73,8 @@ impl Namespaces {
         reader.set_position(8); // magic and classfile version
         let mut pool = ConstantPool::from_bytes(&mut reader).map_err(error)?;
         let end = reader.position();
-        let names = name_constants(&pool, &mut reader).map_err(error)?;
+        let mut annotation_literals = HashMap::default();
+        let names = name_constants(&pool, &mut reader, &mut annotation_literals).map_err(error)?;
         let count = pool.len() as u16;
         let mut literals = HashMap::default();
         for index in 1..=count {
@@ -82,6 +83,7 @@ impl Namespaces {
             }
         }
         let mut changed = false;
+        let mut literal_relocations = Vec::new();
         for index in 1..=count {
             let Some(Constant::Utf8(value)) = pool.get(index) else {
                 continue;
@@ -97,6 +99,12 @@ impl Namespaces {
                             .map(<[u8]>::to_vec)
                     };
                 if let Some(bytes) = relocated {
+                    if let Some(positions) = annotation_literals.get(&index) {
+                        let original = pool.add(Constant::Utf8(value.clone())).map_err(error)?;
+                        for &position in positions {
+                            literal_relocations.push((position, original));
+                        }
+                    }
                     let value = JavaString::from_mutf8(bytes).map_err(error)?;
                     pool.set(index, Constant::Utf8(value.into()))
                         .map_err(error)?;
@@ -112,11 +120,18 @@ impl Namespaces {
             };
             // A string literal may share its UTF8 entry with a class name or
             // descriptor. Preserve its contents and its ldc operand index.
-            if let Some(strings) = literals.get(&index) {
+            if literals.contains_key(&index) || annotation_literals.contains_key(&index) {
                 let original = pool.add(Constant::Utf8(value.clone())).map_err(error)?;
-                for &string in strings {
-                    pool.set(string, Constant::String(original))
-                        .map_err(error)?;
+                if let Some(strings) = literals.get(&index) {
+                    for &string in strings {
+                        pool.set(string, Constant::String(original))
+                            .map_err(error)?;
+                    }
+                }
+                if let Some(positions) = annotation_literals.get(&index) {
+                    for &position in positions {
+                        literal_relocations.push((position, original));
+                    }
                 }
             }
             let value = JavaString::from_mutf8(bytes).map_err(error)?;
@@ -130,7 +145,12 @@ impl Namespaces {
             let mut bytes = Vec::with_capacity(class.data.len());
             bytes.extend_from_slice(&class.data[..8]);
             pool.to_bytes(&mut bytes).map_err(error)?;
+            let body_start = bytes.len();
             bytes.extend_from_slice(&class.data[end..]);
+            for (position, index) in literal_relocations {
+                let position = body_start + position - end;
+                bytes[position..position + 2].copy_from_slice(&index.to_be_bytes());
+            }
             class.data = bytes;
             class.jar_entry_name = self.name(&class.jar_entry_name);
         }
@@ -164,6 +184,7 @@ impl Namespaces {
 fn name_constants(
     pool: &ConstantPool<'_>,
     reader: &mut ByteReader<'_>,
+    literals: &mut HashMap<u16, Vec<usize>>,
 ) -> ristretto_classfile::Result<HashSet<u16>> {
     let mut names = HashSet::default();
     for constant in pool.iter() {
@@ -190,10 +211,10 @@ fn name_constants(
             reader.skip(2)?;
             names.insert(reader.read_u16()?);
             names.insert(reader.read_u16()?);
-            name_attributes(pool, reader, &mut names)?;
+            name_attributes(pool, reader, &mut names, literals, 0)?;
         }
     }
-    name_attributes(pool, reader, &mut names)?;
+    name_attributes(pool, reader, &mut names, literals, 0)?;
     Ok(names)
 }
 
@@ -201,12 +222,20 @@ fn name_attributes(
     pool: &ConstantPool<'_>,
     reader: &mut ByteReader<'_>,
     names: &mut HashSet<u16>,
+    literals: &mut HashMap<u16, Vec<usize>>,
+    offset: usize,
 ) -> ristretto_classfile::Result<()> {
     for _ in 0..reader.read_u16()? {
         let name = pool.try_get_utf8(reader.read_u16()?)?;
         let len = reader.read_u32()? as usize;
+        let start = offset + reader.position();
         let mut attribute = ByteReader::new(reader.read_bytes(len)?);
         match name.as_bytes() {
+            b"RuntimeVisibleAnnotations" | b"RuntimeInvisibleAnnotations" => {
+                for _ in 0..attribute.read_u16()? {
+                    annotation_names(&mut attribute, names, literals, start)?;
+                }
+            }
             b"Signature" => {
                 names.insert(attribute.read_u16()?);
             }
@@ -223,7 +252,7 @@ fn name_attributes(
                 attribute.skip(len)?;
                 let exceptions = attribute.read_u16()?;
                 attribute.skip(usize::from(exceptions) * 8)?;
-                name_attributes(pool, &mut attribute, names)?;
+                name_attributes(pool, &mut attribute, names, literals, start)?;
             }
             b"LocalVariableTable" | b"LocalVariableTypeTable" => {
                 for _ in 0..attribute.read_u16()? {
@@ -234,6 +263,60 @@ fn name_attributes(
             }
             _ => {}
         }
+    }
+    Ok(())
+}
+
+fn annotation_literal(
+    reader: &mut ByteReader<'_>,
+    literals: &mut HashMap<u16, Vec<usize>>,
+    offset: usize,
+) -> ristretto_classfile::Result<()> {
+    let position = offset + reader.position();
+    literals
+        .entry(reader.read_u16()?)
+        .or_default()
+        .push(position);
+    Ok(())
+}
+
+fn annotation_names(
+    reader: &mut ByteReader<'_>,
+    names: &mut HashSet<u16>,
+    literals: &mut HashMap<u16, Vec<usize>>,
+    offset: usize,
+) -> ristretto_classfile::Result<()> {
+    names.insert(reader.read_u16()?);
+    for _ in 0..reader.read_u16()? {
+        annotation_literal(reader, literals, offset)?;
+        annotation_value_names(reader, names, literals, offset)?;
+    }
+    Ok(())
+}
+
+fn annotation_value_names(
+    reader: &mut ByteReader<'_>,
+    names: &mut HashSet<u16>,
+    literals: &mut HashMap<u16, Vec<usize>>,
+    offset: usize,
+) -> ristretto_classfile::Result<()> {
+    match reader.read_u8()? {
+        b'B' | b'C' | b'D' | b'F' | b'I' | b'J' | b'S' | b'Z' => reader.skip(2)?,
+        b's' => annotation_literal(reader, literals, offset)?,
+        b'e' => {
+            names.insert(reader.read_u16()?);
+            annotation_literal(reader, literals, offset)?;
+        }
+        b'c' => {
+            names.insert(reader.read_u16()?);
+        }
+        b'@' => annotation_names(reader, names, literals, offset)?,
+        b'[' => {
+            for _ in 0..reader.read_u16()? {
+                annotation_value_names(reader, names, literals, offset)?;
+            }
+        }
+        tag => return Err(ristretto_classfile::Error::InvalidAnnotationElementTag(tag)),
     }
     Ok(())
 }

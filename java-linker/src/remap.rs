@@ -220,6 +220,19 @@ pub(crate) fn remap_attribute(
                 remap_attribute(nested, indexes)?;
             }
         }
+        Attribute::RuntimeVisibleAnnotations {
+            name_index,
+            annotations,
+        }
+        | Attribute::RuntimeInvisibleAnnotations {
+            name_index,
+            annotations,
+        } => {
+            *name_index = remapped_constant_index(*name_index, indexes)?;
+            for annotation in annotations {
+                crate::annotations::remap(annotation, indexes)?;
+            }
+        }
         Attribute::StackMapTable { name_index, frames } => {
             *name_index = remapped_constant_index(*name_index, indexes)?;
             for frame in frames {

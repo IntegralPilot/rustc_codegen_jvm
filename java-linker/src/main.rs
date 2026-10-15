@@ -21,6 +21,7 @@ mod import;
 use import::ConstantImporter;
 mod remap;
 use remap::*;
+mod annotations;
 mod merge;
 use merge::*;
 mod metrics;
@@ -31,10 +32,10 @@ mod jar;
 #[cfg(test)]
 use jar::*;
 mod inputs;
-mod pipeline;
 mod namespaces;
 #[cfg(test)]
 mod namespaces_tests;
+mod pipeline;
 mod split;
 #[cfg(test)]
 mod split_tests;
