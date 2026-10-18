@@ -1250,7 +1250,10 @@ fn print_doctor(backend: &Backend) -> DynResult<()> {
         print!(" (dirty)");
     }
     println!();
-    println!("rustc_codegen_jvm: {}", backend.root.display());
+    println!(
+        "rustc_codegen_jvm: {}",
+        strip_unc_prefix(&backend.root).display()
+    );
     println!("pinned Rust toolchain: {}", backend.toolchain.channel);
     match git_output(&backend.root, &["log", "-1", "--format=%H%x09%s"]) {
         Ok(commit) => println!("rustc_codegen_jvm HEAD: {}", commit.trim()),
@@ -1296,9 +1299,15 @@ fn print_doctor(backend: &Backend) -> DynResult<()> {
         };
         println!("{name}: {}", String::from_utf8_lossy(version).trim());
     }
-    println!("target: {}", backend.target_spec.display());
-    println!("linker: {}", backend.linker.display());
-    println!("runtime: {}", backend.runtime_jar.display());
+    println!(
+        "target: {}",
+        strip_unc_prefix(&backend.target_spec).display()
+    );
+    println!("linker: {}", strip_unc_prefix(&backend.linker).display());
+    println!(
+        "runtime: {}",
+        strip_unc_prefix(&backend.runtime_jar).display()
+    );
     Ok(())
 }
 
