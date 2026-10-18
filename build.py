@@ -192,8 +192,8 @@ def build_runtime():
     Config.RUNTIME_CLASSES_DIR.mkdir(parents=True, exist_ok=True)
     Config.RUNTIME_JAR.parent.mkdir(parents=True, exist_ok=True)
 
-    source_paths = [str(path) for path in Config.RUNTIME_SOURCES]
-    javac_base = ["javac", "-Xlint:-options", "-d", str(Config.RUNTIME_CLASSES_DIR)]
+    source_paths = [str(path).removeprefix("//?/") for path in Config.RUNTIME_SOURCES]
+    javac_base = ["javac", "-Xlint:-options", "-d", str(Config.RUNTIME_CLASSES_DIR).removeprefix("//?/")]
     proc = run_command(["javac", "--release", "8"] + javac_base[1:] + source_paths, check=False)
     if proc.returncode != 0:
         print(
@@ -204,9 +204,9 @@ def build_runtime():
     run_command([
         "jar",
         "cf",
-        str(Config.RUNTIME_JAR),
+        str(Config.RUNTIME_JAR).removeprefix("//?/"),
         "-C",
-        str(Config.RUNTIME_CLASSES_DIR),
+        str(Config.RUNTIME_CLASSES_DIR).removeprefix("//?/"),
         ".",
     ])
 

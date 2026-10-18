@@ -834,7 +834,9 @@ fn package_library(backend: &Backend, rlibs: &BTreeSet<PathBuf>, output: &Path) 
     if rlibs.is_empty() {
         return Err(user_error("Cargo did not report any library archives"));
     }
-    let has_panic_unwind = rlibs.iter().any(|path| rlib_crate_name(path) == Some("panic_unwind"));
+    let has_panic_unwind = rlibs
+        .iter()
+        .any(|path| rlib_crate_name(path) == Some("panic_unwind"));
     let selected_rlibs = rlibs.iter().filter(|path| {
         // `-Zbuild-std=std,panic_unwind` may still report panic_abort as a
         // compiler artifact. A native linker selects one panic runtime; a JAR
@@ -853,7 +855,21 @@ fn package_library(backend: &Backend, rlibs: &BTreeSet<PathBuf>, output: &Path) 
 
 fn rlib_crate_name(path: &Path) -> Option<&str> {
     let name = path.file_stem()?.to_str()?.strip_prefix("lib")?;
-    Some(name.split_once('-').map_or(name, |(crate_name, _)| crate_name))
+    Some(
+        name.split_once('-')
+            .map_or(name, |(crate_name, _)| crate_name),
+    )
+}
+
+fn strip_unc_prefix(path: &Path) -> PathBuf {
+    let s = path.to_string_lossy();
+    if let Some(stripped) = s.strip_prefix(r"\\?\") {
+        PathBuf::from(stripped)
+    } else if let Some(stripped) = s.strip_prefix("//?/") {
+        PathBuf::from(stripped)
+    } else {
+        path.to_path_buf()
+    }
 }
 
 fn cargo_command(
@@ -867,14 +883,14 @@ fn cargo_command(
     command
         .arg(subcommand)
         .arg("--target")
-        .arg(&backend.target_spec)
+        .arg(strip_unc_prefix(&backend.target_spec))
         .arg("-Zjson-target-spec")
         .arg("-Zbuild-std=std,panic_unwind")
         .arg("-Zbuild-std-features=panic-unwind")
         .arg("--config")
-        .arg(&backend.cargo_config)
+        .arg(strip_unc_prefix(&backend.cargo_config))
         .env("RUSTUP_TOOLCHAIN", &backend.toolchain.channel)
-        .env("__CARGO_TESTS_ONLY_SRC_ROOT", overlay);
+        .env("__CARGO_TESTS_ONLY_SRC_ROOT", strip_unc_prefix(&overlay));
     if capture {
         command.arg("--message-format=json-render-diagnostics");
     }
@@ -1601,7 +1617,10 @@ mod tests {
             rlib_crate_name(Path::new("/tmp/libpanic_unwind-35f4b19ff65eda2b.rlib")),
             Some("panic_unwind")
         );
-        assert_eq!(rlib_crate_name(Path::new("/tmp/libdemo.rlib")), Some("demo"));
+        assert_eq!(
+            rlib_crate_name(Path::new("/tmp/libdemo.rlib")),
+            Some("demo")
+        );
         assert_eq!(rlib_crate_name(Path::new("/tmp/demo.jar")), None);
     }
 
