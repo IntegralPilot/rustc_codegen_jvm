@@ -66,7 +66,7 @@ class Config:
     else:
         DYLIB_PREFIX = "lib"
         DYLIB_SUFFIX = ".so"
-        
+
     RUST_BACKEND_DYLIB = ROOT_DIR / "target/release" / f"{DYLIB_PREFIX}rustc_codegen_jvm{DYLIB_SUFFIX}"
     RUST_BACKEND_TOOLCHAIN = ROOT_DIR / "target/release/.rustc_codegen_jvm-toolchain"
     JAVA_LINKER_EXE = JAVA_LINKER_DIR / "target/release/java-linker"
@@ -84,8 +84,8 @@ def run_command(cmd: List[str], cwd: Path = None, check: bool = True):
     print(f"{Colors.YELLOW}▶️  Running: {' '.join(cmd)}{cwd_str}{Colors.RESET}")
     try:
         proc = subprocess.run(
-            cmd, 
-            cwd=cwd, 
+            cmd,
+            cwd=cwd,
             check=check,
             stdout=sys.stdout, # Stream output directly
             stderr=sys.stderr
@@ -143,17 +143,17 @@ def contains_non_runtime_classes(jar_path: Path) -> bool:
 def clean():
     """Cleans all generated files and build artifacts."""
     print(f"{Colors.CYAN}🧹 Cleaning all components...{Colors.RESET}")
-    
+
     # Root cargo clean
     run_command(["cargo", "clean"], cwd=Config.ROOT_DIR)
-    
+
     # Subproject cargo clean
     run_command(["cargo", "clean"], cwd=Config.JAVA_LINKER_DIR)
     run_command(["cargo", "clean"], cwd=Config.CARGO_JVM_DIR)
 
     # Remove specific files and directories
     for path in [
-        Config.CONFIG_TOML, 
+        Config.CONFIG_TOML,
         Config.JVM_TARGET_JSON,
         Config.RUNTIME_DIR / "build"
     ]:
@@ -192,8 +192,8 @@ def build_runtime():
     Config.RUNTIME_CLASSES_DIR.mkdir(parents=True, exist_ok=True)
     Config.RUNTIME_JAR.parent.mkdir(parents=True, exist_ok=True)
 
-    source_paths = [str(path) for path in Config.RUNTIME_SOURCES]
-    javac_base = ["javac", "-Xlint:-options", "-d", str(Config.RUNTIME_CLASSES_DIR)]
+    source_paths = [str(path).removeprefix("//?/") for path in Config.RUNTIME_SOURCES]
+    javac_base = ["javac", "-Xlint:-options", "-d", str(Config.RUNTIME_CLASSES_DIR).removeprefix("//?/")]
     proc = run_command(["javac", "--release", "8"] + javac_base[1:] + source_paths, check=False)
     if proc.returncode != 0:
         print(
@@ -204,9 +204,9 @@ def build_runtime():
     run_command([
         "jar",
         "cf",
-        str(Config.RUNTIME_JAR),
+        str(Config.RUNTIME_JAR).removeprefix("//?/"),
         "-C",
-        str(Config.RUNTIME_CLASSES_DIR),
+        str(Config.RUNTIME_CLASSES_DIR).removeprefix("//?/"),
         ".",
     ])
 
@@ -234,7 +234,7 @@ def build_rust_backend():
     ):
         print(f"{Colors.GREEN}✅ Rust codegen backend is up to date.{Colors.RESET}")
         return
-    
+
     print(f"{Colors.CYAN}📦 Building Rust codegen backend...{Colors.RESET}")
     # Setting RUSTFLAGS as an environment variable is more robust.
     env = os.environ.copy()
@@ -248,7 +248,7 @@ def build_java_linker():
     if not is_stale(Config.JAVA_LINKER_EXE, Config.LINKER_RUST_SOURCES):
         print(f"{Colors.GREEN}✅ Java linker is up to date.{Colors.RESET}")
         return
-        
+
     print(f"{Colors.CYAN}📦 Building Java linker...{Colors.RESET}")
     env = os.environ.copy()
     env["RUSTFLAGS"] = "-Awarnings"
@@ -264,14 +264,14 @@ def build_cargo_jvm():
     print(f"{Colors.CYAN}📦 Building cargo-jvm...{Colors.RESET}")
     subprocess.run(["cargo", "build", "--release"], cwd=Config.CARGO_JVM_DIR, check=True)
     print(f"{Colors.GREEN}   cargo-jvm built successfully.{Colors.RESET}")
-    
+
 def generate_config_files():
     """Generates config.toml and jvm-unknown-jvm.json from templates."""
     print(f"{Colors.CYAN}🛠️  Generating configuration files from templates...{Colors.RESET}")
 
     # Logic from GenerateFiles.py is now integrated here
     replacements = {
-        "../../../": Config.ROOT_DIR.as_posix() + "/",
+        "../../../": Config.ROOT_DIR.as_posix().removeprefix("//?/") + "/",
         "@RUST_BACKEND_DYLIB@": Config.RUST_BACKEND_DYLIB.name,
     }
 
@@ -279,20 +279,20 @@ def generate_config_files():
         content = template_path.read_text()
         for old, new in replacements.items():
             content = content.replace(old, new)
-        
+
         target_path = template_path.with_suffix("") # Removes .template
         target_path.write_text(content)
         shutil.copymode(template_path, target_path)
         print(f"   Generated {target_path.name}")
     print(f"{Colors.GREEN}   Configuration files generated.{Colors.RESET}")
-    
+
 def all_tasks():
     """Runs all necessary build tasks in the correct order."""
     if not Config.IS_CI:
         install_rust_components()
 
     generate_config_files()
-    
+
     # The order defines the dependency chain.
     build_runtime()
     build_rust_backend()
@@ -327,9 +327,9 @@ TARGETS = {
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Build script for rustc_codegen_jvm.")
     parser.add_argument(
-        "target", 
-        nargs="?", 
-        default="all", 
+        "target",
+        nargs="?",
+        default="all",
         choices=TARGETS.keys(),
         help=f"The build target to run. One of: {', '.join(TARGETS.keys())}"
     )

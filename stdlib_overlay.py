@@ -88,7 +88,7 @@ def prepare_stdlib_source(sysroot: Path, commit: str) -> tuple[Path, str]:
     try:
         shutil.copytree(installed, temporary_library)
         shutil.copytree(STDLIB_OVERLAY_ROOT, temporary_library, dirs_exist_ok=True)
-        patch_directory = temporary_library.relative_to(ROOT)
+        patch_directory = temporary_library.relative_to(ROOT).as_posix()
         for patch in sorted(STDLIB_PATCH_ROOT.glob("*.patch")):
             applied = run(
                 [
@@ -96,7 +96,7 @@ def prepare_stdlib_source(sysroot: Path, commit: str) -> tuple[Path, str]:
                     "apply",
                     "--whitespace=nowarn",
                     f"--directory={patch_directory}",
-                    str(patch.resolve()),
+                    patch.relative_to(ROOT).as_posix(),
                 ]
             )
             if applied.returncode != 0:
@@ -120,7 +120,7 @@ def prepare_stdlib_source(sysroot: Path, commit: str) -> tuple[Path, str]:
 def main() -> None:
     sysroot, _, commit = rustc_info()
     source, _ = prepare_stdlib_source(sysroot, commit)
-    print(source)
+    print(source.as_posix().removeprefix("//?/"))
 
 
 if __name__ == "__main__":
