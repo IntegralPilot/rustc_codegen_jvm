@@ -1,4 +1,4 @@
-#![feature(tcp_keepalive, tcp_linger)]
+#![feature(ipv6_hop_limit, tcp_keepalive, tcp_linger)]
 
 use std::io::{self, IoSlice, IoSliceMut, Read, Write};
 use std::net::{
@@ -291,11 +291,31 @@ fn test_ipv6_when_available() {
     assert!(!socket.multicast_loop_v6().unwrap());
     socket.set_multicast_loop_v6(true).unwrap();
     assert!(socket.multicast_loop_v6().unwrap());
+    for limit in [0, 7, 255] {
+        socket.set_multicast_hop_limit_v6(limit).unwrap();
+        assert_eq!(socket.multicast_hop_limit_v6().unwrap(), limit);
+    }
+    assert_eq!(
+        socket.set_hop_limit_v6(42).unwrap_err().kind(),
+        io::ErrorKind::Unsupported
+    );
+    assert_eq!(
+        socket.hop_limit_v6().unwrap_err().kind(),
+        io::ErrorKind::Unsupported
+    );
 
     let Ok(listener) = TcpListener::bind((Ipv6Addr::LOCALHOST, 0)) else {
         return;
     };
     assert!(matches!(listener.local_addr().unwrap(), SocketAddr::V6(_)));
+    assert_eq!(
+        listener.set_hop_limit_v6(42).unwrap_err().kind(),
+        io::ErrorKind::Unsupported
+    );
+    assert_eq!(
+        listener.hop_limit_v6().unwrap_err().kind(),
+        io::ErrorKind::Unsupported
+    );
     #[allow(deprecated)]
     {
         assert_eq!(
@@ -313,6 +333,14 @@ fn test_ipv6_when_available() {
         stream.write_all(b"6").unwrap();
     });
     let mut client = TcpStream::connect_timeout(&address, Duration::from_secs(2)).unwrap();
+    assert_eq!(
+        client.set_hop_limit_v6(42).unwrap_err().kind(),
+        io::ErrorKind::Unsupported
+    );
+    assert_eq!(
+        client.hop_limit_v6().unwrap_err().kind(),
+        io::ErrorKind::Unsupported
+    );
     let mut byte = [0];
     client.read_exact(&mut byte).unwrap();
     assert_eq!(byte, *b"6");

@@ -334,6 +334,14 @@ impl TcpStream {
         unsupported("Java does not expose the TCP unicast IP TTL")
     }
 
+    pub fn set_hop_limit_v6(&self, _limit: u8) -> io::Result<()> {
+        unsupported("Java does not expose the IPv6 unicast hop limit")
+    }
+
+    pub fn hop_limit_v6(&self) -> io::Result<u8> {
+        unsupported("Java does not expose the IPv6 unicast hop limit")
+    }
+
     pub fn take_error(&self) -> io::Result<Option<io::Error>> {
         take_error(unsafe { jvm_tcp_take_error(self.0) })
     }
@@ -395,6 +403,14 @@ impl TcpListener {
 
     pub fn ttl(&self) -> io::Result<u32> {
         unsupported("Java does not expose the TCP listener unicast IP TTL")
+    }
+
+    pub fn set_hop_limit_v6(&self, _limit: u8) -> io::Result<()> {
+        unsupported("Java does not expose the IPv6 unicast hop limit")
+    }
+
+    pub fn hop_limit_v6(&self) -> io::Result<u8> {
+        unsupported("Java does not expose the IPv6 unicast hop limit")
     }
 
     pub fn set_only_v6(&self, _only_v6: bool) -> io::Result<()> {
@@ -538,6 +554,15 @@ impl UdpSocket {
         udp_boolean(self.0, OPTION_MULTICAST_LOOP_V6)
     }
 
+    pub fn set_multicast_hop_limit_v6(&self, limit: u8) -> io::Result<()> {
+        // Java uses IP_MULTICAST_TTL for both address families.
+        self.set_multicast_ttl_v4(u32::from(limit))
+    }
+
+    pub fn multicast_hop_limit_v6(&self) -> io::Result<u8> {
+        self.multicast_ttl_v4().map(|limit| limit as u8)
+    }
+
     pub fn join_multicast_v4(&self, multiaddr: &Ipv4Addr, interface: &Ipv4Addr) -> io::Result<()> {
         multicast_v4(self.0, true, multiaddr, interface)
     }
@@ -560,6 +585,14 @@ impl UdpSocket {
 
     pub fn ttl(&self) -> io::Result<u32> {
         unsupported("Java does not expose the UDP unicast IP TTL")
+    }
+
+    pub fn set_hop_limit_v6(&self, _limit: u8) -> io::Result<()> {
+        unsupported("Java does not expose the IPv6 unicast hop limit")
+    }
+
+    pub fn hop_limit_v6(&self) -> io::Result<u8> {
+        unsupported("Java does not expose the IPv6 unicast hop limit")
     }
 
     pub fn take_error(&self) -> io::Result<Option<io::Error>> {

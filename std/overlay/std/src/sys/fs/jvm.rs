@@ -408,6 +408,12 @@ impl fmt::Debug for FileType {
     }
 }
 
+impl ReadDir {
+    pub fn dir(&self) -> io::Result<Dir> {
+        Dir::open_for_traversal(&self.root)
+    }
+}
+
 impl fmt::Debug for ReadDir {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("ReadDir").field(&self.root).finish()

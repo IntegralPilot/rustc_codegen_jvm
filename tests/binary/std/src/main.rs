@@ -1,4 +1,4 @@
-#![feature(fs_home_dirs, fs_media_dirs, rename_noreplace)]
+#![feature(dirfd, fs_home_dirs, fs_media_dirs, rename_noreplace)]
 
 use std::collections::{HashSet, hash_map::DefaultHasher};
 use std::env;
@@ -422,8 +422,9 @@ fn test_directories_and_paths(root: &Path) {
     assert!(canonical.is_absolute(), "canonical path: {canonical:?}");
     assert!(canonical.ends_with("renamed.txt"));
 
-    let entries = fs::read_dir(root)
-        .unwrap()
+    let read_dir = fs::read_dir(root).unwrap();
+    let dir = read_dir.dir().unwrap();
+    let entries = read_dir
         .map(|entry| {
             let entry = entry.unwrap();
             entry.file_type().unwrap();
@@ -434,6 +435,13 @@ fn test_directories_and_paths(root: &Path) {
     assert!(entries.contains(&"source.txt".to_string()));
     assert!(entries.contains(&"renamed.txt".to_string()));
     assert!(entries.contains(&"nested".to_string()));
+    assert!(dir.self_metadata().unwrap().is_dir());
+    let mut contents = String::new();
+    dir.open_file("renamed.txt")
+        .unwrap()
+        .read_to_string(&mut contents)
+        .unwrap();
+    assert_eq!(contents, "copy me");
 
     fs::remove_file(&renamed).unwrap();
     fs::remove_file(&source).unwrap();
